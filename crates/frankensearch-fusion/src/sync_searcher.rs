@@ -2473,6 +2473,9 @@ mod tests {
                 SearchPhase::RefinementFailed { error, .. } => {
                     panic!("semantic refinement failed: {error}")
                 }
+                SearchPhase::Reranked { .. } => {
+                    panic!("synchronous search must not emit a reranked phase")
+                }
             };
             for hit in hits {
                 assert_ne!(hit.source, ScoreSource::HashControl);

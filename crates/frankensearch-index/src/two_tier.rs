@@ -1971,6 +1971,10 @@ impl TwoTierIndex {
             });
         }
 
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Precompute `doc_id → latest WAL entry index` once, instead of an O(W)
         // reverse linear scan of the quality WAL **per hit** (was O(hits·W); the
         // exact scan in `search.rs` already precomputes a WAL map). `&str` keys

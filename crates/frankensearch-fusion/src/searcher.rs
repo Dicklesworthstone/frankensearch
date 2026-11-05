@@ -517,6 +517,9 @@ pub struct TwoTierSearcher {
 /// re-fused against blended vector scores without a second lexical query
 /// (sync-searcher parity, bd-tm83).
 struct RefinementPools {
+    /// Requested semantic pool size, retained even when fast retrieval has
+    /// no signal or exclusions remove candidates from that pool.
+    semantic_budget: usize,
     /// Semantic pool after calibration, exclusion filtering, and pool
     /// corrections — exactly what Phase-1 fusion consumed.
     fast_hits: Vec<VectorHit>,
@@ -539,6 +542,14 @@ enum QualityPool {
     Retrieved(Vec<VectorHit>),
     /// Quality scores aligned positionally to the fast pool.
     RescoredFastPool(Vec<Option<f32>>),
+}
+
+/// A valid quality response may carry no signal. Keep that outcome distinct
+/// from successful refinement so it cannot publish Refined, train a success
+/// gate, or start reranking the unchanged Initial results.
+enum Phase2Outcome {
+    Refined(Vec<ScoredResult>),
+    SkippedZeroSignal,
 }
 
 /// Phase-1 fused results plus the refinement pools when refinement is
@@ -1413,10 +1424,20 @@ impl TwoTierSearcher {
         self.export_search_metrics(query_class, &metrics, display_hits.len(), false);
 
         // Phase 2: Quality refinement (optional).
-        // Runs even if Phase 1 was lexical-only (fast_score is None), effectively
-        // performing a "lexical -> quality rerank" flow.  Skipped when fast
-        // embedding failed entirely (phase1_vectors_searched == 0) because the
-        // embedding pipeline is degraded and quality refinement would be unreliable.
+        // Independent quality retrieval can answer a successful but empty fast
+        // phase. Retained pools distinguish that case from failed embedding or
+        // a policy short circuit; a work counter cannot make that distinction.
+        // An unidentified legacy tier still needs candidates to rescore.
+        let independent_quality = match admission {
+            SemanticAdmission::OwnerBacked { quality } => quality,
+            SemanticAdmission::LegacyUnidentified => self
+                .index
+                .quality_embedder_revision()
+                .is_some_and(|revision| !revision.is_empty()),
+        };
+        let has_quality_work = refinement_pools.is_some()
+            && (independent_quality
+                || (!initial_hits.is_empty() && metrics.phase1_vectors_searched > 0));
         let quality_circuit_open = if self.should_run_quality()
             && let Some(circuit_breaker) = self.circuit_breaker.as_ref()
         {
@@ -1431,8 +1452,7 @@ impl TwoTierSearcher {
         if self.should_run_quality()
             && !quality_circuit_open
             && !quality_phase_gate_skip
-            && !initial_hits.is_empty()
-            && metrics.phase1_vectors_searched > 0
+            && has_quality_work
         {
             let phase2_start = Instant::now();
             metrics.quality_embedder_id = self.quality_embedder.as_ref().map(|e| e.id().to_owned());
@@ -1513,7 +1533,13 @@ impl TwoTierSearcher {
                     });
                 }
                 Ok(phase2_outcome) => match phase2_outcome {
-                    Ok(refined_results) => {
+                    Ok(Phase2Outcome::SkippedZeroSignal) => {
+                        let phase2_latency = phase2_start.elapsed();
+                        metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
+                        metrics.skip_reason = Some("quality_query_zero_norm".to_owned());
+                        self.maybe_record_quality_completion(phase2_latency, None);
+                    }
+                    Ok(Phase2Outcome::Refined(refined_results)) => {
                         if let Err(cancellation) = cancellation_checkpoint(cx, "phase2_to_refined")
                         {
                             let (phase, reason) = match cancellation {
@@ -1541,14 +1567,7 @@ impl TwoTierSearcher {
                             &refined_results,
                             query_class,
                         );
-                        if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
-                            let outcome = QualityOutcome::Success {
-                                latency_ms: u64::try_from(phase2_latency.as_millis())
-                                    .unwrap_or(u64::MAX),
-                                tau_improvement: metrics.kendall_tau.unwrap_or(0.0),
-                            };
-                            let _ = circuit_breaker.record_outcome(&outcome);
-                        }
+                        self.maybe_record_quality_completion(phase2_latency, metrics.kendall_tau);
                         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                             let refined_event_id = self.emit_search_telemetry(
                                 semantic_query,
@@ -2153,13 +2172,17 @@ impl TwoTierSearcher {
                 // (bd-tqhc). The default path classifies inline (and drives
                 // the index's once-per-transition availability logging); an
                 // explicit `search_params` override keeps its exact scan
-                // configuration and classifies lazily, only when the result
-                // comes back empty.
+                // configuration. Zero queries use the classified dimension
+                // check before any backend can manufacture tied zero scores.
                 let search_start = Instant::now();
+                let zero_fast_query = query_vec.iter().all(|&value| value == 0.0);
                 let (mut fast_hits, index_zero_signal) =
                     match (self.search_params, native_embeddings.as_ref()) {
-                        (None, Some(_)) if query_vec.iter().all(|&value| value == 0.0) => {
-                            (Vec::new(), Some(ZeroSignalReason::ZeroNormQuery))
+                        _ if zero_fast_query => {
+                            let classified = self
+                                .index
+                                .search_fast_classified(&query_vec, semantic_budget)?;
+                            (classified.hits, classified.zero_signal)
                         }
                         (None, Some(embeddings)) => {
                             let hits = self
@@ -2243,7 +2266,11 @@ impl TwoTierSearcher {
                     fast_hits.len(),
                     is_shipped_hash_embedder(self.fast_embedder.as_ref()),
                 );
-                metrics.phase1_vectors_searched = self.index.doc_count();
+                metrics.phase1_vectors_searched = if zero_fast_query {
+                    0
+                } else {
+                    self.index.doc_count()
+                };
                 metrics.zero_signal = if fast_hits.is_empty() {
                     if prefilter_empty {
                         // The index itself produced nothing; carry its typed
@@ -2396,6 +2423,7 @@ impl TwoTierSearcher {
                 Ok(Phase1Outcome {
                     results,
                     pools: Some(RefinementPools {
+                        semantic_budget,
                         fast_hits,
                         lexical: lexical_results,
                     }),
@@ -2489,7 +2517,7 @@ impl TwoTierSearcher {
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
         parent_event_id: Option<String>,
-    ) -> SearchResult<Vec<ScoredResult>> {
+    ) -> SearchResult<Phase2Outcome> {
         let quality_embedder =
             self.quality_embedder
                 .as_ref()
@@ -2557,6 +2585,16 @@ impl TwoTierSearcher {
             let embeddings = TieredQueryEmbeddings::quality_only(bound);
             self.index.activate_owner_backed_search(cx, &embeddings)?;
             cancellation_checkpoint(cx, "quality_activation_to_prf")?;
+        }
+
+        if quality_vec.iter().all(|&value| value == 0.0) {
+            // Keep the legacy index's dimension check even when its embedder
+            // has no identity. An empty pool validates width without scoring
+            // any vector. Identity and cancellation above still take priority
+            // over this no-signal outcome, including a foreign zero response.
+            self.index.quality_scores_for_hits(&quality_vec, &[])?;
+            cancellation_checkpoint(cx, "quality_zero_signal_to_skip")?;
+            return Ok(Phase2Outcome::SkippedZeroSignal);
         }
 
         if self.prf_config.should_expand(&query_class) {
@@ -2653,7 +2691,9 @@ impl TwoTierSearcher {
         // `ActivatedTierSearch::search_fast` reproduces none of that. Union
         // here therefore means "phase 1's real fast pool ∪ the quality owner's
         // own top-k", which is strictly more than either arm alone.
-        let quality_budget = fast_hits.len().max(k);
+        let quality_budget = pools
+            .map_or(fast_hits.len(), |pools| pools.semantic_budget)
+            .max(k);
         cancellation_checkpoint(cx, "fast_pool_to_quality_search")?;
         let mut quality_coverage = None;
         let quality_pool = match admission {
@@ -2811,6 +2851,9 @@ impl TwoTierSearcher {
             .filter(|hit| !quality_scores_by_doc.contains_key(hit.doc_id.as_str()))
             .count();
         metrics.phase2_vectors_searched = quality_scores_by_doc.len();
+        if !quality_scores_by_doc.is_empty() {
+            metrics.zero_signal = None;
+        }
 
         cancellation_checkpoint(cx, "quality_evidence_to_blend")?;
 
@@ -2858,8 +2901,10 @@ impl TwoTierSearcher {
         let tau = kendall_tau_with_refined_rank(&fast_hits, &refined_rank);
         metrics.kendall_tau = tau;
         metrics.rank_changes = rank_changes;
-        if let Some(adaptive_fusion) = self.adaptive_fusion.as_ref() {
-            let success = tau.is_some_and(|value| value < 0.98);
+        if let Some(adaptive_fusion) = self.adaptive_fusion.as_ref()
+            && let Some(tau) = tau
+        {
+            let success = tau < 0.98;
             let signal = if success {
                 SignalSource::Click
             } else {
@@ -3064,7 +3109,7 @@ impl TwoTierSearcher {
             if let Some(coverage) = completed_coverage {
                 metrics.coverage = Some(coverage);
             }
-            return Ok(results);
+            return Ok(Phase2Outcome::Refined(results));
         }
 
         cancellation_checkpoint(cx, "quality_result_preparation_to_construction")?;
@@ -3114,7 +3159,7 @@ impl TwoTierSearcher {
         if let Some(coverage) = completed_coverage {
             metrics.coverage = Some(coverage);
         }
-        Ok(results)
+        Ok(Phase2Outcome::Refined(results))
     }
 
     /// Load one complete MMR candidate pool from a single embedding space.
@@ -3347,6 +3392,27 @@ impl TwoTierSearcher {
         }
     }
 
+    fn maybe_record_quality_completion(&self, latency: Duration, tau: Option<f64>) {
+        let Some(circuit_breaker) = self.circuit_breaker.as_ref() else {
+            return;
+        };
+        let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+        // Quality-only retrieval has no fast ranking to compare. Missing
+        // evidence is neither a usefulness failure nor a recovery success,
+        // while measured slow responses still count against the breaker.
+        let outcome = if latency_ms > circuit_breaker.config().latency_threshold_ms {
+            Some(QualityOutcome::Slow { latency_ms })
+        } else {
+            tau.map(|tau_improvement| QualityOutcome::Success {
+                latency_ms,
+                tau_improvement,
+            })
+        };
+        if let Some(outcome) = outcome {
+            let _ = circuit_breaker.record_outcome(&outcome);
+        }
+    }
+
     fn maybe_record_phase_gate_observation(
         &self,
         initial_results: &[ScoredResult],
@@ -3445,6 +3511,9 @@ impl TwoTierSearcher {
 
     #[allow(clippy::cast_possible_truncation)]
     fn maybe_update_adaptive_conformal(&self, tau: Option<f64>) {
+        let Some(tau) = tau else {
+            return;
+        };
         let Some(calibration) = self.conformal_calibration.as_ref() else {
             return;
         };
@@ -3452,10 +3521,8 @@ impl TwoTierSearcher {
             return;
         };
 
-        let observed_error_rate = tau.map_or(0.5_f32, |value| {
-            let normalized = value.midpoint(1.0).clamp(0.0, 1.0);
-            (1.0 - normalized) as f32
-        });
+        let normalized = tau.midpoint(1.0).clamp(0.0, 1.0);
+        let observed_error_rate = (1.0 - normalized) as f32;
 
         let mut state = state_lock
             .lock()
@@ -4332,7 +4399,8 @@ mod tests {
     use std::task::{Context, Poll, Wake, Waker};
 
     use frankensearch_core::generation::{
-        ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+        ArtifactGenerationIdentityV1, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
+        EmbeddingSpaceKindV1, QuantizationFormat,
     };
     use frankensearch_core::traits::{
         IdentityBoundEmbedding, MetricsExporter, ModelCategory, SearchFuture,
@@ -5893,6 +5961,21 @@ mod tests {
         )
     }
 
+    fn query_admission_identity(model: &str, dimension: u32) -> EmbeddingIdentityBundleV1 {
+        let mut identity = in_memory_identity(model, dimension);
+        identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+        identity.space.hash_control = None;
+        identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+        identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+            role: "weights".to_owned(),
+            sha256: "b".repeat(64),
+            size: 1,
+        }];
+        identity.producer.space_fingerprint = identity.space.fingerprint();
+        identity.validate().expect("semantic query identity");
+        identity
+    }
+
     /// Reopen each production layout with independent 4D fast and 6D quality
     /// spaces. The quality-only document cannot be discovered by fast rescoring.
     fn query_admission_index(layout: &str) -> (OwnerBackedDir, Arc<TwoTierIndex>) {
@@ -5909,10 +5992,10 @@ mod tests {
         if layout == "stamped-v1" {
             let mut writer = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
             writer
-                .set_fast_identity(&in_memory_identity("response-fast", 4))
+                .set_fast_identity(&query_admission_identity("response-fast", 4))
                 .unwrap();
             writer
-                .set_quality_identity(&in_memory_identity("response-quality", 6))
+                .set_quality_identity(&query_admission_identity("response-quality", 6))
                 .unwrap();
             for (id, vector) in fast_rows {
                 writer.add_fast_record(*id, vector).unwrap();
@@ -5926,8 +6009,19 @@ mod tests {
             assert!(!index.fast_embedder_revision().is_empty());
             return (dir, Arc::new(index));
         }
-        let fast_binding = artifact_binding("response-fast", 4, 79);
-        let quality_binding = artifact_binding("response-quality", 6, 79);
+        let binding = |model, dimension| {
+            let mut identity = query_admission_identity(model, dimension);
+            "fsvi-v2".clone_into(&mut identity.storage.format);
+            identity.storage.quantization = QuantizationFormat::F16;
+            "little-endian".clone_into(&mut identity.storage.endianness);
+            FsviV2IdentityBinding::new(
+                ArtifactGenerationIdentityV1::new(79, [0x5c; 16]).unwrap(),
+                identity.freeze().unwrap(),
+            )
+            .expect("valid query admission binding")
+        };
+        let fast_binding = binding("response-fast", 4);
+        let quality_binding = binding("response-quality", 6);
         let fast_path = dir.join("vector.fast.idx");
         let quality_path = dir.join("vector.quality.idx");
         write_v2_tier(&fast_path, &fast_binding, fast_rows);
@@ -5955,15 +6049,341 @@ mod tests {
         if tier == "fast" {
             IdentityCountingEmbedder::new(
                 "fast",
-                in_memory_identity("response-fast", 4),
+                query_admission_identity("response-fast", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             )
         } else {
             IdentityCountingEmbedder::new(
                 "quality",
-                in_memory_identity("response-quality", 6),
+                query_admission_identity("response-quality", 6),
                 vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             )
+        }
+    }
+
+    #[test]
+    fn zero_quality_response_preserves_initial_before_prf_and_reranking() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_index_dir, index) = query_admission_index(layout);
+                for prf_enabled in [false, true] {
+                    for zero_fast in [false, true] {
+                        let mut fast = query_admission_embedder("fast");
+                        if zero_fast {
+                            fast.bound_response_values = Some(vec![0.0; 4]);
+                        }
+                        let quality = Arc::new(
+                            query_admission_embedder("quality")
+                                .with_bound_response_values(vec![0.0; 6]),
+                        );
+                        let searcher = TwoTierSearcher::new(
+                            Arc::clone(&index),
+                            Arc::new(fast),
+                            TwoTierConfig::default(),
+                        )
+                        .with_quality_embedder(quality.clone())
+                        .with_prf_config(PrfConfig {
+                            enabled: prf_enabled,
+                            alpha: 0.5,
+                            top_k_feedback: 1,
+                            min_feedback_docs: 1,
+                            score_weighted: false,
+                        });
+                        #[cfg(feature = "rerank")]
+                        let rerank_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        #[cfg(feature = "rerank")]
+                        let searcher = searcher
+                            .with_reranker(Arc::new(CountingReranker::new(rerank_calls.clone())));
+                        let mut phases = Vec::new();
+                        let metrics = searcher
+                            .search(
+                                &cx,
+                                "find the quality document beyond the fast pool",
+                                2,
+                                |_| Some("document text for reranking".to_owned()),
+                                |phase| match phase {
+                                    SearchPhase::Initial { results, .. } => {
+                                        assert_eq!(results.is_empty(), zero_fast, "{layout}");
+                                        assert!(
+                                            results.iter().all(|hit| hit.quality_score.is_none())
+                                        );
+                                        phases.push("initial");
+                                    }
+                                    phase => panic!("zero quality published {phase:?}"),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(phases, ["initial"]);
+                        assert_eq!(
+                            metrics.skip_reason.as_deref(),
+                            Some("quality_query_zero_norm")
+                        );
+                        assert_eq!(metrics.phase2_vectors_searched, 0);
+                        assert_eq!(metrics.quality_search_ms.to_bits(), 0.0_f64.to_bits());
+                        assert_eq!(metrics.zero_signal.is_some(), zero_fast);
+                        assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
+                        #[cfg(feature = "rerank")]
+                        assert_eq!(rerank_calls.load(Ordering::Relaxed), 0);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn repeated_quality_only_rescue_does_not_train_missing_rank_evidence() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_index_dir, index) = query_admission_index(layout);
+                for exact_override in [false, true] {
+                    let fast = Arc::new(
+                        query_admission_embedder("fast").with_bound_response_values(vec![0.0; 4]),
+                    );
+                    let quality = Arc::new(query_admission_embedder("quality"));
+                    // Isolate usefulness from wall-clock scheduling on loaded
+                    // hosts; retain the default failure and improvement gates.
+                    let breaker = Arc::new(CircuitBreaker::new(
+                        crate::circuit_breaker::CircuitBreakerConfig {
+                            latency_threshold_ms: u64::MAX,
+                            ..crate::circuit_breaker::CircuitBreakerConfig::default()
+                        },
+                    ));
+                    let adaptive = Arc::new(AdaptiveFusion::with_defaults());
+                    let conformal = AdaptiveConformalState::new(0.2, 0.1).unwrap();
+                    let mut searcher =
+                        TwoTierSearcher::new(Arc::clone(&index), fast, TwoTierConfig::default())
+                            .with_quality_embedder(quality)
+                            .with_circuit_breaker(breaker.clone())
+                            .with_adaptive_fusion(adaptive.clone())
+                            .with_conformal_calibration(
+                                ConformalSearchCalibration::calibrate(&[1, 2, 3]).unwrap(),
+                            )
+                            .with_adaptive_conformal_state(conformal)
+                            .with_phase_gate(PhaseGate::with_defaults());
+                    if exact_override {
+                        searcher = searcher.with_search_params(SearchParams {
+                            parallel_enabled: false,
+                            parallel_threshold: usize::MAX,
+                            parallel_chunk_size: 1,
+                        });
+                    }
+                    for _ in 0..breaker.config().failure_threshold + 2 {
+                        let mut phases = Vec::new();
+                        let metrics = searcher
+                            .search(
+                                &cx,
+                                "find the quality document beyond the fast pool",
+                                1,
+                                |_| None,
+                                |phase| match phase {
+                                    SearchPhase::Initial {
+                                        results, metrics, ..
+                                    } => {
+                                        assert!(results.is_empty());
+                                        assert_eq!(metrics.vectors_searched, 0);
+                                        phases.push("initial");
+                                    }
+                                    SearchPhase::Refined { results, .. } => {
+                                        assert_eq!(results.len(), 1, "{layout}");
+                                        assert_eq!(results[0].doc_id, "doc-quality-only");
+                                        assert_eq!(results[0].fast_score, None);
+                                        assert_eq!(results[0].quality_score, Some(1.0));
+                                        assert_eq!(results[0].index, None);
+                                        assert_eq!(results[0].source, ScoreSource::SemanticQuality);
+                                        phases.push("refined");
+                                    }
+                                    phase => panic!("quality rescue published {phase:?}"),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(phases, ["initial", "refined"]);
+                        assert_eq!(metrics.phase1_vectors_searched, 0);
+                        assert!(metrics.phase2_vectors_searched > 0);
+                        assert_eq!(metrics.zero_signal, None);
+                        assert_eq!(metrics.kendall_tau, None);
+                        assert!(metrics.skip_reason.is_none());
+                        assert!(breaker.is_closed());
+                    }
+                    assert_eq!(breaker.metrics().trips, 0);
+                    assert_eq!(adaptive.snapshot().global_blend.n, 0);
+                    assert_eq!(
+                        *searcher
+                            .adaptive_conformal_state
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap(),
+                        conformal
+                    );
+                    assert_eq!(
+                        searcher
+                            .phase_gate
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .observations(),
+                        0
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn missing_rank_evidence_preserves_real_slow_failures() {
+        let (_index_dir, index) = build_test_index(4);
+        let breaker = Arc::new(CircuitBreaker::new(
+            crate::circuit_breaker::CircuitBreakerConfig {
+                failure_threshold: 2,
+                latency_threshold_ms: 10,
+                ..crate::circuit_breaker::CircuitBreakerConfig::default()
+            },
+        ));
+        let searcher = TwoTierSearcher::new(
+            index,
+            Arc::new(StubEmbedder::new("fast", 4)),
+            TwoTierConfig::default(),
+        )
+        .with_circuit_breaker(breaker.clone());
+        searcher.maybe_record_quality_completion(Duration::from_millis(11), None);
+        assert!(breaker.is_closed());
+        for _ in 0..3 {
+            searcher.maybe_record_quality_completion(Duration::ZERO, None);
+            assert!(breaker.is_closed());
+        }
+        // Unmeasurable usefulness must neither invent a new failure nor reset
+        // the measured slow response already awaiting another failure.
+        searcher.maybe_record_quality_completion(Duration::from_millis(11), None);
+        assert!(breaker.is_open());
+        assert_eq!(breaker.metrics().trips, 1);
+    }
+
+    #[test]
+    fn quality_only_rescue_keeps_oversampling_through_exclusions() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_index_dir, index) = query_admission_index(layout);
+                let fast = Arc::new(
+                    query_admission_embedder("fast").with_bound_response_values(vec![0.0; 4]),
+                );
+                let quality = Arc::new(
+                    query_admission_embedder("quality")
+                        .with_bound_response_values(vec![0.0, 0.8, 0.6, 0.0, 0.0, 0.0]),
+                );
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    fast,
+                    TwoTierConfig {
+                        candidate_multiplier: 3,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_quality_embedder(quality);
+                let mut refined = Vec::new();
+                let metrics = searcher
+                    .search(
+                        &cx,
+                        "find a useful quality document -excluded",
+                        1,
+                        |id| {
+                            Some(
+                                if id == "doc-quality-only" {
+                                    "excluded"
+                                } else {
+                                    "retained"
+                                }
+                                .to_owned(),
+                            )
+                        },
+                        |phase| match phase {
+                            SearchPhase::Initial { results, .. } => assert!(results.is_empty()),
+                            SearchPhase::Refined { results, .. } => refined = results,
+                            phase => panic!("quality rescue published {phase:?}"),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    refined.len(),
+                    1,
+                    "{layout}: oversampling must survive an empty fast pool"
+                );
+                assert_eq!(refined[0].doc_id, "doc-a");
+                assert!(refined[0].quality_score.is_some_and(|score| score > 0.5));
+                assert_eq!(metrics.zero_signal, None);
+            }
+        });
+    }
+
+    #[test]
+    fn zero_quality_response_cannot_hide_identity_refusal_or_cancellation() {
+        for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+            for cancel in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (_index_dir, index) = query_admission_index(layout);
+                    let fast = Arc::new(query_admission_embedder("fast"));
+                    let mut quality = query_admission_embedder("quality")
+                        .with_bound_response_values(vec![0.0; 6]);
+                    let mut foreign = quality.identity.clone();
+                    foreign
+                        .producer
+                        .implementation_revision
+                        .push_str("-foreign");
+                    quality.bound_response_identity = Some(foreign);
+                    if cancel {
+                        quality.bound_action = Some(BoundResponseAction::Cancel);
+                    }
+                    let quality = Arc::new(quality);
+                    let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                        .with_quality_embedder(quality.clone())
+                        .with_prf_config(PrfConfig {
+                            enabled: true,
+                            alpha: 0.5,
+                            top_k_feedback: 1,
+                            min_feedback_docs: 1,
+                            score_weighted: false,
+                        });
+                    let mut phases = Vec::new();
+                    let mut refusal = None;
+                    let outcome = searcher
+                        .search(
+                            &cx,
+                            "find the quality document beyond the fast pool",
+                            1,
+                            |_| None,
+                            |phase| match phase {
+                                SearchPhase::Initial { .. } => phases.push("initial"),
+                                SearchPhase::RefinementFailed { error, .. } => {
+                                    refusal = Some(error);
+                                    phases.push("refinement_failed");
+                                }
+                                phase => panic!("invalid zero response published {phase:?}"),
+                            },
+                        )
+                        .await;
+                    if cancel {
+                        assert_eq!(phases, ["initial"]);
+                        assert!(matches!(outcome, Err(SearchError::Cancelled { phase, .. })
+                            if phase == "quality_embed_to_prf"));
+                    } else {
+                        let metrics = outcome.unwrap();
+                        assert_eq!(phases, ["initial", "refinement_failed"]);
+                        assert!(
+                            matches!(refusal, Some(SearchError::InvalidConfig { field, .. })
+                            if field == "search_activation.quality.producer_conformance")
+                        );
+                        assert_eq!(metrics.phase2_vectors_searched, 0);
+                        assert_ne!(
+                            metrics.skip_reason.as_deref(),
+                            Some("quality_query_zero_norm")
+                        );
+                    }
+                    assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
+                });
+            }
         }
     }
 
@@ -7343,7 +7763,9 @@ mod tests {
                 )
                 .unwrap();
             let index = Arc::new(index);
-            for (exact_override, zero_query) in [(false, false), (true, false), (false, true)] {
+            for (exact_override, zero_query) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let fast = Arc::new(IdentityCountingEmbedder::new(
                     "fast",
                     in_memory_identity("native-fast-override", 4),
@@ -7365,6 +7787,7 @@ mod tests {
                 let (hits, metrics) = searcher.search_collect(&cx, "query", 1).await.unwrap();
                 if zero_query {
                     assert!(hits.is_empty());
+                    assert_eq!(metrics.phase1_vectors_searched, 0);
                     assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
                     assert!(metrics.coverage.is_none());
                 } else {
@@ -7756,19 +8179,96 @@ mod tests {
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_index_dir, index) = build_test_index(4);
-            let embedder = Arc::new(ZeroEmbedder { dimension: 4 });
-            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+            for exact_override in [false, true] {
+                for dimension in [4, 3] {
+                    let embedder = Arc::new(ZeroEmbedder { dimension });
+                    let mut searcher = TwoTierSearcher::new(
+                        Arc::clone(&index),
+                        embedder,
+                        TwoTierConfig::default(),
+                    );
+                    if exact_override {
+                        searcher = searcher.with_search_params(SearchParams {
+                            parallel_enabled: false,
+                            parallel_threshold: usize::MAX,
+                            parallel_chunk_size: 1,
+                        });
+                    }
+                    let mut phases = Vec::new();
+                    let outcome = searcher
+                        .search(
+                            &cx,
+                            "test",
+                            5,
+                            |_| None,
+                            |phase| match phase {
+                                SearchPhase::Initial { results, .. } => {
+                                    assert!(results.is_empty());
+                                    phases.push("initial");
+                                }
+                                phase => panic!("zero fast response published {phase:?}"),
+                            },
+                        )
+                        .await;
+                    if dimension == 3 {
+                        assert!(phases.is_empty());
+                        assert!(matches!(
+                            outcome,
+                            Err(SearchError::DimensionMismatch {
+                                expected: 4,
+                                found: 3,
+                            })
+                        ));
+                    } else {
+                        let metrics = outcome.unwrap();
+                        assert_eq!(phases, ["initial"]);
+                        assert_eq!(metrics.semantic_candidates, 0);
+                        assert_eq!(metrics.phase1_vectors_searched, 0);
+                        assert_eq!(
+                            metrics.zero_signal,
+                            Some(ZeroSignalReason::ZeroNormQuery),
+                            "an empty semantic lane must say why, not just return nothing"
+                        );
+                    }
+                }
+            }
 
+            let (_quality_dir, quality_index) = build_test_index_with_quality(4);
+            let searcher = TwoTierSearcher::new(
+                quality_index,
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::new(ZeroEmbedder { dimension: 3 }));
+            let mut phases = Vec::new();
             let metrics = searcher
-                .search(&cx, "test", 5, |_| None, |_| {})
+                .search(
+                    &cx,
+                    "find a document with quality refinement",
+                    2,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => phases.push("initial"),
+                        SearchPhase::RefinementFailed { error, .. } => {
+                            assert!(matches!(
+                                error,
+                                SearchError::DimensionMismatch {
+                                    expected: 4,
+                                    found: 3,
+                                }
+                            ));
+                            phases.push("refinement_failed");
+                        }
+                        phase => panic!("wrong-width zero quality published {phase:?}"),
+                    },
+                )
                 .await
                 .unwrap();
-
-            assert_eq!(metrics.semantic_candidates, 0);
-            assert_eq!(
-                metrics.zero_signal,
-                Some(ZeroSignalReason::ZeroNormQuery),
-                "an empty semantic lane must say why, not just return nothing"
+            assert_eq!(phases, ["initial", "refinement_failed"]);
+            assert_eq!(metrics.phase2_vectors_searched, 0);
+            assert_ne!(
+                metrics.skip_reason.as_deref(),
+                Some("quality_query_zero_norm")
             );
         });
     }
