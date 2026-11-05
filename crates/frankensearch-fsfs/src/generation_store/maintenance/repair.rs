@@ -177,6 +177,7 @@ impl CompleteGenerationStore {
             store: self.clone(),
             target,
             expected_selection,
+            allow_genesis: false,
         })
     }
 }
