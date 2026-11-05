@@ -543,7 +543,11 @@ impl GenerationBuild {
         checkpoint(cx)?;
         self.lease
             .fence("complete-generation pointer publication")?;
-        if read_pointer(&self.store.root)? != self.predecessor {
+        // Ordinary builds admitted their predecessor at begin; recovery builds
+        // deliberately captured malformed selection bytes without adopting its
+        // artifacts. Both must compare the exact bounded evidence here, rather
+        // than re-decoding the damage an independent recovery is replacing.
+        if maintenance::selection_evidence(&self.store.root)? != self.predecessor {
             return Err(invalid(
                 &self.store.root,
                 "selected predecessor changed during rebuild",

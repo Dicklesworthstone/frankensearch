@@ -529,7 +529,7 @@ fn restore_selection_sha256(
     ContentHasher::to_hex(&sha256)
 }
 
-fn selection_evidence(root: &Path) -> SearchResult<Option<Vec<u8>>> {
+pub(super) fn selection_evidence(root: &Path) -> SearchResult<Option<Vec<u8>>> {
     let path = root.join(COMPLETE_GENERATION_POINTER);
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),

@@ -268,6 +268,108 @@ fn recovery_rebuild_binds_malformed_selection_and_refuses_shared_artifacts() {
 }
 
 #[test]
+fn recovery_rebuild_publishes_directly_over_malformed_selection_evidence() {
+    run_test_with_cx(|cx| async move {
+        let malformed: [&[u8]; 3] = [b"damaged selection", b"", &[0xff, 0xfe, 0x00, 0x80]];
+        for evidence in malformed {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let old = published(&store, &cx, b"old retained contents");
+            fs::write(root.path().join(COMPLETE_GENERATION_POINTER), evidence).unwrap();
+            assert!(store.begin(&cx).is_err());
+            assert!(store.active(&cx).is_err());
+
+            let build = store.begin_recovery_rebuild(&cx).unwrap();
+            let candidate_path = build.path().to_path_buf();
+            fs::create_dir(candidate_path.join("lexical")).unwrap();
+            for name in ["lexical/MANIFEST", "vector.idx", "content.txt"] {
+                fs::write(candidate_path.join(name), b"independently rebuilt").unwrap();
+            }
+            let validated = std::cell::Cell::new(false);
+            let recovered = durable(
+                build
+                    .publish(&cx, |_, path| {
+                        assert_eq!(
+                            fs::read(path.join("content.txt"))?,
+                            b"independently rebuilt"
+                        );
+                        validated.set(true);
+                        Ok(())
+                    })
+                    .unwrap(),
+            );
+            assert!(validated.get());
+            assert_eq!(recovered.path(), candidate_path);
+            assert_ne!(recovered.id(), old.id());
+            let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
+            assert_eq!(reopened.active(&cx).unwrap(), Some(recovered));
+            assert_eq!(
+                fs::read(old.path().join("content.txt")).unwrap(),
+                b"old retained contents"
+            );
+            // Repairing selection cannot turn unknown earlier activations into
+            // a proven empty history or authorize automatic deletion of them.
+            assert!(reopened.collect_retained(&cx, 0).is_err());
+            assert!(old.path().is_dir());
+        }
+    });
+}
+
+#[test]
+fn direct_recovery_publication_refuses_changed_evidence_and_precommit_cancellation() {
+    run_test_with_cx(|cx| async move {
+        for cancel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let old = published(&store, &cx, b"old retained contents");
+            let selection = root.path().join(COMPLETE_GENERATION_POINTER);
+            let original = b"original malformed selection";
+            let replacement = b"newer malformed selection";
+            fs::write(&selection, original).unwrap();
+            let build = store.begin_recovery_rebuild(&cx).unwrap();
+            let candidate_path = build.path().to_path_buf();
+            fs::write(candidate_path.join("content.txt"), b"rebuilt candidate").unwrap();
+            let result = build.publish_with_precommit(
+                &cx,
+                |_, _| Ok(()),
+                |cx| {
+                    // Fault injection after sealing and staging, immediately
+                    // before the final cancellation/lease/selection checks.
+                    if cancel {
+                        cx.set_cancel_requested(true);
+                    } else {
+                        fs::write(&selection, replacement)?;
+                    }
+                    Ok(())
+                },
+            );
+            if cancel {
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                cx.set_cancel_requested(false);
+                assert_eq!(pointer(&store), original);
+            } else {
+                assert!(matches!(result,
+                    Err(SearchError::IndexCorrupted { detail, .. })
+                        if detail == "selected predecessor changed during rebuild"));
+                assert_eq!(pointer(&store), replacement);
+            }
+            assert_eq!(
+                fs::read(old.path().join("content.txt")).unwrap(),
+                b"old retained contents"
+            );
+            assert_eq!(
+                fs::read(candidate_path.join("content.txt")).unwrap(),
+                b"rebuilt candidate"
+            );
+            assert!(candidate_path.join(COMPLETE_GENERATION_MANIFEST).is_file());
+            // Refusal releases publication ownership without deleting either
+            // the old bundle or the sealed, unselected recovery candidate.
+            drop(store.begin_recovery_rebuild(&cx).unwrap());
+        }
+    });
+}
+
+#[test]
 fn recovery_rebuild_refuses_unsafe_and_oversized_selection_evidence() {
     run_test_with_cx(|cx| async move {
         let root = tempfile::tempdir().unwrap();
