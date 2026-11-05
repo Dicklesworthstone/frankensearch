@@ -139,6 +139,7 @@ This excludes --input and --source-low/high. --max-source-bytes bounds retained\
 source for this mode and updates, defaulting to 256 MiB of raw stored source bytes.\n\
 The existing 100000-document and 16 MiB encoded-record limits still apply.\n\
 Rebuild inherits each tier's admitted retrieval policy, HNSW parameters and seed.\n\
+Retained-source rebuilds preserve each tier's persisted F16 or F32 precision.\n\
 An explicit --retrieval selects exact or default HNSW for every stored tier.\n\
 Concurrent publication refuses the captured old selection; retry explicitly\n\
 from the winning receipt. Rebuild never edits the old generation's images.\n\
@@ -1938,12 +1939,12 @@ fn rebuild_identity(
             "the rebuild provider dimension disagrees with its complete identity",
         ));
     }
-    // Retained migrations preserve each tier's persisted precision, including
+    // Retained rebuilds preserve each tier's persisted precision, including
     // generations written through the library with F16. Fresh input rebuilds
     // use the CLI's F32 encoding. The provider's raw storage label does not
     // determine whether its mathematical/producer/input identity can be reused.
     "fsvi-v2".clone_into(&mut identity.storage.format);
-    identity.storage.quantization = if retained_source && migrate_model {
+    identity.storage.quantization = if retained_source {
         expected.identity.storage.quantization
     } else {
         QuantizationFormat::F32
@@ -2125,13 +2126,13 @@ where
             NativeIndexBuilder::new(&work_path, generation, Arc::clone(&loaded.fast))?
                 .with_batch_size(options.batch_size)?
                 .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-                .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+                .with_fast_storage(rebuild_precision(&expected_identity)?, retrieval)
                 .add_documents(documents);
-        if let Some(quality) = &loaded.quality {
+        if let (Some(quality), Some(identity)) = (&loaded.quality, &expected_quality) {
             builder = builder
                 .with_quality_embedder(Arc::clone(quality))?
                 .with_quality_storage(
-                    NativeBuildPrecision::F32,
+                    rebuild_precision(identity)?,
                     quality_retrieval.ok_or_else(|| {
                         bad("the full generation has no quality retrieval policy")
                     })?,

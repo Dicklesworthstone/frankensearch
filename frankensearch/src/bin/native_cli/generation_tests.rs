@@ -1080,6 +1080,52 @@ fn rebuild_requires_explicit_producer_migration_before_any_inference() {
 }
 
 #[test]
+fn retained_rebuild_admits_the_same_producer_without_relabeling_its_persisted_precision() {
+    for quantization in [QuantizationFormat::F16, QuantizationFormat::F32] {
+        let mut persisted = identity().identity.clone();
+        persisted.storage.quantization = quantization;
+        let expected = persisted.freeze().unwrap();
+        let mut provider = Provider {
+            identity: provider_identity(),
+            calls: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            rebuild_identity(&expected, &provider, false, true).unwrap(),
+            expected,
+        );
+        assert_eq!(
+            rebuild_identity(&expected, &provider, true, true).unwrap(),
+            expected,
+        );
+        // Fresh JSONL remains F32 and still requires explicit consent when
+        // that complete persisted identity differs from the selected one.
+        assert_eq!(
+            rebuild_identity(&expected, &provider, true, false)
+                .unwrap()
+                .identity
+                .storage
+                .quantization,
+            QuantizationFormat::F32,
+        );
+        assert_eq!(
+            rebuild_identity(&expected, &provider, false, false).is_ok(),
+            quantization == QuantizationFormat::F32,
+        );
+        provider
+            .identity
+            .producer
+            .implementation_revision
+            .push_str("-foreign");
+        assert!(rebuild_identity(&expected, &provider, false, true).is_err());
+        let migrated = rebuild_identity(&expected, &provider, true, true).unwrap();
+        assert_eq!(migrated.identity.storage.quantization, quantization);
+        assert_ne!(migrated.identity.producer, expected.identity.producer);
+        assert_eq!(migrated.identity.input, expected.identity.input);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
 fn retained_rebuild_migrates_producers_and_spaces_without_relabeling_prepared_input() {
     let expected = identity();
     let mut provider = Provider {
@@ -7531,6 +7577,204 @@ mod progressive_authority {
             NativeBuildRetrieval::Exact => None,
             NativeBuildRetrieval::Hnsw { params, seed } => Some((params, seed)),
         }
+    }
+
+    #[test]
+    fn retained_rebuild_preserves_independent_tier_precision_and_retrieval_without_migration() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use NativeBuildPrecision::{F16, F32};
+            for (mode, primary_precision, quality_precision, primary_ann) in [
+                (QueryMode::Fast, F16, None, false),
+                (QueryMode::Quality, F16, None, true),
+                (QueryMode::Full, F16, Some(F32), true),
+                (QueryMode::Full, F32, Some(F16), false),
+            ] {
+                let parent = private_parent();
+                let root_path = parent.join("root");
+                let root = create_root(&root_path).expect("qualified Linux root required");
+                let fast = provider(false);
+                let quality = provider(true);
+                let loaded = topology_models(mode, &fast, &quality);
+                let ann = NativeBuildRetrieval::Hnsw {
+                    params: HnswParams {
+                        m: 4,
+                        m0: 8,
+                        ef_construction: 24,
+                        ef_search: 12,
+                    },
+                    seed: 671,
+                };
+                let primary_retrieval = if primary_ann {
+                    ann
+                } else {
+                    NativeBuildRetrieval::Exact
+                };
+                let quality_retrieval = quality_precision.map(|_| {
+                    if primary_ann {
+                        NativeBuildRetrieval::Exact
+                    } else {
+                        ann
+                    }
+                });
+                let tier = if mode == QueryMode::Quality {
+                    EmbedderTierTag::Quality
+                } else {
+                    EmbedderTierTag::Fast
+                };
+                let documents = [
+                    IndexableDocument::new("retry", "retry network requests\nretain exact source")
+                        .with_title("Retained title λ")
+                        .with_metadata("version", "unchanged"),
+                    IndexableDocument::new("garden", "garden flowers"),
+                ];
+                let mut builder = NativeIndexBuilder::new(
+                    parent.join("first-work"),
+                    new_generation(1).unwrap(),
+                    Arc::clone(&loaded.fast),
+                )
+                .unwrap()
+                .with_fast_storage(primary_precision, primary_retrieval)
+                .add_documents(documents);
+                if let Some(precision) = quality_precision {
+                    builder = builder
+                        .with_quality_embedder(loaded.quality.clone().unwrap())
+                        .unwrap()
+                        .with_quality_storage(precision, quality_retrieval.unwrap())
+                        .unwrap();
+                }
+                let cut = CommitRange { low: 2, high: 7 };
+                let built = if mode == QueryMode::Full {
+                    builder
+                        .build_progressive_generation(&cx, cut.clone(), DEFAULT_IMAGE_BYTES)
+                        .await
+                        .unwrap()
+                } else {
+                    builder
+                        .build_exact_generation(&cx, tier, cut.clone(), DEFAULT_IMAGE_BYTES)
+                        .await
+                        .unwrap()
+                };
+                let first_path = parent.join("first.json");
+                let published = stage_and_publish(
+                    &cx,
+                    &root,
+                    &root_path,
+                    &first_path,
+                    &built,
+                    None,
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                )
+                .unwrap();
+                let selected = published.receipt;
+                let retained = published.snapshot;
+                let source =
+                    serde_json::to_value(retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
+                        .unwrap();
+                fs::rename(
+                    parent.join("first-work"),
+                    parent.join("unavailable-first-work"),
+                )
+                .unwrap();
+                let mut options = parse(&retained_rebuild_arguments()).unwrap().unwrap();
+                options.from_receipt = Some(first_path);
+                options.work = Some(parent.join("retained-work"));
+                options.receipt = parent.join("retained.json");
+                assert!(!options.migrate_model);
+                let before = calls(&fast, &quality);
+                let mut output = Vec::new();
+                rebuild_with_loader(&cx, &options, &mut output, |requested| {
+                    assert_eq!(requested, mode);
+                    Ok(topology_models(mode, &fast, &quality))
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    calls(&fast, &quality),
+                    (
+                        before.0 + if mode == QueryMode::Quality { 0 } else { 2 },
+                        before.1 + if mode == QueryMode::Fast { 0 } else { 2 },
+                    )
+                );
+                let rebuilt = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(rebuilt.identity, selected.identity);
+                assert_eq!(rebuilt.quality_identity, selected.quality_identity);
+                assert_eq!(
+                    rebuilt.generation.sequence,
+                    selected.generation.sequence + 1
+                );
+                let reader = rebuilt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(reader.topology(), retained.topology());
+                assert_eq!(reader.metadata().commit_range, cut);
+                assert_eq!(reader.retrieval_configuration(), primary_retrieval);
+                assert_eq!(reader.quality_retrieval_configuration(), quality_retrieval);
+                assert_eq!(
+                    serde_json::to_value(reader.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
+                        .unwrap(),
+                    source
+                );
+                assert_eq!(frames(&output)[0]["model_migrated"], false);
+                let mut delivered = 0;
+                query_admitted(&cx, &reader, None, &loaded, plan(mode, false), |_, hits| {
+                    assert!(hits.iter().any(|hit| hit.doc_id == "retry"));
+                    delivered += 1;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+                assert_eq!(delivered, 1);
+                assert_eq!(retained.authority(), selected.authority().unwrap());
+
+                if quality_precision == Some(F16) {
+                    // The same producers on a fresh input path still select
+                    // F32 independently for both tiers. Conversion is explicit.
+                    let input = parent.join("fresh.jsonl");
+                    let mut bytes = Vec::new();
+                    for document in reader.source_documents(&cx, MAX_INPUT_BYTES).unwrap() {
+                        bytes.extend(encode(&document, MAX_RECORD_BYTES).unwrap());
+                    }
+                    fs::write(&input, bytes).unwrap();
+                    let mut fresh = parse(&rebuild_arguments()).unwrap().unwrap();
+                    fresh.from_receipt = Some(options.receipt.clone());
+                    fresh.work = Some(parent.join("fresh-work"));
+                    fresh.receipt = parent.join("fresh.json");
+                    fresh.input = Some(input);
+                    fresh.source_low = Some(cut.low);
+                    fresh.source_high = Some(cut.high);
+                    let before = calls(&fast, &quality);
+                    assert!(
+                        rebuild_with_loader(&cx, &fresh, &mut Vec::new(), |_| {
+                            Ok(topology_models(mode, &fast, &quality))
+                        })
+                        .await
+                        .is_err()
+                    );
+                    assert_eq!(calls(&fast, &quality), before);
+                    assert!(!fresh.work.as_ref().unwrap().exists());
+                    fresh.migrate_model = true;
+                    rebuild_with_loader(&cx, &fresh, &mut Vec::new(), |_| {
+                        Ok(topology_models(mode, &fast, &quality))
+                    })
+                    .await
+                    .unwrap();
+                    let converted = Receipt::read(&fresh.receipt).unwrap();
+                    assert_eq!(
+                        converted.identity.identity.storage.quantization,
+                        QuantizationFormat::F32
+                    );
+                    assert_eq!(
+                        converted
+                            .quality_identity
+                            .as_ref()
+                            .unwrap()
+                            .identity
+                            .storage
+                            .quantization,
+                        QuantizationFormat::F32
+                    );
+                    converted.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                }
+            }
+        });
     }
 
     fn empty_lifecycle_index_options(
