@@ -1232,7 +1232,7 @@ fn create_root(path: &Path) -> Result<QualifiedGenerationRoot> {
     admit_root(path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn write_immutable(cx: &Cx, path: &Path, bytes: &[u8]) -> Result<()> {
     checkpoint(cx)?;
     let mut file = create_file(path, 0o400)?;
@@ -3239,7 +3239,7 @@ impl AuthoritySession {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn with_filter(
         mut self,
         cx: &Cx,

@@ -2616,7 +2616,10 @@ fn run_local_perf_command_inner(
     let qg1_run_log = (config.gate == PerfGate::Qg1)
         .then(|| run_log.try_clone())
         .transpose()?;
+    #[cfg(target_os = "linux")]
     let mut descendant_scope = LocalPerfDescendantScope::enter()?;
+    #[cfg(not(target_os = "linux"))]
+    let mut descendant_scope = LocalPerfDescendantScope {};
     let mut child = Command::new(descriptor_path(&captured_build.executable)?);
     child
         .arg0(&captured_build.command[0])
@@ -2650,6 +2653,7 @@ fn run_local_perf_command_inner(
             (child, root_process_identity)
         }
         Err(error) => {
+            #[cfg(target_os = "linux")]
             descendant_scope.restore()?;
             let run_log_synced = run_log_sync.sync_all().is_ok();
             let run_log_bytes = read_file_at(&run_directories.run.handle, "run.log").ok();
@@ -2801,11 +2805,16 @@ fn run_local_perf_command_inner(
             None,
         )
     };
+    #[cfg(target_os = "linux")]
     let (process_tree_quiescence, descendant_processes_observed) = match qg1_reconciliation {
         Some(reconciliation) => reconciliation,
         None => LocalPerfDescendantScope::reconcile_after_root_exit()
             .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?,
     };
+    #[cfg(not(target_os = "linux"))]
+    let (process_tree_quiescence, descendant_processes_observed) =
+        qg1_reconciliation.unwrap_or((LocalPerfProcessTreeQuiescence::DirectChildOnly, 0));
+    #[cfg(target_os = "linux")]
     descendant_scope.restore()?;
     let run_log_synced = run_log_sync.sync_all().is_ok();
     let run_log_result = read_file_at(&run_directories.run.handle, "run.log");
@@ -4736,8 +4745,11 @@ fn finish_qg1_authority_after_root_exit(
     }
     // The root may have exited while an escaped descendant still owns stdout.
     // Reconcile first so the forwarder cannot hold this recovery path open.
+    #[cfg(target_os = "linux")]
     let reconciliation = LocalPerfDescendantScope::reconcile_after_root_exit()
         .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?;
+    #[cfg(not(target_os = "linux"))]
+    let reconciliation = (LocalPerfProcessTreeQuiescence::DirectChildOnly, 0);
     if let Err(error) = finish_qg1_authority_forwarder(forwarder) {
         handshake_failure.get_or_insert(error);
     }
@@ -7857,38 +7869,21 @@ struct LocalPerfDescendantScope {
     linux: LinuxSubreaperScope,
 }
 
+#[cfg(target_os = "linux")]
 impl LocalPerfDescendantScope {
     fn enter() -> Result<Self, LocalPerfRunError> {
-        #[cfg(target_os = "linux")]
-        {
-            Ok(Self {
-                linux: LinuxSubreaperScope::enter()?,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Ok(Self {})
-        }
+        Ok(Self {
+            linux: LinuxSubreaperScope::enter()?,
+        })
     }
 
     fn reconcile_after_root_exit()
     -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
-        #[cfg(target_os = "linux")]
-        {
-            LinuxSubreaperScope::reconcile_after_root_exit()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Ok((LocalPerfProcessTreeQuiescence::DirectChildOnly, 0))
-        }
+        LinuxSubreaperScope::reconcile_after_root_exit()
     }
 
     fn restore(&mut self) -> Result<(), LocalPerfRunError> {
-        #[cfg(target_os = "linux")]
-        {
-            self.linux.restore()?;
-        }
-        Ok(())
+        self.linux.restore()
     }
 }
 
@@ -10035,8 +10030,11 @@ mod tests {
         // right to refuse — the refusal was a true observation of the
         // fixture's ordering, not a containment defect, and no lock can fix it
         // because the offending process is the one this fixture just spawned.
+        #[cfg(target_os = "linux")]
         let mut descendant_scope =
             LocalPerfDescendantScope::enter().expect("establish QG-1 test descendant scope");
+        #[cfg(not(target_os = "linux"))]
+        let mut descendant_scope = LocalPerfDescendantScope {};
         // Mirror production: one budget starts immediately before spawn and
         // setup can only spend, never refresh, that budget.
         let startup_deadline = Instant::now() + startup_budget;
@@ -10081,6 +10079,7 @@ mod tests {
                 true,
             )
             .expect("drive the real QG-1 parent wait/kill/reap boundary");
+        #[cfg(target_os = "linux")]
         descendant_scope
             .restore()
             .expect("restore QG-1 test descendant scope");
@@ -11540,9 +11539,37 @@ mod tests {
         );
     }
 
+    fn cargo_config_guard_fixture_directory() -> tempfile::TempDir {
+        // RCH can place TMPDIR below the real checkout. A fake repository
+        // there inherits that checkout's Cargo configuration, so the guard
+        // correctly rejects the fixture before its hostile edit is exercised.
+        // Pick a clean fixture hierarchy; retain the production policy and
+        // both tests' actual filesystem mutations and rejection assertions.
+        let base = [
+            Some(std::env::temp_dir()),
+            std::env::var_os("HOME").map(PathBuf::from),
+            Some(PathBuf::from("/tmp")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|base| {
+            base.ancestors().all(|ancestor| {
+                ["config", "config.toml"].into_iter().all(|name| {
+                    !ancestor
+                        .join(".cargo")
+                        .join(name)
+                        .try_exists()
+                        .expect("inspect Cargo configuration fixture ancestry")
+                })
+            })
+        })
+        .expect("Cargo config guard tests require a temporary base without enclosing Cargo config");
+        tempfile::tempdir_in(base).expect("isolated Cargo configuration guard directory")
+    }
+
     #[test]
     fn cargo_config_guard_rejects_a_transient_unbound_candidate() {
-        let directory = tempfile::tempdir().expect("Cargo configuration guard directory");
+        let directory = cargo_config_guard_fixture_directory();
         let repository = directory.path().join("repository");
         let repository_cargo = repository.join(".cargo");
         let cargo_home = directory.path().join("cargo-home");
@@ -11573,7 +11600,7 @@ mod tests {
 
     #[test]
     fn cargo_config_guard_rejects_a_restored_tracked_path() {
-        let directory = tempfile::tempdir().expect("Cargo configuration guard directory");
+        let directory = cargo_config_guard_fixture_directory();
         let repository = directory.path().join("repository");
         let repository_cargo = repository.join(".cargo");
         let cargo_home = directory.path().join("cargo-home");

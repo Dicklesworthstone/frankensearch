@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(target_os = "linux")]
 use frankensearch::native_ann::{NativeExactReason, NativeRetrievalMode};
 use frankensearch_core::generation::{
     EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1,
