@@ -65,6 +65,9 @@ mod reindex;
 #[path = "authority_quality_completion.rs"]
 mod quality_completion;
 
+#[path = "authority_repair.rs"]
+mod repair;
+
 const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v3";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
@@ -91,6 +94,10 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       --source-low N --source-high N [--input EDITS_JSONL]\n\
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
+  authority-repair --from-receipt DAMAGED_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
+      --retrieval exact [--model-dir DIR] [--quality-backend BACKEND]\n\
+      [--quality-model-dir DIR] [--batch-size N] [--max-source-bytes N]\n\
+      [--max-image-bytes N]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N] [--lexical-only]\n\
       [--current-receipt CURRENT_JSON]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
@@ -143,6 +150,14 @@ The final cohort satisfies the combined encoded-source limits. Deleting every\n\
 document publishes a complete empty generation that later updates can populate.\n\
 Updates require nonbackward source checkpoints and a new work directory/receipt.\n\
 Use rebuild for producer or retrieval changes. Update never changes old images.\n\
+Repair explicitly admits the selected control state, metadata and complete stored\n\
+source even when vector or ANN images are damaged or missing. It needs no healthy\n\
+ancestor and never serves a partial generation. It rebuilds every stored tier\n\
+with the same full producer identities, precision, source checkpoint and document\n\
+fields, then publishes a complete higher-sequence Repair successor. Explicit\n\
+--retrieval exact is required; old damaged images remain untouched. Repair accepts\n\
+no replacement input, source advancement, model migration or topology change.\n\
+Damaged source, control state, unsafe root entries or a competing head refuse.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
 contract. Unsupported filesystems fail before indexing. Cooperative-local is\n\
 explicit: this command does not provide an external anti-rollback service.\n\
@@ -255,6 +270,7 @@ enum Command {
     CompleteQuality,
     Rebuild,
     Update,
+    Repair,
     Search,
     Fetch,
     Serve,
@@ -332,6 +348,7 @@ pub fn is_command(command: &str) -> bool {
             | "authority-complete-quality"
             | "authority-rebuild"
             | "authority-update"
+            | "authority-repair"
             | "authority-search"
             | "authority-fetch"
             | "authority-serve"
@@ -348,6 +365,7 @@ impl Options {
             Some("authority-complete-quality") => Command::CompleteQuality,
             Some("authority-rebuild") => Command::Rebuild,
             Some("authority-update") => Command::Update,
+            Some("authority-repair") => Command::Repair,
             Some("authority-search") => Command::Search,
             Some("authority-fetch") => Command::Fetch,
             Some("authority-serve") => Command::Serve,
@@ -414,6 +432,7 @@ impl Options {
                         Command::Rebuild
                             | Command::CompleteQuality
                             | Command::Update
+                            | Command::Repair
                             | Command::Rollback
                     ) =>
                 {
@@ -438,6 +457,7 @@ impl Options {
                         Command::Rebuild
                             | Command::CompleteQuality
                             | Command::Update
+                            | Command::Repair
                             | Command::Search
                             | Command::Fetch
                             | Command::Serve
@@ -501,6 +521,7 @@ impl Options {
                             | Command::CompleteQuality
                             | Command::Rebuild
                             | Command::Update
+                            | Command::Repair
                     ) =>
                 {
                     options.work = Some(PathBuf::from(value(&mut args)?));
@@ -538,6 +559,7 @@ impl Options {
                             | Command::CompleteQuality
                             | Command::Rebuild
                             | Command::Update
+                            | Command::Repair
                             | Command::Serve
                     ) =>
                 {
@@ -546,7 +568,10 @@ impl Options {
                 "--retrieval"
                     if matches!(
                         command,
-                        Command::Index | Command::CompleteQuality | Command::Rebuild
+                        Command::Index
+                            | Command::CompleteQuality
+                            | Command::Rebuild
+                            | Command::Repair
                     ) =>
                 {
                     options.retrieval = Some(match value(&mut args)?.as_str() {
@@ -706,6 +731,16 @@ impl Options {
                     ));
                 }
                 options.source_cut()?;
+            }
+            Command::Repair => {
+                if options.from_receipt.is_none() || options.work.is_none() {
+                    return Err(bad(
+                        "authority-repair requires --from-receipt and --work-dir",
+                    ));
+                }
+                if options.retrieval != Some(NativeBuildRetrieval::Exact) {
+                    return Err(bad("authority-repair requires explicit --retrieval exact"));
+                }
             }
             Command::Rollback => {
                 if options.from_receipt.is_none() || options.target_receipt.is_none() {
@@ -1860,8 +1895,17 @@ fn retained_rebuild_documents(
         return Err(bad("retained source exceeds the 100000-document limit"));
     }
     let documents = snapshot.source_documents(cx, max_source_bytes)?;
+    validate_retained_documents(cx, &documents)?;
+    Ok(documents)
+}
+
+fn validate_retained_documents(cx: &Cx, documents: &[IndexableDocument]) -> Result<()> {
+    checkpoint(cx)?;
+    if documents.len() > MAX_DOCUMENTS {
+        return Err(bad("retained source exceeds the 100000-document limit"));
+    }
     let mut ids = BTreeSet::new();
-    for document in &documents {
+    for document in documents {
         checkpoint(cx)?;
         if document.id.trim().is_empty()
             || document.id.contains('\0')
@@ -1878,7 +1922,7 @@ fn retained_rebuild_documents(
             .map_err(|_| bad("retained source exceeds the 16 MiB encoded-record limit"))?;
     }
     checkpoint(cx)?;
-    Ok(documents)
+    Ok(())
 }
 
 fn rebuild_identity(
@@ -4047,6 +4091,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             }
             Command::Rebuild => Box::pin(rebuild(&cx, &options, &mut output, pool)).await,
             Command::Update => Box::pin(update_generation(&cx, &options, &mut output, pool)).await,
+            Command::Repair => Box::pin(repair::run(&cx, &options, &mut output, pool)).await,
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,
             Command::Fetch => fetch(&cx, &options, &mut output),
             Command::Serve => Box::pin(serve(&cx, &options, &mut output, pool)).await,
