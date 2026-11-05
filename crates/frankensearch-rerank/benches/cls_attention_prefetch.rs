@@ -101,6 +101,8 @@ fn softmax_rows(data: &mut [f32], rows: usize, n: usize, scale: f32) {
 #[inline]
 #[allow(unsafe_code)]
 fn prefetch(qkv: &[f32], idx: usize) {
+    // The hint is intentionally a no-op on architectures without this intrinsic.
+    let _ = (qkv, idx);
     #[cfg(target_arch = "x86_64")]
     // SAFETY: _mm_prefetch is a hint; idx is only dereferenced by hardware and any
     // address is architecturally valid to prefetch. We bound idx < len anyway.

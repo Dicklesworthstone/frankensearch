@@ -1634,7 +1634,14 @@ impl FsWatcher {
                     ingest_task,
                 } => {
                     stop.request();
-                    let result = finish_watcher_tasks(cx, Some(producer), Some(ingest_task)).await;
+                    let result = finish_watcher_tasks(
+                        cx,
+                        Some(producer),
+                        Some(ingest_task),
+                        &self.ready_batches,
+                        &self.reconciliation,
+                    )
+                    .await;
                     lock_or_recover(&self.control).complete_generation(generation);
                     result?;
                 }
@@ -1712,12 +1719,26 @@ impl FsWatcher {
             if stop.is_requested() || !still_starting {
                 stop.request();
                 ingest_task.abort_with_reason(CancelReason::shutdown());
-                let _ = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+                let _ = finish_watcher_tasks(
+                    cx,
+                    None,
+                    Some(ingest_task),
+                    &self.ready_batches,
+                    &self.reconciliation,
+                )
+                .await;
                 lock_or_recover(&self.control).complete_generation(generation);
                 return Ok(());
             }
             if ingest_task.is_finished() {
-                let result = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+                let result = finish_watcher_tasks(
+                    cx,
+                    None,
+                    Some(ingest_task),
+                    &self.ready_batches,
+                    &self.reconciliation,
+                )
+                .await;
                 lock_or_recover(&self.control).complete_generation(generation);
                 return result;
             }
@@ -1729,7 +1750,14 @@ impl FsWatcher {
             ingest_task.abort_with_reason(CancelReason::user(
                 "watcher ingest admission handshake timed out",
             ));
-            let _ = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+            let _ = finish_watcher_tasks(
+                cx,
+                None,
+                Some(ingest_task),
+                &self.ready_batches,
+                &self.reconciliation,
+            )
+            .await;
             let error =
                 watcher_task_error("watcher ingest task was not admitted within 1000 polls");
             lock_or_recover(&self.control).complete_generation(generation);
@@ -1737,7 +1765,14 @@ impl FsWatcher {
         }
 
         if ingest_task.is_finished() {
-            let result = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+            let result = finish_watcher_tasks(
+                cx,
+                None,
+                Some(ingest_task),
+                &self.ready_batches,
+                &self.reconciliation,
+            )
+            .await;
             lock_or_recover(&self.control).complete_generation(generation);
             return result;
         }
@@ -1763,7 +1798,14 @@ impl FsWatcher {
             Err(error) => {
                 stop.request();
                 ingest_task.abort_with_reason(CancelReason::shutdown());
-                let _ = finish_watcher_tasks(cx, None, Some(ingest_task)).await;
+                let _ = finish_watcher_tasks(
+                    cx,
+                    None,
+                    Some(ingest_task),
+                    &self.ready_batches,
+                    &self.reconciliation,
+                )
+                .await;
                 let error =
                     watcher_task_error(format!("failed to spawn watcher producer: {error}"));
                 lock_or_recover(&self.control).complete_generation(generation);
@@ -1794,7 +1836,14 @@ impl FsWatcher {
 
         stop.request();
         let (producer, ingest_task) = pair.expect("unpublished watcher pair remains owned");
-        let result = finish_watcher_tasks(cx, Some(producer), Some(ingest_task)).await;
+        let result = finish_watcher_tasks(
+            cx,
+            Some(producer),
+            Some(ingest_task),
+            &self.ready_batches,
+            &self.reconciliation,
+        )
+        .await;
         lock_or_recover(&self.control).complete_generation(generation);
         result
     }
@@ -1848,14 +1897,16 @@ impl FsWatcher {
                     ingest_task,
                 } => {
                     stop.request();
-                    let result = finish_watcher_tasks(cx, Some(producer), Some(ingest_task)).await;
-                    // An aborted ingest task cannot drain the producer's final
-                    // flush. Both owners are now joined, so retain every late
-                    // observation as reconciliation debt before publishing Stop.
-                    let reconciled =
-                        fold_queue_into_reconciliation(&self.ready_batches, &self.reconciliation);
+                    let result = finish_watcher_tasks(
+                        cx,
+                        Some(producer),
+                        Some(ingest_task),
+                        &self.ready_batches,
+                        &self.reconciliation,
+                    )
+                    .await;
                     lock_or_recover(&self.control).complete_generation(generation);
-                    return result.and(reconciled);
+                    return result;
                 }
             }
         }
@@ -3239,6 +3290,8 @@ async fn finish_watcher_tasks(
     cx: &Cx,
     producer: Option<ProducerHandle>,
     ingest_task: Option<TaskHandle<SearchResult<()>>>,
+    ready_batches: &ReadyBatchQueue,
+    reconciliation: &ReconciliationTracker,
 ) -> SearchResult<()> {
     let mut failure = None;
     if let Some(producer) = producer {
@@ -3267,7 +3320,11 @@ async fn finish_watcher_tasks(
         }
     }
 
-    failure.map_or(Ok(()), Err)
+    // An aborted ingest cannot drain the producer's final flush. Every drain
+    // owner (stop, restart, or an unpublished start) must retain that work before
+    // publishing Stopped, even when joining already yielded a task failure.
+    let reconciled = fold_queue_into_reconciliation(ready_batches, reconciliation);
+    failure.map_or(reconciled, Err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9075,76 +9132,101 @@ mod tests {
 
     #[test]
     fn same_region_task_cancellation_reports_the_natural_user_reason() {
-        run_on_runtime_task(|cx| async move {
-            let pipeline = Arc::new(CancellationProbePipeline::default());
-            let temp = tempdir().expect("tempdir");
-            let watcher = FsWatcher::new(
-                vec![temp.path().to_path_buf()],
-                DiscoveryConfig::default(),
-                pipeline.clone(),
-            );
-            watcher.start(&cx).await.expect("start watcher");
-            await_startup_reconciliation(&cx, &watcher).await;
-            let batch = vec![WatchEvent::deleted(temp.path().join("cancel.rs"), 400)];
-            lock_or_recover(&watcher.ready_batches).push_back(batch.clone());
+        for restart in [false, true] {
+            run_on_runtime_task(move |cx| async move {
+                let pipeline = Arc::new(CancellationProbePipeline::default());
+                let temp = tempdir().expect("tempdir");
+                let watcher = FsWatcher::new(
+                    vec![temp.path().to_path_buf()],
+                    DiscoveryConfig::default(),
+                    pipeline.clone(),
+                );
+                watcher.start(&cx).await.expect("start watcher");
+                await_startup_reconciliation(&cx, &watcher).await;
+                let batch = vec![WatchEvent::deleted(temp.path().join("cancel.rs"), 400)];
+                lock_or_recover(&watcher.ready_batches).push_back(batch.clone());
 
-            for _ in 0..1_000 {
-                if pipeline.started.load(Ordering::Acquire) {
-                    break;
+                for _ in 0..1_000 {
+                    if pipeline.started.load(Ordering::Acquire) {
+                        break;
+                    }
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
-                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-            }
-            if !pipeline.started.load(Ordering::Acquire) {
-                watcher.stop(&cx).await;
-                panic!("ingest task did not acquire the queued batch");
-            }
+                if !pipeline.started.load(Ordering::Acquire) {
+                    watcher.stop(&cx).await;
+                    panic!("ingest task did not acquire the queued batch");
+                }
 
-            {
-                let control = lock_or_recover(&watcher.control);
-                let WatcherLifecycle::Running { ingest_task, .. } = &control.lifecycle else {
-                    panic!("watcher should be running");
+                {
+                    let control = lock_or_recover(&watcher.control);
+                    let WatcherLifecycle::Running { ingest_task, .. } = &control.lifecycle else {
+                        panic!("watcher should be running");
+                    };
+                    ingest_task.abort();
+                    drop(control);
+                }
+                // Both public lifecycle paths can own the drain of a terminated
+                // generation. Finish cancellation first so no consumer can take
+                // the producer's late flush before that drain owns it.
+                let mut finished = false;
+                for _ in 0..1_000 {
+                    finished = matches!(
+                        &lock_or_recover(&watcher.control).lifecycle,
+                        WatcherLifecycle::Running { ingest_task, .. } if ingest_task.is_finished()
+                    );
+                    if finished {
+                        break;
+                    }
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                if !finished {
+                    watcher.stop(&cx).await;
+                    panic!("cancelled ingest task did not terminate");
+                }
+                // Model a producer flush racing with the cancelled consumer. The
+                // stop owner must retain it even when ingest can no longer poll.
+                let late_path = temp.path().join("late.rs");
+                lock_or_recover(&watcher.ready_batches)
+                    .push_back(vec![WatchEvent::deleted(late_path.clone(), 401)]);
+                let drained = if restart {
+                    watcher.start(&cx).await
+                } else {
+                    watcher.stop_checked(&cx).await
                 };
-                ingest_task.abort();
-                drop(control);
-            }
-            // Model a producer flush racing with the cancelled consumer. The
-            // stop owner must retain it even when ingest can no longer poll.
-            let late_path = temp.path().join("late.rs");
-            lock_or_recover(&watcher.ready_batches)
-                .push_back(vec![WatchEvent::deleted(late_path.clone(), 401)]);
-            let _stop_error = watcher
-                .stop_checked(&cx)
-                .await
-                .expect_err("cancel must surface");
+                drained.expect_err("cancel must surface from either lifecycle drain");
 
-            let child_cx = lock_or_recover(&pipeline.child_cx)
-                .clone()
-                .expect("sink observed child context");
-            assert_eq!(
-                child_cx.cancel_reason().map(|reason| reason.kind),
-                Some(CancelKind::User)
-            );
-            assert!(child_cx.cancelled_by(CancelKind::User));
-            assert!(!child_cx.cancelled_by(CancelKind::ParentCancelled));
-            let chain = child_cx
-                .cancel_chain()
-                .map(|reason| reason.kind)
-                .collect::<Vec<_>>();
-            assert_eq!(chain, vec![CancelKind::User]);
-            assert!(pipeline.future_dropped.load(Ordering::Acquire));
-            assert_eq!(pipeline.attempts.load(Ordering::Acquire), 1);
-            assert!(lock_or_recover(&watcher.ready_batches).is_empty());
-            assert!(lock_or_recover(&watcher.reconciliation).required);
-            assert!(
-                lock_or_recover(&watcher.reconciliation)
-                    .affected_paths
-                    .contains(&late_path)
-            );
-            assert!(matches!(
-                &lock_or_recover(&watcher.control).lifecycle,
-                WatcherLifecycle::Stopped
-            ));
-        });
+                let child_cx = lock_or_recover(&pipeline.child_cx)
+                    .clone()
+                    .expect("sink observed child context");
+                assert_eq!(
+                    child_cx.cancel_reason().map(|reason| reason.kind),
+                    Some(CancelKind::User)
+                );
+                assert!(child_cx.cancelled_by(CancelKind::User));
+                assert!(!child_cx.cancelled_by(CancelKind::ParentCancelled));
+                let chain = child_cx
+                    .cancel_chain()
+                    .map(|reason| reason.kind)
+                    .collect::<Vec<_>>();
+                assert_eq!(chain, vec![CancelKind::User]);
+                assert!(pipeline.future_dropped.load(Ordering::Acquire));
+                assert_eq!(pipeline.attempts.load(Ordering::Acquire), 1);
+                assert!(
+                    lock_or_recover(&watcher.ready_batches).is_empty(),
+                    "late producer batch survived drain (restart={restart})"
+                );
+                assert!(lock_or_recover(&watcher.reconciliation).required);
+                assert!(
+                    lock_or_recover(&watcher.reconciliation)
+                        .affected_paths
+                        .contains(&late_path)
+                );
+                assert!(matches!(
+                    &lock_or_recover(&watcher.control).lifecycle,
+                    WatcherLifecycle::Stopped
+                ));
+            });
+        }
     }
 
     #[test]
