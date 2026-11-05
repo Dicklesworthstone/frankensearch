@@ -1613,6 +1613,97 @@ mod tests {
         });
     }
 
+    #[test]
+    fn zero_shard_queries_preserve_only_actual_quality_and_lexical_evidence() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut quality = Provider::new("quality", 3, true);
+            quality.values = vec![0.0, -0.0, 0.0];
+            let quality_shards = quality_set(&cx, &quality);
+            let zero = frankensearch_core::BoundQueryEmbedding::new(
+                quality.values.clone(),
+                quality.identity.clone(),
+            )
+            .unwrap();
+            let filters = AtomicUsize::new(0);
+            assert!(
+                quality_shards
+                    .search_filtered(&cx, &zero, 2, Some(1), |_| {
+                        filters.fetch_add(1, Ordering::SeqCst);
+                        true
+                    })
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(filters.load(Ordering::SeqCst), 0);
+            for ids in [vec![], vec!["a-late"]] {
+                let lexical = Lexical::new(&ids);
+                let hits = quality_shards
+                    .search_hybrid_quality_text(&cx, &quality, &lexical, "query", 3)
+                    .await
+                    .unwrap();
+                assert_eq!(hits.len(), ids.len());
+                for hit in hits {
+                    assert_eq!(hit.result.source, ScoreSource::Lexical);
+                    assert_eq!(hit.result.doc_id, "a-late");
+                    assert!(hit.fast_row.is_none() && hit.quality_row.is_none());
+                    assert!(hit.result.fast_score.is_none() && hit.result.quality_score.is_none());
+                    assert!(hit.result.index.is_none());
+                    assert_eq!(hit.result.metadata.as_deref().unwrap()["generation"], 7);
+                }
+            }
+
+            // The same zero-valued response cannot suppress producer refusal.
+            quality.reply = Reply::Foreign;
+            assert!(matches!(
+                quality_shards.search_text(&cx, &quality, "query", 1, None).await,
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "query_embedding.native_ann.producer_conformance"
+            ));
+
+            let mut fast = Provider::new("fast", 2, true);
+            fast.values = vec![-0.0, 0.0];
+            let fast_shards = fast_set(&cx, &fast);
+            let quality = Provider::new("quality", 3, true);
+            let lexical = Lexical::new(&[]);
+            let mut stream = fast_shards
+                .search_hybrid_progressive(
+                    &cx,
+                    &fast,
+                    Some((&quality_shards, &quality)),
+                    &lexical,
+                    "query",
+                    1,
+                )
+                .unwrap();
+            let Some(NativeShardedSearchPhase::Initial {
+                results,
+                candidates,
+            }) = stream.next_phase().await.unwrap()
+            else {
+                panic!("initial phase required");
+            };
+            assert!(results.is_empty());
+            assert_eq!(candidates.fast, 0);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            let Some(NativeShardedSearchPhase::Refined {
+                results,
+                candidates,
+            }) = stream.next_phase().await.unwrap()
+            else {
+                panic!("independent quality rescue required");
+            };
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].result.doc_id, "a-late");
+            assert_eq!(results[0].result.source, ScoreSource::SemanticQuality);
+            assert_eq!(results[0].result.quality_score, Some(1.0));
+            assert!(results[0].result.fast_score.is_none() && results[0].fast_row.is_none());
+            assert!(results[0].quality_row.is_some());
+            assert_eq!(candidates.fast, 0);
+            assert_eq!(candidates.quality, 3);
+            assert!(stream.next_phase().await.unwrap().is_none());
+        });
+    }
+
     #[derive(Clone, Copy)]
     enum RerankReply {
         Ready,

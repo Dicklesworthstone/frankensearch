@@ -259,7 +259,10 @@ pub(super) async fn checked_lexical(
     budget: usize,
 ) -> SearchResult<LexicalCandidateBatch> {
     let text = lexical.query_text(text);
-    let response = lexical.search_candidates(cx, &text, budget).await;
+    let response = frankensearch_core::with_cancellation(cx, "native_ann.tiered_lexical", async {
+        lexical.search_candidates(cx, &text, budget).await
+    })
+    .await;
     checkpoint(cx, "native_ann.tiered_lexical")?;
     let batch = response?;
     validate_lexical(cx, &batch)?;
@@ -565,6 +568,49 @@ mod tests {
             assert_eq!(results[0].source, ScoreSource::SemanticQuality);
             assert_eq!(results[0].quality_score, Some(0.75));
             assert!(results[0].fast_score.is_none());
+        });
+    }
+
+    #[test]
+    fn zero_quality_query_preserves_lexical_winners_without_semantic_evidence() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let provider = Provider::new("quality", vec![0.0, -0.0, 0.0], true);
+            let native = index(
+                &cx,
+                &provider,
+                &[
+                    ("late", &[0.0, 1.0, 0.0]),
+                    ("vector-only", &[1.0, 0.0, 0.0]),
+                ],
+                1,
+                7,
+                QuantizationFormat::F32,
+            );
+            let exact = NativeAnnIndex::exact(&cx, Arc::clone(&native.owner)).unwrap();
+            for owner in [exact, native] {
+                for include_late in [false, true] {
+                    let lexical = Lexical {
+                        include_late,
+                        ..Lexical::default()
+                    };
+                    let hits = owner
+                        .search_hybrid_quality_text(&cx, &provider, &lexical, "query", 3)
+                        .await
+                        .unwrap();
+                    assert_eq!(hits.len(), usize::from(include_late));
+                    if include_late {
+                        let hit = &hits[0];
+                        assert_eq!(hit.doc_id, "late");
+                        assert_eq!(hit.source, ScoreSource::Lexical);
+                        assert_eq!(hit.lexical_score, Some(10.0));
+                        assert!(hit.fast_score.is_none() && hit.quality_score.is_none());
+                        assert!(hit.index.is_none());
+                        assert_eq!(hit.metadata.as_deref().unwrap()["snapshot"], 1);
+                    }
+                    assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+                }
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
         });
     }
 

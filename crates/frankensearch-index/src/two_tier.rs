@@ -2851,13 +2851,25 @@ pub struct ActivatedTier<'index, 'query> {
 }
 
 impl ActivatedTier<'_, '_> {
+    // Activation already checked the query's identity, finite coordinates,
+    // and dimension. An all-zero embedding carries no retrieval signal;
+    // inspecting coordinates preserves tiny nonzero queries whose squared
+    // norm would underflow. Raw vector kernels retain their scoring semantics.
+    fn has_query_signal(&self) -> bool {
+        self.query.vector().iter().any(|&value| value != 0.0)
+    }
+
     /// Exact top-k over the retained owner's own bytes.
+    /// An admitted all-zero query returns no candidates.
     ///
     /// # Errors
     ///
     /// Propagates typed row/vector decode failures from the owner.
     pub fn search_top_k(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
         tier_checkpoint(&self.cx, "search_activation.exact")?;
+        if !self.has_query_signal() {
+            return Ok(Vec::new());
+        }
         let result = self.owner.search_top_k(self.query.vector(), k, None);
         tier_checkpoint(&self.cx, "search_activation.exact")?;
         result
@@ -2867,6 +2879,7 @@ impl ActivatedTier<'_, '_> {
     ///
     /// This bypasses all candidate generators, including native and legacy
     /// ANN and dimension truncation, while retaining the query's admission.
+    /// An admitted all-zero query returns no candidates.
     ///
     /// # Errors
     /// Propagates typed row/vector decode failures from the owner.
@@ -2876,6 +2889,9 @@ impl ActivatedTier<'_, '_> {
         params: SearchParams,
     ) -> SearchResult<Vec<VectorHit>> {
         tier_checkpoint(&self.cx, "search_activation.exact")?;
+        if !self.has_query_signal() {
+            return Ok(Vec::new());
+        }
         let result =
             self.owner
                 .index
@@ -2888,6 +2904,9 @@ impl ActivatedTier<'_, '_> {
     /// reads the same retained allocation and uses the exact lane's scorer.
     fn search_candidates(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
         tier_checkpoint(&self.cx, "search_activation.candidates")?;
+        if !self.has_query_signal() {
+            return Ok(Vec::new());
+        }
         let Some((graph, ef_search)) = self.native_hnsw else {
             return self.search_top_k(k);
         };
@@ -7810,6 +7829,229 @@ mod tests {
         "native-f32-values".clone_into(&mut query_identity.storage.endianness);
         BoundQueryEmbedding::new(vector.to_vec(), query_identity)
             .expect("bind a query embedding in the fixture's space")
+    }
+
+    #[test]
+    fn activated_zero_queries_preserve_independent_retrieval_and_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let fast_path = directory.path().join("fast.fsvi");
+        let quality_path = directory.path().join("quality.fsvi");
+        let (fast_binding, fast_identity) = fsvi_v2_binding("zero-fast", 4, 73);
+        let (quality_binding, quality_identity) = fsvi_v2_binding("zero-quality", 4, 73);
+        write_v2_tier(
+            &fast_path,
+            &fast_binding,
+            &[
+                ("shared", &[1.0, 0.0, 0.0, 0.0]),
+                ("fast-only", &[1.0, 0.0, 0.0, 0.0]),
+            ],
+        );
+        write_v2_tier(
+            &quality_path,
+            &quality_binding,
+            &[
+                ("shared", &[0.0, 1.0, 0.0, 0.0]),
+                ("quality-only", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        for native in [false, true] {
+            let cx = Cx::for_testing();
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .unwrap();
+            if native {
+                index
+                    .enable_native_fast_hnsw(&cx, HnswParams::default(), 42)
+                    .unwrap();
+                index
+                    .enable_native_quality_hnsw(&cx, HnswParams::default(), 43)
+                    .unwrap();
+            }
+            for (fast_signal, quality_signal) in [(false, false), (false, true), (true, false)] {
+                let fast = bound_query(
+                    &fast_identity,
+                    if fast_signal {
+                        &[1.0, 0.0, 0.0, 0.0]
+                    } else {
+                        &[0.0, -0.0, 0.0, -0.0]
+                    },
+                );
+                let quality = bound_query(
+                    &quality_identity,
+                    if quality_signal {
+                        &[0.0, 1.0, 0.0, 0.0]
+                    } else {
+                        &[-0.0, 0.0, -0.0, 0.0]
+                    },
+                );
+                let fast_only = TieredQueryEmbeddings::fast_only(fast.clone());
+                let quality_only = TieredQueryEmbeddings::quality_only(quality.clone());
+                let embeddings = TieredQueryEmbeddings::progressive(fast, quality);
+                let activated = index
+                    .activate_owner_backed_search(&cx, &embeddings)
+                    .unwrap();
+                for k in [0, 4] {
+                    let fast_count = if fast_signal { k.min(2) } else { 0 };
+                    let quality_count = if quality_signal { k.min(2) } else { 0 };
+                    for (tier, expected) in [
+                        (activated.fast().unwrap(), fast_count),
+                        (activated.quality().unwrap(), quality_count),
+                    ] {
+                        assert_eq!(tier.search_top_k(k).unwrap().len(), expected);
+                        assert_eq!(
+                            tier.search_top_k_with_params(k, SearchParams::default())
+                                .unwrap()
+                                .len(),
+                            expected
+                        );
+                    }
+                    assert_eq!(activated.search_fast(k).unwrap().len(), fast_count);
+                    assert_eq!(activated.search_quality(k).unwrap().len(), quality_count);
+                    assert_eq!(
+                        index
+                            .activate_owner_backed_search(&cx, &fast_only)
+                            .unwrap()
+                            .search_fast(k)
+                            .unwrap()
+                            .len(),
+                        fast_count
+                    );
+                    assert_eq!(
+                        index
+                            .activate_owner_backed_search(&cx, &quality_only)
+                            .unwrap()
+                            .search_quality(k)
+                            .unwrap()
+                            .len(),
+                        quality_count
+                    );
+                    let union = activated.search_union(k).unwrap();
+                    assert_eq!(union.len(), fast_count + quality_count, "native={native}");
+                    if !union.is_empty() {
+                        let exclusive = if fast_signal {
+                            "fast-only"
+                        } else {
+                            "quality-only"
+                        };
+                        assert!(union.iter().any(|hit| hit.doc_id == exclusive));
+                        assert!(union.iter().any(|hit| hit.doc_id == "shared"));
+                    }
+                    let coverage = activated.coverage(&union, k).unwrap();
+                    // Even the shared document must not give a zero-query
+                    // tier credit for the other tier's actual retrieval.
+                    assert_eq!(
+                        coverage.fast,
+                        TierQueryCoverageV1::Witnessed {
+                            generation_sequence: 73,
+                            live_count: 2,
+                            contributed_candidates: fast_count as u64,
+                        }
+                    );
+                    assert_eq!(
+                        coverage.quality,
+                        TierQueryCoverageV1::Witnessed {
+                            generation_sequence: 73,
+                            live_count: 2,
+                            contributed_candidates: quality_count as u64,
+                        }
+                    );
+                }
+                cx.set_cancel_requested(true);
+                for k in [0, 4] {
+                    for result in [
+                        activated.search_fast(k),
+                        activated.search_quality(k),
+                        activated.search_union(k),
+                        activated.fast().unwrap().search_top_k(k),
+                        activated
+                            .quality()
+                            .unwrap()
+                            .search_top_k_with_params(k, SearchParams::default()),
+                    ] {
+                        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                    }
+                    assert!(matches!(
+                        activated.coverage(&[], k),
+                        Err(SearchError::Cancelled { .. })
+                    ));
+                }
+                cx.set_cancel_requested(false);
+            }
+        }
+    }
+
+    #[test]
+    fn activated_signal_check_preserves_ties_and_tiny_nonzero_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let fast_path = directory.path().join("fast.fsvi");
+        let (binding, identity) = fsvi_v2_binding("zero-score-ties", 4, 73);
+        write_v2_tier(
+            &fast_path,
+            &binding,
+            &[
+                ("tie-a", &[0.0, 1.0, 0.0, 0.0]),
+                ("tie-b", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &TwoTierIndexPaths::new(&fast_path),
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .unwrap();
+        for native in [false, true] {
+            if native {
+                index
+                    .enable_native_fast_hnsw(&Cx::for_testing(), HnswParams::default(), 42)
+                    .unwrap();
+            }
+            for component in [1.0, f32::MIN_POSITIVE, f32::from_bits(1)] {
+                let embeddings = TieredQueryEmbeddings::fast_only(bound_query(
+                    &identity,
+                    &[component, 0.0, 0.0, 0.0],
+                ));
+                let activated = index
+                    .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
+                    .unwrap();
+                let tier = activated.fast().unwrap();
+                for hits in [
+                    activated.search_fast(2).unwrap(),
+                    tier.search_top_k(2).unwrap(),
+                    tier.search_top_k_with_params(2, SearchParams::default())
+                        .unwrap(),
+                ] {
+                    assert_eq!(hits.len(), 2, "native={native}, component={component}");
+                    assert!(hits.iter().all(|hit| hit.score == 0.0));
+                }
+            }
+            let (_, foreign_identity) = fsvi_v2_binding("foreign-zero-query", 4, 73);
+            let foreign = TieredQueryEmbeddings::fast_only(bound_query(
+                &foreign_identity,
+                &[0.0, -0.0, 0.0, -0.0],
+            ));
+            assert!(matches!(
+                index.activate_owner_backed_search(&Cx::for_testing(), &foreign),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "query_embedding.fast.space_identity"
+            ));
+            let mut foreign_producer = identity.clone();
+            "foreign-producer".clone_into(&mut foreign_producer.producer.backend);
+            let foreign = TieredQueryEmbeddings::fast_only(bound_query(
+                &foreign_producer,
+                &[0.0, -0.0, 0.0, -0.0],
+            ));
+            assert!(matches!(
+                index.activate_owner_backed_search(&Cx::for_testing(), &foreign),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "search_activation.fast.producer_conformance"
+            ));
+        }
     }
 
     #[test]

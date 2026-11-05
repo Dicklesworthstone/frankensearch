@@ -214,7 +214,11 @@ impl NativeAnnIndex {
     ) -> SearchResult<BoundQueryEmbedding> {
         checkpoint(cx, "native_ann.before_embedding")?;
         self.admit_identity(embedder.identity()?)?;
-        let response = embedder.embed_bound(cx, text).await;
+        let response =
+            frankensearch_core::with_cancellation(cx, "native_ann.after_embedding", async {
+                embedder.embed_bound(cx, text).await
+            })
+            .await;
         checkpoint(cx, "native_ann.after_embedding")?;
         let bound = response?;
         let query = BoundQueryEmbedding::new(bound.values, bound.identity)?;
@@ -304,7 +308,8 @@ impl NativeAnnIndex {
     /// cannot silently truncate the first ANN window when more eligible hits
     /// exist. With fewer than `k` eligible rows, the final result is shorter.
     /// The predicate must return the same answer for a document throughout this
-    /// call; widening may evaluate it again.
+    /// call; widening may evaluate it again. An admitted all-zero query has no
+    /// retrieval signal and returns no candidates without invoking the predicate.
     ///
     /// # Errors
     ///
@@ -328,6 +333,12 @@ impl NativeAnnIndex {
                 expected: self.owner.dimension(),
                 found: query.vector().len(),
             });
+        }
+        // Admission and cancellation still apply to zero-signal queries. Do
+        // not turn their tied dot products into semantic or hash-control ranks,
+        // and do not use a norm threshold that would discard tiny valid queries.
+        if query.vector().iter().all(|&value| value == 0.0) {
+            return Ok(Vec::new());
         }
         let target = k.min(self.owner.live_count());
         if target == 0 {
@@ -656,6 +667,7 @@ mod tests {
         ForeignProducer,
         WrongDimension,
         Cancelled,
+        CancelWithZero,
         Pending,
     }
 
@@ -678,7 +690,9 @@ mod tests {
     impl Embedder for ProbeEmbedder {
         fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async move {
-                Ok(if text == "vertical" {
+                Ok(if text == "zero" {
+                    vec![0.0, -0.0, 0.0, -0.0]
+                } else if text == "vertical" {
                     vec![0.0, 1.0, 0.0, 0.0]
                 } else {
                     vec![1.0, 0.0, 0.0, 0.0]
@@ -711,6 +725,10 @@ mod tests {
                             phase: "test.provider".to_owned(),
                             reason: "provider cancelled".to_owned(),
                         });
+                    }
+                    Reply::CancelWithZero => {
+                        values.fill(0.0);
+                        cx.set_cancel_requested(true);
                     }
                     Reply::Pending => return std::future::pending().await,
                 }
@@ -915,15 +933,17 @@ mod tests {
             for rows in [rows(), Vec::new()] {
                 let owner = owner(&rows, 1, QuantizationFormat::F32);
                 let index = NativeAnnIndex::build(&cx, owner, HnswParams::default(), 7).unwrap();
-                let foreign = BoundQueryEmbedding::new(
-                    vec![1.0, 0.0, 0.0, 0.0],
-                    EmbeddingIdentityBundleV1::explicit_test_model("wrong-model", 4),
-                )
-                .unwrap();
-                for k in [0, 1] {
-                    let error = index.search(&cx, &foreign, k, None).unwrap_err();
-                    assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
-                        if field == "query_embedding.native_ann.space_identity"));
+                for values in [vec![1.0, 0.0, 0.0, 0.0], vec![0.0; 4]] {
+                    let foreign = BoundQueryEmbedding::new(
+                        values,
+                        EmbeddingIdentityBundleV1::explicit_test_model("wrong-model", 4),
+                    )
+                    .unwrap();
+                    for k in [0, 1] {
+                        let error = index.search(&cx, &foreign, k, None).unwrap_err();
+                        assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
+                            if field == "query_embedding.native_ann.space_identity"));
+                    }
                 }
                 assert!(
                     index
@@ -931,6 +951,116 @@ mod tests {
                         .unwrap()
                         .is_empty()
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn zero_signal_skips_exact_and_ann_but_preserves_tiny_queries_and_real_ties() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for format in [QuantizationFormat::F16, QuantizationFormat::F32] {
+                let owner = owner(&rows(), 1, format);
+                for ann in [false, true] {
+                    let index = if ann {
+                        NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7)
+                            .unwrap()
+                    } else {
+                        NativeAnnIndex::exact(&cx, Arc::clone(&owner)).unwrap()
+                    };
+                    let filters = AtomicUsize::new(0);
+                    for values in [[0.0; 4], [-0.0, 0.0, -0.0, 0.0]] {
+                        for k in [0, 1, 3] {
+                            for ef in [Some(1), Some(usize::MAX)] {
+                                let hits = index
+                                    .search_filtered(&cx, &query(values), k, ef, |_| {
+                                        filters.fetch_add(1, Ordering::SeqCst);
+                                        true
+                                    })
+                                    .unwrap();
+                                assert!(hits.is_empty(), "{format:?}/{ann}/{k}/{ef:?}");
+                            }
+                        }
+                    }
+                    assert_eq!(filters.load(Ordering::SeqCst), 0);
+
+                    // Squaring these coordinates underflows in f32, but the
+                    // actual query and its retained-row scores are nonzero.
+                    let tiny = index
+                        .search(&cx, &query([1e-30, 0.0, 0.0, 0.0]), 2, Some(usize::MAX))
+                        .unwrap();
+                    assert_eq!(tiny.len(), 2);
+                    assert_eq!(tiny[0].doc_id, "alpha");
+                    assert!(tiny.iter().all(|hit| hit.score > 0.0));
+
+                    // A nonzero query may legitimately be orthogonal to all
+                    // rows. Equal zero scores are not a zero query.
+                    let tied = index
+                        .search(&cx, &query([0.0, 0.0, 1.0, 0.0]), 2, Some(2))
+                        .unwrap();
+                    assert_eq!(tied.len(), 2);
+                    assert!(tied.iter().all(|hit| hit.score == 0.0));
+
+                    let cancelled = Cx::for_testing();
+                    cancelled.set_cancel_requested(true);
+                    assert!(matches!(
+                        index.search(&cancelled, &query([0.0; 4]), 1, None),
+                        Err(SearchError::Cancelled { .. })
+                    ));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn zero_bound_response_still_requires_actual_identity_and_cancellation_admission() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let owner = owner(&rows(), 1, QuantizationFormat::F32);
+            for ann in [false, true] {
+                let index = if ann {
+                    NativeAnnIndex::build(&cx, Arc::clone(&owner), HnswParams::default(), 7)
+                        .unwrap()
+                } else {
+                    NativeAnnIndex::exact(&cx, Arc::clone(&owner)).unwrap()
+                };
+                for reply in [
+                    Reply::Correct,
+                    Reply::ForeignSpace,
+                    Reply::ForeignProducer,
+                    Reply::WrongDimension,
+                    Reply::CancelWithZero,
+                ] {
+                    let request = Cx::for_testing();
+                    let provider = ProbeEmbedder::new(reply);
+                    let filters = AtomicUsize::new(0);
+                    let result = index
+                        .search_text_filtered(&request, &provider, "zero", 2, None, |_| {
+                            filters.fetch_add(1, Ordering::SeqCst);
+                            true
+                        })
+                        .await;
+                    match reply {
+                        Reply::Correct => assert!(result.unwrap().is_empty()),
+                        Reply::ForeignSpace => assert!(matches!(result,
+                            Err(SearchError::InvalidConfig { field, .. })
+                            if field == "query_embedding.native_ann.space_identity")),
+                        Reply::ForeignProducer => assert!(matches!(result,
+                            Err(SearchError::InvalidConfig { field, .. })
+                            if field == "query_embedding.native_ann.producer_conformance")),
+                        Reply::WrongDimension => assert!(matches!(
+                            result,
+                            Err(SearchError::DimensionMismatch {
+                                expected: 4,
+                                found: 3
+                            })
+                        )),
+                        Reply::CancelWithZero => assert!(matches!(result,
+                            Err(SearchError::Cancelled { phase, .. })
+                            if phase == "native_ann.after_embedding")),
+                        Reply::Cancelled | Reply::Pending => unreachable!(),
+                    }
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(filters.load(Ordering::SeqCst), 0);
+                }
             }
         });
     }

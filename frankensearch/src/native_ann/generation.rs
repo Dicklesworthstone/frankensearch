@@ -15,6 +15,7 @@ use frankensearch_core::generation::{
     GenerationRootSecurityProfileV1, InvariantKind, SourceCheckpointV1, resolve_authority_slots_v1,
     validate_manifest,
 };
+use frankensearch_core::with_cancellation;
 use frankensearch_index::ann_cohort::NativeAnnCohortV1;
 use frankensearch_index::exact_component_adapters::{
     ann_component_receipt, vector_component_receipt,
@@ -1153,7 +1154,10 @@ impl CompositeReaders {
             return Ok(Vec::new());
         }
         let query = lexical.query_text(text);
-        let response = lexical.search_candidates(cx, &query, k).await;
+        let response = with_cancellation(cx, "native_ann.generation.lexical_response", async {
+            lexical.search_candidates(cx, &query, k).await
+        })
+        .await;
         checkpoint(cx, "native_ann.generation.lexical_response")?;
         let batch = response?;
         if batch.results().len() > k {
@@ -1173,9 +1177,12 @@ impl CompositeReaders {
             .iter()
             .map(|hit| (hit.doc_id.clone(), hit.score.to_bits()))
             .collect();
-        let hydrated = lexical
-            .hydrate_candidates(cx, context.as_ref(), &mut results)
-            .await;
+        let hydrated = with_cancellation(cx, "native_ann.generation.lexical_hydrated", async {
+            lexical
+                .hydrate_candidates(cx, context.as_ref(), &mut results)
+                .await
+        })
+        .await;
         checkpoint(cx, "native_ann.generation.lexical_hydrated")?;
         hydrated?;
         for (hit, (id, score)) in results.iter_mut().zip(identities) {
