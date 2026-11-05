@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::traits::{IdentityBoundEmbedding, ModelCategory, ModelTier, SearchFuture};
+use frankensearch_core::with_cancellation;
 
 use super::checkpoint;
 use crate::{Cx, Embedder, SearchError, SearchResult};
@@ -100,7 +101,10 @@ pub(super) async fn infer_admitted(
         "native_ann.builder.before_batch",
     )?;
     let response = if native_batch {
-        let outcome = embedder.embed_batch_bound(cx, texts).await;
+        let outcome = with_cancellation(cx, "native_ann.builder.after_batch", async {
+            embedder.embed_batch_bound(cx, texts).await
+        })
+        .await;
         let response = finish_admitted_call(cx, embedder, expected, native_batch, outcome)?;
         if response.len() != texts.len() {
             return Err(SearchError::InvalidConfig {
@@ -124,7 +128,10 @@ pub(super) async fn infer_admitted(
                 native_batch,
                 "native_ann.builder.before_batch",
             )?;
-            let outcome = embedder.embed_bound(cx, text).await;
+            let outcome = with_cancellation(cx, "native_ann.builder.after_batch", async {
+                embedder.embed_bound(cx, text).await
+            })
+            .await;
             let bound = finish_admitted_call(cx, embedder, expected, native_batch, outcome)?;
             checkpoint(cx, "native_ann.builder.admit_output")?;
             admit_output(expected, &bound)?;
@@ -182,10 +189,12 @@ impl SplittingEmbedder {
                 native_batch,
                 "native_ann.builder.before_batch",
             )?;
-            let outcome = self
-                .inner
-                .embed_batch_bound(cx, &texts[range.clone()])
-                .await;
+            let outcome = with_cancellation(cx, "native_ann.builder.after_batch", async {
+                self.inner
+                    .embed_batch_bound(cx, &texts[range.clone()])
+                    .await
+            })
+            .await;
             let outcome = finish_admitted_call(
                 cx,
                 self.inner.as_ref(),

@@ -214,7 +214,11 @@ impl NativeAnnIndex {
     ) -> SearchResult<BoundQueryEmbedding> {
         checkpoint(cx, "native_ann.before_embedding")?;
         self.admit_identity(embedder.identity()?)?;
-        let response = embedder.embed_bound(cx, text).await;
+        let response =
+            frankensearch_core::with_cancellation(cx, "native_ann.after_embedding", async {
+                embedder.embed_bound(cx, text).await
+            })
+            .await;
         checkpoint(cx, "native_ann.after_embedding")?;
         let bound = response?;
         let query = BoundQueryEmbedding::new(bound.values, bound.identity)?;

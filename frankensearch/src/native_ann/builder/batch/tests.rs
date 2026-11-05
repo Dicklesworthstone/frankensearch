@@ -1,6 +1,8 @@
 use super::*;
+use std::future::Future;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 
 use asupersync::test_utils::run_test_with_cx;
 use frankensearch_core::generation::ArtifactGenerationIdentityV1;
@@ -74,6 +76,19 @@ struct PendingDrop<'a>(&'a AtomicUsize);
 
 impl Drop for PendingDrop<'_> {
     fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Default)]
+struct CancellationWake(AtomicUsize);
+
+impl Wake for CancellationWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -953,6 +968,88 @@ fn dropping_a_split_batch_drops_its_pending_provider_without_detached_work() {
             4
         );
     });
+}
+
+#[test]
+fn externally_cancelled_pending_groups_drop_providers_and_write_no_partial_rows() {
+    use super::super::TierPlan;
+    use frankensearch_index::{ValidatedFsviBytes, VectorIndex};
+
+    for case in ["native", "single", "split"] {
+        let cx = Cx::for_testing();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("candidate.fsvi");
+        let mut native = Provider::new("fast", 2, if case == "split" { 2 } else { 8 });
+        native.fault = Fault::Pending;
+        // In split mode the root refuses four inputs, the left child succeeds,
+        // and the right child never wakes. Accepted siblings cannot be written.
+        native.fault_call = if case == "split" { 2 } else { 0 };
+        let native = Arc::new(native);
+        let mut single = Provider::new("fast", 2, 8);
+        single.fault = Fault::Pending;
+        single.fault_call = 1;
+        let single = Arc::new(BoundSingle(single));
+        let (embedder, state): (Arc<dyn Embedder>, &Provider) = match case {
+            "native" => (native.clone(), native.as_ref()),
+            "split" => (split(&native), native.as_ref()),
+            "single" => (single.clone(), &single.0),
+            _ => unreachable!(),
+        };
+        let tier = TierPlan::new(embedder).unwrap();
+        let binding = tier.binding(&generation(1)).unwrap();
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
+        writer.write_record("earlier-batch", &[0.25, -0.0]).unwrap();
+        let input = ["a", "b", "c", "d"].map(|id| IndexableDocument::new(id, id));
+        let wakes = Arc::new(CancellationWake::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let baseline = Arc::strong_count(&wakes);
+        let mut task = Context::from_waker(&waker);
+        let mut operation = Box::pin(tier.write_batch(&cx, &mut writer, &input));
+        assert!(operation.as_mut().poll(&mut task).is_pending(), "{case}");
+        let expected_calls = match case {
+            "native" => 1,
+            "single" => 2,
+            "split" => 3,
+            _ => unreachable!(),
+        };
+        assert_eq!(state.calls.lock().unwrap().len(), expected_calls, "{case}");
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| cx.cancel_fast(asupersync::CancelKind::User))
+                .join()
+                .expect("cancel pending bound inference");
+        });
+        // Assert the independent wake before a manual poll can hide the bug.
+        assert!(wakes.0.load(Ordering::SeqCst) > 0, "{case}");
+        assert!(matches!(
+            operation.as_mut().poll(&mut task),
+            Poll::Ready(Err(SearchError::Cancelled { .. }))
+        ));
+        assert_eq!(state.dropped.load(Ordering::SeqCst), 1, "{case}");
+        assert_eq!(state.calls.lock().unwrap().len(), expected_calls, "{case}");
+        assert_eq!(state.raw_calls.load(Ordering::SeqCst), 0, "{case}");
+        assert_eq!(Arc::strong_count(&wakes), baseline, "{case}");
+        drop(operation);
+
+        // Finalize only to inspect the unselected writer. Earlier valid rows
+        // remain byte-exact; no accepted prefix from the cancelled group exists.
+        writer.finish().unwrap();
+        let bytes: Arc<[u8]> = std::fs::read(path).unwrap().into();
+        let owner = ValidatedFsviBytes::from_arc(bytes, &binding).unwrap();
+        assert_eq!(owner.record_count(), 1, "{case}");
+        assert_eq!(owner.row(0).unwrap().doc_id(), "earlier-batch", "{case}");
+        assert_eq!(
+            owner
+                .vector_at_f32(0)
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0.25_f32.to_bits(), (-0.0_f32).to_bits()],
+            "{case}"
+        );
+    }
 }
 
 #[test]
