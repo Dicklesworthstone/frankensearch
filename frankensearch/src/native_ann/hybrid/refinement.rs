@@ -569,6 +569,49 @@ mod tests {
     }
 
     #[test]
+    fn zero_quality_query_preserves_lexical_winners_without_semantic_evidence() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let provider = Provider::new("quality", vec![0.0, -0.0, 0.0], true);
+            let native = index(
+                &cx,
+                &provider,
+                &[
+                    ("late", &[0.0, 1.0, 0.0]),
+                    ("vector-only", &[1.0, 0.0, 0.0]),
+                ],
+                1,
+                7,
+                QuantizationFormat::F32,
+            );
+            let exact = NativeAnnIndex::exact(&cx, Arc::clone(&native.owner)).unwrap();
+            for owner in [exact, native] {
+                for include_late in [false, true] {
+                    let lexical = Lexical {
+                        include_late,
+                        ..Lexical::default()
+                    };
+                    let hits = owner
+                        .search_hybrid_quality_text(&cx, &provider, &lexical, "query", 3)
+                        .await
+                        .unwrap();
+                    assert_eq!(hits.len(), usize::from(include_late));
+                    if include_late {
+                        let hit = &hits[0];
+                        assert_eq!(hit.doc_id, "late");
+                        assert_eq!(hit.source, ScoreSource::Lexical);
+                        assert_eq!(hit.lexical_score, Some(10.0));
+                        assert!(hit.fast_score.is_none() && hit.quality_score.is_none());
+                        assert!(hit.index.is_none());
+                        assert_eq!(hit.metadata.as_deref().unwrap()["snapshot"], 1);
+                    }
+                    assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+                }
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+        });
+    }
+
+    #[test]
     fn equal_dimensions_never_authorize_reusing_the_fast_query_in_quality_space() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let fast = Provider::new("fast", vec![1.0, 0.0], true);

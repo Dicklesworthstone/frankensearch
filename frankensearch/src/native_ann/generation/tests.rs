@@ -19,6 +19,7 @@ const BUDGET: usize = 16 * 1024 * 1024;
 struct ProgressiveProvider {
     identity: EmbeddingIdentityBundleV1,
     quality: bool,
+    zero_query: bool,
     calls: AtomicUsize,
 }
 
@@ -44,6 +45,7 @@ impl ProgressiveProvider {
         Self {
             identity,
             quality,
+            zero_query: false,
             calls: AtomicUsize::new(0),
         }
     }
@@ -53,6 +55,9 @@ impl Embedder for ProgressiveProvider {
     fn embed<'a>(&'a self, _: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
+            if self.zero_query {
+                return Ok(vec![-0.0; self.dimension()]);
+            }
             let special = text == "quality-special";
             Ok(if self.quality {
                 if special || text == "unmatched" {
@@ -2197,6 +2202,27 @@ mod qualified_rollback {
                     quality_ann,
                     true,
                 );
+                let mut zero_quality = ProgressiveProvider::new(true);
+                zero_quality.zero_query = true;
+                assert!(
+                    retained
+                        .search_quality_text(&cx, &zero_quality, "unmatched", 2)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let lexical_only = retained
+                    .search_quality_text(&cx, &zero_quality, "cohort", 2)
+                    .await
+                    .unwrap();
+                assert_eq!(lexical_only.len(), 2);
+                for hit in lexical_only {
+                    assert_eq!(hit.source, ScoreSource::Lexical);
+                    assert!(hit.fast_score.is_none() && hit.quality_score.is_none());
+                    assert!(hit.index.is_none());
+                    assert_eq!(hit.metadata.as_deref().unwrap()["version"], "old");
+                }
+                assert_eq!(zero_quality.calls.load(Ordering::SeqCst), 2);
                 let successor_generation =
                     ArtifactGenerationIdentityV1::new(8, [0xc4; 16]).unwrap();
                 let refused = parent.join("single-refused");
