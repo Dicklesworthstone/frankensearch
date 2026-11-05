@@ -471,12 +471,11 @@ fn validate_unix_route_bytes(route: &OsStr) -> Result<(), GenerationRootRouteErr
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
     use super::{
         GenerationRootAdmissionErrorV1, GenerationRootCapabilityV1,
-        GenerationRootDirectoryPolicyV1, GenerationRootFilePolicyV1,
+        GenerationRootDirectoryPolicyV1, GenerationRootFilePolicyV1, GenerationRootRouteErrorV1,
+        GenerationRootRouteV1,
     };
-    use super::{GenerationRootRouteErrorV1, GenerationRootRouteV1};
     use std::ffi::OsStr;
     use std::path::Path;
 

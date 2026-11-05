@@ -12008,8 +12008,8 @@ impl PreparsedQuillIndex {
 }
 
 impl QuillSearchIndex {
-    /// Actual prefix hashes in this handle's current snapshot, for Linux receipt regressions.
-    #[cfg(all(test, target_os = "linux"))]
+    /// Actual prefix hashes in this handle's current snapshot, for regressions.
+    #[cfg(test)]
     pub(crate) fn authenticated_file_witness_hash_count(&self) -> u64 {
         self.reader
             .published_snapshot
