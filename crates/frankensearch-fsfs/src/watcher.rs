@@ -1719,7 +1719,7 @@ impl FsWatcher {
         owner.tasks.ingest_task = Some(ingest_task);
 
         for _ in 0..ADMISSION_POLLS {
-            if admitted.load(Ordering::Acquire) {
+            if cx.is_cancel_requested() || admitted.load(Ordering::Acquire) {
                 break;
             }
             let still_starting = lock_or_recover(&self.control).generation_can_publish(generation);
@@ -1737,6 +1737,27 @@ impl FsWatcher {
             asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
         }
 
+        if owner.ingest_task().is_finished() {
+            return owner.finish(cx).await;
+        }
+
+        // Admission can suspend the request. A cancelled caller must retire
+        // its unpublished generation before creating a producer or returning.
+        // An already terminal task above keeps its natural failure first.
+        if cx.is_cancel_requested() {
+            stop.request();
+            owner.ingest_task().abort_with_reason(
+                cx.cancel_reason().unwrap_or_else(|| {
+                    CancelReason::user("watcher start cancelled during admission")
+                }),
+            );
+            let _ = owner.finish(cx).await;
+            return Err(SearchError::Cancelled {
+                phase: "watch.start".to_owned(),
+                reason: "cancel requested during watcher start".to_owned(),
+            });
+        }
+
         if !admitted.load(Ordering::Acquire) {
             stop.request();
             owner.ingest_task().abort_with_reason(CancelReason::user(
@@ -1746,10 +1767,6 @@ impl FsWatcher {
             let error =
                 watcher_task_error("watcher ingest task was not admitted within 1000 polls");
             return Err(error);
-        }
-
-        if owner.ingest_task().is_finished() {
-            return owner.finish(cx).await;
         }
 
         let producer_context = ProducerContext {
@@ -8816,6 +8833,69 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn cancelled_start_during_admission_drains_before_another_caller_restarts() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = Arc::new(FsWatcher::new(
+                vec![temp.path().to_path_buf()],
+                DiscoveryConfig::default(),
+                pipeline.clone(),
+            ));
+            let starting_watcher = Arc::clone(&watcher);
+            let mut request = cx
+                .spawn_local(move |request_cx| async move {
+                    let mut starting = Box::pin(starting_watcher.start(&request_cx));
+                    std::future::poll_fn(|context| {
+                        assert!(starting.as_mut().poll(context).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    assert!(matches!(
+                        &lock_or_recover(&starting_watcher.control).lifecycle,
+                        WatcherLifecycle::Starting { .. }
+                    ));
+                    request_cx.cancel_fast(asupersync::CancelKind::User);
+                    // Acknowledge cancellation so the request task can finish
+                    // its asynchronous cleanup and return the operation error.
+                    assert!(request_cx.checkpoint().is_err());
+                    starting.await
+                })
+                .expect("spawn independently cancellable start request");
+            let error = request
+                .join(&cx)
+                .await
+                .expect("request task returns its operation result")
+                .expect_err("cancellation during admission must not publish a watcher");
+            assert!(matches!(error, SearchError::Cancelled { ref phase, .. }
+                if phase == "watch.start"));
+            assert!(!cx.is_cancel_requested());
+            assert!(matches!(
+                &lock_or_recover(&watcher.control).lifecycle,
+                WatcherLifecycle::Stopped
+            ));
+            assert_eq!(lock_or_recover(&watcher.control).next_generation, 1);
+
+            let later = temp.path().join("after-cancelled-admission.rs");
+            fs::write(&later, "fn later() {}\n").expect("write restart fixture");
+            watcher
+                .start(&cx)
+                .await
+                .expect("uncancelled caller can restart after cancelled admission");
+            await_startup_reconciliation(&cx, &watcher).await;
+            watcher
+                .stop_checked(&cx)
+                .await
+                .expect("stop restarted watcher");
+            assert_eq!(lock_or_recover(&watcher.control).next_generation, 2);
+            assert!(pipeline.all_ops().iter().any(|op| {
+                matches!(op, WatchIngestOp::Upsert { file_key, .. }
+                    if file_key == &normalize_file_key(&later))
+            }));
+        });
     }
 
     #[test]
