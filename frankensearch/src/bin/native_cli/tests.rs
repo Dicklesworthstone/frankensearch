@@ -20,7 +20,12 @@ fn stopped_command_pool_is_refused_before_input_models_or_candidate_paths() {
         let stopped = BlockingPool::new(0, 1);
         let handle = stopped.handle();
         assert!(stopped.shutdown_and_wait(Duration::from_secs(10)));
-        for command in [Command::Index, Command::Update, Command::Rebuild] {
+        for command in [
+            Command::Index,
+            Command::Update,
+            Command::Rebuild,
+            Command::CompleteQuality,
+        ] {
             let mut options =
                 options(&["index", "--index-dir", "unused", "--receipt", "unused.json"]);
             options.command = command;
@@ -40,6 +45,10 @@ fn stopped_command_pool_is_refused_before_input_models_or_candidate_paths() {
                 }
                 Command::Rebuild => {
                     update::rebuild(&cx, &options, &mut output, Some(handle.clone())).await
+                }
+                Command::CompleteQuality => {
+                    quality_completion::execute(&cx, &options, &mut output, Some(handle.clone()))
+                        .await
                 }
                 Command::Search | Command::Serve => unreachable!(),
             }

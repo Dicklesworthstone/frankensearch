@@ -66,6 +66,158 @@ pub struct NativeIndexUpdate {
     edits: BTreeMap<String, Option<IndexableDocument>>,
 }
 
+/// Add a complete quality tier to a retained fast-only native cohort.
+///
+/// The original source records, fast producer, precision and graph policy remain
+/// fixed. Only the new quality provider receives document inference requests.
+/// Every quality row must succeed before a complete successor is returned; the
+/// predecessor remains usable after failure, cancellation or a dropped build.
+///
+/// Both ordinary and sharded predecessors can produce either layout. Changing
+/// partition boundaries preserves fast vectors by source ID, not physical row.
+/// Source/vector artifacts and the optional global lexical index are complete
+/// successor images, so their memory and I/O costs still cover the whole corpus.
+/// This builder cannot edit documents, replace the fast model or select a live
+/// generation. Model migration retains its separate full-reembedding contract.
+pub struct NativeIndexQualityCompletion {
+    update: NativeIndexUpdate,
+}
+
+impl NativeIndexQualityCompletion {
+    fn from_partitions(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        quality_provider: Arc<dyn crate::Embedder>,
+        partitions: &[NativeBuiltIndex],
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.quality_completion.prepare")?;
+        if partitions.is_empty() || partitions.iter().any(|part| part.quality.is_some()) {
+            return Err(invalid(
+                "quality_completion.topology",
+                "fast-only-required",
+                "quality completion requires a complete retained fast-only inventory",
+            ));
+        }
+        let mut update = NativeIndexUpdate::from_partitions(cx, directory, generation, partitions)?;
+        let quality = TierPlan::new(quality_provider)?;
+        if quality.identity.input != update.builder.fast.identity.input
+            || quality.identity.space.kind != update.builder.fast.identity.space.kind
+        {
+            return Err(invalid(
+                "quality_completion.input",
+                "changed",
+                "quality completion must preserve the retained prepared-input contract",
+            ));
+        }
+        quality.binding(&generation)?;
+        update.builder.quality = Some(quality);
+        let source = update
+            .builder
+            .reuse
+            .as_mut()
+            .and_then(Arc::get_mut)
+            .ok_or_else(|| {
+                invalid(
+                    "quality_completion.source",
+                    "unavailable",
+                    "quality completion requires its newly retained source inventory",
+                )
+            })?;
+        source.completing_quality = true;
+        checkpoint(cx, "native_ann.quality_completion.prepared")?;
+        Ok(Self { update })
+    }
+
+    /// Bound the new quality model's inference batch size.
+    ///
+    /// # Errors
+    /// Refuses a zero batch size.
+    pub fn with_batch_size(mut self, batch_size: usize) -> SearchResult<Self> {
+        self.update = self.update.with_batch_size(batch_size)?;
+        Ok(self)
+    }
+
+    /// Bound prepared content bytes submitted in each quality inference batch.
+    ///
+    /// # Errors
+    /// Refuses a zero byte limit.
+    pub fn with_max_batch_input_bytes(mut self, max_bytes: usize) -> SearchResult<Self> {
+        self.update = self.update.with_max_batch_input_bytes(max_bytes)?;
+        Ok(self)
+    }
+
+    /// Select the new quality tier's precision and exact/native ANN retrieval.
+    /// The inherited fast encoding and graph policy cannot be changed here.
+    ///
+    /// # Errors
+    /// Propagates invalid quality storage configuration.
+    pub fn with_quality_storage(
+        mut self,
+        precision: NativeBuildPrecision,
+        retrieval: NativeBuildRetrieval,
+    ) -> SearchResult<Self> {
+        self.update = self.update.with_quality_storage(precision, retrieval)?;
+        Ok(self)
+    }
+
+    /// Finalize vectors and graphs on the caller's existing blocking pool.
+    #[must_use]
+    pub fn with_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        self.update = self.update.with_blocking_pool(pool);
+        self
+    }
+
+    /// Build a complete ordinary source/vector successor with both tiers.
+    ///
+    /// # Errors
+    /// Propagates source, producer, inference, artifact and cancellation errors.
+    pub async fn build(self, cx: &Cx) -> SearchResult<NativeBuiltIndex> {
+        Box::pin(self.update.build(cx)).await
+    }
+
+    /// Build both tiers over a complete, optionally repartitioned source cohort.
+    ///
+    /// # Errors
+    /// Includes ordinary build errors and invalid partition-size/count limits.
+    pub async fn build_sharded(
+        self,
+        cx: &Cx,
+        max_documents_per_shard: usize,
+    ) -> SearchResult<NativeBuiltShardedIndex> {
+        Box::pin(self.update.build_sharded(cx, max_documents_per_shard)).await
+    }
+
+    /// Build both tiers and a complete global Quill population for one cohort.
+    ///
+    /// # Errors
+    /// Includes ordinary build errors and lexical construction/admission errors.
+    #[cfg(feature = "quill")]
+    pub async fn build_hybrid(self, cx: &Cx) -> SearchResult<NativeBuiltHybridIndex> {
+        Box::pin(self.update.build_hybrid(cx)).await
+    }
+
+    /// Build both partitioned tiers and one complete global Quill population.
+    ///
+    /// # Errors
+    /// Includes sharded build errors and lexical construction/admission errors.
+    #[cfg(feature = "quill")]
+    pub async fn build_sharded_hybrid(
+        self,
+        cx: &Cx,
+        max_documents_per_shard: usize,
+    ) -> SearchResult<NativeBuiltShardedHybridIndex> {
+        Box::pin(
+            self.update
+                .build_sharded_hybrid(cx, max_documents_per_shard),
+        )
+        .await
+    }
+}
+
 /// Complete a fast-only authority generation's missing quality tier.
 ///
 /// This owns the selected source and fast-vector pins. It cannot edit documents,
@@ -131,12 +283,12 @@ impl NativeQualityCompletion {
         )?;
         quality.binding(&generation)?;
         update.builder.quality = Some(quality);
-        let authority = update
+        let source = update
             .builder
             .reuse
             .as_mut()
             .and_then(Arc::get_mut)
-            .and_then(|source| source.authority.as_mut())
+            .filter(|source| source.authority.is_some())
             .ok_or_else(|| {
                 invalid(
                     "quality_completion.source",
@@ -146,7 +298,7 @@ impl NativeQualityCompletion {
             })?;
         // Missing quality is an explicit build intent, never a failed lookup
         // silently converted into re-embedding during an ordinary update.
-        authority.completing_quality = true;
+        source.completing_quality = true;
         checkpoint(cx, "native_ann.quality_completion.prepared")?;
         Ok(Self {
             update,
@@ -237,6 +389,32 @@ enum AuthorityUpdateIntent {
 }
 
 impl NativeBuiltIndex {
+    /// Prepare quality inference while preserving this complete fast-only cohort.
+    ///
+    /// The new provider must share the retained prepared-input contract and
+    /// semantic/control kind. Admission checks every original fast identity and
+    /// row/source join before any inference or filesystem staging. The returned
+    /// builder can change only quality storage, batching and successor layout.
+    ///
+    /// # Errors
+    /// Refuses existing quality, a non-newer generation, incompatible providers,
+    /// inconsistent source membership, policy drift or cancellation.
+    pub fn begin_quality_completion(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        quality_provider: Arc<dyn crate::Embedder>,
+    ) -> SearchResult<NativeIndexQualityCompletion> {
+        NativeIndexQualityCompletion::from_partitions(
+            cx,
+            directory,
+            generation,
+            quality_provider,
+            std::slice::from_ref(self),
+        )
+    }
+
     /// Prepare a strictly newer generation while retaining the original sources.
     ///
     /// No files are created and no inference starts. The old owner is retained
@@ -259,6 +437,31 @@ impl NativeBuiltIndex {
 }
 
 impl NativeBuiltShardedIndex {
+    /// Prepare a complete quality tier over this retained fast-only inventory.
+    ///
+    /// Fast values, producer, precision and graph policy remain fixed across
+    /// every partition. The successor may use different partition boundaries;
+    /// all unchanged fast rows are carried by their exact source ID and content.
+    /// Preparation performs no inference or filesystem staging.
+    ///
+    /// # Errors
+    /// Includes ordinary quality-completion errors and mixed partition policies.
+    pub fn begin_quality_completion(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        quality_provider: Arc<dyn crate::Embedder>,
+    ) -> SearchResult<NativeIndexQualityCompletion> {
+        NativeIndexQualityCompletion::from_partitions(
+            cx,
+            directory,
+            generation,
+            quality_provider,
+            self.partitions(),
+        )
+    }
+
     /// Prepare source edits against every partition of this retained cohort.
     ///
     /// The returned update owns source and vector pins, not references to this
@@ -364,6 +567,7 @@ impl NativeIndexUpdate {
         }
         builder.reuse = Some(Arc::new(ReuseSource {
             partitions: retained,
+            completing_quality: false,
             #[cfg(feature = "quill")]
             authority: None,
         }));
@@ -548,11 +752,11 @@ impl NativeIndexUpdate {
                 fast,
                 quality,
             }],
+            completing_quality: false,
             authority: Some(AuthorityReuse {
                 snapshot: Arc::clone(snapshot.retained_snapshot()),
                 tier,
                 progressive,
-                completing_quality: false,
                 source: snapshot.metadata().commit_range.clone(),
             }),
         }));
@@ -868,6 +1072,24 @@ impl NativeIndexUpdate {
 
 #[cfg(feature = "quill")]
 impl NativeBuiltHybridIndex {
+    /// Add quality to this retained fast-only source/vector/Quill cohort.
+    ///
+    /// Finish with [`NativeIndexQualityCompletion::build_hybrid`] to return
+    /// complete hybrid readers. The predecessor remains independently readable.
+    ///
+    /// # Errors
+    /// Has the same admission errors as [`NativeBuiltIndex::begin_quality_completion`].
+    pub fn begin_quality_completion(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        quality_provider: Arc<dyn crate::Embedder>,
+    ) -> SearchResult<NativeIndexQualityCompletion> {
+        self.vectors()
+            .begin_quality_completion(cx, directory, generation, quality_provider)
+    }
+
     /// Stage source edits while this complete hybrid generation remains readable.
     ///
     /// Finish with [`NativeIndexUpdate::build_hybrid`] to rebuild lexical and both
@@ -888,6 +1110,24 @@ impl NativeBuiltHybridIndex {
 
 #[cfg(feature = "quill")]
 impl NativeBuiltShardedHybridIndex {
+    /// Add quality while retaining every source and fast row in this cohort.
+    ///
+    /// Finish with [`NativeIndexQualityCompletion::build_sharded_hybrid`] for
+    /// both complete tier inventories and one rebuilt global lexical population.
+    ///
+    /// # Errors
+    /// Has the same errors as [`NativeBuiltShardedIndex::begin_quality_completion`].
+    pub fn begin_quality_completion(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        quality_provider: Arc<dyn crate::Embedder>,
+    ) -> SearchResult<NativeIndexQualityCompletion> {
+        self.vectors()
+            .begin_quality_completion(cx, directory, generation, quality_provider)
+    }
+
     /// Stage edits against the exact source/vector cohort behind this Quill view.
     ///
     /// Finish with `build_sharded_hybrid` to reconstruct the complete global
@@ -910,6 +1150,10 @@ pub(super) struct ReuseSource {
     // Shared by ALL successor children: no repeated source-body, vector-slab,
     // or physical-row-map copies when repartitioning the predecessor.
     partitions: Vec<ReusePartition>,
+    // Only explicit completion constructors may set this after proving every
+    // predecessor partition is fast-only. Ordinary updates require their
+    // retained quality owner and must never treat an absent owner as a fallback.
+    completing_quality: bool,
     #[cfg(feature = "quill")]
     authority: Option<AuthorityReuse>,
 }
@@ -921,7 +1165,6 @@ struct AuthorityReuse {
     snapshot: Arc<OpenedGenerationSnapshotV1>,
     tier: EmbedderTierTag,
     progressive: bool,
-    completing_quality: bool,
     source: CommitRange,
 }
 
@@ -938,14 +1181,8 @@ pub(super) enum ReuseRole {
 }
 
 impl ReuseSource {
-    #[cfg_attr(not(feature = "quill"), allow(clippy::unnecessary_wraps))]
     pub(super) fn quality_reuse(&self) -> Option<(&Self, ReuseRole)> {
-        #[cfg(feature = "quill")]
-        if self
-            .authority
-            .as_ref()
-            .is_some_and(|authority| authority.completing_quality)
-        {
+        if self.completing_quality {
             return None;
         }
         Some((self, ReuseRole::Quality))
@@ -2328,6 +2565,452 @@ mod tests {
         });
     }
 
+    mod quality_completion {
+        use super::*;
+
+        fn fast_values(partitions: &[NativeBuiltIndex]) -> BTreeMap<String, Vec<u32>> {
+            partitions
+                .iter()
+                .flat_map(|part| {
+                    let owner = &part.fast.index.owner;
+                    (0..owner.record_count()).map(move |row| {
+                        (
+                            owner.doc_id_at(row).unwrap().to_owned(),
+                            owner
+                                .vector_at_f32(row)
+                                .unwrap()
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect(),
+                        )
+                    })
+                })
+                .collect()
+        }
+
+        fn assert_sources<'a>(
+            before: impl Iterator<Item = &'a IndexableDocument>,
+            after: impl Iterator<Item = &'a IndexableDocument>,
+        ) {
+            let fields =
+                |doc: &'a IndexableDocument| (&doc.id, &doc.content, &doc.title, &doc.metadata);
+            assert_eq!(
+                before.map(fields).collect::<Vec<_>>(),
+                after.map(fields).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn quality_completion_preserves_fast_precision_graph_policy_and_source() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for precision in [NativeBuildPrecision::F16, NativeBuildPrecision::F32] {
+                    for ann in [false, true] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let fast = Provider::new("completion-fast", 2);
+                        let quality = Provider::new("completion-quality", 3);
+                        let mut source = documents();
+                        source[0] = source[0]
+                            .clone()
+                            .with_title("retained title")
+                            .with_metadata("revision", "incumbent");
+                        let old = Box::pin(
+                            NativeIndexBuilder::new(
+                                dir.path().join("old"),
+                                generation(1),
+                                fast.clone(),
+                            )
+                            .unwrap()
+                            .with_fast_storage(precision, graph(ann))
+                            .add_documents(source)
+                            .build(&cx),
+                        )
+                        .await
+                        .unwrap();
+                        let original = std::fs::read(old.fast.vector_path()).unwrap();
+                        let next = Box::pin(
+                            old.begin_quality_completion(
+                                &cx,
+                                dir.path().join("completed"),
+                                generation(2),
+                                quality.clone(),
+                            )
+                            .unwrap()
+                            .with_batch_size(2)
+                            .unwrap()
+                            .with_max_batch_input_bytes(64)
+                            .unwrap()
+                            .with_quality_storage(NativeBuildPrecision::F32, graph(!ann))
+                            .unwrap()
+                            .build(&cx),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                        assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                        assert_eq!(
+                            fast_values(std::slice::from_ref(&old)),
+                            fast_values(std::slice::from_ref(&next)),
+                        );
+                        assert_eq!(next.fast.precision, precision);
+                        assert_eq!(next.fast.producer_identity, old.fast.producer_identity);
+                        assert_eq!(next.fast.binding.generation(), generation(2));
+                        assert_sources(old.documents().iter(), next.documents().iter());
+                        assert_eq!(std::fs::read(old.fast.vector_path()).unwrap(), original);
+                        assert!(old.quality().is_none());
+                        assert_eq!(next.quality().unwrap().index().live_count(), 5);
+                        assert_eq!(next.quality().unwrap().precision, NativeBuildPrecision::F32);
+                        assert_eq!(next.quality().unwrap().graph_path.is_some(), !ann);
+                        match (&old.fast.graph_receipt, &next.fast.graph_receipt) {
+                            (Some(before), Some(after)) => {
+                                assert_eq!(before.params, after.params);
+                                assert_eq!(before.seed, after.seed);
+                                assert_eq!(before.topology_sha256, after.topology_sha256);
+                            }
+                            (None, None) => {}
+                            _ => panic!("quality completion changed the fast retrieval backend"),
+                        }
+                        for text in ["vertical", "fractional"] {
+                            assert_eq!(
+                                old.fast().search(&cx, text, 5).await.unwrap(),
+                                next.fast().search(&cx, text, 5).await.unwrap(),
+                            );
+                            assert_eq!(
+                                next.quality()
+                                    .unwrap()
+                                    .search(&cx, text, 5)
+                                    .await
+                                    .unwrap()
+                                    .len(),
+                                5
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn sharded_quality_completion_repartitions_and_reopens_without_fast_inference() {
+            use crate::native_ann::builder::sharded::NativeShardedReopenLimits;
+
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for ann in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let fast = Provider::new("sharded-completion-fast", 2);
+                    let quality = Provider::new("sharded-completion-quality", 3);
+                    let old = Box::pin(
+                        NativeIndexBuilder::new(
+                            dir.path().join("old"),
+                            generation(1),
+                            fast.clone(),
+                        )
+                        .unwrap()
+                        .with_fast_storage(NativeBuildPrecision::F16, graph(ann))
+                        .add_documents(documents())
+                        .build_sharded(&cx, 2),
+                    )
+                    .await
+                    .unwrap();
+                    let original: Vec<_> = old
+                        .partitions()
+                        .iter()
+                        .map(|part| std::fs::read(part.fast.vector_path()).unwrap())
+                        .collect();
+                    let path = dir.path().join("completed");
+                    let next = Box::pin(
+                        old.begin_quality_completion(&cx, &path, generation(2), quality.clone())
+                            .unwrap()
+                            .with_batch_size(2)
+                            .unwrap()
+                            .with_quality_storage(NativeBuildPrecision::F32, graph(!ann))
+                            .unwrap()
+                            .build_sharded(&cx, 3),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(old.partitions().len(), 3);
+                    assert_eq!(next.partitions().len(), 2);
+                    assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                    assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                    assert_eq!(
+                        fast_values(old.partitions()),
+                        fast_values(next.partitions())
+                    );
+                    assert_sources(old.documents(), next.documents());
+                    for part in next.partitions() {
+                        assert_eq!(part.fast.precision, NativeBuildPrecision::F16);
+                        assert_eq!(
+                            part.fast.producer_identity,
+                            old.partitions()[0].fast.producer_identity
+                        );
+                        assert_eq!(
+                            part.quality().unwrap().index().live_count(),
+                            part.documents().len()
+                        );
+                        match (
+                            &old.partitions()[0].fast.graph_receipt,
+                            &part.fast.graph_receipt,
+                        ) {
+                            (Some(before), Some(after)) => {
+                                assert_eq!(before.params, after.params);
+                                assert_eq!(before.seed, after.seed);
+                            }
+                            (None, None) => {}
+                            _ => panic!("repartitioned completion changed the fast backend"),
+                        }
+                    }
+                    let receipt = next.seal_for_reopen(&cx).unwrap();
+                    let reopened = NativeBuiltShardedIndex::open_selected(
+                        &cx,
+                        &path,
+                        &receipt,
+                        fast.clone(),
+                        Some(quality.clone()),
+                        NativeShardedReopenLimits::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        fast_values(old.partitions()),
+                        fast_values(reopened.partitions())
+                    );
+                    assert_sources(old.documents(), reopened.documents());
+                    for text in ["vertical", "fractional"] {
+                        let before = old.search_fast(&cx, text, 5).await.unwrap();
+                        let after = reopened.search_fast(&cx, text, 5).await.unwrap();
+                        assert_eq!(
+                            before
+                                .iter()
+                                .map(|hit| (&hit.doc_id, hit.score.to_bits()))
+                                .collect::<Vec<_>>(),
+                            after
+                                .iter()
+                                .map(|hit| (&hit.doc_id, hit.score.to_bits()))
+                                .collect::<Vec<_>>(),
+                        );
+                        assert_eq!(
+                            reopened.search_quality(&cx, text, 5).await.unwrap().len(),
+                            5
+                        );
+                    }
+                    for (part, bytes) in old.partitions().iter().zip(original) {
+                        assert_eq!(std::fs::read(part.fast.vector_path()).unwrap(), bytes);
+                        assert!(part.quality().is_none());
+                    }
+                    assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                    assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                }
+            });
+        }
+
+        #[test]
+        fn quality_completion_refuses_topology_input_and_provider_drift_before_staging() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("completion-fast", 2);
+                let quality = Provider::new("completion-quality", 3);
+                let old = Box::pin(
+                    NativeIndexBuilder::new(dir.path().join("old"), generation(1), fast.clone())
+                        .unwrap()
+                        .add_documents(documents())
+                        .build(&cx),
+                )
+                .await
+                .unwrap();
+                let rejected = dir.path().join("rejected");
+                assert!(
+                    old.begin_quality_completion(&cx, &rejected, generation(1), quality.clone())
+                        .is_err()
+                );
+                let mut changed = quality.identity.clone();
+                changed
+                    .input
+                    .canonicalization
+                    .push_str("-different-preparation");
+                changed.space.input_contract_fingerprint = changed.input.fingerprint();
+                changed.producer.space_fingerprint = changed.space.fingerprint();
+                let incompatible = Provider::from_identity(changed);
+                assert!(
+                    old.begin_quality_completion(
+                        &cx,
+                        &rejected,
+                        generation(2),
+                        incompatible.clone()
+                    )
+                    .is_err()
+                );
+                fast.fault.store(IDENTITY_DRIFT, Ordering::SeqCst);
+                assert!(
+                    old.begin_quality_completion(&cx, &rejected, generation(2), quality.clone())
+                        .is_err()
+                );
+                fast.fault.store(OK, Ordering::SeqCst);
+                for model in [&fast, &quality] {
+                    let completion = old
+                        .begin_quality_completion(&cx, &rejected, generation(2), quality.clone())
+                        .unwrap();
+                    model.fault.store(IDENTITY_DRIFT, Ordering::SeqCst);
+                    assert!(Box::pin(completion.build(&cx)).await.is_err());
+                    model.fault.store(OK, Ordering::SeqCst);
+                    assert!(!rejected.exists());
+                }
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 0);
+                assert_eq!(incompatible.submitted.load(Ordering::SeqCst), 0);
+                let full = Box::pin(
+                    old.begin_quality_completion(
+                        &cx,
+                        dir.path().join("complete"),
+                        generation(2),
+                        quality.clone(),
+                    )
+                    .unwrap()
+                    .build(&cx),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    full.begin_quality_completion(&cx, &rejected, generation(3), quality.clone())
+                        .is_err()
+                );
+                assert!(!rejected.exists());
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+
+                // Missing quality remains an error for ordinary updates. Only
+                // the explicit completion constructor may disable quality reuse.
+                let mut ordinary = old.begin_update(&cx, &rejected, generation(2)).unwrap();
+                ordinary.builder.quality = Some(TierPlan::new(quality.clone()).unwrap());
+                assert!(matches!(
+                    Box::pin(ordinary.build(&cx)).await,
+                    Err(SearchError::InvalidConfig { field, .. }) if field == "update.source_join"
+                ));
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+            });
+        }
+
+        #[test]
+        fn quality_completion_failures_cancellation_and_abandonment_keep_fast_usable() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("completion-fast", 2);
+                let quality = Provider::new("completion-quality", 3);
+                let old = Box::pin(
+                    NativeIndexBuilder::new(dir.path().join("old"), generation(1), fast.clone())
+                        .unwrap()
+                        .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                        .add_documents(documents())
+                        .build(&cx),
+                )
+                .await
+                .unwrap();
+                let original = std::fs::read(old.fast.vector_path()).unwrap();
+                for fault in [FAIL, FOREIGN, CANCEL] {
+                    quality.fault.store(fault, Ordering::SeqCst);
+                    let path = dir.path().join(format!("failed-{fault}"));
+                    let outcome = Box::pin(
+                        old.begin_quality_completion(&cx, &path, generation(2), quality.clone())
+                            .unwrap()
+                            .with_batch_size(2)
+                            .unwrap()
+                            .build(&cx),
+                    )
+                    .await;
+                    assert!(outcome.is_err());
+                    if fault == CANCEL {
+                        assert!(matches!(outcome, Err(SearchError::Cancelled { .. })));
+                        cx.set_cancel_requested(false);
+                    }
+                    assert!(!path.join("fast.fsvi").exists());
+                    assert!(!path.join("native.snapshot.json").exists());
+                    assert_eq!(std::fs::read(old.fast.vector_path()).unwrap(), original);
+                    assert_eq!(
+                        old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                        "b"
+                    );
+                    assert!(old.quality().is_none());
+                    assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                }
+                quality.fault.store(PENDING, Ordering::SeqCst);
+                let before_drop = quality.drops.load(Ordering::SeqCst);
+                let path = dir.path().join("abandoned");
+                let completion = old
+                    .begin_quality_completion(&cx, &path, generation(2), quality.clone())
+                    .unwrap();
+                let mut pending = Box::pin(completion.build(&cx));
+                assert!(
+                    pending
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                assert_eq!(
+                    old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                    "b"
+                );
+                drop(pending);
+                assert_eq!(quality.drops.load(Ordering::SeqCst), before_drop + 1);
+                assert!(!path.join("fast.fsvi").exists());
+                quality.fault.store(OK, Ordering::SeqCst);
+                let completed = Box::pin(
+                    old.begin_quality_completion(
+                        &cx,
+                        dir.path().join("retry"),
+                        generation(2),
+                        quality,
+                    )
+                    .unwrap()
+                    .build(&cx),
+                )
+                .await
+                .unwrap();
+                assert_eq!(completed.quality().unwrap().index().live_count(), 5);
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(std::fs::read(old.fast.vector_path()).unwrap(), original);
+            });
+        }
+
+        #[test]
+        fn empty_quality_completion_retains_both_identities_without_inference() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("empty-fast", 2);
+                let quality = Provider::new("empty-quality", 3);
+                let old = Box::pin(
+                    NativeIndexBuilder::new(dir.path().join("old"), generation(1), fast.clone())
+                        .unwrap()
+                        .build_sharded(&cx, 2),
+                )
+                .await
+                .unwrap();
+                let completed = Box::pin(
+                    old.begin_quality_completion(
+                        &cx,
+                        dir.path().join("complete"),
+                        generation(2),
+                        quality.clone(),
+                    )
+                    .unwrap()
+                    .build_sharded(&cx, 3),
+                )
+                .await
+                .unwrap();
+                assert_eq!(completed.partitions().len(), 1);
+                assert_eq!(completed.document_count(), 0);
+                assert!(completed.quality().is_some());
+                assert_eq!(
+                    completed.partitions()[0]
+                        .quality()
+                        .unwrap()
+                        .producer_identity,
+                    quality.identity
+                );
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 0);
+            });
+        }
+    }
+
     #[cfg(feature = "quill")]
     mod model_migrations {
         use super::*;
@@ -2386,6 +3069,7 @@ mod tests {
                     fast: reuse_tier(&builder.fast, &old.fast)?,
                     quality: Some(reuse_tier(builder.quality.as_ref().unwrap(), old_quality)?),
                 }],
+                completing_quality: false,
                 authority: None,
             }));
             Ok(NativeIndexUpdate {

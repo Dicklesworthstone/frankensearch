@@ -251,6 +251,37 @@ cargo test -p frankensearch --features hybrid --bin frankensearch-native \
   serve::warm_update
 ```
 
+## Complete a fast-only sharded selection
+
+`complete-quality` adds a quality tier while preserving every admitted fast
+vector and the original source records. The new `--shard-size` is explicit and
+may differ from the predecessor's layout; reuse follows source IDs across shard
+boundaries. The original fast model and a compatible local quality provider must
+both be available.
+
+```sh
+frankensearch-native complete-quality \
+  --receipt /absolute/receipts/fast-g1.json \
+  --index-dir /absolute/indexes/full-g2 \
+  --new-receipt /absolute/receipts/full-g2.json \
+  --model-dir /absolute/models \
+  --shard-size 2500 --batch-size 16
+```
+
+The new quality tier uses F32 and native HNSW by default; `--quality-exact`
+selects exact quality retrieval. Fast precision and graph policy are inherited.
+`--quality-backend` and `--quality-model-dir` select the quality provider as on
+fresh indexing. Existing quality tiers, replacement input and `--exact` are
+refused. Only a complete, sealed two-tier cohort receives a new selection receipt
+and a `quality_completed` event. Any final-shard failure leaves the original
+receipt usable, and no successful prefix is published as a complete generation.
+
+The command creates complete successor artifacts and a global Quill index;
+it saves fast inference, not all corpus-wide storage or graph work. It does not
+activate a server or create a durable CURRENT authority. Open the new receipt
+with both matching models to use quality/full mode. See `native-search-cli.md`
+for destination, cancellation and receipt-persistence behavior.
+
 ## Rebuild after search-artifact damage or a deliberate model migration
 
 `rebuild --shard-size N` authenticates the complete retained source from a sharded

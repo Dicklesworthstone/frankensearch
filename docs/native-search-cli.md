@@ -1681,6 +1681,63 @@ phase fails. Streaming emits `rerank_failed` with the exact preceding page and a
 deadline includes reranking: expiry after Refined starts no scorer; late scoring
 never replaces the delivered page. Synchronous native work is not preemptible.
 
+## Add quality to a fast-only native index
+
+`complete-quality` adds a complete, independently bound quality tier to an
+ordinary or sharded fast-only selection. It retains the original prepared source
+records and fast vectors, including their precision and exact/native-HNSW policy.
+Only the new quality provider receives document inference requests. Both local
+models must be available: the original fast model admits the retained fast owner,
+and the selected quality model produces the new tier.
+
+```sh
+./target/release/frankensearch-native complete-quality \
+  --receipt ./native-receipts/fast-g1.json \
+  --index-dir ./native-indexes/full-g2 \
+  --new-receipt ./native-receipts/full-g2.json \
+  --model-dir /absolute/path/to/installed/models \
+  --batch-size 16
+./target/release/frankensearch-native search \
+  --receipt ./native-receipts/full-g2.json \
+  --model-dir /absolute/path/to/installed/models \
+  --mode full --query 'retry failed network requests'
+```
+
+The quality tier uses F32 storage and native HNSW by default. `--quality-exact`
+selects exact retrieval for that new tier; it does not change fast retrieval.
+`--quality-backend` and `--quality-model-dir` select a local quality producer as
+on fresh indexing. The provider must retain the original prepared-input
+contract. `--input`, `--fast-only`, and `--exact` are invalid for completion.
+A selection with an existing quality tier is refused; `rebuild` remains the
+explicit full-reembedding operation for replacing models or damaged artifacts.
+
+For a sharded receipt, pass an explicit `--shard-size N`. Repartitioning preserves
+fast vectors by source ID even when shard boundaries change. An ordinary receipt
+does not accept `--shard-size`. The command checks the same final source/document
+limits as incremental update and supports `--batch-size 1..256`. Although fast
+inference is reused, complete successor source/vector images, native graphs and
+the global Quill index still require corpus-wide memory and I/O.
+
+Both destinations must be new, non-overlapping and outside the predecessor.
+The command seals all tiers and Quill before saving the new selection receipt,
+then emits `event: "quality_completed"`, the predecessor, the new selection and
+`fast_reused_documents`. The original receipt, artifacts and readers remain
+usable. Failure or cancellation during building creates no completion receipt;
+inert partial files can remain. A failure or cancellation during or after receipt
+persistence can leave a complete new receipt, so inspect that destination before
+retrying with fresh paths. Completion never rewrites an existing receipt or
+activates a running server. Open the new receipt with both matching models to use
+quality or full search.
+
+Library consumers can call `begin_quality_completion` on `NativeBuiltIndex`,
+`NativeBuiltHybridIndex`, `NativeBuiltShardedIndex`, or
+`NativeBuiltShardedHybridIndex`. The returned `NativeIndexQualityCompletion`
+can build either layout, select quality storage and bound inference batches,
+while keeping the fast producer and source content fixed. Live hybrid snapshots
+also expose a completion builder; their completed candidates install through
+the existing exact-predecessor check, so a stale completion cannot displace an
+intervening activation.
+
 ## Recover a damaged native index by rebuilding its selected sources
 
 Ordinary search, activation and incremental update still require every selected
