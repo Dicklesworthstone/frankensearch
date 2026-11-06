@@ -7382,6 +7382,10 @@ mod warm_authority {
 
 #[cfg(target_os = "linux")]
 mod progressive_authority {
+    mod timeout_tests {
+        include!("authority_timeout_tests.rs");
+    }
+
     use std::io::Cursor;
     use std::os::unix::fs::DirBuilderExt as _;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7478,6 +7482,7 @@ mod progressive_authority {
             limit: 2,
             mode,
             stream,
+            deadline: None,
         }
     }
 

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use frankensearch::native_ann::builder::deadline::NativeSearchDeadline;
 use frankensearch::native_ann::builder::scope::NativeScopedGenerationSnapshot;
 use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
@@ -51,7 +52,8 @@ use sha2::{Digest as _, Sha256};
 use super::{
     MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Models, Result, SCHEMA,
     bad, emit, encode, execution_context, filter::Filter, models, new_generation, new_path,
-    positive as number, read_documents, serve::source, update as mutations, validate_query, value,
+    positive as number, query, read_documents, serve::source, update as mutations, validate_query,
+    value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
@@ -101,7 +103,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
   authority-search --receipt JSON --query TEXT [--limit N] [--lexical-only]\n\
       [--current-receipt CURRENT_JSON]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--mode fast|quality|full|lexical] [--stream] [--filter JSON]\n\
+      [--mode fast|quality|full|lexical] [--stream] [--filter JSON] [--timeout-ms N]\n\
       [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-fetch --receipt JSON --doc-id ID [--offset-bytes N] [--max-bytes N]\n\
       [--current-receipt CURRENT_JSON]\n\
@@ -110,7 +112,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
   authority-serve --receipt JSON [--limit N] [--allow-activation] [--allow-updates]\n\
       [--current-receipt CURRENT_JSON]\n\
       [--allow-model-activation]\n\
-      [--lexical-only]\n\
+      [--lexical-only] [--timeout-ms N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N] [--batch-size N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
@@ -122,6 +124,11 @@ authority. Full search independently retrieves quality candidates, including\n\
 documents absent from fast results. --stream emits Initial then Refined from\n\
 the same retained generation. --mode fast or quality loads only that producer.\n\
 Full generations support independently bound exact or native HNSW tiers.\n\
+Search timeouts are total query budgets of 1..600000 milliseconds after startup\n\
+admission and model loading. All query stages share one deadline; output delivery\n\
+does not turn a completed final page into a timeout. A warm request's timeout_ms\n\
+can shorten the server's --timeout-ms ceiling. A timed-out query leaves the\n\
+retained authority and warm models available for subsequent requests.\n\
 --retrieval selects both full tiers; partial/sharded cohorts remain unsupported.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
@@ -319,6 +326,7 @@ struct Options {
     progressive: bool,
     mode: Option<QueryMode>,
     stream: bool,
+    timeout_ms: Option<u64>,
     retrieval: Option<NativeBuildRetrieval>,
     source_low: Option<u64>,
     source_high: Option<u64>,
@@ -390,6 +398,7 @@ impl Options {
             progressive: false,
             mode: None,
             stream: false,
+            timeout_ms: None,
             retrieval: None,
             source_low: None,
             source_high: None,
@@ -608,6 +617,13 @@ impl Options {
                     if matches!(command, Command::Search | Command::Serve | Command::Rebuild) =>
                 {
                     options.limit = number(&value(&mut args)?, 1_000)?;
+                }
+                "--timeout-ms" if matches!(command, Command::Search | Command::Serve) => {
+                    options.timeout_ms =
+                        Some(value(&mut args)?.parse().map_err(|_| {
+                            bad("query timeout must be an unsigned millisecond count")
+                        })?);
+                    query::validate_timeout(options.timeout_ms)?;
                 }
                 "--mode" if command == Command::Search => {
                     options.mode = Some(match value(&mut args)?.as_str() {
@@ -2654,6 +2670,7 @@ struct QueryPlan<'a> {
     limit: usize,
     mode: QueryMode,
     stream: bool,
+    deadline: Option<&'a NativeSearchDeadline>,
 }
 
 /// Execute against one retained generation and deliver each completed phase
@@ -2679,23 +2696,34 @@ where
             .ok_or_else(|| serve_refused("quality_provider_missing"))?;
         if plan.stream {
             let mut empty_initial_without_refinement = false;
-            let mut query = match scope {
-                Some(scope) => scope.search_progressive_with_quality(
-                    cx,
-                    loaded.fast.as_ref(),
-                    quality,
-                    plan.text,
-                    plan.limit,
-                )?,
-                None => snapshot.search_progressive_with_quality(
-                    cx,
-                    loaded.fast.as_ref(),
-                    quality,
-                    plan.text,
-                    plan.limit,
-                )?,
-            };
-            while let Some(phase) = query.next_phase().await? {
+            let mut query = query::within(cx, plan.deadline, async {
+                Ok(match scope {
+                    Some(scope) => scope.search_progressive_with_quality(
+                        cx,
+                        loaded.fast.as_ref(),
+                        quality,
+                        plan.text,
+                        plan.limit,
+                    )?,
+                    None => snapshot.search_progressive_with_quality(
+                        cx,
+                        loaded.fast.as_ref(),
+                        quality,
+                        plan.text,
+                        plan.limit,
+                    )?,
+                })
+            })
+            .await?;
+            // Do not poll again after a terminal phase was delivered: slow
+            // output must not retroactively reject a completed final page.
+            while !query.is_finished() {
+                let Some(phase) =
+                    query::within(cx, plan.deadline, async { Ok(query.next_phase().await?) })
+                        .await?
+                else {
+                    break;
+                };
                 let (name, results) = match phase {
                     NativeSearchPhase::Initial { results, .. } => {
                         empty_initial_without_refinement = results.is_empty();
@@ -2717,73 +2745,88 @@ where
                 // A zero-sized scope admits both identities, then the native
                 // iterator completes after empty Initial without inference.
                 // Finish the CLI's two-frame contract on a persistent stream.
+                // Native computation is already complete. Delivering its
+                // synthetic final frame must not recheck elapsed output time.
                 checkpoint(cx)?;
                 deliver("refined", &[])?;
             }
         } else {
-            let results = match scope {
-                Some(scope) => {
-                    Box::pin(scope.search_refined_text(
-                        cx,
-                        loaded.fast.as_ref(),
-                        quality,
-                        plan.text,
-                        plan.limit,
-                    ))
-                    .await?
-                }
-                None => {
-                    Box::pin(snapshot.search_refined_text(
-                        cx,
-                        loaded.fast.as_ref(),
-                        quality,
-                        plan.text,
-                        plan.limit,
-                    ))
-                    .await?
-                }
-            };
-            deliver("refined", &results)?;
-        }
-    } else {
-        let (phase, results) = if plan.mode == QueryMode::Quality {
-            let quality = loaded
-                .quality
-                .as_deref()
-                .unwrap_or_else(|| loaded.fast.as_ref());
-            (
-                "quality",
-                match scope {
+            let results = query::within(cx, plan.deadline, async {
+                Ok(match scope {
                     Some(scope) => {
-                        Box::pin(scope.search_quality_text(cx, quality, plan.text, plan.limit))
-                            .await?
-                    }
-                    None => {
-                        Box::pin(snapshot.search_quality_text(cx, quality, plan.text, plan.limit))
-                            .await?
-                    }
-                },
-            )
-        } else {
-            (
-                "initial",
-                match scope {
-                    Some(scope) => {
-                        Box::pin(scope.search_text(cx, loaded.fast.as_ref(), plan.text, plan.limit))
-                            .await?
-                    }
-                    None => {
-                        Box::pin(snapshot.search_text(
+                        Box::pin(scope.search_refined_text(
                             cx,
                             loaded.fast.as_ref(),
+                            quality,
                             plan.text,
                             plan.limit,
                         ))
                         .await?
                     }
-                },
-            )
-        };
+                    None => {
+                        Box::pin(snapshot.search_refined_text(
+                            cx,
+                            loaded.fast.as_ref(),
+                            quality,
+                            plan.text,
+                            plan.limit,
+                        ))
+                        .await?
+                    }
+                })
+            })
+            .await?;
+            deliver("refined", &results)?;
+        }
+    } else {
+        let (phase, results) = query::within(cx, plan.deadline, async {
+            Ok(if plan.mode == QueryMode::Quality {
+                let quality = loaded
+                    .quality
+                    .as_deref()
+                    .unwrap_or_else(|| loaded.fast.as_ref());
+                (
+                    "quality",
+                    match scope {
+                        Some(scope) => {
+                            Box::pin(scope.search_quality_text(cx, quality, plan.text, plan.limit))
+                                .await?
+                        }
+                        None => {
+                            Box::pin(
+                                snapshot.search_quality_text(cx, quality, plan.text, plan.limit),
+                            )
+                            .await?
+                        }
+                    },
+                )
+            } else {
+                (
+                    "initial",
+                    match scope {
+                        Some(scope) => {
+                            Box::pin(scope.search_text(
+                                cx,
+                                loaded.fast.as_ref(),
+                                plan.text,
+                                plan.limit,
+                            ))
+                            .await?
+                        }
+                        None => {
+                            Box::pin(snapshot.search_text(
+                                cx,
+                                loaded.fast.as_ref(),
+                                plan.text,
+                                plan.limit,
+                            ))
+                            .await?
+                        }
+                    },
+                )
+            })
+        })
+        .await?;
         deliver(phase, &results)?;
     }
     Ok(())
@@ -2868,11 +2911,17 @@ where
         }
         .into()
     };
+    // Opening the selected images, fixed scope and models is startup work,
+    // matching the ordinary native CLI. Every query phase then shares this
+    // absolute deadline, including synchronous retrieval and hydration.
+    let policy = query::Policy::new(cx, options.timeout_ms)?;
+    let deadline = policy.start(cx, None)?;
     let plan = QueryPlan {
         text: query,
         limit: options.limit,
         mode,
         stream: options.stream,
+        deadline: deadline.as_ref(),
     };
     query_selected(
         cx,
@@ -2980,6 +3029,7 @@ struct AuthoritySearchRequest {
     query: String,
     limit: Option<usize>,
     mode: Option<QueryMode>,
+    timeout_ms: Option<u64>,
     #[serde(default)]
     stream: bool,
     filter: Option<Filter>,
@@ -3042,14 +3092,17 @@ where
     F: FnMut(&'static str, &[frankensearch::ScoredResult]) -> Result<()>,
 {
     if plan.mode == QueryMode::Lexical {
-        let results = match scope {
-            Some(scope) => scope.search_lexical_text(cx, plan.text, plan.limit).await?,
-            None => {
-                snapshot
-                    .search_lexical_text(cx, plan.text, plan.limit)
-                    .await?
-            }
-        };
+        let results = query::within(cx, plan.deadline, async {
+            Ok(match scope {
+                Some(scope) => scope.search_lexical_text(cx, plan.text, plan.limit).await?,
+                None => {
+                    snapshot
+                        .search_lexical_text(cx, plan.text, plan.limit)
+                        .await?
+                }
+            })
+        })
+        .await?;
         checkpoint(cx)?;
         deliver("lexical", &results)
     } else {
@@ -3197,6 +3250,7 @@ struct AuthoritySession {
     allow_activation: bool,
     allow_model_activation: bool,
     update_limits: Option<AuthorityUpdateLimits>,
+    query_policy: query::Policy,
 }
 
 impl AuthoritySession {
@@ -3263,6 +3317,7 @@ impl AuthoritySession {
             allow_activation,
             allow_model_activation: false,
             update_limits: None,
+            query_policy: query::Policy::default(),
         })
     }
 
@@ -3349,6 +3404,16 @@ impl AuthoritySession {
                 .downcast_ref::<AuthorityServeRefusal>()
                 .map_or(default_code, |error| error.0)
         );
+        if let Some(SearchError::SearchTimeout {
+            elapsed_ms,
+            budget_ms,
+        }) = error.downcast_ref::<SearchError>()
+        {
+            response["status"] = serde_json::json!("timed_out");
+            response["code"] = serde_json::json!("search_timeout");
+            response["elapsed_ms"] = serde_json::json!(elapsed_ms);
+            response["budget_ms"] = serde_json::json!(budget_ms);
+        }
         // Never forward provider error bodies, model paths, receipt JSON, or
         // unvalidated request IDs into the persistent protocol.
         response
@@ -3396,8 +3461,19 @@ impl AuthoritySession {
             return Err(serve_refused("invalid_limit"));
         }
         let mode = self.models.query_mode(&self.receipt, request.mode)?;
+        // Validate before any provider or source work. An override can only
+        // shorten a configured server budget, never disable or extend it.
+        self.query_policy
+            .effective_ms(request.timeout_ms)
+            .map_err(|_| serve_refused("invalid_timeout"))?;
+        let deadline = self.query_policy.start(cx, request.timeout_ms)?;
         if mode != QueryMode::Lexical {
-            self.models.admit(&self.receipt)?;
+            // Preserve the protocol's typed admission refusal before expiry;
+            // the outer boundary still rejects late synchronous admission.
+            query::within(cx, deadline.as_ref(), async {
+                Ok(self.models.admit(&self.receipt))
+            })
+            .await??;
         }
         if let Some(filter) = &request.filter {
             filter
@@ -3407,15 +3483,18 @@ impl AuthoritySession {
         // Narrow the owner's frozen membership; never substitute a request
         // scope for it. Without a fixed filter, only filtered requests export
         // bounded source. No request can mutate the session's retained scope.
-        let narrowed = match (self.scope.as_ref(), request.filter.as_ref()) {
-            (Some(scope), Some(filter)) => {
-                Some(scope.narrow(cx, |document| Ok(filter.matches(document)))?)
-            }
-            (None, Some(filter)) => {
-                prepare_scope(cx, &self.snapshot, Some(filter), self.max_source_bytes)?
-            }
-            _ => None,
-        };
+        let narrowed = query::within(cx, deadline.as_ref(), async {
+            Ok(match (self.scope.as_ref(), request.filter.as_ref()) {
+                (Some(scope), Some(filter)) => {
+                    Some(scope.narrow(cx, |document| Ok(filter.matches(document)))?)
+                }
+                (None, Some(filter)) => {
+                    prepare_scope(cx, &self.snapshot, Some(filter), self.max_source_bytes)?
+                }
+                _ => None,
+            })
+        })
+        .await?;
         let scope = narrowed.as_ref().or(self.scope.as_ref());
         // NativeGenerationSnapshot independently checks the producer before
         // inference and the actual bound output afterward, including zero hits.
@@ -3429,6 +3508,7 @@ impl AuthoritySession {
                 limit,
                 mode,
                 stream: request.stream,
+                deadline: deadline.as_ref(),
             },
             |phase, results| {
                 let mut response =
@@ -3748,6 +3828,7 @@ async fn serve_session(
         ready["max_source_bytes"] = serde_json::json!(limits.max_source_bytes);
     }
     ready["default_limit"] = serde_json::json!(session.default_limit);
+    ready["maximum_timeout_ms"] = serde_json::json!(session.query_policy.maximum_ms());
     ready["max_source_bytes"] = serde_json::json!(session.max_source_bytes);
     ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
     ready["default_mode"] =
@@ -3972,6 +4053,7 @@ async fn serve(
     session.scope = scope;
     session.fixed_filter = options.filter.clone();
     session.max_source_bytes = options.max_source_bytes;
+    session.query_policy = query::Policy::new(cx, options.timeout_ms)?;
     serve_session(cx, &mut session, &mut io::stdin().lock(), output).await
 }
 
