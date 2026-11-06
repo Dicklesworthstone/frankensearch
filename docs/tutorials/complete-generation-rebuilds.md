@@ -203,6 +203,56 @@ publication rather than rebuilding again. This capability uses the cooperative
 complete-store protocol; it does not execute the core recovery planner's
 model-acquisition or fixed-authority actions.
 
+### Resume an interrupted source build
+
+For a long rebuild, save its inactive-build handoff before indexing starts:
+
+```sh
+fsfs-recover --index-dir /work/search-store \
+  --config /work/fsfs.toml --rebuild-source /work/source \
+  --query "connection pooling" --limit 10 --prepare \
+  --save-build /work/search-build.json \
+  --save-preparation /work/prepared-search.json
+```
+
+If indexing is interrupted before a sealed preparation is produced, explicitly
+resume that candidate with the same source, query and resolved policy:
+
+```sh
+fsfs-recover --index-dir /work/search-store \
+  --config /work/fsfs.toml --rebuild-source /work/source \
+  --query "connection pooling" --limit 10 --prepare \
+  --resume-build /work/search-build.json \
+  --save-preparation /work/prepared-resumed-search.json
+```
+
+`--save-build` creates a flushed handoff outside the store before model or index
+work begins, with private permissions on Unix. It never overwrites an existing
+file. `--resume-build`
+reacquires normal publication and engine writer ownership and opens exactly the
+named inactive candidate. It keeps the original selection guard: another
+publication, a relocated source/store, a changed indexing contract, or a changed
+or unprovable executable refuses resume. Linux can prove the same running
+executable across processes; platforms without that proof support only reuse
+within the original process. There is no abandoned-directory scan or automatic
+ordinary `fsfs index` resume.
+
+Resume rediscovers sources and rechecks each recorded content hash and actual
+model producer. Only a consistent **durable** checkpoint can reuse completed
+vectors. Changed or removed inputs are reconciled, and changed producers require
+new vectors. Work marked undurable is re-embedded; interruption inside a batch
+can therefore require rebuilding the entire candidate. Saving a build handoff
+does not certify semantic readiness or preserve every partially processed batch.
+
+The build handoff and sealed preparation serve different stages. Once the
+candidate is sealed, `--resume-build` refuses mutation; use the successful
+`--save-preparation` receipt with `--resume-file` to preview/apply that immutable
+snapshot or confirm its publication durability. A resumed source build still
+requires a useful query preview before publication, and a separate preparation
+file should be retained for that next stage.
+If sealing finished without a trusted preparation receipt being exported, start
+a new recovery build; the build handoff alone cannot authorize sealed restoration.
+
 ## Warm standard-input serving
 
 A long-lived process can reuse admitted models and indexes while following

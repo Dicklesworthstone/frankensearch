@@ -31,7 +31,7 @@ use super::{
     content_sha256_hex, retained_search_checkpoint, write_indexing_checkpoint,
 };
 use crate::generation_store::{
-    COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore, PublishedGeneration,
+    COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore, GenerationBuild, PublishedGeneration,
     is_quill_segment_name,
 };
 
@@ -54,6 +54,101 @@ const MAX_COPY_DEPTH: usize = 64;
 const MAX_COPY_ENTRIES: usize = 200_000;
 const MAX_LEGACY_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 static SESSION: OnceLock<String> = OnceLock::new();
+
+/// Caller-owned handoff for one interrupted, inactive source recovery build.
+///
+/// Save this before indexing starts and retain it in trusted storage. It binds
+/// the store's original selection and candidate, indexing contract, execution
+/// identity and source root. It is not a signature, an artifact inventory or a
+/// completed-generation receipt: resume must validate every durable checkpoint
+/// and current source/producer through the ordinary indexer again. Unsupported
+/// executable proofs permit only same-process resume, never a pathname guess.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedRebuildCheckpoint {
+    schema_version: u16,
+    generation_id: String,
+    expected_selection_sha256: String,
+    session: String,
+    executable_sha256: Option<String>,
+    indexing_contract_sha256: String,
+    source_path_sha256: String,
+}
+
+impl RetainedRebuildCheckpoint {
+    pub(super) async fn capture(
+        cx: &Cx,
+        runtime: &FsfsRuntime,
+        build: &GenerationBuild,
+    ) -> SearchResult<Self> {
+        execution::prepare(cx).await?;
+        let (generation_id, expected_selection_sha256) = build.rebuild_resume_receipt()?;
+        Ok(Self {
+            schema_version: 1,
+            generation_id,
+            expected_selection_sha256,
+            session: session_id()?.to_owned(),
+            executable_sha256: execution::fingerprint().map(str::to_owned),
+            indexing_contract_sha256: indexing_contract_digest(runtime)?,
+            source_path_sha256: rebuild_source_sha256(runtime)?,
+        })
+    }
+
+    pub(super) async fn admit_scope(&self, cx: &Cx, runtime: &FsfsRuntime) -> SearchResult<()> {
+        retained_search_checkpoint(cx)?;
+        if self.schema_version != 1
+            || !hex_digest(&self.expected_selection_sha256)
+            || !hex_digest(&self.indexing_contract_sha256)
+            || !hex_digest(&self.source_path_sha256)
+            || self.session.is_empty()
+            || self.session.len() > 128
+            || self
+                .executable_sha256
+                .as_deref()
+                .is_some_and(|value| !hex_digest(value))
+        {
+            return Err(reuse_error("invalid inactive source rebuild receipt"));
+        }
+        if self.indexing_contract_sha256 != indexing_contract_digest(runtime)?
+            || self.source_path_sha256 != rebuild_source_sha256(runtime)?
+        {
+            return Err(reuse_error(
+                "inactive rebuild source or indexing contract changed; start a new recovery build",
+            ));
+        }
+        execution::prepare(cx).await?;
+        let matches = match (self.executable_sha256.as_deref(), execution::fingerprint()) {
+            (Some(expected), Some(actual)) => expected == actual,
+            (None, None) => self.session == session_id()?,
+            _ => false,
+        };
+        retained_search_checkpoint(cx)?;
+        if !matches {
+            return Err(reuse_error(
+                "inactive rebuild execution identity is unproven or changed; start a new recovery build",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn resume(
+        &self,
+        cx: &Cx,
+        store: &CompleteGenerationStore,
+    ) -> SearchResult<GenerationBuild> {
+        store.resume_recovery_rebuild(cx, &self.generation_id, &self.expected_selection_sha256)
+    }
+}
+
+fn rebuild_source_sha256(runtime: &FsfsRuntime) -> SearchResult<String> {
+    let source = fs::canonicalize(runtime.resolve_target_root()?)?;
+    let mut hash = Sha256::new();
+    hash.update(b"fsfs.inactive-source-rebuild.source-path.v1\0");
+    hash.update(source.as_os_str().as_encoded_bytes());
+    Ok(frankensearch_storage::ContentHasher::to_hex(
+        &hash.finalize().into(),
+    ))
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,9 +326,24 @@ impl FsfsRuntime {
         store: &CompleteGenerationStore,
         candidate_root: &Path,
     ) -> SearchResult<FsfsIndexPayload> {
+        self.run_retained_index_with_progress(cx, store, candidate_root, false, |_| Ok(()))
+            .await
+    }
+
+    pub(super) async fn run_retained_index_with_progress<F>(
+        &self,
+        cx: &Cx,
+        store: &CompleteGenerationStore,
+        candidate_root: &Path,
+        resumed: bool,
+        on_progress: F,
+    ) -> SearchResult<FsfsIndexPayload>
+    where
+        F: FnMut(&super::IndexingProgressSnapshot) -> SearchResult<()>,
+    {
         execution::prepare(cx).await?;
         let seeded;
-        let runtime = if seed_candidate(cx, self, store, candidate_root)?.is_some() {
+        let runtime = if !resumed && seed_candidate(cx, self, store, candidate_root)?.is_some() {
             let mut runtime = self.clone();
             runtime.seeded_from_receipt = true;
             seeded = runtime;
@@ -244,7 +354,7 @@ impl FsfsRuntime {
         let payload = Box::pin(runtime.run_one_shot_index_scaffold_internal(
             cx,
             CliCommand::Index,
-            |_| Ok(()),
+            on_progress,
             false,
             false,
         ))

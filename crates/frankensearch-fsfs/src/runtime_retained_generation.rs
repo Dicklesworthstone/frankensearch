@@ -9,6 +9,12 @@ enum RetainedBuildKind {
     Recovery,
 }
 
+enum RetainedRebuildStart<'a> {
+    Fresh,
+    Save(&'a mut (dyn FnMut(&RetainedRebuildCheckpoint) -> SearchResult<()> + Send)),
+    Resume(&'a RetainedRebuildCheckpoint),
+}
+
 /// A reusable search reader bound to one admitted complete generation.
 ///
 /// Publishing a successor does not retarget this reader. Open a new reader to
@@ -501,6 +507,32 @@ impl FsfsRuntime {
         FsfsIndexPayload,
         SearchExecutionMode,
     )> {
+        self.build_retained_generation_with_progress(
+            cx,
+            store_root,
+            kind,
+            RetainedRebuildStart::Fresh,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn build_retained_generation_with_progress<F>(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        kind: RetainedBuildKind,
+        start: RetainedRebuildStart<'_>,
+        on_progress: F,
+    ) -> SearchResult<(
+        crate::generation_store::GenerationBuild,
+        FsfsIndexPayload,
+        SearchExecutionMode,
+    )>
+    where
+        F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
+    {
         use crate::generation_store::CompleteGenerationStore;
 
         retained_search_checkpoint(cx)?;
@@ -514,10 +546,26 @@ impl FsfsRuntime {
                 reason: STORE_OVERLAP_REASON.to_owned(),
             });
         }
-        let store = CompleteGenerationStore::create(cx, store_root)?;
-        let build = match kind {
-            RetainedBuildKind::Index => store.begin(cx)?,
-            RetainedBuildKind::Recovery => store.begin_recovery_rebuild(cx)?,
+        if !matches!(start, RetainedRebuildStart::Fresh) && kind != RetainedBuildKind::Recovery {
+            return Err(retained_recovery_error(
+                "inactive build receipts require an independent source recovery rebuild",
+            ));
+        }
+        if let RetainedRebuildStart::Resume(receipt) = &start {
+            receipt.admit_scope(cx, self).await?;
+        }
+        let resumed = matches!(start, RetainedRebuildStart::Resume(_));
+        let store = if resumed {
+            CompleteGenerationStore::open(cx, store_root)?
+        } else {
+            CompleteGenerationStore::create(cx, store_root)?
+        };
+        let build = match &start {
+            RetainedRebuildStart::Resume(receipt) => receipt.resume(cx, &store)?,
+            _ => match kind {
+                RetainedBuildKind::Index => store.begin(cx)?,
+                RetainedBuildKind::Recovery => store.begin_recovery_rebuild(cx)?,
+            },
         };
         let mut input = self.cli_input.clone();
         input.command = CliCommand::Index;
@@ -531,13 +579,27 @@ impl FsfsRuntime {
         let mut candidate = self.clone().with_cli_input(input);
         candidate.config.indexing.watch_mode = false;
         if kind == RetainedBuildKind::Recovery {
-            candidate.cli_input.full_reindex = true;
+            // A fresh recovery never inherits the selected generation. Only
+            // an explicitly scoped resume may consult its own inactive
+            // checkpoint; that checkpoint grants no completed-receipt carry.
+            candidate.cli_input.full_reindex = !resumed;
             candidate.unchanged_sources = None;
             candidate.seeded_from_receipt = false;
         }
         candidate.discovery_excluded_root = Some(store.root().to_path_buf());
-        let summary =
-            Box::pin(candidate.run_retained_index_with_reuse(cx, &store, build.path())).await?;
+        if let RetainedRebuildStart::Save(save) = start {
+            let receipt = RetainedRebuildCheckpoint::capture(cx, &candidate, &build).await?;
+            save(&receipt)?;
+            retained_search_checkpoint(cx)?;
+        }
+        let summary = Box::pin(candidate.run_retained_index_with_progress(
+            cx,
+            &store,
+            build.path(),
+            resumed,
+            on_progress,
+        ))
+        .await?;
         reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
 
         // An indexing command can return success with deferred semantic rows.
@@ -3771,6 +3833,7 @@ mod complete_watch;
 
 #[path = "runtime/retained_reuse.rs"]
 mod retained_reuse;
+pub use retained_reuse::RetainedRebuildCheckpoint;
 
 #[path = "runtime/semantic_windows.rs"]
 mod semantic_windows;

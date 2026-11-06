@@ -342,12 +342,106 @@ impl FsfsRuntime {
         cx: &Cx,
         store_root: &Path,
     ) -> SearchResult<PreparedRetainedRecovery> {
+        self.prepare_retained_rebuild_from_start(
+            cx,
+            store_root,
+            RetainedRebuildStart::Fresh,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Begin an independent source rebuild with an explicit restart handoff.
+    ///
+    /// `save` runs once before indexing or model admission. Persist the supplied
+    /// checkpoint in trusted storage before returning success; a failed save
+    /// leaves the empty candidate inactive and prevents indexing. Resume with
+    /// [`Self::resume_retained_rebuild`], never by selecting an arbitrary
+    /// abandoned directory. The usual nonempty requested-tier preview remains
+    /// mandatory before publication.
+    ///
+    /// The handoff proves scope, not completed work. The existing indexer may
+    /// reuse only a durable consistent checkpoint after source hashes and both
+    /// producer identities are checked again. An interruption during an
+    /// undurable batch can require re-embedding the entire candidate. Linux
+    /// supports same-executable cross-process proof; unsupported platforms
+    /// retain same-process scope. No model download is performed.
+    ///
+    /// # Errors
+    /// Returns save, source/configuration, ownership, indexing, producer,
+    /// integrity, I/O or cancellation errors without changing selection.
+    #[allow(clippy::future_not_send)]
+    pub async fn prepare_retained_rebuild_with_checkpoint<F>(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        mut save: F,
+    ) -> SearchResult<PreparedRetainedRecovery>
+    where
+        F: FnMut(&RetainedRebuildCheckpoint) -> SearchResult<()> + Send,
+    {
+        self.prepare_retained_rebuild_from_start(
+            cx,
+            store_root,
+            RetainedRebuildStart::Save(&mut save),
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Resume exactly one explicitly saved inactive source recovery build.
+    ///
+    /// Reacquires publication and normal engine writer ownership, preserves the
+    /// original selection guard and refuses sealed targets or changed source,
+    /// indexing-contract or execution scope. Source contents are rediscovered
+    /// and hashed; modified/deleted inputs and changed producers follow the
+    /// ordinary checkpoint re-embedding/reconciliation rules. A resume receipt
+    /// never upgrades undurable work to trustworthy reuse. The resulting
+    /// generation still requires a useful query preview before restoration.
+    ///
+    /// # Errors
+    /// Returns invalid/stale receipt, changed scope, active writer, sealed or
+    /// missing candidate, indexing/admission, I/O or cancellation errors. The
+    /// selected generation remains unchanged.
+    #[allow(clippy::future_not_send)]
+    pub async fn resume_retained_rebuild(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        checkpoint: &RetainedRebuildCheckpoint,
+    ) -> SearchResult<PreparedRetainedRecovery> {
+        self.prepare_retained_rebuild_from_start(
+            cx,
+            store_root,
+            RetainedRebuildStart::Resume(checkpoint),
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn prepare_retained_rebuild_from_start<F>(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        start: RetainedRebuildStart<'_>,
+        on_progress: F,
+    ) -> SearchResult<PreparedRetainedRecovery>
+    where
+        F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
+    {
         self.preflight_retained_recovery(cx)?;
         let mut runtime = self.clone();
         runtime.config.indexing.offline = true;
         runtime.cli_input.full_reindex = true;
         let (build, _, candidate_mode) = runtime
-            .build_retained_generation(cx, store_root, RetainedBuildKind::Recovery)
+            .build_retained_generation_with_progress(
+                cx,
+                store_root,
+                RetainedBuildKind::Recovery,
+                start,
+                on_progress,
+            )
             .await?;
         let plan = build.prepare(cx, |_, path| {
             Self::validate_search_generation_at_root(path, candidate_mode)
@@ -674,6 +768,7 @@ mod retained_recovery_tests {
         changed_identity: EmbeddingIdentityBundleV1,
         changed: AtomicBool,
         zero_signal: AtomicBool,
+        embedded_documents: std::sync::atomic::AtomicUsize,
         category: ModelCategory,
     }
 
@@ -690,6 +785,7 @@ mod retained_recovery_tests {
                 changed_identity,
                 changed: AtomicBool::new(false),
                 zero_signal: AtomicBool::new(false),
+                embedded_documents: std::sync::atomic::AtomicUsize::new(0),
                 category,
             }
         }
@@ -707,9 +803,12 @@ mod retained_recovery_tests {
         fn embed<'a>(
             &'a self,
             _cx: &'a Cx,
-            _text: &'a str,
+            text: &'a str,
         ) -> frankensearch_core::SearchFuture<'a, Vec<f32>> {
             Box::pin(async move {
+                if text != "probe" {
+                    self.embedded_documents.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(if self.zero_signal.load(Ordering::Relaxed) {
                     vec![0.0; 3]
                 } else {
@@ -822,6 +921,322 @@ mod retained_recovery_tests {
             FsfsRuntime::new(runtime.config().clone()).with_cli_input(runtime.cli_input.clone());
         fresh.lexical_only_indexing = runtime.lexical_only_indexing;
         fresh
+    }
+
+    async fn interrupt_inactive_rebuild(
+        runtime: &FsfsRuntime,
+        cx: &Cx,
+        root: &Path,
+    ) -> (RetainedRebuildCheckpoint, PathBuf, IndexingCheckpoint) {
+        let mut saved = None;
+        let mut save = |receipt: &RetainedRebuildCheckpoint| {
+            // Exercise the persisted wire handoff, not an in-memory runtime
+            // capability or a completed-generation reuse receipt.
+            saved = Some(serde_json::from_slice(&serde_json::to_vec(receipt).unwrap()).unwrap());
+            Ok(())
+        };
+        let mut interrupted = None;
+        let result = runtime
+            .prepare_retained_rebuild_from_start(
+                cx,
+                root,
+                RetainedRebuildStart::Save(&mut save),
+                |progress| {
+                    if let Some(checkpoint) = read_indexing_checkpoint(&progress.index_root)?
+                        && checkpoint.artifacts_durable
+                        && !checkpoint.files.is_empty()
+                    {
+                        interrupted = Some((progress.index_root.clone(), checkpoint));
+                        cx.set_cancel_requested(true);
+                        return Err(SearchError::Cancelled {
+                            phase: "test.inactive_rebuild_durable_boundary".to_owned(),
+                            reason: "interrupt after actual durable batch publication".to_owned(),
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+        cx.set_cancel_requested(false);
+        let (path, checkpoint) = interrupted.expect("a real durable partial checkpoint");
+        assert_eq!(checkpoint.files.len(), CHECKPOINT_PERSIST_INTERVAL);
+        (
+            saved.expect("scope saved before indexing"),
+            path,
+            checkpoint,
+        )
+    }
+
+    fn add_resume_sources(source: &Path) -> usize {
+        for index in 0..(CHECKPOINT_PERSIST_INTERVAL * 2) {
+            fs::write(
+                source.join(format!("document-{index:03}.md")),
+                format!("sharedtoken source recovery document number {index}"),
+            )
+            .unwrap();
+        }
+        CHECKPOINT_PERSIST_INTERVAL * 2 + 1
+    }
+
+    fn reset_document_counts(models: &RecoveryModels) {
+        models.fast.embedded_documents.store(0, Ordering::Relaxed);
+        models
+            .quality
+            .embedded_documents
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn inactive_build_resume_reuses_only_matching_durable_rows_and_reconciles_sources() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.indexing.embedding_batch_size = 1;
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let total = add_resume_sources(&source);
+            let (saved, path, checkpoint) = interrupt_inactive_rebuild(&runtime, &cx, &root).await;
+            let completed = checkpoint.files.keys().cloned().collect::<Vec<_>>();
+            fs::write(
+                source.join(&completed[0]),
+                "sharedtoken changed source body",
+            )
+            .unwrap();
+            fs::rename(
+                source.join(&completed[1]),
+                directory.path().join("removed-source.md"),
+            )
+            .unwrap();
+            fs::write(source.join("new.md"), "sharedtoken newly discovered source").unwrap();
+            reset_document_counts(&models);
+
+            let mut resumed = fresh_runtime(&runtime)
+                .resume_retained_rebuild(&cx, &root, &saved)
+                .await
+                .unwrap();
+            assert_eq!(resumed.generation().path(), path);
+            let expected_embeddings = total - (completed.len() - 2);
+            assert_eq!(
+                models.fast.embedded_documents.load(Ordering::Relaxed),
+                expected_embeddings
+            );
+            assert_eq!(
+                models.quality.embedded_documents.load(Ordering::Relaxed),
+                expected_embeddings
+            );
+            let manifest = FsfsRuntime::read_index_manifest(&path).unwrap().unwrap();
+            assert_eq!(manifest.len(), total);
+            assert!(manifest.iter().any(|entry| entry.file_key == "new.md"));
+            assert!(!manifest.iter().any(|entry| entry.file_key == completed[1]));
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                selected
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+            // The same build file cannot reopen a candidate once it is sealed.
+            assert!(
+                fresh_runtime(&runtime)
+                    .resume_retained_rebuild(&cx, &root, &saved)
+                    .await
+                    .is_err()
+            );
+            resumed.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            let (publication, reader) = resumed.restore(&cx).unwrap();
+            assert!(matches!(publication, GenerationPublication::Durable(_)));
+            assert_eq!(reader.generation().path(), path);
+            assert_eq!(file_bytes(old.path()), old_bytes);
+        });
+    }
+
+    #[test]
+    fn inactive_build_resume_reembeds_undurable_work_and_changed_producer_tiers() {
+        on_runtime(|cx| async move {
+            for changed in ["undurable", "fast", "quality"] {
+                let models = RecoveryModels::install();
+                let directory = tempfile::tempdir().unwrap();
+                let (mut runtime, source, root) = fixture(directory.path());
+                runtime.config.indexing.embedding_batch_size = 1;
+                let old = publish(&runtime, &cx, &root).await;
+                let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+                let old_bytes = file_bytes(old.path());
+                let total = add_resume_sources(&source);
+                let (saved, path, mut checkpoint) =
+                    interrupt_inactive_rebuild(&runtime, &cx, &root).await;
+                match changed {
+                    "undurable" => {
+                        checkpoint.artifacts_durable = false;
+                        write_indexing_checkpoint(&path, &checkpoint).unwrap();
+                    }
+                    "fast" => models.fast.changed.store(true, Ordering::Relaxed),
+                    "quality" => models.quality.changed.store(true, Ordering::Relaxed),
+                    _ => unreachable!(),
+                }
+                reset_document_counts(&models);
+                let resumed = fresh_runtime(&runtime)
+                    .resume_retained_rebuild(&cx, &root, &saved)
+                    .await
+                    .unwrap();
+                let expected_fast = if changed == "quality" {
+                    total - checkpoint.files.len()
+                } else {
+                    total
+                };
+                assert_eq!(
+                    models.fast.embedded_documents.load(Ordering::Relaxed),
+                    expected_fast,
+                    "{changed}"
+                );
+                assert_eq!(
+                    models.quality.embedded_documents.load(Ordering::Relaxed),
+                    total,
+                    "{changed}"
+                );
+                assert_eq!(resumed.generation().path(), path);
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    selected
+                );
+                assert_eq!(file_bytes(old.path()), old_bytes);
+            }
+        });
+    }
+
+    #[test]
+    fn inactive_build_resume_refuses_changed_scope_writers_selection_and_cancellation() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.indexing.embedding_batch_size = 1;
+            let old = publish(&runtime, &cx, &root).await;
+            let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let old_bytes = file_bytes(old.path());
+            add_resume_sources(&source);
+            let (saved, path, _) = interrupt_inactive_rebuild(&runtime, &cx, &root).await;
+            let candidate_bytes = file_bytes(&path);
+            reset_document_counts(&models);
+            let mut changed = fresh_runtime(&runtime);
+            changed.config.indexing.embedding_batch_size = 2;
+            assert!(
+                changed
+                    .resume_retained_rebuild(&cx, &root, &saved)
+                    .await
+                    .is_err()
+            );
+            let other_source = directory.path().join("other-source");
+            fs::create_dir(&other_source).unwrap();
+            let mut changed = fresh_runtime(&runtime);
+            changed.cli_input.target_path = Some(other_source);
+            assert!(
+                changed
+                    .resume_retained_rebuild(&cx, &root, &saved)
+                    .await
+                    .is_err()
+            );
+            let mut wire = serde_json::to_value(&saved).unwrap();
+            wire["executable_sha256"] = serde_json::Value::String("0".repeat(64));
+            let changed = serde_json::from_value(wire).unwrap();
+            assert!(
+                fresh_runtime(&runtime)
+                    .resume_retained_rebuild(&cx, &root, &changed)
+                    .await
+                    .is_err()
+            );
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                fresh_runtime(&runtime)
+                    .resume_retained_rebuild(&cx, &root, &saved)
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            assert_eq!(file_bytes(&path), candidate_bytes);
+            // Physical writer ownership remains required even after the store
+            // build owner was dropped. Resume cannot steal this candidate.
+            let writer = crate::lifecycle::PublicationLease::acquire(&path).unwrap();
+            assert!(
+                fresh_runtime(&runtime)
+                    .resume_retained_rebuild(&cx, &root, &saved)
+                    .await
+                    .is_err()
+            );
+            drop(writer);
+            assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+            assert_eq!(models.quality.embedded_documents.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                selected
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+            let winner = publish(&runtime, &cx, &root).await;
+            let winner_selection = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            reset_document_counts(&models);
+            assert!(
+                fresh_runtime(&runtime)
+                    .resume_retained_rebuild(&cx, &root, &saved)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                winner_selection
+            );
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(winner)
+            );
+        });
+    }
+
+    #[test]
+    fn inactive_build_handoff_failure_prevents_model_and_index_work() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let receipt_path = directory.path().join("existing-build.json");
+            fs::write(&receipt_path, b"previous operator receipt").unwrap();
+            reset_document_counts(&models);
+            let result = fresh_runtime(&runtime)
+                .prepare_retained_rebuild_with_checkpoint(&cx, &root, |_| {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&receipt_path)?;
+                    Ok(())
+                })
+                .await;
+            assert!(
+                matches!(result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::AlreadyExists)
+            );
+            assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+            assert_eq!(models.quality.embedded_documents.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                fs::read(&receipt_path).unwrap(),
+                b"previous operator receipt"
+            );
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                selected
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+            for candidate in fs::read_dir(root.join("generations")).unwrap() {
+                let candidate = candidate.unwrap().path();
+                if candidate != old.path() {
+                    assert!(fs::read_dir(candidate).unwrap().next().is_none());
+                }
+            }
+        });
     }
 
     async fn publish(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> PublishedGeneration {

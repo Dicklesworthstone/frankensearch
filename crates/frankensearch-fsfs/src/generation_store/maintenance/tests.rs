@@ -25,6 +25,101 @@ fn pointer(store: &CompleteGenerationStore) -> Vec<u8> {
 }
 
 #[test]
+fn inactive_rebuild_resume_preserves_candidate_and_original_selection_guard() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let old = published(&store, &cx, b"old");
+        let selected = pointer(&store);
+        let build = store.begin_recovery_rebuild(&cx).unwrap();
+        fs::write(build.path().join("content.txt"), b"durable partial work").unwrap();
+        let path = build.path().to_path_buf();
+        let (id, guard) = build.rebuild_resume_receipt().unwrap();
+        assert!(store.resume_recovery_rebuild(&cx, &id, &guard).is_err());
+        drop(build);
+        let resumed = CompleteGenerationStore::open(&cx, root.path())
+            .unwrap()
+            .resume_recovery_rebuild(&cx, &id, &guard)
+            .unwrap();
+        assert_eq!(resumed.path(), path);
+        assert_eq!(
+            resumed.rebuild_resume_receipt().unwrap(),
+            (id.clone(), guard.clone())
+        );
+        assert_eq!(
+            fs::read(path.join("content.txt")).unwrap(),
+            b"durable partial work"
+        );
+        assert_eq!(pointer(&store), selected);
+        let prepared = resumed.prepare(&cx, |_, _| Ok(())).unwrap();
+        assert!(store.resume_recovery_rebuild(&cx, &id, &guard).is_err());
+        let winner = published(&store, &cx, b"winner");
+        let winner_selection = pointer(&store);
+        assert!(prepared.restore(&cx, |_, _| Ok(())).is_err());
+        assert!(store.resume_recovery_rebuild(&cx, &id, &guard).is_err());
+        assert_eq!(pointer(&store), winner_selection);
+        assert_eq!(store.active(&cx).unwrap(), Some(winner));
+        assert_eq!(fs::read(old.path().join("content.txt")).unwrap(), b"old");
+    });
+}
+
+#[test]
+fn inactive_rebuild_resume_refuses_scope_substitution_aliases_and_cancellation() {
+    use std::os::unix::fs::symlink;
+
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let old = published(&store, &cx, b"old");
+        let selected = pointer(&store);
+        let build = store.begin_recovery_rebuild(&cx).unwrap();
+        let (id, guard) = build.rebuild_resume_receipt().unwrap();
+        drop(build);
+        let other = store.begin_recovery_rebuild(&cx).unwrap();
+        let (other_id, _) = other.rebuild_resume_receipt().unwrap();
+        drop(other);
+        assert!(
+            store
+                .resume_recovery_rebuild(&cx, &other_id, &guard)
+                .is_err()
+        );
+        assert!(
+            store
+                .resume_recovery_rebuild(&cx, "../outside", &guard)
+                .is_err()
+        );
+        let foreign_root = tempfile::tempdir().unwrap();
+        let foreign = CompleteGenerationStore::create(&cx, foreign_root.path()).unwrap();
+        assert!(foreign.resume_recovery_rebuild(&cx, &id, &guard).is_err());
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            store.resume_recovery_rebuild(&cx, &id, &guard),
+            Err(SearchError::Cancelled { .. })
+        ));
+        cx.set_cancel_requested(false);
+        drop(store.resume_recovery_rebuild(&cx, &id, &guard).unwrap());
+        for linked in [false, true] {
+            let candidate = store.begin_recovery_rebuild(&cx).unwrap();
+            let (candidate_id, candidate_guard) = candidate.rebuild_resume_receipt().unwrap();
+            let destination = candidate.path().join("seg-0000000000000001.fslx");
+            if linked {
+                fs::hard_link(old.path().join("content.txt"), destination).unwrap();
+            } else {
+                symlink(old.path().join("content.txt"), destination).unwrap();
+            }
+            drop(candidate);
+            assert!(
+                store
+                    .resume_recovery_rebuild(&cx, &candidate_id, &candidate_guard)
+                    .is_err()
+            );
+        }
+        assert_eq!(pointer(&store), selected);
+        assert_eq!(fs::read(old.path().join("content.txt")).unwrap(), b"old");
+    });
+}
+
+#[test]
 fn prepared_build_seals_without_selection_and_releases_publication_ownership() {
     run_test_with_cx(|cx| async move {
         let root = tempfile::tempdir().unwrap();
