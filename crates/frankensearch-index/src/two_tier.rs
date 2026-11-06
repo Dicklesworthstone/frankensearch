@@ -8120,9 +8120,11 @@ mod tests {
         ] {
             let before = cx.checkpoint_state().checkpoint_count;
             let hits = pool
-                .install(|| match params {
-                    None => tier.search_top_k(17),
-                    Some(params) => tier.search_top_k_with_params(17, params),
+                .install(|| {
+                    params.map_or_else(
+                        || tier.search_top_k(17),
+                        |params| tier.search_top_k_with_params(17, params),
+                    )
                 })
                 .unwrap();
             let observed = cx.checkpoint_state().checkpoint_count - before;
