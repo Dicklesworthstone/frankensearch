@@ -21,8 +21,8 @@ use super::{
     CompleteGenerationStore, GENERATIONS, GenerationBuild, GenerationPublication,
     MAX_MANIFEST_BYTES, MAX_POINTER_BYTES, NEXT_GENERATION, POINTER_MAGIC, PublicationLease,
     PublishedGeneration, checkpoint, decode_pointer, digest, hex, invalid, inventory, open_regular,
-    pin_generation, read_bounded_regular, require_directory, stage_activation_pointer,
-    sync_selected_activation, sync_tree, write_new_synced,
+    pin_generation, read_bounded_regular, reject_published_write, require_directory,
+    stage_activation_pointer, sync_selected_activation, sync_tree, write_new_synced,
 };
 
 #[cfg(unix)]
@@ -45,6 +45,28 @@ pub struct PreparedGenerationRestore {
 }
 
 impl GenerationBuild {
+    /// Bind an explicitly saved inactive source rebuild to its original head.
+    /// This does not certify any checkpoint or artifact in the mutable build.
+    pub(crate) fn rebuild_resume_receipt(&self) -> SearchResult<(String, String)> {
+        if self.allow_inherited_files {
+            return Err(invalid(
+                &self.path,
+                "only an independent source recovery rebuild can export a build receipt",
+            ));
+        }
+        self.lease.fence("complete-generation rebuild handoff")?;
+        // The caller saves this receipt durably before indexing starts. Make
+        // the candidate's directory ancestry durable first, so a flushed
+        // checkpoint cannot outlive an unflushed candidate directory entry.
+        sync_directory(&self.path)?;
+        sync_directory(&self.store.root.join(GENERATIONS))?;
+        sync_directory(&self.store.root)?;
+        Ok((
+            self.id.clone(),
+            rebuild_selection_sha256(&self.store.root, &self.id, self.predecessor.as_deref()),
+        ))
+    }
+
     /// Seal a new bundle without changing the active generation.
     ///
     /// Runs the same consumer admission, complete inventory and durability
@@ -117,6 +139,73 @@ impl CompleteGenerationStore {
         lease.fence("complete-generation recovery rebuild entry")?;
         let predecessor = selection_evidence(&self.root)?;
         self.allocate_build(cx, lease, predecessor, false)
+    }
+
+    /// Reopen exactly one explicitly receipted, unsealed source rebuild.
+    ///
+    /// The caller must separately verify the original indexing contract and
+    /// execution identity, then re-admit checkpoint rows and current sources.
+    /// This preserves the original expected-old guard and retains publisher
+    /// ownership; it never discovers a candidate or grants checkpoint trust.
+    /// Ordinary engine writer locks remain mandatory before any mutation.
+    pub(crate) fn resume_recovery_rebuild(
+        &self,
+        cx: &Cx,
+        id: &str,
+        expected_selection_sha256: &str,
+    ) -> SearchResult<GenerationBuild> {
+        checkpoint(cx)?;
+        if id.len() != 60 || !hex(expected_selection_sha256, 64) {
+            return Err(invalid(&self.root, "invalid inactive rebuild receipt"));
+        }
+        // Reuse the canonical generation grammar without granting a sealed
+        // inventory identity to this still-mutable candidate.
+        let pointer = format!("{POINTER_MAGIC}\n{id}\n{}\n", "0".repeat(64));
+        decode_pointer(pointer.as_bytes(), &self.root)?;
+        self.require_mutation_authorized()?;
+        let lease = PublicationLease::acquire(&self.root)?;
+        lease.fence("complete-generation rebuild resume entry")?;
+        let predecessor = selection_evidence(&self.root)?;
+        if expected_selection_sha256
+            != rebuild_selection_sha256(&self.root, id, predecessor.as_deref())
+        {
+            return Err(invalid(
+                &self.root,
+                "inactive rebuild selection differs; resume cannot rebase onto current state",
+            ));
+        }
+        if predecessor
+            .as_deref()
+            .and_then(|bytes| decode_pointer(bytes, &self.root).ok())
+            .is_some_and(|selected| selected.id == id)
+        {
+            return Err(invalid(
+                &self.root,
+                "the selected generation cannot be resumed for mutation",
+            ));
+        }
+        let parent = self.root.join(GENERATIONS);
+        require_directory(&parent)?;
+        let path = parent.join(id);
+        require_directory(&path)?;
+        reject_published_write(&path)?;
+        let build = GenerationBuild {
+            store: self.clone(),
+            path,
+            id: id.to_owned(),
+            predecessor,
+            allow_inherited_files: false,
+            lease,
+        };
+        // Refuse aliases and special files BEFORE any model/index mutation.
+        // No artifact is made trustworthy by this inventory: the indexer must
+        // still admit its durable checkpoint, each producer and source hash.
+        let files = inventory(cx, build.path(), false)?;
+        build.require_shared_files_unchanged(cx, &files)?;
+        checkpoint(cx)?;
+        build.lease.fence("complete-generation rebuild resumed")?;
+        ensure_selection(&self.root, build.predecessor.as_deref())?;
+        Ok(build)
     }
 
     /// Reopen an explicitly named retained generation without changing selection.
@@ -520,6 +609,22 @@ fn restore_selection_sha256(
         hasher.update(value);
     }
     // Missing and present-but-empty selections must not share a resume token.
+    hasher.update([u8::from(selection.is_some())]);
+    if let Some(bytes) = selection {
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let sha256: [u8; 32] = hasher.finalize().into();
+    ContentHasher::to_hex(&sha256)
+}
+
+fn rebuild_selection_sha256(root: &Path, id: &str, selection: Option<&[u8]>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"FSFS-INACTIVE-SOURCE-REBUILD-SELECTION-v1\0");
+    for value in [root.as_os_str().as_encoded_bytes(), id.as_bytes()] {
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(value);
+    }
     hasher.update([u8::from(selection.is_some())]);
     if let Some(bytes) = selection {
         hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());

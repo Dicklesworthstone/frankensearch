@@ -150,6 +150,16 @@ fn decode(reader: impl Read) -> SearchResult<SavedPreparation> {
 }
 
 pub fn read(path: &Path, root: &Path) -> SearchResult<SavedPreparation> {
+    let receipt = decode(open_receipt(path)?)?;
+    if receipt.store_path_sha256 != store_path_sha256(&fs::canonicalize(root)?) {
+        return Err(invalid(
+            "preparation receipt belongs to a different store; it cannot be relocated or rebased",
+        ));
+    }
+    Ok(receipt)
+}
+
+pub(super) fn open_receipt(path: &Path) -> SearchResult<File> {
     #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags};
@@ -175,13 +185,7 @@ pub fn read(path: &Path, root: &Path) -> SearchResult<SavedPreparation> {
     if !file.metadata()?.is_file() {
         return Err(invalid("preparation receipt must be a regular file"));
     }
-    let receipt = decode(file)?;
-    if receipt.store_path_sha256 != store_path_sha256(&fs::canonicalize(root)?) {
-        return Err(invalid(
-            "preparation receipt belongs to a different store; it cannot be relocated or rebased",
-        ));
-    }
-    Ok(receipt)
+    Ok(file)
 }
 
 fn checkpoint(cx: &Cx) -> SearchResult<()> {
@@ -196,6 +200,15 @@ fn checkpoint(cx: &Cx) -> SearchResult<()> {
 /// Do not delete, truncate, reuse or overwrite that path on a retry.
 /// Parent directories must already exist and remain trusted during the call.
 pub fn write(cx: &Cx, path: &Path, root: &Path, report: &Report) -> SearchResult<()> {
+    checkpoint(cx)?;
+    let receipt = SavedPreparation::from_report(&fs::canonicalize(root)?, report)?;
+    let mut bytes =
+        serde_json::to_vec(&receipt).map_err(|_| invalid("cannot encode preparation receipt"))?;
+    bytes.push(b'\n');
+    write_receipt(cx, path, root, &bytes)
+}
+
+pub(super) fn write_receipt(cx: &Cx, path: &Path, root: &Path, bytes: &[u8]) -> SearchResult<()> {
     checkpoint(cx)?;
     let root = fs::canonicalize(root)?;
     let parent = path
@@ -212,10 +225,6 @@ pub fn write(cx: &Cx, path: &Path, root: &Path, report: &Report) -> SearchResult
         .file_name()
         .ok_or_else(|| invalid("preparation receipt requires a file name"))?;
     let destination = parent.join(name);
-    let receipt = SavedPreparation::from_report(&root, report)?;
-    let mut bytes =
-        serde_json::to_vec(&receipt).map_err(|_| invalid("cannot encode preparation receipt"))?;
-    bytes.push(b'\n');
     if bytes.len() as u64 > MAX_BYTES {
         return Err(invalid("preparation receipt exceeds the 8192-byte limit"));
     }
@@ -228,7 +237,7 @@ pub fn write(cx: &Cx, path: &Path, root: &Path, report: &Report) -> SearchResult
         options.mode(0o600);
     }
     let mut file = options.open(destination)?;
-    file.write_all(&bytes)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     // Non-Unix std has no portable directory synchronization primitive. There
     // the file is flushed, without a directory-durability claim.

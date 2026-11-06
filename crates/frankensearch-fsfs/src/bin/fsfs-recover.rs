@@ -6,6 +6,8 @@
 #![recursion_limit = "512"]
 #![deny(unsafe_code)]
 
+#[path = "fsfs-recover/build_file.rs"]
+mod build_file;
 #[path = "fsfs-recover/preparation_file.rs"]
 mod preparation_file;
 
@@ -40,6 +42,7 @@ const DEFAULT_REPAIR_COPY_BYTES: u64 = 1024 * 1024 * 1024;
 const HELP: &str =
     "fsfs-recover --index-dir STORE --generation ID --manifest-sha256 SHA256 [OPTIONS]
 fsfs-recover --index-dir STORE --rebuild-source SOURCE --query TEXT --prepare|--apply [OPTIONS]
+fsfs-recover --index-dir STORE --rebuild-source SOURCE --query TEXT --resume-build FILE --prepare|--apply [OPTIONS]
 fsfs-recover --index-dir STORE --resume-file FILE --apply [OPTIONS]
 fsfs-recover --index-dir STORE --resume-file FILE --confirm-durability
 
@@ -58,6 +61,8 @@ No directory scan chooses a recovery target. Models are never downloaded.
   --prepare           Admit a target and export a resume guard WITHOUT changing selection
   --apply             Explicitly restore the admitted target; default is read-only inspection
   --rebuild-source DIR Reindex this source into a NEW sealed generation before preview
+  --save-build FILE    Save an inactive-build handoff BEFORE indexing, for explicit restart
+  --resume-build FILE  Resume that exact inactive source build under its original guard
   --expected-selection-sha256 HASH
                       With --apply, resume a previously prepared target under its saved guard
   --save-preparation FILE
@@ -91,6 +96,18 @@ Empty sources, unmatched filters, lexical fallback and skipped required quality 
 Choose a query that exercises the candidate; the old selection remains usable after a refusal.
 The store must be outside SOURCE. Source changes after preparation do not change the sealed target.
 Save the prepared receipt to resume without rescanning sources; a competing publication is refused.
+For an interruptible source build, add --save-build FILE on its first invocation.
+After interruption, repeat the same source, query and policy with --resume-build FILE instead.
+Both flags require --rebuild-source and are mutually exclusive. No abandoned-directory scan occurs.
+The create-only build file is private on Unix and must be outside STORE, with a trusted existing parent.
+Resume preserves the original selection guard, indexing contract and actual executable identity;
+changed selection/configuration, relocated sources, sealed candidates or active writers are refused.
+Unchanged durable checkpoint rows may reuse vectors after current source and producer checks.
+Undurable or inconsistent checkpoints are rebuilt; interruption within a batch may re-embed all inputs.
+Linux supports same-executable restart; unavailable executable proof permits only same-process reuse.
+A build file proves no semantic readiness and cannot confirm publication durability.
+Use a separate --save-preparation FILE for the sealed preview/publication handoff.
+If sealing finished without that preparation receipt, start a new build; a build file cannot restore it.
 --save-preparation requires --prepare or --apply and an existing trusted parent outside STORE.
 It never overwrites a path. Failure prevents selection; an incomplete file may remain.
 The file is flushed before selection; on Unix it is created private (0600) and its parent is synced.
@@ -184,6 +201,8 @@ struct Options {
     max_copy_bytes: u64,
     expected_selection_sha256: Option<String>,
     save_preparation: Option<PathBuf>,
+    save_build: Option<PathBuf>,
+    resume_build: Option<build_file::SavedBuild>,
     resume_origin: Option<RepairSource>,
     resume_preview: Option<PreviewRequirement>,
     format: OutputFormat,
@@ -221,6 +240,8 @@ impl Options {
         let mut max_copy_bytes = DEFAULT_REPAIR_COPY_BYTES;
         let mut expected_selection_sha256 = None;
         let mut save_preparation = None;
+        let mut save_build = None;
+        let mut resume_build_file = None;
         let mut resume_file = None;
         let mut format = OutputFormat::Json;
         let mut seen = HashSet::new();
@@ -233,6 +254,8 @@ impl Options {
                     | "--generation"
                     | "--manifest-sha256"
                     | "--rebuild-source"
+                    | "--save-build"
+                    | "--resume-build"
                     | "--config"
                     | "--query"
                     | "--limit"
@@ -302,6 +325,8 @@ impl Options {
                 "--rebuild-source" => rebuild_source = Some(PathBuf::from(value)),
                 "--expected-selection-sha256" => expected_selection_sha256 = Some(text(value)?),
                 "--save-preparation" => save_preparation = Some(PathBuf::from(value)),
+                "--save-build" => save_build = Some(PathBuf::from(value)),
+                "--resume-build" => resume_build_file = Some(PathBuf::from(value)),
                 "--resume-file" => resume_file = Some(PathBuf::from(value)),
                 "--query" => query = Some(text(value)?),
                 "--filter" => filter = Some(text(value)?),
@@ -350,6 +375,30 @@ impl Options {
         }
         let root =
             root.ok_or_else(|| invalid("--index-dir is required; recovery never guesses a store"))?;
+        if save_build.is_some() || resume_build_file.is_some() {
+            if (save_build.is_some() && resume_build_file.is_some())
+                || rebuild_source.is_none()
+                || query.is_none()
+                || !matches!(action, RecoveryAction::Prepare | RecoveryAction::Apply)
+                || generation.is_some()
+                || digest.is_some()
+                || expected_selection_sha256.is_some()
+                || resume_file.is_some()
+                || repair_vectors
+                || seen.contains("--max-copy-bytes")
+            {
+                return Err(invalid(
+                    "--save-build or --resume-build requires --rebuild-source, --query and --prepare or --apply, without competing build/target/repair options",
+                ));
+            }
+            if save_preparation.is_some()
+                && (save_preparation == save_build || save_preparation == resume_build_file)
+            {
+                return Err(invalid(
+                    "build and preparation receipts require different files",
+                ));
+            }
+        }
         let mut resume_preview = None;
         let resume_origin = if let Some(path) = resume_file {
             // Reject conflicting authority before reading a file. Its contents
@@ -416,6 +465,11 @@ impl Options {
             max_copy_bytes,
             expected_selection_sha256,
             save_preparation,
+            save_build,
+            resume_build: resume_build_file
+                .as_deref()
+                .map(build_file::read)
+                .transpose()?,
             resume_origin,
             resume_preview,
             format,
@@ -761,6 +815,13 @@ fn preview_requirement(
         return Ok(PreviewRequirement::None {});
     };
     let policy_sha256 = runtime.recovery_query_policy_sha256(query, options.limit)?;
+    if let Some(saved) = &options.resume_build
+        && saved.preview_policy_sha256 != policy_sha256
+    {
+        return Err(invalid(
+            "the query or resolved preview policy differs from the saved build; repeat the original request and configuration",
+        ));
+    }
     let mut searchable = matches!(options.target, RecoveryTarget::Source(_));
     if let Some(PreviewRequirement::Query {
         policy_sha256: expected,
@@ -805,7 +866,19 @@ async fn execute(
         RecoveryAction::Prepare | RecoveryAction::Apply
     ) {
         let mut plan = if matches!(options.target, RecoveryTarget::Source(_)) {
-            runtime.prepare_retained_rebuild(cx, &options.root).await?
+            if let Some(saved) = &options.resume_build {
+                runtime
+                    .resume_retained_rebuild(cx, &options.root, &saved.checkpoint)
+                    .await?
+            } else if let Some(path) = &options.save_build {
+                runtime
+                    .prepare_retained_rebuild_with_checkpoint(cx, &options.root, |checkpoint| {
+                        build_file::write(cx, path, &options.root, checkpoint, &preview_requirement)
+                    })
+                    .await?
+            } else {
+                runtime.prepare_retained_rebuild(cx, &options.root).await?
+            }
         } else if let Some(expected) = &options.expected_selection_sha256 {
             let (generation, digest) = options.receipt()?;
             runtime
@@ -1182,6 +1255,174 @@ mod tests {
             let input = base.into_iter().chain(suffix).map(OsString::from).collect();
             assert!(Options::parse(input).is_err());
         }
+    }
+
+    #[test]
+    fn inactive_build_flags_require_explicit_source_action_without_competing_handoffs() {
+        let source = [
+            "--index-dir",
+            "store",
+            "--rebuild-source",
+            "source",
+            "--query",
+            "marker",
+        ];
+        for action in ["--prepare", "--apply"] {
+            let input = source
+                .into_iter()
+                .chain([action, "--save-build", "build.json"])
+                .map(OsString::from)
+                .collect();
+            let options = Options::parse(input).unwrap();
+            assert_eq!(
+                options.save_build.as_deref(),
+                Some(std::path::Path::new("build.json"))
+            );
+            assert!(options.resume_build.is_none());
+        }
+        for suffix in [
+            vec!["--save-build", "build.json"],
+            vec!["--confirm-durability", "--save-build", "build.json"],
+            vec![
+                "--prepare",
+                "--save-build",
+                "build.json",
+                "--resume-build",
+                "missing.json",
+            ],
+            vec![
+                "--apply",
+                "--resume-build",
+                "missing.json",
+                "--resume-file",
+                "missing-preparation.json",
+            ],
+            vec![
+                "--prepare",
+                "--save-build",
+                "build.json",
+                "--generation",
+                "untrusted",
+            ],
+            vec![
+                "--prepare",
+                "--save-build",
+                "build.json",
+                "--repair-vectors",
+            ],
+            vec![
+                "--prepare",
+                "--save-build",
+                "same.json",
+                "--save-preparation",
+                "same.json",
+            ],
+            vec![
+                "--prepare",
+                "--resume-build",
+                "same.json",
+                "--save-preparation",
+                "same.json",
+            ],
+            vec![
+                "--prepare",
+                "--save-build",
+                "first.json",
+                "--save-build",
+                "second.json",
+            ],
+        ] {
+            let input = source
+                .into_iter()
+                .chain(suffix)
+                .map(OsString::from)
+                .collect();
+            assert!(
+                matches!(
+                    Options::parse(input),
+                    Err(SearchError::InvalidConfig { .. })
+                ),
+                "invalid flag combinations must be refused before opening missing handoff files"
+            );
+        }
+        for flag in ["--save-build", "--resume-build"] {
+            let mut input = args();
+            input
+                .extend(["--apply", "--query", "marker", flag, "missing.json"].map(OsString::from));
+            assert!(matches!(
+                Options::parse(input),
+                Err(SearchError::InvalidConfig { .. })
+            ));
+            let input = [
+                "--index-dir",
+                "store",
+                "--rebuild-source",
+                "source",
+                "--prepare",
+                flag,
+                "missing.json",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+            assert!(matches!(
+                Options::parse(input),
+                Err(SearchError::InvalidConfig { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn inactive_build_resume_binds_preview_before_any_store_or_model_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("store");
+            std::fs::create_dir(&root).unwrap();
+            let source = directory.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            let path = directory.path().join("build.json");
+            let arguments = |flag: &str| {
+                vec![
+                    OsString::from("--index-dir"),
+                    root.as_os_str().to_owned(),
+                    OsString::from("--rebuild-source"),
+                    source.as_os_str().to_owned(),
+                    OsString::from("--query"),
+                    OsString::from("original marker"),
+                    OsString::from("--prepare"),
+                    OsString::from(flag),
+                    path.as_os_str().to_owned(),
+                ]
+            };
+            let options = Options::parse(arguments("--save-build")).unwrap();
+            let runtime = FsfsRuntime::new(frankensearch_fsfs::config::FsfsConfig::default());
+            let preview = preview_requirement(&runtime, &options).unwrap();
+            let checkpoint = serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "generation_id": format!("g-{}-{}-{}", "a".repeat(32), "b".repeat(8), "c".repeat(16)),
+                "expected_selection_sha256": "d".repeat(64),
+                "session": "fixture-session",
+                "executable_sha256": "e".repeat(64),
+                "indexing_contract_sha256": "f".repeat(64),
+                "source_path_sha256": "0".repeat(64),
+            })).unwrap();
+            build_file::write(&cx, &path, &root, &checkpoint, &preview).unwrap();
+            let resumed = Options::parse(arguments("--resume-build")).unwrap();
+            assert_eq!(preview_requirement(&runtime, &resumed).unwrap(), preview);
+            for change_query in [false, true] {
+                let mut changed = resumed.clone();
+                if change_query {
+                    changed.query = Some("different marker".to_owned());
+                } else {
+                    changed.limit += 1;
+                }
+                let error = execute(&cx, Some(&runtime), &changed).await.unwrap_err();
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { reason, .. } if reason.contains("differs from the saved build"))
+                );
+                assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            }
+        });
     }
 
     #[test]
