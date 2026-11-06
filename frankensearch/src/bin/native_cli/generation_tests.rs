@@ -7386,6 +7386,10 @@ mod progressive_authority {
         include!("authority_timeout_tests.rs");
     }
 
+    mod query_controls_tests {
+        include!("authority_query_tests.rs");
+    }
+
     use std::io::Cursor;
     use std::os::unix::fs::DirBuilderExt as _;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7483,6 +7487,8 @@ mod progressive_authority {
             mode,
             stream,
             deadline: None,
+            policy: None,
+            max_source_bytes: MAX_INPUT_BYTES,
         }
     }
 
