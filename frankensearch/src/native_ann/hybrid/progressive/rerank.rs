@@ -13,9 +13,19 @@ use super::{checkpoint, invalid};
 use crate::{Cx, ScoreSource, ScoredResult, SearchError, SearchResult};
 
 #[derive(Clone, Copy)]
+pub(in crate::native_ann::hybrid) enum RerankTextSource<'a> {
+    Callback(&'a (dyn Fn(&str) -> Option<String> + Send + Sync)),
+    #[cfg(feature = "quill")]
+    Retained {
+        source: &'a crate::native_ann::generation::CompositeReaders,
+        max_source_bytes: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
 pub(in crate::native_ann::hybrid) struct RerankRequest<'a> {
     pub reranker: &'a dyn Reranker,
-    pub text: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
+    pub text: RerankTextSource<'a>,
     pub limit: usize,
 }
 
@@ -48,6 +58,13 @@ impl RerankRequest<'_> {
         let mut documents = Vec::with_capacity(self.limit.min(candidates.len()));
         let mut positions = Vec::with_capacity(documents.capacity());
         let mut seen = BTreeSet::new();
+        #[cfg(feature = "quill")]
+        let mut remaining_source_bytes = match self.text {
+            RerankTextSource::Callback(_) => 0,
+            RerankTextSource::Retained {
+                max_source_bytes, ..
+            } => max_source_bytes,
+        };
         for (position, candidate) in candidates.iter().take(self.limit).enumerate() {
             checkpoint(cx, "native_ann.rerank_text")?;
             if !seen.insert(candidate.doc_id.as_str()) {
@@ -57,7 +74,15 @@ impl RerankRequest<'_> {
                     "reranking requires unique candidate document identities",
                 ));
             }
-            let text = (self.text)(candidate.doc_id.as_str());
+            let text = match self.text {
+                RerankTextSource::Callback(resolve) => resolve(candidate.doc_id.as_str()),
+                #[cfg(feature = "quill")]
+                RerankTextSource::Retained { source, .. } => Some(source.retained_rerank_text(
+                    cx,
+                    candidate.doc_id.as_str(),
+                    &mut remaining_source_bytes,
+                )?),
+            };
             checkpoint(cx, "native_ann.rerank_text_complete")?;
             if let Some(text) = text {
                 documents.push(RerankDocument {

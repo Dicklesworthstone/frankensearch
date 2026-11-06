@@ -9,7 +9,7 @@ use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::traits::Reranker;
 use frankensearch_fusion::{blend_two_tier, rrf_fuse_for_vector_lane};
 
-use super::progressive::rerank::RerankRequest;
+use super::progressive::rerank::{RerankRequest, RerankTextSource};
 use super::refinement::{admit_pair, checked_lexical};
 use super::{NativePhaseCandidates, checkpoint, hydrate_winners, invalid, join_sources};
 use crate::native_ann::{NativeShardHit, NativeShardRow, NativeShardSet};
@@ -596,7 +596,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         self.budget = self.policy.budget(self.k.max(top_k))?;
         self.reranker = Some(RerankRequest {
             reranker,
-            text: text_fn,
+            text: RerankTextSource::Callback(text_fn),
             limit: top_k,
         });
         Ok(self)

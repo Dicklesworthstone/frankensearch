@@ -15,7 +15,7 @@ use super::{NativeAnnIndex, checkpoint, hydrate_winners, invalid, join_sources};
 use crate::{Cx, Embedder, LexicalRead, ScoredResult, SearchError, SearchResult, VectorHit};
 
 pub(super) mod rerank;
-use rerank::RerankRequest;
+use rerank::{RerankRequest, RerankTextSource};
 
 impl NativeAnnIndex {
     /// Prepare native progressive search without starting inference or retrieval.
@@ -499,9 +499,69 @@ impl<'a> NativeProgressiveSearch<'a> {
     /// Refuses zero/overflowing budgets, cancellation, or configuration after
     /// a phase has started. Model availability is checked only at the final phase.
     pub fn with_reranker(
-        mut self,
+        self,
         reranker: &'a dyn Reranker,
         text_fn: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
+        top_k: usize,
+    ) -> SearchResult<Self> {
+        self.configure_reranker(reranker, RerankTextSource::Callback(text_fn), top_k)
+    }
+
+    /// Rerank lazily using bounded source from this query's retained generation.
+    ///
+    /// Snapshot, preview and scoped generation queries carry a private binding
+    /// to their admitted Quill source. This method uses that binding rather than
+    /// accepting a text resolver or reopening an original source path. Only the
+    /// final rerank candidate window is read, after retrieval and filtering;
+    /// configuring or abandoning earlier phases exports no source documents and
+    /// starts no reranker inference. Fusion, candidate and beam settings remain
+    /// independently configurable before the first phase.
+    ///
+    /// `max_source_bytes` bounds the aggregate stored ID, content, title and
+    /// canonical metadata payloads of those candidates, checked before copying
+    /// their fields. Only content is submitted to the reranker. Zero permits an
+    /// empty final window but refuses any nonempty source. The bound excludes
+    /// parsed allocations, reader caches and process RSS.
+    ///
+    /// Every candidate must have a complete valid source document. Missing or
+    /// corrupt fields and exhausted source budgets produce `RerankFailed` with
+    /// the prior page unchanged; `collect` returns the error. They never become
+    /// a missing-text skip or an incomplete successful rerank. Cancellation and
+    /// dropping a pending phase retain the ordinary terminal semantics.
+    ///
+    /// # Errors
+    /// Refuses a query without retained generation source, cancellation, an
+    /// already-started phase, or a zero/overflowing rerank window. Source and
+    /// provider errors are evaluated only when the final phase is requested.
+    #[cfg(feature = "quill")]
+    pub fn with_retained_reranker(
+        self,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        max_source_bytes: usize,
+    ) -> SearchResult<Self> {
+        checkpoint(self.cx, "native_ann.rerank_configuration")?;
+        let source = self.retained_metadata.ok_or_else(|| {
+            invalid(
+                "rerank.source",
+                "retained-generation-required",
+                "retained-source reranking requires an admitted generation query",
+            )
+        })?;
+        self.configure_reranker(
+            reranker,
+            RerankTextSource::Retained {
+                source,
+                max_source_bytes,
+            },
+            window,
+        )
+    }
+
+    fn configure_reranker(
+        mut self,
+        reranker: &'a dyn Reranker,
+        source: RerankTextSource<'a>,
         top_k: usize,
     ) -> SearchResult<Self> {
         checkpoint(self.cx, "native_ann.rerank_configuration")?;
@@ -525,7 +585,7 @@ impl<'a> NativeProgressiveSearch<'a> {
             })?;
         self.reranker = Some(RerankRequest {
             reranker,
-            text: text_fn,
+            text: source,
             limit: top_k,
         });
         Ok(self)
