@@ -24,9 +24,10 @@ impl NativeAnnIndex {
     ///
     /// The caller owns and drains the pool, and bounds aggregate concurrency.
     /// Dropping an unpolled future starts nothing. Dropping pending work prevents
-    /// queued graph work from starting; a running synchronous search may drain
-    /// before releasing its owners. It cannot publish a late result or retry.
-    /// This is not a hard deadline, RSS bound or guarantee to preempt traversal.
+    /// queued graph work from starting and cancels the running job at its next
+    /// checkpoint. The job retains its owners until it stops and cannot publish
+    /// a late result or retry. Blocking predicates cannot be preempted, and this
+    /// is not a hard deadline or RSS bound.
     ///
     /// # Errors
     /// Propagates ordinary search/admission errors, cancellation and worker
@@ -94,7 +95,8 @@ impl NativeShardSet {
     /// Keep the originating set/snapshot while interpreting returned coordinates.
     /// The worker retains its original ordered owners even if a live selection
     /// changes or the caller drops another clone. No files or models are opened.
-    /// The caller must retain/drain the pool; running traversal is not preempted.
+    /// The caller must retain/drain the pool. Dropping the query cancels only its
+    /// own traversal at a checkpoint; blocking predicates cannot be preempted.
     ///
     /// # Errors
     /// Returns the original query failure, cancellation or worker refusal. No
@@ -154,9 +156,9 @@ impl NativeShardSet {
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, mpsc};
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::{Duration, Instant};
 
     use crate::SearchError;
@@ -167,6 +169,19 @@ mod tests {
     };
     use frankensearch_index::native_hnsw::HnswParams;
     use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
+
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn run<F, Fut, T>(workers: usize, body: F) -> T
     where
@@ -485,67 +500,25 @@ mod tests {
 
     #[test]
     fn running_search_yields_the_executor_and_cancellation_precedes_ready_hits() {
-        run(1, |cx, pool| async move {
-            let index = index(&cx, QuantizationFormat::F32, false, &rows());
-            let (started, entered) = mpsc::channel();
-            let (release, gate) = mpsc::channel();
-            let gate = Mutex::new(gate);
-            let first = AtomicBool::new(true);
-            let mut pending = Box::pin(index.search_filtered_with_pool(
-                &cx,
-                query(),
-                3,
-                None,
-                pool.clone(),
-                move |_| {
-                    assert!(!Cx::is_active());
-                    if first.swap(false, Ordering::SeqCst) {
-                        started.send(()).unwrap();
-                        gate.lock()
-                            .unwrap()
-                            .recv_timeout(Duration::from_secs(10))
-                            .unwrap();
-                    }
-                    true
-                },
-            ));
-            assert!(
-                pending
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending()
-            );
-            wait_for_worker(entered).await;
-            // The real worker is still gated; this unrelated executor future
-            // completes without waiting for graph work or moving the gate.
-            assert_eq!(std::future::ready(37_u8).await, 37);
-            cx.set_cancel_requested(true);
-            release.send(()).unwrap();
-            assert!(matches!(pending.await, Err(SearchError::Cancelled { .. })));
-            cx.set_cancel_requested(false);
-            assert!(
-                !index
-                    .search_with_pool(&cx, query(), 1, None, pool)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-        });
-    }
-
-    #[test]
-    fn pending_drop_releases_the_retained_owner_after_the_running_worker_drains() {
-        let weak = run(1, |cx, pool| async move {
-            let index = index(&cx, QuantizationFormat::F32, false, &rows());
-            let weak = Arc::downgrade(&index.owner);
-            let (started, entered) = mpsc::channel();
-            let (release, gate) = mpsc::channel();
-            let gate = Mutex::new(gate);
-            let first = AtomicBool::new(true);
-            let mut pending =
-                Box::pin(
-                    index.search_filtered_with_pool(&cx, query(), 1, None, pool, move |_| {
-                        if first.swap(false, Ordering::SeqCst) {
+        for ann in [false, true] {
+            let calls = run(1, |cx, pool| async move {
+                let index = index(&cx, QuantizationFormat::F32, ann, &rows());
+                let (started, entered) = mpsc::channel();
+                let (release, gate) = mpsc::channel();
+                let gate = Mutex::new(gate);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&calls);
+                let wakes = Arc::new(Wakes::default());
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut pending = Box::pin(index.search_filtered_with_pool(
+                    &cx,
+                    query(),
+                    2,
+                    Some(2),
+                    pool.clone(),
+                    move |_| {
+                        assert!(!Cx::is_active());
+                        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
                             started.send(()).unwrap();
                             gate.lock()
                                 .unwrap()
@@ -553,28 +526,195 @@ mod tests {
                                 .unwrap();
                         }
                         true
-                    }),
+                    },
+                ));
+                assert!(
+                    pending
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
                 );
-            assert!(matches!(
-                pending
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop())),
-                Poll::Pending
-            ));
-            wait_for_worker(entered).await;
-            drop(pending);
-            drop(index);
-            assert!(
-                weak.upgrade().is_some(),
-                "running worker must retain its exact bytes"
+                wait_for_worker(entered).await;
+                // The real worker is still gated; this unrelated executor
+                // future completes without waiting for graph work.
+                assert_eq!(std::future::ready(37_u8).await, 37);
+                let before = wakes.0.load(Ordering::SeqCst);
+                cx.cancel_fast(asupersync::CancelKind::User);
+                assert!(
+                    wakes.0.load(Ordering::SeqCst) > before,
+                    "caller cancellation must wake a pending worker join"
+                );
+                // Drive cancellation while the worker cannot advance. The
+                // caller's wake must abort the child before opening the gate.
+                let outcome = pending.as_mut().poll(&mut Context::from_waker(&waker));
+                release.send(()).unwrap();
+                let result = match outcome {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => pending.await,
+                };
+                assert!(matches!(
+                    result,
+                    Err(SearchError::Cancelled { phase, .. })
+                        if phase == "native_ann.query_worker.delivery"
+                ));
+                cx.set_cancel_requested(false);
+                assert!(
+                    !index
+                        .search_with_pool(&cx, query(), 1, None, pool)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                calls
+            });
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "cancelled exact/ANN work must stop before another predicate call"
             );
-            assert!(!cx.is_cancel_requested());
-            release.send(()).unwrap();
-            weak
-        });
-        assert!(
-            weak.upgrade().is_none(),
-            "pool drain must release abandoned query owners"
-        );
+        }
+    }
+
+    #[test]
+    fn pending_drop_releases_the_retained_owner_after_the_running_worker_drains() {
+        for ann in [false, true] {
+            let (weak, calls) = run(1, |cx, pool| async move {
+                let retained = index(&cx, QuantizationFormat::F32, ann, &rows());
+                let weak = Arc::downgrade(&retained.owner);
+                let (started, entered) = mpsc::channel();
+                let (release, gate) = mpsc::channel();
+                let gate = Mutex::new(gate);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&calls);
+                let mut pending = Box::pin(retained.search_filtered_with_pool(
+                    &cx,
+                    query(),
+                    2,
+                    Some(2),
+                    pool.clone(),
+                    move |_| {
+                        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                            started.send(()).unwrap();
+                            gate.lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(10))
+                                .unwrap();
+                        }
+                        true
+                    },
+                ));
+                assert!(
+                    pending
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                wait_for_worker(entered).await;
+                drop(pending);
+                drop(retained);
+                assert!(
+                    weak.upgrade().is_some(),
+                    "running worker must retain its exact bytes"
+                );
+                assert!(!cx.is_cancel_requested());
+                release.send(()).unwrap();
+                let next = index(&cx, QuantizationFormat::F32, ann, &rows());
+                assert!(
+                    !next
+                        .search_with_pool(&cx, query(), 1, None, pool)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                (weak, calls)
+            });
+            assert!(
+                weak.upgrade().is_none(),
+                "pool drain must release abandoned query owners"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "dropped exact/ANN work must stop before another predicate call"
+            );
+        }
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn deadline_expiry_stops_active_native_search_without_cancelling_its_caller() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        use crate::native_ann::builder::deadline::NativeSearchDeadline;
+
+        for ann in [false, true] {
+            let calls = run(1, |cx, pool| async move {
+                let index = index(&cx, QuantizationFormat::F32, ann, &rows());
+                let clock = Arc::new(VirtualClock::new());
+                let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+                let deadline =
+                    NativeSearchDeadline::with_timer(&cx, timer.clone(), Duration::from_millis(10))
+                        .unwrap();
+                let (started, entered) = mpsc::channel();
+                let (release, gate) = mpsc::channel();
+                let gate = Mutex::new(gate);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&calls);
+                let mut pending = Box::pin(deadline.run(
+                    &cx,
+                    index.search_filtered_with_pool(
+                        &cx,
+                        query(),
+                        2,
+                        Some(2),
+                        pool.clone(),
+                        move |_| {
+                            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                                started.send(()).unwrap();
+                                gate.lock()
+                                    .unwrap()
+                                    .recv_timeout(Duration::from_secs(10))
+                                    .unwrap();
+                            }
+                            true
+                        },
+                    ),
+                ));
+                assert!(
+                    pending
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                wait_for_worker(entered).await;
+                clock.advance(10_000_000);
+                let _ = timer.process_timers();
+                assert!(matches!(
+                    pending
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(SearchError::SearchTimeout { .. }))
+                ));
+                assert!(timer.is_empty());
+                assert!(!cx.is_cancel_requested());
+                release.send(()).unwrap();
+                // Keep the completed deadline future allocated: it must have
+                // already dropped and cancelled its owned query at Ready.
+                assert!(
+                    !index
+                        .search_with_pool(&cx, query(), 1, None, pool)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                drop(pending);
+                calls
+            });
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "expired exact/ANN work must stop before another predicate call"
+            );
+        }
     }
 }

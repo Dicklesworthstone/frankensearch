@@ -8,10 +8,11 @@
 //!
 //! Graph kernels are synchronous and belong on the caller's blocking/CPU lane.
 //! Builders and pool query APIs place that work on a caller-owned pool and join
-//! the worker before delivery. Graph construction and traversal check the
-//! caller's cancellation during their work. Synchronous loading and structural
-//! admission are bracketed by checkpoints. No runtime, pool, fallback embedder
-//! or detached publication worker is created here.
+//! the worker before delivery. Graph construction and traversal observe both
+//! caller cancellation and abandonment of their own job through checkpoints.
+//! Synchronous loading and structural admission are bracketed by checkpoints.
+//! No runtime, pool, fallback embedder or detached publication worker is created
+//! here.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,8 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use asupersync::runtime::JoinError;
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
-use frankensearch_core::BoundQueryEmbedding;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
+use frankensearch_core::{BoundQueryEmbedding, with_cancellation};
 use frankensearch_index::native_hnsw::{
     HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
 };
@@ -605,14 +606,30 @@ impl NativeWorker {
                         self.kind
                     )));
                 }
-                let result = work(&request);
+                // Dropping the join aborts this child without cancelling the
+                // caller or unrelated pool jobs. Native kernels must observe
+                // that child during traversal, not only at result delivery.
+                let result = work(&child);
                 self.checkpoint(&request, &child, &abandoned)?;
                 result
             })
             .map_err(|_| self.error(format!("cannot admit native {} work", self.kind)))?;
-        // Join the owned worker even after a cancellation request. Racing this
-        // join with cancellation would leave an unobserved writer or traversal.
-        let result = worker.join(cx).await;
+        // A direct caller cancellation must also abort the child: task joins
+        // themselves are uninterruptible. Keep ownership of the handle after
+        // interruption while running native kernels stop at their checkpoints.
+        let result =
+            with_cancellation(cx, self.delivery, async { Ok(worker.join(cx).await) }).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // Cancellation can win before the inner join is first polled,
+                // so its drop hook alone does not cover every admission race.
+                worker.abort();
+                let _ = worker.join(cx).await;
+                checkpoint(cx, self.delivery)?;
+                return Err(error);
+            }
+        };
         // Caller cancellation wins over ready work AND worker failure. Workers
         // never own result-delivery callbacks or a live generation selection.
         checkpoint(cx, self.delivery)?;
