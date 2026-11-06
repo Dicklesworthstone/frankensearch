@@ -1511,7 +1511,7 @@ impl ValidatedFsviBytes {
     /// or changes any retained content witness.
     pub fn rebind_generation(
         &self,
-        cx: &asupersync::Cx,
+        cx: &frankensearch_core::Cx,
         generation: ArtifactGenerationIdentityV1,
         max_image_bytes: usize,
     ) -> SearchResult<Self> {

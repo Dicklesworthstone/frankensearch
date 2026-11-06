@@ -100,7 +100,9 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-repair --from-receipt DAMAGED_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
-      --retrieval exact [--model-dir DIR] [--quality-backend BACKEND]\n\
+      --retrieval exact|hnsw [--reuse-vectors]\n\
+      [--hnsw-seed N] [--quality-hnsw-seed N]\n\
+      [--model-dir DIR] [--quality-backend BACKEND]\n\
       [--quality-model-dir DIR] [--batch-size N] [--max-source-bytes N]\n\
       [--max-image-bytes N]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N] [--lexical-only]\n\
@@ -179,7 +181,15 @@ source even when vector or ANN images are damaged or missing. It needs no health
 ancestor and never serves a partial generation. It rebuilds every stored tier\n\
 with the same full producer identities, precision, source checkpoint and document\n\
 fields, then publishes a complete higher-sequence Repair successor. Explicit\n\
---retrieval exact is required; old damaged images remain untouched. Repair accepts\n\
+--retrieval exact is required for repair that reruns inference; old images remain\n\
+untouched. With --reuse-vectors, repair instead requires intact authenticated\n\
+vectors and never loads models. It preserves the same source and each tier's\n\
+precision, and accepts explicit --retrieval exact or hnsw. HNSW requires\n\
+--hnsw-seed: choose a fresh seed so the rebuilt graph has a new immutable object\n\
+address. --quality-hnsw-seed selects an independent full-tier seed; otherwise it\n\
+uses --hnsw-seed. A repeated old whole-graph receipt is refused before staging.\n\
+Seed flags require HNSW, and --reuse-vectors excludes model directory/backend\n\
+options. Both repair routes accept\n\
 no replacement input, source advancement, model migration or topology change.\n\
 Damaged source, control state, unsafe root entries or a competing head refuse.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
@@ -347,6 +357,7 @@ struct Options {
     reranker_dir: Option<PathBuf>,
     rerank_window: usize,
     retrieval: Option<NativeBuildRetrieval>,
+    repair_vectors: repair::RetainedVectorOptions,
     source_low: Option<u64>,
     source_high: Option<u64>,
     query: Option<String>,
@@ -422,6 +433,7 @@ impl Options {
             reranker_dir: None,
             rerank_window: 50,
             retrieval: None,
+            repair_vectors: repair::RetainedVectorOptions::default(),
             source_low: None,
             source_high: None,
             query: None,
@@ -615,6 +627,22 @@ impl Options {
                         _ => return Err(bad("authority retrieval must be exact or hnsw")),
                     });
                 }
+                "--reuse-vectors" if command == Command::Repair => {
+                    options.repair_vectors.reuse_vectors = true;
+                }
+                "--hnsw-seed" if command == Command::Repair => {
+                    options.repair_vectors.primary_seed = Some(
+                        value(&mut args)?
+                            .parse()
+                            .map_err(|_| bad("HNSW seed must be an unsigned 64-bit integer"))?,
+                    );
+                }
+                "--quality-hnsw-seed" if command == Command::Repair => {
+                    options.repair_vectors.quality_seed =
+                        Some(value(&mut args)?.parse().map_err(|_| {
+                            bad("quality HNSW seed must be an unsigned 64-bit integer")
+                        })?);
+                }
                 "--cooperative-local" if command == Command::Index => {
                     options.cooperative_local = true;
                 }
@@ -798,9 +826,7 @@ impl Options {
                         "authority-repair requires --from-receipt and --work-dir",
                     ));
                 }
-                if options.retrieval != Some(NativeBuildRetrieval::Exact) {
-                    return Err(bad("authority-repair requires explicit --retrieval exact"));
-                }
+                repair::validate_options(&options)?;
             }
             Command::Rollback => {
                 if options.from_receipt.is_none() || options.target_receipt.is_none() {
