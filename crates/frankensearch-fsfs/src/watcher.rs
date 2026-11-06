@@ -1611,16 +1611,17 @@ impl FsWatcher {
     /// waiting out a production-sized bound. The shipping path is the same
     /// code with the same constant it always used.
     async fn start_bounded(&self, cx: &Cx, max_waits: usize) -> SearchResult<()> {
-        if cx.is_cancel_requested() {
-            return Err(SearchError::Cancelled {
-                phase: "watch.start".to_owned(),
-                reason: "cancel requested before start".to_owned(),
-            });
-        }
-
         let mut observed_generation = None;
         let mut waits = 0_usize;
         loop {
+            // A wait or graceful drain can suspend this request. Recheck
+            // before a subsequent decision allocates another generation.
+            if cx.is_cancel_requested() {
+                return Err(SearchError::Cancelled {
+                    phase: "watch.start".to_owned(),
+                    reason: "cancel requested before start".to_owned(),
+                });
+            }
             let decision = lock_or_recover(&self.control).start_decision(observed_generation);
             match decision {
                 StartDecision::AlreadyRunning | StartDecision::ObservedGenerationCompleted => {
@@ -8815,6 +8816,90 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn cancelled_start_does_not_restart_after_finishing_an_abandoned_drain() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let initial = temp.path().join("initial.rs");
+            fs::write(&initial, "fn initial() {}\n").expect("write initial fixture");
+            let pipeline = Arc::new(ParkedApplyPipeline::default());
+            let _release_on_unwind = ParkedApplyReleaseGuard {
+                pipeline: Arc::clone(&pipeline),
+            };
+            let watcher = FsWatcher::new(
+                vec![temp.path().to_path_buf()],
+                DiscoveryConfig::default(),
+                pipeline.clone(),
+            );
+            watcher.start(&cx).await.expect("start watcher");
+            for _ in 0..1_000 {
+                if pipeline.entered.load(Ordering::Acquire) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert!(
+                pipeline.entered.load(Ordering::Acquire),
+                "apply must be parked"
+            );
+
+            let mut stopping = Box::pin(watcher.stop_checked(&cx));
+            std::future::poll_fn(|context| {
+                assert!(stopping.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(stopping);
+
+            // Cancelling this request must not cancel the runtime that owns
+            // the existing ingest, which must still finish its graceful drain.
+            let request_cx = Cx::for_testing();
+            let mut restarting = Box::pin(watcher.start(&request_cx));
+            std::future::poll_fn(|context| {
+                assert!(restarting.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            request_cx.cancel_fast(asupersync::CancelKind::User);
+            assert!(!cx.is_cancel_requested());
+            pipeline.released.store(true, Ordering::Release);
+
+            let error = restarting
+                .await
+                .expect_err("a cancelled start must not admit another generation");
+            assert!(matches!(error, SearchError::Cancelled { ref phase, .. }
+                if phase == "watch.start"));
+            assert!(matches!(
+                &lock_or_recover(&watcher.control).lifecycle,
+                WatcherLifecycle::Stopped
+            ));
+            assert_eq!(lock_or_recover(&watcher.control).next_generation, 1);
+            assert!(!lock_or_recover(&pipeline.applied).is_empty());
+
+            let later = temp.path().join("after-cancelled-start.rs");
+            fs::write(&later, "fn later() {}\n").expect("write restart fixture");
+            watcher
+                .start(&cx)
+                .await
+                .expect("an uncancelled caller can restart");
+            await_startup_reconciliation(&cx, &watcher).await;
+            watcher
+                .stop_checked(&cx)
+                .await
+                .expect("stop restarted watcher");
+            assert_eq!(lock_or_recover(&watcher.control).next_generation, 2);
+            assert!(
+                lock_or_recover(&pipeline.applied)
+                    .iter()
+                    .flatten()
+                    .any(|op| {
+                        matches!(op, WatchIngestOp::Upsert { file_key, .. }
+                    if file_key == &normalize_file_key(&later))
+                    })
+            );
+        });
     }
 
     /// A wedged lifecycle transition must time out rather than poll forever.
