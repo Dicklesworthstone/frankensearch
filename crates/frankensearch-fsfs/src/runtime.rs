@@ -7847,7 +7847,7 @@ impl FsfsRuntime {
         shutdown: &ShutdownCoordinator,
     ) -> SearchResult<()> {
         match mode {
-            InterfaceMode::Cli => self.run_cli_with_shutdown(cx, shutdown).await,
+            InterfaceMode::Cli => Box::pin(self.run_cli_with_shutdown(cx, shutdown)).await,
             InterfaceMode::Tui => self.run_tui_with_shutdown(cx, shutdown).await,
         }
     }

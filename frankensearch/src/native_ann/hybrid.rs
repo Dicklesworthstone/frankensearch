@@ -441,12 +441,14 @@ fn validate_lexical(cx: &Cx, batch: &LexicalCandidateBatch) -> SearchResult<()> 
 /// Poll both caller-owned sources without spawning or requiring ready futures.
 /// On any error the still-owned sibling is dropped by this function's return.
 /// Cancellation has its own wake registration even when neither source wakes.
-async fn join_sources<A, B>(
+/// Keep the combined source frame on the heap so nested joins do not inflate
+/// every caller's future with both sources' inline state.
+fn join_sources<A, B>(
     cx: &Cx,
     first: impl Future<Output = SearchResult<A>>,
     second: impl Future<Output = SearchResult<B>>,
-) -> SearchResult<(A, B)> {
-    with_cancellation(cx, "native_ann.hybrid_sources", async move {
+) -> impl Future<Output = SearchResult<(A, B)>> {
+    let joined = with_cancellation(cx, "native_ann.hybrid_sources", async move {
         let mut first = std::pin::pin!(first);
         let mut second = std::pin::pin!(second);
         let mut first_value = None;
@@ -481,8 +483,8 @@ async fn join_sources<A, B>(
             Poll::Pending
         })
         .await
-    })
-    .await
+    });
+    Box::pin(joined)
 }
 
 #[cfg(test)]

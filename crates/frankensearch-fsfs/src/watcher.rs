@@ -1792,6 +1792,7 @@ impl FsWatcher {
                     producer: owner.tasks.producer.take().expect("unpublished producer"),
                     ingest_task: owner.tasks.ingest_task.take().expect("unpublished ingest"),
                 };
+                drop(control);
                 owner.completed = true;
                 true
             } else {
@@ -8759,11 +8760,13 @@ mod tests {
 
                 // Either public entry point can take the abandoned owners.
                 // Abandon it a second time while the same ingest is still live.
-                let mut draining: WatchIngestFuture<'_, ()> = if restart_drain {
-                    Box::pin(watcher.start(&cx))
-                } else {
-                    Box::pin(watcher.stop_checked(&cx))
-                };
+                let mut draining = Box::pin(async {
+                    if restart_drain {
+                        watcher.start(&cx).await
+                    } else {
+                        watcher.stop_checked(&cx).await
+                    }
+                });
                 std::future::poll_fn(|context| {
                     assert!(draining.as_mut().poll(context).is_pending());
                     std::task::Poll::Ready(())

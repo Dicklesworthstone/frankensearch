@@ -2543,7 +2543,7 @@ mod tests {
             let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
             let plan = reopened.plan_retention(&cx, 1).unwrap();
             assert_eq!(plan.active.as_deref(), Some(current.as_str()));
-            assert_eq!(plan.retained, [previous_id.clone()]);
+            assert_eq!(plan.retained.as_slice(), std::slice::from_ref(&previous_id));
             let mut expected_removed = vec![first, preview_id];
             expected_removed.sort_unstable();
             assert_eq!(
@@ -2608,8 +2608,8 @@ mod tests {
 
             let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
             assert_eq!(
-                reopened.plan_retention(&cx, 1).unwrap().retained,
-                [oldest_id.clone()]
+                reopened.plan_retention(&cx, 1).unwrap().retained.as_slice(),
+                std::slice::from_ref(&oldest_id)
             );
             assert_eq!(
                 reopened.plan_retention(&cx, 2).unwrap().retained,
@@ -2686,7 +2686,7 @@ mod tests {
                     activation_path(root.path(), selection.activation_sha256.as_deref().unwrap());
                 match fault {
                     "missing" => {
-                        fs::rename(&record_path, root.path().join("saved-record")).unwrap()
+                        fs::rename(&record_path, root.path().join("saved-record")).unwrap();
                     }
                     "digest" => fs::write(&record_path, b"damaged activation record").unwrap(),
                     "oversized" => fs::write(
