@@ -33,9 +33,12 @@ use super::scope::PreparedNativeGenerationScope;
 use super::{NativeBuildRetrieval, NativeBuiltTier, NativeIndexBuilder, hybrid};
 use crate::{Cx, IndexableDocument, SearchResult};
 
+mod vector_recovery;
+
 /// Complete owned vector, lexical, metadata, and optional native ANN images.
 ///
-/// The only constructor builds every component from one source cohort and joins its actual
+/// Constructors build from one source cohort or rebuild derived components from
+/// authenticated source and exact retained vector owners, then join their actual
 /// document-set/checkpoint receipts. No arbitrary reader or caller-provided
 /// checksum can construct this payload. Images remain usable after the build
 /// directory is moved or removed. Publication still requires the qualified-root
@@ -688,6 +691,16 @@ fn capture_ann(
             ));
         }
     };
+    capture_ann_image(cx, path, receipt, owner, budget).map(Some)
+}
+
+fn capture_ann_image(
+    cx: &Cx,
+    path: &std::path::Path,
+    receipt: &NativeHnswGenerationReceiptV2,
+    owner: Arc<ValidatedFsviBytes>,
+    budget: usize,
+) -> SearchResult<(Arc<[u8]>, NativeHnswGenerationReceiptV2)> {
     let len = usize::try_from(receipt.graph_byte_len).map_err(|_| image_budget_error())?;
     if len > budget {
         return Err(image_budget_error());
@@ -721,7 +734,7 @@ fn capture_ann(
     ValidatedNativeHnsw::from_bytes(owner, Arc::clone(&bytes), receipt)
         .map_err(|error| invalid("builder.generation.ann", "invalid", &error.to_string()))?;
     checkpoint(cx, "native_ann.builder.generation_ann_complete")?;
-    Ok(Some((bytes, receipt.clone())))
+    Ok((bytes, receipt.clone()))
 }
 
 #[allow(clippy::too_many_arguments)]
