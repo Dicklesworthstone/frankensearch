@@ -201,6 +201,31 @@ impl FsfsRuntime {
             ));
         }
         let _cancellation_scope = shutdown.map(|shutdown| shutdown.cancellation_scope(cx));
+        if !dashboard
+            && matches!(
+                self.cli_input.command,
+                CliCommand::Status | CliCommand::Doctor
+            )
+        {
+            let reader = if self.cli_input.format == OutputFormat::Table {
+                self.open_complete_generation_diagnostics_with_error_writer(
+                    cx,
+                    &root,
+                    &mut std::io::stderr(),
+                )?
+            } else {
+                self.open_complete_generation_diagnostics_with_error_writer(
+                    cx,
+                    &root,
+                    &mut std::io::stdout(),
+                )?
+            };
+            return if self.cli_input.command == CliCommand::Status {
+                reader.runtime.run_status_command()
+            } else {
+                reader.runtime.run_doctor_command()
+            };
+        }
         retained_search_checkpoint(cx)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
         if dashboard {
@@ -259,19 +284,101 @@ impl FsfsRuntime {
                 Box::pin(self.run_complete_generation_daemon(cx, &root)).await,
                 shutdown,
             ),
-            CliCommand::Status | CliCommand::Doctor => {
-                let reader = self.open_complete_generation_diagnostics(cx, &root)?;
-                if self.cli_input.command == CliCommand::Status {
-                    reader.runtime.run_status_command()
-                } else {
-                    reader.runtime.run_doctor_command()
-                }
-            }
             _ => Err(complete_cli_error(
                 "command",
                 "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, append-batch, delete, compact, flush, search, explain, tui, serve, daemon, status, or doctor",
             )),
         }
+    }
+
+    /// Admission failures precede the ordinary doctor/status collectors, so
+    /// project only the readiness the typed failure actually establishes. No
+    /// unadmitted generation or legacy root may supply diagnostic facts.
+    fn open_complete_generation_diagnostics_with_error_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        writer: &mut W,
+    ) -> SearchResult<CompleteGenerationDiagnosticReader> {
+        let admission = (|| {
+            retained_search_checkpoint(cx)?;
+            validate_retained_catalog_path(&self.config.storage.db_path)?;
+            self.open_complete_generation_diagnostics(cx, root)
+        })();
+        let error = match admission {
+            Ok(reader) => return Ok(reader),
+            Err(error) => error,
+        };
+        let mut output = crate::output_schema::output_error_from(&error);
+        // Generic corruption advice recommends an ordinary --force rebuild,
+        // which cannot admit a corrupt complete-store selection either.
+        output.suggestion = None;
+        output.context = Some(
+            "The complete generation was not admitted. No semantic producer, coverage, or \
+             usable legacy fallback has been verified."
+                .to_owned(),
+        );
+        let recovery = (|| -> SearchResult<_> {
+            let plan = super::recovery_plan_for_search_error(
+                &error,
+                Self::runtime_recovery_request(self.doctor_requested_mode(), false),
+                &self.runtime_recovery_policy(),
+                None,
+                0,
+            )
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.complete_generation.diagnostics",
+                source: Box::new(source),
+            })?;
+            let value =
+                serde_json::to_value(&plan).map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.complete_generation.diagnostics",
+                    source: Box::new(source),
+                })?;
+            Ok((plan, value))
+        })();
+        match recovery {
+            Ok((plan, value)) => {
+                output.context = Some(format!(
+                    "The complete generation was not admitted ({}). No semantic producer, \
+                     coverage, or usable legacy fallback has been verified.",
+                    plan.state_code(),
+                ));
+                output.suggestion = plan.action().map(|action| action.explanation().to_owned());
+                output.recovery_plan = Some(value);
+            }
+            Err(projection_error) => tracing::warn!(
+                %projection_error,
+                "could not attach complete-generation diagnostic recovery advice"
+            ),
+        }
+        let command = if self.cli_input.command == CliCommand::Status {
+            "status"
+        } else {
+            "doctor"
+        };
+        let envelope = OutputEnvelope::<()>::error(
+            output.clone(),
+            meta_for_format(command, self.cli_input.format),
+            iso_timestamp_now(),
+        );
+        let emission = (|| -> SearchResult<()> {
+            emit_envelope(&envelope, self.cli_input.format, writer)?;
+            if self.cli_input.format != OutputFormat::Jsonl {
+                writer.write_all(b"\n")?;
+            }
+            writer.flush()?;
+            Ok(())
+        })();
+        if let Err(emission_error) = emission {
+            tracing::warn!(
+                %emission_error,
+                "could not emit complete-generation diagnostic failure"
+            );
+        }
+        // Preserve the admission error's exit code even after a failed/partial
+        // write, and prevent the process boundary from emitting a second record.
+        Err(crate::output_schema::mark_output_reported(output))
     }
 
     fn open_complete_generation_diagnostics(
@@ -1620,6 +1727,9 @@ pub(super) fn complete_cli_error(field: &str, reason: &str) -> SearchError {
 #[cfg(all(test, unix))]
 mod diagnostic_retention_tests {
     use super::*;
+    use crate::output_schema::{
+        OutputError, decode_envelope_toon, output_error_from, reported_output_error,
+    };
     use crate::{CliInput, FsfsConfig};
     use asupersync::test_utils::run_test_with_cx;
 
@@ -1645,6 +1755,309 @@ mod diagnostic_retention_tests {
         let build = store.begin(cx).unwrap();
         fs::write(build.path().join("diagnostic-artifact"), "retained bytes").unwrap();
         require_durable_publication(build.publish(cx, |_, _| Ok(())).unwrap()).unwrap()
+    }
+
+    fn assert_emitted_admission_error(
+        runtime: &FsfsRuntime,
+        cx: &Cx,
+        root: &Path,
+        state_code: &str,
+    ) -> OutputError {
+        let original = runtime
+            .open_complete_generation_diagnostics(cx, root)
+            .err()
+            .expect("the fixture must refuse admission");
+        let original = output_error_from(&original);
+        let mut bytes = Vec::new();
+        let reported = runtime
+            .open_complete_generation_diagnostics_with_error_writer(cx, root, &mut bytes)
+            .err()
+            .expect("the command must retain the admission failure");
+        let error = reported_output_error(&reported).expect("the error must own its output");
+        assert_eq!(error.code, original.code);
+        assert_eq!(error.message, original.message);
+        assert_eq!(error.field, original.field);
+        assert_eq!(error.exit_code, original.exit_code);
+        let plan = error
+            .recovery_plan
+            .as_ref()
+            .expect("canonical recovery plan");
+        assert_eq!(plan["state_code"], state_code);
+        assert_eq!(plan["semantic_available"], false);
+        assert_eq!(plan["provenance"], "unavailable");
+        serde_json::from_value::<frankensearch_core::recovery_plan::UntrustedRecoveryPlan>(
+            plan.clone(),
+        )
+        .unwrap();
+        assert!(!error.suggestion.as_deref().unwrap().contains("--force"));
+        assert!(error.context.as_deref().unwrap().contains(state_code));
+        assert!(!error.context.as_deref().unwrap().contains("--force"));
+        let text = String::from_utf8(bytes).unwrap();
+        match runtime.cli_input.format {
+            OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
+                let envelope: OutputEnvelope<()> = if runtime.cli_input.format == OutputFormat::Toon
+                {
+                    decode_envelope_toon(&text).unwrap()
+                } else {
+                    serde_json::from_str(&text).unwrap()
+                };
+                assert!(!envelope.ok);
+                assert!(envelope.data.is_none());
+                assert_eq!(envelope.error.as_ref(), Some(error));
+                assert_eq!(
+                    envelope.meta.command,
+                    if runtime.cli_input.command == CliCommand::Status {
+                        "status"
+                    } else {
+                        "doctor"
+                    }
+                );
+                if runtime.cli_input.format == OutputFormat::Jsonl {
+                    assert_eq!(text.lines().count(), 1);
+                }
+            }
+            OutputFormat::Table => {
+                assert_eq!(text.matches("error: [").count(), 1);
+                assert!(text.contains(&error.code));
+                assert!(text.contains(state_code));
+                assert!(text.contains(error.suggestion.as_deref().unwrap()));
+            }
+            OutputFormat::Csv => {
+                assert!(text.starts_with("ok,error_code,error_message,"));
+                assert_eq!(text.lines().filter(|line| !line.is_empty()).count(), 2);
+                assert!(text.contains(&error.code));
+                assert!(text.contains(state_code));
+            }
+        }
+        assert!(!text.contains("--force"));
+        error.clone()
+    }
+
+    #[test]
+    fn diagnostics_emit_canonical_corruption_recovery_in_every_format() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let selected = publish_bundle(&store, &cx);
+            let artifact = selected.path().join("diagnostic-artifact");
+            let pointer = fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
+            fs::write(&artifact, "corrupt").unwrap();
+            for command in [CliCommand::Status, CliCommand::Doctor] {
+                for format in [
+                    OutputFormat::Json,
+                    OutputFormat::Jsonl,
+                    OutputFormat::Toon,
+                    OutputFormat::Table,
+                    OutputFormat::Csv,
+                ] {
+                    let mut runtime = diagnostic_runtime(root.path(), command);
+                    runtime.cli_input.format = format;
+                    let error = assert_emitted_admission_error(
+                        &runtime,
+                        &cx,
+                        root.path(),
+                        "recovery.state.manifest_unsafe",
+                    );
+                    let plan = error.recovery_plan.unwrap();
+                    assert_eq!(plan["action"]["code"], "recovery.action.reindex_full");
+                    assert_eq!(plan["action"]["argv"], serde_json::json!([]));
+                    assert!(
+                        !plan["action"]["prerequisites"]
+                            .as_array()
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert_eq!(fs::read_to_string(&artifact).unwrap(), "corrupt");
+                    assert_eq!(
+                        fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                        pointer
+                    );
+                    assert!(!root.path().join("catalog.sqlite").exists());
+                    assert!(!root.path().join("missing-models").exists());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn diagnostics_distinguish_missing_artifacts_from_unproven_readiness() {
+        run_test_with_cx(|cx| async move {
+            for (missing, state_code) in [
+                ("diagnostic-artifact", "recovery.state.manifest_unsafe"),
+                (
+                    COMPLETE_GENERATION_MANIFEST,
+                    "recovery.state.readiness_unproven",
+                ),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+                let selected = publish_bundle(&store, &cx);
+                let missing = selected.path().join(missing);
+                let saved = root.path().join("saved-artifact");
+                let pointer = fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
+                fs::rename(&missing, &saved).unwrap();
+                let saved_bytes = fs::read(&saved).unwrap();
+                for command in [CliCommand::Status, CliCommand::Doctor] {
+                    let runtime = diagnostic_runtime(root.path(), command);
+                    assert_emitted_admission_error(&runtime, &cx, root.path(), state_code);
+                    assert!(!missing.exists());
+                    assert_eq!(fs::read(&saved).unwrap(), saved_bytes);
+                    assert_eq!(
+                        fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                        pointer
+                    );
+                    assert!(!root.path().join("missing-models").exists());
+                }
+                fs::rename(&saved, &missing).unwrap();
+                assert_eq!(store.active(&cx).unwrap(), Some(selected));
+            }
+        });
+    }
+
+    #[test]
+    fn diagnostics_do_not_repair_a_malformed_selection_during_reporting() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let selected = publish_bundle(&store, &cx);
+            let pointer_path = root.path().join(COMPLETE_GENERATION_POINTER);
+            let pointer = fs::read(&pointer_path).unwrap();
+            fs::write(&pointer_path, "invalid selection").unwrap();
+            for command in [CliCommand::Status, CliCommand::Doctor] {
+                let runtime = diagnostic_runtime(root.path(), command);
+                assert_emitted_admission_error(
+                    &runtime,
+                    &cx,
+                    root.path(),
+                    "recovery.state.manifest_unsafe",
+                );
+                assert_eq!(
+                    fs::read_to_string(&pointer_path).unwrap(),
+                    "invalid selection"
+                );
+                assert_eq!(
+                    fs::read_to_string(selected.path().join("diagnostic-artifact")).unwrap(),
+                    "retained bytes"
+                );
+                assert!(!root.path().join("missing-models").exists());
+            }
+            fs::write(&pointer_path, pointer).unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(selected));
+        });
+    }
+
+    #[test]
+    fn diagnostics_preserve_cancellation_without_claiming_corruption() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let selected = publish_bundle(&store, &cx);
+            let pointer = fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
+            cx.set_cancel_requested(true);
+            for command in [CliCommand::Status, CliCommand::Doctor] {
+                let runtime = diagnostic_runtime(root.path(), command);
+                let error = assert_emitted_admission_error(
+                    &runtime,
+                    &cx,
+                    root.path(),
+                    "recovery.state.readiness_unproven",
+                );
+                assert_eq!(error.code, "cancelled");
+                let plan = error.recovery_plan.unwrap();
+                assert_eq!(plan["action"]["code"], "recovery.action.inspect_readiness");
+                assert_eq!(plan["action"]["potentially_destructive"], false);
+            }
+            cx.set_cancel_requested(false);
+            let runtime = diagnostic_runtime(root.path(), CliCommand::Doctor);
+            let mut output = Vec::new();
+            let reader = runtime
+                .open_complete_generation_diagnostics_with_error_writer(
+                    &cx,
+                    root.path(),
+                    &mut output,
+                )
+                .unwrap();
+            assert!(output.is_empty());
+            assert_eq!(reader.generation.as_ref(), Some(&selected));
+            assert_eq!(
+                fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert!(!root.path().join("missing-models").exists());
+        });
+    }
+
+    #[test]
+    fn diagnostics_keep_output_ownership_after_a_partial_write_or_flush_failure() {
+        struct FailingWriter {
+            bytes: Vec<u8>,
+            limit: usize,
+            failed: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(
+                    !self.failed,
+                    "failed output must never receive another record"
+                );
+                if self.bytes.len() == self.limit {
+                    self.failed = true;
+                    return Err(std::io::Error::from(ErrorKind::BrokenPipe));
+                }
+                let length = bytes.len().min(self.limit - self.bytes.len());
+                self.bytes.extend_from_slice(&bytes[..length]);
+                Ok(length)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert!(!self.failed, "failed output must not be flushed");
+                self.failed = true;
+                Err(std::io::Error::from(ErrorKind::BrokenPipe))
+            }
+        }
+
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let selected = publish_bundle(&store, &cx);
+            fs::write(selected.path().join("diagnostic-artifact"), "corrupt").unwrap();
+            let runtime = diagnostic_runtime(root.path(), CliCommand::Doctor);
+            let original = runtime
+                .open_complete_generation_diagnostics(&cx, root.path())
+                .err()
+                .unwrap();
+            let original = output_error_from(&original);
+            for limit in [17, usize::MAX] {
+                let mut writer = FailingWriter {
+                    bytes: Vec::new(),
+                    limit,
+                    failed: false,
+                };
+                let reported = runtime
+                    .open_complete_generation_diagnostics_with_error_writer(
+                        &cx,
+                        root.path(),
+                        &mut writer,
+                    )
+                    .err()
+                    .unwrap();
+                assert!(writer.failed);
+                let error = reported_output_error(&reported).unwrap();
+                assert_eq!(error.code, original.code);
+                assert_eq!(error.exit_code, original.exit_code);
+                assert_eq!(
+                    error.recovery_plan.as_ref().unwrap()["state_code"],
+                    "recovery.state.manifest_unsafe"
+                );
+                if limit == usize::MAX {
+                    let envelope: OutputEnvelope<()> =
+                        serde_json::from_slice(&writer.bytes).unwrap();
+                    assert_eq!(envelope.error.as_ref(), Some(error));
+                } else {
+                    assert_eq!(writer.bytes.len(), limit);
+                }
+            }
+        });
     }
 
     #[test]
@@ -1762,12 +2175,25 @@ mod diagnostic_retention_tests {
             let selected = publish_bundle(&store, &cx);
             let artifact = selected.path().join("diagnostic-artifact");
             let pointer = fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
-            let runtime = diagnostic_runtime(root.path(), CliCommand::Doctor);
+            let mut runtime = diagnostic_runtime(root.path(), CliCommand::Doctor);
+            runtime.cli_input.format = OutputFormat::Table;
             fs::write(&artifact, "corrupt").unwrap();
             assert!(matches!(
                 runtime.open_complete_generation_diagnostics(&cx, root.path()),
                 Err(SearchError::IndexCorrupted { .. })
             ));
+            let reported = runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                reported_output_error(&reported)
+                    .unwrap()
+                    .recovery_plan
+                    .as_ref()
+                    .unwrap()["state_code"],
+                "recovery.state.manifest_unsafe"
+            );
             assert_eq!(fs::read_to_string(&artifact).unwrap(), "corrupt");
             fs::write(&artifact, "retained bytes").unwrap();
             cx.set_cancel_requested(true);
@@ -1775,6 +2201,18 @@ mod diagnostic_retention_tests {
                 runtime.open_complete_generation_diagnostics(&cx, root.path()),
                 Err(SearchError::Cancelled { .. })
             ));
+            let reported = runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                reported_output_error(&reported)
+                    .unwrap()
+                    .recovery_plan
+                    .as_ref()
+                    .unwrap()["state_code"],
+                "recovery.state.readiness_unproven"
+            );
             cx.set_cancel_requested(false);
             assert_eq!(
                 fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
