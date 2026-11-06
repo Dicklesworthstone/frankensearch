@@ -509,7 +509,7 @@ mod tests {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let seen = Arc::clone(&calls);
                 let wakes = Arc::new(Wakes::default());
-                let waker = Waker::from(Arc::clone(&wakes));
+                let context_waker = Waker::from(Arc::clone(&wakes));
                 let mut pending = Box::pin(index.search_filtered_with_pool(
                     &cx,
                     query(),
@@ -531,7 +531,7 @@ mod tests {
                 assert!(
                     pending
                         .as_mut()
-                        .poll(&mut Context::from_waker(&waker))
+                        .poll(&mut Context::from_waker(&context_waker))
                         .is_pending()
                 );
                 wait_for_worker(entered).await;
@@ -546,7 +546,9 @@ mod tests {
                 );
                 // Drive cancellation while the worker cannot advance. The
                 // caller's wake must abort the child before opening the gate.
-                let outcome = pending.as_mut().poll(&mut Context::from_waker(&waker));
+                let outcome = pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&context_waker));
                 release.send(()).unwrap();
                 let result = match outcome {
                     Poll::Ready(result) => result,

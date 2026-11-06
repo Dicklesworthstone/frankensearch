@@ -856,9 +856,9 @@ mod tests {
         let index = index(&cx, false);
         let provider = Provider::new(true);
         let wakes = Arc::new(CancellationWake::default());
-        let waker = Waker::from(Arc::clone(&wakes));
+        let context_waker = Waker::from(Arc::clone(&wakes));
         let baseline = Arc::strong_count(&wakes);
-        let mut task = Context::from_waker(&waker);
+        let mut task = Context::from_waker(&context_waker);
         let mut operation = Box::pin(index.embed_query(&cx, &provider, "query"));
         assert!(operation.as_mut().poll(&mut task).is_pending());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
@@ -886,9 +886,9 @@ mod tests {
             let mut lexical = Lexical::new();
             lexical.pending = lexical_pending;
             let wakes = Arc::new(CancellationWake::default());
-            let waker = Waker::from(Arc::clone(&wakes));
+            let context_waker = Waker::from(Arc::clone(&wakes));
             let baseline = Arc::strong_count(&wakes);
-            let mut task = Context::from_waker(&waker);
+            let mut task = Context::from_waker(&context_waker);
             let mut operation =
                 Box::pin(index.search_hybrid_candidates(&cx, &provider, &lexical, "query", 2));
             assert!(operation.as_mut().poll(&mut task).is_pending());
@@ -921,9 +921,9 @@ mod tests {
         let mut lexical = Lexical::new();
         lexical.pending = true;
         let wakes = Arc::new(CancellationWake::default());
-        let waker = Waker::from(Arc::clone(&wakes));
+        let context_waker = Waker::from(Arc::clone(&wakes));
         let baseline = Arc::strong_count(&wakes);
-        let mut task = Context::from_waker(&waker);
+        let mut task = Context::from_waker(&context_waker);
         let mut operation =
             Box::pin(index.search_hybrid_candidates(&cx, &provider, &lexical, "query", 2));
         assert!(operation.as_mut().poll(&mut task).is_pending());
@@ -949,9 +949,9 @@ mod tests {
         let mut lexical = Lexical::new();
         lexical.hydration_reply = HydrationReply::Pending;
         let wakes = Arc::new(CancellationWake::default());
-        let waker = Waker::from(Arc::clone(&wakes));
+        let context_waker = Waker::from(Arc::clone(&wakes));
         let baseline = Arc::strong_count(&wakes);
-        let mut task = Context::from_waker(&waker);
+        let mut task = Context::from_waker(&context_waker);
         let mut operation =
             Box::pin(index.search_hybrid_text(&cx, &provider, &lexical, "query", 2));
         assert!(operation.as_mut().poll(&mut task).is_pending());
@@ -989,7 +989,7 @@ mod tests {
             })
         }
 
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "pending-native-reranker"
         }
 
@@ -1017,9 +1017,9 @@ mod tests {
             let initial = stream.next_phase().await.unwrap().unwrap();
             assert!(matches!(initial, NativeSearchPhase::Initial { .. }));
             let wakes = Arc::new(CancellationWake::default());
-            let waker = Waker::from(Arc::clone(&wakes));
+            let context_waker = Waker::from(Arc::clone(&wakes));
             let baseline = Arc::strong_count(&wakes);
-            let mut task = Context::from_waker(&waker);
+            let mut task = Context::from_waker(&context_waker);
             let mut operation = Box::pin(stream.next_phase());
             assert!(operation.as_mut().poll(&mut task).is_pending());
             assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);

@@ -663,7 +663,8 @@ mod lifecycle {
                             "count" => receipt.documents += 1,
                             "generation" => receipt.generation = new_generation(1).unwrap(),
                             "primary" => {
-                                receipt.identity = fixture.primary.foreign.clone().freeze().unwrap()
+                                receipt.identity =
+                                    fixture.primary.foreign.clone().freeze().unwrap();
                             }
                             "quality" => {
                                 receipt.quality_identity = Some(
@@ -675,7 +676,7 @@ mod lifecycle {
                                         .clone()
                                         .freeze()
                                         .unwrap(),
-                                )
+                                );
                             }
                             _ => unreachable!(),
                         }

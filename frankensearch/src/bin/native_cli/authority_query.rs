@@ -22,7 +22,7 @@ enum Operation {
 /// requests keep their existing fields and cannot implicitly grant tuning.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Request {
+pub(super) struct SearchEnvelope {
     #[serde(rename = "op")]
     _operation: Operation,
     pub(super) request: AuthoritySearchRequest,
@@ -42,7 +42,7 @@ pub(super) fn validate_startup(options: &Options, mode: QueryMode) -> Result<()>
 pub(super) fn load_policy(cx: &Cx, options: &Options) -> Result<query::Policy> {
     let mut policy = query::Policy::new(cx, options.timeout_ms)?;
     policy.query_pool = cx.blocking_pool_handle();
-    policy.full_query = options.full_query.clone();
+    policy.full_query.clone_from(&options.full_query);
     policy.rerank = options
         .reranker_dir
         .as_deref()
@@ -216,7 +216,7 @@ pub(super) fn annotate(policy: &query::Policy, mode: QueryMode, response: &mut s
 pub(super) async fn execute(
     session: &AuthoritySession,
     cx: &Cx,
-    message: &Request,
+    message: &SearchEnvelope,
     ordinal: u64,
     output: &mut impl Write,
 ) -> Result<()> {

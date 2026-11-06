@@ -427,7 +427,7 @@ fn invalid_timeouts_and_expired_admission_do_no_inference_and_keep_refusal_codes
             &mut f.session,
             &[
                 serde_json::json!({"query":"retry", "timeout_ms":0}),
-                serde_json::json!({"query":"retry", "timeout_ms":600001}),
+                serde_json::json!({"query":"retry", "timeout_ms":600_001}),
                 serde_json::json!({"query":"retry", "timeout_ms":"private-invalid-budget"}),
             ],
         )

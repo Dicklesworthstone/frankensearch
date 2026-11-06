@@ -67,7 +67,7 @@ impl Drop for ScorerDrop<'_> {
 }
 
 impl Reranker for Scorer {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "retained-authority-reranker"
     }
     fn model_name(&self) -> &str {
@@ -413,8 +413,7 @@ fn reranking_reads_only_eligible_retained_sources_and_reports_the_actual_final_p
             assert_eq!(final_page["rerank_window"], 3);
             assert_eq!(final_page["scope"]["eligible_documents"], 2);
             assert!(final_page["results"][0]["rerank_score"].is_number());
-            let seen = f.scorer.seen.lock().unwrap();
-            let mut documents = seen.last().unwrap().clone();
+            let mut documents = f.scorer.seen.lock().unwrap().last().unwrap().clone();
             documents.sort();
             assert_eq!(
                 documents,
@@ -741,9 +740,11 @@ fn caller_pool_reaches_every_authority_query_mode_and_preserves_retained_results
                     }
                     for request in &requests {
                         f.session.query_policy.query_pool = None;
-                        let inline = exchange(&cx, &mut f.session, &[request.clone()]).await;
+                        let inline =
+                            exchange(&cx, &mut f.session, std::slice::from_ref(request)).await;
                         f.session.query_policy.query_pool = policy.query_pool();
-                        let pooled = exchange(&cx, &mut f.session, &[request.clone()]).await;
+                        let pooled =
+                            exchange(&cx, &mut f.session, std::slice::from_ref(request)).await;
                         assert_eq!(inline.len(), pooled.len());
                         for (left, right) in inline.iter().zip(&pooled).skip(1) {
                             assert_eq!(right["event"], "results", "{right}");
@@ -758,7 +759,8 @@ fn caller_pool_reaches_every_authority_query_mode_and_preserves_retained_results
                 // run a retained exact scan or graph traversal on the executor.
                 assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
                 for request in &requests {
-                    let output = exchange(&cx, &mut f.session, &[request.clone()]).await;
+                    let output =
+                        exchange(&cx, &mut f.session, std::slice::from_ref(request)).await;
                     assert_eq!(output.len(), 2, "{output:?}");
                     assert_eq!(output[1]["event"], "failed");
                     assert_eq!(output[1]["code"], "query_or_activation_refused");

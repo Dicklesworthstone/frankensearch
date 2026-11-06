@@ -2803,9 +2803,10 @@ where
             // Do not poll again after a terminal phase was delivered: slow
             // output must not retroactively reject a completed final page.
             while !query.is_finished() {
-                let Some(phase) =
-                    query::within(cx, plan.deadline, async { Ok(query.next_phase().await?) })
-                        .await?
+                let Some(phase) = Box::pin(query::within(cx, plan.deadline, async {
+                    Ok(query.next_phase().await?)
+                }))
+                .await?
                 else {
                     break;
                 };
@@ -3218,7 +3219,7 @@ struct AuthorityFetchRequest {
 #[serde(untagged)]
 enum AuthorityRequest {
     Search(AuthoritySearchRequest),
-    TunedSearch(query_controls::Request),
+    TunedSearch(query_controls::SearchEnvelope),
     ModelActivation(model_activation::Request),
     Activate(AuthorityActivateRequest),
     Update(AuthorityUpdateRequest),

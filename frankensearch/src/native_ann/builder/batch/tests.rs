@@ -1001,9 +1001,9 @@ fn externally_cancelled_pending_groups_drop_providers_and_write_no_partial_rows(
         writer.write_record("earlier-batch", &[0.25, -0.0]).unwrap();
         let input = ["a", "b", "c", "d"].map(|id| IndexableDocument::new(id, id));
         let wakes = Arc::new(CancellationWake::default());
-        let waker = Waker::from(Arc::clone(&wakes));
+        let context_waker = Waker::from(Arc::clone(&wakes));
         let baseline = Arc::strong_count(&wakes);
-        let mut task = Context::from_waker(&waker);
+        let mut task = Context::from_waker(&context_waker);
         let mut operation = Box::pin(tier.write_batch(&cx, &mut writer, &input));
         assert!(operation.as_mut().poll(&mut task).is_pending(), "{case}");
         let expected_calls = match case {

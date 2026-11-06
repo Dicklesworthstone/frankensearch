@@ -225,7 +225,7 @@ impl NativeGenerationSource {
             quality,
             tier,
             authority.lexical_bytes(),
-            authority.metadata_bytes(),
+            &authority.metadata_bytes(),
             max_image_bytes,
         )?;
         checkpoint(cx, "native_ann.generation.recovery_ready")?;
@@ -320,7 +320,7 @@ fn admit_source_components(
     quality: Option<&FsviV2IdentityBinding>,
     tier: EmbedderTierTag,
     lexical_bytes: Arc<[u8]>,
-    metadata_bytes: Arc<[u8]>,
+    metadata_bytes: &[u8],
     max_image_bytes: usize,
 ) -> SearchResult<SourceComponents> {
     checkpoint(cx, "native_ann.generation.recovery_components")?;
@@ -349,8 +349,8 @@ fn admit_source_components(
     }
     let declared = activation.components();
     for (image, receipt) in [
-        (&lexical_bytes, declared.lexical),
-        (&metadata_bytes, declared.metadata),
+        (lexical_bytes.as_ref(), declared.lexical),
+        (metadata_bytes, declared.metadata),
     ] {
         let mut digest = Sha256::new();
         for chunk in image.chunks(1024 * 1024) {
@@ -364,7 +364,7 @@ fn admit_source_components(
         }
     }
     checkpoint(cx, "native_ann.generation.recovery_metadata")?;
-    let metadata: GenerationManifest = serde_json::from_slice(&metadata_bytes)
+    let metadata: GenerationManifest = serde_json::from_slice(metadata_bytes)
         .map_err(|_| refused("source-recovery", "invalid-metadata-json"))?;
     let tier_count = if quality.is_some() { 2 } else { 1 };
     if metadata.vector_artifacts.len() != tier_count
@@ -629,7 +629,7 @@ mod tests {
     }
 
     struct Fixture {
-        _directory: tempfile::TempDir,
+        directory: tempfile::TempDir,
         built: NativeBuiltExactGeneration,
         candidate: GenerationCandidateV1,
         primary: Arc<Provider>,
@@ -645,7 +645,8 @@ mod tests {
                 self.built
                     .component_bytes(GenerationComponentRole::Lexical)
                     .unwrap(),
-                self.built
+                &self
+                    .built
                     .component_bytes(GenerationComponentRole::Metadata)
                     .unwrap(),
                 budget,
@@ -657,7 +658,7 @@ mod tests {
             cx: &Cx,
             manifest: &ActivationManifest,
             lexical: Arc<[u8]>,
-            metadata: Arc<[u8]>,
+            metadata: &[u8],
             budget: usize,
         ) -> SearchResult<SourceComponents> {
             admit_source_components(
@@ -742,7 +743,7 @@ mod tests {
         primary.calls.store(0, Ordering::SeqCst);
         quality.calls.store(0, Ordering::SeqCst);
         Fixture {
-            _directory: directory,
+            directory,
             built,
             candidate,
             primary,
@@ -883,7 +884,7 @@ mod tests {
                         quality,
                         fixture.tier,
                         Arc::clone(&lexical),
-                        Arc::clone(&metadata),
+                        &metadata,
                         BUDGET,
                     )
                     .is_err()
@@ -896,13 +897,7 @@ mod tests {
                 let manifest = reseal(&fixture, &metadata, source, docset);
                 assert!(
                     fixture
-                        .admit_images(
-                            &cx,
-                            &manifest,
-                            Arc::clone(&lexical),
-                            Arc::clone(&metadata),
-                            BUDGET,
-                        )
+                        .admit_images(&cx, &manifest, Arc::clone(&lexical), &metadata, BUDGET)
                         .is_err()
                 );
             }
@@ -919,14 +914,14 @@ mod tests {
             );
             assert!(
                 fixture
-                    .admit_images(&cx, &manifest, Arc::clone(&lexical), wrong_count, BUDGET)
+                    .admit_images(&cx, &manifest, Arc::clone(&lexical), &wrong_count, BUDGET)
                     .is_err()
             );
             let mut corrupt_lexical = lexical.to_vec();
             corrupt_lexical[0] ^= 1;
             assert!(
                 fixture
-                    .admit_images(&cx, selected, corrupt_lexical.into(), metadata, BUDGET)
+                    .admit_images(&cx, selected, corrupt_lexical.into(), &metadata, BUDGET)
                     .is_err()
             );
             assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
@@ -1175,7 +1170,7 @@ mod tests {
                     assert_eq!(source.source().retained_source().authority_pair(), expected);
                     let generation = ArtifactGenerationIdentityV1::new(8, [0xc1; 16]).unwrap();
                     assert!(matches!(source.rebuild(
-                        &cx, fixture._directory.path().join("repeated-graph"), generation,
+                        &cx, fixture.directory.path().join("repeated-graph"), generation,
                         hnsw(11), full.then_some(hnsw(29)), BUDGET,
                     ), Err(SearchError::InvalidConfig { value, .. }) if value == "same-retained-object"));
                     assert_eq!(
@@ -1185,7 +1180,7 @@ mod tests {
                     let repaired = source
                         .rebuild(
                             &cx,
-                            fixture._directory.path().join("fresh-graphs"),
+                            fixture.directory.path().join("fresh-graphs"),
                             generation,
                             hnsw(101),
                             full.then_some(hnsw(131)),
@@ -1359,7 +1354,7 @@ mod tests {
                     let built = source
                         .rebuild(
                             &cx,
-                            fixture._directory.path().join(format!("mixed-{index}")),
+                            fixture.directory.path().join(format!("mixed-{index}")),
                             generation,
                             primary,
                             Some(quality),
@@ -1395,7 +1390,7 @@ mod tests {
                         let bounded = source
                             .rebuild(
                                 &cx,
-                                fixture._directory.path().join("exact-output-budget"),
+                                fixture.directory.path().join("exact-output-budget"),
                                 generation,
                                 primary,
                                 Some(quality),
@@ -1438,7 +1433,7 @@ mod tests {
                 let source = open_source(&cx, &root, &fixture);
                 let authority = fs::read(directory.path().join("AUTHORITY")).unwrap();
                 let generation = ArtifactGenerationIdentityV1::new(8, [0xe1; 16]).unwrap();
-                let path = fixture._directory.path().join("refused-work");
+                let path = fixture.directory.path().join("refused-work");
                 for (generation, quality, budget) in [
                     (generation, Some(NativeBuildRetrieval::Exact), 0),
                     (
@@ -1605,14 +1600,14 @@ mod tests {
                     [0xa4; 16],
                 )
                 .unwrap();
-            let published = publisher
+            let outcome = publisher
                 .publish_prepared(&cx, &fixture.candidate, &attempt, None, BUDGET as u64)
                 .unwrap();
             assert!(matches!(
-                published.publication,
+                outcome.publication,
                 PublicationOutcomeV1::Committed { .. }
             ));
-            let Some(GenerationActivationV1::Installed(complete)) = published.activation else {
+            let Some(GenerationActivationV1::Installed(complete)) = outcome.activation else {
                 panic!("fixture publication must admit a complete generation");
             };
             let original_pair = complete.authority_pair();
