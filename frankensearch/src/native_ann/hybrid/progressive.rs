@@ -85,8 +85,8 @@ impl NativeAnnIndex {
     ///
     /// Inference, lexical scoring, hydration and reranking retain their ordinary
     /// async ownership. Only native/exact traversal may use the supplied pool.
-    /// Scoped queries continue inline until their membership predicate has an
-    /// independently owned worker-safe representation.
+    /// Scoped queries retain their frozen membership with the worker; the
+    /// original source predicate is never reevaluated during traversal.
     ///
     /// # Errors
     ///

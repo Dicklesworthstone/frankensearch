@@ -9,20 +9,22 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use frankensearch_core::generation::{
-    ActivationManifest, AuthorityRefV1, EmbedderTierTag, ExactComponentReceiptV1,
-    GenerationComponentRole, GenerationManifest, InvariantKind, SourceCheckpointV1,
-    validate_manifest,
+    ActivationManifest, AuthorityRefV1, CanonicalDocsetV1, EmbedderTierTag,
+    ExactComponentReceiptV1, GenerationComponentRole, GenerationManifest, InvariantKind,
+    SourceCheckpointV1, validate_manifest,
 };
-use frankensearch_index::FsviV2IdentityBinding;
+use frankensearch_index::exact_component_adapters::vector_component_receipt;
 use frankensearch_index::generation_root::generation_reader::{
-    OpenedGenerationSourceV1, component_object_name_v1,
+    OpenedGenerationSourceV1, OpenedGenerationVectorSourceV1, component_object_name_v1,
 };
+use frankensearch_index::vector_cohort::ExactVectorCohortV1;
+use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{
     DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillIndexError, QuillSnapshotIndex,
 };
 use sha2::{Digest as _, Sha256};
 
-use super::{NativeGenerationTopology, checkpoint, lower_hex, refused};
+use super::{NativeGenerationTopology, checkpoint, lower_hex, refused, validate_artifact_metadata};
 use crate::{Cx, IndexableDocument, SearchResult};
 
 /// Authenticated source from an explicitly selected, possibly damaged generation.
@@ -44,6 +46,153 @@ pub struct NativeGenerationSource {
     primary: FsviV2IdentityBinding,
     quality: Option<FsviV2IdentityBinding>,
     tier: EmbedderTierTag,
+}
+
+/// Authenticated retained vectors and source for repair without model inference.
+///
+/// The source and every independently identified vector tier are fully admitted,
+/// including exact physical rows, complete live membership, source checkpoint
+/// and metadata. The selected ANN image may be missing or corrupt and is never
+/// read. This capability consequently has no search interface or conversion to
+/// an ordinary generation snapshot.
+///
+/// [`Self::rebuild`] preserves the source image and the exact stored vector bits
+/// in a fresh artifact generation, then builds the explicitly requested graphs.
+/// It requires no embedder, model installation, source export or document
+/// inference. Publication remains a separate expected-pair operation.
+pub struct NativeGenerationVectorSource {
+    authority: Arc<OpenedGenerationVectorSourceV1>,
+    source: NativeGenerationSource,
+    primary: Arc<ValidatedFsviBytes>,
+    quality: Option<Arc<ValidatedFsviBytes>>,
+}
+
+impl NativeGenerationVectorSource {
+    /// Admit healthy retained vectors without admitting their damaged accelerator.
+    ///
+    /// The complete expected bindings must come from the caller's trusted
+    /// selection, independently for each tier. Encoded source and vector bytes
+    /// share one image budget; the absent or damaged ANN image consumes none.
+    ///
+    /// # Errors
+    /// Refuses vector corruption, generation/identity/coverage/metadata mismatch,
+    /// source admission failure, image budget overflow and cancellation.
+    pub fn admit(
+        cx: &Cx,
+        authority: Arc<OpenedGenerationVectorSourceV1>,
+        primary: &FsviV2IdentityBinding,
+        quality: Option<&FsviV2IdentityBinding>,
+        tier: EmbedderTierTag,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.generation.vector_recovery_admit")?;
+        if authority.retained_image_bytes() > u64::try_from(max_image_bytes).unwrap_or(u64::MAX) {
+            return Err(refused("vector-recovery", "encoded-image-limit"));
+        }
+        let source = NativeGenerationSource::admit(
+            cx,
+            Arc::clone(authority.source()),
+            primary,
+            quality,
+            tier,
+            max_image_bytes,
+        )?;
+        let checkpoint_value = SourceCheckpointV1::derive(&source.metadata().commit_range);
+        let activation = authority.source().manifest();
+        let vector_bytes = authority.vector_bytes();
+        let cohort = quality
+            .map(|quality| {
+                ExactVectorCohortV1::admit(
+                    cx,
+                    Arc::clone(&vector_bytes),
+                    primary,
+                    quality,
+                    checkpoint_value,
+                    max_image_bytes,
+                )
+            })
+            .transpose()?;
+        let owner = if let Some(cohort) = &cohort {
+            Arc::clone(cohort.fast())
+        } else {
+            let admitted = ValidatedFsviBytes::from_arc(vector_bytes, primary);
+            checkpoint(cx, "native_ann.generation.vector_recovery_owner")?;
+            Arc::new(admitted.map_err(|_| refused("vector-recovery", "invalid-vector-image"))?)
+        };
+        let mut identifiers = Vec::new();
+        for physical in 0..owner.record_count() {
+            checkpoint(cx, "native_ann.generation.vector_recovery_row")?;
+            let row = owner.row(physical)?;
+            if row.flags().is_live() {
+                identifiers.push(row.doc_id().to_owned());
+            }
+        }
+        let primary_receipt = vector_component_receipt(
+            owner.witness(),
+            identifiers.iter().map(String::as_str),
+            checkpoint_value,
+        )
+        .map_err(|_| refused("vector-recovery", "invalid-live-document-set"))?;
+        let vector_receipt = cohort
+            .as_ref()
+            .map_or(&primary_receipt, ExactVectorCohortV1::receipt);
+        if vector_receipt.bytes != activation.components().vector
+            || vector_receipt.docset_digest != activation.document_set_sha256()
+            || vector_receipt.live_document_count != source.metadata().total_documents
+        {
+            return Err(refused("vector-recovery", "selected-vector-mismatch"));
+        }
+        let documents = CanonicalDocsetV1::from_ordered_live_documents(identifiers)
+            .map_err(|_| refused("vector-recovery", "invalid-live-document-set"))?;
+        let metadata_bytes = authority.source().metadata_bytes();
+        let metadata_receipt = ExactComponentReceiptV1::for_metadata_manifest(
+            source.metadata(),
+            &metadata_bytes,
+            &documents,
+        )
+        .map_err(|_| refused("vector-recovery", "metadata-document-set-mismatch"))?;
+        metadata_receipt
+            .verify_metadata_manifest(source.metadata(), &metadata_bytes)
+            .map_err(|_| refused("vector-recovery", "metadata-receipt-mismatch"))?;
+        validate_artifact_metadata(
+            source.metadata(),
+            primary,
+            activation,
+            &owner,
+            &primary_receipt,
+            quality.zip(cohort.as_ref()).map(|(binding, cohort)| {
+                (binding, cohort.quality().as_ref(), cohort.quality_receipt())
+            }),
+        )?;
+        let quality = cohort.as_ref().map(|cohort| Arc::clone(cohort.quality()));
+        checkpoint(cx, "native_ann.generation.vector_recovery_ready")?;
+        Ok(Self {
+            authority,
+            source,
+            primary: owner,
+            quality,
+        })
+    }
+
+    /// Authenticated source, identities and original publication expectation.
+    #[must_use]
+    pub const fn source(&self) -> &NativeGenerationSource {
+        &self.source
+    }
+
+    /// Exact qualified source/vector capability retained by this repair.
+    #[must_use]
+    pub const fn retained_vector_source(&self) -> &Arc<OpenedGenerationVectorSourceV1> {
+        &self.authority
+    }
+
+    pub(in crate::native_ann) const fn primary_owner(&self) -> &Arc<ValidatedFsviBytes> {
+        &self.primary
+    }
+
+    pub(in crate::native_ann) const fn quality_owner(&self) -> Option<&Arc<ValidatedFsviBytes>> {
+        self.quality.as_ref()
+    }
 }
 
 impl NativeGenerationSource {
@@ -525,6 +674,25 @@ mod tests {
     }
 
     async fn fixture(cx: &Cx, tier: EmbedderTierTag, full: bool) -> Fixture {
+        fixture_with_policies(
+            cx,
+            tier,
+            full,
+            NativeBuildRetrieval::Exact,
+            NativeBuildRetrieval::Exact,
+            false,
+        )
+        .await
+    }
+
+    async fn fixture_with_policies(
+        cx: &Cx,
+        tier: EmbedderTierTag,
+        full: bool,
+        primary_policy: NativeBuildRetrieval,
+        quality_policy: NativeBuildRetrieval,
+        empty: bool,
+    ) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let primary = Arc::new(Provider::new("source-primary", 2));
         let quality = Arc::new(Provider::new("source-quality", 3));
@@ -534,19 +702,22 @@ mod tests {
             primary.clone(),
         )
         .unwrap()
-        .with_fast_storage(NativeBuildPrecision::F16, NativeBuildRetrieval::Exact)
-        .add_document(
-            IndexableDocument::new("alpha", "recover α unchanged")
-                .with_title("Retained title")
-                .with_metadata("z", "last")
-                .with_metadata("a", "first"),
-        )
-        .add_document(IndexableDocument::new("beta", "another document"));
+        .with_fast_storage(NativeBuildPrecision::F16, primary_policy);
+        if !empty {
+            builder = builder
+                .add_document(
+                    IndexableDocument::new("alpha", "recover α unchanged")
+                        .with_title("Retained title")
+                        .with_metadata("z", "last")
+                        .with_metadata("a", "first"),
+                )
+                .add_document(IndexableDocument::new("beta", "another document"));
+        }
         if full {
             builder = builder
                 .with_quality_embedder(quality.clone())
                 .unwrap()
-                .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                .with_quality_storage(NativeBuildPrecision::F32, quality_policy)
                 .unwrap();
         }
         let source = CommitRange { low: 3, high: 9 };
@@ -781,6 +952,578 @@ mod tests {
             assert_eq!(admitted.source_documents(&cx, BUDGET).unwrap().len(), 2);
             assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    mod vector_rebuild {
+        use super::*;
+        use std::fs::{self, File, OpenOptions};
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        use frankensearch_core::generation::GenerationRootSecurityProfileV1;
+        use frankensearch_index::generation_root::authority_publisher::{
+            AUTHORITY_PUBLISHER_LOCK_BYTES_V1, ExpectedAuthorityPairV1, PublicationOutcomeV1,
+        };
+        use frankensearch_index::generation_root::generation_reader::{
+            SnapshotOpenOutcomeV1, VectorSourceOpenOutcomeV1, activation_manifest_path_v1,
+            component_object_path_v1,
+        };
+        use frankensearch_index::generation_root::{
+            GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout,
+            QualifiedGenerationRoot,
+        };
+        use frankensearch_index::native_hnsw::HnswParams;
+
+        use crate::native_ann::NativeGenerationSnapshot;
+        use crate::{
+            GenerationActivationV1, GenerationPublicationErrorV1, GenerationPublicationResultV1,
+            GenerationPublisherV1,
+        };
+
+        const ROOT_ID: [u8; 16] = [0xb1; 16];
+        const PROFILE: GenerationRootSecurityProfileV1 =
+            GenerationRootSecurityProfileV1::CooperativeLocal;
+
+        fn hnsw(seed: u64) -> NativeBuildRetrieval {
+            NativeBuildRetrieval::Hnsw {
+                params: HnswParams {
+                    m: 4,
+                    m0: 8,
+                    ef_construction: 32,
+                    ef_search: 32,
+                },
+                seed,
+            }
+        }
+
+        fn root() -> (tempfile::TempDir, QualifiedGenerationRoot) {
+            let directory = tempfile::Builder::new()
+                .prefix(".frankensearch-vector-recovery-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(std::env::var_os("HOME").unwrap())
+                .unwrap();
+            for (name, size) in [
+                ("LOCK", AUTHORITY_PUBLISHER_LOCK_BYTES_V1),
+                ("AUTHORITY", GENERATION_ROOT_AUTHORITY_FILE_BYTES),
+            ] {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.path().join(name))
+                    .unwrap();
+                file.write_all(&vec![0; usize::try_from(size).unwrap()])
+                    .unwrap();
+                file.sync_all().unwrap();
+            }
+            File::open(directory.path()).unwrap().sync_all().unwrap();
+            File::open(directory.path().parent().unwrap())
+                .unwrap()
+                .sync_all()
+                .unwrap();
+            let root = QualifiedGenerationRoot::admit(
+                directory.path(),
+                GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1).unwrap(),
+            )
+            .unwrap();
+            (directory, root)
+        }
+
+        fn publish(
+            cx: &Cx,
+            root: &QualifiedGenerationRoot,
+            built: &NativeBuiltExactGeneration,
+            candidate: &GenerationCandidateV1,
+            expected: ExpectedAuthorityPairV1,
+        ) -> Result<GenerationPublicationResultV1, GenerationPublicationErrorV1> {
+            for (role, receipt) in candidate.manifest().components().iter() {
+                root.stage_immutable_file(
+                    &component_object_path_v1(role, receipt.sha256).unwrap(),
+                    &built.component_bytes(role).unwrap(),
+                )
+                .unwrap();
+            }
+            root.stage_immutable_file(
+                &activation_manifest_path_v1(candidate.authority().object_id).unwrap(),
+                candidate.manifest_bytes(),
+            )
+            .unwrap();
+            let mut publisher = GenerationPublisherV1::new(root, ROOT_ID, [0xb2; 16], PROFILE)?;
+            let attempt = publisher.prepare_attempt(
+                candidate,
+                expected,
+                candidate.authority().object_id,
+                candidate.authority().object_id,
+            )?;
+            publisher.publish_prepared(cx, candidate, &attempt, None, BUDGET as u64)
+        }
+
+        fn open_source(
+            cx: &Cx,
+            root: &QualifiedGenerationRoot,
+            fixture: &Fixture,
+        ) -> NativeGenerationVectorSource {
+            let VectorSourceOpenOutcomeV1::Opened(opened) = root
+                .open_expected_generation_vector_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    fixture.candidate.authority(),
+                    fixture.built.binding().generation(),
+                    BUDGET as u64,
+                )
+                .unwrap()
+            else {
+                panic!("intact selected source and vectors must remain recoverable");
+            };
+            let exact_budget = usize::try_from(opened.retained_image_bytes()).unwrap();
+            assert!(
+                NativeGenerationVectorSource::admit(
+                    cx,
+                    Arc::clone(&opened),
+                    fixture.built.binding(),
+                    fixture.built.quality_binding(),
+                    fixture.tier,
+                    exact_budget - 1,
+                )
+                .is_err()
+            );
+            NativeGenerationVectorSource::admit(
+                cx,
+                opened,
+                fixture.built.binding(),
+                fixture.built.quality_binding(),
+                fixture.tier,
+                exact_budget,
+            )
+            .unwrap()
+        }
+
+        fn damage(path: &std::path::Path, bytes: &[u8]) {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+
+        fn unchanged_rows(old: &ValidatedFsviBytes, new: &ValidatedFsviBytes) {
+            assert_eq!(
+                old.identity_binding().frozen_identity(),
+                new.identity_binding().frozen_identity()
+            );
+            assert_eq!(old.record_count(), new.record_count());
+            assert!(
+                new.identity_binding().generation().sequence
+                    > old.identity_binding().generation().sequence
+            );
+            for physical in 0..old.record_count() {
+                let old = old.row(physical).unwrap();
+                let new = new.row(physical).unwrap();
+                assert_eq!(old.doc_id(), new.doc_id());
+                assert_eq!(old.flags(), new.flags());
+                assert_eq!(old.vector_bytes(), new.vector_bytes());
+            }
+        }
+
+        #[test]
+        fn damaged_graph_repair_preserves_vectors_and_source_and_publishes_every_topology() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for (tier, full, empty) in [
+                    (EmbedderTierTag::Fast, false, false),
+                    (EmbedderTierTag::Quality, false, false),
+                    (EmbedderTierTag::Fast, true, false),
+                    (EmbedderTierTag::Fast, true, true),
+                ] {
+                    let fixture =
+                        fixture_with_policies(&cx, tier, full, hnsw(11), hnsw(29), empty).await;
+                    let (directory, root) = root();
+                    let published = publish(
+                        &cx,
+                        &root,
+                        &fixture.built,
+                        &fixture.candidate,
+                        ExpectedAuthorityPairV1::default(),
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        published.publication,
+                        PublicationOutcomeV1::Committed { .. }
+                    ));
+                    let Some(GenerationActivationV1::Installed(initial)) = published.activation
+                    else {
+                        panic!("initial generation must be queryable");
+                    };
+                    let expected = initial.authority_pair();
+                    drop(initial);
+                    let original = fixture.candidate.manifest().components();
+                    let graph_path = directory.path().join(component_object_name_v1(
+                        GenerationComponentRole::Ann,
+                        original.ann.unwrap().sha256,
+                    ));
+                    damage(&graph_path, b"damaged retained accelerator");
+                    let authority_before = fs::read(directory.path().join("AUTHORITY")).unwrap();
+                    assert!(matches!(
+                        root.open_expected_generation_snapshot_with_budget(
+                            ROOT_ID,
+                            PROFILE,
+                            None,
+                            fixture.candidate.authority(),
+                            BUDGET as u64,
+                        )
+                        .unwrap(),
+                        SnapshotOpenOutcomeV1::Refused(_)
+                    ));
+                    let source = open_source(&cx, &root, &fixture);
+                    assert_eq!(source.source().retained_source().authority_pair(), expected);
+                    let generation = ArtifactGenerationIdentityV1::new(8, [0xc1; 16]).unwrap();
+                    assert!(matches!(source.rebuild(
+                        &cx, fixture._directory.path().join("repeated-graph"), generation,
+                        hnsw(11), full.then_some(hnsw(29)), BUDGET,
+                    ), Err(SearchError::InvalidConfig { value, .. }) if value == "same-retained-object"));
+                    assert_eq!(
+                        fs::read(directory.path().join("AUTHORITY")).unwrap(),
+                        authority_before
+                    );
+                    let repaired = source
+                        .rebuild(
+                            &cx,
+                            fixture._directory.path().join("fresh-graphs"),
+                            generation,
+                            hnsw(101),
+                            full.then_some(hnsw(131)),
+                            BUDGET,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        repaired
+                            .component_bytes(GenerationComponentRole::Lexical)
+                            .unwrap(),
+                        fixture
+                            .built
+                            .component_bytes(GenerationComponentRole::Lexical)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        repaired.metadata().commit_range,
+                        fixture.built.metadata().commit_range
+                    );
+                    assert_eq!(
+                        repaired.metadata().total_documents,
+                        if empty { 0 } else { 2 }
+                    );
+                    let vector = repaired
+                        .component_bytes(GenerationComponentRole::Vector)
+                        .unwrap();
+                    if let Some(quality) = repaired.quality_binding() {
+                        let cohort = ExactVectorCohortV1::admit(
+                            &cx,
+                            vector,
+                            repaired.binding(),
+                            quality,
+                            SourceCheckpointV1::derive(&repaired.metadata().commit_range),
+                            BUDGET,
+                        )
+                        .unwrap();
+                        unchanged_rows(source.primary_owner(), cohort.fast());
+                        unchanged_rows(source.quality_owner().unwrap(), cohort.quality());
+                    } else {
+                        let owner =
+                            ValidatedFsviBytes::from_arc(vector, repaired.binding()).unwrap();
+                        unchanged_rows(source.primary_owner(), &owner);
+                    }
+                    let candidate = repaired
+                        .candidate(
+                            [0xc2; 16],
+                            Some(fixture.candidate.authority()),
+                            GenerationAuthorityActionV1::Repair,
+                            [0xc3; 32],
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        candidate.manifest().source_checkpoint_sha256(),
+                        fixture.candidate.manifest().source_checkpoint_sha256()
+                    );
+                    assert_eq!(
+                        candidate.manifest().document_set_sha256(),
+                        fixture.candidate.manifest().document_set_sha256()
+                    );
+                    assert_ne!(candidate.manifest().components().ann, original.ann);
+                    repaired.validate_candidate(&cx, &candidate).unwrap();
+                    assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                    let published = publish(&cx, &root, &repaired, &candidate, expected).unwrap();
+                    assert!(matches!(
+                        published.publication,
+                        PublicationOutcomeV1::Committed { .. }
+                    ));
+                    let Some(GenerationActivationV1::Installed(opened)) = published.activation
+                    else {
+                        panic!("repaired generation must install a complete snapshot");
+                    };
+                    let reader = if let Some(quality) = repaired.quality_binding() {
+                        NativeGenerationSnapshot::admit_progressive(
+                            &cx,
+                            opened,
+                            repaired.binding(),
+                            quality,
+                            DEFAULT_SCHEMA,
+                            QuillConfig::default(),
+                            BUDGET,
+                        )
+                    } else {
+                        NativeGenerationSnapshot::admit_exact(
+                            &cx,
+                            opened,
+                            repaired.binding(),
+                            DEFAULT_SCHEMA,
+                            QuillConfig::default(),
+                            BUDGET,
+                        )
+                    }
+                    .unwrap();
+                    assert_eq!(
+                        reader.source_documents(&cx, BUDGET).unwrap().len(),
+                        if empty { 0 } else { 2 }
+                    );
+                    if !empty {
+                        let hits = if full {
+                            reader
+                                .search_refined_text(
+                                    &cx,
+                                    fixture.primary.as_ref(),
+                                    fixture.quality.as_ref(),
+                                    "recover",
+                                    2,
+                                )
+                                .await
+                        } else if tier == EmbedderTierTag::Quality {
+                            reader
+                                .search_quality_text(&cx, fixture.primary.as_ref(), "recover", 2)
+                                .await
+                        } else {
+                            reader
+                                .search_text(&cx, fixture.primary.as_ref(), "recover", 2)
+                                .await
+                        }
+                        .unwrap();
+                        assert_eq!(hits.len(), 2);
+                        assert!(hits.iter().any(|hit| hit.doc_id == "alpha"));
+                    }
+                    assert_eq!(
+                        fs::read(&graph_path).unwrap(),
+                        b"damaged retained accelerator"
+                    );
+                    // A second complete build cannot use its captured old physical pair
+                    // after the first repair wins, even when its content is otherwise valid.
+                    let stale = repaired
+                        .candidate(
+                            [0xc4; 16],
+                            Some(fixture.candidate.authority()),
+                            GenerationAuthorityActionV1::Repair,
+                            [0xc5; 32],
+                        )
+                        .unwrap();
+                    let selected_after = fs::read(directory.path().join("AUTHORITY")).unwrap();
+                    if let Ok(result) = publish(&cx, &root, &repaired, &stale, expected) {
+                        assert!(matches!(
+                            result.publication,
+                            PublicationOutcomeV1::NotCommitted(_)
+                        ));
+                    }
+                    assert_eq!(
+                        fs::read(directory.path().join("AUTHORITY")).unwrap(),
+                        selected_after
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn retained_vectors_support_exact_and_independent_graph_policies_without_models() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let fixture = fixture(&cx, EmbedderTierTag::Fast, true).await;
+                let (_directory, root) = root();
+                publish(
+                    &cx,
+                    &root,
+                    &fixture.built,
+                    &fixture.candidate,
+                    ExpectedAuthorityPairV1::default(),
+                )
+                .unwrap();
+                let source = open_source(&cx, &root, &fixture);
+                for (index, primary, quality) in [
+                    (0, NativeBuildRetrieval::Exact, NativeBuildRetrieval::Exact),
+                    (1, NativeBuildRetrieval::Exact, hnsw(0)),
+                    (2, hnsw(2), NativeBuildRetrieval::Exact),
+                ] {
+                    let generation = ArtifactGenerationIdentityV1::new(8, [0xd1; 16]).unwrap();
+                    let built = source
+                        .rebuild(
+                            &cx,
+                            fixture._directory.path().join(format!("mixed-{index}")),
+                            generation,
+                            primary,
+                            Some(quality),
+                            BUDGET,
+                        )
+                        .unwrap();
+                    assert_eq!(built.retrieval_configuration(), primary);
+                    assert_eq!(built.quality_retrieval_configuration(), Some(quality));
+                    let candidate = built
+                        .candidate(
+                            [0xd2; 16],
+                            Some(fixture.candidate.authority()),
+                            GenerationAuthorityActionV1::Repair,
+                            [0xd3; 32],
+                        )
+                        .unwrap();
+                    built.validate_candidate(&cx, &candidate).unwrap();
+                    assert_eq!(
+                        built
+                            .component_bytes(GenerationComponentRole::Lexical)
+                            .unwrap(),
+                        fixture
+                            .built
+                            .component_bytes(GenerationComponentRole::Lexical)
+                            .unwrap()
+                    );
+                    assert_eq!(candidate.manifest().components().ann.is_some(), index != 0);
+                    if index == 0 {
+                        // The factory reserves a maximum canonical activation header;
+                        // the remaining budget is exactly the encoded component closure.
+                        let exact = usize::try_from(candidate.manifest().components().iter().map(|(_, receipt)| receipt.byte_len).sum::<u64>()).unwrap()
+                            + frankensearch_core::generation::GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V2;
+                        let bounded = source
+                            .rebuild(
+                                &cx,
+                                fixture._directory.path().join("exact-output-budget"),
+                                generation,
+                                primary,
+                                Some(quality),
+                                exact,
+                            )
+                            .unwrap();
+                        bounded
+                            .validate_candidate(
+                                &cx,
+                                &bounded
+                                    .candidate(
+                                        [0xd4; 16],
+                                        Some(fixture.candidate.authority()),
+                                        GenerationAuthorityActionV1::Repair,
+                                        [0xd5; 32],
+                                    )
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                    }
+                }
+                assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+            });
+        }
+
+        #[test]
+        fn vector_recovery_preflight_and_new_admission_fail_without_partial_publication() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let fixture = fixture(&cx, EmbedderTierTag::Fast, true).await;
+                let (directory, root) = root();
+                publish(
+                    &cx,
+                    &root,
+                    &fixture.built,
+                    &fixture.candidate,
+                    ExpectedAuthorityPairV1::default(),
+                )
+                .unwrap();
+                let source = open_source(&cx, &root, &fixture);
+                let authority = fs::read(directory.path().join("AUTHORITY")).unwrap();
+                let generation = ArtifactGenerationIdentityV1::new(8, [0xe1; 16]).unwrap();
+                let path = fixture._directory.path().join("refused-work");
+                for (generation, quality, budget) in [
+                    (generation, Some(NativeBuildRetrieval::Exact), 0),
+                    (
+                        fixture.built.binding().generation(),
+                        Some(NativeBuildRetrieval::Exact),
+                        BUDGET,
+                    ),
+                    (generation, None, BUDGET),
+                ] {
+                    assert!(
+                        source
+                            .rebuild(
+                                &cx,
+                                &path,
+                                generation,
+                                NativeBuildRetrieval::Exact,
+                                quality,
+                                budget
+                            )
+                            .is_err()
+                    );
+                    assert!(!path.exists());
+                }
+                cx.set_cancel_requested(true);
+                assert!(matches!(
+                    source.rebuild(
+                        &cx,
+                        &path,
+                        generation,
+                        NativeBuildRetrieval::Exact,
+                        Some(NativeBuildRetrieval::Exact),
+                        0
+                    ),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                cx.set_cancel_requested(false);
+                assert!(!path.exists());
+                let vector_path = directory.path().join(component_object_name_v1(
+                    GenerationComponentRole::Vector,
+                    fixture.candidate.manifest().components().vector.sha256,
+                ));
+                damage(&vector_path, b"damaged retained vector");
+                assert!(!matches!(
+                    root.open_expected_generation_vector_source_for_recovery_with_budget(
+                        ROOT_ID,
+                        fixture.candidate.authority(),
+                        fixture.built.binding().generation(),
+                        BUDGET as u64,
+                    ),
+                    Ok(VectorSourceOpenOutcomeV1::Opened(_))
+                ));
+                // A capability owns the bytes it already authenticated. It never
+                // reopens a subsequently damaged vector pathname during repair.
+                let built = source
+                    .rebuild(
+                        &cx,
+                        &path,
+                        generation,
+                        NativeBuildRetrieval::Exact,
+                        Some(NativeBuildRetrieval::Exact),
+                        BUDGET,
+                    )
+                    .unwrap();
+                built
+                    .validate_candidate(
+                        &cx,
+                        &built
+                            .candidate(
+                                [0xe2; 16],
+                                Some(fixture.candidate.authority()),
+                                GenerationAuthorityActionV1::Repair,
+                                [0xe3; 32],
+                            )
+                            .unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    fs::read(directory.path().join("AUTHORITY")).unwrap(),
+                    authority
+                );
+                assert_eq!(fs::read(&vector_path).unwrap(), b"damaged retained vector");
+                assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+            });
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -96,6 +96,27 @@ impl Default for FullQuery {
 }
 
 impl FullQuery {
+    /// Apply validated settings to an already retained native query. This
+    /// preserves its source capability, scope, models and optional reranker.
+    pub(crate) fn apply_native<'a>(
+        &self,
+        query: frankensearch::native_ann::NativeProgressiveSearch<'a>,
+    ) -> Result<frankensearch::native_ann::NativeProgressiveSearch<'a>> {
+        self.validate()?;
+        Ok(query
+            .with_fusion(
+                RrfConfig {
+                    k: self.rrf_k,
+                    lexical_weight: self.lexical_weight,
+                    semantic_weight: self.semantic_weight,
+                    ..RrfConfig::default()
+                },
+                self.quality_weight,
+            )?
+            .with_candidate_multiplier(self.candidate_multiplier)?
+            .with_beam_widths(self.fast_ef, self.quality_ef)?)
+    }
+
     pub(crate) fn parse(text: &str) -> Result<Self> {
         if text.len() > MAX_POLICY_BYTES {
             return Err(bad("full-query policy exceeds 8 KiB"));
@@ -155,12 +176,9 @@ impl FullQuery {
             ..RrfConfig::default()
         };
         Ok(match query {
-            cohort::Progressive::Single(query) => cohort::Progressive::Single(Box::new(
-                (*query)
-                    .with_fusion(rrf, self.quality_weight)?
-                    .with_candidate_multiplier(self.candidate_multiplier)?
-                    .with_beam_widths(self.fast_ef, self.quality_ef)?,
-            )),
+            cohort::Progressive::Single(query) => {
+                cohort::Progressive::Single(Box::new(self.apply_native(*query)?))
+            }
             cohort::Progressive::Sharded(query) => cohort::Progressive::Sharded(Box::new(
                 (*query)
                     .with_fusion(rrf, self.quality_weight)?

@@ -52,8 +52,8 @@ use sha2::{Digest as _, Sha256};
 use super::{
     MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Models, Result, SCHEMA,
     bad, emit, encode, execution_context, filter::Filter, models, new_generation, new_path,
-    positive as number, query, read_documents, serve::source, update as mutations, validate_query,
-    value,
+    positive as number, query, query_cache, read_documents, serve::source, update as mutations,
+    validate_query, value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
@@ -69,6 +69,9 @@ mod quality_completion;
 
 #[path = "authority_repair.rs"]
 mod repair;
+
+#[path = "authority_query.rs"]
+mod query_controls;
 
 const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v3";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
@@ -97,13 +100,16 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-repair --from-receipt DAMAGED_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
-      --retrieval exact [--model-dir DIR] [--quality-backend BACKEND]\n\
+      --retrieval exact|hnsw [--reuse-vectors]\n\
+      [--hnsw-seed N] [--quality-hnsw-seed N]\n\
+      [--model-dir DIR] [--quality-backend BACKEND]\n\
       [--quality-model-dir DIR] [--batch-size N] [--max-source-bytes N]\n\
       [--max-image-bytes N]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N] [--lexical-only]\n\
       [--current-receipt CURRENT_JSON]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--mode fast|quality|full|lexical] [--stream] [--filter JSON] [--timeout-ms N]\n\
+      [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]\n\
       [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-fetch --receipt JSON --doc-id ID [--offset-bytes N] [--max-bytes N]\n\
       [--current-receipt CURRENT_JSON]\n\
@@ -112,7 +118,8 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
   authority-serve --receipt JSON [--limit N] [--allow-activation] [--allow-updates]\n\
       [--current-receipt CURRENT_JSON]\n\
       [--allow-model-activation]\n\
-      [--lexical-only] [--timeout-ms N]\n\
+      [--lexical-only] [--timeout-ms N] [--query-cache-entries N]\n\
+      [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N] [--batch-size N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
@@ -129,6 +136,17 @@ admission and model loading. All query stages share one deadline; output deliver
 does not turn a completed final page into a timeout. A warm request's timeout_ms\n\
 can shorten the server's --timeout-ms ceiling. A timed-out query leaves the\n\
 retained authority and warm models available for subsequent requests.\n\
+--full-query uses the ordinary CLI's validated fusion, candidate and graph-beam\n\
+settings for full mode. Reranking requires an explicit local --reranker-dir;\n\
+its window defaults to 50 (1..1000). Only final eligible candidate source is\n\
+read, bounded by --max-source-bytes, from the same retained authority. Streaming\n\
+delivers Initial, Refined and, when performed, Reranked; buffered search requires\n\
+every configured stage to succeed. The original timeout also covers reranking.\n\
+Full-mode controls require a complete full generation; primary and lexical\n\
+requests explicitly skip them. Request tuning requires request_overrides:true\n\
+in the server --full-query and an envelope {\"op\":\"search\",\"request\":{...},\n\
+\"full_query\":{...}}. Overrides cannot increase server candidate, beam or rerank\n\
+limits, change models/source scope, or extend its timeout ceiling.\n\
 --retrieval selects both full tiers; partial/sharded cohorts remain unsupported.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
@@ -163,7 +181,15 @@ source even when vector or ANN images are damaged or missing. It needs no health
 ancestor and never serves a partial generation. It rebuilds every stored tier\n\
 with the same full producer identities, precision, source checkpoint and document\n\
 fields, then publishes a complete higher-sequence Repair successor. Explicit\n\
---retrieval exact is required; old damaged images remain untouched. Repair accepts\n\
+--retrieval exact is required for repair that reruns inference; old images remain\n\
+untouched. With --reuse-vectors, repair instead requires intact authenticated\n\
+vectors and never loads models. It preserves the same source and each tier's\n\
+precision, and accepts explicit --retrieval exact or hnsw. HNSW requires\n\
+--hnsw-seed: choose a fresh seed so the rebuilt graph has a new immutable object\n\
+address. --quality-hnsw-seed selects an independent full-tier seed; otherwise it\n\
+uses --hnsw-seed. A repeated old whole-graph receipt is refused before staging.\n\
+Seed flags require HNSW, and --reuse-vectors excludes model directory/backend\n\
+options. Both repair routes accept\n\
 no replacement input, source advancement, model migration or topology change.\n\
 Damaged source, control state, unsafe root entries or a competing head refuse.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
@@ -208,7 +234,16 @@ authority. No publication, arbitrary history discovery or damaged-current\n\
 fallback occurs. A warm historical reader stays on that target after publication.\n\
 The default encoded-image budget is 256 MiB, checked before component reads.\n\
 authority-serve retains one admitted generation and its local models for bounded\n\
-JSONL requests: {\"id\":\"q1\",\"query\":\"text\",\"limit\":10}. Requests may select\n\
+JSONL requests. --query-cache-entries enables an in-memory bound query embedding\n\
+cache of 1..1024 entries per producer; 0 (the default) disables it. Cache keys\n\
+include the exact query and full producer/input identity. Oversized queries or\n\
+vectors bypass it, and document/update inference always uses uncached models.\n\
+Data activation and updates retain query embeddings while retrieval uses the\n\
+new snapshot. Quality completion retains the fast cache and adds a separate\n\
+quality cache. Model activation installs fresh caches only after admission;\n\
+failed activation preserves the previous caches. Enabled caching excludes\n\
+--lexical-only. Query/filter text and embeddings are never written to disk.\n\
+Requests use {\"id\":\"q1\",\"query\":\"text\",\"limit\":10} and may select\n\
 \"mode\":\"fast\"|\"quality\"|\"full\" and \"stream\":true. Full is the default for\n\
 a full generation. Streaming emits separate Initial and Refined frames. It never follows a new\n\
 authority implicitly. With --allow-activation, an explicit request may select a\n\
@@ -327,7 +362,12 @@ struct Options {
     mode: Option<QueryMode>,
     stream: bool,
     timeout_ms: Option<u64>,
+    full_query: Option<query::FullQuery>,
+    reranker_dir: Option<PathBuf>,
+    rerank_window: usize,
+    query_cache: query_cache::Config,
     retrieval: Option<NativeBuildRetrieval>,
+    repair_vectors: repair::RetainedVectorOptions,
     source_low: Option<u64>,
     source_high: Option<u64>,
     query: Option<String>,
@@ -399,7 +439,12 @@ impl Options {
             mode: None,
             stream: false,
             timeout_ms: None,
+            full_query: None,
+            reranker_dir: None,
+            rerank_window: 50,
+            query_cache: query_cache::Config::default(),
             retrieval: None,
+            repair_vectors: repair::RetainedVectorOptions::default(),
             source_low: None,
             source_high: None,
             query: None,
@@ -593,6 +638,22 @@ impl Options {
                         _ => return Err(bad("authority retrieval must be exact or hnsw")),
                     });
                 }
+                "--reuse-vectors" if command == Command::Repair => {
+                    options.repair_vectors.reuse_vectors = true;
+                }
+                "--hnsw-seed" if command == Command::Repair => {
+                    options.repair_vectors.primary_seed = Some(
+                        value(&mut args)?
+                            .parse()
+                            .map_err(|_| bad("HNSW seed must be an unsigned 64-bit integer"))?,
+                    );
+                }
+                "--quality-hnsw-seed" if command == Command::Repair => {
+                    options.repair_vectors.quality_seed =
+                        Some(value(&mut args)?.parse().map_err(|_| {
+                            bad("quality HNSW seed must be an unsigned 64-bit integer")
+                        })?);
+                }
                 "--cooperative-local" if command == Command::Index => {
                     options.cooperative_local = true;
                 }
@@ -624,6 +685,18 @@ impl Options {
                             bad("query timeout must be an unsigned millisecond count")
                         })?);
                     query::validate_timeout(options.timeout_ms)?;
+                }
+                "--query-cache-entries" if command == Command::Serve => {
+                    options.query_cache = query_cache::Config::parse(&value(&mut args)?)?;
+                }
+                "--full-query" if matches!(command, Command::Search | Command::Serve) => {
+                    options.full_query = Some(query::FullQuery::parse(&value(&mut args)?)?);
+                }
+                "--reranker-dir" if matches!(command, Command::Search | Command::Serve) => {
+                    options.reranker_dir = Some(PathBuf::from(value(&mut args)?));
+                }
+                "--rerank-window" if matches!(command, Command::Search | Command::Serve) => {
+                    options.rerank_window = number(&value(&mut args)?, 1_000)?;
                 }
                 "--mode" if command == Command::Search => {
                     options.mode = Some(match value(&mut args)?.as_str() {
@@ -662,12 +735,25 @@ impl Options {
             && (options.models.is_some()
                 || options.quality.backend.is_some()
                 || options.quality.directory.is_some()
+                || options.full_query.is_some()
+                || options.reranker_dir.is_some()
+                || options.query_cache.enabled()
+                || seen.contains("--rerank-window")
                 || options.allow_updates
                 || options.allow_model_activation)
         {
             return Err(bad(
-                "--lexical-only excludes model options, updates, and model activation",
+                "--lexical-only excludes model options, query caching, full-query tuning, reranking, updates, and model activation",
             ));
+        }
+        if seen.contains("--rerank-window") && options.reranker_dir.is_none() {
+            return Err(bad("--rerank-window requires --reranker-dir"));
+        }
+        if command == Command::Search
+            && options.mode.is_some_and(|mode| mode != QueryMode::Full)
+            && (options.full_query.is_some() || options.reranker_dir.is_some())
+        {
+            return Err(bad("full-query tuning and reranking require --mode full"));
         }
         match command {
             Command::Index => {
@@ -755,9 +841,7 @@ impl Options {
                         "authority-repair requires --from-receipt and --work-dir",
                     ));
                 }
-                if options.retrieval != Some(NativeBuildRetrieval::Exact) {
-                    return Err(bad("authority-repair requires explicit --retrieval exact"));
-                }
+                repair::validate_options(&options)?;
             }
             Command::Rollback => {
                 if options.from_receipt.is_none() || options.target_receipt.is_none() {
@@ -2671,6 +2755,8 @@ struct QueryPlan<'a> {
     mode: QueryMode,
     stream: bool,
     deadline: Option<&'a NativeSearchDeadline>,
+    policy: Option<&'a query::Policy>,
+    max_source_bytes: usize,
 }
 
 /// Execute against one retained generation and deliver each completed phase
@@ -2689,30 +2775,29 @@ where
     if plan.mode == QueryMode::Lexical {
         return Err(serve_refused("lexical_requires_model_free_execution"));
     }
+    let selection = query_controls::RetainedQuery::new(snapshot, scope, plan.policy);
     if plan.mode == QueryMode::Full {
         let quality = loaded
             .quality
             .as_deref()
             .ok_or_else(|| serve_refused("quality_provider_missing"))?;
-        if plan.stream {
+        if plan.stream || plan.policy.is_some_and(query_controls::configured) {
             let mut empty_initial_without_refinement = false;
+            let mut buffered = None;
             let mut query = query::within(cx, plan.deadline, async {
-                Ok(match scope {
-                    Some(scope) => scope.search_progressive_with_quality(
-                        cx,
-                        loaded.fast.as_ref(),
-                        quality,
-                        plan.text,
-                        plan.limit,
-                    )?,
-                    None => snapshot.search_progressive_with_quality(
-                        cx,
-                        loaded.fast.as_ref(),
-                        quality,
-                        plan.text,
-                        plan.limit,
-                    )?,
-                })
+                let search = selection.progressive(
+                    cx,
+                    loaded.fast.as_ref(),
+                    quality,
+                    plan.text,
+                    plan.limit,
+                )?;
+                match plan.policy {
+                    Some(policy) => {
+                        query_controls::configure(search, policy, plan.max_source_bytes)
+                    }
+                    None => Ok(search),
+                }
             })
             .await?;
             // Do not poll again after a terminal phase was delivered: slow
@@ -2735,11 +2820,16 @@ where
                     }
                     NativeSearchPhase::RefinementFailed { error, .. }
                     | NativeSearchPhase::RerankFailed { error, .. } => return Err(error.into()),
-                    NativeSearchPhase::Reranked { .. } => {
-                        return Err(serve_refused("unexpected_reranking_phase"));
+                    NativeSearchPhase::Reranked { results, .. } => {
+                        empty_initial_without_refinement = false;
+                        ("reranked", results)
                     }
                 };
-                deliver(name, &results)?;
+                if plan.stream {
+                    deliver(name, &results)?;
+                } else {
+                    buffered = Some((name, results));
+                }
             }
             if empty_initial_without_refinement {
                 // A zero-sized scope admits both identities, then the native
@@ -2748,32 +2838,22 @@ where
                 // Native computation is already complete. Delivering its
                 // synthetic final frame must not recheck elapsed output time.
                 checkpoint(cx)?;
-                deliver("refined", &[])?;
+                if plan.stream {
+                    deliver("refined", &[])?;
+                } else {
+                    buffered = Some(("refined", Vec::new()));
+                }
+            }
+            if !plan.stream {
+                let (phase, results) =
+                    buffered.ok_or_else(|| serve_refused("missing_full_query_phase"))?;
+                deliver(phase, &results)?;
             }
         } else {
             let results = query::within(cx, plan.deadline, async {
-                Ok(match scope {
-                    Some(scope) => {
-                        Box::pin(scope.search_refined_text(
-                            cx,
-                            loaded.fast.as_ref(),
-                            quality,
-                            plan.text,
-                            plan.limit,
-                        ))
-                        .await?
-                    }
-                    None => {
-                        Box::pin(snapshot.search_refined_text(
-                            cx,
-                            loaded.fast.as_ref(),
-                            quality,
-                            plan.text,
-                            plan.limit,
-                        ))
-                        .await?
-                    }
-                })
+                selection
+                    .refined(cx, loaded.fast.as_ref(), quality, plan.text, plan.limit)
+                    .await
             })
             .await?;
             deliver("refined", &results)?;
@@ -2787,42 +2867,16 @@ where
                     .unwrap_or_else(|| loaded.fast.as_ref());
                 (
                     "quality",
-                    match scope {
-                        Some(scope) => {
-                            Box::pin(scope.search_quality_text(cx, quality, plan.text, plan.limit))
-                                .await?
-                        }
-                        None => {
-                            Box::pin(
-                                snapshot.search_quality_text(cx, quality, plan.text, plan.limit),
-                            )
-                            .await?
-                        }
-                    },
+                    selection
+                        .quality(cx, quality, plan.text, plan.limit)
+                        .await?,
                 )
             } else {
                 (
                     "initial",
-                    match scope {
-                        Some(scope) => {
-                            Box::pin(scope.search_text(
-                                cx,
-                                loaded.fast.as_ref(),
-                                plan.text,
-                                plan.limit,
-                            ))
-                            .await?
-                        }
-                        None => {
-                            Box::pin(snapshot.search_text(
-                                cx,
-                                loaded.fast.as_ref(),
-                                plan.text,
-                                plan.limit,
-                            ))
-                            .await?
-                        }
-                    },
+                    selection
+                        .fast(cx, loaded.fast.as_ref(), plan.text, plan.limit)
+                        .await?,
                 )
             })
         })
@@ -2877,6 +2931,7 @@ where
     } else {
         options.mode
     })?;
+    query_controls::validate_startup(options, mode)?;
     options
         .quality
         .validate_usage(matches!(mode, QueryMode::Quality | QueryMode::Full))?;
@@ -2914,7 +2969,7 @@ where
     // Opening the selected images, fixed scope and models is startup work,
     // matching the ordinary native CLI. Every query phase then shares this
     // absolute deadline, including synchronous retrieval and hydration.
-    let policy = query::Policy::new(cx, options.timeout_ms)?;
+    let policy = query_controls::load_policy(cx, options)?;
     let deadline = policy.start(cx, None)?;
     let plan = QueryPlan {
         text: query,
@@ -2922,6 +2977,8 @@ where
         mode,
         stream: options.stream,
         deadline: deadline.as_ref(),
+        policy: Some(&policy),
+        max_source_bytes: options.max_source_bytes,
     };
     query_selected(
         cx,
@@ -2944,6 +3001,7 @@ where
                 scope.as_ref().map(NativeScopedGenerationSnapshot::len),
             );
             annotate_execution(&mut response, mode);
+            query_controls::annotate(&policy, mode, &mut response);
             emit(output, &response)
         },
     )
@@ -3160,6 +3218,7 @@ struct AuthorityFetchRequest {
 #[serde(untagged)]
 enum AuthorityRequest {
     Search(AuthoritySearchRequest),
+    TunedSearch(query_controls::Request),
     ModelActivation(model_activation::Request),
     Activate(AuthorityActivateRequest),
     Update(AuthorityUpdateRequest),
@@ -3242,6 +3301,10 @@ struct AuthoritySession {
     receipt: Receipt,
     snapshot: Arc<NativeGenerationSnapshot>,
     models: AuthorityModels,
+    // Keep document inference on the raw providers, including the builder's
+    // singleton fallback. Only query execution sees the optional cache wrappers.
+    cached_query_models: Option<AuthorityModels>,
+    query_cache: query_cache::Config,
     default_limit: usize,
     max_image_bytes: usize,
     max_source_bytes: usize,
@@ -3309,6 +3372,8 @@ impl AuthoritySession {
             receipt,
             snapshot,
             models,
+            cached_query_models: None,
+            query_cache: query_cache::Config::default(),
             default_limit: limits.0,
             max_image_bytes: limits.1,
             max_source_bytes: MAX_INPUT_BYTES,
@@ -3319,6 +3384,53 @@ impl AuthoritySession {
             update_limits: None,
             query_policy: query::Policy::default(),
         })
+    }
+
+    fn with_query_cache(mut self, cx: &Cx, cache: query_cache::Config) -> Result<Self> {
+        checkpoint(cx)?;
+        let cached = if cache.enabled() {
+            Some(AuthorityModels::Semantic(
+                cache.wrap(cx, self.models.models()?.clone())?,
+            ))
+        } else {
+            None
+        };
+        checkpoint(cx)?;
+        self.query_cache = cache;
+        self.cached_query_models = cached;
+        Ok(self)
+    }
+
+    fn query_models(&self) -> &AuthorityModels {
+        self.cached_query_models.as_ref().unwrap_or(&self.models)
+    }
+
+    /// Prepare the next query providers without changing the serving selection.
+    /// A quality completion retains the exact warm fast cache; model migration
+    /// receives fresh caches even if a provider keeps its display name.
+    fn cache_replacement_models(
+        &self,
+        cx: &Cx,
+        models: &Models,
+        retain_fast: bool,
+    ) -> Result<Option<AuthorityModels>> {
+        checkpoint(cx)?;
+        if !self.query_cache.enabled() {
+            return Ok(None);
+        }
+        let fast = if retain_fast {
+            Arc::clone(&self.query_models().models()?.fast)
+        } else {
+            self.query_cache
+                .wrap_embedder(cx, Arc::clone(&models.fast))?
+        };
+        let quality = models
+            .quality
+            .as_ref()
+            .map(|model| self.query_cache.wrap_embedder(cx, Arc::clone(model)))
+            .transpose()?;
+        checkpoint(cx)?;
+        Ok(Some(AuthorityModels::Semantic(Models { fast, quality })))
     }
 
     fn with_updates(mut self, batch_size: usize, max_source_bytes: usize) -> Result<Self> {
@@ -3452,6 +3564,18 @@ impl AuthoritySession {
         ordinal: u64,
         output: &mut impl Write,
     ) -> Result<()> {
+        self.query_with_policy(cx, request, ordinal, output, &self.query_policy)
+            .await
+    }
+
+    async fn query_with_policy(
+        &self,
+        cx: &Cx,
+        request: &AuthoritySearchRequest,
+        ordinal: u64,
+        output: &mut impl Write,
+        policy: &query::Policy,
+    ) -> Result<()> {
         checkpoint(cx)?;
         super::serve::validate_id(request.id.as_deref())
             .map_err(|_| serve_refused("invalid_request_id"))?;
@@ -3463,10 +3587,10 @@ impl AuthoritySession {
         let mode = self.models.query_mode(&self.receipt, request.mode)?;
         // Validate before any provider or source work. An override can only
         // shorten a configured server budget, never disable or extend it.
-        self.query_policy
+        policy
             .effective_ms(request.timeout_ms)
             .map_err(|_| serve_refused("invalid_timeout"))?;
-        let deadline = self.query_policy.start(cx, request.timeout_ms)?;
+        let deadline = policy.start(cx, request.timeout_ms)?;
         if mode != QueryMode::Lexical {
             // Preserve the protocol's typed admission refusal before expiry;
             // the outer boundary still rejects late synchronous admission.
@@ -3502,13 +3626,15 @@ impl AuthoritySession {
             cx,
             &self.snapshot,
             scope,
-            &self.models,
+            self.query_models(),
             QueryPlan {
                 text: &request.query,
                 limit,
                 mode,
                 stream: request.stream,
                 deadline: deadline.as_ref(),
+                policy: Some(policy),
+                max_source_bytes: self.max_source_bytes,
             },
             |phase, results| {
                 let mut response =
@@ -3518,6 +3644,7 @@ impl AuthoritySession {
                 response["phase"] = serde_json::json!(phase);
                 annotate_snapshot_retrieval(&mut response, &self.snapshot, Some(mode));
                 annotate_execution(&mut response, mode);
+                query_controls::annotate(policy, mode, &mut response);
                 annotate_scope(
                     &mut response,
                     scope.map(NativeScopedGenerationSnapshot::len),
@@ -3829,6 +3956,24 @@ async fn serve_session(
     }
     ready["default_limit"] = serde_json::json!(session.default_limit);
     ready["maximum_timeout_ms"] = serde_json::json!(session.query_policy.maximum_ms());
+    ready["query_cache_entries"] = serde_json::json!(session.query_cache.entries());
+    ready["query_tuning_enabled"] =
+        serde_json::json!(session.query_policy.query_overrides_enabled());
+    ready["full_mode_reranker"] = serde_json::json!(
+        session
+            .query_policy
+            .rerank
+            .as_ref()
+            .map(|rerank| rerank.model.id())
+    );
+    ready["rerank_window"] = serde_json::json!(
+        session
+            .query_policy
+            .rerank
+            .as_ref()
+            .map(|rerank| rerank.window)
+    );
+    query_controls::annotate(&session.query_policy, QueryMode::Full, &mut ready);
     ready["max_source_bytes"] = serde_json::json!(session.max_source_bytes);
     ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
     ready["default_mode"] =
@@ -3863,6 +4008,17 @@ async fn serve_session(
                     .filter(|id| super::serve::validate_id(Some(id)).is_ok());
                 let result = session
                     .query(cx, &request, ordinal, output)
+                    .await
+                    .map(|()| None);
+                (id, result, false)
+            }
+            AuthorityRequest::TunedSearch(request) => {
+                let id = request
+                    .request
+                    .id
+                    .clone()
+                    .filter(|id| super::serve::validate_id(Some(id)).is_ok());
+                let result = query_controls::execute(session, cx, &request, ordinal, output)
                     .await
                     .map(|()| None);
                 (id, result, false)
@@ -4011,6 +4167,14 @@ async fn serve(
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
     let receipt = Receipt::read(&options.receipt)?;
+    query_controls::validate_startup(
+        options,
+        if options.lexical_only {
+            QueryMode::Lexical
+        } else {
+            receipt.query_mode(None)?
+        },
+    )?;
     options.quality.validate_usage(
         receipt.tier == EmbedderTierTag::Quality || receipt.quality_identity.is_some(),
     )?;
@@ -4041,7 +4205,8 @@ async fn serve(
         loaded,
         (options.limit, options.max_image_bytes),
         options.allow_activation,
-    )?;
+    )?
+    .with_query_cache(cx, options.query_cache)?;
     if options.allow_updates {
         session = session.with_updates(options.batch_size, options.max_source_bytes)?;
     }
@@ -4053,7 +4218,7 @@ async fn serve(
     session.scope = scope;
     session.fixed_filter = options.filter.clone();
     session.max_source_bytes = options.max_source_bytes;
-    session.query_policy = query::Policy::new(cx, options.timeout_ms)?;
+    session.query_policy = query_controls::load_policy(cx, options)?;
     serve_session(cx, &mut session, &mut io::stdin().lock(), output).await
 }
 

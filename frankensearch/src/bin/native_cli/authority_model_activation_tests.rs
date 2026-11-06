@@ -1,5 +1,9 @@
 use super::*;
 
+mod query_cache_tests {
+    include!("authority_query_cache_tests.rs");
+}
+
 fn replacement_provider(change_space: bool) -> Arc<Provider> {
     let mut identity = provider_identity();
     identity.producer.implementation_revision = "authority-activated-producer".to_owned();

@@ -1004,6 +1004,10 @@ fn seed_candidate(
     copy_tree(cx, predecessor.path(), destination, 0, &mut stats)?;
     stats.confirm(cx, store, &predecessor, destination)?;
     let label = destination.display().to_string();
+    // Mixed deferred mutations retain canonical input, while the source
+    // indexer consumes raw-source fences. Restore only independently proven
+    // checkpoint bindings before unchanged rows bypass source preparation.
+    super::deferred_quality::prepare_source_reuse(cx, runtime, &predecessor, &receipt.checkpoint)?;
     sentinel.index_root.clone_from(&label);
     receipt.checkpoint.index_root = label;
     runtime.write_index_sentinel(destination, &sentinel)?;

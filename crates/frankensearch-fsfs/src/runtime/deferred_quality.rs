@@ -487,6 +487,106 @@ fn open_carried_backlog(
     Ok(Some((storage, backlog)))
 }
 
+/// Prepare owned-text work for the ordinary source indexer's version-1 fence.
+/// The caller has admitted the predecessor's reuse receipt and independently
+/// copied its sealed artifacts into this candidate. A canonical-text digest
+/// never becomes a filesystem witness: only a proven, exact checkpoint entry
+/// supplies the original source digest. Changed or opaque inputs stay unproven
+/// and must pass through the indexer's normal source preparation again.
+///
+/// Validate the entire version-2 backlog before changing any candidate metadata.
+/// The ordinary indexer then writes a new generation-bound backlog before this
+/// private candidate can be published. No selected catalog is opened for writing.
+pub(super) fn prepare_source_reuse(
+    cx: &Cx,
+    candidate: &FsfsRuntime,
+    predecessor: &PublishedGeneration,
+    checkpoint: &super::IndexingCheckpoint,
+) -> SearchResult<()> {
+    if !captures_quality(candidate) {
+        return Ok(());
+    }
+    retained_search_checkpoint(cx)?;
+    let previous = FsfsRuntime::read_index_sentinel(predecessor.path())?
+        .ok_or_else(|| invalid("source reuse predecessor has no completion sentinel"))?;
+    let Some((storage, backlog)) = open_carried_backlog(candidate, predecessor, &previous)? else {
+        return Ok(());
+    };
+    if backlog.schema_version != 2 {
+        return Ok(());
+    }
+    if backlog.generation_root != predecessor.path().display().to_string()
+        || backlog.source_hash != previous.source_hash_hex
+        || backlog.unavailable_documents != 0
+        || !checkpoint.artifacts_durable
+        || checkpoint.schema_version != super::INDEXING_CHECKPOINT_SCHEMA_VERSION
+        || checkpoint.index_root != predecessor.path().display().to_string()
+    {
+        return Err(invalid(
+            "source reuse requires exact retained quality input and checkpoint fences",
+        ));
+    }
+    let manifests =
+        FsfsRuntime::read_checkpoint_manifest_generation(predecessor.path(), checkpoint)?
+            .ok_or_else(|| invalid("source reuse checkpoint disagrees with retained membership"))?;
+    if manifests
+        .values()
+        .filter(|entry| {
+            entry.ingestion_class == ingestion_class_label(IngestionClass::FullSemanticLexical)
+        })
+        .count()
+        != backlog.requested_documents
+    {
+        return Err(invalid(
+            "source reuse quality coverage disagrees with retained membership",
+        ));
+    }
+    validate_pending_jobs(&storage, &backlog.queue_key(), &manifests, None)?;
+    retained_search_checkpoint(cx)?;
+    let mut restored = Vec::new();
+    for (id, manifest) in &manifests {
+        retained_search_checkpoint(cx)?;
+        let Some(entry) = checkpoint.files.get(id).filter(|entry| {
+            entry.lexical_indexed
+                && entry.semantic_indexed
+                && entry.content_hash_hex.len() == 64
+                && entry
+                    .content_hash_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                && entry.revision == manifest.revision
+                && entry.ingestion_class
+                    == ingestion_class_label(IngestionClass::FullSemanticLexical)
+                && entry.ingestion_class == manifest.ingestion_class
+                && entry.canonical_bytes == manifest.canonical_bytes
+                && entry.reason_code == manifest.reason_code
+                && entry.fast_windows == manifest.fast_windows
+        }) else {
+            continue;
+        };
+        restored.push((
+            id.as_str(),
+            SourceInput {
+                revision: entry.revision,
+                source_sha256: entry.content_hash_hex.clone(),
+            },
+        ));
+    }
+    for (id, source) in restored {
+        retained_search_checkpoint(cx)?;
+        let mut document = storage
+            .get_document(id)?
+            .ok_or_else(|| invalid("admitted source reuse input disappeared"))?;
+        let metadata = document
+            .metadata
+            .as_mut()
+            .ok_or_else(|| invalid("admitted source reuse fence disappeared"))?;
+        metadata[SOURCE_METADATA] = serde_json::to_value(source).map_err(storage_error)?;
+        storage.upsert_document(&document)?;
+    }
+    retained_search_checkpoint(cx)
+}
+
 /// Move an admitted source backlog to an owned-text fence in the independently
 /// copied candidate. Version 2 certifies embedding input, never filesystem bytes
 /// or upgrade reuse. Validate every old job before replacing its source fence.
@@ -1629,6 +1729,248 @@ mod tests {
                 &["new retained content"]
             );
             assert_eq!(files(completed.path()), completed_bytes);
+        });
+    }
+
+    #[test]
+    fn deferred_upserts_keep_completable_inputs_through_warm_source_reindex() {
+        use super::super::retained_batch::RetainedMutation;
+
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            let raw_beta = fs::read(directory.path().join("source/beta.md")).unwrap();
+            assert_ne!(
+                content_sha256_hex(&raw_beta),
+                content_sha256_hex(expected["beta.md"].as_bytes()),
+                "the carried file must distinguish raw source from canonical input"
+            );
+            let fast = Arc::new(Producer::new("deferred-fast"));
+            let quality = Arc::new(Producer::new("deferred-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let deferred = runtime(directory.path(), true);
+            let root = directory.path().join("store");
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let mut predecessors = vec![(first.clone(), files(first.path()))];
+            let latest_raw = "sharedtoken updated alpha body\r\n\r\nlatest source revision";
+            let latest_canonical = DefaultCanonicalizer::default().canonicalize(latest_raw);
+            fs::write(directory.path().join("source/alpha.md"), latest_raw).unwrap();
+            let updated = deferred
+                .apply_retained_batch(
+                    &cx,
+                    &root,
+                    &first,
+                    &[RetainedMutation::Upsert {
+                        id: "alpha.md".to_owned(),
+                        text: latest_raw.to_owned(),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!((updated.upserted, updated.deleted), (1, 0));
+            let mut selected = durable(updated.publication.unwrap());
+            let inherited = retained_reuse::completed_input_checkpoint(&cx, &selected).unwrap();
+            assert!(inherited.files["alpha.md"].content_hash_hex.is_empty());
+            assert!(!inherited.files["alpha.md"].semantic_indexed);
+            assert!(inherited.files["beta.md"].semantic_indexed);
+            assert_eq!(
+                inherited.files["beta.md"].content_hash_hex,
+                content_sha256_hex(&raw_beta)
+            );
+            predecessors.push((selected.clone(), files(selected.path())));
+
+            // The first source rebuild rereads the opaque replacement and
+            // carries beta. The next rebuild carries both source-proven rows.
+            // Neither pass may lose the deferred canonical input it carries.
+            for pass in 0..2 {
+                fast.inputs.lock().unwrap().clear();
+                selected = durable(
+                    deferred
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                );
+                let wanted = if pass == 0 {
+                    vec![latest_canonical.clone()]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(*fast.inputs.lock().unwrap(), wanted);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                for (previous, before) in &predecessors {
+                    assert_eq!(&files(previous.path()), before);
+                }
+                predecessors.push((selected.clone(), files(selected.path())));
+            }
+            let fast_bytes = fs::read(selected.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap();
+            fs::rename(
+                directory.path().join("source"),
+                directory.path().join("source-gone"),
+            )
+            .unwrap();
+            fast.inputs.lock().unwrap().clear();
+            let restarted = runtime(directory.path(), false);
+            let completion = restarted
+                .complete_retained_quality(&cx, &root, &selected)
+                .await
+                .unwrap();
+            assert_eq!(completion.completed_documents, 2);
+            let completed = durable(completion.publication);
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert_eq!(
+                quality
+                    .inputs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([latest_canonical, expected["beta.md"].clone()]),
+            );
+            assert_eq!(
+                fs::read(completed.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                fast_bytes
+            );
+            for (previous, before) in &predecessors {
+                assert_eq!(&files(previous.path()), before);
+            }
+            assert_eq!(
+                VectorIndex::open_read_only(&completed.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE))
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap(),
+                std::collections::HashSet::from(["alpha.md".to_owned(), "beta.md".to_owned()]),
+            );
+            let mut config = restarted.config().clone();
+            config.pressure.profile = crate::config::PressureProfile::Performance;
+            let search = FsfsRuntime::new(config).with_cli_input(restarted.cli_input.clone());
+            let mut reader = search.open_retained_search(&cx, &root).await.unwrap();
+            let phases = reader
+                .search(
+                    &cx,
+                    "how do sharedtoken files retain the latest source revision",
+                    5,
+                )
+                .await
+                .unwrap();
+            assert_eq!(phases.last().unwrap().phase, SearchOutputPhase::Refined);
+            assert_eq!(phases.last().unwrap().hits.len(), 2);
+        });
+    }
+
+    #[test]
+    fn source_reuse_checks_the_entire_owned_backlog_before_restoring_proven_fences() {
+        use super::super::retained_batch::RetainedMutation;
+
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("deferred-fast"));
+            let quality = Arc::new(Producer::new("deferred-quality"));
+            let _providers = Providers::install(fast, Arc::clone(&quality));
+            let deferred = runtime(directory.path(), true);
+            let root = directory.path().join("store");
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let updated = deferred
+                .apply_retained_batch(
+                    &cx,
+                    &root,
+                    &first,
+                    &[RetainedMutation::Upsert {
+                        id: "opaque.md".to_owned(),
+                        text: "retained opaque body".to_owned(),
+                    }],
+                )
+                .await
+                .unwrap();
+            let selected = durable(updated.publication.unwrap());
+            let before = files(selected.path());
+            let checkpoint = retained_reuse::completed_input_checkpoint(&cx, &selected).unwrap();
+            assert!(checkpoint.files["opaque.md"].content_hash_hex.is_empty());
+            assert!(!checkpoint.files["opaque.md"].lexical_indexed);
+            assert!(!checkpoint.files["opaque.md"].semantic_indexed);
+            for case in ["valid", "corrupt-unproven-input", "cancelled"] {
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let build = store.begin(&cx).unwrap();
+                let mut input = deferred.cli_input.clone();
+                input.index_dir = Some(build.path().to_path_buf());
+                let mut candidate = deferred.clone().with_cli_input(input);
+                candidate.discovery_excluded_root = Some(root.clone());
+                assert_eq!(
+                    retained_reuse::copy_selected_generation(&cx, &candidate, &store, build.path())
+                        .unwrap(),
+                    selected
+                );
+                let storage = open_catalog(&candidate, false).unwrap();
+                assert_eq!(read_backlog(&storage).unwrap().schema_version, 2);
+                let metadata_before = ["alpha.md", "beta.md", "opaque.md"]
+                    .map(|id| storage.get_document(id).unwrap().unwrap().metadata);
+                assert_eq!(
+                    source_input(&storage.get_document("beta.md").unwrap().unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .source_sha256,
+                    content_sha256_hex(expected["beta.md"].as_bytes()),
+                );
+                if case == "corrupt-unproven-input" {
+                    // Even a row that will never acquire a source witness must
+                    // be admitted before any other row's metadata is changed.
+                    storage
+                        .connection()
+                        .execute_sync(
+                            "UPDATE document_contents SET canonical_text = 'corrupted opaque body' WHERE doc_id = 'opaque.md';",
+                        )
+                        .unwrap();
+                }
+                drop(storage);
+                if case == "cancelled" {
+                    cx.set_cancel_requested(true);
+                }
+                let result = prepare_source_reuse(&cx, &candidate, &selected, &checkpoint);
+                cx.set_cancel_requested(false);
+                let storage = open_catalog(&candidate, false).unwrap();
+                if case == "valid" {
+                    result.unwrap();
+                    assert_eq!(
+                        source_input(&storage.get_document("beta.md").unwrap().unwrap())
+                            .unwrap()
+                            .unwrap()
+                            .source_sha256,
+                        checkpoint.files["beta.md"].content_hash_hex,
+                    );
+                    assert_eq!(
+                        storage.get_document("opaque.md").unwrap().unwrap().metadata,
+                        metadata_before[2]
+                    );
+                    assert_eq!(
+                        storage.get_document_content("beta.md").unwrap().as_deref(),
+                        Some(expected["beta.md"].as_str())
+                    );
+                } else {
+                    if case == "cancelled" {
+                        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                    } else {
+                        assert!(result.is_err());
+                    }
+                    let after = ["alpha.md", "beta.md", "opaque.md"]
+                        .map(|id| storage.get_document(id).unwrap().unwrap().metadata);
+                    assert_eq!(after, metadata_before, "{case}");
+                }
+                drop(storage);
+                assert_eq!(store.active(&cx).unwrap(), Some(selected.clone()));
+                assert_eq!(files(selected.path()), before);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+            }
         });
     }
 

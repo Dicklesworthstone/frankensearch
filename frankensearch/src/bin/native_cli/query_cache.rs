@@ -34,20 +34,32 @@ impl Config {
     pub const fn enabled(self) -> bool {
         self.entries != 0
     }
+    #[must_use]
+    pub const fn entries(self) -> usize {
+        self.entries
+    }
+    /// Wrap one query provider; bound batch operations remain uncached.
+    pub fn wrap_embedder(self, cx: &Cx, inner: Arc<dyn Embedder>) -> Result<Arc<dyn Embedder>> {
+        checkpoint(cx)?;
+        if !self.enabled() {
+            return Ok(inner);
+        }
+        Ok(Arc::new(ServingEmbedder {
+            cache: CachedEmbedder::new(Arc::clone(&inner), self.entries),
+            inner,
+        }))
+    }
     pub fn wrap(self, cx: &Cx, models: Models) -> Result<Models> {
         checkpoint(cx)?;
         if !self.enabled() {
             return Ok(models);
         }
-        let wrap = |inner: Arc<dyn Embedder>| -> Arc<dyn Embedder> {
-            Arc::new(ServingEmbedder {
-                cache: CachedEmbedder::new(Arc::clone(&inner), self.entries),
-                inner,
-            })
-        };
         Ok(Models {
-            fast: wrap(models.fast),
-            quality: models.quality.map(wrap),
+            fast: self.wrap_embedder(cx, models.fast)?,
+            quality: models
+                .quality
+                .map(|model| self.wrap_embedder(cx, model))
+                .transpose()?,
         })
     }
 }

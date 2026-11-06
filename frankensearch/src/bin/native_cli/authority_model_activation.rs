@@ -277,6 +277,7 @@ impl AuthoritySession {
         let admission = admit_serving_models(&selected, &loaded);
         checkpoint(cx)?;
         admission?;
+        let cached = self.cache_replacement_models(cx, &loaded, completes_quality)?;
 
         // Loading can be slow. A successor published meanwhile must not turn
         // this stale request into an implicit selection of that newer head.
@@ -302,6 +303,7 @@ impl AuthoritySession {
         self.scope = scope;
         self.receipt = selected;
         self.models = AuthorityModels::Semantic(loaded);
+        self.cached_query_models = cached;
         Ok(())
     }
 }

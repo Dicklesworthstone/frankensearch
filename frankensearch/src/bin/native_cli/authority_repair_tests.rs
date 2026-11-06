@@ -71,6 +71,78 @@ fn repair_requires_explicit_exact_retrieval_and_excludes_source_or_model_migrati
     assert_eq!(options.max_image_bytes, 65536);
 }
 
+#[test]
+fn retained_vector_repair_requires_explicit_graph_seeds_and_excludes_models() {
+    let mut exact = arguments();
+    exact.push("--reuse-vectors".to_owned());
+    let options = Options::parse(exact.clone()).unwrap().unwrap();
+    assert!(options.repair_vectors.reuse_vectors);
+    assert!(options.repair_vectors.primary_seed.is_none());
+    let mut graph = arguments();
+    *graph.last_mut().unwrap() = "hnsw".to_owned();
+    graph.extend(
+        [
+            "--reuse-vectors",
+            "--hnsw-seed",
+            "0",
+            "--quality-hnsw-seed",
+            "18446744073709551615",
+        ]
+        .map(str::to_owned),
+    );
+    let options = Options::parse(graph.clone()).unwrap().unwrap();
+    assert_eq!(options.repair_vectors.primary_seed, Some(0));
+    assert_eq!(options.repair_vectors.quality_seed, Some(u64::MAX));
+    for extra in [
+        vec!["--model-dir", "models"],
+        vec!["--quality-backend", "native-f32"],
+        vec!["--quality-model-dir", "quality"],
+        vec!["--hnsw-seed", "1"],
+        vec!["--quality-hnsw-seed", "1"],
+    ] {
+        let mut args = exact.clone();
+        args.extend(extra.into_iter().map(str::to_owned));
+        assert!(Options::parse(args).is_err());
+    }
+    for seed in [
+        None,
+        Some("-1"),
+        Some("18446744073709551616"),
+        Some("not-a-seed"),
+    ] {
+        let mut args = arguments();
+        *args.last_mut().unwrap() = "hnsw".to_owned();
+        args.push("--reuse-vectors".to_owned());
+        if let Some(seed) = seed {
+            args.extend(["--hnsw-seed", seed].map(str::to_owned));
+        }
+        assert!(Options::parse(args).is_err());
+    }
+    for flag in ["--hnsw-seed", "--quality-hnsw-seed"] {
+        let mut duplicate = graph.clone();
+        duplicate.extend([flag, "1"].map(str::to_owned));
+        assert!(Options::parse(duplicate).is_err());
+        assert!(
+            Options::parse(
+                ["authority-recover", "--receipt", "existing.json", flag, "1"].map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        Options::parse(
+            [
+                "authority-recover",
+                "--receipt",
+                "existing.json",
+                "--reuse-vectors"
+            ]
+            .map(str::to_owned)
+        )
+        .is_err()
+    );
+}
+
 #[cfg(target_os = "linux")]
 mod lifecycle {
     use super::super::super::{
@@ -211,6 +283,28 @@ mod lifecycle {
             options.work = Some(self.parent.join(format!("{label}-work")));
             options.receipt = self.parent.join(format!("{label}.json"));
             options.batch_size = 1;
+            options
+        }
+
+        fn vector_options(
+            &self,
+            label: &str,
+            primary: Option<u64>,
+            quality: Option<u64>,
+        ) -> Options {
+            let mut options = self.options(label);
+            options.repair_vectors = RetainedVectorOptions {
+                reuse_vectors: true,
+                primary_seed: primary,
+                quality_seed: quality,
+            };
+            options.retrieval = Some(primary.map_or(NativeBuildRetrieval::Exact, |_| {
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    // The explicit repair seed must override the generic parser policy.
+                    seed: 999,
+                }
+            }));
             options
         }
     }
@@ -769,6 +863,344 @@ mod lifecycle {
             );
             assert_eq!(loads, 0);
             assert!(!retry.receipt.exists());
+        });
+    }
+
+    #[test]
+    fn retained_vector_repair_never_loads_models_and_preserves_exact_source_for_every_topology() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use NativeGenerationTopology::{FastOnly, FullProgressive, QualityOnly};
+            for (topology, empty, primary_seed, quality_seed, missing) in [
+                (FastOnly, false, Some(0), None, true),
+                (QualityOnly, false, Some(19), None, false),
+                (FullProgressive, false, Some(23), Some(31), false),
+                (FullProgressive, true, Some(0), None, true),
+                (FullProgressive, false, None, None, false),
+            ] {
+                let fixture = fixture(&cx, topology, true, empty).await;
+                let old_manifest = fixture.snapshot.retained_snapshot().manifest();
+                let lexical = fixture
+                    .snapshot
+                    .retained_snapshot()
+                    .closure()
+                    .bytes(GenerationComponentRole::Lexical)
+                    .unwrap();
+                let original_source = serde_json::to_value(
+                    fixture
+                        .snapshot
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap(),
+                )
+                .unwrap();
+                let damaged = damage(&cx, &fixture, GenerationComponentRole::Ann, missing);
+                assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                let primary_calls = fixture.primary.calls.load(Ordering::SeqCst);
+                let quality_calls = fixture
+                    .quality
+                    .as_ref()
+                    .map(|quality| quality.calls.load(Ordering::SeqCst));
+                let mut options =
+                    fixture.vector_options("reused-vectors", primary_seed, quality_seed);
+                // No full-corpus extraction is needed on the model-free path.
+                options.max_source_bytes = 0;
+                let mut loads = 0;
+                let mut output = Vec::new();
+                with_loader(&cx, &options, &mut output, |_| {
+                    loads += 1;
+                    Err(bad(
+                        "model loading must never run for retained-vector repair",
+                    ))
+                })
+                .await
+                .unwrap();
+                assert_eq!(loads, 0);
+                assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), primary_calls);
+                if let Some(quality) = &fixture.quality {
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls.unwrap());
+                }
+                let receipt = Receipt::read(&options.receipt).unwrap();
+                let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(receipt.identity, fixture.selected.identity);
+                assert_eq!(receipt.quality_identity, fixture.selected.quality_identity);
+                assert_eq!(
+                    receipt.generation.sequence,
+                    fixture.selected.generation.sequence + 1
+                );
+                assert_eq!(reopened.topology(), topology);
+                let (primary, quality) = vector_policies(&options, &fixture.selected).unwrap();
+                assert_eq!(reopened.retrieval_configuration(), primary);
+                assert_eq!(reopened.quality_retrieval_configuration(), quality);
+                assert_eq!(
+                    reopened
+                        .retained_snapshot()
+                        .closure()
+                        .bytes(GenerationComponentRole::Lexical)
+                        .unwrap(),
+                    lexical
+                );
+                assert_eq!(
+                    serde_json::to_value(reopened.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
+                        .unwrap(),
+                    original_source
+                );
+                assert_eq!(
+                    reopened.metadata().commit_range,
+                    fixture.snapshot.metadata().commit_range
+                );
+                let manifest = reopened.retained_snapshot().manifest();
+                assert_eq!(
+                    manifest.predecessor(),
+                    Some(fixture.selected.authority().unwrap())
+                );
+                assert_eq!(
+                    manifest.document_set_sha256(),
+                    old_manifest.document_set_sha256()
+                );
+                assert_eq!(
+                    manifest.source_checkpoint_sha256(),
+                    old_manifest.source_checkpoint_sha256()
+                );
+                assert_ne!(manifest.components().ann, old_manifest.components().ann);
+                assert_eq!(manifest.components().ann.is_some(), primary_seed.is_some());
+                if missing {
+                    assert!(!damaged.exists());
+                } else {
+                    assert_eq!(fs::read(&damaged).unwrap(), b"damaged-component-evidence");
+                }
+                let hits = if let Some(quality) = &fixture.quality {
+                    reopened
+                        .search_refined_text(
+                            &cx,
+                            fixture.primary.as_ref(),
+                            quality.as_ref(),
+                            "retry",
+                            2,
+                        )
+                        .await
+                } else {
+                    reopened
+                        .search_text(&cx, fixture.primary.as_ref(), "retry", 2)
+                        .await
+                }
+                .unwrap();
+                assert_eq!(hits.is_empty(), empty);
+                if !empty {
+                    assert_eq!(hits[0].doc_id, "retry");
+                }
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["event"], "repaired");
+                assert_eq!(report["source"], "authenticated_retained_vectors");
+                assert_eq!(report["vectors_reused"], true);
+                assert_eq!(report["model_migrated"], false);
+                assert_eq!(
+                    report["retrieval"],
+                    if primary_seed.is_some() {
+                        "hnsw"
+                    } else {
+                        "exact"
+                    }
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn retained_vector_failures_never_fallback_to_models_or_publish_partial_repairs() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture(&cx, NativeGenerationTopology::FastOnly, true, false).await;
+            let graph = damage(&cx, &fixture, GenerationComponentRole::Ann, false);
+            let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+            for case in [
+                "repeated-seed",
+                "quality-seed",
+                "budget",
+                "cancelled",
+                "damaged-vector",
+            ] {
+                let mut options = fixture.vector_options(
+                    case,
+                    Some(if case == "repeated-seed" { 17 } else { 41 }),
+                    None,
+                );
+                match case {
+                    "quality-seed" => options.repair_vectors.quality_seed = Some(43),
+                    "budget" => options.max_image_bytes = 1,
+                    "cancelled" => cx.set_cancel_requested(true),
+                    "damaged-vector" => {
+                        damage(&cx, &fixture, GenerationComponentRole::Vector, false);
+                    }
+                    _ => {}
+                }
+                let mut loads = 0;
+                let error = with_loader(&cx, &options, &mut Vec::new(), |_| {
+                    loads += 1;
+                    Err(bad(
+                        "retained-vector repair must never fall back to inference",
+                    ))
+                })
+                .await
+                .unwrap_err();
+                if case == "cancelled" {
+                    assert!(matches!(
+                        error.downcast_ref::<SearchError>(),
+                        Some(SearchError::Cancelled { .. })
+                    ));
+                }
+                cx.set_cancel_requested(false);
+                assert_eq!(loads, 0, "case {case}");
+                assert!(!options.receipt.exists(), "case {case}");
+                if case != "repeated-seed" {
+                    assert!(!options.work.as_ref().unwrap().exists(), "case {case}");
+                }
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    before
+                );
+                assert_eq!(fs::read(&graph).unwrap(), b"damaged-component-evidence");
+            }
+        });
+    }
+
+    #[test]
+    fn retained_vector_publication_keeps_its_original_physical_parent_after_another_repair_wins() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture(&cx, NativeGenerationTopology::FastOnly, true, false).await;
+            damage(&cx, &fixture, GenerationComponentRole::Ann, false);
+            let root = admit_root(&fixture.selected.root).unwrap();
+            let source =
+                open_vector_source(&cx, &root, &fixture.selected, DEFAULT_IMAGE_BYTES).unwrap();
+            let original_pair = source.source().retained_source().authority_pair();
+            let build = |label: &str| {
+                source
+                    .rebuild(
+                        &cx,
+                        fixture.parent.join(label),
+                        new_generation(2).unwrap(),
+                        NativeBuildRetrieval::Exact,
+                        None,
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .unwrap()
+            };
+            let stale = build("stale-vector-work");
+            let stale_prepared = prepare_repair(
+                source.source(),
+                &stale,
+                DEFAULT_IMAGE_BYTES,
+                NativeBuildRetrieval::Exact,
+                None,
+                true,
+            )
+            .unwrap();
+            let winner = build("winning-vector-work");
+            let winning_prepared = prepare_repair(
+                source.source(),
+                &winner,
+                DEFAULT_IMAGE_BYTES,
+                NativeBuildRetrieval::Exact,
+                None,
+                true,
+            )
+            .unwrap();
+            let published = stage_prepared_and_publish(
+                &cx,
+                &root,
+                &fixture.selected.root,
+                &fixture.parent.join("winning-vector.json"),
+                &winner,
+                winning_prepared,
+                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+            )
+            .unwrap();
+            let selected = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+            let stale_receipt = fixture.parent.join("stale-vector.json");
+            let result = stage_prepared_and_publish(
+                &cx,
+                &root,
+                &fixture.selected.root,
+                &stale_receipt,
+                &stale,
+                stale_prepared,
+                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+            );
+            let Err(error) = result else {
+                panic!("stale vector repair must not replace the winning selection");
+            };
+            assert_eq!(
+                error.downcast_ref::<PublicationFailure>().unwrap().0["publication"],
+                "not_committed"
+            );
+            assert_eq!(
+                Receipt::read(&stale_receipt)
+                    .unwrap()
+                    .recovery_attempt()
+                    .unwrap()
+                    .expected,
+                original_pair
+            );
+            assert_eq!(
+                fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                selected
+            );
+            published.receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let options = fixture.vector_options("stale-vector-retry", None, None);
+            let mut loads = 0;
+            assert!(
+                with_loader(&cx, &options, &mut Vec::new(), |_| {
+                    loads += 1;
+                    Err(bad("no loader on a stale vector receipt"))
+                })
+                .await
+                .is_err()
+            );
+            assert_eq!(loads, 0);
+            assert!(!options.work.as_ref().unwrap().exists());
+        });
+    }
+
+    #[test]
+    fn vector_repair_output_failure_preserves_committed_recovery_without_loading_models() {
+        struct BrokenOutput;
+        impl Write for BrokenOutput {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected vector repair output failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture(&cx, NativeGenerationTopology::QualityOnly, true, false).await;
+            damage(&cx, &fixture, GenerationComponentRole::Ann, true);
+            let options = fixture.vector_options("vector-output-loss", Some(47), None);
+            let mut loads = 0;
+            let error = with_loader(&cx, &options, &mut BrokenOutput, |_| {
+                loads += 1;
+                Err(bad("vector repair must not load models"))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(loads, 0);
+            let failure = error.downcast_ref::<PublicationFailure>().unwrap();
+            assert_eq!(failure.0["publication"], "committed");
+            assert_eq!(failure.0["serving"], "activated");
+            let receipt = Receipt::read(&options.receipt).unwrap();
+            receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let before = fs::read(receipt.root.join("AUTHORITY")).unwrap();
+            let calls = fixture.primary.calls.load(Ordering::SeqCst);
+            let mut recovery = Options::parse(
+                ["authority-recover", "--receipt", "placeholder.json"].map(str::to_owned),
+            )
+            .unwrap()
+            .unwrap();
+            recovery.receipt = options.receipt;
+            let mut output = Vec::new();
+            recover(&cx, &recovery, &mut output).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["publication"], "committed");
+            assert_eq!(report["serving"], "activated");
+            assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), calls);
+            assert_eq!(fs::read(receipt.root.join("AUTHORITY")).unwrap(), before);
         });
     }
 

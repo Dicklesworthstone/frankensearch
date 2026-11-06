@@ -197,6 +197,8 @@ pub(super) async fn execute(
             mode: inputs.mode,
             stream: inputs.mode == QueryMode::Full,
             deadline: None,
+            policy: None,
+            max_source_bytes: options.max_source_bytes,
         },
         |phase, results| {
             validate_results(phase, results)?;
