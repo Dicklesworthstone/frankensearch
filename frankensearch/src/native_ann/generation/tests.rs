@@ -790,6 +790,328 @@ fn retained_preview_reranking_is_lazy_tunable_and_uses_the_exact_candidate_sourc
     });
 }
 
+fn assert_same_retained_page(expected: &[ScoredResult], actual: &[ScoredResult]) {
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+}
+
+#[test]
+fn pooled_retained_previews_preserve_independent_tiers_scopes_and_lazy_reranking() {
+    use crate::native_ann::NativeSearchPhase;
+    use asupersync::runtime::blocking_pool::BlockingPool;
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap();
+        let pool = BlockingPool::new(0, 2);
+        let handle = pool.handle();
+        for (fast_ann, quality_ann) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let fixture = progressive_fixture_with_retrieval(&cx, fast_ann, quality_ann).await;
+            let readers = fixture.admit(&cx).unwrap();
+            let candidate = GenerationCandidateV1::new(
+                [0x75; 16],
+                None,
+                GenerationAuthorityActionV1::Activate,
+                fixture.fast_binding.generation(),
+                [0x76; 32],
+                &readers.components,
+            )
+            .unwrap();
+            let preview = Arc::new(NativeGenerationPreview::new(candidate.authority(), readers));
+            let scope = preview
+                .scope(&cx, BUDGET, |document| {
+                    Ok(document.id == "e" || document.id == "quality-only")
+                })
+                .unwrap();
+            // Pool jobs must consume admitted bytes after every original path moves.
+            std::fs::rename(
+                fixture.directory.path().join("source"),
+                fixture.directory.path().join("relocated-pool-source"),
+            )
+            .unwrap();
+            let fast = fixture.fast.as_ref();
+            let quality = fixture.quality.as_ref();
+            for text in ["unmatched", "cohort"] {
+                assert_same_retained_page(
+                    &preview.search_text(&cx, fast, text, 2).await.unwrap(),
+                    &preview
+                        .search_text_with_pool(&cx, fast, text, 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                assert_same_retained_page(
+                    &preview
+                        .search_quality_text(&cx, quality, text, 2)
+                        .await
+                        .unwrap(),
+                    &preview
+                        .search_quality_text_with_pool(&cx, quality, text, 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                assert_same_retained_page(
+                    &preview
+                        .search_refined_text(&cx, fast, quality, text, 2)
+                        .await
+                        .unwrap(),
+                    &preview
+                        .search_refined_text_with_pool(&cx, fast, quality, text, 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                assert_same_retained_page(
+                    &scope.search_text(&cx, fast, text, 2).await.unwrap(),
+                    &scope
+                        .search_text_with_pool(&cx, fast, text, 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                assert_same_retained_page(
+                    &scope
+                        .search_quality_text(&cx, quality, text, 2)
+                        .await
+                        .unwrap(),
+                    &scope
+                        .search_quality_text_with_pool(&cx, quality, text, 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                let scoped = scope
+                    .search_refined_text_with_pool(&cx, fast, quality, text, 2, handle.clone())
+                    .await
+                    .unwrap();
+                assert_same_retained_page(
+                    &scope
+                        .search_refined_text(&cx, fast, quality, text, 2)
+                        .await
+                        .unwrap(),
+                    &scoped,
+                );
+                assert_eq!(scoped.len(), 2);
+                assert!(
+                    scoped
+                        .iter()
+                        .all(|hit| hit.doc_id == "e" || hit.doc_id == "quality-only")
+                );
+                assert!(
+                    scoped
+                        .iter()
+                        .all(|hit| hit.metadata.as_deref().unwrap()["version"] == "old")
+                );
+            }
+            fast.calls.store(0, Ordering::SeqCst);
+            quality.calls.store(0, Ordering::SeqCst);
+            let model = RetainedReranker::default();
+            let mut stream = preview
+                .search_progressive_with_quality_and_pool(
+                    &cx,
+                    fast,
+                    quality,
+                    "unmatched",
+                    1,
+                    handle.clone(),
+                )
+                .unwrap()
+                .with_candidate_multiplier(1)
+                .unwrap()
+                .with_beam_widths(Some(2), Some(3))
+                .unwrap()
+                .with_retained_reranker(&model, 6, BUDGET)
+                .unwrap();
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Initial { .. })
+            ));
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Refined { .. })
+            ));
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            assert!(model.observed().is_empty());
+            let Some(NativeSearchPhase::Reranked { results, .. }) =
+                stream.next_phase().await.unwrap()
+            else {
+                panic!("pooled retained query must reach its lazy reranker");
+            };
+            assert_eq!(results[0].doc_id, "a");
+            assert_eq!(model.observed().len(), 6);
+            assert!(stream.next_phase().await.unwrap().is_none());
+            let scoped_model = RetainedReranker::default();
+            let scoped = scope
+                .search_progressive_with_quality_and_pool(
+                    &cx,
+                    fast,
+                    quality,
+                    "unmatched",
+                    2,
+                    handle.clone(),
+                )
+                .unwrap()
+                .with_retained_reranker(&scoped_model, 6, BUDGET)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(scoped.len(), 2);
+            assert_eq!(
+                scoped_model
+                    .observed()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["e", "quality-only"]
+            );
+        }
+        assert!(pool.shutdown_and_wait(std::time::Duration::from_secs(10)));
+    });
+}
+
+#[test]
+fn pooled_retained_preview_yields_and_abandons_queued_work_without_starting_quality() {
+    use asupersync::runtime::blocking_pool::BlockingPool;
+    use std::future::Future as _;
+    use std::sync::mpsc;
+    use std::task::{Context, Waker};
+    use std::time::Duration;
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap();
+        let fixture = progressive_fixture(&cx).await;
+        let readers = fixture.admit(&cx).unwrap();
+        let candidate = GenerationCandidateV1::new(
+            [0x75; 16],
+            None,
+            GenerationAuthorityActionV1::Activate,
+            fixture.fast_binding.generation(),
+            [0x76; 32],
+            &readers.components,
+        )
+        .unwrap();
+        let preview = Arc::new(NativeGenerationPreview::new(candidate.authority(), readers));
+        let scope = preview.scope(&cx, BUDGET, |_| Ok(true)).unwrap();
+        let pool = BlockingPool::new(0, 1);
+        let handle = pool.handle();
+        let (started, entered) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let mut blocker =
+            Box::pin(
+                crate::native_ann::NativeWorker::QUERY.run(&cx, handle.clone(), move |_| {
+                    assert!(!Cx::is_active());
+                    started.send(()).unwrap();
+                    gate.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Ok(())
+                }),
+            );
+        assert!(
+            blocker
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut stream = scope
+            .search_progressive_with_quality_and_pool(
+                &cx,
+                fixture.fast.as_ref(),
+                fixture.quality.as_ref(),
+                "unmatched",
+                1,
+                handle.clone(),
+            )
+            .unwrap();
+        let mut phase = Box::pin(stream.next_phase());
+        assert!(
+            phase
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::future::ready(37_u8).await, 37);
+        drop(phase);
+        assert!(stream.is_finished());
+        assert!(stream.next_phase().await.unwrap().is_none());
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        assert!(!cx.is_cancel_requested());
+        assert!(
+            !preview
+                .search_text_with_pool(&cx, fixture.fast.as_ref(), "unmatched", 1, handle.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            scope
+                .search_refined_text_with_pool(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                    handle.clone(),
+                )
+                .await,
+            Err(SearchError::Cancelled { .. })
+        ));
+        cx.set_cancel_requested(false);
+        assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
+        assert!(matches!(
+            preview
+                .search_text_with_pool(&cx, fixture.fast.as_ref(), "unmatched", 1, handle.clone())
+                .await,
+            Err(SearchError::SubsystemError {
+                subsystem: "native_ann.query_worker",
+                ..
+            })
+        ));
+        assert!(matches!(
+            scope
+                .search_quality_text_with_pool(
+                    &cx,
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                    handle.clone()
+                )
+                .await,
+            Err(SearchError::SubsystemError {
+                subsystem: "native_ann.query_worker",
+                ..
+            })
+        ));
+        assert!(
+            scope
+                .search_refined_text_with_pool(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                    handle
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 1);
+    });
+}
+
 #[test]
 fn retained_reranking_reads_only_its_window_and_enforces_aggregate_source_bytes() {
     use crate::native_ann::NativeSearchPhase;
@@ -2683,6 +3005,497 @@ mod qualified_rollback {
             BUDGET,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn pooled_authority_single_tier_queries_preserve_scopes_metadata_and_admission() {
+        use asupersync::runtime::blocking_pool::BlockingPool;
+
+        let parent = update_parent("query-pool-single");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let pool = BlockingPool::new(0, 2);
+            let handle = pool.handle();
+            for (name, tier, ann) in [
+                ("fast-exact", EmbedderTierTag::Fast, false),
+                ("quality-exact", EmbedderTierTag::Quality, false),
+                ("fast-ann", EmbedderTierTag::Fast, true),
+                ("quality-ann", EmbedderTierTag::Quality, true),
+            ] {
+                let provider = Provider::new();
+                let fixture = fixture(&cx, &provider, tier).await;
+                let fixture = if ann {
+                    fixture.with_ann(&cx, HnswParams::default(), 37)
+                } else {
+                    fixture
+                };
+                let root = create_root(&parent.join(name));
+                let retained = Arc::new(publish_fixture(&cx, &root, &fixture));
+                let scope = retained
+                    .scope(&cx, BUDGET, |document| Ok(document.id == "beta"))
+                    .unwrap();
+                let preview = Arc::new(NativeGenerationPreview::new(
+                    retained.authority(),
+                    fixture.admit(&cx).unwrap(),
+                ));
+                let scoped_preview = preview
+                    .scope(&cx, BUDGET, |document| Ok(document.id == "beta"))
+                    .unwrap();
+                for k in [0, 1, usize::MAX] {
+                    assert_same_retained_page(
+                        &retained
+                            .search_text(&cx, &provider, "unmatched", k)
+                            .await
+                            .unwrap(),
+                        &retained
+                            .search_text_with_pool(&cx, &provider, "unmatched", k, handle.clone())
+                            .await
+                            .unwrap(),
+                    );
+                    let scoped = scope
+                        .search_text_with_pool(&cx, &provider, "unmatched", k, handle.clone())
+                        .await
+                        .unwrap();
+                    assert_same_retained_page(
+                        &scope
+                            .search_text(&cx, &provider, "unmatched", k)
+                            .await
+                            .unwrap(),
+                        &scoped,
+                    );
+                    assert_eq!(scoped.len(), usize::from(k > 0));
+                    if let Some(hit) = scoped.first() {
+                        assert_eq!(hit.doc_id, "beta");
+                        assert_eq!(hit.metadata.as_deref().unwrap()["version"], "old");
+                        assert_eq!(hit.fast_score.is_some(), tier == EmbedderTierTag::Fast);
+                        assert_eq!(
+                            hit.quality_score.is_some(),
+                            tier == EmbedderTierTag::Quality
+                        );
+                    }
+                }
+                assert_same_retained_page(
+                    &preview
+                        .search_text(&cx, &provider, "unmatched", 2)
+                        .await
+                        .unwrap(),
+                    &preview
+                        .search_text_with_pool(&cx, &provider, "unmatched", 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                assert_same_retained_page(
+                    &scoped_preview
+                        .search_text(&cx, &provider, "unmatched", 2)
+                        .await
+                        .unwrap(),
+                    &scoped_preview
+                        .search_text_with_pool(&cx, &provider, "unmatched", 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                if tier == EmbedderTierTag::Quality {
+                    assert_same_retained_page(
+                        &retained
+                            .search_quality_text(&cx, &provider, "unmatched", 2)
+                            .await
+                            .unwrap(),
+                        &retained
+                            .search_quality_text_with_pool(
+                                &cx,
+                                &provider,
+                                "unmatched",
+                                2,
+                                handle.clone(),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                    assert_same_retained_page(
+                        &scope
+                            .search_quality_text(&cx, &provider, "unmatched", 2)
+                            .await
+                            .unwrap(),
+                        &scope
+                            .search_quality_text_with_pool(
+                                &cx,
+                                &provider,
+                                "unmatched",
+                                2,
+                                handle.clone(),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                    assert_same_retained_page(
+                        &preview
+                            .search_quality_text(&cx, &provider, "unmatched", 2)
+                            .await
+                            .unwrap(),
+                        &preview
+                            .search_quality_text_with_pool(
+                                &cx,
+                                &provider,
+                                "unmatched",
+                                2,
+                                handle.clone(),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                    assert_same_retained_page(
+                        &scoped_preview
+                            .search_quality_text(&cx, &provider, "unmatched", 2)
+                            .await
+                            .unwrap(),
+                        &scoped_preview
+                            .search_quality_text_with_pool(
+                                &cx,
+                                &provider,
+                                "unmatched",
+                                2,
+                                handle.clone(),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                } else {
+                    assert!(
+                        retained
+                            .search_quality_text_with_pool(
+                                &cx,
+                                &provider,
+                                "unmatched",
+                                1,
+                                handle.clone()
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        scope
+                            .search_quality_text_with_pool(
+                                &cx,
+                                &provider,
+                                "unmatched",
+                                1,
+                                handle.clone()
+                            )
+                            .await
+                            .is_err()
+                    );
+                }
+                assert!(
+                    retained
+                        .search_refined_text_with_pool(
+                            &cx,
+                            &provider,
+                            &provider,
+                            "unmatched",
+                            1,
+                            handle.clone()
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    scope
+                        .search_progressive_with_quality_and_pool(
+                            &cx,
+                            &provider,
+                            &provider,
+                            "unmatched",
+                            1,
+                            handle.clone()
+                        )
+                        .is_err()
+                );
+                assert!(
+                    preview
+                        .search_text_with_pool(&cx, &provider, "unmatched", 0, handle.clone())
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    scoped_preview
+                        .search_text_with_pool(&cx, &provider, "unmatched", 0, handle.clone())
+                        .await
+                        .is_err()
+                );
+                let empty = retained.scope(&cx, BUDGET, |_| Ok(false)).unwrap();
+                let calls = provider.calls.load(Ordering::SeqCst);
+                assert!(
+                    empty
+                        .search_text_with_pool(
+                            &cx,
+                            &provider,
+                            "unmatched",
+                            usize::MAX,
+                            handle.clone()
+                        )
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+                let mut foreign = Provider::new();
+                foreign
+                    .identity
+                    .producer
+                    .implementation_revision
+                    .push_str("-different");
+                for k in [0, 1] {
+                    assert!(
+                        retained
+                            .search_text_with_pool(&cx, &foreign, "unmatched", k, handle.clone())
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        empty
+                            .search_text_with_pool(&cx, &foreign, "unmatched", k, handle.clone())
+                            .await
+                            .is_err()
+                    );
+                }
+                assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+            }
+            assert!(pool.shutdown_and_wait(std::time::Duration::from_secs(10)));
+        });
+    }
+
+    #[test]
+    fn pooled_authority_full_queries_keep_each_owner_and_the_scoped_phase_pipeline() {
+        use asupersync::runtime::blocking_pool::BlockingPool;
+
+        let parent = update_parent("query-pool-full");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let pool = BlockingPool::new(0, 2);
+            let handle = pool.handle();
+            for (fast_ann, quality_ann) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let fixture = progressive_fixture_with_retrieval(&cx, fast_ann, quality_ann).await;
+                let readers = fixture.admit(&cx).unwrap();
+                let candidate = GenerationCandidateV1::new(
+                    [0x75; 16],
+                    None,
+                    GenerationAuthorityActionV1::Activate,
+                    fixture.fast_binding.generation(),
+                    [0x76; 32],
+                    &readers.components,
+                )
+                .unwrap();
+                let root = create_root(&parent.join(format!("{fast_ann}-{quality_ann}")));
+                for (role, receipt) in candidate.manifest().components().iter() {
+                    let image = match role {
+                        GenerationComponentRole::Vector => &fixture.images[0],
+                        GenerationComponentRole::Lexical => &fixture.images[1],
+                        GenerationComponentRole::Metadata => &fixture.images[2],
+                        GenerationComponentRole::Ann => fixture.ann.as_ref().unwrap(),
+                    };
+                    root.stage_immutable_file(
+                        &component_object_path_v1(role, receipt.sha256).unwrap(),
+                        image,
+                    )
+                    .unwrap();
+                }
+                stage_manifest(&root, &candidate);
+                let retained = Arc::new(publish_progressive(
+                    &cx,
+                    &root,
+                    &candidate,
+                    (&fixture.fast_binding, &fixture.quality_binding),
+                    ExpectedAuthorityPairV1::default(),
+                    [0x77; 16],
+                ));
+                let scope = retained
+                    .scope(&cx, BUDGET, |document| {
+                        Ok(document.id == "e" || document.id == "quality-only")
+                    })
+                    .unwrap();
+                let fast = fixture.fast.as_ref();
+                let quality = fixture.quality.as_ref();
+                assert_same_retained_page(
+                    &retained
+                        .search_text(&cx, fast, "unmatched", 1)
+                        .await
+                        .unwrap(),
+                    &retained
+                        .search_text_with_pool(&cx, fast, "unmatched", 1, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                fast.calls.store(0, Ordering::SeqCst);
+                let direct_quality = retained
+                    .search_quality_text_with_pool(&cx, quality, "unmatched", 1, handle.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(direct_quality[0].doc_id, "quality-only");
+                assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+                assert_same_retained_page(
+                    &retained
+                        .search_quality_text(&cx, quality, "unmatched", 1)
+                        .await
+                        .unwrap(),
+                    &direct_quality,
+                );
+                for k in [0, 1, usize::MAX] {
+                    assert_same_retained_page(
+                        &retained
+                            .search_refined_text(&cx, fast, quality, "unmatched", k)
+                            .await
+                            .unwrap(),
+                        &retained
+                            .search_refined_text_with_pool(
+                                &cx,
+                                fast,
+                                quality,
+                                "unmatched",
+                                k,
+                                handle.clone(),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                    assert_same_retained_page(
+                        &scope
+                            .search_refined_text(&cx, fast, quality, "unmatched", k)
+                            .await
+                            .unwrap(),
+                        &scope
+                            .search_refined_text_with_pool(
+                                &cx,
+                                fast,
+                                quality,
+                                "unmatched",
+                                k,
+                                handle.clone(),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                }
+                assert_same_retained_page(
+                    &scope.search_text(&cx, fast, "unmatched", 2).await.unwrap(),
+                    &scope
+                        .search_text_with_pool(&cx, fast, "unmatched", 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                assert_same_retained_page(
+                    &scope
+                        .search_quality_text(&cx, quality, "unmatched", 2)
+                        .await
+                        .unwrap(),
+                    &scope
+                        .search_quality_text_with_pool(&cx, quality, "unmatched", 2, handle.clone())
+                        .await
+                        .unwrap(),
+                );
+                let model = RetainedReranker::default();
+                let expected = retained
+                    .search_progressive_with_quality(&cx, fast, quality, "unmatched", 1)
+                    .unwrap()
+                    .with_retained_reranker(&model, 6, BUDGET)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let actual = retained
+                    .search_progressive_with_quality_and_pool(
+                        &cx,
+                        fast,
+                        quality,
+                        "unmatched",
+                        1,
+                        handle.clone(),
+                    )
+                    .unwrap()
+                    .with_retained_reranker(&model, 6, BUDGET)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_same_retained_page(&expected, &actual);
+                let expected = scope
+                    .search_progressive_with_quality(&cx, fast, quality, "unmatched", 2)
+                    .unwrap()
+                    .with_retained_reranker(&model, 6, BUDGET)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let actual = scope
+                    .search_progressive_with_quality_and_pool(
+                        &cx,
+                        fast,
+                        quality,
+                        "unmatched",
+                        2,
+                        handle.clone(),
+                    )
+                    .unwrap()
+                    .with_retained_reranker(&model, 6, BUDGET)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_same_retained_page(&expected, &actual);
+                assert!(
+                    actual
+                        .iter()
+                        .all(|hit| hit.doc_id == "e" || hit.doc_id == "quality-only")
+                );
+                assert!(
+                    actual
+                        .iter()
+                        .all(|hit| hit.metadata.as_deref().unwrap()["version"] == "old")
+                );
+                let mut foreign = ProgressiveProvider::new(true);
+                foreign
+                    .identity
+                    .producer
+                    .implementation_revision
+                    .push_str("-different");
+                let before = fast.calls.load(Ordering::SeqCst);
+                assert!(
+                    retained
+                        .search_refined_text_with_pool(
+                            &cx,
+                            fast,
+                            &foreign,
+                            "unmatched",
+                            0,
+                            handle.clone()
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    scope
+                        .search_progressive_with_quality_and_pool(
+                            &cx,
+                            fast,
+                            &foreign,
+                            "unmatched",
+                            0,
+                            handle.clone()
+                        )
+                        .is_err()
+                );
+                assert_eq!(fast.calls.load(Ordering::SeqCst), before);
+                assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+            }
+            assert!(pool.shutdown_and_wait(std::time::Duration::from_secs(10)));
+        });
     }
 
     #[test]

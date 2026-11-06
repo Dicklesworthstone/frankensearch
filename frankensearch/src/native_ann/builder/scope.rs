@@ -305,6 +305,40 @@ impl NativeScopedGenerationPreview {
             text,
             k,
             Arc::clone(&self.lexical.allowed),
+            None,
+        )?)
+        .await?;
+        if self.preview.topology() == NativeGenerationTopology::QualityOnly {
+            quality_provenance(cx, &mut results)?;
+        }
+        Ok(results)
+    }
+
+    /// Preview the fixed scope with vector traversal on the caller's pool.
+    /// Frozen membership and the admitted owner travel together to the worker;
+    /// source predicates are never evaluated during traversal.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_text`], plus pool failures without
+    /// inline fallback. No candidate is published by this operation.
+    pub async fn search_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.preview.scoped_progressive(
+            cx,
+            embedder,
+            None,
+            false,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            Some(pool),
         )?)
         .await?;
         if self.preview.topology() == NativeGenerationTopology::QualityOnly {
@@ -335,6 +369,36 @@ impl NativeScopedGenerationPreview {
             text,
             k,
             Arc::clone(&self.lexical.allowed),
+            None,
+        )?)
+        .await?;
+        quality_provenance(cx, &mut results)?;
+        Ok(results)
+    }
+
+    /// Preview quality directly within this fixed scope on the caller's pool.
+    /// No fast inference runs, and quality scores keep their original owner.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_quality_text`], plus pool failures.
+    pub async fn search_quality_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.preview.scoped_progressive(
+            cx,
+            embedder,
+            None,
+            true,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            Some(pool),
         )?)
         .await?;
         quality_provenance(cx, &mut results)?;
@@ -356,6 +420,24 @@ impl NativeScopedGenerationPreview {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         collect(self.search_progressive_with_quality(cx, fast, quality, text, k)?).await
+    }
+
+    /// Preview both scoped tiers with vector traversals on the caller's pool.
+    /// An Initial-only page is never returned as successful refinement.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_refined_text`], plus pool failures.
+    pub async fn search_refined_text_with_pool(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        collect(self.search_progressive_with_quality_and_pool(cx, fast, quality, text, k, pool)?)
+            .await
     }
 
     /// Lazily preview Initial and Refined using the same frozen membership.
@@ -380,6 +462,35 @@ impl NativeScopedGenerationPreview {
             text,
             k,
             Arc::clone(&self.lexical.allowed),
+            None,
+        )
+    }
+
+    /// Lazily preview both scoped tiers with vector traversal on the caller's
+    /// pool, retaining tuning and bounded candidate-source reranking.
+    ///
+    /// # Errors
+    /// Has the admission refusals of [`Self::search_progressive_with_quality`].
+    /// Phase execution additionally propagates pool failures and cancellation.
+    pub fn search_progressive_with_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.preview.scoped_progressive(
+            cx,
+            fast,
+            Some(quality),
+            false,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            Some(pool),
         )
     }
 }
@@ -518,6 +629,39 @@ impl NativeScopedGenerationSnapshot {
         Ok(results)
     }
 
+    /// Search this retained scope with vector traversal on the caller's pool.
+    /// The immutable vector owner and frozen membership remain bound to the
+    /// same admitted generation throughout execution and hydration.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_text`], plus pool failures without
+    /// inline fallback. Empty requests still admit the producer normally.
+    pub async fn search_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.snapshot.scoped_progressive_on_pool(
+            cx,
+            embedder,
+            None,
+            false,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            pool,
+        )?)
+        .await?;
+        if self.snapshot.tier() == EmbedderTierTag::Quality {
+            quality_provenance(cx, &mut results)?;
+        }
+        Ok(results)
+    }
+
     /// Search only the admitted quality owner and lexical reader in this scope.
     ///
     /// Both quality-only and complete progressive generations are supported.
@@ -556,6 +700,36 @@ impl NativeScopedGenerationSnapshot {
         Ok(results)
     }
 
+    /// Query only the scoped quality owner on the caller's pool. Frozen
+    /// membership applies before selection, fusion and hydration.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_quality_text`], plus pool failures.
+    /// Fast inference is never required or used as a fallback.
+    pub async fn search_quality_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.snapshot.scoped_progressive_on_pool(
+            cx,
+            embedder,
+            None,
+            true,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            pool,
+        )?)
+        .await?;
+        quality_provenance(cx, &mut results)?;
+        Ok(results)
+    }
+
     /// Retrieve both independently admitted vector tiers within this scope.
     ///
     /// Quality searches its complete eligible owner and may promote a document
@@ -575,6 +749,24 @@ impl NativeScopedGenerationSnapshot {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         collect(self.search_progressive_with_quality(cx, fast, quality, text, k)?).await
+    }
+
+    /// Retrieve both scoped tiers with vector traversals on the caller's pool.
+    /// Both independent arms must succeed before the refined page is delivered.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_refined_text`], plus pool failures.
+    pub async fn search_refined_text_with_pool(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        collect(self.search_progressive_with_quality_and_pool(cx, fast, quality, text, k, pool)?)
+            .await
     }
 
     /// Lazily emit scoped Initial and Refined phases from the same retained cohort.
@@ -601,6 +793,35 @@ impl NativeScopedGenerationSnapshot {
             text,
             k,
             Arc::clone(&self.lexical.allowed),
+        )
+    }
+
+    /// Lazily emit both scoped phases with vector traversal on the caller's
+    /// pool. Quality remains deferred until refinement is requested, and the
+    /// query retains ordinary tuning and candidate-source reranking.
+    ///
+    /// # Errors
+    /// Has the admission refusals of [`Self::search_progressive_with_quality`].
+    /// Phase execution additionally propagates pool failures and cancellation.
+    pub fn search_progressive_with_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.snapshot.scoped_progressive_on_pool(
+            cx,
+            fast,
+            Some(quality),
+            false,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            pool,
         )
     }
 

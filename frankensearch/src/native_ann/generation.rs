@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+
 use frankensearch_core::generation::{
     ActivationManifest, ArtifactGenerationIdentityV1, AuthorityRefV1, CanonicalDocsetV1,
     EmbedderTierTag, ExactComponentReceiptV1, ExactGenerationComponentsV1,
@@ -169,6 +171,27 @@ impl NativeGenerationPreview {
         self.readers.search_text(cx, embedder, text, k).await
     }
 
+    /// Preview the primary tier with vector traversal on the caller's pool.
+    /// Inference, lexical scoring and hydration retain their ordinary async
+    /// ownership. The candidate's immutable vector owner is retained by the job.
+    ///
+    /// # Errors
+    /// Has the admission and no-op refusal of [`Self::search_text`], plus
+    /// blocking-pool failures. A stopped pool never falls back to inline work.
+    pub async fn search_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_text_with_pool(cx, embedder, text, k, pool)
+            .await
+    }
+
     /// Execute quality directly, including in a complete two-tier candidate.
     /// The fast producer is neither required nor invoked.
     ///
@@ -185,6 +208,26 @@ impl NativeGenerationPreview {
         Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
         self.readers
             .search_quality_text(cx, embedder, text, k)
+            .await
+    }
+
+    /// Preview quality directly with retained vector traversal on the caller's
+    /// pool. The fast provider is neither required nor invoked.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_quality_text`], plus blocking-pool
+    /// failures, without inline traversal or an Initial-only fallback.
+    pub async fn search_quality_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_quality_text_with_pool(cx, embedder, text, k, pool)
             .await
     }
 
@@ -208,6 +251,27 @@ impl NativeGenerationPreview {
             .await
     }
 
+    /// Preview both independent tiers with their vector traversals on the
+    /// caller's pool. Both arms must complete successfully before delivery.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_refined_text`], plus blocking-pool
+    /// failures. Cancellation or a failed worker never returns a partial page.
+    pub async fn search_refined_text_with_pool(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_refined_text_with_pool(cx, fast, quality, text, k, pool)
+            .await
+    }
+
     /// Lazily preview both phases from this exact candidate.
     /// Callers using this as validation must consume refinement successfully;
     /// an unpolled or dropped stream proves no complete semantic execution.
@@ -228,6 +292,27 @@ impl NativeGenerationPreview {
         Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
         self.readers
             .search_progressive_with_quality(cx, fast, quality, text, k)
+    }
+
+    /// Lazily preview both phases with retained vector traversal on the caller's
+    /// pool. Construction starts no inference or worker; quality remains lazy.
+    /// The returned query retains ordinary tuning and retained-source reranking.
+    ///
+    /// # Errors
+    /// Has the admission refusals of [`Self::search_progressive_with_quality`].
+    /// Polling a phase also propagates pool, retrieval and cancellation failures.
+    pub fn search_progressive_with_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_progressive_with_quality_and_pool(cx, fast, quality, text, k, pool)
     }
 
     pub(in crate::native_ann) fn require_query(
@@ -266,6 +351,7 @@ impl NativeGenerationPreview {
         text: &'a str,
         k: usize,
         allowed: Arc<BTreeSet<String>>,
+        pool: Option<BlockingPoolHandle>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         Self::require_query(cx, text, k, allowed.len())?;
         self.readers.scoped_progressive(
@@ -277,6 +363,7 @@ impl NativeGenerationPreview {
             text,
             k,
             allowed,
+            pool,
         )
     }
 }
@@ -919,6 +1006,27 @@ impl NativeGenerationSnapshot {
         self.readers.search_text(cx, embedder, text, k).await
     }
 
+    /// Search the retained primary tier with vector traversal on the caller's
+    /// pool. The job owns the admitted vector image; later publications cannot
+    /// alter it. Inference, lexical scoring and hydration stay on their ordinary
+    /// async paths, and no pool or runtime is created by this handle.
+    ///
+    /// # Errors
+    /// Has the producer, retrieval and cancellation refusals of
+    /// [`Self::search_text`], plus pool failures without inline fallback.
+    pub async fn search_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.readers
+            .search_text_with_pool(cx, embedder, text, k, pool)
+            .await
+    }
+
     /// Retrieve and hydrate quality results without invoking the fast provider.
     ///
     /// # Errors
@@ -932,6 +1040,25 @@ impl NativeGenerationSnapshot {
     ) -> SearchResult<Vec<ScoredResult>> {
         self.readers
             .search_quality_text(cx, embedder, text, k)
+            .await
+    }
+
+    /// Query the independent quality owner with traversal on the caller's pool.
+    /// Fast inference is never required, including in a full generation.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_quality_text`], plus pool failures.
+    /// A failed worker never becomes inline work or a partial-success fallback.
+    pub async fn search_quality_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.readers
+            .search_quality_text_with_pool(cx, embedder, text, k, pool)
             .await
     }
 
@@ -951,6 +1078,26 @@ impl NativeGenerationSnapshot {
     ) -> SearchResult<Vec<ScoredResult>> {
         self.readers
             .search_refined_text(cx, fast, quality, text, k)
+            .await
+    }
+
+    /// Retrieve both independently admitted tiers on the caller's pool before
+    /// fusing and hydrating their complete candidate union.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_refined_text`], plus pool failures.
+    /// Both arms must succeed; cancellation never delivers a partial page.
+    pub async fn search_refined_text_with_pool(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.readers
+            .search_refined_text_with_pool(cx, fast, quality, text, k, pool)
             .await
     }
 
@@ -974,6 +1121,27 @@ impl NativeGenerationSnapshot {
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         self.readers
             .search_progressive_with_quality(cx, fast, quality, text, k)
+    }
+
+    /// Lazily emit phases whose vector traversal runs on the caller's pool.
+    /// Both admitted owners remain pinned to this generation, quality starts
+    /// only on refinement, and dropping pending work abandons its queued job.
+    /// Ordinary tuning and retained-source reranking remain available.
+    ///
+    /// # Errors
+    /// Has the admission refusals of [`Self::search_progressive_with_quality`].
+    /// Polling a phase also propagates pool, retrieval and cancellation failures.
+    pub fn search_progressive_with_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.readers
+            .search_progressive_with_quality_and_pool(cx, fast, quality, text, k, pool)
     }
 
     /// Search the retained Quill image without loading or invoking a model.
@@ -1038,7 +1206,7 @@ impl NativeGenerationSnapshot {
         allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         self.readers
-            .scoped_progressive(cx, embedder, None, false, lexical, text, k, allowed)
+            .scoped_progressive(cx, embedder, None, false, lexical, text, k, allowed, None)
     }
 
     pub(in crate::native_ann) fn scoped_quality_progressive<'a>(
@@ -1051,7 +1219,7 @@ impl NativeGenerationSnapshot {
         allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         self.readers
-            .scoped_progressive(cx, embedder, None, true, lexical, text, k, allowed)
+            .scoped_progressive(cx, embedder, None, true, lexical, text, k, allowed, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1065,8 +1233,43 @@ impl NativeGenerationSnapshot {
         k: usize,
         allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        self.readers
-            .scoped_progressive(cx, fast, Some(quality), false, lexical, text, k, allowed)
+        self.readers.scoped_progressive(
+            cx,
+            fast,
+            Some(quality),
+            false,
+            lexical,
+            text,
+            k,
+            allowed,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn scoped_progressive_on_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        primary: &'a dyn Embedder,
+        quality: Option<&'a dyn Embedder>,
+        quality_only: bool,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.readers.scoped_progressive(
+            cx,
+            primary,
+            quality,
+            quality_only,
+            lexical,
+            text,
+            k,
+            allowed,
+            Some(pool),
+        )
     }
 }
 
@@ -1127,6 +1330,7 @@ impl CompositeReaders {
         text: &'a str,
         k: usize,
         allowed: Arc<BTreeSet<String>>,
+        pool: Option<BlockingPoolHandle>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         checkpoint(cx, "native_ann.generation.scoped_search")?;
         let index = if quality_only && self.tier != EmbedderTierTag::Quality {
@@ -1135,17 +1339,23 @@ impl CompositeReaders {
             &self.vector
         };
         let refinement = quality
-            .map(|provider| self.full_quality().map(|index| (index.as_ref(), provider)))
+            .map(|provider| self.full_quality().map(|index| (index, provider)))
             .transpose()?;
-        index
-            .search_hybrid_progressive(
+        let k = self.bounded_limit(k).min(allowed.len());
+        let search = match pool {
+            Some(pool) => index.search_hybrid_progressive_with_pool(
+                cx, primary, refinement, lexical, text, k, pool,
+            )?,
+            None => index.search_hybrid_progressive(
                 cx,
                 primary,
-                refinement,
+                refinement.map(|(index, provider)| (index.as_ref(), provider)),
                 lexical,
                 text,
-                self.bounded_limit(k).min(allowed.len()),
-            )?
+                k,
+            )?,
+        };
+        search
             .with_retained_metadata(self)
             .with_allowed_documents_arc(allowed)
     }
@@ -1505,6 +1715,39 @@ impl CompositeReaders {
         Ok(results)
     }
 
+    async fn search_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.generation.search")?;
+        let k = self.bounded_limit(k);
+        let mut results = match self.tier {
+            EmbedderTierTag::Fast => {
+                self.vector
+                    .search_hybrid_text_with_pool(cx, embedder, &self.lexical, text, k, pool)
+                    .await
+            }
+            EmbedderTierTag::Quality => {
+                self.vector
+                    .search_hybrid_quality_text_with_pool(
+                        cx,
+                        embedder,
+                        &self.lexical,
+                        text,
+                        k,
+                        pool,
+                    )
+                    .await
+            }
+        }?;
+        self.hydrate_vector_metadata(cx, &mut results)?;
+        Ok(results)
+    }
+
     async fn search_quality_text(
         &self,
         cx: &Cx,
@@ -1520,6 +1763,34 @@ impl CompositeReaders {
         };
         let mut results = quality
             .search_hybrid_quality_text(cx, embedder, &self.lexical, text, self.bounded_limit(k))
+            .await?;
+        self.hydrate_vector_metadata(cx, &mut results)?;
+        Ok(results)
+    }
+
+    async fn search_quality_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.generation.quality_search")?;
+        let quality = if self.tier == EmbedderTierTag::Quality {
+            &self.vector
+        } else {
+            self.full_quality()?
+        };
+        let mut results = quality
+            .search_hybrid_quality_text_with_pool(
+                cx,
+                embedder,
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+                pool,
+            )
             .await?;
         self.hydrate_vector_metadata(cx, &mut results)?;
         Ok(results)
@@ -1549,6 +1820,32 @@ impl CompositeReaders {
         Ok(results)
     }
 
+    async fn search_refined_text_with_pool(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.generation.refined_search")?;
+        let mut results = self
+            .vector
+            .search_hybrid_refined_text_with_pool(
+                cx,
+                fast,
+                (self.full_quality()?, quality),
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+                pool,
+            )
+            .await?;
+        self.hydrate_vector_metadata(cx, &mut results)?;
+        Ok(results)
+    }
+
     fn search_progressive_with_quality<'a>(
         &'a self,
         cx: &'a Cx,
@@ -1567,6 +1864,30 @@ impl CompositeReaders {
                 &self.lexical,
                 text,
                 self.bounded_limit(k),
+            )?
+            .with_retained_metadata(self))
+    }
+
+    fn search_progressive_with_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation.progressive_search")?;
+        Ok(self
+            .vector
+            .search_hybrid_progressive_with_pool(
+                cx,
+                fast,
+                Some((self.full_quality()?, quality)),
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+                pool,
             )?
             .with_retained_metadata(self))
     }
