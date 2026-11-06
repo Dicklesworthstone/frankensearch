@@ -2112,10 +2112,10 @@ mod tests {
         }
     }
 
-    fn assert_bounded_cancellation<T>(result: SearchResult<T>, visits: usize, workers: usize) {
+    fn assert_bounded_cancellation<T>(result: &SearchResult<T>, visits: usize, workers: usize) {
         assert!(matches!(
             result,
-            Err(SearchError::Cancelled { ref phase, .. }) if phase == "search_activation.exact"
+            Err(SearchError::Cancelled { phase, .. }) if phase == "search_activation.exact"
         ));
         assert!(
             visits >= CANCEL_AFTER_ROWS,
@@ -2173,10 +2173,12 @@ mod tests {
                     let filter_cx = cx.clone();
                     let filter_visits = Arc::clone(&visits);
                     let filter = PredicateFilter::new("cancel-after-work", move |_| {
-                        let mut visits = filter_visits.lock().expect("filter work counter");
-                        *visits += 1;
-                        if *visits == CANCEL_AFTER_ROWS {
-                            filter_cx.set_cancel_requested(true);
+                        {
+                            let mut visits = filter_visits.lock().expect("filter work counter");
+                            *visits += 1;
+                            if *visits == CANCEL_AFTER_ROWS {
+                                filter_cx.set_cancel_requested(true);
+                            }
                         }
                         true
                     });
@@ -2195,7 +2197,7 @@ mod tests {
                         )
                     });
                     assert_bounded_cancellation(
-                        result,
+                        &result,
                         *visits.lock().expect("filter work counter"),
                         if parallel_enabled { 2 } else { 1 },
                     );
@@ -2272,7 +2274,7 @@ mod tests {
                     _ => unreachable!("fixed lane list"),
                 });
                 assert_bounded_cancellation(
-                    result,
+                    &result,
                     *visits.lock().expect("row work counter"),
                     if lane.starts_with("parallel") { 2 } else { 1 },
                 );
@@ -2295,15 +2297,17 @@ mod tests {
         let filter_cx = cx.clone();
         let filter_visits = Arc::clone(&visits);
         let filter = PredicateFilter::new("cancel-WAL-after-work", move |_| {
-            let mut visits = filter_visits.lock().expect("WAL work counter");
-            *visits += 1;
-            if *visits == CANCEL_AFTER_ROWS {
-                filter_cx.set_cancel_requested(true);
+            {
+                let mut visits = filter_visits.lock().expect("WAL work counter");
+                *visits += 1;
+                if *visits == CANCEL_AFTER_ROWS {
+                    filter_cx.set_cancel_requested(true);
+                }
             }
             true
         });
         let result = index.search_top_k_cancellable(&cx, &[1.0, 0.0], 23, Some(&filter));
-        assert_bounded_cancellation(result, *visits.lock().expect("WAL work counter"), 1);
+        assert_bounded_cancellation(&result, *visits.lock().expect("WAL work counter"), 1);
         cx.set_cancel_requested(false);
         let retry = index
             .search_top_k_cancellable(&cx, &[1.0, 0.0], 23, None)
@@ -2317,7 +2321,7 @@ mod tests {
         };
         let mut winners = Vec::new();
         let result = index.scan_wal_collect_all(&[1.0, 0.0], &mut winners, cancel);
-        assert_bounded_cancellation(result, *visits.lock().expect("WAL work counter"), 1);
+        assert_bounded_cancellation(&result, *visits.lock().expect("WAL work counter"), 1);
     }
 
     #[test]
@@ -2336,7 +2340,7 @@ mod tests {
                 visits: &visits,
             },
         );
-        assert_bounded_cancellation(result, *visits.lock().expect("row work counter"), 1);
+        assert_bounded_cancellation(&result, *visits.lock().expect("row work counter"), 1);
 
         cx.set_cancel_requested(false);
         *visits.lock().expect("row work counter") = 0;
@@ -2355,7 +2359,7 @@ mod tests {
                 visits: &visits,
             },
         );
-        assert_bounded_cancellation(result, *visits.lock().expect("row work counter"), 1);
+        assert_bounded_cancellation(&result, *visits.lock().expect("row work counter"), 1);
     }
 
     #[test]
