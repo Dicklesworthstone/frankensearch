@@ -1,8 +1,9 @@
 //! Exact selected source admission for rebuilding damaged derived components.
 //!
-//! This capability deliberately cannot become a search snapshot: vector and
-//! ANN bytes have not been admitted. A repair must build a fresh complete
-//! generation and publish it against the captured physical authority pair.
+//! These capabilities deliberately cannot become search snapshots: source-only
+//! recovery omits vectors and ANN, while vector recovery omits ANN. A repair
+//! must build a fresh complete generation and publish it against the captured
+//! physical authority pair.
 
 use super::{
     ActivationManifest, ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1,
@@ -131,7 +132,161 @@ pub enum SourceOpenOutcomeV1 {
     Refused(SnapshotRefusalV1),
 }
 
+/// Selected authenticated source and vector images for model-free recovery.
+///
+/// No ANN bytes are admitted and this value cannot become a search snapshot.
+/// An engine must validate the vector image's full identity and join it to the
+/// retained source checkpoint and docset before rebuilding derived indexes.
+pub struct OpenedGenerationVectorSourceV1 {
+    source: Arc<OpenedGenerationSourceV1>,
+    vector: QualifiedGenerationFile,
+}
+
+impl OpenedGenerationVectorSourceV1 {
+    /// Source images and the frozen physical publication expectation.
+    #[must_use]
+    pub const fn source(&self) -> &Arc<OpenedGenerationSourceV1> {
+        &self.source
+    }
+
+    /// Exact vector image at the selected manifest's receipt.
+    #[must_use]
+    pub fn vector_bytes(&self) -> Arc<[u8]> {
+        self.vector.bytes()
+    }
+
+    /// Total encoded source/vector bytes, excluding ANN and parsed memory.
+    #[must_use]
+    pub fn retained_image_bytes(&self) -> u64 {
+        self.source
+            .retained_image_bytes()
+            .saturating_add(self.vector.witness().byte_len())
+    }
+}
+
+impl fmt::Debug for OpenedGenerationVectorSourceV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenedGenerationVectorSourceV1")
+            .field("source", &self.source)
+            .field("retained_image_bytes", &self.retained_image_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of source/vector admission with no query or ANN capability.
+#[derive(Debug)]
+pub enum VectorSourceOpenOutcomeV1 {
+    /// Authenticated immutable source/vector images and frozen authority pair.
+    Opened(Arc<OpenedGenerationVectorSourceV1>),
+    /// Typed refusal without usable recovery state.
+    Refused(SnapshotRefusalV1),
+}
+
 impl QualifiedGenerationRoot {
+    /// Admit healthy source and vectors even when the selected ANN is damaged.
+    ///
+    /// Source admission freezes the exact current head, pair and physical
+    /// anchors. Vector admission then checks the manifest receipt and a final
+    /// shared-lock resolution of that same selection. A newer winner is never
+    /// adopted. The budget includes manifest, lexical, metadata and vector
+    /// encoded bytes and is checked before vector I/O; ANN is never read.
+    /// Unread ANN objects still undergo regular-file and alias inventory checks.
+    ///
+    /// This read-only capability supports `CooperativeLocal` without an
+    /// external floor, exactly like source-only recovery. Engine-level vector
+    /// and source identity validation remains mandatory before a repair build.
+    ///
+    /// # Errors
+    /// Returns infrastructure errors or typed source, vector, budget, closure
+    /// and concurrent-authority refusals.
+    pub fn open_expected_generation_vector_source_for_recovery_with_budget(
+        &self,
+        root_id: [u8; 16],
+        expected: AuthorityRefV1,
+        expected_generation: ArtifactGenerationIdentityV1,
+        max_owned_image_bytes: u64,
+    ) -> GenerationRootResult<VectorSourceOpenOutcomeV1> {
+        let source = match self.open_expected_generation_source_for_recovery_with_budget(
+            root_id,
+            expected,
+            expected_generation,
+            max_owned_image_bytes,
+        )? {
+            SourceOpenOutcomeV1::Opened(source) => source,
+            SourceOpenOutcomeV1::Refused(refusal) => {
+                return Ok(VectorSourceOpenOutcomeV1::Refused(refusal));
+            }
+        };
+        let receipts = source.manifest().components();
+        if let Err(refusal) = check_image_budget(
+            expected.manifest_len,
+            [
+                receipts.lexical.byte_len,
+                receipts.metadata.byte_len,
+                receipts.vector.byte_len,
+            ],
+            max_owned_image_bytes,
+        ) {
+            return Ok(VectorSourceOpenOutcomeV1::Refused(refusal));
+        }
+        let vector = match admit_component(self, GenerationComponentRole::Vector, receipts.vector)?
+        {
+            Ok(file) => file,
+            Err(refusal) => return Ok(VectorSourceOpenOutcomeV1::Refused(refusal)),
+        };
+        for _ in 0..SNAPSHOT_OPEN_MAX_ATTEMPTS_V1 {
+            let (resolved, anchors, inventory) =
+                match self.resolution_round(root_id, source.profile(), None)? {
+                    Round::Resolved(resolved) => *resolved,
+                    Round::Retry => continue,
+                    Round::Refused(refusal) => {
+                        return Ok(VectorSourceOpenOutcomeV1::Refused(refusal));
+                    }
+                };
+            if resolved.pair != source.authority_pair() || resolved.head != source.head() {
+                return Ok(VectorSourceOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::ExpectedCurrentChanged,
+                ));
+            }
+            if !same_snapshot_anchors(&source.anchor_witnesses(), &anchors) {
+                return Ok(VectorSourceOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::Closure(GenerationRootErrorKind::ObjectChanged),
+                ));
+            }
+            let manifest_name = activation_manifest_name_v1(expected.object_id);
+            let lexical_name =
+                component_object_name_v1(GenerationComponentRole::Lexical, receipts.lexical.sha256);
+            let metadata_name = component_object_name_v1(
+                GenerationComponentRole::Metadata,
+                receipts.metadata.sha256,
+            );
+            let vector_name =
+                component_object_name_v1(GenerationComponentRole::Vector, receipts.vector.sha256);
+            let declared = [
+                GENERATION_ROOT_LOCK_FILE_NAME,
+                GENERATION_ROOT_AUTHORITY_FILE_NAME,
+                manifest_name.as_str(),
+                lexical_name.as_str(),
+                metadata_name.as_str(),
+                vector_name.as_str(),
+            ];
+            if let Err(violation) = check_closure(&inventory, self.witness().device(), &declared) {
+                return Ok(VectorSourceOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::ClosureViolation(violation),
+                ));
+            }
+            return Ok(VectorSourceOpenOutcomeV1::Opened(Arc::new(
+                OpenedGenerationVectorSourceV1 { source, vector },
+            )));
+        }
+        Ok(VectorSourceOpenOutcomeV1::Refused(
+            SnapshotRefusalV1::ConcurrentSwitch {
+                attempts: SNAPSHOT_OPEN_MAX_ATTEMPTS_V1,
+            },
+        ))
+    }
+
     /// Admit selected source while vector or ANN components may be damaged.
     ///
     /// The caller explicitly selects the current authority and artifact
