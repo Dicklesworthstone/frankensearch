@@ -10,14 +10,14 @@ use frankensearch_core::{SearchError, SearchResult};
 
 use super::retained_search_checkpoint;
 
-static EXECUTABLE: OnceLock<Option<String>> = OnceLock::new();
+static EXECUTABLE: OnceLock<String> = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux", not(feature = "embedded-models")))]
 #[path = "restart_tests.rs"]
 mod restart_tests;
 
 pub(super) fn fingerprint() -> Option<&'static str> {
-    EXECUTABLE.get().and_then(Option::as_deref)
+    EXECUTABLE.get().map(String::as_str)
 }
 
 impl super::FsfsRuntime {
@@ -58,10 +58,11 @@ impl super::FsfsRuntime {
 
 /// Prepare once on the caller-owned blocking lane. No model is loaded and no
 /// runtime or worker pool is created. Lack of a usable lane is a cold-reuse
-/// decision, not a reason to reject an otherwise valid indexing command.
+/// decision for this attempt, not a permanent failure cached for the process.
+/// Unsupported platforms retain process-local reuse without spawning a worker.
 pub(super) async fn prepare(cx: &Cx) -> SearchResult<()> {
     retained_search_checkpoint(cx)?;
-    if EXECUTABLE.get().is_some() {
+    if cfg!(not(target_os = "linux")) || EXECUTABLE.get().is_some() {
         return Ok(());
     }
     let request = cx.clone();
@@ -102,9 +103,14 @@ pub(super) async fn prepare(cx: &Cx) -> SearchResult<()> {
         }
     };
     retained_search_checkpoint(cx)?;
-    let admitted = EXECUTABLE.get_or_init(|| candidate);
+    // A missing/rejected lane or an unproven image grants no reuse, but a
+    // later caller may supply the capability needed to establish the proof.
+    // Only a successful proof is stable for this process's lifetime.
+    if let Some(candidate) = candidate {
+        let _ = EXECUTABLE.set(candidate);
+    }
     tracing::debug!(
-        cross_process_reuse = admitted.is_some(),
+        cross_process_reuse = fingerprint().is_some(),
         "established retained-index reuse execution scope"
     );
     Ok(())

@@ -156,6 +156,17 @@ fn restart_child() {
             inner: HashEmbedder::default_256(),
             inputs: Arc::clone(&inputs),
         })));
+        if mode == "rebuild_after_unavailable_lane" {
+            assert!(super::fingerprint().is_none());
+            let unavailable = cx.clone().with_blocking_pool_handle(None);
+            assert!(unavailable.blocking_pool_handle().is_none());
+            super::prepare(&unavailable).await.unwrap();
+            assert!(
+                super::fingerprint().is_none(),
+                "an inline fallback must not hash the executable on the executor"
+            );
+            assert!(cx.blocking_pool_handle().is_some());
+        }
         super::prepare(&cx).await.unwrap();
         let executable = super::fingerprint()
             .expect("Linux restart test requires a provable executing image")
@@ -211,7 +222,7 @@ fn restart_child() {
             return;
         }
         let mut seeded = None;
-        let generation = if mode == "rebuild" {
+        let generation = if matches!(mode.as_str(), "rebuild" | "rebuild_after_unavailable_lane") {
             rebuild(&runtime, &cx, &root).await
         } else {
             if mode == "seed_changed_config" {
@@ -434,6 +445,41 @@ fn restart_completed_legacy_reuses_inputs_and_rejects_changed_executable() {
     assert_eq!(opted_in.eligible, 4);
     assert!(source_inputs(&opted_in).is_empty());
     assert_eq!(opted_in.hits, first.hits);
+}
+
+#[test]
+fn restart_recovers_execution_proof_after_an_unavailable_blocking_lane() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path();
+    source_fixture(parent);
+    let executable = std::env::current_exe().unwrap();
+    let first = child(
+        &executable,
+        parent,
+        "rebuild_after_unavailable_lane",
+        "first",
+    );
+    assert_eq!(first.eligible, 4);
+    assert_eq!(source_inputs(&first).len(), 4);
+    let retained = generation_path(parent, &first);
+    let before = snapshot(&retained);
+    let second = child(
+        &executable,
+        parent,
+        "rebuild_after_unavailable_lane",
+        "second",
+    );
+    assert_ne!(second.session, first.session);
+    assert_ne!(second.generation, first.generation);
+    assert_eq!(second.executable, first.executable);
+    assert_eq!(second.hits, first.hits);
+    assert_eq!(second.eligible, 4);
+    assert!(
+        source_inputs(&second).is_empty(),
+        "a transient missing lane must not disable later restart reuse: {:?}",
+        second.embedded_inputs
+    );
+    assert_eq!(snapshot(&retained), before);
 }
 
 #[test]
