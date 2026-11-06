@@ -8,7 +8,7 @@ use ahash::AHashSet;
 
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::filter::{DocIdHashSet, ExcludeDocIdsFilter, SearchFilter};
-use frankensearch_core::{SearchError, SearchResult, VectorHit};
+use frankensearch_core::{Cx, SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
 
 use crate::simd::dot_i8x4_i8;
@@ -31,6 +31,51 @@ const INT8_PARALLEL_CHUNK_SIZE: usize = PARALLEL_CHUNK_SIZE * 4;
 /// `log2(N)` record-table probes; the short `filtered_gather` sweep keeps clear of
 /// the measured 5% regression.
 const GATHER_SELECTIVITY_DIVISOR: usize = 50;
+/// Bound work between cooperative checks independently of Rayon chunk tuning.
+const SCAN_CHECKPOINT_INTERVAL: usize = 256;
+
+/// The raw numeric API keeps its existing noncancellable kernel. Retained-tier
+/// callers instantiate the same traversal with their context, so cancellation
+/// cannot accidentally select a different scorer or visibility policy.
+trait ScanCancellation: Copy + Send + Sync {
+    fn checkpoint(self) -> SearchResult<()>;
+
+    #[inline]
+    fn checkpoint_at(self, offset: usize) -> SearchResult<()> {
+        if offset.is_multiple_of(SCAN_CHECKPOINT_INTERVAL) {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UncancelledScan;
+
+impl ScanCancellation for UncancelledScan {
+    #[inline]
+    fn checkpoint(self) -> SearchResult<()> {
+        Ok(())
+    }
+
+    // Keep the interval test out of the noncancellable numeric hot loops.
+    #[inline]
+    fn checkpoint_at(self, _offset: usize) -> SearchResult<()> {
+        Ok(())
+    }
+}
+
+impl ScanCancellation for &Cx {
+    fn checkpoint(self) -> SearchResult<()> {
+        if Cx::checkpoint(self).is_err() || self.is_cancel_requested() {
+            return Err(SearchError::Cancelled {
+                phase: "search_activation.exact".to_owned(),
+                reason: "operation cancelled".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Configurable parameters for vector search parallelism.
 ///
@@ -205,6 +250,33 @@ impl VectorIndex {
         )
     }
 
+    /// Exact retrieval below an admitted tier, with bounded cooperative checks.
+    /// No partial candidate or result set escapes on cancellation.
+    pub(crate) fn search_top_k_cancellable(
+        &self,
+        cx: &Cx,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_with_params_cancellable(cx, query, limit, filter, SearchParams::default())
+    }
+
+    pub(crate) fn search_top_k_with_params_cancellable(
+        &self,
+        cx: &Cx,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let result = self.search_top_k_controlled(query, limit, filter, params, cx);
+        // Cancellation wins over a decode/filter error occurring at the same
+        // boundary, and no success can escape after the final filter callback.
+        ScanCancellation::checkpoint(cx)?;
+        result
+    }
+
     /// Brute-force top-k with typed zero-signal classification.
     ///
     /// Behaves like [`Self::search_top_k`] with two fail-closed differences
@@ -332,9 +404,9 @@ impl VectorIndex {
             return Ok(BinaryHeap::new());
         }
         if parallel_search_enabled() && self.record_count() >= PARALLEL_THRESHOLD {
-            self.scan_parallel(query, limit, None, PARALLEL_CHUNK_SIZE)
+            self.scan_parallel(query, limit, None, PARALLEL_CHUNK_SIZE, UncancelledScan)
         } else {
-            self.scan_sequential(query, limit, None)
+            self.scan_sequential(query, limit, None, UncancelledScan)
         }
     }
 
@@ -383,17 +455,24 @@ impl VectorIndex {
         let use_parallel = parallel_search_enabled() && self.record_count() >= PARALLEL_THRESHOLD;
         let mut heap = if has_main {
             if use_parallel {
-                self.scan_parallel(query, limit, filter, PARALLEL_CHUNK_SIZE)?
+                self.scan_parallel(query, limit, filter, PARALLEL_CHUNK_SIZE, UncancelledScan)?
             } else {
-                self.scan_sequential(query, limit, filter)?
+                self.scan_sequential(query, limit, filter, UncancelledScan)?
             }
         } else {
             BinaryHeap::with_capacity(limit.min(self.wal_entries.len()).saturating_add(1))
         };
         if has_wal {
-            heap = self.merge_wal_top_k(query, heap, limit, filter, SearchParams::default())?;
+            heap = self.merge_wal_top_k(
+                query,
+                heap,
+                limit,
+                filter,
+                SearchParams::default(),
+                UncancelledScan,
+            )?;
         }
-        self.resolve_hits(heap)
+        self.resolve_hits(heap, UncancelledScan)
     }
 
     /// Bench-only: force the selective-filter gather path, ignoring the production
@@ -413,15 +492,21 @@ impl VectorIndex {
             return self.bench_scan_filtered(query, limit, Some(filter));
         };
         let mut heap = if self.record_count() > 0 {
-            self.scan_gather_hashes(allowed, query, limit)?
+            self.scan_gather_hashes(allowed, query, limit, UncancelledScan)?
         } else {
             BinaryHeap::with_capacity(limit.min(self.wal_entries.len()).saturating_add(1))
         };
         if !self.wal_entries.is_empty() {
-            heap =
-                self.merge_wal_top_k(query, heap, limit, Some(filter), SearchParams::default())?;
+            heap = self.merge_wal_top_k(
+                query,
+                heap,
+                limit,
+                Some(filter),
+                SearchParams::default(),
+                UncancelledScan,
+            )?;
         }
-        self.resolve_hits(heap)
+        self.resolve_hits(heap, UncancelledScan)
     }
 
     // The input heap contains main-slab candidates only. Ordinary appends
@@ -435,20 +520,20 @@ impl VectorIndex {
         limit: usize,
         filter: Option<&dyn SearchFilter>,
         params: SearchParams,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        cancel.checkpoint()?;
         let shadowed_winner = {
-            let wal_hashes: AHashSet<u64> = self
-                .wal_entries
-                .iter()
-                .map(|entry| entry.doc_id_hash)
-                .collect();
-            let wal_ids: AHashSet<&str> = self
-                .wal_entries
-                .iter()
-                .map(|entry| entry.doc_id.as_str())
-                .collect();
+            let mut wal_hashes = AHashSet::with_capacity(self.wal_entries.len());
+            let mut wal_ids = AHashSet::with_capacity(self.wal_entries.len());
+            for (offset, entry) in self.wal_entries.iter().enumerate() {
+                cancel.checkpoint_at(offset)?;
+                wal_hashes.insert(entry.doc_id_hash);
+                wal_ids.insert(entry.doc_id.as_str());
+            }
             let mut shadowed = false;
-            for winner in &heap {
+            for (offset, winner) in heap.iter().enumerate() {
+                cancel.checkpoint_at(offset)?;
                 let hash = self.record_at(winner.index)?.doc_id_hash;
                 if wal_hashes.contains(&hash) && wal_ids.contains(self.doc_id_at(winner.index)?) {
                     shadowed = true;
@@ -459,10 +544,25 @@ impl VectorIndex {
             shadowed
         };
         if shadowed_winner {
-            let visible_main = ExcludeDocIdsFilter::new(
-                filter,
-                self.wal_entries.iter().map(|entry| entry.doc_id.as_str()),
-            );
+            // The exclusion view builds hash sets, so its input must also
+            // stop promptly when a large WAL is cancelled during preparation.
+            let mut cancelled = None;
+            let exclusions = self
+                .wal_entries
+                .iter()
+                .enumerate()
+                .map_while(|(offset, entry)| match cancel.checkpoint_at(offset) {
+                    Ok(()) => Some(entry.doc_id.as_str()),
+                    Err(error) => {
+                        cancelled = Some(error);
+                        None
+                    }
+                });
+            let visible_main = ExcludeDocIdsFilter::new(filter, exclusions);
+            if let Some(error) = cancelled {
+                return Err(error);
+            }
+            cancel.checkpoint()?;
             // Only an actual superseded winner takes the extra scan. Normal
             // WAL appends preserve the existing selective gather and SIMD path.
             // Do not forward candidate_hashes: hashes alone cannot represent
@@ -473,14 +573,16 @@ impl VectorIndex {
                     limit,
                     Some(&visible_main),
                     params.parallel_chunk_size.max(1),
+                    cancel,
                 )?
             } else {
-                self.scan_sequential(query, limit, Some(&visible_main))?
+                self.scan_sequential(query, limit, Some(&visible_main), cancel)?
             };
         }
         // Apply the caller's original filter to the live WAL, NOT visible_main,
         // which would exclude the very replacements that must remain searchable.
-        self.scan_wal(query, &mut heap, limit, filter)?;
+        self.scan_wal(query, &mut heap, limit, filter, cancel)?;
+        cancel.checkpoint()?;
         Ok(heap)
     }
 
@@ -493,14 +595,37 @@ impl VectorIndex {
         parallel_chunk_size: usize,
         parallel_enabled: bool,
     ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_controlled(
+            query,
+            limit,
+            filter,
+            SearchParams {
+                parallel_threshold,
+                parallel_chunk_size,
+                parallel_enabled,
+            },
+            UncancelledScan,
+        )
+    }
+
+    fn search_top_k_controlled(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<Vec<VectorHit>> {
+        cancel.checkpoint()?;
         self.ensure_query_dimension(query)?;
         let has_main = self.record_count() > 0;
         let has_wal = !self.wal_entries.is_empty();
         if limit == 0 || (!has_main && !has_wal) {
             return Ok(Vec::new());
         }
-        let chunk_size = parallel_chunk_size.max(1);
-        let use_parallel = parallel_enabled && self.record_count() >= parallel_threshold;
+        let chunk_size = params.parallel_chunk_size.max(1);
+        let use_parallel =
+            params.parallel_enabled && self.record_count() >= params.parallel_threshold;
         let total_candidate_upper_bound =
             self.record_count().saturating_add(self.wal_entries.len());
 
@@ -510,36 +635,38 @@ impl VectorIndex {
         if filter.is_none() && limit >= total_candidate_upper_bound {
             let mut winners = if has_main {
                 if use_parallel {
-                    self.scan_parallel_collect_all(query, chunk_size)?
+                    self.scan_parallel_collect_all(query, chunk_size, cancel)?
                 } else {
-                    self.scan_range_collect_all(0, self.record_count(), query)?
+                    self.scan_range_collect_all(0, self.record_count(), query, cancel)?
                 }
             } else {
                 Vec::new()
             };
             if has_wal {
-                self.scan_wal_collect_all(query, &mut winners)?;
+                self.scan_wal_collect_all(query, &mut winners, cancel)?;
             }
             // `limit_all` scan-all path: `winners` can hold every match. Above a
             // threshold the final sort dominates, and a parallel sort pays
             // (measured ~2.81× at 50k winners, `winners_sort` bench); below it the
             // rayon overhead is not worth it, so stay serial. Bit-identical either
             // way — `compare_best_first` is a strict total order.
+            cancel.checkpoint()?;
             if winners.len() >= PAR_SORT_THRESHOLD {
                 winners.par_sort_unstable_by(compare_best_first);
             } else {
                 winners.sort_unstable_by(compare_best_first);
             }
-            return self.resolve_sorted_entries(winners);
+            cancel.checkpoint()?;
+            return self.resolve_sorted_entries(winners, cancel);
         }
 
         let mut heap = if has_main {
-            if let Some(gathered) = self.try_gather_filtered(query, limit, filter)? {
+            if let Some(gathered) = self.try_gather_filtered(query, limit, filter, cancel)? {
                 gathered
             } else if use_parallel {
-                self.scan_parallel(query, limit, filter, chunk_size)?
+                self.scan_parallel(query, limit, filter, chunk_size, cancel)?
             } else {
-                self.scan_sequential(query, limit, filter)?
+                self.scan_sequential(query, limit, filter, cancel)?
             }
         } else {
             let max_wal = self.wal_entries.len();
@@ -548,20 +675,10 @@ impl VectorIndex {
 
         // Resolve main/WAL visibility before the final bounded selection.
         if has_wal {
-            heap = self.merge_wal_top_k(
-                query,
-                heap,
-                limit,
-                filter,
-                SearchParams {
-                    parallel_threshold,
-                    parallel_chunk_size: chunk_size,
-                    parallel_enabled,
-                },
-            )?;
+            heap = self.merge_wal_top_k(query, heap, limit, filter, params, cancel)?;
         }
 
-        self.resolve_hits(heap)
+        self.resolve_hits(heap, cancel)
     }
 
     /// int8 ADC two-pass exact top-k for **standalone** large-N vector search:
@@ -728,7 +845,7 @@ impl VectorIndex {
             let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
             insert_candidate(&mut heap, HeapEntry::new(index, score), k);
         }
-        self.resolve_hits(heap)
+        self.resolve_hits(heap, UncancelledScan)
     }
 
     fn int8_scan_range_orig<const MADDUBS: bool>(
@@ -1001,7 +1118,7 @@ impl VectorIndex {
                     )
                 })
                 .collect();
-            merge_partial_heaps(partials, candidate_count)
+            merge_partial_heaps(partials, candidate_count, UncancelledScan)?
         };
 
         // Pass 2: exact f16 rescore (same bounded-heap selection + tie-break).
@@ -1013,7 +1130,7 @@ impl VectorIndex {
             let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
             insert_candidate(&mut heap, HeapEntry::new(candidate.index, score), k);
         }
-        self.resolve_hits(heap)
+        self.resolve_hits(heap, UncancelledScan)
     }
 
     /// Bounded-heap 4-bit scan of records `[start, end)` over the packed nibble
@@ -1073,11 +1190,14 @@ impl VectorIndex {
         query: &[f32],
         limit: usize,
         filter: Option<&dyn SearchFilter>,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         // Re-use the parallel chunk logic for sequential scan to benefit from optimizations.
         filter.map_or_else(
-            || self.scan_range_chunk(0, self.record_count(), query, limit),
-            |filter| self.scan_range_chunk_filtered(0, self.record_count(), query, limit, filter),
+            || self.scan_range_chunk(0, self.record_count(), query, limit, cancel),
+            |filter| {
+                self.scan_range_chunk_filtered(0, self.record_count(), query, limit, filter, cancel)
+            },
         )
     }
 
@@ -1087,7 +1207,9 @@ impl VectorIndex {
         limit: usize,
         filter: Option<&dyn SearchFilter>,
         chunk_size: usize,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        cancel.checkpoint()?;
         let chunk_count = self.record_count().div_ceil(chunk_size);
         let partial_heaps: SearchResult<Vec<BinaryHeap<HeapEntry>>> = (0..chunk_count)
             .into_par_iter()
@@ -1095,38 +1217,53 @@ impl VectorIndex {
                 let start = chunk_index * chunk_size;
                 let end = (start + chunk_size).min(self.record_count());
                 filter.map_or_else(
-                    || self.scan_range_chunk(start, end, query, limit),
+                    || self.scan_range_chunk(start, end, query, limit, cancel),
                     |active_filter| {
-                        self.scan_range_chunk_filtered(start, end, query, limit, active_filter)
+                        self.scan_range_chunk_filtered(
+                            start,
+                            end,
+                            query,
+                            limit,
+                            active_filter,
+                            cancel,
+                        )
                     },
                 )
             })
             .collect();
 
-        Ok(merge_partial_heaps(partial_heaps?, limit))
+        merge_partial_heaps(partial_heaps?, limit, cancel)
     }
 
     fn scan_parallel_collect_all(
         &self,
         query: &[f32],
         chunk_size: usize,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<Vec<HeapEntry>> {
+        cancel.checkpoint()?;
         let chunk_count = self.record_count().div_ceil(chunk_size);
         let partial: SearchResult<Vec<Vec<HeapEntry>>> = (0..chunk_count)
             .into_par_iter()
             .map(|chunk_index| {
                 let start = chunk_index * chunk_size;
                 let end = (start + chunk_size).min(self.record_count());
-                self.scan_range_collect_all(start, end, query)
+                self.scan_range_collect_all(start, end, query, cancel)
             })
             .collect();
 
         let partial = partial?;
-        let total = partial.iter().map(std::vec::Vec::len).sum();
+        let mut total = 0;
+        for (offset, chunk) in partial.iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
+            total += chunk.len();
+        }
         let mut merged = Vec::with_capacity(total);
         for mut chunk in partial {
+            cancel.checkpoint()?;
             merged.append(&mut chunk);
         }
+        cancel.checkpoint()?;
         Ok(merged)
     }
 
@@ -1135,7 +1272,9 @@ impl VectorIndex {
         start: usize,
         end: usize,
         query: &[f32],
+        cancel: impl ScanCancellation,
     ) -> SearchResult<Vec<HeapEntry>> {
+        cancel.checkpoint()?;
         let mut winners = Vec::with_capacity(end.saturating_sub(start));
         let dim = self.dimension();
 
@@ -1146,6 +1285,7 @@ impl VectorIndex {
                 let mut vector_offset = self.vectors_offset + start * stride;
 
                 for index in start..end {
+                    cancel.checkpoint_at(index - start)?;
                     let flags_bytes = &self.data[flags_offset..flags_offset + 2];
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
@@ -1165,6 +1305,7 @@ impl VectorIndex {
                 let mut vector_offset = self.vectors_offset + start * stride;
 
                 for index in start..end {
+                    cancel.checkpoint_at(index - start)?;
                     let flags_bytes = &self.data[flags_offset..flags_offset + 2];
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
@@ -1179,6 +1320,7 @@ impl VectorIndex {
                 }
             }
         }
+        cancel.checkpoint()?;
         Ok(winners)
     }
 
@@ -1187,7 +1329,9 @@ impl VectorIndex {
         query: &[f32],
         limit: usize,
         filter: Option<&dyn SearchFilter>,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<Option<BinaryHeap<HeapEntry>>> {
+        cancel.checkpoint()?;
         let Some(active_filter) = filter else {
             return Ok(None);
         };
@@ -1198,7 +1342,8 @@ impl VectorIndex {
         if count == 0 || allowed.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) >= count {
             return Ok(None);
         }
-        self.scan_gather_hashes(allowed, query, limit).map(Some)
+        self.scan_gather_hashes(allowed, query, limit, cancel)
+            .map(Some)
     }
 
     fn scan_gather_hashes(
@@ -1206,25 +1351,35 @@ impl VectorIndex {
         allowed: &DocIdHashSet,
         query: &[f32],
         limit: usize,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
-        let positions = self.gather_positions_for_hashes(allowed)?;
-        self.scan_gather_positions(&positions, query, limit)
+        let positions = self.gather_positions_for_hashes(allowed, cancel)?;
+        self.scan_gather_positions(&positions, query, limit, cancel)
     }
 
-    fn gather_positions_for_hashes(&self, allowed: &DocIdHashSet) -> SearchResult<Vec<usize>> {
+    fn gather_positions_for_hashes(
+        &self,
+        allowed: &DocIdHashSet,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<Vec<usize>> {
+        cancel.checkpoint()?;
         let mut positions = Vec::with_capacity(allowed.len());
-        for &hash in allowed {
+        for (offset, &hash) in allowed.iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
             let Some((start, end)) = self.hash_range(hash)? else {
                 continue;
             };
             for index in start..end {
+                cancel.checkpoint_at(index - start)?;
                 let entry = self.record_at(index)?;
                 if (entry.flags & 0x0001) == 0 {
                     positions.push(index);
                 }
             }
         }
+        cancel.checkpoint()?;
         positions.sort_unstable();
+        cancel.checkpoint()?;
         Ok(positions)
     }
 
@@ -1267,15 +1422,17 @@ impl VectorIndex {
         positions: &[usize],
         query: &[f32],
         limit: usize,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        cancel.checkpoint()?;
         if positions.len() > PARALLEL_CHUNK_SIZE {
             let partials: SearchResult<Vec<BinaryHeap<HeapEntry>>> = positions
                 .par_chunks(PARALLEL_CHUNK_SIZE)
-                .map(|chunk| self.gather_range(chunk, query, limit))
+                .map(|chunk| self.gather_range(chunk, query, limit, cancel))
                 .collect();
-            return Ok(merge_partial_heaps(partials?, limit));
+            return merge_partial_heaps(partials?, limit, cancel);
         }
-        self.gather_range(positions, query, limit)
+        self.gather_range(positions, query, limit, cancel)
     }
 
     fn gather_range(
@@ -1283,7 +1440,9 @@ impl VectorIndex {
         positions: &[usize],
         query: &[f32],
         limit: usize,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        cancel.checkpoint()?;
         let mut heap = BinaryHeap::with_capacity(limit.min(positions.len()).saturating_add(1));
         let dim = self.dimension();
         let mut cutoff = f32::NEG_INFINITY;
@@ -1291,7 +1450,8 @@ impl VectorIndex {
         match self.quantization() {
             Quantization::F16 => {
                 let stride = dim * 2;
-                for &index in positions {
+                for (offset, &index) in positions.iter().enumerate() {
+                    cancel.checkpoint_at(offset)?;
                     let vector_offset = self.vectors_offset + index * stride;
                     let vector_bytes = &self.data[vector_offset..vector_offset + stride];
                     let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
@@ -1307,7 +1467,8 @@ impl VectorIndex {
             }
             Quantization::F32 => {
                 let stride = dim * 4;
-                for &index in positions {
+                for (offset, &index) in positions.iter().enumerate() {
+                    cancel.checkpoint_at(offset)?;
                     let vector_offset = self.vectors_offset + index * stride;
                     let vector_bytes = &self.data[vector_offset..vector_offset + stride];
                     let score = dot_product_f32_bytes_f32(vector_bytes, query)?;
@@ -1322,6 +1483,7 @@ impl VectorIndex {
                 }
             }
         }
+        cancel.checkpoint()?;
         Ok(heap)
     }
 
@@ -1331,7 +1493,9 @@ impl VectorIndex {
         end: usize,
         query: &[f32],
         limit: usize,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        cancel.checkpoint()?;
         let max_elements = end.saturating_sub(start);
         let mut heap = BinaryHeap::with_capacity(limit.min(max_elements).saturating_add(1));
         let dim = self.dimension();
@@ -1345,6 +1509,7 @@ impl VectorIndex {
                 let mut vector_offset = self.vectors_offset + start * stride;
 
                 for index in start..end {
+                    cancel.checkpoint_at(index - start)?;
                     // Check flags directly from mapped memory
                     // SAFETY: offset arithmetic is bounded by record_count checks in open()
                     let flags_bytes = &self.data[flags_offset..flags_offset + 2];
@@ -1373,6 +1538,7 @@ impl VectorIndex {
                 let mut vector_offset = self.vectors_offset + start * stride;
 
                 for index in start..end {
+                    cancel.checkpoint_at(index - start)?;
                     let flags_bytes = &self.data[flags_offset..flags_offset + 2];
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
@@ -1394,9 +1560,11 @@ impl VectorIndex {
                 }
             }
         }
+        cancel.checkpoint()?;
         Ok(heap)
     }
 
+    #[allow(clippy::too_many_arguments)] // One context accompanies the existing exact scan inputs.
     fn scan_range_chunk_filtered(
         &self,
         start: usize,
@@ -1404,7 +1572,9 @@ impl VectorIndex {
         query: &[f32],
         limit: usize,
         filter: &dyn SearchFilter,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        cancel.checkpoint()?;
         let max_elements = end.saturating_sub(start);
         let mut heap = BinaryHeap::with_capacity(limit.min(max_elements).saturating_add(1));
         let dim = self.dimension();
@@ -1417,6 +1587,7 @@ impl VectorIndex {
                 let mut vector_offset = self.vectors_offset + start * stride;
 
                 for index in start..end {
+                    cancel.checkpoint_at(index - start)?;
                     let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
@@ -1468,6 +1639,7 @@ impl VectorIndex {
                 let mut vector_offset = self.vectors_offset + start * stride;
 
                 for index in start..end {
+                    cancel.checkpoint_at(index - start)?;
                     let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
@@ -1514,6 +1686,7 @@ impl VectorIndex {
                 }
             }
         }
+        cancel.checkpoint()?;
         Ok(heap)
     }
 
@@ -1523,8 +1696,10 @@ impl VectorIndex {
         heap: &mut BinaryHeap<HeapEntry>,
         limit: usize,
         filter: Option<&dyn SearchFilter>,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<()> {
         for (idx, entry) in self.wal_entries.iter().enumerate() {
+            cancel.checkpoint_at(idx)?;
             if let Some(f) = filter {
                 if let Some(matches) = f.matches_doc_id_hash(entry.doc_id_hash, None) {
                     if !matches {
@@ -1542,6 +1717,7 @@ impl VectorIndex {
             }
             insert_candidate(heap, HeapEntry::new(to_wal_index(idx), score), limit);
         }
+        cancel.checkpoint()?;
         Ok(())
     }
 
@@ -1549,37 +1725,57 @@ impl VectorIndex {
         &self,
         query: &[f32],
         winners: &mut Vec<HeapEntry>,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<()> {
+        cancel.checkpoint()?;
         winners.reserve(self.wal_entries.len());
         for (idx, entry) in self.wal_entries.iter().enumerate() {
+            cancel.checkpoint_at(idx)?;
             let score = dot_product_f32_f32(&entry.embedding, query)?;
             if !score.is_finite() {
                 continue;
             }
             winners.push(HeapEntry::new(to_wal_index(idx), score));
         }
+        cancel.checkpoint()?;
         Ok(())
     }
 
-    fn resolve_hits(&self, heap: BinaryHeap<HeapEntry>) -> SearchResult<Vec<VectorHit>> {
+    fn resolve_hits(
+        &self,
+        heap: BinaryHeap<HeapEntry>,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<Vec<VectorHit>> {
+        cancel.checkpoint()?;
         if heap.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut winners = heap.into_vec();
         winners.sort_unstable_by(compare_best_first);
-        self.resolve_sorted_entries(winners)
+        cancel.checkpoint()?;
+        self.resolve_sorted_entries(winners, cancel)
     }
 
-    fn resolve_sorted_entries(&self, winners: Vec<HeapEntry>) -> SearchResult<Vec<VectorHit>> {
+    fn resolve_sorted_entries(
+        &self,
+        winners: Vec<HeapEntry>,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<Vec<VectorHit>> {
+        cancel.checkpoint()?;
         // Pre-build a hash set of WAL doc_id hashes for O(1) pre-screening
         // instead of O(W) linear scan per main-index winner. On hash match,
         // falls back to string verification for correctness.
-        let wal_hashes: AHashSet<u64> = self.wal_entries.iter().map(|e| e.doc_id_hash).collect();
+        let mut wal_hashes = AHashSet::with_capacity(self.wal_entries.len());
+        for (offset, entry) in self.wal_entries.iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
+            wal_hashes.insert(entry.doc_id_hash);
+        }
 
         let mut seen: AHashSet<String> = AHashSet::with_capacity(winners.len());
         let mut hits = Vec::with_capacity(winners.len());
-        for winner in winners {
+        for (offset, winner) in winners.into_iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
             if is_wal_index(winner.index) {
                 let wal_idx = from_wal_index(winner.index);
                 let doc_id = &self.wal_entries[wal_idx].doc_id;
@@ -1599,10 +1795,14 @@ impl VectorIndex {
                 let doc_id_hash = record.doc_id_hash;
                 // O(1) hash pre-screen; only linear-scan on hash match.
                 if wal_hashes.contains(&doc_id_hash) {
-                    let has_wal_entry = self
-                        .wal_entries
-                        .iter()
-                        .any(|e| e.doc_id_hash == doc_id_hash && e.doc_id == doc_id);
+                    let mut has_wal_entry = false;
+                    for (wal_offset, entry) in self.wal_entries.iter().enumerate() {
+                        cancel.checkpoint_at(wal_offset)?;
+                        if entry.doc_id_hash == doc_id_hash && entry.doc_id == doc_id {
+                            has_wal_entry = true;
+                            break;
+                        }
+                    }
                     if has_wal_entry {
                         continue;
                     }
@@ -1625,6 +1825,7 @@ impl VectorIndex {
             }
         }
 
+        cancel.checkpoint()?;
         Ok(hits)
     }
 
@@ -1775,19 +1976,25 @@ fn insert_candidate(heap: &mut BinaryHeap<HeapEntry>, candidate: HeapEntry, limi
 fn merge_partial_heaps(
     partial_heaps: Vec<BinaryHeap<HeapEntry>>,
     limit: usize,
-) -> BinaryHeap<HeapEntry> {
+    cancel: impl ScanCancellation,
+) -> SearchResult<BinaryHeap<HeapEntry>> {
+    cancel.checkpoint()?;
     let mut total_elements = 0_usize;
-    for heap in &partial_heaps {
+    for (offset, heap) in partial_heaps.iter().enumerate() {
+        cancel.checkpoint_at(offset)?;
         total_elements = total_elements.saturating_add(heap.len());
     }
     let capacity = limit.min(total_elements).saturating_add(1);
     let mut merged = BinaryHeap::with_capacity(capacity);
     for heap in partial_heaps {
-        for entry in heap {
+        cancel.checkpoint()?;
+        for (offset, entry) in heap.into_iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
             insert_candidate(&mut merged, entry, limit);
         }
     }
-    merged
+    cancel.checkpoint()?;
+    Ok(merged)
 }
 
 fn merge_int8_partial_heaps(
@@ -1833,6 +2040,7 @@ fn parse_parallel_search_env(value: Option<&str>) -> bool {
 mod tests {
     use std::collections::HashSet;
     use std::fs;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::test_fixtures::TempFixturePath;
@@ -1871,6 +2079,308 @@ mod tests {
 
     fn hit_ids(hits: &[VectorHit]) -> Vec<String> {
         hits.iter().map(|hit| hit.doc_id.to_string()).collect()
+    }
+
+    const CANCEL_AFTER_ROWS: usize = 17;
+    const CANCELLATION_TEST_ROWS: usize = 4_096;
+
+    fn cancellation_index(
+        name: &str,
+        quantization: Quantization,
+        count: usize,
+    ) -> (TempFixturePath, VectorIndex) {
+        let path = temp_index_path(name);
+        let mut writer = VectorIndex::create_with_revision(&path, "hash", "test", 2, quantization)
+            .expect("cancellation fixture writer");
+        for row in 0..count {
+            let score = f32::from(u16::try_from(row % 31).expect("bounded score")) / 31.0;
+            writer
+                .write_record(&format!("doc-{row:05}"), &[score, 1.0 - score])
+                .expect("write cancellation fixture");
+        }
+        writer.finish().expect("finish cancellation fixture");
+        let index = VectorIndex::open(&path).expect("open cancellation fixture");
+        (path, index)
+    }
+
+    fn assert_same_hits(actual: &[VectorHit], expected: &[VectorHit]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.doc_id, expected.doc_id);
+            assert_eq!(actual.index, expected.index);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+        }
+    }
+
+    fn assert_bounded_cancellation<T>(result: SearchResult<T>, visits: usize, workers: usize) {
+        assert!(matches!(
+            result,
+            Err(SearchError::Cancelled { ref phase, .. }) if phase == "search_activation.exact"
+        ));
+        assert!(
+            visits >= CANCEL_AFTER_ROWS,
+            "cancellation followed real row work"
+        );
+        assert!(
+            visits <= CANCEL_AFTER_ROWS + workers * SCAN_CHECKPOINT_INTERVAL,
+            "cancelled scan kept traversing rows: {visits} visits with {workers} workers"
+        );
+    }
+
+    /// Inject cancellation after actual traversal work in kernels without a
+    /// filter callback. The interval and context check remain the production
+    /// implementation; only the trigger and work counter are test-owned.
+    #[derive(Clone, Copy)]
+    struct CancelDuringRows<'a> {
+        cx: &'a Cx,
+        visits: &'a Mutex<usize>,
+    }
+
+    impl ScanCancellation for CancelDuringRows<'_> {
+        fn checkpoint(self) -> SearchResult<()> {
+            ScanCancellation::checkpoint(self.cx)
+        }
+
+        fn checkpoint_at(self, offset: usize) -> SearchResult<()> {
+            {
+                let mut visits = self.visits.lock().expect("row work counter");
+                *visits += 1;
+                if *visits == CANCEL_AFTER_ROWS {
+                    self.cx.set_cancel_requested(true);
+                }
+            }
+            ScanCancellation::checkpoint_at(self.cx, offset)
+        }
+    }
+
+    #[test]
+    fn cancellable_exact_stops_filter_work_and_retry_keeps_exact_results() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("two-worker scan pool");
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let (_path, index) =
+                cancellation_index("cancel-filter-work", quantization, CANCELLATION_TEST_ROWS);
+            let query = [1.0, 0.0];
+            let expected = index.search_top_k(&query, 23, None).expect("raw control");
+            for parallel_enabled in [false, true] {
+                // Both tiny chunks and a single large chunk must respect the
+                // row bound; tuning may not stretch cancellation latency.
+                for parallel_chunk_size in [37, CANCELLATION_TEST_ROWS] {
+                    let cx = Cx::for_testing();
+                    let visits = Arc::new(Mutex::new(0));
+                    let filter_cx = cx.clone();
+                    let filter_visits = Arc::clone(&visits);
+                    let filter = PredicateFilter::new("cancel-after-work", move |_| {
+                        let mut visits = filter_visits.lock().expect("filter work counter");
+                        *visits += 1;
+                        if *visits == CANCEL_AFTER_ROWS {
+                            filter_cx.set_cancel_requested(true);
+                        }
+                        true
+                    });
+                    let params = SearchParams {
+                        parallel_enabled,
+                        parallel_threshold: 1,
+                        parallel_chunk_size,
+                    };
+                    let result = pool.install(|| {
+                        index.search_top_k_with_params_cancellable(
+                            &cx,
+                            &query,
+                            23,
+                            Some(&filter),
+                            params,
+                        )
+                    });
+                    assert_bounded_cancellation(
+                        result,
+                        *visits.lock().expect("filter work counter"),
+                        if parallel_enabled { 2 } else { 1 },
+                    );
+
+                    cx.set_cancel_requested(false);
+                    let retry = pool
+                        .install(|| {
+                            index.search_top_k_with_params_cancellable(
+                                &cx,
+                                &query,
+                                23,
+                                Some(&filter),
+                                params,
+                            )
+                        })
+                        .expect("same-owner retry");
+                    assert_same_hits(&retry, &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancellable_exact_checks_unfiltered_collect_all_and_gather_rows() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("two-worker scan pool");
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let (_path, index) =
+                cancellation_index("cancel-exact-kernels", quantization, CANCELLATION_TEST_ROWS);
+            let positions: Vec<usize> = (0..index.record_count()).collect();
+            let hashes: DocIdHashSet = positions
+                .iter()
+                .map(|&row| index.record_at(row).expect("record").doc_id_hash)
+                .collect();
+            for lane in [
+                "top-k",
+                "collect-all",
+                "parallel-top-k",
+                "parallel-collect-all",
+                "gather",
+                "parallel-gather",
+                "gather-positions",
+            ] {
+                let cx = Cx::for_testing();
+                let visits = Mutex::new(0);
+                let cancel = CancelDuringRows {
+                    cx: &cx,
+                    visits: &visits,
+                };
+                let result = pool.install(|| match lane {
+                    "top-k" => index
+                        .scan_range_chunk(0, index.record_count(), &[1.0, 0.0], 23, cancel)
+                        .map(|_| ()),
+                    "collect-all" => index
+                        .scan_range_collect_all(0, index.record_count(), &[1.0, 0.0], cancel)
+                        .map(|_| ()),
+                    "parallel-top-k" => index
+                        .scan_parallel(&[1.0, 0.0], 23, None, 1_024, cancel)
+                        .map(|_| ()),
+                    "parallel-collect-all" => index
+                        .scan_parallel_collect_all(&[1.0, 0.0], 1_024, cancel)
+                        .map(|_| ()),
+                    "gather" => index
+                        .gather_range(&positions, &[1.0, 0.0], 23, cancel)
+                        .map(|_| ()),
+                    "parallel-gather" => index
+                        .scan_gather_positions(&positions, &[1.0, 0.0], 23, cancel)
+                        .map(|_| ()),
+                    "gather-positions" => index
+                        .gather_positions_for_hashes(&hashes, cancel)
+                        .map(|_| ()),
+                    _ => unreachable!("fixed lane list"),
+                });
+                assert_bounded_cancellation(
+                    result,
+                    *visits.lock().expect("row work counter"),
+                    if lane.starts_with("parallel") { 2 } else { 1 },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancellable_exact_checks_wal_work_and_does_not_mutate_visibility() {
+        let (_path, mut index) = cancellation_index("cancel-wal", Quantization::F16, 0);
+        let entries: Vec<_> = (0..CANCELLATION_TEST_ROWS)
+            .map(|row| (format!("wal-{row:05}"), vec![1.0, 0.0]))
+            .collect();
+        index.append_batch(&entries).expect("append WAL fixture");
+        let expected = index
+            .search_top_k(&[1.0, 0.0], 23, None)
+            .expect("WAL control");
+        let cx = Cx::for_testing();
+        let visits = Arc::new(Mutex::new(0));
+        let filter_cx = cx.clone();
+        let filter_visits = Arc::clone(&visits);
+        let filter = PredicateFilter::new("cancel-WAL-after-work", move |_| {
+            let mut visits = filter_visits.lock().expect("WAL work counter");
+            *visits += 1;
+            if *visits == CANCEL_AFTER_ROWS {
+                filter_cx.set_cancel_requested(true);
+            }
+            true
+        });
+        let result = index.search_top_k_cancellable(&cx, &[1.0, 0.0], 23, Some(&filter));
+        assert_bounded_cancellation(result, *visits.lock().expect("WAL work counter"), 1);
+        cx.set_cancel_requested(false);
+        let retry = index
+            .search_top_k_cancellable(&cx, &[1.0, 0.0], 23, None)
+            .expect("WAL retry");
+        assert_same_hits(&retry, &expected);
+
+        let visits = Mutex::new(0);
+        let cancel = CancelDuringRows {
+            cx: &cx,
+            visits: &visits,
+        };
+        let mut winners = Vec::new();
+        let result = index.scan_wal_collect_all(&[1.0, 0.0], &mut winners, cancel);
+        assert_bounded_cancellation(result, *visits.lock().expect("WAL work counter"), 1);
+    }
+
+    #[test]
+    fn cancellable_exact_stops_result_materialization_and_heap_merging() {
+        let (_path, index) =
+            cancellation_index("cancel-results", Quantization::F16, CANCELLATION_TEST_ROWS);
+        let cx = Cx::for_testing();
+        let visits = Mutex::new(0);
+        let winners: Vec<_> = (0..index.record_count())
+            .map(|row| HeapEntry::new(row, 1.0))
+            .collect();
+        let result = index.resolve_sorted_entries(
+            winners,
+            CancelDuringRows {
+                cx: &cx,
+                visits: &visits,
+            },
+        );
+        assert_bounded_cancellation(result, *visits.lock().expect("row work counter"), 1);
+
+        cx.set_cancel_requested(false);
+        *visits.lock().expect("row work counter") = 0;
+        let partials: Vec<_> = (0..4)
+            .map(|chunk| {
+                (0..1_024)
+                    .map(|row| HeapEntry::new(chunk * 1_024 + row, 1.0))
+                    .collect()
+            })
+            .collect();
+        let result = merge_partial_heaps(
+            partials,
+            23,
+            CancelDuringRows {
+                cx: &cx,
+                visits: &visits,
+            },
+        );
+        assert_bounded_cancellation(result, *visits.lock().expect("row work counter"), 1);
+    }
+
+    #[test]
+    fn cancelled_exact_refuses_empty_fast_paths_and_final_filter_cancellation() {
+        let (_empty_path, empty) = cancellation_index("cancel-empty", Quantization::F16, 0);
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        for limit in [0, 1] {
+            assert!(matches!(
+                empty.search_top_k_cancellable(&cx, &[1.0, 0.0], limit, None),
+                Err(SearchError::Cancelled { .. })
+            ));
+        }
+
+        let (_path, index) = cancellation_index("cancel-final-row", Quantization::F16, 1);
+        cx.set_cancel_requested(false);
+        let filter_cx = cx.clone();
+        let filter = PredicateFilter::new("cancel-final-row", move |_| {
+            filter_cx.set_cancel_requested(true);
+            true
+        });
+        assert!(matches!(
+            index.search_top_k_cancellable(&cx, &[1.0, 0.0], 1, Some(&filter)),
+            Err(SearchError::Cancelled { .. })
+        ));
     }
 
     #[test]
@@ -3232,7 +3742,8 @@ mod tests {
                 })
                 .collect();
 
-            let mut legacy_indices = merge_partial_heaps(legacy_parts, limit)
+            let mut legacy_indices = merge_partial_heaps(legacy_parts, limit, UncancelledScan)
+                .expect("uncancelled merge")
                 .into_iter()
                 .map(|entry| entry.index)
                 .collect::<Vec<_>>();
@@ -3296,7 +3807,8 @@ mod tests {
         insert_candidate(&mut heap_b, HeapEntry::new(2, 0.7), 3);
         insert_candidate(&mut heap_b, HeapEntry::new(3, 0.5), 3);
 
-        let merged = merge_partial_heaps(vec![heap_a, heap_b], 3);
+        let merged = merge_partial_heaps(vec![heap_a, heap_b], 3, UncancelledScan)
+            .expect("uncancelled merge");
         let entries: Vec<HeapEntry> = merged.into_vec();
         assert_eq!(entries.len(), 3);
         let scores: Vec<f32> = entries.iter().map(|e| e.score).collect();
@@ -3537,7 +4049,7 @@ mod tests {
 
     #[test]
     fn merge_partial_heaps_empty_list() {
-        let merged = merge_partial_heaps(vec![], 10);
+        let merged = merge_partial_heaps(vec![], 10, UncancelledScan).expect("uncancelled merge");
         assert!(merged.is_empty());
     }
 
@@ -3546,7 +4058,7 @@ mod tests {
         let mut h = BinaryHeap::new();
         h.push(HeapEntry::new(0, 0.9));
         h.push(HeapEntry::new(1, 0.5));
-        let merged = merge_partial_heaps(vec![h], 10);
+        let merged = merge_partial_heaps(vec![h], 10, UncancelledScan).expect("uncancelled merge");
         assert_eq!(merged.len(), 2);
     }
 

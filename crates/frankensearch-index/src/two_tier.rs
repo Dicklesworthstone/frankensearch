@@ -2864,13 +2864,18 @@ impl ActivatedTier<'_, '_> {
     ///
     /// # Errors
     ///
-    /// Propagates typed row/vector decode failures from the owner.
+    /// Propagates typed row/vector decode failures from the owner and
+    /// cooperative cancellation during the exact scan. Cancellation never
+    /// returns a partially selected result page.
     pub fn search_top_k(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
         tier_checkpoint(&self.cx, "search_activation.exact")?;
         if !self.has_query_signal() {
             return Ok(Vec::new());
         }
-        let result = self.owner.search_top_k(self.query.vector(), k, None);
+        let result =
+            self.owner
+                .index
+                .search_top_k_cancellable(&self.cx, self.query.vector(), k, None);
         tier_checkpoint(&self.cx, "search_activation.exact")?;
         result
     }
@@ -2882,7 +2887,8 @@ impl ActivatedTier<'_, '_> {
     /// An admitted all-zero query returns no candidates.
     ///
     /// # Errors
-    /// Propagates typed row/vector decode failures from the owner.
+    /// Propagates typed row/vector decode failures from the owner and
+    /// cooperative cancellation in serial or parallel exact scans.
     pub fn search_top_k_with_params(
         &self,
         k: usize,
@@ -2892,10 +2898,13 @@ impl ActivatedTier<'_, '_> {
         if !self.has_query_signal() {
             return Ok(Vec::new());
         }
-        let result =
-            self.owner
-                .index
-                .search_top_k_with_params(self.query.vector(), k, None, params);
+        let result = self.owner.index.search_top_k_with_params_cancellable(
+            &self.cx,
+            self.query.vector(),
+            k,
+            None,
+            params,
+        );
         tier_checkpoint(&self.cx, "search_activation.exact")?;
         result
     }
@@ -8051,6 +8060,86 @@ mod tests {
                 Err(SearchError::InvalidConfig { field, .. })
                     if field == "search_activation.fast.producer_conformance"
             ));
+        }
+    }
+
+    #[test]
+    fn activated_exact_scans_use_the_callers_checkpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let fast_path = directory.path().join("fast.fsvi");
+        let (binding, identity) = fsvi_v2_binding("exact-scan-checkpoints", 4, 74);
+        let rows: Vec<(String, [f32; 4])> = (0..4_096)
+            .map(|row| {
+                let vector = if row % 3 == 0 {
+                    [0.0, 1.0, 0.0, 0.0]
+                } else {
+                    [1.0, 0.0, 0.0, 0.0]
+                };
+                (format!("doc-{row:05}"), vector)
+            })
+            .collect();
+        let row_refs: Vec<_> = rows
+            .iter()
+            .map(|(doc_id, vector)| (doc_id.as_str(), vector.as_slice()))
+            .collect();
+        write_v2_tier(&fast_path, &binding, &row_refs);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &TwoTierIndexPaths::new(&fast_path),
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .unwrap();
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let embeddings = TieredQueryEmbeddings::fast_only(bound_query(&identity, &query));
+        let cx = Cx::for_testing();
+        let activated = index
+            .activate_owner_backed_search(&cx, &embeddings)
+            .unwrap();
+        let tier = activated.fast().unwrap();
+        let expected = index
+            .fast_admitted_owner()
+            .unwrap()
+            .search_top_k(&query, 17, None)
+            .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for params in [
+            None,
+            Some(SearchParams {
+                parallel_enabled: false,
+                ..SearchParams::default()
+            }),
+            Some(SearchParams {
+                parallel_enabled: true,
+                parallel_threshold: 1,
+                parallel_chunk_size: 1_024,
+            }),
+        ] {
+            let before = cx.checkpoint_state().checkpoint_count;
+            let hits = pool
+                .install(|| match params {
+                    None => tier.search_top_k(17),
+                    Some(params) => tier.search_top_k_with_params(17, params),
+                })
+                .unwrap();
+            let observed = cx.checkpoint_state().checkpoint_count - before;
+            // A raw-owner dispatch observes only the two outer checkpoints.
+            // Require real traversal checkpoints in the caller's context,
+            // without coupling this witness to the exact internal count.
+            // Kernel tests separately prove bounded mid-scan cancellation.
+            assert!(
+                observed >= 8,
+                "exact scan bypassed the caller's context: {observed} checkpoints, params={params:?}"
+            );
+            assert_eq!(hits.len(), expected.len());
+            for (actual, expected) in hits.iter().zip(&expected) {
+                assert_eq!(actual.doc_id, expected.doc_id);
+                assert_eq!(actual.index, expected.index);
+                assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            }
         }
     }
 
