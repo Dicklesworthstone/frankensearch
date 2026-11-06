@@ -1482,6 +1482,110 @@ impl ValidatedFsviBytes {
         self.bytes.len()
     }
 
+    /// Share the exact immutable image admitted by this owner.
+    ///
+    /// Cloning this allocation does not grant mutable access or a pathname
+    /// publication proof. Consumers must retain or recheck its typed binding.
+    #[must_use]
+    pub fn owned_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
+    }
+
+    /// Bind retained vector bytes to a strictly newer artifact generation.
+    ///
+    /// Only the canonical v2 header is rebuilt. Every byte after the header
+    /// is preserved, including physical row order, flags, tombstones, padding
+    /// and the exact F16/F32 vector representation. The complete frozen model
+    /// identity, publication nonce and content/docset digests are unchanged.
+    /// This makes recovery independent of model inference and avoids a lossy
+    /// decode/re-encode pass (including F16 rows rounded to zero).
+    ///
+    /// The budget bounds the encoded output image, not total process memory.
+    /// Copying checks cancellation between bounded chunks; typed admission is
+    /// checked before and after its synchronous validation pass. The returned
+    /// owner is memory-only and carries no published-path/WAL witness.
+    ///
+    /// # Errors
+    /// Returns cancellation, allocation/budget or invalid-generation errors.
+    /// Returns an admission error if the rebuilt image fails its full binding
+    /// or changes any retained content witness.
+    pub fn rebind_generation(
+        &self,
+        cx: &asupersync::Cx,
+        generation: ArtifactGenerationIdentityV1,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
+        let checkpoint = || {
+            if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+                Err(SearchError::Cancelled {
+                    phase: "fsvi_v2.rebind_generation".to_owned(),
+                    reason: "operation cancelled".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        };
+        checkpoint()?;
+        if generation.sequence <= self.identity_binding.generation.sequence {
+            return Err(fsvi_v2_config_error(
+                "rebind_generation.generation",
+                "replacement generation sequence must strictly increase",
+            ));
+        }
+        if self.bytes.len() > max_image_bytes {
+            return Err(fsvi_v2_config_error(
+                "rebind_generation.max_image_bytes",
+                "retained vector image exceeds the encoded output budget",
+            ));
+        }
+        let binding =
+            FsviV2IdentityBinding::new(generation, self.identity_binding.frozen_identity.clone())?;
+        let identity = self.identity_v2();
+        let header = build_v2_header(
+            &binding,
+            self.metadata().publication_nonce,
+            self.record_count(),
+            self.metadata().vectors_offset,
+            identity.ordered_live_docset_digest,
+            identity.vector_content_digest,
+        )?;
+        if header.len() != identity.header_size {
+            return Err(fsvi_v2_config_error(
+                "rebind_generation.header",
+                "generation rebinding must preserve the canonical header length",
+            ));
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(self.bytes.len()).map_err(|_| {
+            fsvi_v2_config_error(
+                "rebind_generation.allocation",
+                "could not reserve the bounded replacement image",
+            )
+        })?;
+        bytes.extend_from_slice(&header);
+        for chunk in self.bytes[identity.header_size..].chunks(64 * 1024) {
+            checkpoint()?;
+            bytes.extend_from_slice(chunk);
+        }
+        checkpoint()?;
+        let rebound = Self::from_arc(Arc::from(bytes), &binding).map_err(|error| match error {
+            FsviAdmissionError::Index(error) => error,
+            other => fsvi_v2_config_error("rebind_generation.admission", &other.to_string()),
+        })?;
+        checkpoint()?;
+        let mut expected = self.witness.clone();
+        expected.generation = generation;
+        expected.generation_fingerprint = binding.generation_fingerprint;
+        expected.whole_image_sha256 = rebound.witness.whole_image_sha256;
+        if rebound.witness != expected {
+            return Err(fsvi_v2_config_error(
+                "rebind_generation.witness",
+                "generation rebinding changed a retained identity or content witness",
+            ));
+        }
+        Ok(rebound)
+    }
+
     /// Whether pathname construction proved WAL absence for this published
     /// generation. An owner created with [`Self::from_arc`] returns `false`.
     #[must_use]
@@ -6720,6 +6824,175 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<ValidatedFsviBytes>();
+    }
+
+    #[test]
+    fn generation_rebind_preserves_exact_rows_precision_and_tombstones() {
+        for precision in [Quantization::F16, Quantization::F32] {
+            let binding = fsvi_v2_binding("retained-recovery", 4, precision, 51, 0x51);
+            let path = temp_index_path("generation-rebind-rows");
+            let mut writer = VectorIndex::create_v2(&path, binding.clone())
+                .expect("writer")
+                .with_publication_nonce(0xabc1);
+            writer
+                .write_record("live", &[0.125, -0.75, 0.0, 1.0])
+                .expect("live row");
+            writer
+                .write_record("underflow", &[1.0e-9, 0.0, 0.0, 0.0])
+                .expect("nonzero f32 input that rounds to zero in f16");
+            writer
+                .write_tombstone_record("deleted", &[0.0, 0.5, 0.0, 0.0])
+                .expect("retained tombstone");
+            writer.finish().expect("finish");
+            let source = admit_owned_v2_fixture(&path, &binding).expect("source owner");
+            let old_bytes = source.owned_bytes();
+            let old_witness = source.witness().clone();
+            let generation = ArtifactGenerationIdentityV1::new(1_u64 << 40, [0x52; 16])
+                .expect("full-width successor generation");
+            let rebound = source
+                .rebind_generation(&asupersync::Cx::for_testing(), generation, old_bytes.len())
+                .expect("header-only generation rebind");
+            let new_bytes = rebound.owned_bytes();
+            assert_eq!(rebound.witness().generation, generation);
+            assert_eq!(rebound.quantization(), precision);
+            assert_eq!(rebound.metadata().publication_nonce, 0xabc1);
+            assert_eq!(
+                (
+                    rebound.record_count(),
+                    rebound.live_count(),
+                    rebound.tombstone_count()
+                ),
+                (3, 2, 1)
+            );
+            assert_eq!(
+                rebound.identity_binding().frozen_identity(),
+                binding.frozen_identity()
+            );
+            assert_eq!(
+                rebound.identity_v2().header_size,
+                source.identity_v2().header_size
+            );
+            assert_eq!(
+                &new_bytes[rebound.identity_v2().header_size..],
+                &old_bytes[source.identity_v2().header_size..],
+                "physical rows and vectors must be byte-for-byte identical",
+            );
+            assert_eq!(
+                rebound.witness().vector_content_digest,
+                old_witness.vector_content_digest
+            );
+            assert_eq!(
+                rebound.witness().ordered_live_docset_digest,
+                old_witness.ordered_live_docset_digest
+            );
+            assert_ne!(
+                rebound.witness().whole_image_sha256,
+                old_witness.whole_image_sha256
+            );
+            assert!(!rebound.published_wal_absent());
+            assert!(
+                rebound
+                    .find_live_row_by_doc_id("deleted")
+                    .expect("lookup")
+                    .is_none()
+            );
+            let tiny = rebound
+                .find_live_row_by_doc_id("underflow")
+                .expect("underflow lookup")
+                .expect("retained underflow row");
+            if precision == Quantization::F16 {
+                assert!(tiny.vector_bytes().iter().all(|byte| *byte == 0));
+            }
+            assert!(ValidatedFsviBytes::from_arc(Arc::clone(&new_bytes), &binding).is_err());
+            assert_eq!(source.witness(), &old_witness);
+            assert_eq!(
+                fs::read(&path).expect("unchanged source file"),
+                old_bytes.as_ref()
+            );
+            assert_eq!(
+                source
+                    .search_top_k(&[1.0, 0.0, 0.0, 0.0], 3, None)
+                    .expect("source search"),
+                rebound
+                    .search_top_k(&[1.0, 0.0, 0.0, 0.0], 3, None)
+                    .expect("rebound search"),
+            );
+        }
+    }
+
+    #[test]
+    fn generation_rebind_rejects_stale_budget_and_cancellation_without_changing_source() {
+        let (path, binding) = write_v2_fixture(
+            "generation-rebind-refusals",
+            fsvi_v2_binding("rebind-refusals", 4, Quantization::F32, 60, 0x60),
+        );
+        let source = admit_owned_v2_fixture(&path, &binding).expect("owner");
+        let before = source.owned_bytes();
+        let cx = asupersync::Cx::for_testing();
+        for sequence in [0, 59, 60] {
+            assert!(matches!(
+                source.rebind_generation(
+                    &cx,
+                    ArtifactGenerationIdentityV1::new(sequence, [0x61; 16]).expect("generation"),
+                    usize::MAX,
+                ),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "fsvi_v2.rebind_generation.generation"
+            ));
+        }
+        let next = ArtifactGenerationIdentityV1::new(61, [0x61; 16]).expect("next generation");
+        assert!(matches!(
+            source.rebind_generation(&cx, next, before.len() - 1),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "fsvi_v2.rebind_generation.max_image_bytes"
+        ));
+        let mut invalid = next;
+        invalid.nonce = [0; 16];
+        assert!(source.rebind_generation(&cx, invalid, usize::MAX).is_err());
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            source.rebind_generation(&cx, next, usize::MAX),
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(Arc::ptr_eq(&before, &source.owned_bytes()));
+        assert_eq!(fs::read(&path).expect("retained source"), before.as_ref());
+    }
+
+    #[test]
+    fn generation_rebind_supports_empty_images_and_shared_bytes_are_immutable() {
+        let path = temp_index_path("generation-rebind-empty");
+        let binding = fsvi_v2_binding("rebind-empty", 4, Quantization::F16, 70, 0x70);
+        VectorIndex::create_v2(&path, binding.clone())
+            .expect("empty writer")
+            .finish()
+            .expect("empty image");
+        let source = admit_owned_v2_fixture(&path, &binding).expect("empty owner");
+        let mut shared = source.owned_bytes();
+        assert!(Arc::ptr_eq(&shared, &source.owned_bytes()));
+        let rebound = source
+            .rebind_generation(
+                &asupersync::Cx::for_testing(),
+                ArtifactGenerationIdentityV1::new(71, [0x71; 16]).expect("new generation"),
+                shared.len(),
+            )
+            .expect("empty rebind");
+        assert_eq!(
+            (
+                rebound.record_count(),
+                rebound.live_count(),
+                rebound.tombstone_count()
+            ),
+            (0, 0, 0)
+        );
+        Arc::make_mut(&mut shared)[0] ^= 0x80;
+        assert_ne!(shared[0], source.owned_bytes()[0]);
+        assert!(
+            source
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 1, None)
+                .expect("source search")
+                .is_empty()
+        );
+        assert!(!rebound.published_wal_absent());
     }
 
     #[test]

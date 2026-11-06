@@ -5274,7 +5274,10 @@ impl fmt::Debug for QualifiedGenerationDirectory {
 pub mod generation_reader {
     mod source_recovery;
 
-    pub use source_recovery::{OpenedGenerationSourceV1, SourceOpenOutcomeV1};
+    pub use source_recovery::{
+        OpenedGenerationSourceV1, OpenedGenerationVectorSourceV1, SourceOpenOutcomeV1,
+        VectorSourceOpenOutcomeV1,
+    };
 
     use std::fmt;
     use std::path::Path;
@@ -7584,6 +7587,181 @@ pub mod generation_reader {
                 )
                 .expect("inventory refusal"),
                 SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ClosureViolation(
+                    ClosureViolationV1::UndeclaredEntry { .. },
+                )),
+            ));
+        }
+
+        #[test]
+        fn vector_source_recovery_retains_healthy_vectors_without_reading_ann() {
+            for damaged_ann in [false, true] {
+                let (path, root, authority, manifest) =
+                    source_recovery_fixture("vector-source-retained", true, true, None);
+                let receipts = manifest.components();
+                let vector_bytes = component_bytes(GenerationComponentRole::Vector, 1);
+                write_sealed_object(
+                    &path,
+                    &component_object_name_v1(
+                        GenerationComponentRole::Vector,
+                        receipts.vector.sha256,
+                    ),
+                    &vector_bytes,
+                );
+                let ann_path = path.join(component_object_name_v1(
+                    GenerationComponentRole::Ann,
+                    receipts.ann.expect("ANN receipt").sha256,
+                ));
+                if damaged_ann {
+                    write_sealed_object(
+                        &path,
+                        ann_path
+                            .file_name()
+                            .expect("ANN name")
+                            .to_str()
+                            .expect("UTF-8 name"),
+                        b"damaged ANN evidence",
+                    );
+                }
+                let required = authority.manifest_len
+                    + receipts.lexical.byte_len
+                    + receipts.metadata.byte_len
+                    + receipts.vector.byte_len;
+                let control_before = fs::read(path.join(GENERATION_ROOT_AUTHORITY_FILE_NAME))
+                    .expect("authority before read-only admission");
+                let VectorSourceOpenOutcomeV1::Opened(retained) = root
+                    .open_expected_generation_vector_source_for_recovery_with_budget(
+                        ROOT_ID,
+                        authority,
+                        manifest.generation(),
+                        required,
+                    )
+                    .expect("vector-source open")
+                else {
+                    panic!("healthy source and vectors must not require healthy ANN");
+                };
+                assert_eq!(retained.source().head().authority, authority);
+                assert_eq!(retained.retained_image_bytes(), required);
+                assert_eq!(retained.vector_bytes().as_ref(), vector_bytes);
+                assert_eq!(
+                    retained.source().lexical_bytes().as_ref(),
+                    component_bytes(GenerationComponentRole::Lexical, 1)
+                );
+                assert_eq!(
+                    fs::read(path.join(GENERATION_ROOT_AUTHORITY_FILE_NAME))
+                        .expect("authority after"),
+                    control_before
+                );
+                if damaged_ann {
+                    assert_eq!(
+                        fs::read(&ann_path).expect("ANN retained"),
+                        b"damaged ANN evidence"
+                    );
+                } else {
+                    assert!(!ann_path.exists());
+                }
+                assert!(matches!(
+                    root.open_generation_snapshot(
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                    )
+                    .expect("complete admission stays strict"),
+                    SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(_)),
+                ));
+                let next = manifest_v2(2, Some(authority), true);
+                publish_manifest(
+                    &path,
+                    &publisher(&root),
+                    &next,
+                    retained.source().authority_pair(),
+                    None,
+                );
+                assert_eq!(retained.vector_bytes().as_ref(), vector_bytes);
+                assert!(matches!(
+                    root.open_expected_generation_vector_source_for_recovery_with_budget(
+                        ROOT_ID,
+                        authority,
+                        manifest.generation(),
+                        0,
+                    )
+                    .expect("stale explicit selection"),
+                    VectorSourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ExpectedCurrentChanged),
+                ));
+            }
+        }
+
+        #[test]
+        fn vector_source_recovery_budget_precedes_vector_io_and_rejects_corruption() {
+            let (path, root, authority, manifest) =
+                source_recovery_fixture("vector-source-budget", true, true, None);
+            let receipts = manifest.components();
+            let required = authority.manifest_len
+                + receipts.lexical.byte_len
+                + receipts.metadata.byte_len
+                + receipts.vector.byte_len;
+            assert!(matches!(
+                root.open_expected_generation_vector_source_for_recovery_with_budget(
+                    ROOT_ID, authority, manifest.generation(), required - 1,
+                ).expect("bounded vector-source open"),
+                VectorSourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ImageBudget { required: actual, limit })
+                    if actual == required && limit == required - 1,
+            ));
+            assert!(matches!(
+                root.open_expected_generation_vector_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    authority,
+                    manifest.generation(),
+                    required,
+                )
+                .expect("missing vector open"),
+                VectorSourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(_)),
+            ));
+            let mut corrupted = component_bytes(GenerationComponentRole::Vector, 1);
+            corrupted[0] ^= 0x80;
+            write_sealed_object(
+                &path,
+                &component_object_name_v1(GenerationComponentRole::Vector, receipts.vector.sha256),
+                &corrupted,
+            );
+            assert!(matches!(
+                root.open_expected_generation_vector_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    authority,
+                    manifest.generation(),
+                    required,
+                )
+                .expect("corrupt vector open"),
+                VectorSourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(_)),
+            ));
+        }
+
+        #[test]
+        fn vector_source_recovery_does_not_exempt_unread_ann_aliases() {
+            let (path, root, authority, manifest) =
+                source_recovery_fixture("vector-source-ann-alias", true, true, None);
+            let receipts = manifest.components();
+            let vector_name =
+                component_object_name_v1(GenerationComponentRole::Vector, receipts.vector.sha256);
+            write_sealed_object(
+                &path,
+                &vector_name,
+                &component_bytes(GenerationComponentRole::Vector, 1),
+            );
+            let ann_name = component_object_name_v1(
+                GenerationComponentRole::Ann,
+                receipts.ann.expect("ANN").sha256,
+            );
+            std::os::unix::fs::symlink(&vector_name, path.join(ann_name))
+                .expect("unread ANN alias");
+            assert!(matches!(
+                root.open_expected_generation_vector_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    authority,
+                    manifest.generation(),
+                    u64::MAX,
+                )
+                .expect("alias refusal"),
+                VectorSourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ClosureViolation(
                     ClosureViolationV1::UndeclaredEntry { .. },
                 )),
             ));
