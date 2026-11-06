@@ -159,7 +159,7 @@ pub fn read(path: &Path, root: &Path) -> SearchResult<SavedPreparation> {
     Ok(receipt)
 }
 
-pub(super) fn open_receipt(path: &Path) -> SearchResult<File> {
+pub fn open_receipt(path: &Path) -> SearchResult<File> {
     #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags};
@@ -208,7 +208,7 @@ pub fn write(cx: &Cx, path: &Path, root: &Path, report: &Report) -> SearchResult
     write_receipt(cx, path, root, &bytes)
 }
 
-pub(super) fn write_receipt(cx: &Cx, path: &Path, root: &Path, bytes: &[u8]) -> SearchResult<()> {
+pub fn write_receipt(cx: &Cx, path: &Path, root: &Path, bytes: &[u8]) -> SearchResult<()> {
     checkpoint(cx)?;
     let root = fs::canonicalize(root)?;
     let parent = path

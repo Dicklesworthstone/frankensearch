@@ -320,6 +320,7 @@ impl FsfsRuntime {
     /// The outer retained builder still owns model admission, source precommit,
     /// sealing, publication and cancellation. A failed candidate stays inert.
     /// Returns the build summary the legacy `fsfs index` command reports.
+    #[cfg(test)]
     pub(super) async fn run_retained_index_with_reuse(
         &self,
         cx: &Cx,
