@@ -52,8 +52,8 @@ use sha2::{Digest as _, Sha256};
 use super::{
     MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Models, Result, SCHEMA,
     bad, emit, encode, execution_context, filter::Filter, models, new_generation, new_path,
-    positive as number, query, read_documents, serve::source, update as mutations, validate_query,
-    value,
+    positive as number, query, query_cache, read_documents, serve::source, update as mutations,
+    validate_query, value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
@@ -118,7 +118,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
   authority-serve --receipt JSON [--limit N] [--allow-activation] [--allow-updates]\n\
       [--current-receipt CURRENT_JSON]\n\
       [--allow-model-activation]\n\
-      [--lexical-only] [--timeout-ms N]\n\
+      [--lexical-only] [--timeout-ms N] [--query-cache-entries N]\n\
       [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N] [--batch-size N]\n\n\
@@ -234,7 +234,16 @@ authority. No publication, arbitrary history discovery or damaged-current\n\
 fallback occurs. A warm historical reader stays on that target after publication.\n\
 The default encoded-image budget is 256 MiB, checked before component reads.\n\
 authority-serve retains one admitted generation and its local models for bounded\n\
-JSONL requests: {\"id\":\"q1\",\"query\":\"text\",\"limit\":10}. Requests may select\n\
+JSONL requests. --query-cache-entries enables an in-memory bound query embedding\n\
+cache of 1..1024 entries per producer; 0 (the default) disables it. Cache keys\n\
+include the exact query and full producer/input identity. Oversized queries or\n\
+vectors bypass it, and document/update inference always uses uncached models.\n\
+Data activation and updates retain query embeddings while retrieval uses the\n\
+new snapshot. Quality completion retains the fast cache and adds a separate\n\
+quality cache. Model activation installs fresh caches only after admission;\n\
+failed activation preserves the previous caches. Enabled caching excludes\n\
+--lexical-only. Query/filter text and embeddings are never written to disk.\n\
+Requests use {\"id\":\"q1\",\"query\":\"text\",\"limit\":10} and may select\n\
 \"mode\":\"fast\"|\"quality\"|\"full\" and \"stream\":true. Full is the default for\n\
 a full generation. Streaming emits separate Initial and Refined frames. It never follows a new\n\
 authority implicitly. With --allow-activation, an explicit request may select a\n\
@@ -356,6 +365,7 @@ struct Options {
     full_query: Option<query::FullQuery>,
     reranker_dir: Option<PathBuf>,
     rerank_window: usize,
+    query_cache: query_cache::Config,
     retrieval: Option<NativeBuildRetrieval>,
     repair_vectors: repair::RetainedVectorOptions,
     source_low: Option<u64>,
@@ -432,6 +442,7 @@ impl Options {
             full_query: None,
             reranker_dir: None,
             rerank_window: 50,
+            query_cache: query_cache::Config::default(),
             retrieval: None,
             repair_vectors: repair::RetainedVectorOptions::default(),
             source_low: None,
@@ -675,6 +686,9 @@ impl Options {
                         })?);
                     query::validate_timeout(options.timeout_ms)?;
                 }
+                "--query-cache-entries" if command == Command::Serve => {
+                    options.query_cache = query_cache::Config::parse(&value(&mut args)?)?;
+                }
                 "--full-query" if matches!(command, Command::Search | Command::Serve) => {
                     options.full_query = Some(query::FullQuery::parse(&value(&mut args)?)?);
                 }
@@ -723,12 +737,13 @@ impl Options {
                 || options.quality.directory.is_some()
                 || options.full_query.is_some()
                 || options.reranker_dir.is_some()
+                || options.query_cache.enabled()
                 || seen.contains("--rerank-window")
                 || options.allow_updates
                 || options.allow_model_activation)
         {
             return Err(bad(
-                "--lexical-only excludes model options, full-query tuning, reranking, updates, and model activation",
+                "--lexical-only excludes model options, query caching, full-query tuning, reranking, updates, and model activation",
             ));
         }
         if seen.contains("--rerank-window") && options.reranker_dir.is_none() {
@@ -3339,6 +3354,10 @@ struct AuthoritySession {
     receipt: Receipt,
     snapshot: Arc<NativeGenerationSnapshot>,
     models: AuthorityModels,
+    // Keep document inference on the raw providers, including the builder's
+    // singleton fallback. Only query execution sees the optional cache wrappers.
+    cached_query_models: Option<AuthorityModels>,
+    query_cache: query_cache::Config,
     default_limit: usize,
     max_image_bytes: usize,
     max_source_bytes: usize,
@@ -3406,6 +3425,8 @@ impl AuthoritySession {
             receipt,
             snapshot,
             models,
+            cached_query_models: None,
+            query_cache: query_cache::Config::default(),
             default_limit: limits.0,
             max_image_bytes: limits.1,
             max_source_bytes: MAX_INPUT_BYTES,
@@ -3416,6 +3437,53 @@ impl AuthoritySession {
             update_limits: None,
             query_policy: query::Policy::default(),
         })
+    }
+
+    fn with_query_cache(mut self, cx: &Cx, cache: query_cache::Config) -> Result<Self> {
+        checkpoint(cx)?;
+        let cached = if cache.enabled() {
+            Some(AuthorityModels::Semantic(
+                cache.wrap(cx, self.models.models()?.clone())?,
+            ))
+        } else {
+            None
+        };
+        checkpoint(cx)?;
+        self.query_cache = cache;
+        self.cached_query_models = cached;
+        Ok(self)
+    }
+
+    fn query_models(&self) -> &AuthorityModels {
+        self.cached_query_models.as_ref().unwrap_or(&self.models)
+    }
+
+    /// Prepare the next query providers without changing the serving selection.
+    /// A quality completion retains the exact warm fast cache; model migration
+    /// receives fresh caches even if a provider keeps its display name.
+    fn cache_replacement_models(
+        &self,
+        cx: &Cx,
+        models: &Models,
+        retain_fast: bool,
+    ) -> Result<Option<AuthorityModels>> {
+        checkpoint(cx)?;
+        if !self.query_cache.enabled() {
+            return Ok(None);
+        }
+        let fast = if retain_fast {
+            Arc::clone(&self.query_models().models()?.fast)
+        } else {
+            self.query_cache
+                .wrap_embedder(cx, Arc::clone(&models.fast))?
+        };
+        let quality = models
+            .quality
+            .as_ref()
+            .map(|model| self.query_cache.wrap_embedder(cx, Arc::clone(model)))
+            .transpose()?;
+        checkpoint(cx)?;
+        Ok(Some(AuthorityModels::Semantic(Models { fast, quality })))
     }
 
     fn with_updates(mut self, batch_size: usize, max_source_bytes: usize) -> Result<Self> {
@@ -3611,7 +3679,7 @@ impl AuthoritySession {
             cx,
             &self.snapshot,
             scope,
-            &self.models,
+            self.query_models(),
             QueryPlan {
                 text: &request.query,
                 limit,
@@ -3941,6 +4009,7 @@ async fn serve_session(
     }
     ready["default_limit"] = serde_json::json!(session.default_limit);
     ready["maximum_timeout_ms"] = serde_json::json!(session.query_policy.maximum_ms());
+    ready["query_cache_entries"] = serde_json::json!(session.query_cache.entries());
     ready["query_tuning_enabled"] =
         serde_json::json!(session.query_policy.query_overrides_enabled());
     ready["full_mode_reranker"] = serde_json::json!(
@@ -4189,7 +4258,8 @@ async fn serve(
         loaded,
         (options.limit, options.max_image_bytes),
         options.allow_activation,
-    )?;
+    )?
+    .with_query_cache(cx, options.query_cache)?;
     if options.allow_updates {
         session = session.with_updates(options.batch_size, options.max_source_bytes)?;
     }

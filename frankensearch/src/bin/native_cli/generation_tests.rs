@@ -49,6 +49,61 @@ fn parse(args: &[&str]) -> Result<Option<Options>> {
     Options::parse(args.iter().map(|argument| (*argument).to_owned()))
 }
 
+#[test]
+fn authority_query_cache_is_bounded_opt_in_and_only_applies_to_semantic_serve() {
+    let base = ["authority-serve", "--receipt", "selected.json"];
+    assert!(!parse(&base).unwrap().unwrap().query_cache.enabled());
+    for (value, entries) in [("0", 0), ("1", 1), ("1024", 1024)] {
+        let mut arguments = base.to_vec();
+        arguments.extend(["--query-cache-entries", value]);
+        assert_eq!(
+            parse(&arguments).unwrap().unwrap().query_cache.entries(),
+            entries
+        );
+    }
+    for value in ["", "-1", "1.5", "1025", "18446744073709551616", " 1"] {
+        let mut arguments = base.to_vec();
+        arguments.extend(["--query-cache-entries", value]);
+        assert!(parse(&arguments).is_err(), "{value:?}");
+    }
+    for extra in [
+        vec!["--query-cache-entries", "1", "--lexical-only"],
+        vec!["--query-cache-entries", "1", "--query-cache-entries", "1"],
+    ] {
+        let mut arguments = base.to_vec();
+        arguments.extend(extra);
+        assert!(parse(&arguments).is_err());
+    }
+    for command in [
+        "authority-search",
+        "authority-index",
+        "authority-update",
+        "authority-repair",
+    ] {
+        assert!(
+            parse(&[
+                command,
+                "--receipt",
+                "selected.json",
+                "--query-cache-entries",
+                "1"
+            ])
+            .is_err()
+        );
+    }
+    assert!(
+        parse(&[
+            "authority-serve",
+            "--receipt",
+            "selected.json",
+            "--lexical-only",
+            "--query-cache-entries",
+            "0"
+        ])
+        .is_ok()
+    );
+}
+
 fn index_arguments() -> Vec<&'static str> {
     vec![
         "authority-index",
