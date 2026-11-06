@@ -20,7 +20,7 @@ use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationCom
 
 use super::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltHybridIndex, NativeHybridReopenLimits,
-    NativeIndexUpdate, checkpoint, invalid,
+    NativeIndexQualityCompletion, NativeIndexUpdate, checkpoint, invalid,
 };
 use crate::{Cx, IndexableDocument, ScoredResult, SearchError, SearchResult};
 
@@ -94,6 +94,16 @@ pub struct NativeHybridCandidate {
 pub struct NativeLiveHybridUpdate {
     base: NativeHybridSnapshot,
     update: NativeIndexUpdate,
+}
+
+/// Quality completion tied to one exact retained fast-only live predecessor.
+///
+/// No source edits, fast-model replacement or fast-storage changes are exposed.
+/// Only a complete hybrid successor can become an installable candidate, and
+/// installation still compares the original predecessor pin.
+pub struct NativeLiveHybridQualityCompletion {
+    base: NativeHybridSnapshot,
+    completion: NativeIndexQualityCompletion,
 }
 
 impl NativeLiveHybridIndex {
@@ -244,6 +254,32 @@ impl NativeHybridSnapshot {
         Ok(NativeLiveHybridUpdate {
             base: self.clone(),
             update,
+        })
+    }
+
+    /// Add quality without re-embedding or changing this snapshot's fast tier.
+    ///
+    /// All retained source fields and fast storage/graph policy remain fixed.
+    /// The quality provider must accept the same prepared-input contract and
+    /// semantic/control kind. This prepares no files or inference and holds no
+    /// serving-selection lock. A competing update makes installation stale.
+    ///
+    /// # Errors
+    /// Refuses existing quality, a non-newer generation, provider/input drift,
+    /// inconsistent retained membership or cancellation.
+    pub fn begin_quality_completion(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        quality_provider: Arc<dyn crate::Embedder>,
+    ) -> SearchResult<NativeLiveHybridQualityCompletion> {
+        let completion =
+            self.index
+                .begin_quality_completion(cx, directory, generation, quality_provider)?;
+        Ok(NativeLiveHybridQualityCompletion {
+            base: self.clone(),
+            completion,
         })
     }
 
@@ -423,6 +459,70 @@ impl NativeLiveHybridUpdate {
     pub async fn build(self, cx: &Cx) -> SearchResult<NativeHybridCandidate> {
         let next = Box::pin(self.update.build_hybrid(cx)).await?;
         NativeHybridCandidate::new(cx, self.base, next)
+    }
+}
+
+impl NativeLiveHybridQualityCompletion {
+    /// Bound the new quality model's document inference batches.
+    ///
+    /// # Errors
+    /// Refuses a zero batch size before building anything.
+    pub fn with_batch_size(mut self, size: usize) -> SearchResult<Self> {
+        self.completion = self.completion.with_batch_size(size)?;
+        Ok(self)
+    }
+
+    /// Bound prepared bytes submitted to the quality model in each batch.
+    ///
+    /// # Errors
+    /// Refuses zero; oversized sources fail build before candidate staging.
+    pub fn with_max_batch_input_bytes(mut self, max_bytes: usize) -> SearchResult<Self> {
+        self.completion = self.completion.with_max_batch_input_bytes(max_bytes)?;
+        Ok(self)
+    }
+
+    /// Configure the new quality tier without changing retained fast storage.
+    ///
+    /// # Errors
+    /// Propagates invalid quality storage configuration.
+    pub fn with_quality_storage(
+        mut self,
+        precision: NativeBuildPrecision,
+        retrieval: NativeBuildRetrieval,
+    ) -> SearchResult<Self> {
+        self.completion = self.completion.with_quality_storage(precision, retrieval)?;
+        Ok(self)
+    }
+
+    /// Finalize vector and graph images on the caller's existing blocking pool.
+    #[must_use]
+    pub fn with_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        self.completion = self.completion.with_blocking_pool(pool);
+        self
+    }
+
+    /// Build both tiers and Quill without changing the live selection.
+    ///
+    /// Only quality receives document inference. The private completion builder
+    /// fixes all source fields, the original fast contract and the newer target
+    /// generation. It cannot return a partial tier or an unrelated successor.
+    /// Finish with [`NativeLiveHybridIndex::install`], which compares this same
+    /// predecessor even if another writer published while quality was building.
+    ///
+    /// # Errors
+    /// Propagates required quality, source, artifact, lexical and cancellation errors.
+    pub async fn build(self, cx: &Cx) -> SearchResult<NativeHybridCandidate> {
+        let next = Box::pin(self.completion.build_hybrid(cx)).await?;
+        checkpoint(cx, "native_ann.live.quality_completion_ready")?;
+        Ok(NativeHybridCandidate {
+            base: self.base,
+            next: NativeHybridSnapshot {
+                index: Arc::new(next),
+            },
+        })
     }
 }
 
@@ -639,6 +739,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn live_quality_completion_preserves_fast_and_installs_only_its_exact_predecessor() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let fast = Provider::new("completion-live-fast", 2);
+            let quality = Provider::new("completion-live-quality", 3);
+            let initial = Box::pin(build(&cx, &dir.path().join("old"), 1, &fast, None)).await;
+            let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+            let old = live.snapshot(&cx).await.unwrap();
+            let original_fast = std::fs::read(old.index().vectors().fast().vector_path()).unwrap();
+            // A fast provider that now refuses document inference must still
+            // permit completion through its admitted retained values.
+            fast.fail_batches.store(true, Ordering::SeqCst);
+            let completed = Box::pin(
+                old.begin_quality_completion(
+                    &cx,
+                    dir.path().join("complete"),
+                    generation(2),
+                    quality.clone(),
+                )
+                .unwrap()
+                .with_batch_size(2)
+                .unwrap()
+                .with_max_batch_input_bytes(64)
+                .unwrap()
+                .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                .unwrap()
+                .build(&cx),
+            )
+            .await
+            .unwrap();
+            let stale = Box::pin(
+                old.begin_quality_completion(
+                    &cx,
+                    dir.path().join("stale"),
+                    generation(4),
+                    quality.clone(),
+                )
+                .unwrap()
+                .build(&cx),
+            )
+            .await
+            .unwrap();
+            assert_eq!(fast.documents.load(Ordering::SeqCst), 3);
+            assert_eq!(quality.documents.load(Ordering::SeqCst), 6);
+            assert!(Arc::ptr_eq(
+                &live.snapshot(&cx).await.unwrap().index,
+                &old.index
+            ));
+            assert!(old.index().vectors().quality().is_none());
+            let installed = live.install(&cx, &completed).await.unwrap();
+            assert_eq!(installed.generation(), generation(2));
+            let page = live.search_refined(&cx, "vertical", 3).await.unwrap();
+            assert_eq!(page.results[0].doc_id, "b");
+            assert!(page.results.iter().any(|hit| hit.quality_score.is_some()));
+            assert_rows(&page);
+            assert_eq!(
+                installed.index().vectors().document("a").unwrap().metadata["version"],
+                "old"
+            );
+            let source_before: Vec<_> = old
+                .index()
+                .vectors()
+                .documents()
+                .iter()
+                .map(|doc| (&doc.id, &doc.content, &doc.title, &doc.metadata))
+                .collect();
+            let source_after: Vec<_> = installed
+                .index()
+                .vectors()
+                .documents()
+                .iter()
+                .map(|doc| (&doc.id, &doc.content, &doc.title, &doc.metadata))
+                .collect();
+            assert_eq!(source_before, source_after);
+
+            fast.fail_batches.store(false, Ordering::SeqCst);
+            let update = Box::pin(
+                installed
+                    .begin_update(&cx, dir.path().join("edited"), generation(3))
+                    .unwrap()
+                    .upsert_document(
+                        IndexableDocument::new("a", "changedtoken vertical")
+                            .with_metadata("version", "new"),
+                    )
+                    .build(&cx),
+            )
+            .await
+            .unwrap();
+            let current = live.install(&cx, &update).await.unwrap();
+            assert_refusal(
+                live.install(&cx, &stale).await.unwrap_err(),
+                "live.expected_current",
+            );
+            assert!(Arc::ptr_eq(
+                &live.snapshot(&cx).await.unwrap().index,
+                &current.index
+            ));
+            assert_eq!(
+                current.index().vectors().document("a").unwrap().metadata["version"],
+                "new"
+            );
+            assert_eq!(
+                stale.index().vectors().document("a").unwrap().metadata["version"],
+                "old"
+            );
+            assert_eq!(
+                std::fs::read(old.index().vectors().fast().vector_path()).unwrap(),
+                original_fast
+            );
+            assert_eq!(
+                old.index().search(&cx, "legacyterm", 1).await.unwrap()[0].doc_id,
+                "a"
+            );
+            assert!(old.index().vectors().quality().is_none());
+        });
     }
 
     #[test]

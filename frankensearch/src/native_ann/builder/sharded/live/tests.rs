@@ -209,6 +209,189 @@ fn image(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
+#[test]
+fn sharded_live_quality_completion_refines_after_repartition_and_refuses_stale_install() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let fast = Provider::new("completion-sharded-fast", 2);
+        let quality = Provider::new("completion-sharded-quality", 3);
+        let initial = Box::pin(build(&cx, &root.path().join("old"), 1, &fast, None, true)).await;
+        let live = NativeLiveShardedHybridIndex::new(&cx, initial).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let original = image(old.index().vectors().directory());
+        let completed = Box::pin(
+            old.begin_quality_completion(
+                &cx,
+                root.path().join("complete"),
+                generation(2),
+                quality.clone(),
+            )
+            .unwrap()
+            .with_batch_size(1)
+            .unwrap()
+            .with_max_batch_input_bytes(64)
+            .unwrap()
+            .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+            .unwrap()
+            .build(&cx, 3),
+        )
+        .await
+        .unwrap();
+        let stale = Box::pin(
+            old.begin_quality_completion(
+                &cx,
+                root.path().join("stale"),
+                generation(4),
+                quality.clone(),
+            )
+            .unwrap()
+            .build(&cx, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fast.documents.load(Ordering::SeqCst), 4);
+        assert_eq!(quality.documents.load(Ordering::SeqCst), 8);
+        assert!(Arc::ptr_eq(
+            &live.snapshot(&cx).await.unwrap().index,
+            &old.index
+        ));
+        let before = old
+            .index()
+            .vectors()
+            .search_fast(&cx, "vertical", 4)
+            .await
+            .unwrap();
+        let installed = live.install(&cx, &completed).await.unwrap();
+        assert_eq!(
+            installed.index().vectors().partitions()[0]
+                .documents()
+                .len(),
+            3
+        );
+        let after = installed
+            .index()
+            .vectors()
+            .search_fast(&cx, "vertical", 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .map(|hit| (&hit.doc_id, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|hit| (&hit.doc_id, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+        );
+        let page = live.search_refined(&cx, "vertical", 4).await.unwrap();
+        assert_eq!(page.results[0].result.doc_id, "b");
+        assert!(
+            page.results
+                .iter()
+                .any(|hit| hit.result.quality_score.is_some())
+        );
+        assert_rows(&page.snapshot, &page.results);
+        let update = Box::pin(
+            installed
+                .begin_update(&cx, root.path().join("edited"), generation(3))
+                .unwrap()
+                .upsert_document(
+                    IndexableDocument::new("a", "newtoken vertical")
+                        .with_metadata("version", "new"),
+                )
+                .build(&cx, 2),
+        )
+        .await
+        .unwrap();
+        let current = live.install(&cx, &update).await.unwrap();
+        assert!(
+            matches!(live.install(&cx, &stale).await, Err(SearchError::InvalidConfig { field, .. }) if field == "sharded_live.expected_current")
+        );
+        assert!(Arc::ptr_eq(
+            &live.snapshot(&cx).await.unwrap().index,
+            &current.index
+        ));
+        assert_eq!(
+            current.index().vectors().document("a").unwrap().metadata["version"],
+            "new"
+        );
+        assert_eq!(
+            stale.index().vectors().document("a").unwrap().metadata["version"],
+            "old"
+        );
+        assert!(old.index().vectors().quality().is_none());
+        assert_eq!(image(old.index().vectors().directory()), original);
+    });
+}
+
+#[test]
+fn sharded_live_quality_completion_failure_never_installs_a_completed_prefix() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let fast = Provider::new("completion-failure-fast", 2);
+        let quality = Provider::new("completion-failure-quality", 3);
+        let initial = Box::pin(
+            NativeIndexBuilder::new(root.path().join("old"), generation(1), fast.clone())
+                .unwrap()
+                .add_documents(sources())
+                .add_document(IndexableDocument::new("z", "failuretoken vertical"))
+                .build_sharded_hybrid(&cx, 2),
+        )
+        .await
+        .unwrap();
+        let live = NativeLiveShardedHybridIndex::new(&cx, initial).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let original = image(old.index().vectors().directory());
+        quality.fail_late.store(true, Ordering::SeqCst);
+        let path = root.path().join("failed");
+        let outcome = Box::pin(
+            old.begin_quality_completion(&cx, &path, generation(2), quality.clone())
+                .unwrap()
+                .with_batch_size(1)
+                .unwrap()
+                .build(&cx, 2),
+        )
+        .await;
+        assert!(outcome.is_err());
+        assert_eq!(
+            quality.documents.load(Ordering::SeqCst),
+            5,
+            "the final shard must exercise failure after completed earlier shards"
+        );
+        assert_eq!(fast.documents.load(Ordering::SeqCst), 5);
+        assert!(!path.join("native.sharded-hybrid.json").exists());
+        assert!(Arc::ptr_eq(
+            &live.snapshot(&cx).await.unwrap().index,
+            &old.index
+        ));
+        assert_eq!(image(old.index().vectors().directory()), original);
+        assert_eq!(
+            live.search(&cx, "legacytoken", 1).await.unwrap().results[0]
+                .result
+                .doc_id,
+            "b"
+        );
+        quality.fail_late.store(false, Ordering::SeqCst);
+        let completed = Box::pin(
+            old.begin_quality_completion(
+                &cx,
+                root.path().join("retry"),
+                generation(2),
+                quality.clone(),
+            )
+            .unwrap()
+            .build(&cx, 3),
+        )
+        .await
+        .unwrap();
+        let installed = live.install(&cx, &completed).await.unwrap();
+        assert_eq!(installed.index().vectors().document_count(), 5);
+        assert!(installed.index().vectors().quality().is_some());
+        assert_eq!(fast.documents.load(Ordering::SeqCst), 5);
+    });
+}
+
 fn assert_rows(snapshot: &NativeShardedSnapshot, hits: &[NativeShardedResult]) {
     let mut resolved = 0;
     for hit in hits {

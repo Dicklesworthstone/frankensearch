@@ -31,6 +31,9 @@ mod query;
 #[path = "native_cli/update.rs"]
 mod update;
 
+#[path = "native_cli/quality_completion.rs"]
+mod quality_completion;
+
 #[path = "native_cli/filter.rs"]
 mod filter;
 
@@ -96,6 +99,9 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   rebuild --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
           [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
           [--shard-size N (required for sharded receipts)]\n\n\
+  complete-quality --receipt FAST_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
+          [--model-dir DIR] [--quality-exact] [--batch-size N]\n\
+          [--shard-size N (required for sharded receipts)]\n\n\
 Quality options (not with --lexical-only):\n\
   --quality-backend onnx|native-int8|native-f32|native-multilingual\n\
   --quality-model-dir DIR (required for native; exact verified model directory)\n\
@@ -119,6 +125,10 @@ Index creates a new directory and a new trusted selection receipt. Keep that\n\
 receipt outside the immutable index; search never discovers or repairs one.\n\
 Rebuild authenticates retained sources without opening old search artifacts,\n\
 then re-embeds every document. It never reads stdin or reuses old vectors.\n\
+Complete-quality admits a fast-only selection, preserves its fast vectors and\n\
+retrieval policy, and embeds an independent quality tier for every retained\n\
+document. --quality-exact changes only the new quality tier's retrieval policy.\n\
+The old selection remains unchanged; use the new receipt to serve both tiers.\n\
 Stdout is JSON. This command does not change fsfs stores or CURRENT pointers.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +138,7 @@ enum Command {
     Serve,
     Update,
     Rebuild,
+    CompleteQuality,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,9 +205,10 @@ impl Options {
             "serve" => Command::Serve,
             "update" => Command::Update,
             "rebuild" => Command::Rebuild,
+            "complete-quality" => Command::CompleteQuality,
             _ => {
                 return Err(bad(
-                    "expected index, search, serve, update, or rebuild; use --help",
+                    "expected index, search, serve, update, rebuild, or complete-quality; use --help",
                 ));
             }
         };
@@ -242,6 +254,9 @@ impl Options {
                 "--exact" if matches!(command, Command::Index | Command::Rebuild) => {
                     options.exact = true;
                 }
+                "--quality-exact" if command == Command::CompleteQuality => {
+                    options.exact = true;
+                }
                 "--stream" if command == Command::Search => options.stream = true,
                 "--lexical-only" if matches!(command, Command::Search | Command::Serve) => {
                     options.lexical_only = true;
@@ -254,7 +269,12 @@ impl Options {
                     options.allow_model_migration = true;
                 }
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
-                "--new-receipt" if matches!(command, Command::Update | Command::Rebuild) => {
+                "--new-receipt"
+                    if matches!(
+                        command,
+                        Command::Update | Command::Rebuild | Command::CompleteQuality
+                    ) =>
+                {
                     options.new_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--model-dir" => options.models = Some(PathBuf::from(value(&mut args)?)),
@@ -266,7 +286,13 @@ impl Options {
                     options.quality.directory = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--index-dir"
-                    if matches!(command, Command::Index | Command::Update | Command::Rebuild) =>
+                    if matches!(
+                        command,
+                        Command::Index
+                            | Command::Update
+                            | Command::Rebuild
+                            | Command::CompleteQuality
+                    ) =>
                 {
                     options.directory = Some(PathBuf::from(value(&mut args)?));
                 }
@@ -274,12 +300,24 @@ impl Options {
                     options.input = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--batch-size"
-                    if matches!(command, Command::Index | Command::Update | Command::Rebuild) =>
+                    if matches!(
+                        command,
+                        Command::Index
+                            | Command::Update
+                            | Command::Rebuild
+                            | Command::CompleteQuality
+                    ) =>
                 {
                     options.batch_size = positive(&value(&mut args)?, 256)?;
                 }
                 "--shard-size"
-                    if matches!(command, Command::Index | Command::Update | Command::Rebuild) =>
+                    if matches!(
+                        command,
+                        Command::Index
+                            | Command::Update
+                            | Command::Rebuild
+                            | Command::CompleteQuality
+                    ) =>
                 {
                     options.shard_size = Some(positive(&value(&mut args)?, MAX_DOCUMENTS)?);
                 }
@@ -355,16 +393,22 @@ impl Options {
                 "reranking requires --mode full; primary-tier modes explicitly skip it",
             ));
         }
-        if matches!(command, Command::Index | Command::Update | Command::Rebuild)
-            && options.directory.is_none()
+        if matches!(
+            command,
+            Command::Index | Command::Update | Command::Rebuild | Command::CompleteQuality
+        ) && options.directory.is_none()
         {
             return Err(bad(
-                "index/update/rebuild requires --index-dir pointing to a NEW directory",
+                "index/update/rebuild/complete-quality requires --index-dir pointing to a NEW directory",
             ));
         }
-        if matches!(command, Command::Update | Command::Rebuild) && options.new_receipt.is_none() {
+        if matches!(
+            command,
+            Command::Update | Command::Rebuild | Command::CompleteQuality
+        ) && options.new_receipt.is_none()
+        {
             return Err(bad(
-                "update/rebuild requires --new-receipt pointing to a NEW file",
+                "update/rebuild/complete-quality requires --new-receipt pointing to a NEW file",
             ));
         }
         if command == Command::Search {
@@ -750,6 +794,7 @@ async fn execute(
         }
         Command::Update => update::execute(cx, &options, output, pool).await,
         Command::Rebuild => update::rebuild(cx, &options, output, pool).await,
+        Command::CompleteQuality => quality_completion::execute(cx, &options, output, pool).await,
         Command::Index => {
             let directory = new_path(
                 options

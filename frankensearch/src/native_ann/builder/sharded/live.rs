@@ -36,7 +36,9 @@ use std::sync::Arc;
 use asupersync::sync::{RwLock, RwLockError};
 use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
 
-use super::super::{NativeBuildPrecision, NativeBuildRetrieval, NativeIndexUpdate};
+use super::super::{
+    NativeBuildPrecision, NativeBuildRetrieval, NativeIndexQualityCompletion, NativeIndexUpdate,
+};
 use super::{
     NativeBuiltShardedHybridIndex, NativeBuiltShardedIndex, NativeShardedHybridReopenLimits,
 };
@@ -104,6 +106,16 @@ pub struct NativeShardedCandidate {
 pub struct NativeLiveShardedUpdate {
     base: NativeShardedSnapshot,
     update: NativeIndexUpdate,
+}
+
+/// Quality completion tied to one exact fast-only sharded live predecessor.
+///
+/// Every source and fast vector stays fixed, even when successor partition
+/// boundaries change. Only a complete two-tier/global-Quill cohort becomes an
+/// installable candidate; installation compares the original predecessor pin.
+pub struct NativeLiveShardedQualityCompletion {
+    base: NativeShardedSnapshot,
+    completion: NativeIndexQualityCompletion,
 }
 
 impl NativeLiveShardedHybridIndex {
@@ -250,6 +262,32 @@ impl NativeShardedSnapshot {
         Ok(NativeLiveShardedUpdate {
             base: self.clone(),
             update,
+        })
+    }
+
+    /// Add quality to this complete fast-only inventory without fast inference.
+    ///
+    /// Source fields, fast precision and native graph parameters remain fixed
+    /// across every partition. The new quality model must accept the retained
+    /// prepared-input contract and semantic/control kind. Preparation performs
+    /// no inference or filesystem staging and holds no serving-selection lock.
+    ///
+    /// # Errors
+    /// Refuses existing quality, a non-newer generation, incompatible providers,
+    /// mixed retained policies, inconsistent source membership or cancellation.
+    pub fn begin_quality_completion(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        quality_provider: Arc<dyn crate::Embedder>,
+    ) -> SearchResult<NativeLiveShardedQualityCompletion> {
+        let completion =
+            self.index
+                .begin_quality_completion(cx, directory, generation, quality_provider)?;
+        Ok(NativeLiveShardedQualityCompletion {
+            base: self.clone(),
+            completion,
         })
     }
 
@@ -465,6 +503,78 @@ impl NativeLiveShardedUpdate {
         )
         .await?;
         NativeShardedCandidate::new(cx, self.base, next)
+    }
+}
+
+impl NativeLiveShardedQualityCompletion {
+    /// Bound the new quality model's document inference batches.
+    ///
+    /// # Errors
+    /// Refuses a zero batch size before building anything.
+    pub fn with_batch_size(mut self, size: usize) -> SearchResult<Self> {
+        self.completion = self.completion.with_batch_size(size)?;
+        Ok(self)
+    }
+
+    /// Bound prepared bytes submitted to the quality model in each batch.
+    ///
+    /// # Errors
+    /// Refuses zero; oversized sources fail build before candidate staging.
+    pub fn with_max_batch_input_bytes(mut self, max_bytes: usize) -> SearchResult<Self> {
+        self.completion = self.completion.with_max_batch_input_bytes(max_bytes)?;
+        Ok(self)
+    }
+
+    /// Configure the new quality tier without changing any fast partition.
+    ///
+    /// # Errors
+    /// Propagates invalid quality storage configuration.
+    pub fn with_quality_storage(
+        mut self,
+        precision: NativeBuildPrecision,
+        retrieval: NativeBuildRetrieval,
+    ) -> SearchResult<Self> {
+        self.completion = self.completion.with_quality_storage(precision, retrieval)?;
+        Ok(self)
+    }
+
+    /// Finalize vector and graph images on the caller's existing blocking pool.
+    #[must_use]
+    pub fn with_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        self.completion = self.completion.with_blocking_pool(pool);
+        self
+    }
+
+    /// Build every quality row and one global lexical population before admission.
+    ///
+    /// The positive partition size may differ from the predecessor's. Fast
+    /// reuse follows exact source IDs across boundaries; no fast storage or
+    /// model can change. Failure or cancellation returns no installable prefix.
+    /// Finish with [`NativeLiveShardedHybridIndex::install`], which refuses the
+    /// candidate if another source update won while quality was being built.
+    ///
+    /// # Errors
+    /// Propagates partition limits, required quality, artifact, lexical and cancellation errors.
+    pub async fn build(
+        self,
+        cx: &Cx,
+        max_documents_per_shard: usize,
+    ) -> SearchResult<NativeShardedCandidate> {
+        let next = Box::pin(
+            self.completion
+                .build_sharded_hybrid(cx, max_documents_per_shard),
+        )
+        .await?;
+        checkpoint(cx, "native_ann.sharded_live.quality_completion_ready")?;
+        Ok(NativeShardedCandidate {
+            base: self.base,
+            next: NativeShardedSnapshot {
+                index: Arc::new(next),
+            },
+        })
     }
 }
 
