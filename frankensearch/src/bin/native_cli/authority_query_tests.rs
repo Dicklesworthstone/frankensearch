@@ -702,3 +702,150 @@ fn rerank_delivery_and_lazy_failure_boundaries_preserve_the_phase_contract() {
         assert_eq!(f.scorer.calls.load(Ordering::SeqCst), before);
     });
 }
+
+#[test]
+fn caller_pool_reaches_every_authority_query_mode_and_preserves_retained_results() {
+    use asupersync::runtime::blocking_pool::BlockingPool;
+    use std::time::Duration;
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            for scoped in [false, true] {
+                let mut f = fixture(&cx, true, ann).await;
+                if !scoped {
+                    f.session.scope = None;
+                    f.session.fixed_filter = None;
+                    // Request filters must first admit the full source cohort;
+                    // this fixture's small cap only suits its prepared scope.
+                    f.session.max_source_bytes = MAX_INPUT_BYTES;
+                }
+                let pool = BlockingPool::new(0, 2);
+                let pooled_cx = cx.clone().with_blocking_pool_handle(Some(pool.handle()));
+                let options = parsed(&[]).unwrap().unwrap();
+                let policy = query_controls::load_policy(&pooled_cx, &options).unwrap();
+                assert!(policy.query_pool().is_some());
+                let mut requests = vec![
+                    serde_json::json!({"query":"needle","mode":"fast"}),
+                    serde_json::json!({"query":"needle","mode":"quality"}),
+                    message(false),
+                    message(true),
+                    serde_json::json!({"query":"needle","mode":"full","stream":true,
+                        "filter":{"ids":["vector","quality"]}}),
+                ];
+                for tuned in [false, true] {
+                    if tuned {
+                        install(&mut f, true, true);
+                        requests.push(serde_json::json!({"op":"search",
+                            "request":{"query":"needle","mode":"full"},
+                            "full_query":{"candidate_multiplier":1,"rerank":false}}));
+                    }
+                    for request in &requests {
+                        f.session.query_policy.query_pool = None;
+                        let inline = exchange(&cx, &mut f.session, &[request.clone()]).await;
+                        f.session.query_policy.query_pool = policy.query_pool();
+                        let pooled = exchange(&cx, &mut f.session, &[request.clone()]).await;
+                        assert_eq!(inline.len(), pooled.len());
+                        for (left, right) in inline.iter().zip(&pooled).skip(1) {
+                            assert_eq!(right["event"], "results", "{right}");
+                            for field in ["event", "mode", "phase", "results", "scope"] {
+                                assert_eq!(left[field], right[field], "{field}: {request}");
+                            }
+                        }
+                    }
+                }
+
+                // An unusable supplied pool is a failure, never permission to
+                // run a retained exact scan or graph traversal on the executor.
+                assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
+                for request in &requests {
+                    let output = exchange(&cx, &mut f.session, &[request.clone()]).await;
+                    assert_eq!(output.len(), 2, "{output:?}");
+                    assert_eq!(output[1]["event"], "failed");
+                    assert_eq!(output[1]["code"], "query_or_activation_refused");
+                }
+                let lexical = exchange(
+                    &cx,
+                    &mut f.session,
+                    &[serde_json::json!({"query":"needle","mode":"lexical"})],
+                )
+                .await;
+                assert_eq!(lexical[1]["event"], "results");
+
+                // The one-shot path obtains its pool from the same caller Cx.
+                let mut options = options;
+                options.receipt = f.receipt.clone();
+                options.filter = f.session.fixed_filter.clone();
+                let mut output = Vec::new();
+                let error = search_with_loader(&pooled_cx, &options, &mut output, |tier| {
+                    Ok(if tier == EmbedderTierTag::Fast {
+                        f.fast.clone() as Arc<dyn Embedder>
+                    } else {
+                        f.quality.clone() as Arc<dyn Embedder>
+                    })
+                })
+                .await
+                .unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<SearchError>(),
+                    Some(SearchError::SubsystemError {
+                        subsystem: "native_ann.query_worker",
+                        ..
+                    })
+                ));
+                assert!(output.is_empty());
+            }
+        }
+    });
+}
+
+#[test]
+fn authority_deadline_expires_while_vector_work_is_queued_and_session_stays_usable() {
+    use asupersync::runtime::blocking_pool::BlockingPool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let mut f = fixture(&cx, true, true).await;
+        let pool = BlockingPool::new(0, 1);
+        let (started, entered) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let blocker = pool.spawn(move || {
+            started.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        f.session.query_policy.query_pool = Some(pool.handle());
+        f.session.query_policy.maximum_ms = Some(10);
+        let before_quality = f.quality.calls.load(Ordering::SeqCst);
+        let request: AuthoritySearchRequest = serde_json::from_value(message(true)).unwrap();
+        let mut output = Vec::new();
+        let mut pending = Box::pin(f.session.query(&cx, &request, 1, &mut output));
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(f.quality.calls.load(Ordering::SeqCst), before_quality);
+        f.clock.advance(10_000_000);
+        let _ = f.timer.process_timers();
+        let error = pending.await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SearchError>(),
+            Some(SearchError::SearchTimeout { .. })
+        ));
+        assert!(output.is_empty());
+        assert!(!cx.is_cancel_requested());
+        assert!(f.timer.is_empty());
+        assert_eq!(f.quality.calls.load(Ordering::SeqCst), before_quality);
+
+        release.send(()).unwrap();
+        assert!(blocker.wait_timeout(Duration::from_secs(10)));
+        let next = exchange(&cx, &mut f.session, &[message(true)]).await;
+        assert_eq!(next.len(), 3);
+        assert_eq!(next[1]["phase"], "initial");
+        assert_eq!(next[2]["phase"], "refined");
+        assert_eq!(f.quality.calls.load(Ordering::SeqCst), before_quality + 1);
+        assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
+    });
+}

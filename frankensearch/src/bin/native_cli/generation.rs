@@ -2775,6 +2775,7 @@ where
     if plan.mode == QueryMode::Lexical {
         return Err(serve_refused("lexical_requires_model_free_execution"));
     }
+    let selection = query_controls::RetainedQuery::new(snapshot, scope, plan.policy);
     if plan.mode == QueryMode::Full {
         let quality = loaded
             .quality
@@ -2784,22 +2785,13 @@ where
             let mut empty_initial_without_refinement = false;
             let mut buffered = None;
             let mut query = query::within(cx, plan.deadline, async {
-                let search = match scope {
-                    Some(scope) => scope.search_progressive_with_quality(
-                        cx,
-                        loaded.fast.as_ref(),
-                        quality,
-                        plan.text,
-                        plan.limit,
-                    )?,
-                    None => snapshot.search_progressive_with_quality(
-                        cx,
-                        loaded.fast.as_ref(),
-                        quality,
-                        plan.text,
-                        plan.limit,
-                    )?,
-                };
+                let search = selection.progressive(
+                    cx,
+                    loaded.fast.as_ref(),
+                    quality,
+                    plan.text,
+                    plan.limit,
+                )?;
                 match plan.policy {
                     Some(policy) => {
                         query_controls::configure(search, policy, plan.max_source_bytes)
@@ -2859,28 +2851,9 @@ where
             }
         } else {
             let results = query::within(cx, plan.deadline, async {
-                Ok(match scope {
-                    Some(scope) => {
-                        Box::pin(scope.search_refined_text(
-                            cx,
-                            loaded.fast.as_ref(),
-                            quality,
-                            plan.text,
-                            plan.limit,
-                        ))
-                        .await?
-                    }
-                    None => {
-                        Box::pin(snapshot.search_refined_text(
-                            cx,
-                            loaded.fast.as_ref(),
-                            quality,
-                            plan.text,
-                            plan.limit,
-                        ))
-                        .await?
-                    }
-                })
+                selection
+                    .refined(cx, loaded.fast.as_ref(), quality, plan.text, plan.limit)
+                    .await
             })
             .await?;
             deliver("refined", &results)?;
@@ -2894,42 +2867,16 @@ where
                     .unwrap_or_else(|| loaded.fast.as_ref());
                 (
                     "quality",
-                    match scope {
-                        Some(scope) => {
-                            Box::pin(scope.search_quality_text(cx, quality, plan.text, plan.limit))
-                                .await?
-                        }
-                        None => {
-                            Box::pin(
-                                snapshot.search_quality_text(cx, quality, plan.text, plan.limit),
-                            )
-                            .await?
-                        }
-                    },
+                    selection
+                        .quality(cx, quality, plan.text, plan.limit)
+                        .await?,
                 )
             } else {
                 (
                     "initial",
-                    match scope {
-                        Some(scope) => {
-                            Box::pin(scope.search_text(
-                                cx,
-                                loaded.fast.as_ref(),
-                                plan.text,
-                                plan.limit,
-                            ))
-                            .await?
-                        }
-                        None => {
-                            Box::pin(snapshot.search_text(
-                                cx,
-                                loaded.fast.as_ref(),
-                                plan.text,
-                                plan.limit,
-                            ))
-                            .await?
-                        }
-                    },
+                    selection
+                        .fast(cx, loaded.fast.as_ref(), plan.text, plan.limit)
+                        .await?,
                 )
             })
         })

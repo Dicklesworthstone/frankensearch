@@ -2,7 +2,10 @@
 //! The ordinary CLI policy owns validation and request limits; this adapter
 //! changes only how that policy reaches a fixed generation's native query.
 
-use frankensearch::native_ann::NativeProgressiveSearch;
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use frankensearch::native_ann::builder::scope::NativeScopedGenerationSnapshot;
+use frankensearch::native_ann::{NativeGenerationSnapshot, NativeProgressiveSearch};
+use frankensearch::{Embedder, ScoredResult};
 
 use super::{
     AuthoritySearchRequest, AuthoritySession, Cx, Deserialize, Options, QueryMode, Result,
@@ -38,6 +41,7 @@ pub(super) fn validate_startup(options: &Options, mode: QueryMode) -> Result<()>
 
 pub(super) fn load_policy(cx: &Cx, options: &Options) -> Result<query::Policy> {
     let mut policy = query::Policy::new(cx, options.timeout_ms)?;
+    policy.query_pool = cx.blocking_pool_handle();
     policy.full_query = options.full_query.clone();
     policy.rerank = options
         .reranker_dir
@@ -50,6 +54,136 @@ pub(super) fn load_policy(cx: &Cx, options: &Options) -> Result<query::Policy> {
 
 pub(super) fn configured(policy: &query::Policy) -> bool {
     policy.full_query.is_some() || policy.rerank.is_some()
+}
+
+/// Route every semantic mode through the same retained selection and optional
+/// caller pool. The worker owns vector traversal; inference, lexical work and
+/// result delivery keep their existing ownership and deadline boundaries.
+pub(super) struct RetainedQuery<'a> {
+    snapshot: &'a NativeGenerationSnapshot,
+    scope: Option<&'a NativeScopedGenerationSnapshot>,
+    pool: Option<BlockingPoolHandle>,
+}
+
+impl<'a> RetainedQuery<'a> {
+    pub(super) fn new(
+        snapshot: &'a NativeGenerationSnapshot,
+        scope: Option<&'a NativeScopedGenerationSnapshot>,
+        policy: Option<&query::Policy>,
+    ) -> Self {
+        Self {
+            snapshot,
+            scope,
+            pool: policy.and_then(query::Policy::query_pool),
+        }
+    }
+
+    pub(super) async fn fast(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredResult>> {
+        Ok(match (self.scope, self.pool.clone()) {
+            (Some(scope), Some(pool)) => {
+                Box::pin(scope.search_text_with_pool(cx, embedder, text, limit, pool)).await?
+            }
+            (None, Some(pool)) => {
+                Box::pin(
+                    self.snapshot
+                        .search_text_with_pool(cx, embedder, text, limit, pool),
+                )
+                .await?
+            }
+            (Some(scope), None) => Box::pin(scope.search_text(cx, embedder, text, limit)).await?,
+            (None, None) => Box::pin(self.snapshot.search_text(cx, embedder, text, limit)).await?,
+        })
+    }
+
+    pub(super) async fn quality(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredResult>> {
+        Ok(match (self.scope, self.pool.clone()) {
+            (Some(scope), Some(pool)) => {
+                Box::pin(scope.search_quality_text_with_pool(cx, embedder, text, limit, pool))
+                    .await?
+            }
+            (None, Some(pool)) => {
+                Box::pin(
+                    self.snapshot
+                        .search_quality_text_with_pool(cx, embedder, text, limit, pool),
+                )
+                .await?
+            }
+            (Some(scope), None) => {
+                Box::pin(scope.search_quality_text(cx, embedder, text, limit)).await?
+            }
+            (None, None) => {
+                Box::pin(self.snapshot.search_quality_text(cx, embedder, text, limit)).await?
+            }
+        })
+    }
+
+    pub(super) async fn refined(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredResult>> {
+        Ok(match (self.scope, self.pool.clone()) {
+            (Some(scope), Some(pool)) => {
+                Box::pin(scope.search_refined_text_with_pool(cx, fast, quality, text, limit, pool))
+                    .await?
+            }
+            (None, Some(pool)) => {
+                Box::pin(
+                    self.snapshot
+                        .search_refined_text_with_pool(cx, fast, quality, text, limit, pool),
+                )
+                .await?
+            }
+            (Some(scope), None) => {
+                Box::pin(scope.search_refined_text(cx, fast, quality, text, limit)).await?
+            }
+            (None, None) => {
+                Box::pin(
+                    self.snapshot
+                        .search_refined_text(cx, fast, quality, text, limit),
+                )
+                .await?
+            }
+        })
+    }
+
+    pub(super) fn progressive(
+        &self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        limit: usize,
+    ) -> Result<NativeProgressiveSearch<'a>> {
+        Ok(match (self.scope, self.pool.clone()) {
+            (Some(scope), Some(pool)) => scope
+                .search_progressive_with_quality_and_pool(cx, fast, quality, text, limit, pool)?,
+            (None, Some(pool)) => self
+                .snapshot
+                .search_progressive_with_quality_and_pool(cx, fast, quality, text, limit, pool)?,
+            (Some(scope), None) => {
+                scope.search_progressive_with_quality(cx, fast, quality, text, limit)?
+            }
+            (None, None) => self
+                .snapshot
+                .search_progressive_with_quality(cx, fast, quality, text, limit)?,
+        })
+    }
 }
 
 pub(super) fn configure<'a>(
