@@ -211,6 +211,9 @@ impl NativeGenerationPreview {
     /// Lazily preview both phases from this exact candidate.
     /// Callers using this as validation must consume refinement successfully;
     /// an unpolled or dropped stream proves no complete semantic execution.
+    /// The returned query accepts fusion, candidate and beam tuning, and
+    /// [`NativeProgressiveSearch::with_retained_reranker`] reads only its final
+    /// candidate source from these same admitted images under a byte budget.
     ///
     /// # Errors
     /// Refuses no-op previews, absent tiers, producer drift and cancellation.
@@ -955,6 +958,9 @@ impl NativeGenerationSnapshot {
     /// Both provider identities are admitted before inference; quality work starts
     /// only when the caller requests refinement. Dropping the stream preserves
     /// the original immutable readers and starts no detached work.
+    /// The returned query accepts fusion, candidate and beam tuning, and
+    /// [`NativeProgressiveSearch::with_retained_reranker`] adds bounded, lazy
+    /// reranking from this exact generation's stored source.
     ///
     /// # Errors
     /// Refuses absent tiers, producer disagreement, invalid budgets and cancellation.
@@ -1446,6 +1452,32 @@ impl CompositeReaders {
             title: (!title.is_empty()).then_some(title),
             metadata: metadata.into_iter().collect(),
         })
+    }
+
+    // Only a closed generation query may request this source. Validate one
+    // candidate at a time against the retained common cohort and charge all
+    // stored fields to the request's aggregate budget before copying them.
+    // An absent or malformed document is an error, never a missing-text skip.
+    pub(in crate::native_ann) fn retained_rerank_text(
+        &self,
+        cx: &Cx,
+        doc_id: &str,
+        remaining_bytes: &mut usize,
+    ) -> SearchResult<String> {
+        let (snapshot, _, field_ids) = self.source_context(cx)?;
+        if self
+            .vector
+            .owner
+            .find_live_row_by_doc_id(doc_id)
+            .map_err(|_| refused("source", "invalid-vector-row"))?
+            .is_none()
+        {
+            return Err(refused("source", "missing-live-document"));
+        }
+        let document =
+            self.read_source_document(cx, &snapshot, field_ids, doc_id, remaining_bytes)?;
+        checkpoint(cx, "native_ann.generation.rerank_source_complete")?;
+        Ok(document.content)
     }
 
     async fn search_text(

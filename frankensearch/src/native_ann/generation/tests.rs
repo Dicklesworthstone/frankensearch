@@ -10,11 +10,74 @@ use frankensearch_core::generation::{
     LexicalArtifact, MANIFEST_SCHEMA_VERSION, QuantizationFormat, VectorArtifact,
     compute_manifest_hash,
 };
-use frankensearch_core::traits::{ModelCategory, SearchFuture};
+use frankensearch_core::traits::{
+    ModelCategory, RerankDocument, RerankScore, Reranker, SearchFuture,
+};
 use frankensearch_index::VectorIndex;
 use frankensearch_quill::{CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, QuillIndex, SchemaDocument};
 
 const BUDGET: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct RetainedReranker {
+    documents: std::sync::Mutex<Vec<(String, String)>>,
+    calls: AtomicUsize,
+    pending: bool,
+}
+
+impl RetainedReranker {
+    fn observed(&self) -> BTreeMap<String, String> {
+        self.documents.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+impl Reranker for RetainedReranker {
+    fn rerank<'a>(
+        &'a self,
+        _: &'a Cx,
+        query: &'a str,
+        documents: &'a [RerankDocument],
+    ) -> SearchFuture<'a, Vec<RerankScore>> {
+        Box::pin(async move {
+            assert_eq!(query, "unmatched");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.documents.lock().unwrap() = documents
+                .iter()
+                .map(|document| (document.doc_id.clone(), document.text.clone()))
+                .collect();
+            if self.pending {
+                return std::future::pending().await;
+            }
+            Ok(documents
+                .iter()
+                .enumerate()
+                .map(|(original_rank, document)| RerankScore {
+                    doc_id: document.doc_id.clone(),
+                    score: if document.doc_id == "a" { 0.9 } else { 0.1 },
+                    original_rank,
+                    raw_logit: None,
+                })
+                .collect())
+        })
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn id(&self) -> &str {
+        "retained-source-reranker"
+    }
+
+    fn model_name(&self) -> &str {
+        self.id()
+    }
+}
+
+fn source_payload_bytes(document: &IndexableDocument) -> usize {
+    let metadata: BTreeMap<_, _> = document.metadata.iter().collect();
+    document.id.len()
+        + document.content.len()
+        + document.title.as_deref().unwrap_or("").len()
+        + serde_json::to_vec(&metadata).unwrap().len()
+}
 
 struct ProgressiveProvider {
     identity: EmbeddingIdentityBundleV1,
@@ -611,6 +674,477 @@ fn progressive_selected_source_uses_common_membership_and_exact_payload_budget()
         );
         assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn retained_preview_reranking_is_lazy_tunable_and_uses_the_exact_candidate_source() {
+    use crate::native_ann::NativeSearchPhase;
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for (fast_ann, quality_ann) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let fixture = progressive_fixture_with_retrieval(&cx, fast_ann, quality_ann).await;
+            let readers = fixture.admit(&cx).unwrap();
+            let documents = readers.source_documents(&cx, BUDGET).unwrap();
+            let payload_bytes = documents.iter().map(source_payload_bytes).sum();
+            let expected: BTreeMap<_, _> = documents
+                .into_iter()
+                .map(|document| (document.id, document.content))
+                .collect();
+            let candidate = GenerationCandidateV1::new(
+                [0x75; 16],
+                None,
+                GenerationAuthorityActionV1::Activate,
+                fixture.fast_binding.generation(),
+                [0x76; 32],
+                &readers.components,
+            )
+            .unwrap();
+            let preview = Arc::new(NativeGenerationPreview::new(candidate.authority(), readers));
+            std::fs::rename(
+                fixture.directory.path().join("source"),
+                fixture.directory.path().join("relocated"),
+            )
+            .unwrap();
+            let model = RetainedReranker::default();
+            let mut stream = preview
+                .search_progressive_with_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                )
+                .unwrap()
+                .with_retained_reranker(&model, 6, payload_bytes)
+                .unwrap()
+                .with_candidate_multiplier(1)
+                .unwrap()
+                .with_fusion(frankensearch_fusion::RrfConfig::default(), 0.7)
+                .unwrap()
+                .with_beam_widths(Some(1), Some(2))
+                .unwrap();
+            assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Initial { .. })
+            ));
+            assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+            let Some(NativeSearchPhase::Refined { results, .. }) =
+                stream.next_phase().await.unwrap()
+            else {
+                panic!("refinement must precede retained reranking")
+            };
+            assert_ne!(results[0].doc_id, "a");
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert!(model.observed().is_empty());
+            drop(stream.next_phase());
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            let Some(NativeSearchPhase::Reranked {
+                results, evaluated, ..
+            }) = stream.next_phase().await.unwrap()
+            else {
+                panic!("retained source must reach the final reranker")
+            };
+            assert_eq!(evaluated, 6);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].doc_id, "a");
+            assert_eq!(results[0].source, ScoreSource::Reranked);
+            assert_eq!(results[0].rerank_score, Some(0.9));
+            assert_eq!(results[0].metadata.as_deref().unwrap()["version"], "old");
+            assert_eq!(model.observed(), expected);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+            assert!(stream.next_phase().await.unwrap().is_none());
+            drop(stream);
+
+            let scope = preview
+                .scope(&cx, BUDGET, |document| Ok(document.id == "e"))
+                .unwrap();
+            let scoped_model = RetainedReranker::default();
+            let results = scope
+                .search_progressive_with_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                )
+                .unwrap()
+                .with_candidate_multiplier(2)
+                .unwrap()
+                .with_retained_reranker(&scoped_model, 6, BUDGET)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(results[0].doc_id, "e");
+            assert_eq!(
+                scoped_model.observed(),
+                BTreeMap::from([("e".to_owned(), expected["e"].clone())])
+            );
+        }
+    });
+}
+
+#[test]
+fn retained_reranking_reads_only_its_window_and_enforces_aggregate_source_bytes() {
+    use crate::native_ann::NativeSearchPhase;
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = progressive_fixture(&cx).await;
+        let readers = fixture.admit(&cx).unwrap();
+        let baseline = readers
+            .search_progressive_with_quality(
+                &cx,
+                fixture.fast.as_ref(),
+                fixture.quality.as_ref(),
+                "unmatched",
+                1,
+            )
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let documents = readers.source_documents(&cx, BUDGET).unwrap();
+        let selected = documents
+            .iter()
+            .find(|document| document.id == baseline[0].doc_id.as_str())
+            .unwrap();
+        let payload_bytes = source_payload_bytes(selected);
+        assert_source_refused(
+            readers.source_documents(&cx, payload_bytes),
+            "stored-payload-limit",
+        );
+
+        for budget in [0, payload_bytes - 1, payload_bytes] {
+            let model = RetainedReranker::default();
+            let mut stream = readers
+                .search_progressive_with_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                )
+                .unwrap()
+                .with_retained_reranker(&model, 1, budget)
+                .unwrap();
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Initial { .. })
+            ));
+            let Some(NativeSearchPhase::Refined {
+                results: previous, ..
+            }) = stream.next_phase().await.unwrap()
+            else {
+                panic!("source admission is deferred until the rerank phase")
+            };
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            let phase = stream.next_phase().await.unwrap().unwrap();
+            if budget == payload_bytes {
+                let NativeSearchPhase::Reranked {
+                    results, evaluated, ..
+                } = phase
+                else {
+                    panic!("the exact aggregate source budget must succeed")
+                };
+                assert_eq!(evaluated, 1);
+                assert_eq!(results[0].score.to_bits(), previous[0].score.to_bits());
+                assert_eq!(results[0].fast_score, previous[0].fast_score);
+                assert_eq!(results[0].quality_score, previous[0].quality_score);
+                assert_eq!(results[0].index, previous[0].index);
+                assert!(Arc::ptr_eq(
+                    results[0].metadata.as_ref().unwrap(),
+                    previous[0].metadata.as_ref().unwrap()
+                ));
+                assert_eq!(
+                    model.observed(),
+                    BTreeMap::from([(selected.id.clone(), selected.content.clone())])
+                );
+                assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+            } else {
+                let NativeSearchPhase::RerankFailed {
+                    previous_results,
+                    error,
+                    ..
+                } = phase
+                else {
+                    panic!("source exhaustion must be an explicit final failure")
+                };
+                assert!(error.to_string().contains("stored-payload-limit"));
+                assert_eq!(
+                    serde_json::to_value(previous_results).unwrap(),
+                    serde_json::to_value(previous).unwrap()
+                );
+                assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                assert_source_refused(
+                    readers
+                        .search_progressive_with_quality(
+                            &cx,
+                            fixture.fast.as_ref(),
+                            fixture.quality.as_ref(),
+                            "unmatched",
+                            1,
+                        )
+                        .unwrap()
+                        .with_retained_reranker(&model, 1, budget)
+                        .unwrap()
+                        .collect()
+                        .await,
+                    "stored-payload-limit",
+                );
+                assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            }
+            assert!(stream.next_phase().await.unwrap().is_none());
+        }
+
+        // A budget larger than every individual document must still cover the
+        // sum of the whole final window before any model inference may start.
+        let aggregate_bytes: usize = documents.iter().map(source_payload_bytes).sum();
+        assert!(aggregate_bytes - 1 > documents.iter().map(source_payload_bytes).max().unwrap());
+        let model = RetainedReranker::default();
+        assert_source_refused(
+            readers
+                .search_progressive_with_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                )
+                .unwrap()
+                .with_retained_reranker(&model, 6, aggregate_bytes - 1)
+                .unwrap()
+                .collect()
+                .await,
+            "stored-payload-limit",
+        );
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+
+        let model = RetainedReranker::default();
+        let empty = readers
+            .search_progressive_with_quality(
+                &cx,
+                fixture.fast.as_ref(),
+                fixture.quality.as_ref(),
+                "unmatched",
+                0,
+            )
+            .unwrap()
+            .with_retained_reranker(&model, 1, 0)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+        let unbound = readers
+            .vector
+            .search_hybrid_progressive(
+                &cx,
+                fixture.fast.as_ref(),
+                Some((
+                    readers.quality.as_ref().unwrap().as_ref(),
+                    fixture.quality.as_ref(),
+                )),
+                &readers.lexical,
+                "unmatched",
+                1,
+            )
+            .unwrap();
+        assert_source_refused(
+            unbound.with_retained_reranker(&model, 1, BUDGET),
+            "retained-generation-required",
+        );
+    });
+}
+
+#[test]
+fn retained_reranking_refuses_selected_corrupt_source_without_reading_other_documents() {
+    use crate::native_ann::NativeSearchPhase;
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = progressive_fixture(&cx).await;
+        let readers = fixture.admit(&cx).unwrap();
+        let winner = readers
+            .search_refined_text(
+                &cx,
+                fixture.fast.as_ref(),
+                fixture.quality.as_ref(),
+                "unmatched",
+                1,
+            )
+            .await
+            .unwrap()[0]
+            .doc_id
+            .to_string();
+        let source = readers.source_documents(&cx, BUDGET).unwrap();
+        for selected in [false, true] {
+            for (fault, code) in [
+                ("missing-title", "missing-stored-field"),
+                ("invalid-content", "invalid-stored-utf8"),
+            ] {
+                let mut documents: Vec<_> = source
+                    .iter()
+                    .map(|document| SchemaDocument {
+                        id: document.id.clone(),
+                        indexed: vec![
+                            (0, document.id.clone()),
+                            (1, document.content.clone()),
+                            (2, document.title.clone().unwrap_or_default()),
+                        ],
+                        stored: vec![(
+                            3,
+                            serde_json::to_vec(
+                                &document.metadata.iter().collect::<BTreeMap<_, _>>(),
+                            )
+                            .unwrap(),
+                        )],
+                        ..SchemaDocument::default()
+                    })
+                    .collect();
+                let changed = documents
+                    .iter_mut()
+                    .find(|document| (document.id == winner) == selected)
+                    .unwrap();
+                if fault == "missing-title" {
+                    changed.indexed.retain(|(field, _)| *field != 2);
+                } else {
+                    changed.indexed.retain(|(field, _)| *field != 1);
+                    changed.stored.push((1, vec![0xff]));
+                }
+                let writer = QuillIndex::in_memory(config()).unwrap();
+                writer
+                    .index_schema_documents(&cx, &documents)
+                    .await
+                    .unwrap();
+                writer.commit(&cx).await.unwrap();
+                let image = writer
+                    .snapshot()
+                    .unwrap()
+                    .export_exact_image(&cx, source_cut(), BUDGET)
+                    .unwrap();
+                let mut images = fixture.images.clone();
+                images[1] = image.bytes();
+                let mut metadata = fixture.metadata.clone();
+                metadata.lexical_artifacts[0].size_bytes = image.receipt().bytes.byte_len;
+                metadata.lexical_artifacts[0].checksum = lower_hex(&image.receipt().bytes.sha256);
+                metadata.manifest_hash = compute_manifest_hash(&metadata).unwrap();
+                images[2] = serde_json::to_vec(&metadata).unwrap().into();
+                let malformed = fixture.admit_resealed(&cx, images).unwrap();
+                assert_source_refused(malformed.source_documents(&cx, BUDGET), code);
+                let model = RetainedReranker::default();
+                let mut stream = malformed
+                    .search_progressive_with_quality(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        fixture.quality.as_ref(),
+                        "unmatched",
+                        1,
+                    )
+                    .unwrap()
+                    .with_retained_reranker(&model, 1, BUDGET)
+                    .unwrap();
+                assert!(matches!(
+                    stream.next_phase().await.unwrap(),
+                    Some(NativeSearchPhase::Initial { .. })
+                ));
+                let Some(NativeSearchPhase::Refined {
+                    results: previous, ..
+                }) = stream.next_phase().await.unwrap()
+                else {
+                    panic!("source bodies must not be read by earlier phases")
+                };
+                assert_eq!(previous[0].doc_id, winner);
+                let final_phase = stream.next_phase().await.unwrap().unwrap();
+                if selected {
+                    let NativeSearchPhase::RerankFailed {
+                        previous_results,
+                        error,
+                        ..
+                    } = final_phase
+                    else {
+                        panic!("corrupt selected source must fail before inference")
+                    };
+                    assert!(error.to_string().contains(code));
+                    assert_eq!(
+                        serde_json::to_value(previous_results).unwrap(),
+                        serde_json::to_value(previous).unwrap()
+                    );
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                } else {
+                    assert!(matches!(
+                        final_phase,
+                        NativeSearchPhase::Reranked { evaluated: 1, .. }
+                    ));
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(model.observed().len(), 1);
+                    assert!(model.observed().contains_key(&winner));
+                }
+                assert!(stream.next_phase().await.unwrap().is_none());
+            }
+        }
+    });
+}
+
+#[test]
+fn retained_reranking_cancellation_and_dropped_pending_phase_are_terminal() {
+    use crate::native_ann::NativeSearchPhase;
+    use std::future::Future as _;
+    use std::task::{Context, Poll, Waker};
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = progressive_fixture(&cx).await;
+        let readers = fixture.admit(&cx).unwrap();
+        for cancel_before_source in [true, false] {
+            let model = RetainedReranker {
+                pending: true,
+                ..RetainedReranker::default()
+            };
+            let mut stream = readers
+                .search_progressive_with_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                )
+                .unwrap()
+                .with_retained_reranker(&model, 1, BUDGET)
+                .unwrap();
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Initial { .. })
+            ));
+            assert!(matches!(
+                stream.next_phase().await.unwrap(),
+                Some(NativeSearchPhase::Refined { .. })
+            ));
+            if cancel_before_source {
+                cx.set_cancel_requested(true);
+                assert!(matches!(
+                    stream.next_phase().await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                assert!(model.observed().is_empty());
+                cx.set_cancel_requested(false);
+            } else {
+                let mut phase = Box::pin(stream.next_phase());
+                assert!(matches!(
+                    phase.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Pending
+                ));
+                assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                drop(phase);
+            }
+            assert!(stream.is_finished());
+            assert!(stream.next_phase().await.unwrap().is_none());
+        }
     });
 }
 
@@ -2582,6 +3116,54 @@ mod qualified_rollback {
                         .is_err()
                 );
                 assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+                // Final reranking stays on each retained image even after both
+                // successor publication and rollback changed the root selection.
+                for snapshot in [retained.as_ref(), &current] {
+                    let expected: BTreeMap<_, _> = snapshot
+                        .source_documents(&cx, BUDGET)
+                        .unwrap()
+                        .into_iter()
+                        .map(|document| (document.id, document.content))
+                        .collect();
+                    let model = RetainedReranker::default();
+                    let results = snapshot
+                        .search_progressive_with_quality(
+                            &cx,
+                            fixture.fast.as_ref(),
+                            fixture.quality.as_ref(),
+                            "unmatched",
+                            1,
+                        )
+                        .unwrap()
+                        .with_retained_reranker(&model, 6, BUDGET)
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(results[0].source, ScoreSource::Reranked);
+                    assert_eq!(model.observed(), expected);
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                }
+                let scoped_model = RetainedReranker::default();
+                let results = scoped
+                    .search_progressive_with_quality(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        fixture.quality.as_ref(),
+                        "unmatched",
+                        1,
+                    )
+                    .unwrap()
+                    .with_retained_reranker(&scoped_model, 6, BUDGET)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_ne!(results[0].doc_id, "a");
+                assert_eq!(scoped_model.observed().len(), 5);
+                assert!(!scoped_model.observed().contains_key("a"));
+                assert!(!scoped_model.observed().contains_key("inserted"));
+                assert!(scoped_model.observed().contains_key("quality-only"));
             });
         }
     }
