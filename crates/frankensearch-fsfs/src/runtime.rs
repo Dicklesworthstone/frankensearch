@@ -9962,19 +9962,27 @@ impl FsfsRuntime {
             }
             // Resolve the fast producer once before snapshotting it. Quality
             // remains lazy so its cold load cannot delay INITIAL delivery.
-            if matches!(
-                mode,
-                SearchExecutionMode::Full | SearchExecutionMode::FastOnly
-            ) && resources.vector_index.is_some()
-            {
-                runtime.maybe_prepare_fast_embedder(cx, resources).await?;
+            let fast_admission: SearchResult<()> = async {
+                if matches!(
+                    mode,
+                    SearchExecutionMode::Full | SearchExecutionMode::FastOnly
+                ) && resources.vector_index.is_some()
+                {
+                    runtime.maybe_prepare_fast_embedder(cx, resources).await?;
+                }
+                let services = runtime
+                    .daemon_coalescers
+                    .as_ref()
+                    .expect("daemon services installed");
+                if let Some(admitted) = &mut resources.fast_embedder {
+                    admitted.enable_daemon_dispatch(cx, services).await?;
+                }
+                Ok(())
             }
-            let services = runtime
-                .daemon_coalescers
-                .as_ref()
-                .expect("daemon services installed");
-            if let Some(admitted) = &mut resources.fast_embedder {
-                admitted.enable_daemon_dispatch(cx, services).await?;
+            .await;
+            if let Err(error) = fast_admission {
+                cache.remove(&key);
+                return Err(error);
             }
             // Clone only this request's cache entry. Other payloads stay in the
             // bounded shared cache and are neither copied nor held during I/O.
@@ -9988,6 +9996,9 @@ impl FsfsRuntime {
             };
             (resources.clone(), cached.unwrap_or_default())
         };
+        let expected_cached = cache.get(&key).cloned();
+        let expected_generation = resources.generation_fingerprint.clone();
+        let expected_mode = resources.resource_mode;
         let response = runtime
             .execute_search_serve_request_with_sink(
                 cx,
@@ -9997,13 +10008,35 @@ impl FsfsRuntime {
                 options,
                 frame_sink,
             )
-            .await?;
+            .await;
+        let mut guard = if let Ok(guard) = shared.try_lock_owned() {
+            guard
+        } else {
+            match asupersync::sync::OwnedMutexGuard::lock(shared, cx).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return match response {
+                        Err(original) => Err(original),
+                        Ok(_) => Err(Self::search_daemon_error(format!(
+                            "search state completion: {error}"
+                        ))),
+                    };
+                }
+            }
+        };
+        // Request-local rejection must reach the persistent shared cache too.
+        // Equality preserves a different answer another request has installed;
+        // it is not an ownership token for an identical concurrent answer.
+        if (response.is_err() || !cache.contains_key(&key))
+            && let Some(expected) = expected_cached.as_ref()
+            && guard.0.generation_fingerprint == expected_generation
+            && guard.0.resource_mode == expected_mode
+            && guard.1.get(&key) == Some(expected)
+        {
+            guard.1.remove(&key);
+        }
+        let response = response?;
         Self::search_daemon_checkpoint(cx)?;
-        let mut guard = asupersync::sync::OwnedMutexGuard::lock(shared, cx)
-            .await
-            .map_err(|error| {
-                Self::search_daemon_error(format!("search state completion: {error}"))
-            })?;
         // An older request cannot overwrite resources or cached results that
         // another request admitted after a publication or mode transition.
         if guard.0.generation_fingerprint == resources.generation_fingerprint
@@ -10019,7 +10052,9 @@ impl FsfsRuntime {
                 guard.0.quality_embedder = resources.quality_embedder.take();
                 guard.0.quality_embedder_attempted = true;
             }
-            if let Some(value) = cache.remove(&key) {
+            if !response.cached
+                && let Some(value) = cache.remove(&key)
+            {
                 if guard.1.len() >= FSFS_DAEMON_MAX_CACHE_ENTRIES {
                     guard.1.clear();
                 }
@@ -10144,16 +10179,27 @@ impl FsfsRuntime {
         runtime.prepare_search_reranker(cx).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
-        let cached_payloads = options
-            .hot_cache_enabled
-            .then(|| hot_cache.get(&cache_key))
-            .flatten();
-        let cached = cached_payloads.is_some();
-        if cached && matches!(mode, SearchExecutionMode::QualityOnly) {
-            runtime
-                .with_quality_deadline(cx, runtime.admit_required_quality(cx, resources))
-                .await?;
-        }
+        let cached = if options.hot_cache_enabled
+            && let Some(payloads) = hot_cache.get(&cache_key)
+        {
+            match runtime
+                .admit_cached_search_producers(cx, resources, mode, payloads)
+                .await
+            {
+                Ok(true) => true,
+                Ok(false) => {
+                    hot_cache.remove(&cache_key);
+                    false
+                }
+                Err(error) => {
+                    hot_cache.remove(&cache_key);
+                    return Err(error);
+                }
+            }
+        } else {
+            false
+        };
+        let cached_payloads = cached.then(|| hot_cache.get(&cache_key)).flatten();
         Self::validate_bound_search_resources(resources, mode)?;
         let policy = runtime.search_serve_policy_for_mode(mode)?;
         if let Some(sink) = frame_sink.as_mut() {
@@ -10193,10 +10239,14 @@ impl FsfsRuntime {
             Ok(())
         };
         let payloads = if let Some(payloads) = cached_payloads {
-            for payload in payloads {
-                publish(payload)?;
-            }
-            payloads.clone()
+            Self::replay_cached_search_payloads(
+                cx,
+                resources,
+                mode,
+                &resources.generation_fingerprint,
+                payloads,
+                Some(&mut publish),
+            )?
         } else {
             runtime
                 .execute_search_phase_artifacts_with_mode_using_resources(
@@ -10216,7 +10266,13 @@ impl FsfsRuntime {
                 .map(|artifact| artifact.payload)
                 .collect::<Vec<_>>()
         };
+        if cached && !Self::search_payloads_cacheable(&payloads) {
+            hot_cache.remove(&cache_key);
+        }
         Self::validate_bound_search_resources(resources, mode)?;
+        if cached {
+            Self::validate_cached_search_producers(cx, resources, mode, &payloads)?;
+        }
         if matches!(mode, SearchExecutionMode::QualityOnly) {
             Self::validate_required_quality_resources(resources)?;
         }
@@ -12428,12 +12484,22 @@ impl FsfsRuntime {
         let mut prepared = self.clone();
         prepared.prepare_search_reranker(cx).await?;
         let key = prepared.search_cache_key(query, limit, mode)?;
+        let mut admitted_resources = None;
         match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
                 // A persisted semantic answer does not establish that its
-                // exact producer is still available in this process.
-                let quality_resources = if matches!(mode, SearchExecutionMode::QualityOnly) {
-                    let mut resources = self
+                // exact producers are still available in this process or at
+                // its configured model directory. Lexical-only answers need
+                // no semantic loader, even when model settings are invalid.
+                let replay = if matches!(mode, SearchExecutionMode::LexicalOnly) {
+                    !payloads.iter().any(|payload| {
+                        payload
+                            .hits
+                            .iter()
+                            .any(|hit| hit.semantic_rank.is_some() || hit.hash_rank.is_some())
+                    }) && !Self::cached_search_requires_quality(mode, &payloads)
+                } else {
+                    let mut resources = prepared
                         .prepare_search_execution_resources_at_root_with_modes(
                             cx,
                             &index_root,
@@ -12441,43 +12507,60 @@ impl FsfsRuntime {
                             mode,
                         )
                         .await?;
-                    self.with_quality_deadline(cx, self.admit_required_quality(cx, &mut resources))
+                    let replay = prepared
+                        .admit_cached_search_producers(cx, &mut resources, mode, &payloads)
                         .await?;
-                    Some(resources)
-                } else {
-                    None
+                    admitted_resources = Some(resources);
+                    replay
                 };
-                if let Some(sink) = phase_sink.as_deref_mut() {
-                    for payload in &payloads {
-                        if let Some(resources) = &quality_resources {
-                            Self::validate_required_quality_resources(resources)?;
-                        }
-                        Self::validate_search_generation_fingerprint(
-                            &index_root,
-                            &lookup_fingerprint,
+                if replay {
+                    Self::validate_search_generation_fingerprint(
+                        &index_root,
+                        &lookup_fingerprint,
+                        mode,
+                    )?;
+                    let payloads = if let Some(resources) = &admitted_resources {
+                        Self::replay_cached_search_payloads(
+                            cx,
+                            resources,
                             mode,
-                        )?;
-                        sink(payload)?;
+                            &lookup_fingerprint,
+                            &payloads,
+                            phase_sink.take(),
+                        )?
+                    } else {
+                        if let Some(sink) = phase_sink.as_deref_mut() {
+                            for payload in &payloads {
+                                Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
+                                Self::validate_search_generation_fingerprint(
+                                    &index_root,
+                                    &lookup_fingerprint,
+                                    mode,
+                                )?;
+                                sink(payload)?;
+                            }
+                        }
+                        payloads
+                    };
+                    Self::validate_search_generation_fingerprint(
+                        &index_root,
+                        &lookup_fingerprint,
+                        mode,
+                    )?;
+                    if let Some(resources) = &admitted_resources {
+                        Self::validate_cached_search_producers(cx, resources, mode, &payloads)?;
                     }
+                    Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
+                    if let Err(error) =
+                        self.persist_explain_session_for_cached_payloads(query, &payloads)
+                    {
+                        warn!(
+                            error = %error,
+                            "fsfs cached search could not persist explain-session context"
+                        );
+                    }
+                    return Ok(payloads);
                 }
-                Self::validate_search_generation_fingerprint(
-                    &index_root,
-                    &lookup_fingerprint,
-                    mode,
-                )?;
-                if let Some(resources) = &quality_resources {
-                    Self::validate_required_quality_resources(resources)?;
-                }
-                Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
-                if let Err(error) =
-                    self.persist_explain_session_for_cached_payloads(query, &payloads)
-                {
-                    warn!(
-                        error = %error,
-                        "fsfs cached search could not persist explain-session context"
-                    );
-                }
-                return Ok(payloads);
             }
             Ok(None) => {}
             Err(error) => {
@@ -12488,9 +12571,12 @@ impl FsfsRuntime {
             }
         }
 
-        let mut resources = self
-            .prepare_search_execution_resources_at_root_with_modes(cx, &index_root, mode, mode)
-            .await?;
+        let mut resources = if let Some(resources) = admitted_resources {
+            resources
+        } else {
+            self.prepare_search_execution_resources_at_root_with_modes(cx, &index_root, mode, mode)
+                .await?
+        };
         let execution_fingerprint = resources.generation_fingerprint.clone();
         let artifacts = prepared
             .execute_search_phase_artifacts_with_mode_using_resources(
@@ -13196,6 +13282,243 @@ impl FsfsRuntime {
                     .as_ref()
                     .is_some_and(|stage| stage.reason_code == REASON_RERANK_TIMEOUT)
         })
+    }
+
+    /// Cache provenance can require more admission, never excuse the primary
+    /// tier a live request would use. In particular, an empty or incomplete
+    /// cached explanation cannot bypass a retained semantic fast generation.
+    fn cached_search_requires_fast(
+        resources: &SearchExecutionResources,
+        mode: SearchExecutionMode,
+        payloads: &[SearchPayload],
+    ) -> bool {
+        matches!(
+            mode,
+            SearchExecutionMode::Full | SearchExecutionMode::FastOnly
+        ) && (resources
+            .vector_index
+            .as_ref()
+            .is_some_and(|index| !Self::is_legacy_hash_vector_generation(index.embedder_id()))
+            || payloads.iter().any(|payload| {
+                payload.phase == SearchOutputPhase::Initial
+                    && payload_has_admitted_semantic_hits(payload)
+            }))
+    }
+
+    fn cached_search_requires_quality(
+        mode: SearchExecutionMode,
+        payloads: &[SearchPayload],
+    ) -> bool {
+        matches!(mode, SearchExecutionMode::QualityOnly)
+            || payloads.iter().any(|payload| {
+                payload.phase == SearchOutputPhase::Refined
+                    || payload.semantic_blend.as_ref().is_some_and(|blend| {
+                        !blend.quality_embedder.is_empty()
+                            || blend.hits.iter().any(|hit| hit.quality.is_some())
+                    })
+            })
+    }
+
+    /// A stored answer is not evidence that this process still has the exact
+    /// producers admitted by its vector generations. Admit before replaying
+    /// any phase. Optional quality failure turns a Full cache hit into ordinary
+    /// progressive execution, preserving Initial/RefinementFailed behavior.
+    async fn admit_cached_search_producers(
+        &self,
+        cx: &Cx,
+        resources: &mut SearchExecutionResources,
+        mode: SearchExecutionMode,
+        payloads: &[SearchPayload],
+    ) -> SearchResult<bool> {
+        Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
+        if matches!(mode, SearchExecutionMode::LexicalOnly)
+            && payloads.iter().any(|payload| {
+                payload
+                    .hits
+                    .iter()
+                    .any(|hit| hit.semantic_rank.is_some() || hit.hash_rank.is_some())
+            })
+        {
+            return Ok(false);
+        }
+        let needs_quality = Self::cached_search_requires_quality(mode, payloads);
+        if needs_quality
+            && (!matches!(
+                mode,
+                SearchExecutionMode::Full | SearchExecutionMode::QualityOnly
+            ) || (matches!(mode, SearchExecutionMode::Full)
+                && (self.quality_disabled_by_policy() || resources.quality_embedder.is_none())))
+        {
+            // Optional quality initialization belongs after Initial. Never
+            // spend its load gate or timeout budget admitting a cache entry.
+            return Ok(false);
+        }
+        if Self::cached_search_requires_fast(resources, mode, payloads) {
+            if !payloads.iter().any(|payload| {
+                payload.phase == SearchOutputPhase::Initial
+                    && payload_has_admitted_semantic_hits(payload)
+            }) {
+                // A lexical-only or empty Initial does not establish whether
+                // the live planner would use this semantic generation. Run
+                // that planner before loading a model or publishing a hit.
+                return Ok(false);
+            }
+            if resources.vector_index.is_none() {
+                return Err(Self::cached_fast_generation_missing());
+            }
+            self.maybe_prepare_fast_embedder(cx, resources).await?;
+            Self::validate_cached_fast_producer(resources)?;
+        }
+        if needs_quality {
+            let quality = if matches!(mode, SearchExecutionMode::Full) {
+                Self::validate_required_quality_resources(resources)
+            } else {
+                self.with_quality_deadline(cx, self.admit_required_quality(cx, resources))
+                    .await
+            };
+            match quality {
+                Ok(()) => {}
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                Err(error) if matches!(mode, SearchExecutionMode::QualityOnly) => {
+                    return Err(error);
+                }
+                Err(_) => {
+                    // Retry through the normal optional stage instead of
+                    // replaying old quality scores or emitting Initial twice.
+                    resources.quality_embedder = None;
+                    resources.quality_embedder_attempted = false;
+                    return Ok(false);
+                }
+            }
+        }
+        Self::validate_cached_search_producers(cx, resources, mode, payloads)?;
+        Ok(true)
+    }
+
+    fn cached_fast_generation_missing() -> SearchError {
+        SearchError::InvalidConfig {
+            field: "semantic.fast_generation".to_owned(),
+            value: "missing".to_owned(),
+            reason: "cached semantic results require their published fast-tier vector index"
+                .to_owned(),
+        }
+    }
+
+    fn validate_cached_fast_producer(resources: &SearchExecutionResources) -> SearchResult<()> {
+        let index = resources
+            .vector_index
+            .as_ref()
+            .ok_or_else(Self::cached_fast_generation_missing)?;
+        let admitted = resources.fast_embedder.as_ref().ok_or_else(|| {
+            SearchError::EmbedderUnavailable {
+                model: "fast".to_owned(),
+                reason: "cached semantic results require the verified producer for their stored fast tier"
+                    .to_owned(),
+            }
+        })?;
+        Self::validate_fast_embedder_for_vector_index(index, admitted.embedder(), cfg!(test))?;
+        admitted.check_current_identity()
+    }
+
+    /// Recheck after every externally supplied sink callback as well as before
+    /// each phase: a callback can cancel or change a remote producer identity.
+    fn validate_cached_search_producers(
+        cx: &Cx,
+        resources: &SearchExecutionResources,
+        mode: SearchExecutionMode,
+        payloads: &[SearchPayload],
+    ) -> SearchResult<()> {
+        Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
+        if Self::cached_search_requires_quality(mode, payloads) {
+            Self::validate_required_quality_resources(resources)?;
+        }
+        Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")
+    }
+
+    fn validate_cached_primary_producer(
+        cx: &Cx,
+        resources: &SearchExecutionResources,
+        mode: SearchExecutionMode,
+        payloads: &[SearchPayload],
+    ) -> SearchResult<()> {
+        Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
+        Self::validate_bound_search_resources(resources, mode)?;
+        if Self::cached_search_requires_fast(resources, mode, payloads) {
+            Self::validate_cached_fast_producer(resources)?;
+        }
+        if matches!(mode, SearchExecutionMode::QualityOnly) {
+            Self::validate_required_quality_resources(resources)?;
+        }
+        Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")
+    }
+
+    fn replay_cached_search_payloads(
+        cx: &Cx,
+        resources: &SearchExecutionResources,
+        mode: SearchExecutionMode,
+        cache_generation: &str,
+        payloads: &[SearchPayload],
+        mut phase_sink: Option<SearchPhaseSink<'_>>,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
+        if resources.generation_fingerprint != cache_generation {
+            return Err(SearchError::InvalidConfig {
+                field: "index.generation".to_owned(),
+                value: resources.index_root.display().to_string(),
+                reason: "index generation changed while cached search resources were opening; retry the request"
+                    .to_owned(),
+            });
+        }
+        let mut replayed: Vec<SearchPayload> = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
+            if Self::cached_search_requires_quality(mode, std::slice::from_ref(payload))
+                && let Err(error) = Self::validate_required_quality_resources(resources)
+            {
+                if matches!(error, SearchError::Cancelled { .. })
+                    || !matches!(mode, SearchExecutionMode::Full)
+                {
+                    return Err(error);
+                }
+                let Some(initial) = replayed
+                    .iter()
+                    .find(|phase| phase.phase == SearchOutputPhase::Initial)
+                else {
+                    return Err(error);
+                };
+                // Initial has already escaped. Preserve its admitted scores
+                // and the normal optional-quality failure contract, without
+                // replaying stale Refined scores or delivering Initial twice.
+                let mut failed = initial.clone();
+                failed.phase = SearchOutputPhase::RefinementFailed;
+                failed.semantic_blend = None;
+                failed.rerank = None;
+                failed.skip_reason = None;
+                failed.quality_timeout = None;
+                let advice = Self::sanitized_semantic_degradation_advice(
+                    classify_search_error(&error),
+                    &failed.query,
+                    &resources.index_root,
+                    &error,
+                );
+                failed
+                    .degradation_advice
+                    .insert(advice.reason_code.clone(), advice);
+                Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
+                if let Some(sink) = phase_sink.as_deref_mut() {
+                    sink(&failed)?;
+                }
+                replayed.push(failed);
+                Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
+                return Ok(replayed);
+            }
+            if let Some(sink) = phase_sink.as_deref_mut() {
+                sink(payload)?;
+            }
+            replayed.push(payload.clone());
+        }
+        Self::validate_cached_search_producers(cx, resources, mode, payloads)?;
+        Ok(replayed)
     }
 
     #[cfg(test)]
@@ -60327,7 +60650,21 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
             let index_root = temp.path().join("index");
-            fs::create_dir(&index_root).unwrap();
+            fs::create_dir_all(index_root.join("vector")).unwrap();
+            let _restore = AppendEmbedderOverrides::install();
+            super::set_test_fast_embedder(Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))));
+            let mut writer = VectorIndex::create_with_revision(
+                &index_root.join(super::FSFS_VECTOR_INDEX_FILE),
+                "blend-fast-2",
+                &test_identity("blend-fast-2", 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer
+                .write_record("src/original-model.rs", &[1.0, 0.0])
+                .unwrap();
+            writer.finish().unwrap();
             let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
                 index_dir: Some(index_root.clone()),
                 ..CliInput::default()
@@ -60447,6 +60784,768 @@ mod tests {
                 payloads,
             );
             assert_eq!(fs::read(cache_path).unwrap(), original_bytes);
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn persistent_cache_readmits_fast_producers_from_the_current_runtime() {
+        run_on_runtime_task(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            for (override_mode, mode) in [
+                (DegradationOverrideMode::Auto, SearchExecutionMode::Full),
+                (
+                    DegradationOverrideMode::ForceEmbedDeferred,
+                    SearchExecutionMode::FastOnly,
+                ),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                drop(published_blend_resources(temp.path()));
+                super::set_test_fast_embedder(Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))));
+                super::set_test_quality_embedder(Some(Arc::new(BlendQueryEmbedder(
+                    "blend-quality-2",
+                ))));
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = temp.path().display().to_string();
+                config.search.quality_timeout_ms = 5_000;
+                config.pressure.degradation_override = override_mode;
+                config.search.fast_only = true;
+                let input = CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                };
+                let runtime = FsfsRuntime::new(config.clone()).with_cli_input(input.clone());
+                let query = "why does the semantic generation rank these files";
+                let original = runtime
+                    .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                    .await
+                    .unwrap();
+                assert!(
+                    original
+                        .iter()
+                        .any(super::payload_has_admitted_semantic_hits)
+                );
+                let key = runtime.search_cache_key(query, 10, mode).unwrap();
+                let fingerprint = runtime.search_index_fingerprint().unwrap();
+                assert_eq!(
+                    runtime
+                        .try_load_search_payload_cache(&key, &fingerprint)
+                        .unwrap(),
+                    Some(original.clone())
+                );
+                assert_eq!(
+                    runtime
+                        .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                        .await
+                        .unwrap(),
+                    original
+                );
+                let cache_path = runtime.search_cache_path(&key).unwrap();
+                let original_bytes = fs::read(&cache_path).unwrap();
+
+                // Neither the generation nor the model selection changed. A
+                // new process/configuration must still admit its actual loader
+                // result, including an unavailable model at a different root.
+                for provider in [
+                    Some(Arc::new(BlendQueryEmbedder("foreign-fast-2")) as Arc<dyn Embedder>),
+                    None,
+                ] {
+                    super::set_test_fast_embedder(provider);
+                    config.indexing.model_dir =
+                        temp.path().join("missing-models").display().to_string();
+                    let changed = FsfsRuntime::new(config.clone()).with_cli_input(input.clone());
+                    assert_eq!(changed.search_cache_key(query, 10, mode).unwrap(), key);
+                    assert_eq!(changed.search_index_fingerprint().unwrap(), fingerprint);
+                    let mut published = 0;
+                    let error = changed
+                        .execute_search_payloads_cached_for_cli_with_phase_sink(
+                            &cx,
+                            query,
+                            10,
+                            &mut |_| {
+                                published += 1;
+                                Ok(())
+                            },
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            error,
+                            SearchError::UnverifiableRemoteSpace { .. }
+                                | SearchError::EmbedderUnavailable { .. }
+                        ),
+                        "{mode:?}: {error:?}"
+                    );
+                    assert_eq!(
+                        published, 0,
+                        "a warm cache cannot publish before primary admission"
+                    );
+                    assert_eq!(fs::read(&cache_path).unwrap(), original_bytes);
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn persistent_cache_replay_rejects_new_resources_for_an_older_cached_generation() {
+        run_on_runtime_task(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            super::set_test_fast_embedder(Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))));
+            let temp = tempfile::tempdir().unwrap();
+            drop(published_blend_resources(temp.path()));
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.fast_only = true;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let query = "why does semantic ranking find these files";
+            let original = runtime
+                .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                .await
+                .unwrap();
+            let key = runtime
+                .search_cache_key(query, 10, SearchExecutionMode::Full)
+                .unwrap();
+            let lookup_generation = runtime.search_index_fingerprint().unwrap();
+            let cached = runtime
+                .try_load_search_payload_cache(&key, &lookup_generation)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cached, original);
+
+            // Publish another corpus under the exact same producer after the
+            // G1 cache read but before resources for this request are opened.
+            let replacement = temp.path().join("replacement.fsvi");
+            let mut writer = VectorIndex::create_with_revision(
+                &replacement,
+                "blend-fast-2",
+                &test_identity("blend-fast-2", 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer.write_record("replacement.rs", &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            fs::rename(replacement, temp.path().join(super::FSFS_VECTOR_INDEX_FILE)).unwrap();
+            let mut resources = runtime
+                .prepare_search_execution_resources_at_root_with_modes(
+                    &cx,
+                    temp.path(),
+                    SearchExecutionMode::Full,
+                    SearchExecutionMode::Full,
+                )
+                .await
+                .unwrap();
+            runtime
+                .maybe_prepare_fast_embedder(&cx, &mut resources)
+                .await
+                .unwrap();
+            assert_ne!(resources.generation_fingerprint, lookup_generation);
+            FsfsRuntime::validate_cached_search_producers(
+                &cx,
+                &resources,
+                SearchExecutionMode::Full,
+                &cached,
+            )
+            .unwrap();
+
+            let mut published = 0;
+            let error = FsfsRuntime::replay_cached_search_payloads(
+                &cx,
+                &resources,
+                SearchExecutionMode::Full,
+                &lookup_generation,
+                &cached,
+                Some(&mut |_| {
+                    published += 1;
+                    Ok(())
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "index.generation")
+            );
+            assert_eq!(
+                published, 0,
+                "valid G2 resources must not authorize G1 cached scores"
+            );
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn daemon_cache_refuses_missing_and_changed_fast_producers() {
+        run_on_runtime_task(|cx| async move {
+            for mode in ["full", "fast_only"] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = temp.path().display().to_string();
+                config.search.quality_timeout_ms = 5_000;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                });
+                let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                    "query": "why does semantic ranking find these files", "mode": mode,
+                    "limit": 10, "rerank": false,
+                }))
+                .unwrap();
+                let mut cache = HashMap::new();
+                let original = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        request.clone(),
+                        &mut resources,
+                        &mut cache,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!original.cached);
+                let warm = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        request.clone(),
+                        &mut resources,
+                        &mut cache,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(warm.cached);
+                assert_eq!(warm.payloads, original.payloads);
+                let original_cache = cache.clone();
+                for missing in [false, true] {
+                    let mut resources = resources.clone();
+                    resources.fast_embedder = if missing {
+                        None
+                    } else {
+                        Some(admitted(BlendQueryEmbedder("foreign-fast-2")))
+                    };
+                    resources.fast_embedder_attempted = true;
+                    let mut cache = original_cache.clone();
+                    let mut published = 0;
+                    let error = runtime
+                        .execute_search_serve_request_with_sink(
+                            &cx,
+                            request.clone(),
+                            &mut resources,
+                            &mut cache,
+                            super::SearchServeOptions {
+                                hot_cache_enabled: true,
+                                persist_explain_session: false,
+                            },
+                            Some(&mut |frame| {
+                                if matches!(frame, super::SearchServeFrame::Phase { .. }) {
+                                    published += 1;
+                                }
+                                Ok(())
+                            }),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            error,
+                            SearchError::UnverifiableRemoteSpace { .. }
+                                | SearchError::EmbedderUnavailable { .. }
+                        ),
+                        "{mode}: {error:?}"
+                    );
+                    assert_eq!(published, 0);
+                    assert!(cache.is_empty(), "the refused entry must be evicted");
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn daemon_cache_recomputes_optional_quality_before_replaying_initial() {
+        run_on_runtime_task(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            super::set_test_quality_embedder(Some(Arc::new(BlendQueryEmbedder(
+                "foreign-quality-2",
+            ))));
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": "why does semantic ranking find these files", "mode": "full",
+                "limit": 10, "rerank": false,
+            }))
+            .unwrap();
+            let mut cache = HashMap::new();
+            let original = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(
+                original
+                    .payloads
+                    .iter()
+                    .any(|payload| payload.phase == SearchOutputPhase::Refined)
+            );
+            assert!(!cache.is_empty());
+            resources.quality_embedder = Some(admitted(BlendQueryEmbedder("foreign-quality-2")));
+            let mut published = Vec::new();
+            let recovered = runtime
+                .execute_search_serve_request_with_sink(
+                    &cx,
+                    request,
+                    &mut resources,
+                    &mut cache,
+                    super::SearchServeOptions {
+                        hot_cache_enabled: true,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut |frame| {
+                        if let super::SearchServeFrame::Phase { payload } = frame {
+                            published.push(payload.phase);
+                        }
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(!recovered.cached);
+            assert_eq!(
+                published,
+                [
+                    SearchOutputPhase::Initial,
+                    SearchOutputPhase::RefinementFailed
+                ]
+            );
+            assert_eq!(
+                recovered.payloads[0].hits[0].path,
+                original.payloads[0].hits[0].path
+            );
+            assert!(
+                cache.is_empty(),
+                "failed quality is never reinserted as a successful cached refinement"
+            );
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn cold_quality_cache_admission_never_holds_initial_behind_the_load_gate() {
+        run_on_runtime_task(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            super::set_test_quality_embedder(Some(Arc::new(BlendQueryEmbedder("blend-quality-2"))));
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": "why does semantic ranking find these files", "mode": "full",
+                "limit": 10, "rerank": false,
+            }))
+            .unwrap();
+            let mut cache = HashMap::new();
+            let original = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(
+                original
+                    .payloads
+                    .iter()
+                    .any(|payload| payload.phase == SearchOutputPhase::Refined)
+            );
+            resources.quality_embedder = None;
+            resources.quality_embedder_attempted = false;
+            let held = asupersync::sync::OwnedMutexGuard::lock(
+                Arc::clone(&runtime.quality_load_gate),
+                &cx,
+            )
+            .await
+            .unwrap();
+            let initials = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&initials);
+            let mut sink = move |frame| {
+                if let super::SearchServeFrame::Phase { payload } = frame
+                    && payload.phase == SearchOutputPhase::Initial
+                {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            };
+            let mut operation = Box::pin(runtime.execute_search_serve_request_with_sink(
+                &cx,
+                request,
+                &mut resources,
+                &mut cache,
+                super::SearchServeOptions {
+                    hot_cache_enabled: true,
+                    persist_explain_session: false,
+                },
+                Some(&mut sink),
+            ));
+            std::future::poll_fn(|task| {
+                assert!(operation.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            let before_release = initials.load(Ordering::SeqCst);
+            drop(held);
+            assert_eq!(
+                before_release, 1,
+                "Initial must precede optional quality load admission"
+            );
+            let response = operation.await.unwrap();
+            assert!(!response.cached);
+            assert_eq!(initials.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                response.payloads.last().unwrap().phase,
+                SearchOutputPhase::Refined
+            );
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn shared_cache_rechecks_streaming_producers_and_evicts_only_the_rejected_answer() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let make_provider = || {
+                let mut provider = ScriptedBoundEmbedder::new(BoundScript::Values(vec![1.0, 0.0]));
+                provider.drifted = Some(test_identity("foreign-stream-producer", 2).clone());
+                Arc::new(provider)
+            };
+            let fast = make_provider();
+            let quality = make_provider();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            fs::create_dir_all(temp.path().join("vector")).unwrap();
+            for (path, provider, slot) in [
+                (
+                    super::FSFS_VECTOR_INDEX_FILE,
+                    &fast,
+                    &mut resources.vector_index,
+                ),
+                (
+                    super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                    &quality,
+                    &mut resources.quality_vector_index,
+                ),
+            ] {
+                let path = temp.path().join(path);
+                let mut writer = VectorIndex::create_with_revision(
+                    &path,
+                    provider.id(),
+                    &provider.identity().unwrap().fingerprint(),
+                    2,
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap();
+                writer.write_record("admitted.rs", &[1.0, 0.0]).unwrap();
+                writer.finish().unwrap();
+                *slot = Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
+            }
+            resources.fast_embedder = Some(admitted_shared(&fast));
+            resources.quality_embedder = Some(admitted_shared(&quality));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let query = "why does semantic ranking find these files";
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": query, "mode": "full", "limit": 10, "rerank": false,
+            }))
+            .unwrap();
+            let mut cache = HashMap::new();
+            let original = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                original.payloads.last().unwrap().phase,
+                SearchOutputPhase::Refined
+            );
+            let key = runtime
+                .search_cache_key(query, 10, SearchExecutionMode::Full)
+                .unwrap();
+            let calls = (
+                fast.calls.load(Ordering::SeqCst),
+                quality.calls.load(Ordering::SeqCst),
+            );
+            for (drift_fast, at_attestation, concurrent_replacement) in [
+                (true, true, false),
+                (true, false, false),
+                (false, false, false),
+                (false, false, true),
+            ] {
+                fast.drift.store(false, Ordering::SeqCst);
+                quality.drift.store(false, Ordering::SeqCst);
+                let shared = Arc::new(asupersync::sync::Mutex::new((
+                    resources.clone(),
+                    cache.clone(),
+                )));
+                let mut replacement = original.payloads.clone();
+                replacement[0].hits[0].path = "concurrently-refreshed.rs".to_owned();
+                let mut phases = Vec::new();
+                let result = runtime
+                    .execute_shared_search_serve_request_with_sink(
+                        &cx,
+                        request.clone(),
+                        Arc::clone(&shared),
+                        super::SearchServeOptions {
+                            hot_cache_enabled: true,
+                            persist_explain_session: false,
+                        },
+                        Some(&mut |frame| {
+                            let change = match frame {
+                                super::SearchServeFrame::Attested { .. } => at_attestation,
+                                super::SearchServeFrame::Phase { payload } => {
+                                    let initial = payload.phase == SearchOutputPhase::Initial;
+                                    phases.push(*payload);
+                                    initial && !at_attestation
+                                }
+                                _ => false,
+                            };
+                            if change {
+                                if drift_fast {
+                                    fast.drift.store(true, Ordering::SeqCst);
+                                } else {
+                                    quality.drift.store(true, Ordering::SeqCst);
+                                }
+                                if concurrent_replacement {
+                                    shared
+                                        .try_lock_owned()
+                                        .unwrap()
+                                        .1
+                                        .insert(key.clone(), replacement.clone());
+                                }
+                            }
+                            Ok(())
+                        }),
+                    )
+                    .await;
+                if drift_fast {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::UnverifiableRemoteSpace { .. })
+                    ));
+                    assert_eq!(phases.len(), usize::from(!at_attestation));
+                } else {
+                    let response = result.unwrap();
+                    assert_eq!(response.payloads, phases);
+                    assert_eq!(
+                        phases.iter().map(|phase| phase.phase).collect::<Vec<_>>(),
+                        [
+                            SearchOutputPhase::Initial,
+                            SearchOutputPhase::RefinementFailed
+                        ]
+                    );
+                    assert_eq!(phases[1].hits, original.payloads[0].hits);
+                    assert!(!phases[1].degradation_advice.is_empty());
+                }
+                let guard = shared.try_lock_owned().unwrap();
+                if concurrent_replacement {
+                    assert_eq!(guard.1.get(&key), Some(&replacement));
+                } else {
+                    assert!(
+                        !guard.1.contains_key(&key),
+                        "shared cache retained a refused answer"
+                    );
+                }
+                assert_eq!(
+                    (
+                        fast.calls.load(Ordering::SeqCst),
+                        quality.calls.load(Ordering::SeqCst)
+                    ),
+                    calls,
+                    "replay must not repeat inference"
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn ambiguous_cache_metadata_preserves_empty_queries_and_identifier_admission() {
+        run_on_runtime_task(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            super::set_test_fast_embedder(Some(Arc::new(BlendQueryEmbedder("foreign-fast-2"))));
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let lexical = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            lexical
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new(
+                        "lookup.rs",
+                        "pub fn cache_lookup() { cached_content(); }",
+                    ),
+                )
+                .await
+                .unwrap();
+            lexical.commit(&cx).await.unwrap();
+            drop(lexical);
+            resources.lexical_index = Some(
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            resources.fast_embedder = None;
+            resources.fast_embedder_attempted = false;
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            for query in ["", "cache_lookup"] {
+                let key = runtime
+                    .search_cache_key(query, 10, SearchExecutionMode::Full)
+                    .unwrap();
+                let mut cache = HashMap::from([(
+                    key,
+                    vec![SearchPayload::new(
+                        query,
+                        SearchOutputPhase::Initial,
+                        0,
+                        Vec::new(),
+                    )],
+                )]);
+                let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                    "query": query, "mode": "full", "limit": 10, "rerank": false,
+                }))
+                .unwrap();
+                let mut published = 0;
+                let result = runtime
+                    .execute_search_serve_request_with_sink(
+                        &cx,
+                        request,
+                        &mut resources,
+                        &mut cache,
+                        super::SearchServeOptions {
+                            hot_cache_enabled: true,
+                            persist_explain_session: false,
+                        },
+                        Some(&mut |frame| {
+                            if matches!(frame, super::SearchServeFrame::Phase { .. }) {
+                                published += 1;
+                            }
+                            Ok(())
+                        }),
+                    )
+                    .await;
+                if query.is_empty() {
+                    let response = result.unwrap();
+                    assert!(!response.cached);
+                    assert!(response.payloads[0].hits.is_empty());
+                    assert!(!resources.fast_embedder_attempted);
+                    assert!(resources.fast_embedder.is_none());
+                    assert_eq!(published, 1);
+                } else {
+                    // Full still requires semantic readiness when lexical
+                    // evidence lets an identifier skip vector inference.
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::UnverifiableRemoteSpace { .. })
+                    ));
+                    assert!(resources.fast_embedder_attempted);
+                    assert_eq!(
+                        published, 0,
+                        "ambiguous cached metadata cannot bypass primary admission"
+                    );
+                    assert!(cache.is_empty());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn lexical_cache_replay_observes_cancellation_before_and_after_callbacks() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = FsfsConfig::default();
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            config.indexing.fast_model = "unused-invalid-fast".to_owned();
+            config.indexing.quality_model = "unused-invalid-quality".to_owned();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let query = "lexical cancellation";
+            let payloads = vec![SearchPayload::new(
+                query,
+                SearchOutputPhase::Initial,
+                0,
+                Vec::new(),
+            )];
+            let key = runtime
+                .search_cache_key(query, 10, SearchExecutionMode::LexicalOnly)
+                .unwrap();
+            let fingerprint = runtime.search_index_fingerprint().unwrap();
+            runtime
+                .write_search_payload_cache(&key, &payloads, &fingerprint)
+                .unwrap();
+            for cancelled_at_entry in [true, false] {
+                cx.set_cancel_requested(cancelled_at_entry);
+                let mut published = 0;
+                let error = runtime
+                    .execute_search_payloads_cached_for_cli_with_phase_sink(
+                        &cx,
+                        query,
+                        10,
+                        &mut |_| {
+                            published += 1;
+                            cx.cancel_with(
+                                asupersync::CancelKind::User,
+                                Some("cancel cached phase"),
+                            );
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::Cancelled { .. }));
+                assert_eq!(published, usize::from(!cancelled_at_entry));
+                cx.set_cancel_requested(false);
+            }
         });
     }
 
