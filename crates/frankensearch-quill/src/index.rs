@@ -84,8 +84,8 @@ use crate::keeper::{
     KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout, LiveDocumentFloor,
     MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
     PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState, PublishIntent,
-    PublishedIdFilter, RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet,
-    inspect_lexical_layout, load_manifest_pair, plan_tier_merge_with_fit,
+    PublishedIdFilter, PublishedIdProbe, RecoveredSegment, TierMergePolicy, TierPolicyError,
+    TombstoneSet, inspect_lexical_layout, load_manifest_pair, plan_tier_merge_with_fit,
     validate_manifest_successor,
 };
 use crate::query::{
@@ -5746,6 +5746,54 @@ impl BenchAdmissionSession {
         }
     }
 
+    /// Run upsert's pre-admission identity work on `documents` through the
+    /// shipping filtered probes (`filtered`) or the incumbent all-segment
+    /// probes: the replacement probe, then tombstone staging into the next
+    /// MANIFEST. Nothing is installed. Returns whether the batch replaces a
+    /// published document, the staged proposal, and the replaced ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns the identity, cancellation, or authority failure either path
+    /// reports.
+    pub fn stage_upsert(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        filtered: bool,
+    ) -> Result<(bool, Manifest, Vec<String>), QuillIndexError> {
+        let batch = IngestBatch::Default(documents);
+        let (replaces, (manifest, replacement_ids)) = if filtered {
+            let replaces = self.writer.batch_replaces_published_document(cx, batch)?;
+            let mut filter = std::mem::take(&mut self.writer.published_id_filter);
+            let staged = self
+                .writer
+                .stage_upsert_replacements(cx, batch, &mut filter);
+            self.writer.published_id_filter = filter;
+            (replaces, staged?)
+        } else {
+            let authority = self.writer.authority_snapshot()?;
+            let replaces = QuillWriterState::any_document_published(
+                cx,
+                batch,
+                PublishedIdProbe::unfiltered(authority),
+            )?;
+            let manifest = authority.next_manifest()?;
+            let staged = QuillWriterState::stage_replacements_with(
+                cx,
+                batch,
+                PublishedIdProbe::unfiltered(authority),
+                manifest,
+            )?;
+            (replaces, staged)
+        };
+        Ok((
+            replaces,
+            manifest,
+            replacement_ids.into_iter().map(str::to_owned).collect(),
+        ))
+    }
+
     /// Drop the filter so the next filtered admission rebuilds it from the
     /// snapshot, as the first admission after opening an index does.
     pub fn reset_filter(&mut self) {
@@ -9263,27 +9311,15 @@ impl QuillWriterState {
                 return QuillObservedUpsert::new(Err(error), None);
             }
         }
-        let snapshot = match self.authority_snapshot() {
-            Ok(snapshot) => snapshot,
+        // Moved out so the staging probe can borrow it beside `&self`, exactly
+        // as `validate_batch_admission` does.
+        let mut filter = std::mem::take(&mut self.published_id_filter);
+        let staged = self.stage_upsert_replacements(cx, documents, &mut filter);
+        self.published_id_filter = filter;
+        let (manifest, replacement_ids) = match staged {
+            Ok(staged) => staged,
             Err(error) => return QuillObservedUpsert::new(Err(error), None),
         };
-        let mut manifest = match snapshot.next_manifest() {
-            Ok(manifest) => manifest,
-            Err(error) => return QuillObservedUpsert::new(Err(error.into()), None),
-        };
-        let mut replacement_ids = BTreeSet::new();
-        for document in documents {
-            if let Err(error) = check_cancel(cx, "upsert document batch") {
-                return QuillObservedUpsert::new(Err(error), None);
-            }
-            match snapshot.delete_document(&mut manifest, document.id()) {
-                Ok(true) => {
-                    replacement_ids.insert(document.id());
-                }
-                Ok(false) => {}
-                Err(error) => return QuillObservedUpsert::new(Err(error.into()), None),
-            }
-        }
         if replacement_ids.is_empty() {
             let (result, witness) = self
                 .index_documents_with_replacements_observed(
@@ -9414,19 +9450,91 @@ impl QuillWriterState {
     /// deciding to publish pending work — a batch that turns out to replace
     /// nothing leaves the writer exactly as it found it, so ordinary
     /// accumulate-before-commit is unaffected.
+    ///
+    /// Its only state is the [`PublishedIdFilter`] cache, which answers
+    /// "absent" for identifiers no published IDHASH can hold without probing
+    /// every segment; mutating that cache changes no answer.
     fn batch_replaces_published_document(
-        &self,
+        &mut self,
         cx: &Cx,
         documents: IngestBatch<'_>,
     ) -> Result<bool, QuillIndexError> {
+        let mut filter = std::mem::take(&mut self.published_id_filter);
+        let replaces = self.batch_replaces_published_document_filtered(cx, documents, &mut filter);
+        self.published_id_filter = filter;
+        replaces
+    }
+
+    fn batch_replaces_published_document_filtered(
+        &self,
+        cx: &Cx,
+        documents: IngestBatch<'_>,
+        filter: &mut PublishedIdFilter,
+    ) -> Result<bool, QuillIndexError> {
         let snapshot = self.authority_snapshot()?;
+        // An empty batch probes nothing, so it must not synchronize either.
+        if documents.is_empty() {
+            return Ok(false);
+        }
+        let published = filter.sync(snapshot, || check_cancel(cx, "upsert replacement probe"))?;
+        Self::any_document_published(cx, documents, published)
+    }
+
+    /// The loop of [`Self::batch_replaces_published_document`], with the
+    /// published-snapshot probe supplied by the caller.
+    fn any_document_published(
+        cx: &Cx,
+        documents: IngestBatch<'_>,
+        published: PublishedIdProbe<'_>,
+    ) -> Result<bool, QuillIndexError> {
         for document in documents {
             check_cancel(cx, "upsert replacement probe")?;
-            if snapshot.resolve_document_id(document.id())?.is_some() {
+            if published.resolve_document_id(document.id())?.is_some() {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Stage a tombstone into the next MANIFEST for every published identity
+    /// `documents` replaces, returning that proposal and the replaced ids.
+    ///
+    /// Each identifier goes through [`PublishedIdProbe::delete_document`], so
+    /// an identifier no published IDHASH can hold skips the all-segment probe;
+    /// every other one is staged exactly as [`KeeperSnapshot::delete_document`]
+    /// stages it.
+    fn stage_upsert_replacements<'a>(
+        &self,
+        cx: &Cx,
+        documents: IngestBatch<'a>,
+        filter: &mut PublishedIdFilter,
+    ) -> Result<(Manifest, BTreeSet<&'a str>), QuillIndexError> {
+        let snapshot = self.authority_snapshot()?;
+        let manifest = snapshot.next_manifest()?;
+        // An empty batch stages nothing, so it must not synchronize either.
+        if documents.is_empty() {
+            return Ok((manifest, BTreeSet::new()));
+        }
+        let published = filter.sync(snapshot, || check_cancel(cx, "upsert document batch"))?;
+        Self::stage_replacements_with(cx, documents, published, manifest)
+    }
+
+    /// The loop of [`Self::stage_upsert_replacements`], with the
+    /// published-snapshot probe supplied by the caller.
+    fn stage_replacements_with<'a>(
+        cx: &Cx,
+        documents: IngestBatch<'a>,
+        published: PublishedIdProbe<'_>,
+        mut manifest: Manifest,
+    ) -> Result<(Manifest, BTreeSet<&'a str>), QuillIndexError> {
+        let mut replacement_ids = BTreeSet::new();
+        for document in documents {
+            check_cancel(cx, "upsert document batch")?;
+            if published.delete_document(&mut manifest, document.id())? {
+                replacement_ids.insert(document.id());
+            }
+        }
+        Ok((manifest, replacement_ids))
     }
 
     async fn delete_document(
@@ -31687,6 +31795,127 @@ mod tests {
                 .index_documents(&cx, &[IndexableDocument::new("fresh-after-reopen", "new")])
                 .await
                 .expect("a fresh identifier is admitted after reopen");
+        });
+    }
+
+    /// Upsert's replacement probe and tombstone staging go through the
+    /// identity filter: a fresh-only upsert over pending work must publish
+    /// nothing, and every published identity must still be found and replaced
+    /// exactly once across separate publications, a concat merge, and a
+    /// writer reopen (whose first upsert rebuilds the filter from disk).
+    #[test]
+    fn upsert_filter_replaces_every_published_id_across_lifecycle() {
+        fn ids_matching(cx: &Cx, index: &QuillIndex, query: &str) -> BTreeSet<String> {
+            index
+                .search_doc_ids(cx, query, 1_000)
+                .expect("search")
+                .iter()
+                .map(|hit| hit.document_id.clone())
+                .collect()
+        }
+
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_visibility_lag_ms: u64::MAX,
+                tier_fanout: usize::MAX,
+                ..deterministic_config()
+            };
+            let directory = tempfile::tempdir().expect("upsert filter directory");
+            let index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("create on-disk index");
+            for segment in 0..6 {
+                let batch = (0..24)
+                    .map(|ordinal| {
+                        IndexableDocument::new(format!("u{segment}-d{ordinal}"), "original text")
+                    })
+                    .collect::<Vec<_>>();
+                index
+                    .index_documents(&cx, &batch)
+                    .await
+                    .expect("stage segment");
+                index.commit(&cx).await.expect("publish segment");
+            }
+            assert_eq!(committed_segment_ids(&index).len(), 6);
+
+            // Pending work plus a fresh-only upsert: nothing is replaced, so
+            // the upsert must not publish the pending batch.
+            let generation = published_generation(&index);
+            index
+                .index_documents(&cx, &[IndexableDocument::new("pending-0", "pending text")])
+                .await
+                .expect("stage pending work");
+            let fresh = (0..16)
+                .map(|ordinal| IndexableDocument::new(format!("fresh-{ordinal}"), "fresh text"))
+                .collect::<Vec<_>>();
+            index
+                .upsert_documents(&cx, &fresh)
+                .await
+                .expect("fresh-only upsert accumulates");
+            assert_eq!(published_generation(&index), generation);
+            assert!(index.has_uncommitted_changes());
+
+            // One published identity from every segment, plus fresh ones: the
+            // pending work publishes first, then each identity is replaced.
+            let mut replaced = BTreeSet::new();
+            let mut batch = Vec::new();
+            for segment in 0..6 {
+                let document_id = format!("u{segment}-d{segment}");
+                batch.push(IndexableDocument::new(&document_id, "replaced text"));
+                replaced.insert(document_id);
+                batch.push(IndexableDocument::new(
+                    format!("fresh-mixed-{segment}"),
+                    "fresh text",
+                ));
+            }
+            index
+                .upsert_documents(&cx, &batch)
+                .await
+                .expect("replace across every segment");
+            assert!(published_generation(&index) > generation);
+            assert!(!index.has_uncommitted_changes());
+            assert_eq!(index.doc_count().expect("doc count"), 144 + 1 + 16 + 6);
+            assert_eq!(ids_matching(&cx, &index, "replaced"), replaced);
+            assert_eq!(ids_matching(&cx, &index, "original").len(), 144 - 6);
+
+            // Identities that now live in a concat-merged output.
+            let inputs = committed_segment_ids(&index);
+            let output_segment_id = fresh_merge_segment_id(&index, 0x0ad1_0002);
+            index
+                .concat_merge(&cx, &inputs[..2], output_segment_id, 1_700_000_000)
+                .await
+                .expect("fold the first two segments");
+            let merged = [
+                IndexableDocument::new("u0-d5", "replaced text"),
+                IndexableDocument::new("u1-d7", "replaced text"),
+            ];
+            index
+                .upsert_documents(&cx, &merged)
+                .await
+                .expect("replace identities in the merged output");
+            replaced.extend(merged.iter().map(|document| document.id.clone()));
+            assert_eq!(index.doc_count().expect("doc count"), 167);
+            assert_eq!(ids_matching(&cx, &index, "replaced"), replaced);
+
+            drop(index);
+            let reopened = QuillIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("reopen writer");
+            let after_reopen = [
+                IndexableDocument::new("u3-d3", "replaced again"),
+                IndexableDocument::new("u4-d11", "replaced text"),
+                IndexableDocument::new("fresh-3", "replaced text"),
+                IndexableDocument::new("fresh-after-reopen", "fresh text"),
+            ];
+            reopened
+                .upsert_documents(&cx, &after_reopen)
+                .await
+                .expect("replace after reopen");
+            replaced.extend(["u4-d11".to_owned(), "fresh-3".to_owned()]);
+            assert_eq!(reopened.doc_count().expect("doc count"), 168);
+            assert_eq!(ids_matching(&cx, &reopened, "replaced"), replaced);
+            assert_eq!(ids_matching(&cx, &reopened, "again").len(), 1);
+            assert_eq!(ids_matching(&cx, &reopened, "original").len(), 144 - 9);
         });
     }
 

@@ -4538,6 +4538,24 @@ impl KeeperSnapshot {
         proposed: &mut Manifest,
         document_id: &str,
     ) -> Result<bool, KeeperError> {
+        self.delete_document_filtered(proposed, document_id, None)
+    }
+
+    /// [`Self::delete_document`], answering `Ok(false)` without probing any
+    /// segment when `filter` lacks the identifier's key.
+    ///
+    /// `filter` must be synchronized to this snapshot with absence answers
+    /// enabled (see [`PublishedIdProbe`]). The skip comes after both
+    /// identifier-independent checks, so the only result it replaces is the
+    /// probe's: with the proposal's segments verified to be this snapshot's own
+    /// bindings, a key absent from every covered IDHASH resolves to `Ok(None)`
+    /// against `proposed` exactly as against the loaded MANIFEST.
+    fn delete_document_filtered(
+        &self,
+        proposed: &mut Manifest,
+        document_id: &str,
+        filter: Option<&PublishedIdFilter>,
+    ) -> Result<bool, KeeperError> {
         validate_staged_manifest(&self.loaded.manifest, proposed)?;
         if let Some(segment) = proposed.segments.iter().find(|segment| {
             self.loaded
@@ -4554,6 +4572,10 @@ impl KeeperSnapshot {
                     segment.segment_id
                 ),
             });
+        }
+        if filter.is_some_and(|filter| !filter.may_contain(seeded_id_hash(document_id.as_bytes())))
+        {
+            return Ok(false);
         }
         let Some(resolved) = self.resolve_document_id_in(proposed, document_id)? else {
             return Ok(false);
@@ -4963,6 +4985,21 @@ impl PublishedIdProbe<'_> {
         self.snapshot.resolve_document_id(document_id)
     }
 
+    /// [`KeeperSnapshot::delete_document`], returning `Ok(false)` without
+    /// probing any segment when the filter proves the identifier absent.
+    ///
+    /// # Errors
+    ///
+    /// Exactly the errors of [`KeeperSnapshot::delete_document`].
+    pub(crate) fn delete_document(
+        &self,
+        proposed: &mut Manifest,
+        document_id: &str,
+    ) -> Result<bool, KeeperError> {
+        self.snapshot
+            .delete_document_filtered(proposed, document_id, self.filter)
+    }
+
     /// Whether the filter, rather than the full probe, answers misses.
     #[cfg(any(test, feature = "bench-internals"))]
     pub(crate) const fn answers_absence(&self) -> bool {
@@ -4974,6 +5011,18 @@ impl PublishedIdProbe<'_> {
     pub(crate) fn passes_to_probe(&self, document_id: &str) -> bool {
         self.filter
             .is_none_or(|filter| filter.may_contain(seeded_id_hash(document_id.as_bytes())))
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl<'a> PublishedIdProbe<'a> {
+    /// A probe that answers every identifier with the full all-segment probe,
+    /// the incumbent a same-invocation benchmark compares against.
+    pub(crate) const fn unfiltered(snapshot: &'a KeeperSnapshot) -> Self {
+        Self {
+            filter: None,
+            snapshot,
+        }
     }
 }
 
@@ -23444,6 +23493,136 @@ mod tests {
         assert_filtered_resolution_matches(&mut filter, &emptied, &published, &absent)?;
         for document_id in &published {
             assert_eq!(emptied.resolve_document_id(document_id)?, None);
+        }
+        Ok(())
+    }
+
+    /// Stage every identifier into one proposal through a synchronized
+    /// [`PublishedIdFilter`] and through the full probe, requiring the same
+    /// result and the same staged MANIFEST after every call.
+    fn assert_filtered_deletion_matches(
+        filter: &mut PublishedIdFilter,
+        snapshot: &KeeperSnapshot,
+        document_ids: &[String],
+    ) -> TestResult {
+        let probe = filter.sync(snapshot, || Ok::<(), KeeperError>(()))?;
+        assert!(
+            probe.answers_absence(),
+            "a consistent snapshot is filterable"
+        );
+        let mut full = snapshot.next_manifest()?;
+        let mut filtered = full.clone();
+        for document_id in document_ids {
+            assert_eq!(
+                format!("{:?}", probe.delete_document(&mut filtered, document_id)),
+                format!("{:?}", snapshot.delete_document(&mut full, document_id)),
+                "filtered deletion diverged for {document_id:?}"
+            );
+            assert_eq!(
+                filtered, full,
+                "staged proposal diverged at {document_id:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn published_id_filter_stages_deletions_exactly_as_the_full_probe() -> TestResult {
+        const SEGMENTS: u64 = 8;
+        const DOCS_PER_SEGMENT: u64 = 256;
+        let mut snapshot = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let mut filter = PublishedIdFilter::default();
+        let mut published = Vec::new();
+        for segment in 0..SEGMENTS {
+            let ids = (0..DOCS_PER_SEGMENT)
+                .map(|ordinal| format!("seg{segment}-doc{ordinal}"))
+                .collect::<Vec<_>>();
+            let slots = ids.iter().map(|id| Some(id.as_str())).collect::<Vec<_>>();
+            let docid_lo = segment * DOCS_PER_SEGMENT;
+            let encoded = encoded_identity_test_segment(0xa00 + segment, docid_lo, &slots)?;
+            let mut proposed = snapshot.next_manifest()?;
+            proposed.docid_high_watermark = docid_lo + DOCS_PER_SEGMENT;
+            proposed
+                .segments
+                .push(manifest_segment(&encoded, segment + 1));
+            snapshot = snapshot.publish_owned_segments(&proposed, vec![encoded])?;
+            published.extend(ids);
+        }
+        // Interleave published, absent and repeated identifiers, so staged
+        // tombstones from earlier calls shape later ones in both proposals.
+        let mut sequence = Vec::new();
+        for (ordinal, document_id) in published.iter().enumerate().step_by(3) {
+            sequence.push(document_id.clone());
+            sequence.push(format!("absent-{ordinal}"));
+            if ordinal % 5 == 0 {
+                sequence.push(document_id.clone());
+            }
+        }
+        assert_filtered_deletion_matches(&mut filter, &snapshot, &sequence)?;
+
+        // Published tombstones keep their IDHASH keys: they reach the probe,
+        // which skips the dead row and stages nothing.
+        let mut deleted = snapshot.next_manifest()?;
+        for ordinal in 0..DOCS_PER_SEGMENT / 2 {
+            assert!(snapshot.delete_document(&mut deleted, &format!("seg2-doc{ordinal}"))?);
+        }
+        snapshot = snapshot.publish_owned_segments(&deleted, Vec::new())?;
+        assert_filtered_deletion_matches(&mut filter, &snapshot, &sequence)?;
+
+        // A duplicate live row fails the same way through both paths.
+        let docid_lo = SEGMENTS * DOCS_PER_SEGMENT;
+        let encoded = encoded_identity_test_segment(0xaff, docid_lo, &[Some("seg6-doc9")])?;
+        let mut duplicated = snapshot.next_manifest()?;
+        duplicated.docid_high_watermark = docid_lo + 1;
+        duplicated
+            .segments
+            .push(manifest_segment(&encoded, SEGMENTS + 1));
+        let duplicate = snapshot.publish_owned_segments(&duplicated, vec![encoded])?;
+        let mut proposal = duplicate.next_manifest()?;
+        assert!(matches!(
+            duplicate.delete_document(&mut proposal, "seg6-doc9"),
+            Err(KeeperError::MultipleLiveDocumentIds { .. })
+        ));
+        assert_filtered_deletion_matches(&mut filter, &duplicate, &sequence)?;
+
+        // Identifier-independent refusals come first on both paths, even for
+        // an identifier the filter proves absent.
+        let probe = filter.sync(&snapshot, || Ok::<(), KeeperError>(()))?;
+        let filtered_out = (0..4_096)
+            .map(|ordinal| format!("never-published-{ordinal}"))
+            .find(|document_id| !probe.passes_to_probe(document_id))
+            .ok_or("the filter must reject some absent identifier")?;
+        for document_id in [filtered_out.as_str(), "seg4-doc1"] {
+            let mut stale = snapshot.loaded_manifest().manifest.clone();
+            let mut stale_full = stale.clone();
+            assert_eq!(
+                format!("{:?}", probe.delete_document(&mut stale, document_id)),
+                format!(
+                    "{:?}",
+                    snapshot.delete_document(&mut stale_full, document_id)
+                ),
+            );
+            assert!(
+                probe.delete_document(&mut stale, document_id).is_err(),
+                "a non-successor proposal is refused"
+            );
+            assert_eq!(stale, stale_full);
+
+            let mut grown = duplicate.next_manifest()?;
+            grown.generation = snapshot.next_manifest()?.generation;
+            let mut grown_full = grown.clone();
+            assert_eq!(
+                format!("{:?}", probe.delete_document(&mut grown, document_id)),
+                format!(
+                    "{:?}",
+                    snapshot.delete_document(&mut grown_full, document_id)
+                ),
+            );
+            assert!(
+                probe.delete_document(&mut grown, document_id).is_err(),
+                "a proposal adding a segment is refused"
+            );
+            assert_eq!(grown, grown_full);
         }
         Ok(())
     }
