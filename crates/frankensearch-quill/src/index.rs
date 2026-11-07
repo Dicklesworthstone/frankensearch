@@ -5737,7 +5737,7 @@ impl RootRefreshPause {
     /// generation is read, i.e. the VALIDATE window. A reader exists here but
     /// is not installed, so cancelling must drop it.
     const STAGE_VALIDATION: u8 = 2;
-    /// Immediately before the `ArcSwap` store. The SWAP window.
+    /// Immediately before the `ArcSwap` compare-and-swap. The SWAP window.
     const STAGE_SWAP: u8 = 3;
 
     /// Park the refresh at `stage` until the paired canceller releases it.
@@ -14002,13 +14002,25 @@ impl RootBoundQuillSearchIndex {
     /// snapshot always leave the previous reader live for in-flight and later
     /// searches.
     ///
+    /// Returns `true` when this call installs its replacement. Returns `false`
+    /// when the published state is unchanged or another refresh has already
+    /// replaced the state this call started from. A superseded refresh never
+    /// overwrites the winning reader; a caller may refresh again to inspect a
+    /// later publication.
+    ///
     /// # Errors
     ///
     /// Returns typed cancellation, layout, recovery, schema, or
     /// snapshot-transition failures. A generation regression within the same
-    /// active engine directory is rejected.
+    /// active engine directory is rejected while this call's starting state
+    /// is still current.
     pub async fn refresh(&self, cx: &Cx) -> Result<bool, QuillIndexError> {
         check_cancel(cx, "root-bound reader refresh")?;
+        // Bind the replacement to the state observed before any asynchronous
+        // layout inspection. Generations in different engine directories are
+        // independent, so a late refresh cannot safely rebase its candidate
+        // onto a newer reader merely by comparing generation numbers.
+        let expected = self.state.load_full();
         let replacement = Self::open_state_inner(
             cx,
             &self.lexical_root,
@@ -14017,26 +14029,26 @@ impl RootBoundQuillSearchIndex {
             Some(self.refresh_pause.as_ref()),
         )
         .await?;
-        self.install_validated_replacement(cx, replacement).await
+        self.install_validated_replacement(cx, &expected, replacement)
+            .await
     }
 
     /// Install one replacement that has already passed root-layout and Quill
     /// snapshot validation. Keeping this visibility boundary separate makes
     /// cancellation linearizable: no mutable reader state is touched before
-    /// the final check immediately preceding the `ArcSwap` store.
+    /// the final check immediately preceding the `ArcSwap` compare-and-swap.
     #[allow(clippy::unused_async_trait_impl)]
     async fn install_validated_replacement(
         &self,
         cx: &Cx,
+        expected: &Arc<RootBoundQuillReaderState>,
         replacement: RootBoundQuillReaderState,
     ) -> Result<bool, QuillIndexError> {
-        #[cfg(test)]
-        self.refresh_pause
-            .wait_at(RootRefreshPause::STAGE_SWAP)
-            .await;
-
         check_cancel(cx, "root-bound reader refresh swap")?;
         let current = self.state.load_full();
+        if !Arc::ptr_eq(&current, expected) {
+            return Ok(false);
+        }
         if replacement.active_path == current.active_path {
             if replacement.generation < current.generation {
                 return Err(invalid_state(format!(
@@ -14053,8 +14065,14 @@ impl RootBoundQuillSearchIndex {
             }
         }
 
-        self.state.store(Arc::new(replacement));
-        Ok(true)
+        #[cfg(test)]
+        self.refresh_pause
+            .wait_at(RootRefreshPause::STAGE_SWAP)
+            .await;
+
+        check_cancel(cx, "root-bound reader refresh swap")?;
+        let previous = self.state.compare_and_swap(expected, Arc::new(replacement));
+        Ok(Arc::ptr_eq(&previous, expected))
     }
 
     async fn open_state(
@@ -19308,6 +19326,163 @@ mod tests {
     }
 
     #[test]
+    fn root_bound_concurrent_refresh_preserves_newer_engine_at_every_stage() {
+        run_with_blocking_cx(|cx| async move {
+            for stage in [
+                RootRefreshPause::STAGE_INSPECTION,
+                RootRefreshPause::STAGE_VALIDATION,
+                RootRefreshPause::STAGE_SWAP,
+            ] {
+                assert_superseded_root_refresh_preserves_winner(&cx, stage, false).await;
+            }
+        });
+    }
+
+    #[test]
+    fn root_bound_concurrent_refresh_preserves_newer_manifest_at_every_stage() {
+        run_with_blocking_cx(|cx| async move {
+            for stage in [
+                RootRefreshPause::STAGE_INSPECTION,
+                RootRefreshPause::STAGE_VALIDATION,
+                RootRefreshPause::STAGE_SWAP,
+            ] {
+                assert_superseded_root_refresh_preserves_winner(&cx, stage, true).await;
+            }
+        });
+    }
+
+    async fn assert_superseded_root_refresh_preserves_winner(
+        cx: &Cx,
+        stage: u8,
+        same_directory: bool,
+    ) {
+        let root = tempfile::tempdir().expect("concurrent root-bound refresh directory");
+        let lexical_root = root.path();
+        let first_path =
+            create_root_generation(cx, lexical_root, "quill-v1", "old", "old token").await;
+        publish_current(lexical_root, &root_pointer("quill-v1"))
+            .expect("publish initial root generation");
+        let reader = RootBoundQuillSearchIndex::open(cx, lexical_root, deterministic_config())
+            .await
+            .expect("open concurrent root-bound reader");
+        let original = reader.state.load_full();
+
+        let writer = if same_directory {
+            let writer = QuillIndex::open(cx, &first_path, deterministic_config())
+                .await
+                .expect("open writer for successive MANIFEST publications");
+            writer
+                .index_document(cx, &IndexableDocument::new("middle", "middle token"))
+                .await
+                .expect("stage intermediate MANIFEST document");
+            writer
+                .commit(cx)
+                .await
+                .expect("publish intermediate MANIFEST");
+            Some(writer)
+        } else {
+            create_root_generation(cx, lexical_root, "quill-v2", "middle", "middle token").await;
+            publish_current(lexical_root, &root_pointer("quill-v2"))
+                .expect("publish intermediate engine directory");
+            None
+        };
+
+        let pause = Arc::clone(&reader.refresh_pause);
+        pause.stage.store(stage, Ordering::Release);
+        let mut earlier_refresh = Box::pin(reader.refresh(cx));
+        std::future::poll_fn(|task_cx| {
+            let outcome = earlier_refresh.as_mut().poll(task_cx);
+            assert!(
+                outcome.is_pending(),
+                "the earlier refresh must reach stage {stage} before completing: {outcome:?}"
+            );
+            if pause.arrived.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        // The first refresh stays parked because wait_at has already selected
+        // its stage. Disable only future arrivals so the second can finish.
+        pause
+            .stage
+            .store(RootRefreshPause::STAGE_NONE, Ordering::Release);
+        let winning_path = if let Some(writer) = &writer {
+            writer
+                .index_document(cx, &IndexableDocument::new("newest", "newest token"))
+                .await
+                .expect("stage newest MANIFEST document");
+            writer.commit(cx).await.expect("publish newest MANIFEST");
+            first_path
+        } else {
+            let path =
+                create_root_generation(cx, lexical_root, "quill-v3", "newest", "newest token")
+                    .await;
+            publish_current(lexical_root, &root_pointer("quill-v3"))
+                .expect("publish newest engine directory");
+            path
+        };
+        assert!(reader.refresh(cx).await.expect("later refresh wins"));
+        let winner = reader.state.load_full();
+        assert_eq!(winner.active_path, winning_path);
+        if same_directory {
+            assert!(winner.generation > original.generation);
+        }
+
+        pause.release.store(true, Ordering::Release);
+        assert!(
+            !earlier_refresh
+                .await
+                .expect("superseded refresh completes without a stale regression error"),
+            "a refresh superseded at stage {stage} must not install its candidate"
+        );
+        assert!(Arc::ptr_eq(&winner, &reader.state.load_full()));
+        assert_eq!(reader.active_path(), winning_path);
+        assert_eq!(reader.keeper_generation(), winner.generation);
+        assert_eq!(
+            LexicalRead::search(&reader, cx, "newest", 10)
+                .await
+                .expect("winning reader finds the latest document")[0]
+                .doc_id,
+            "newest"
+        );
+        assert_eq!(
+            LexicalRead::search(original.reader.as_ref(), cx, "old", 10)
+                .await
+                .expect("in-flight reader retains its original document")[0]
+                .doc_id,
+            "old"
+        );
+        assert!(
+            LexicalRead::search(original.reader.as_ref(), cx, "newest", 10)
+                .await
+                .expect("in-flight reader remains pinned")
+                .is_empty()
+        );
+        assert!(!reader.refresh(cx).await.expect("unchanged refresh"));
+        assert!(Arc::ptr_eq(&winner, &reader.state.load_full()));
+
+        if same_directory {
+            let regression = RootBoundQuillReaderState {
+                reader: Arc::clone(&original.reader),
+                active_path: original.active_path.clone(),
+                pointer: original.pointer.clone(),
+                generation: original.generation,
+            };
+            let error = reader
+                .install_validated_replacement(cx, &winner, regression)
+                .await
+                .expect_err("an unchanged expected state must still reject a true regression");
+            assert!(
+                matches!(error, QuillIndexError::InvalidState { detail } if detail.contains("regressed Quill generation"))
+            );
+            assert!(Arc::ptr_eq(&winner, &reader.state.load_full()));
+        }
+    }
+
+    #[test]
     fn labruntime_cancel_before_root_bound_swap_retains_the_old_reader() {
         let root = tempfile::tempdir().expect("root-bound cancellation directory");
         let lexical_root = root.path().to_path_buf();
@@ -19317,7 +19492,7 @@ mod tests {
             .build()
             .expect("build root-bound cancellation runtime");
 
-        let (reader, replacement) = runtime.block_on(async {
+        let (reader, expected, replacement) = runtime.block_on(async {
             create_root_generation(&setup_cx, &lexical_root, "quill-v1", "old", "old token").await;
             publish_current(&lexical_root, &root_pointer("quill-v1"))
                 .expect("publish first root generation");
@@ -19325,6 +19500,7 @@ mod tests {
                 RootBoundQuillSearchIndex::open(&setup_cx, &lexical_root, deterministic_config())
                     .await
                     .expect("open root-bound reader");
+            let expected = reader.state.load_full();
             create_root_generation(&setup_cx, &lexical_root, "quill-v2", "new", "new token").await;
             publish_current(&lexical_root, &root_pointer("quill-v2"))
                 .expect("publish replacement root generation");
@@ -19335,7 +19511,7 @@ mod tests {
             )
             .await
             .expect("open and validate replacement before Lab cancellation");
-            (reader, replacement)
+            (reader, expected, replacement)
         });
         let pause = Arc::clone(&reader.refresh_pause);
         pause
@@ -19354,7 +19530,11 @@ mod tests {
             .create_task(region, Budget::INFINITE, async move {
                 assert!(matches!(
                     refresh_reader
-                        .install_validated_replacement(refresh_context.as_ref(), replacement)
+                        .install_validated_replacement(
+                            refresh_context.as_ref(),
+                            &expected,
+                            replacement,
+                        )
                         .await,
                     Err(QuillIndexError::Cancelled {
                         phase: "root-bound reader refresh swap"
