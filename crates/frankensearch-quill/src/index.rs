@@ -365,6 +365,11 @@ pub struct QuillSearchResult {
 const RANKED_QUERY_CACHE_SETS: usize = 64;
 const RANKED_QUERY_CACHE_WAYS: usize = 4;
 const RANKED_QUERY_CACHE_SLOTS: usize = RANKED_QUERY_CACHE_SETS * RANKED_QUERY_CACHE_WAYS;
+// Bound retained allocations, not merely entry count: an all-results page or
+// an ignored query suffix must not keep a corpus-sized allocation alive in
+// each slot. Ordinary top-k pages fit comfortably within this allowance.
+const RANKED_QUERY_CACHE_ENTRY_BYTES: usize = 64 * 1024;
+const RANKED_QUERY_CACHE_RAW_KEY_BYTES: usize = crate::query::MAX_QUERY_LENGTH * 4;
 
 enum RankedQueryCacheKey {
     Raw(Arc<str>),
@@ -386,7 +391,11 @@ struct CachedRankedQuery {
 ///
 /// Exact keys are retained alongside their fingerprints, so collisions only
 /// cost a miss. Snapshot epochs make publication the invalidation boundary.
-/// The fixed four-way table bounds memory without adding reader coordination.
+/// Each entry is admitted against a retained-allocation budget before cloning
+/// its key or diagnostics. The fixed four-way table therefore retains at most
+/// 16 MiB of charged entry allocations, plus its fixed table and allocator
+/// overhead, without reader coordination. Pages held by callers after eviction
+/// are owned by those callers and are outside the cache's retention budget.
 struct RankedQueryCache {
     slots: [ArcSwapOption<CachedRankedQuery>; RANKED_QUERY_CACHE_SLOTS],
 }
@@ -468,6 +477,12 @@ impl RankedQueryCache {
         exact_count: bool,
         result: &QuillSearchResult,
     ) {
+        let key_bytes = cache_arc_allocation_bytes::<u8>(query.len());
+        if query.len() > RANKED_QUERY_CACHE_RAW_KEY_BYTES
+            || ranked_query_cache_entry_bytes(key_bytes, result) > RANKED_QUERY_CACHE_ENTRY_BYTES
+        {
+            return;
+        }
         self.insert(Arc::new(CachedRankedQuery {
             fingerprint,
             snapshot_epoch,
@@ -489,6 +504,11 @@ impl RankedQueryCache {
         exact_count: bool,
         result: &QuillSearchResult,
     ) {
+        let key_bytes =
+            cache_arc_allocation_bytes::<Query>(1).saturating_add(query.cache_heap_bytes());
+        if ranked_query_cache_entry_bytes(key_bytes, result) > RANKED_QUERY_CACHE_ENTRY_BYTES {
+            return;
+        }
         let fingerprint =
             preparsed_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
         self.insert(Arc::new(CachedRankedQuery {
@@ -520,6 +540,50 @@ impl RankedQueryCache {
             slot.store(Some(cached));
         }
     }
+}
+
+/// Charge an Arc's payload, reference counts, and worst-case alignment padding.
+/// Allocator bookkeeping is deliberately not represented as an RSS guarantee.
+fn cache_arc_allocation_bytes<T>(len: usize) -> usize {
+    let alignment = std::mem::align_of::<T>().max(std::mem::align_of::<AtomicUsize>());
+    std::mem::size_of::<T>()
+        .saturating_mul(len)
+        .saturating_add(2 * std::mem::size_of::<AtomicUsize>())
+        .saturating_add(2 * alignment.saturating_sub(1))
+}
+
+fn ranked_query_cache_entry_bytes(key_bytes: usize, result: &QuillSearchResult) -> usize {
+    let mut bytes = cache_arc_allocation_bytes::<CachedRankedQuery>(1)
+        .saturating_add(key_bytes)
+        .saturating_add(cache_arc_allocation_bytes::<QuillSearchResult>(1))
+        .saturating_add(cache_arc_allocation_bytes::<QuillHit>(result.hits.len()))
+        .saturating_add(
+            result
+                .diagnostics
+                .capacity()
+                .saturating_mul(std::mem::size_of::<QueryDiagnostic>()),
+        );
+    if bytes > RANKED_QUERY_CACHE_ENTRY_BYTES {
+        return bytes;
+    }
+    // The hit page is shared, so retain its actual String capacities, even
+    // when a short identifier occupies an oversized allocation. Diagnostics
+    // are cloned; charging their source capacities is conservative as well.
+    for hit in result.hits.iter() {
+        bytes = bytes.saturating_add(hit.document_id.capacity());
+        if bytes > RANKED_QUERY_CACHE_ENTRY_BYTES {
+            return bytes;
+        }
+    }
+    for diagnostic in &result.diagnostics {
+        bytes = bytes
+            .saturating_add(diagnostic.message.capacity())
+            .saturating_add(diagnostic.fragment.as_ref().map_or(0, String::capacity));
+        if bytes > RANKED_QUERY_CACHE_ENTRY_BYTES {
+            return bytes;
+        }
+    }
+    bytes
 }
 
 fn ranked_query_cache_set_start(fingerprint: u64) -> usize {
@@ -10621,7 +10685,11 @@ impl QuillReader {
             }
             return Err(error);
         }
-        let cache_enabled = self.ranked_query_cache_enabled();
+        // The parser ignores any suffix beyond MAX_QUERY_LENGTH characters.
+        // Do not hash or retain arbitrarily large raw input just to memoize
+        // that bounded query; execution and truncation diagnostics are intact.
+        let cache_enabled =
+            self.ranked_query_cache_enabled() && query.len() <= RANKED_QUERY_CACHE_RAW_KEY_BYTES;
         #[cfg(feature = "pruning-conformance")]
         let cache_enabled = cache_enabled && pruning_trace.is_none();
         let cache_fingerprint = cache_enabled.then(|| {
@@ -19819,6 +19887,206 @@ mod tests {
                 .get_preparsed(4, &Query::boost(Query::all(), 2.5), 0, 0, true,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ranked_query_cache_rejects_retained_capacity_and_nested_diagnostics() {
+        let cache = RankedQueryCache::default();
+        let ordinary = QuillSearchResult {
+            hits: vec![QuillHit {
+                document_id: "ordinary".to_owned(),
+                global_docid: 0,
+                score: 1.0,
+            }]
+            .into(),
+            total_count: Some(1),
+            doc_count: 1,
+            diagnostics: Vec::new(),
+        };
+        let fingerprint = raw_query_cache_fingerprint(1, "alpha", 10, 0, true);
+        cache.insert_raw(fingerprint, 1, "alpha", 10, 0, true, &ordinary);
+
+        let mut oversized_id = String::with_capacity(RANKED_QUERY_CACHE_ENTRY_BYTES);
+        oversized_id.push_str("short");
+        let id_capacity = QuillSearchResult {
+            hits: vec![QuillHit {
+                document_id: oversized_id,
+                global_docid: 1,
+                score: 1.0,
+            }]
+            .into(),
+            ..ordinary.clone()
+        };
+        let diagnostic = crate::query::QueryDiagnostic {
+            kind: crate::query::QueryDiagnosticKind::SyntaxRecovery,
+            message: "recovered".to_owned(),
+            byte_offset: Some(0),
+            fragment: None,
+        };
+        let mut oversized_message = diagnostic.clone();
+        oversized_message.message = "x".repeat(RANKED_QUERY_CACHE_ENTRY_BYTES);
+        let mut oversized_fragment = diagnostic.clone();
+        oversized_fragment.fragment = Some("x".repeat(RANKED_QUERY_CACHE_ENTRY_BYTES));
+        let mut reserved_diagnostics = Vec::with_capacity(
+            RANKED_QUERY_CACHE_ENTRY_BYTES / std::mem::size_of::<QueryDiagnostic>() + 1,
+        );
+        reserved_diagnostics.push(diagnostic);
+        let rejected = [
+            id_capacity,
+            QuillSearchResult {
+                diagnostics: vec![oversized_message],
+                ..ordinary.clone()
+            },
+            QuillSearchResult {
+                diagnostics: vec![oversized_fragment],
+                ..ordinary.clone()
+            },
+            QuillSearchResult {
+                diagnostics: reserved_diagnostics,
+                ..ordinary.clone()
+            },
+        ];
+        for (case, result) in rejected.iter().enumerate() {
+            let query = format!("oversized-{case}");
+            let fingerprint = raw_query_cache_fingerprint(1, &query, 10, 0, true);
+            let prior_owners = Arc::strong_count(&result.hits);
+            cache.insert_raw(fingerprint, 1, &query, 10, 0, true, result);
+            assert!(cache.get_raw(fingerprint, 1, &query, 10, 0, true).is_none());
+            assert_eq!(
+                Arc::strong_count(&result.hits),
+                prior_owners,
+                "refused admission must not retain the page for case {case}",
+            );
+        }
+        assert_eq!(
+            cache.get_raw(fingerprint, 1, "alpha", 10, 0, true),
+            Some(ordinary),
+            "oversized results must not evict an ordinary entry",
+        );
+    }
+
+    #[test]
+    fn ranked_query_cache_large_raw_suffix_preserves_search_and_diagnostics() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("cache test index");
+            index
+                .index_document(&cx, &IndexableDocument::new("doc", "alpha"))
+                .await
+                .expect("index document");
+            index.commit(&cx).await.expect("commit document");
+            let ordinary = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("ordinary query");
+            let mut oversized = "alpha".to_owned();
+            oversized.push_str(&" ".repeat(RANKED_QUERY_CACHE_RAW_KEY_BYTES));
+            oversized.push_str("term-outside-parser-bound");
+            let first = index
+                .search_paginated(&cx, &oversized, 10, 0, true)
+                .expect("oversized query still executes");
+            let second = index
+                .search_paginated(&cx, &oversized, 10, 0, true)
+                .expect("repeated oversized query still executes");
+            assert_eq!(first, second);
+            assert_eq!(first.hits, ordinary.hits);
+            assert_eq!(first.total_count, ordinary.total_count);
+            assert_eq!(first.doc_count, ordinary.doc_count);
+            assert!(first.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == crate::query::QueryDiagnosticKind::Truncated
+            }));
+            assert!(
+                !Arc::ptr_eq(&first.hits, &second.hits),
+                "a refused raw key must not retain the first page",
+            );
+            let repeated = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("ordinary query stays cached");
+            assert_eq!(ordinary, repeated);
+            assert!(Arc::ptr_eq(&ordinary.hits, &repeated.hits));
+        });
+    }
+
+    #[test]
+    fn ranked_query_cache_large_pages_execute_without_being_retained() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("cache test index");
+            let documents: Vec<_> = (0..2_048)
+                .map(|ordinal| IndexableDocument::new(format!("document-{ordinal:04}"), "alpha"))
+                .collect();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index result-page corpus");
+            index.commit(&cx).await.expect("commit result-page corpus");
+            let first = index
+                .search_paginated(&cx, "alpha", 100_000, 0, true)
+                .expect("large requested page executes");
+            let second = index
+                .search_paginated(&cx, "alpha", 100_000, 0, true)
+                .expect("repeated large page executes");
+            assert_eq!(
+                first, second,
+                "cache admission must not alter rankings or counts"
+            );
+            assert_eq!(first.hits.len(), documents.len());
+            assert_eq!(first.total_count, Some(2_048));
+            assert!(
+                !Arc::ptr_eq(&first.hits, &second.hits),
+                "full-corpus result pages must not remain in the cache",
+            );
+            let small = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("ordinary top-k still executes");
+            let small_repeat = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("ordinary top-k still caches");
+            assert_eq!(small.hits.as_ref(), &first.hits[..10]);
+            assert_eq!(small.total_count, first.total_count);
+            assert!(Arc::ptr_eq(&small.hits, &small_repeat.hits));
+        });
+    }
+
+    #[test]
+    fn ranked_query_cache_bounds_preparsed_keys_and_result_pages() {
+        let cache = RankedQueryCache::default();
+        let result = QuillSearchResult {
+            hits: Arc::from([]),
+            total_count: Some(0),
+            doc_count: 0,
+            diagnostics: Vec::new(),
+        };
+        let oversized_query = Query::boost(
+            Query::phrase(
+                vec![crate::query::QueryField::new(1, 1.0)],
+                vec![crate::query::PositionedTerm::new(
+                    0,
+                    "x".repeat(RANKED_QUERY_CACHE_ENTRY_BYTES),
+                )],
+                0,
+                false,
+            ),
+            2.0,
+        );
+        cache.insert_preparsed(1, &oversized_query, 10, 0, false, &result);
+        assert!(
+            cache
+                .get_preparsed(1, &oversized_query, 10, 0, false)
+                .is_none()
+        );
+
+        let mut result = result;
+        result.hits = vec![QuillHit {
+            document_id: "x".repeat(RANKED_QUERY_CACHE_ENTRY_BYTES),
+            global_docid: 0,
+            score: 1.0,
+        }]
+        .into();
+        cache.insert_preparsed(1, &Query::all(), 10, 0, false, &result);
+        assert!(
+            cache
+                .get_preparsed(1, &Query::all(), 10, 0, false)
+                .is_none()
+        );
+        assert_eq!(Arc::strong_count(&result.hits), 1);
     }
 
     #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
