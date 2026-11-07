@@ -18,6 +18,16 @@
 //! error. The A/A null is incumbent-vs-incumbent; the lever ratio is
 //! `filtered / incumbent`, so `< 1.0` outside the null band wins.
 //!
+//! The `[upsert]` cells time upsert's identity work before admission over the
+//! same snapshot: the replacement probe (`batch_replaces_published_document`)
+//! and tombstone staging (`delete_document` per identifier), through the same
+//! filter or through the incumbent all-segment probes. `fresh` is a batch of
+//! new identifiers (new messages, an inline rebuild); `replace` is a batch of
+//! published identifiers spread over every segment, where every identifier
+//! passes the filter, so it bounds the filter's overhead. Both arms must stage
+//! the identical MANIFEST and replaced-id set for fresh, replacing and mixed
+//! batches before anything is timed.
+//!
 //! ```bash
 //! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
 //!   rch exec -- env QUILL_ADMIT_SCALE=full QUILL_ADMIT_ROUNDS=21 \
@@ -221,6 +231,90 @@ fn run_shape(cx: &Cx, shape: &Shape, rounds: usize, session: &mut BenchAdmission
         lever.median_ci95_high,
         lever.decidable_against(&null),
     );
+    run_upsert_cells(cx, shape, rounds, &fresh, session.into_inner());
+}
+
+/// Upsert's pre-admission identity work: filtered vs incumbent, per batch.
+fn run_upsert_cells(
+    cx: &Cx,
+    shape: &Shape,
+    rounds: usize,
+    fresh: &[IndexableDocument],
+    session: &mut BenchAdmissionSession,
+) {
+    // Published identifiers spread over every segment, all distinct.
+    let replacing: Vec<IndexableDocument> = (0..PROBE_BATCH_DOCS)
+        .map(|ordinal| {
+            fixture_document(
+                ordinal % shape.segments,
+                ordinal / shape.segments % shape.docs_per_segment,
+            )
+        })
+        .collect();
+    let mut mixed: Vec<IndexableDocument> = fresh[..PROBE_BATCH_DOCS / 2].to_vec();
+    mixed.extend_from_slice(&replacing[..PROBE_BATCH_DOCS / 8]);
+
+    // Parity before timing: identical replacement answer, staged MANIFEST and
+    // replaced identifiers.
+    for (batch, replaced) in [
+        (fresh, 0),
+        (replacing.as_slice(), PROBE_BATCH_DOCS),
+        (mixed.as_slice(), PROBE_BATCH_DOCS / 8),
+    ] {
+        let incumbent = session
+            .stage_upsert(cx, batch, false)
+            .expect("incumbent upsert staging");
+        let filtered = session
+            .stage_upsert(cx, batch, true)
+            .expect("filtered upsert staging");
+        assert!(
+            incumbent == filtered,
+            "{}: upsert staging diverged",
+            shape.name
+        );
+        assert_eq!(
+            incumbent.0,
+            replaced != 0,
+            "{}: replacement answer",
+            shape.name
+        );
+        assert_eq!(incumbent.2.len(), replaced, "{}: replaced ids", shape.name);
+    }
+
+    let session = RefCell::new(session);
+    let stage = |batch: &[IndexableDocument], filtered: bool| {
+        black_box(
+            session
+                .borrow_mut()
+                .stage_upsert(cx, black_box(batch), filtered)
+                .expect("timed upsert staging"),
+        );
+    };
+    for (name, batch) in [("fresh", fresh), ("replace", replacing.as_slice())] {
+        let null = paired_median_ratio(rounds, 1, || stage(batch, false), || stage(batch, false));
+        let lever = paired_median_ratio(rounds, 1, || stage(batch, false), || stage(batch, true));
+        let absolute_calls = if shape.segments >= 512 { 2 } else { 8 };
+        let incumbent_ns = time_per_doc_ns(absolute_calls, || stage(batch, false));
+        let filtered_ns = time_per_doc_ns(absolute_calls, || stage(batch, true));
+        eprintln!(
+            "[upsert] shape={} segments={} docs={} batch={name}x{PROBE_BATCH_DOCS} \
+             null={:.4} [{:.4}, {:.4}] lever(filtered/incumbent)={:.4} [{:.4}, {:.4}] \
+             ci95=[{:.4}, {:.4}] decidable={} incumbent_ns_per_doc={incumbent_ns:.1} \
+             filtered_ns_per_doc={filtered_ns:.1}",
+            shape.name,
+            shape.segments,
+            shape.segments * shape.docs_per_segment,
+            null.median,
+            null.p5,
+            null.p95,
+            lever.median,
+            lever.p5,
+            lever.p95,
+            lever.median_ci95_low,
+            lever.median_ci95_high,
+            lever.decidable_against(&null),
+        );
+    }
 }
 
 fn main() {

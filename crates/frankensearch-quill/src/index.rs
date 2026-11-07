@@ -84,8 +84,8 @@ use crate::keeper::{
     KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout, LiveDocumentFloor,
     MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
     PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState, PublishIntent,
-    PublishedIdFilter, RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet,
-    inspect_lexical_layout, load_manifest_pair, plan_tier_merge_with_fit,
+    PublishedIdFilter, PublishedIdProbe, RecoveredSegment, TierMergePolicy, TierPolicyError,
+    TombstoneSet, inspect_lexical_layout, load_manifest_pair, plan_tier_merge_with_fit,
     validate_manifest_successor,
 };
 use crate::query::{
@@ -365,6 +365,11 @@ pub struct QuillSearchResult {
 const RANKED_QUERY_CACHE_SETS: usize = 64;
 const RANKED_QUERY_CACHE_WAYS: usize = 4;
 const RANKED_QUERY_CACHE_SLOTS: usize = RANKED_QUERY_CACHE_SETS * RANKED_QUERY_CACHE_WAYS;
+// Bound retained allocations, not merely entry count: an all-results page or
+// an ignored query suffix must not keep a corpus-sized allocation alive in
+// each slot. Ordinary top-k pages fit comfortably within this allowance.
+const RANKED_QUERY_CACHE_ENTRY_BYTES: usize = 64 * 1024;
+const RANKED_QUERY_CACHE_RAW_KEY_BYTES: usize = crate::query::MAX_QUERY_LENGTH * 4;
 
 enum RankedQueryCacheKey {
     Raw(Arc<str>),
@@ -386,7 +391,11 @@ struct CachedRankedQuery {
 ///
 /// Exact keys are retained alongside their fingerprints, so collisions only
 /// cost a miss. Snapshot epochs make publication the invalidation boundary.
-/// The fixed four-way table bounds memory without adding reader coordination.
+/// Each entry is admitted against a retained-allocation budget before cloning
+/// its key or diagnostics. The fixed four-way table therefore retains at most
+/// 16 MiB of charged entry allocations, plus its fixed table and allocator
+/// overhead, without reader coordination. Pages held by callers after eviction
+/// are owned by those callers and are outside the cache's retention budget.
 struct RankedQueryCache {
     slots: [ArcSwapOption<CachedRankedQuery>; RANKED_QUERY_CACHE_SLOTS],
 }
@@ -468,6 +477,12 @@ impl RankedQueryCache {
         exact_count: bool,
         result: &QuillSearchResult,
     ) {
+        let key_bytes = cache_arc_allocation_bytes::<u8>(query.len());
+        if query.len() > RANKED_QUERY_CACHE_RAW_KEY_BYTES
+            || ranked_query_cache_entry_bytes(key_bytes, result) > RANKED_QUERY_CACHE_ENTRY_BYTES
+        {
+            return;
+        }
         self.insert(Arc::new(CachedRankedQuery {
             fingerprint,
             snapshot_epoch,
@@ -489,6 +504,11 @@ impl RankedQueryCache {
         exact_count: bool,
         result: &QuillSearchResult,
     ) {
+        let key_bytes =
+            cache_arc_allocation_bytes::<Query>(1).saturating_add(query.cache_heap_bytes());
+        if ranked_query_cache_entry_bytes(key_bytes, result) > RANKED_QUERY_CACHE_ENTRY_BYTES {
+            return;
+        }
         let fingerprint =
             preparsed_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
         self.insert(Arc::new(CachedRankedQuery {
@@ -520,6 +540,50 @@ impl RankedQueryCache {
             slot.store(Some(cached));
         }
     }
+}
+
+/// Charge an Arc's payload, reference counts, and worst-case alignment padding.
+/// Allocator bookkeeping is deliberately not represented as an RSS guarantee.
+fn cache_arc_allocation_bytes<T>(len: usize) -> usize {
+    let alignment = std::mem::align_of::<T>().max(std::mem::align_of::<AtomicUsize>());
+    std::mem::size_of::<T>()
+        .saturating_mul(len)
+        .saturating_add(2 * std::mem::size_of::<AtomicUsize>())
+        .saturating_add(2 * alignment.saturating_sub(1))
+}
+
+fn ranked_query_cache_entry_bytes(key_bytes: usize, result: &QuillSearchResult) -> usize {
+    let mut bytes = cache_arc_allocation_bytes::<CachedRankedQuery>(1)
+        .saturating_add(key_bytes)
+        .saturating_add(cache_arc_allocation_bytes::<QuillSearchResult>(1))
+        .saturating_add(cache_arc_allocation_bytes::<QuillHit>(result.hits.len()))
+        .saturating_add(
+            result
+                .diagnostics
+                .capacity()
+                .saturating_mul(std::mem::size_of::<QueryDiagnostic>()),
+        );
+    if bytes > RANKED_QUERY_CACHE_ENTRY_BYTES {
+        return bytes;
+    }
+    // The hit page is shared, so retain its actual String capacities, even
+    // when a short identifier occupies an oversized allocation. Diagnostics
+    // are cloned; charging their source capacities is conservative as well.
+    for hit in result.hits.iter() {
+        bytes = bytes.saturating_add(hit.document_id.capacity());
+        if bytes > RANKED_QUERY_CACHE_ENTRY_BYTES {
+            return bytes;
+        }
+    }
+    for diagnostic in &result.diagnostics {
+        bytes = bytes
+            .saturating_add(diagnostic.message.capacity())
+            .saturating_add(diagnostic.fragment.as_ref().map_or(0, String::capacity));
+        if bytes > RANKED_QUERY_CACHE_ENTRY_BYTES {
+            return bytes;
+        }
+    }
+    bytes
 }
 
 fn ranked_query_cache_set_start(fingerprint: u64) -> usize {
@@ -5673,7 +5737,7 @@ impl RootRefreshPause {
     /// generation is read, i.e. the VALIDATE window. A reader exists here but
     /// is not installed, so cancelling must drop it.
     const STAGE_VALIDATION: u8 = 2;
-    /// Immediately before the `ArcSwap` store. The SWAP window.
+    /// Immediately before the `ArcSwap` compare-and-swap. The SWAP window.
     const STAGE_SWAP: u8 = 3;
 
     /// Park the refresh at `stage` until the paired canceller releases it.
@@ -5744,6 +5808,54 @@ impl BenchAdmissionSession {
                 })
                 .map(|_| ())
         }
+    }
+
+    /// Run upsert's pre-admission identity work on `documents` through the
+    /// shipping filtered probes (`filtered`) or the incumbent all-segment
+    /// probes: the replacement probe, then tombstone staging into the next
+    /// MANIFEST. Nothing is installed. Returns whether the batch replaces a
+    /// published document, the staged proposal, and the replaced ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns the identity, cancellation, or authority failure either path
+    /// reports.
+    pub fn stage_upsert(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        filtered: bool,
+    ) -> Result<(bool, Manifest, Vec<String>), QuillIndexError> {
+        let batch = IngestBatch::Default(documents);
+        let (replaces, (manifest, replacement_ids)) = if filtered {
+            let replaces = self.writer.batch_replaces_published_document(cx, batch)?;
+            let mut filter = std::mem::take(&mut self.writer.published_id_filter);
+            let staged = self
+                .writer
+                .stage_upsert_replacements(cx, batch, &mut filter);
+            self.writer.published_id_filter = filter;
+            (replaces, staged?)
+        } else {
+            let authority = self.writer.authority_snapshot()?;
+            let replaces = QuillWriterState::any_document_published(
+                cx,
+                batch,
+                PublishedIdProbe::unfiltered(authority),
+            )?;
+            let manifest = authority.next_manifest()?;
+            let staged = QuillWriterState::stage_replacements_with(
+                cx,
+                batch,
+                PublishedIdProbe::unfiltered(authority),
+                manifest,
+            )?;
+            (replaces, staged)
+        };
+        Ok((
+            replaces,
+            manifest,
+            replacement_ids.into_iter().map(str::to_owned).collect(),
+        ))
     }
 
     /// Drop the filter so the next filtered admission rebuilds it from the
@@ -9263,27 +9375,15 @@ impl QuillWriterState {
                 return QuillObservedUpsert::new(Err(error), None);
             }
         }
-        let snapshot = match self.authority_snapshot() {
-            Ok(snapshot) => snapshot,
+        // Moved out so the staging probe can borrow it beside `&self`, exactly
+        // as `validate_batch_admission` does.
+        let mut filter = std::mem::take(&mut self.published_id_filter);
+        let staged = self.stage_upsert_replacements(cx, documents, &mut filter);
+        self.published_id_filter = filter;
+        let (manifest, replacement_ids) = match staged {
+            Ok(staged) => staged,
             Err(error) => return QuillObservedUpsert::new(Err(error), None),
         };
-        let mut manifest = match snapshot.next_manifest() {
-            Ok(manifest) => manifest,
-            Err(error) => return QuillObservedUpsert::new(Err(error.into()), None),
-        };
-        let mut replacement_ids = BTreeSet::new();
-        for document in documents {
-            if let Err(error) = check_cancel(cx, "upsert document batch") {
-                return QuillObservedUpsert::new(Err(error), None);
-            }
-            match snapshot.delete_document(&mut manifest, document.id()) {
-                Ok(true) => {
-                    replacement_ids.insert(document.id());
-                }
-                Ok(false) => {}
-                Err(error) => return QuillObservedUpsert::new(Err(error.into()), None),
-            }
-        }
         if replacement_ids.is_empty() {
             let (result, witness) = self
                 .index_documents_with_replacements_observed(
@@ -9414,19 +9514,91 @@ impl QuillWriterState {
     /// deciding to publish pending work — a batch that turns out to replace
     /// nothing leaves the writer exactly as it found it, so ordinary
     /// accumulate-before-commit is unaffected.
+    ///
+    /// Its only state is the [`PublishedIdFilter`] cache, which answers
+    /// "absent" for identifiers no published IDHASH can hold without probing
+    /// every segment; mutating that cache changes no answer.
     fn batch_replaces_published_document(
-        &self,
+        &mut self,
         cx: &Cx,
         documents: IngestBatch<'_>,
     ) -> Result<bool, QuillIndexError> {
+        let mut filter = std::mem::take(&mut self.published_id_filter);
+        let replaces = self.batch_replaces_published_document_filtered(cx, documents, &mut filter);
+        self.published_id_filter = filter;
+        replaces
+    }
+
+    fn batch_replaces_published_document_filtered(
+        &self,
+        cx: &Cx,
+        documents: IngestBatch<'_>,
+        filter: &mut PublishedIdFilter,
+    ) -> Result<bool, QuillIndexError> {
         let snapshot = self.authority_snapshot()?;
+        // An empty batch probes nothing, so it must not synchronize either.
+        if documents.is_empty() {
+            return Ok(false);
+        }
+        let published = filter.sync(snapshot, || check_cancel(cx, "upsert replacement probe"))?;
+        Self::any_document_published(cx, documents, published)
+    }
+
+    /// The loop of [`Self::batch_replaces_published_document`], with the
+    /// published-snapshot probe supplied by the caller.
+    fn any_document_published(
+        cx: &Cx,
+        documents: IngestBatch<'_>,
+        published: PublishedIdProbe<'_>,
+    ) -> Result<bool, QuillIndexError> {
         for document in documents {
             check_cancel(cx, "upsert replacement probe")?;
-            if snapshot.resolve_document_id(document.id())?.is_some() {
+            if published.resolve_document_id(document.id())?.is_some() {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Stage a tombstone into the next MANIFEST for every published identity
+    /// `documents` replaces, returning that proposal and the replaced ids.
+    ///
+    /// Each identifier goes through [`PublishedIdProbe::delete_document`], so
+    /// an identifier no published IDHASH can hold skips the all-segment probe;
+    /// every other one is staged exactly as [`KeeperSnapshot::delete_document`]
+    /// stages it.
+    fn stage_upsert_replacements<'a>(
+        &self,
+        cx: &Cx,
+        documents: IngestBatch<'a>,
+        filter: &mut PublishedIdFilter,
+    ) -> Result<(Manifest, BTreeSet<&'a str>), QuillIndexError> {
+        let snapshot = self.authority_snapshot()?;
+        let manifest = snapshot.next_manifest()?;
+        // An empty batch stages nothing, so it must not synchronize either.
+        if documents.is_empty() {
+            return Ok((manifest, BTreeSet::new()));
+        }
+        let published = filter.sync(snapshot, || check_cancel(cx, "upsert document batch"))?;
+        Self::stage_replacements_with(cx, documents, published, manifest)
+    }
+
+    /// The loop of [`Self::stage_upsert_replacements`], with the
+    /// published-snapshot probe supplied by the caller.
+    fn stage_replacements_with<'a>(
+        cx: &Cx,
+        documents: IngestBatch<'a>,
+        published: PublishedIdProbe<'_>,
+        mut manifest: Manifest,
+    ) -> Result<(Manifest, BTreeSet<&'a str>), QuillIndexError> {
+        let mut replacement_ids = BTreeSet::new();
+        for document in documents {
+            check_cancel(cx, "upsert document batch")?;
+            if published.delete_document(&mut manifest, document.id())? {
+                replacement_ids.insert(document.id());
+            }
+        }
+        Ok((manifest, replacement_ids))
     }
 
     async fn delete_document(
@@ -10513,7 +10685,11 @@ impl QuillReader {
             }
             return Err(error);
         }
-        let cache_enabled = self.ranked_query_cache_enabled();
+        // The parser ignores any suffix beyond MAX_QUERY_LENGTH characters.
+        // Do not hash or retain arbitrarily large raw input just to memoize
+        // that bounded query; execution and truncation diagnostics are intact.
+        let cache_enabled =
+            self.ranked_query_cache_enabled() && query.len() <= RANKED_QUERY_CACHE_RAW_KEY_BYTES;
         #[cfg(feature = "pruning-conformance")]
         let cache_enabled = cache_enabled && pruning_trace.is_none();
         let cache_fingerprint = cache_enabled.then(|| {
@@ -13826,13 +14002,25 @@ impl RootBoundQuillSearchIndex {
     /// snapshot always leave the previous reader live for in-flight and later
     /// searches.
     ///
+    /// Returns `true` when this call installs its replacement. Returns `false`
+    /// when the published state is unchanged or another refresh has already
+    /// replaced the state this call started from. A superseded refresh never
+    /// overwrites the winning reader; a caller may refresh again to inspect a
+    /// later publication.
+    ///
     /// # Errors
     ///
     /// Returns typed cancellation, layout, recovery, schema, or
     /// snapshot-transition failures. A generation regression within the same
-    /// active engine directory is rejected.
+    /// active engine directory is rejected while this call's starting state
+    /// is still current.
     pub async fn refresh(&self, cx: &Cx) -> Result<bool, QuillIndexError> {
         check_cancel(cx, "root-bound reader refresh")?;
+        // Bind the replacement to the state observed before any asynchronous
+        // layout inspection. Generations in different engine directories are
+        // independent, so a late refresh cannot safely rebase its candidate
+        // onto a newer reader merely by comparing generation numbers.
+        let expected = self.state.load_full();
         let replacement = Self::open_state_inner(
             cx,
             &self.lexical_root,
@@ -13841,26 +14029,26 @@ impl RootBoundQuillSearchIndex {
             Some(self.refresh_pause.as_ref()),
         )
         .await?;
-        self.install_validated_replacement(cx, replacement).await
+        self.install_validated_replacement(cx, &expected, replacement)
+            .await
     }
 
     /// Install one replacement that has already passed root-layout and Quill
     /// snapshot validation. Keeping this visibility boundary separate makes
     /// cancellation linearizable: no mutable reader state is touched before
-    /// the final check immediately preceding the `ArcSwap` store.
+    /// the final check immediately preceding the `ArcSwap` compare-and-swap.
     #[allow(clippy::unused_async_trait_impl)]
     async fn install_validated_replacement(
         &self,
         cx: &Cx,
+        expected: &Arc<RootBoundQuillReaderState>,
         replacement: RootBoundQuillReaderState,
     ) -> Result<bool, QuillIndexError> {
-        #[cfg(test)]
-        self.refresh_pause
-            .wait_at(RootRefreshPause::STAGE_SWAP)
-            .await;
-
         check_cancel(cx, "root-bound reader refresh swap")?;
         let current = self.state.load_full();
+        if !Arc::ptr_eq(&current, expected) {
+            return Ok(false);
+        }
         if replacement.active_path == current.active_path {
             if replacement.generation < current.generation {
                 return Err(invalid_state(format!(
@@ -13877,8 +14065,14 @@ impl RootBoundQuillSearchIndex {
             }
         }
 
-        self.state.store(Arc::new(replacement));
-        Ok(true)
+        #[cfg(test)]
+        self.refresh_pause
+            .wait_at(RootRefreshPause::STAGE_SWAP)
+            .await;
+
+        check_cancel(cx, "root-bound reader refresh swap")?;
+        let previous = self.state.compare_and_swap(expected, Arc::new(replacement));
+        Ok(Arc::ptr_eq(&previous, expected))
     }
 
     async fn open_state(
@@ -19132,6 +19326,163 @@ mod tests {
     }
 
     #[test]
+    fn root_bound_concurrent_refresh_preserves_newer_engine_at_every_stage() {
+        run_with_blocking_cx(|cx| async move {
+            for stage in [
+                RootRefreshPause::STAGE_INSPECTION,
+                RootRefreshPause::STAGE_VALIDATION,
+                RootRefreshPause::STAGE_SWAP,
+            ] {
+                assert_superseded_root_refresh_preserves_winner(&cx, stage, false).await;
+            }
+        });
+    }
+
+    #[test]
+    fn root_bound_concurrent_refresh_preserves_newer_manifest_at_every_stage() {
+        run_with_blocking_cx(|cx| async move {
+            for stage in [
+                RootRefreshPause::STAGE_INSPECTION,
+                RootRefreshPause::STAGE_VALIDATION,
+                RootRefreshPause::STAGE_SWAP,
+            ] {
+                assert_superseded_root_refresh_preserves_winner(&cx, stage, true).await;
+            }
+        });
+    }
+
+    async fn assert_superseded_root_refresh_preserves_winner(
+        cx: &Cx,
+        stage: u8,
+        same_directory: bool,
+    ) {
+        let root = tempfile::tempdir().expect("concurrent root-bound refresh directory");
+        let lexical_root = root.path();
+        let first_path =
+            create_root_generation(cx, lexical_root, "quill-v1", "old", "old token").await;
+        publish_current(lexical_root, &root_pointer("quill-v1"))
+            .expect("publish initial root generation");
+        let reader = RootBoundQuillSearchIndex::open(cx, lexical_root, deterministic_config())
+            .await
+            .expect("open concurrent root-bound reader");
+        let original = reader.state.load_full();
+
+        let writer = if same_directory {
+            let writer = QuillIndex::open(cx, &first_path, deterministic_config())
+                .await
+                .expect("open writer for successive MANIFEST publications");
+            writer
+                .index_document(cx, &IndexableDocument::new("middle", "middle token"))
+                .await
+                .expect("stage intermediate MANIFEST document");
+            writer
+                .commit(cx)
+                .await
+                .expect("publish intermediate MANIFEST");
+            Some(writer)
+        } else {
+            create_root_generation(cx, lexical_root, "quill-v2", "middle", "middle token").await;
+            publish_current(lexical_root, &root_pointer("quill-v2"))
+                .expect("publish intermediate engine directory");
+            None
+        };
+
+        let pause = Arc::clone(&reader.refresh_pause);
+        pause.stage.store(stage, Ordering::Release);
+        let mut earlier_refresh = Box::pin(reader.refresh(cx));
+        std::future::poll_fn(|task_cx| {
+            let outcome = earlier_refresh.as_mut().poll(task_cx);
+            assert!(
+                outcome.is_pending(),
+                "the earlier refresh must reach stage {stage} before completing: {outcome:?}"
+            );
+            if pause.arrived.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        // The first refresh stays parked because wait_at has already selected
+        // its stage. Disable only future arrivals so the second can finish.
+        pause
+            .stage
+            .store(RootRefreshPause::STAGE_NONE, Ordering::Release);
+        let winning_path = if let Some(writer) = &writer {
+            writer
+                .index_document(cx, &IndexableDocument::new("newest", "newest token"))
+                .await
+                .expect("stage newest MANIFEST document");
+            writer.commit(cx).await.expect("publish newest MANIFEST");
+            first_path
+        } else {
+            let path =
+                create_root_generation(cx, lexical_root, "quill-v3", "newest", "newest token")
+                    .await;
+            publish_current(lexical_root, &root_pointer("quill-v3"))
+                .expect("publish newest engine directory");
+            path
+        };
+        assert!(reader.refresh(cx).await.expect("later refresh wins"));
+        let winner = reader.state.load_full();
+        assert_eq!(winner.active_path, winning_path);
+        if same_directory {
+            assert!(winner.generation > original.generation);
+        }
+
+        pause.release.store(true, Ordering::Release);
+        assert!(
+            !earlier_refresh
+                .await
+                .expect("superseded refresh completes without a stale regression error"),
+            "a refresh superseded at stage {stage} must not install its candidate"
+        );
+        assert!(Arc::ptr_eq(&winner, &reader.state.load_full()));
+        assert_eq!(reader.active_path(), winning_path);
+        assert_eq!(reader.keeper_generation(), winner.generation);
+        assert_eq!(
+            LexicalRead::search(&reader, cx, "newest", 10)
+                .await
+                .expect("winning reader finds the latest document")[0]
+                .doc_id,
+            "newest"
+        );
+        assert_eq!(
+            LexicalRead::search(original.reader.as_ref(), cx, "old", 10)
+                .await
+                .expect("in-flight reader retains its original document")[0]
+                .doc_id,
+            "old"
+        );
+        assert!(
+            LexicalRead::search(original.reader.as_ref(), cx, "newest", 10)
+                .await
+                .expect("in-flight reader remains pinned")
+                .is_empty()
+        );
+        assert!(!reader.refresh(cx).await.expect("unchanged refresh"));
+        assert!(Arc::ptr_eq(&winner, &reader.state.load_full()));
+
+        if same_directory {
+            let regression = RootBoundQuillReaderState {
+                reader: Arc::clone(&original.reader),
+                active_path: original.active_path.clone(),
+                pointer: original.pointer.clone(),
+                generation: original.generation,
+            };
+            let error = reader
+                .install_validated_replacement(cx, &winner, regression)
+                .await
+                .expect_err("an unchanged expected state must still reject a true regression");
+            assert!(
+                matches!(error, QuillIndexError::InvalidState { detail } if detail.contains("regressed Quill generation"))
+            );
+            assert!(Arc::ptr_eq(&winner, &reader.state.load_full()));
+        }
+    }
+
+    #[test]
     fn labruntime_cancel_before_root_bound_swap_retains_the_old_reader() {
         let root = tempfile::tempdir().expect("root-bound cancellation directory");
         let lexical_root = root.path().to_path_buf();
@@ -19141,7 +19492,7 @@ mod tests {
             .build()
             .expect("build root-bound cancellation runtime");
 
-        let (reader, replacement) = runtime.block_on(async {
+        let (reader, expected, replacement) = runtime.block_on(async {
             create_root_generation(&setup_cx, &lexical_root, "quill-v1", "old", "old token").await;
             publish_current(&lexical_root, &root_pointer("quill-v1"))
                 .expect("publish first root generation");
@@ -19149,6 +19500,7 @@ mod tests {
                 RootBoundQuillSearchIndex::open(&setup_cx, &lexical_root, deterministic_config())
                     .await
                     .expect("open root-bound reader");
+            let expected = reader.state.load_full();
             create_root_generation(&setup_cx, &lexical_root, "quill-v2", "new", "new token").await;
             publish_current(&lexical_root, &root_pointer("quill-v2"))
                 .expect("publish replacement root generation");
@@ -19159,7 +19511,7 @@ mod tests {
             )
             .await
             .expect("open and validate replacement before Lab cancellation");
-            (reader, replacement)
+            (reader, expected, replacement)
         });
         let pause = Arc::clone(&reader.refresh_pause);
         pause
@@ -19178,7 +19530,11 @@ mod tests {
             .create_task(region, Budget::INFINITE, async move {
                 assert!(matches!(
                     refresh_reader
-                        .install_validated_replacement(refresh_context.as_ref(), replacement)
+                        .install_validated_replacement(
+                            refresh_context.as_ref(),
+                            &expected,
+                            replacement,
+                        )
                         .await,
                     Err(QuillIndexError::Cancelled {
                         phase: "root-bound reader refresh swap"
@@ -19711,6 +20067,206 @@ mod tests {
                 .get_preparsed(4, &Query::boost(Query::all(), 2.5), 0, 0, true,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ranked_query_cache_rejects_retained_capacity_and_nested_diagnostics() {
+        let cache = RankedQueryCache::default();
+        let ordinary = QuillSearchResult {
+            hits: vec![QuillHit {
+                document_id: "ordinary".to_owned(),
+                global_docid: 0,
+                score: 1.0,
+            }]
+            .into(),
+            total_count: Some(1),
+            doc_count: 1,
+            diagnostics: Vec::new(),
+        };
+        let fingerprint = raw_query_cache_fingerprint(1, "alpha", 10, 0, true);
+        cache.insert_raw(fingerprint, 1, "alpha", 10, 0, true, &ordinary);
+
+        let mut oversized_id = String::with_capacity(RANKED_QUERY_CACHE_ENTRY_BYTES);
+        oversized_id.push_str("short");
+        let id_capacity = QuillSearchResult {
+            hits: vec![QuillHit {
+                document_id: oversized_id,
+                global_docid: 1,
+                score: 1.0,
+            }]
+            .into(),
+            ..ordinary.clone()
+        };
+        let diagnostic = crate::query::QueryDiagnostic {
+            kind: crate::query::QueryDiagnosticKind::SyntaxRecovery,
+            message: "recovered".to_owned(),
+            byte_offset: Some(0),
+            fragment: None,
+        };
+        let mut oversized_message = diagnostic.clone();
+        oversized_message.message = "x".repeat(RANKED_QUERY_CACHE_ENTRY_BYTES);
+        let mut oversized_fragment = diagnostic.clone();
+        oversized_fragment.fragment = Some("x".repeat(RANKED_QUERY_CACHE_ENTRY_BYTES));
+        let mut reserved_diagnostics = Vec::with_capacity(
+            RANKED_QUERY_CACHE_ENTRY_BYTES / std::mem::size_of::<QueryDiagnostic>() + 1,
+        );
+        reserved_diagnostics.push(diagnostic);
+        let rejected = [
+            id_capacity,
+            QuillSearchResult {
+                diagnostics: vec![oversized_message],
+                ..ordinary.clone()
+            },
+            QuillSearchResult {
+                diagnostics: vec![oversized_fragment],
+                ..ordinary.clone()
+            },
+            QuillSearchResult {
+                diagnostics: reserved_diagnostics,
+                ..ordinary.clone()
+            },
+        ];
+        for (case, result) in rejected.iter().enumerate() {
+            let query = format!("oversized-{case}");
+            let fingerprint = raw_query_cache_fingerprint(1, &query, 10, 0, true);
+            let prior_owners = Arc::strong_count(&result.hits);
+            cache.insert_raw(fingerprint, 1, &query, 10, 0, true, result);
+            assert!(cache.get_raw(fingerprint, 1, &query, 10, 0, true).is_none());
+            assert_eq!(
+                Arc::strong_count(&result.hits),
+                prior_owners,
+                "refused admission must not retain the page for case {case}",
+            );
+        }
+        assert_eq!(
+            cache.get_raw(fingerprint, 1, "alpha", 10, 0, true),
+            Some(ordinary),
+            "oversized results must not evict an ordinary entry",
+        );
+    }
+
+    #[test]
+    fn ranked_query_cache_large_raw_suffix_preserves_search_and_diagnostics() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("cache test index");
+            index
+                .index_document(&cx, &IndexableDocument::new("doc", "alpha"))
+                .await
+                .expect("index document");
+            index.commit(&cx).await.expect("commit document");
+            let ordinary = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("ordinary query");
+            let mut oversized = "alpha".to_owned();
+            oversized.push_str(&" ".repeat(RANKED_QUERY_CACHE_RAW_KEY_BYTES));
+            oversized.push_str("term-outside-parser-bound");
+            let first = index
+                .search_paginated(&cx, &oversized, 10, 0, true)
+                .expect("oversized query still executes");
+            let second = index
+                .search_paginated(&cx, &oversized, 10, 0, true)
+                .expect("repeated oversized query still executes");
+            assert_eq!(first, second);
+            assert_eq!(first.hits, ordinary.hits);
+            assert_eq!(first.total_count, ordinary.total_count);
+            assert_eq!(first.doc_count, ordinary.doc_count);
+            assert!(first.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == crate::query::QueryDiagnosticKind::Truncated
+            }));
+            assert!(
+                !Arc::ptr_eq(&first.hits, &second.hits),
+                "a refused raw key must not retain the first page",
+            );
+            let repeated = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("ordinary query stays cached");
+            assert_eq!(ordinary, repeated);
+            assert!(Arc::ptr_eq(&ordinary.hits, &repeated.hits));
+        });
+    }
+
+    #[test]
+    fn ranked_query_cache_large_pages_execute_without_being_retained() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("cache test index");
+            let documents: Vec<_> = (0..2_048)
+                .map(|ordinal| IndexableDocument::new(format!("document-{ordinal:04}"), "alpha"))
+                .collect();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index result-page corpus");
+            index.commit(&cx).await.expect("commit result-page corpus");
+            let first = index
+                .search_paginated(&cx, "alpha", 100_000, 0, true)
+                .expect("large requested page executes");
+            let second = index
+                .search_paginated(&cx, "alpha", 100_000, 0, true)
+                .expect("repeated large page executes");
+            assert_eq!(
+                first, second,
+                "cache admission must not alter rankings or counts"
+            );
+            assert_eq!(first.hits.len(), documents.len());
+            assert_eq!(first.total_count, Some(2_048));
+            assert!(
+                !Arc::ptr_eq(&first.hits, &second.hits),
+                "full-corpus result pages must not remain in the cache",
+            );
+            let small = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("ordinary top-k still executes");
+            let small_repeat = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("ordinary top-k still caches");
+            assert_eq!(small.hits.as_ref(), &first.hits[..10]);
+            assert_eq!(small.total_count, first.total_count);
+            assert!(Arc::ptr_eq(&small.hits, &small_repeat.hits));
+        });
+    }
+
+    #[test]
+    fn ranked_query_cache_bounds_preparsed_keys_and_result_pages() {
+        let cache = RankedQueryCache::default();
+        let result = QuillSearchResult {
+            hits: Arc::from([]),
+            total_count: Some(0),
+            doc_count: 0,
+            diagnostics: Vec::new(),
+        };
+        let oversized_query = Query::boost(
+            Query::phrase(
+                vec![crate::query::QueryField::new(1, 1.0)],
+                vec![crate::query::PositionedTerm::new(
+                    0,
+                    "x".repeat(RANKED_QUERY_CACHE_ENTRY_BYTES),
+                )],
+                0,
+                false,
+            ),
+            2.0,
+        );
+        cache.insert_preparsed(1, &oversized_query, 10, 0, false, &result);
+        assert!(
+            cache
+                .get_preparsed(1, &oversized_query, 10, 0, false)
+                .is_none()
+        );
+
+        let mut result = result;
+        result.hits = vec![QuillHit {
+            document_id: "x".repeat(RANKED_QUERY_CACHE_ENTRY_BYTES),
+            global_docid: 0,
+            score: 1.0,
+        }]
+        .into();
+        cache.insert_preparsed(1, &Query::all(), 10, 0, false, &result);
+        assert!(
+            cache
+                .get_preparsed(1, &Query::all(), 10, 0, false)
+                .is_none()
+        );
+        assert_eq!(Arc::strong_count(&result.hits), 1);
     }
 
     #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
@@ -31687,6 +32243,127 @@ mod tests {
                 .index_documents(&cx, &[IndexableDocument::new("fresh-after-reopen", "new")])
                 .await
                 .expect("a fresh identifier is admitted after reopen");
+        });
+    }
+
+    /// Upsert's replacement probe and tombstone staging go through the
+    /// identity filter: a fresh-only upsert over pending work must publish
+    /// nothing, and every published identity must still be found and replaced
+    /// exactly once across separate publications, a concat merge, and a
+    /// writer reopen (whose first upsert rebuilds the filter from disk).
+    #[test]
+    fn upsert_filter_replaces_every_published_id_across_lifecycle() {
+        fn ids_matching(cx: &Cx, index: &QuillIndex, query: &str) -> BTreeSet<String> {
+            index
+                .search_doc_ids(cx, query, 1_000)
+                .expect("search")
+                .iter()
+                .map(|hit| hit.document_id.clone())
+                .collect()
+        }
+
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_visibility_lag_ms: u64::MAX,
+                tier_fanout: usize::MAX,
+                ..deterministic_config()
+            };
+            let directory = tempfile::tempdir().expect("upsert filter directory");
+            let index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("create on-disk index");
+            for segment in 0..6 {
+                let batch = (0..24)
+                    .map(|ordinal| {
+                        IndexableDocument::new(format!("u{segment}-d{ordinal}"), "original text")
+                    })
+                    .collect::<Vec<_>>();
+                index
+                    .index_documents(&cx, &batch)
+                    .await
+                    .expect("stage segment");
+                index.commit(&cx).await.expect("publish segment");
+            }
+            assert_eq!(committed_segment_ids(&index).len(), 6);
+
+            // Pending work plus a fresh-only upsert: nothing is replaced, so
+            // the upsert must not publish the pending batch.
+            let generation = published_generation(&index);
+            index
+                .index_documents(&cx, &[IndexableDocument::new("pending-0", "pending text")])
+                .await
+                .expect("stage pending work");
+            let fresh = (0..16)
+                .map(|ordinal| IndexableDocument::new(format!("fresh-{ordinal}"), "fresh text"))
+                .collect::<Vec<_>>();
+            index
+                .upsert_documents(&cx, &fresh)
+                .await
+                .expect("fresh-only upsert accumulates");
+            assert_eq!(published_generation(&index), generation);
+            assert!(index.has_uncommitted_changes());
+
+            // One published identity from every segment, plus fresh ones: the
+            // pending work publishes first, then each identity is replaced.
+            let mut replaced = BTreeSet::new();
+            let mut batch = Vec::new();
+            for segment in 0..6 {
+                let document_id = format!("u{segment}-d{segment}");
+                batch.push(IndexableDocument::new(&document_id, "replaced text"));
+                replaced.insert(document_id);
+                batch.push(IndexableDocument::new(
+                    format!("fresh-mixed-{segment}"),
+                    "fresh text",
+                ));
+            }
+            index
+                .upsert_documents(&cx, &batch)
+                .await
+                .expect("replace across every segment");
+            assert!(published_generation(&index) > generation);
+            assert!(!index.has_uncommitted_changes());
+            assert_eq!(index.doc_count().expect("doc count"), 144 + 1 + 16 + 6);
+            assert_eq!(ids_matching(&cx, &index, "replaced"), replaced);
+            assert_eq!(ids_matching(&cx, &index, "original").len(), 144 - 6);
+
+            // Identities that now live in a concat-merged output.
+            let inputs = committed_segment_ids(&index);
+            let output_segment_id = fresh_merge_segment_id(&index, 0x0ad1_0002);
+            index
+                .concat_merge(&cx, &inputs[..2], output_segment_id, 1_700_000_000)
+                .await
+                .expect("fold the first two segments");
+            let merged = [
+                IndexableDocument::new("u0-d5", "replaced text"),
+                IndexableDocument::new("u1-d7", "replaced text"),
+            ];
+            index
+                .upsert_documents(&cx, &merged)
+                .await
+                .expect("replace identities in the merged output");
+            replaced.extend(merged.iter().map(|document| document.id.clone()));
+            assert_eq!(index.doc_count().expect("doc count"), 167);
+            assert_eq!(ids_matching(&cx, &index, "replaced"), replaced);
+
+            drop(index);
+            let reopened = QuillIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("reopen writer");
+            let after_reopen = [
+                IndexableDocument::new("u3-d3", "replaced again"),
+                IndexableDocument::new("u4-d11", "replaced text"),
+                IndexableDocument::new("fresh-3", "replaced text"),
+                IndexableDocument::new("fresh-after-reopen", "fresh text"),
+            ];
+            reopened
+                .upsert_documents(&cx, &after_reopen)
+                .await
+                .expect("replace after reopen");
+            replaced.extend(["u4-d11".to_owned(), "fresh-3".to_owned()]);
+            assert_eq!(reopened.doc_count().expect("doc count"), 168);
+            assert_eq!(ids_matching(&cx, &reopened, "replaced"), replaced);
+            assert_eq!(ids_matching(&cx, &reopened, "again").len(), 1);
+            assert_eq!(ids_matching(&cx, &reopened, "original").len(), 144 - 9);
         });
     }
 

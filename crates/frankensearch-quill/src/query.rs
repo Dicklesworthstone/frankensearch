@@ -452,6 +452,73 @@ impl Query {
         )
     }
 
+    /// Conservative owned-buffer charge for the dev-only ranked-query cache.
+    ///
+    /// Visit the complete arena, including nodes disconnected by query
+    /// canonicalization. Walking only the root would miss allocations still
+    /// retained by an exact-key clone. Overflow saturates and refuses caching.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub(crate) fn cache_heap_bytes(&self) -> usize {
+        let mut bytes = self
+            .nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<QueryNode>());
+        for node in self.nodes.iter().chain(std::iter::once(&self.root)) {
+            let node_bytes = match node {
+                QueryNode::Term { fields, text } => fields
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<QueryField>())
+                    .saturating_add(text.capacity()),
+                QueryNode::Phrase { fields, terms, .. } => {
+                    let buffers = fields
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<QueryField>())
+                        .saturating_add(
+                            terms
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<PositionedTerm>()),
+                        );
+                    terms.iter().fold(buffers, |total, term| {
+                        total.saturating_add(term.text.capacity())
+                    })
+                }
+                QueryNode::Boolean { clauses, .. } => clauses
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<QueryClause>()),
+                QueryNode::Range { lower, upper, .. } => {
+                    [lower, upper].into_iter().fold(0_usize, |total, bound| {
+                        total.saturating_add(match bound {
+                            Bound::Included(QueryValue::Str(value))
+                            | Bound::Excluded(QueryValue::Str(value)) => value.capacity(),
+                            _ => 0,
+                        })
+                    })
+                }
+                QueryNode::Set { values, .. } => values.iter().fold(
+                    values
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<QueryValue>()),
+                    |total, value| {
+                        total.saturating_add(match value {
+                            QueryValue::Str(value) => value.capacity(),
+                            QueryValue::I64(_) | QueryValue::U64(_) => 0,
+                        })
+                    },
+                ),
+                QueryNode::Glob { field_ids, pattern } => field_ids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u16>())
+                    .saturating_add(pattern.capacity()),
+                QueryNode::Empty
+                | QueryNode::All
+                | QueryNode::AllocationFailure { .. }
+                | QueryNode::Boost { .. } => 0,
+            };
+            bytes = bytes.saturating_add(node_bytes);
+        }
+        bytes
+    }
+
     fn node_mut(&mut self, id: QueryNodeId) -> &mut QueryNode {
         if id == QueryNodeId::ROOT {
             &mut self.root
@@ -5917,6 +5984,89 @@ mod tests {
 
     fn parser() -> DefaultQueryParser {
         DefaultQueryParser::new(DEFAULT_SCHEMA).expect("default schema supports its parser")
+    }
+
+    #[test]
+    fn cache_heap_bytes_includes_spare_capacity_and_disconnected_nodes() {
+        const RESERVE: usize = 4_096;
+        let text = || {
+            let mut text = String::with_capacity(RESERVE);
+            text.push('x');
+            text
+        };
+        let cases = [
+            QueryNode::Term {
+                fields: Vec::with_capacity(RESERVE),
+                text: String::new(),
+            },
+            QueryNode::Term {
+                fields: Vec::new(),
+                text: text(),
+            },
+            QueryNode::Phrase {
+                fields: Vec::with_capacity(RESERVE),
+                terms: Vec::new(),
+                slop: 0,
+                prefix: false,
+            },
+            QueryNode::Phrase {
+                fields: Vec::new(),
+                terms: Vec::with_capacity(RESERVE),
+                slop: 0,
+                prefix: false,
+            },
+            QueryNode::Phrase {
+                fields: Vec::new(),
+                terms: vec![PositionedTerm::new(0, text())],
+                slop: 0,
+                prefix: false,
+            },
+            QueryNode::Boolean {
+                clauses: Vec::with_capacity(RESERVE),
+                operator: None,
+            },
+            QueryNode::Range {
+                field_id: 0,
+                lower: Bound::Included(QueryValue::Str(text())),
+                upper: Bound::Excluded(QueryValue::Str(text())),
+            },
+            QueryNode::Set {
+                field_id: 0,
+                values: Vec::with_capacity(RESERVE),
+            },
+            QueryNode::Set {
+                field_id: 0,
+                values: vec![QueryValue::Str(text())],
+            },
+            QueryNode::Glob {
+                field_ids: Vec::with_capacity(RESERVE),
+                pattern: String::new(),
+            },
+            QueryNode::Glob {
+                field_ids: Vec::new(),
+                pattern: text(),
+            },
+        ];
+        for node in cases {
+            let query = Query::new(node);
+            assert!(
+                query.cache_heap_bytes() >= RESERVE,
+                "cache charge missed an owned buffer in {:?}",
+                query.root(),
+            );
+        }
+
+        let mut nodes = Vec::with_capacity(RESERVE);
+        nodes.push(QueryNode::Term {
+            fields: Vec::new(),
+            text: text(),
+        });
+        let expected = nodes.capacity() * std::mem::size_of::<QueryNode>() + RESERVE;
+        let query = Query {
+            nodes,
+            root: QueryNode::All,
+        };
+        assert!(query.cache_heap_bytes() >= expected);
     }
 
     /// Whether `node` is the default two-field expansion group of `text`:
