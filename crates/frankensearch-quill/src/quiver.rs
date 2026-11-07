@@ -8176,6 +8176,35 @@ impl IdHashLookupPlan {
         None
     }
 
+    /// Visit the stored key hash of every slot [`Self::lookup_with_content_hash`]
+    /// could report as a hit.
+    ///
+    /// That probe returns a winner only from a readable slot whose
+    /// `doc_ord_plus1` is nonzero and whose stored hash equals the probe's
+    /// [`seeded_id_hash`], after the same section-length and header checks
+    /// applied here. The visited hashes are therefore a superset of every key
+    /// the probe can match, which is what a membership pre-filter needs.
+    pub(crate) fn for_each_occupied_key_hash(
+        self,
+        id_hash_bytes: &[u8],
+        mut visit: impl FnMut(u64),
+    ) {
+        if id_hash_bytes.len() != self.id_hash_len {
+            return;
+        }
+        let Some(entries) = id_hash_bytes.get(ID_HASH_HEADER_LEN..) else {
+            return;
+        };
+        for slot in 0..self.capacity {
+            let Some((stored_hash, doc_ord_plus1)) = id_hash_slot(entries, slot) else {
+                return;
+            };
+            if doc_ord_plus1 != 0 {
+                visit(stored_hash);
+            }
+        }
+    }
+
     fn content_hash(self, id_map_bytes: &[u8], ordinal: usize) -> Option<u64> {
         if ordinal >= self.span {
             return None;
@@ -8216,7 +8245,7 @@ fn consume_id_hash_probe_step(
     Ok(())
 }
 
-fn seeded_id_hash(document_id: &[u8]) -> u64 {
+pub(crate) fn seeded_id_hash(document_id: &[u8]) -> u64 {
     xxh3_64_with_seed(document_id, ID_HASH_SEED)
 }
 

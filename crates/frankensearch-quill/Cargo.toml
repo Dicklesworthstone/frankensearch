@@ -140,5 +140,10 @@ name = "grouped_maxscore_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "admission_filter_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true

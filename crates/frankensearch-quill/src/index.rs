@@ -84,8 +84,9 @@ use crate::keeper::{
     KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout, LiveDocumentFloor,
     MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
     PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState, PublishIntent,
-    RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout,
-    load_manifest_pair, plan_tier_merge_with_fit, validate_manifest_successor,
+    PublishedIdFilter, RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet,
+    inspect_lexical_layout, load_manifest_pair, plan_tier_merge_with_fit,
+    validate_manifest_successor,
 };
 use crate::query::{
     BooleanClause, BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError,
@@ -5706,6 +5707,87 @@ pub struct PreparsedQuillIndex {
     reader: QuillReader,
 }
 
+/// Bench-only handle holding the writer lock for a same-invocation A/B of
+/// scalar batch admission: the shipping [`PublishedIdFilter`] probe against
+/// the incumbent all-segment probe, over the same batch and snapshot.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub struct BenchAdmissionSession {
+    writer: OwnedMutexGuard<QuillWriterState>,
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchAdmissionSession {
+    /// Admit `documents` (no replacements) through the shipping filtered
+    /// probe (`filtered`) or the incumbent probe, touching no ingest state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the admission refusal or failure either path reports.
+    pub fn validate(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        filtered: bool,
+    ) -> Result<(), QuillIndexError> {
+        let batch = IngestBatch::Default(documents);
+        let no_replacements = BTreeSet::new();
+        if filtered {
+            self.writer
+                .validate_batch_admission(cx, batch, &no_replacements)
+                .map(|_| ())
+        } else {
+            let authority = self.writer.authority_snapshot()?;
+            self.writer
+                .admit_batch(cx, batch, &no_replacements, |document_id| {
+                    Ok(authority.resolve_document_id(document_id)?.is_some())
+                })
+                .map(|_| ())
+        }
+    }
+
+    /// Drop the filter so the next filtered admission rebuilds it from the
+    /// snapshot, as the first admission after opening an index does.
+    pub fn reset_filter(&mut self) {
+        self.writer.published_id_filter = PublishedIdFilter::default();
+    }
+
+    /// Filter table bytes, inserted keys, whether misses are answered by the
+    /// filter, and how many of `document_ids` it lets through to the full
+    /// probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns authority or cancellation failures from synchronization.
+    pub fn filter_receipt(
+        &mut self,
+        cx: &Cx,
+        document_ids: &[&str],
+    ) -> Result<(usize, u64, bool, usize), QuillIndexError> {
+        let mut filter = std::mem::take(&mut self.writer.published_id_filter);
+        let receipt = Self::filter_receipt_with(&self.writer, cx, &mut filter, document_ids);
+        self.writer.published_id_filter = filter;
+        receipt
+    }
+
+    fn filter_receipt_with(
+        writer: &QuillWriterState,
+        cx: &Cx,
+        filter: &mut PublishedIdFilter,
+        document_ids: &[&str],
+    ) -> Result<(usize, u64, bool, usize), QuillIndexError> {
+        let authority = writer.authority_snapshot()?;
+        let published = filter.sync(authority, || check_cancel(cx, "index admission"))?;
+        let answers_absence = published.answers_absence();
+        let passed = document_ids
+            .iter()
+            .filter(|document_id| published.passes_to_probe(document_id))
+            .count();
+        let (bytes, keys) = filter.footprint();
+        Ok((bytes, keys, answers_absence, passed))
+    }
+}
+
 /// Scalar Quill writer state guarded by [`QuillIndex::writer`].
 struct QuillWriterState {
     reader: QuillReader,
@@ -5714,6 +5796,10 @@ struct QuillWriterState {
     shard_router: ShardRouter,
     docid_allocator: DocIdAllocator,
     uncommitted_ids: BTreeSet<String>,
+    /// Pre-filter that lets batch admission skip the all-segment identity
+    /// probe for identifiers no published segment can hold. A pure cache over
+    /// the authority snapshot, resynchronized by every admission.
+    published_id_filter: PublishedIdFilter,
     next_lease_base: u64,
     /// The docid frontier this writer opened at. Segments below it were
     /// finished by an earlier writer, so [`Self::finish_bulk_load`] packs only
@@ -6192,6 +6278,7 @@ impl QuillWriterState {
             shard_router,
             docid_allocator,
             uncommitted_ids: BTreeSet::new(),
+            published_id_filter: PublishedIdFilter::default(),
             next_lease_base,
             bulk_session_docid_lo,
             next_seal_seq,
@@ -8160,16 +8247,52 @@ impl QuillWriterState {
     /// refused even for replacement ids, which is what the per-document version
     /// did by inserting as it went.
     ///
+    /// The published-snapshot probe goes through [`PublishedIdFilter`], which
+    /// answers "absent" for an identifier no segment's IDHASH can match without
+    /// probing every segment, and otherwise runs the same probe. Its only
+    /// state is that cache; mutating it changes no admission answer.
+    ///
     /// # Errors
     ///
     /// Returns typed cancellation, empty-id, or duplicate-id failures.
     fn validate_batch_admission<'a>(
-        &self,
+        &mut self,
         cx: &Cx,
         documents: IngestBatch<'a>,
         replacement_ids: &BTreeSet<&str>,
     ) -> Result<ValidatedBatchAdmission<'a>, QuillIndexError> {
+        // Moved out so the probe can borrow it beside `&self`; a panic merely
+        // drops the cache, and the next admission resynchronizes it.
+        let mut filter = std::mem::take(&mut self.published_id_filter);
+        let admission =
+            self.validate_batch_admission_filtered(cx, documents, replacement_ids, &mut filter);
+        self.published_id_filter = filter;
+        admission
+    }
+
+    fn validate_batch_admission_filtered<'a>(
+        &self,
+        cx: &Cx,
+        documents: IngestBatch<'a>,
+        replacement_ids: &BTreeSet<&str>,
+        filter: &mut PublishedIdFilter,
+    ) -> Result<ValidatedBatchAdmission<'a>, QuillIndexError> {
         let authority = self.authority_snapshot()?;
+        let published = filter.sync(authority, || check_cancel(cx, "index admission"))?;
+        self.admit_batch(cx, documents, replacement_ids, |document_id| {
+            Ok(published.resolve_document_id(document_id)?.is_some())
+        })
+    }
+
+    /// The admission predicate of [`Self::validate_batch_admission`], with the
+    /// published-snapshot probe supplied by the caller.
+    fn admit_batch<'a>(
+        &self,
+        cx: &Cx,
+        documents: IngestBatch<'a>,
+        replacement_ids: &BTreeSet<&str>,
+        mut is_published: impl FnMut(&str) -> Result<bool, QuillIndexError>,
+    ) -> Result<ValidatedBatchAdmission<'a>, QuillIndexError> {
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "index admission")?;
@@ -8178,8 +8301,7 @@ impl QuillWriterState {
             }
             if !batch_ids.insert(document.id())
                 || self.uncommitted_ids.contains(document.id())
-                || authority.resolve_document_id(document.id())?.is_some()
-                    && !replacement_ids.contains(document.id())
+                || is_published(document.id())? && !replacement_ids.contains(document.id())
             {
                 return Err(invalid_state(format!(
                     "duplicate live document id {:?}",
@@ -13630,6 +13752,22 @@ impl QuillIndex {
             rank_pruning,
             snapshot.as_ref(),
         )
+    }
+
+    /// Bench-only: hold the writer lock for a same-invocation admission A/B.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation or writer-lock failures.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn bench_admission_session(
+        &self,
+        cx: &Cx,
+    ) -> Result<BenchAdmissionSession, QuillIndexError> {
+        Ok(BenchAdmissionSession {
+            writer: self.lock_writer(cx, "index writer lock").await?,
+        })
     }
 }
 
@@ -31463,6 +31601,92 @@ mod tests {
                 1,
                 "rejected ingests must not change doc_count",
             );
+        });
+    }
+
+    /// The admission pre-filter must never admit an identifier that a
+    /// published segment holds live: every one is refused across separate
+    /// publications, a concat merge, a delete and re-add, an upsert, and a
+    /// writer reopen (whose first admission rebuilds the filter from disk),
+    /// while fresh and tombstoned identifiers are still admitted.
+    #[test]
+    fn admission_filter_refuses_every_published_id_across_lifecycle() {
+        async fn assert_all_refused(cx: &Cx, index: &QuillIndex, ids: &[String]) {
+            for document_id in ids {
+                let refusal = index
+                    .index_documents(cx, &[IndexableDocument::new(document_id, "again")])
+                    .await
+                    .expect_err("a published identifier must be refused");
+                assert!(
+                    refusal.to_string().contains("duplicate live document id"),
+                    "unexpected refusal for {document_id:?}: {refusal}",
+                );
+            }
+        }
+
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_visibility_lag_ms: u64::MAX,
+                tier_fanout: usize::MAX,
+                ..deterministic_config()
+            };
+            let directory = tempfile::tempdir().expect("admission filter directory");
+            let index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("create on-disk index");
+            let mut published = Vec::new();
+            for segment in 0..6 {
+                let batch = (0..40)
+                    .map(|ordinal| {
+                        IndexableDocument::new(format!("s{segment}-d{ordinal}"), "shared text")
+                    })
+                    .collect::<Vec<_>>();
+                index
+                    .index_documents(&cx, &batch)
+                    .await
+                    .expect("stage segment");
+                index.commit(&cx).await.expect("publish segment");
+                published.extend(batch.into_iter().map(|document| document.id));
+                assert_all_refused(&cx, &index, &published).await;
+            }
+            assert_eq!(committed_segment_ids(&index).len(), 6);
+
+            let inputs = committed_segment_ids(&index);
+            let output_segment_id = fresh_merge_segment_id(&index, 0x0ad1_0001);
+            index
+                .concat_merge(&cx, &inputs[..2], output_segment_id, 1_700_000_000)
+                .await
+                .expect("fold the first two segments");
+            assert_all_refused(&cx, &index, &published).await;
+
+            assert!(
+                index
+                    .delete_document(&cx, "s3-d5")
+                    .await
+                    .expect("delete one document")
+            );
+            index
+                .index_documents(&cx, &[IndexableDocument::new("s3-d5", "re-added")])
+                .await
+                .expect("a tombstoned identifier is admitted again");
+            index.commit(&cx).await.expect("publish the re-add");
+            index
+                .upsert_documents(&cx, &[IndexableDocument::new("s4-d6", "replaced")])
+                .await
+                .expect("upsert replaces a published identifier");
+            index.commit(&cx).await.expect("publish the upsert");
+            assert_all_refused(&cx, &index, &published).await;
+            assert_eq!(index.doc_count().expect("doc count"), 240);
+
+            drop(index);
+            let reopened = QuillIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("reopen writer");
+            assert_all_refused(&cx, &reopened, &published).await;
+            reopened
+                .index_documents(&cx, &[IndexableDocument::new("fresh-after-reopen", "new")])
+                .await
+                .expect("a fresh identifier is admitted after reopen");
         });
     }
 

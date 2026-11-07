@@ -52,7 +52,7 @@ use crate::quiver::{
     StoredMetaLookup, StoredMetaSection, ValidatedStoredMetaLookupPlan,
     ValidatedTermPruningMetadata, aggregate_field_stats, check_posting_concat_bounds,
     project_doclen_len, project_id_hash_len, project_id_map_len, project_position_concat_bounds,
-    project_stored_meta_len_total,
+    project_stored_meta_len_total, seeded_id_hash,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{
@@ -3619,6 +3619,39 @@ impl RecoveredSegment {
             .transpose()
     }
 
+    /// Whether [`Self::lookup_document_id`] can only fail on an identifier hit
+    /// when probed under `manifest`, as [`KeeperSnapshot::resolve_document_id_in`]
+    /// probes it.
+    ///
+    /// The probe loop fails for EVERY identifier once it reaches a binding
+    /// that names a different segment than `manifest` holds at the same range,
+    /// or whose validated IDMAP/IDHASH ranges no longer fit its backing.
+    /// Neither depends on the identifier, so a membership pre-filter may only
+    /// answer for a snapshot in which every binding passes this check.
+    fn identity_probe_fails_only_on_hits(&self, manifest: &Manifest) -> bool {
+        let same_identity = manifest
+            .segments
+            .binary_search_by_key(&self.manifest.docid_lo, |candidate| candidate.docid_lo)
+            .map_or(true, |index| {
+                manifest.segments[index].segment_id == self.manifest.segment_id
+            });
+        let source = self.reader.source_bytes();
+        same_identity
+            && source.get(self.identity_sections.id_map.clone()).is_some()
+            && source.get(self.identity_sections.id_hash.clone()).is_some()
+    }
+
+    /// Visit every IDHASH key hash [`Self::lookup_document_id`] could match.
+    fn for_each_identity_key_hash(&self, visit: impl FnMut(u64)) {
+        if let Some(id_hash) = self
+            .reader
+            .source_bytes()
+            .get(self.identity_sections.id_hash.clone())
+        {
+            self.id_lookup.for_each_occupied_key_hash(id_hash, visit);
+        }
+    }
+
     /// Structurally validated FSLX header.
     #[must_use]
     pub fn header(&self) -> SegmentHeader {
@@ -4659,6 +4692,288 @@ impl KeeperSnapshot {
             live = Some(resolved);
         }
         Ok(live)
+    }
+}
+
+/// Lanes in one [`PublishedIdFilterBlock`]; every key sets one bit per lane.
+const PUBLISHED_ID_FILTER_LANES: usize = 8;
+/// Bits in one block: a single 64-byte cache line, so a probe reads one line.
+const PUBLISHED_ID_FILTER_BLOCK_BITS: u64 = 512;
+/// Density a freshly sized filter starts at.
+const PUBLISHED_ID_FILTER_BUILD_BITS_PER_KEY: u64 = 32;
+/// Density below which further publications resize the filter. At 16 bits
+/// per key an eight-lane split-block filter answers "maybe" for about one
+/// absent identifier in a thousand, and each such answer costs one ordinary
+/// all-segment probe.
+const PUBLISHED_ID_FILTER_MIN_BITS_PER_KEY: u64 = 16;
+/// Smallest table, so a small index does not resize on every publication.
+const PUBLISHED_ID_FILTER_MIN_BLOCKS: u64 = 64;
+/// Odd multipliers spreading one 32-bit hash word over the eight lanes (the
+/// split-block Bloom filter salts used by Apache Parquet and Impala).
+const PUBLISHED_ID_FILTER_SALTS: [u32; PUBLISHED_ID_FILTER_LANES] = [
+    0x47b6_137b,
+    0x4497_4d91,
+    0x8824_ad5b,
+    0xa2b7_289d,
+    0x7054_95c7,
+    0x2df1_424b,
+    0x9efc_4947,
+    0x5c6b_fb31,
+];
+
+#[derive(Clone, Copy, Default)]
+#[repr(align(64))]
+struct PublishedIdFilterBlock([u64; PUBLISHED_ID_FILTER_LANES]);
+
+impl PublishedIdFilterBlock {
+    fn lane_masks(key_hash: u64) -> [u64; PUBLISHED_ID_FILTER_LANES] {
+        let [b0, b1, b2, b3, ..] = key_hash.to_le_bytes();
+        let word = u32::from_le_bytes([b0, b1, b2, b3]);
+        PUBLISHED_ID_FILTER_SALTS.map(|salt| 1_u64 << (word.wrapping_mul(salt) >> 26))
+    }
+
+    /// Block owning `key_hash` in a table of `blocks` blocks: the high half of
+    /// the 128-bit product, always `< blocks` for a nonempty table.
+    fn index(key_hash: u64, blocks: usize) -> usize {
+        let blocks = u64::try_from(blocks).unwrap_or(u64::MAX);
+        let index = (u128::from(key_hash) * u128::from(blocks)) >> 64;
+        usize::try_from(index).unwrap_or(usize::MAX)
+    }
+}
+
+/// Writer-held membership pre-filter over the IDHASH keys of one snapshot.
+///
+/// [`KeeperSnapshot::resolve_document_id`] probes every sealed segment, so a
+/// bulk build's per-document admission check costs O(segments) and slows as
+/// segments accumulate. This filter holds a superset of every key that probe
+/// can match in the snapshot it was last synchronized to (see
+/// [`RecoveredSegment::for_each_identity_key_hash`]). An identifier whose key
+/// it lacks is absent from every segment, which is exactly the probe's
+/// `Ok(None)`; every other identifier still runs the full probe, so hits,
+/// tombstones, duplicate-live diagnosis, and errors are unchanged.
+///
+/// Coverage is tracked per immutable segment backing, each pinned by a `Weak`
+/// so its address cannot be reused by another backing while recorded here.
+/// Keys of backings that later leave the snapshot (merged, deleted, or
+/// rebound) stay set until the next resize; that only adds "maybe" answers.
+#[derive(Default)]
+pub(crate) struct PublishedIdFilter {
+    blocks: Vec<PublishedIdFilterBlock>,
+    /// Keys set in `blocks`, including keys of backings since dropped.
+    inserted_keys: u64,
+    /// Backings whose every IDHASH key is set in `blocks`.
+    covered: Vec<Weak<RecoveredSegmentBacking>>,
+    /// Generation whose segments `covered` last listed one-for-one, in order.
+    synced_generation: Option<u64>,
+    /// Whether a miss may answer for the synchronized snapshot.
+    answers_absence: bool,
+}
+
+impl PublishedIdFilter {
+    /// Bring the filter up to date with `snapshot` and bind a probe to it.
+    ///
+    /// An unchanged snapshot costs one pointer comparison per segment. A
+    /// changed one inserts only the keys of backings not yet covered, or
+    /// resizes and reinserts every segment once the table grows too dense.
+    /// `checkpoint` runs before each segment is inserted so the first
+    /// synchronization after opening a large index stays cancellable; its
+    /// error leaves the filter consistent but unsynchronized.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first `checkpoint` error.
+    pub(crate) fn sync<'a, E>(
+        &'a mut self,
+        snapshot: &'a KeeperSnapshot,
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+    ) -> Result<PublishedIdProbe<'a>, E> {
+        let generation = snapshot.loaded.manifest.generation;
+        let current = self.synced_generation == Some(generation)
+            && self.covered.len() == snapshot.segments.len()
+            && self
+                .covered
+                .iter()
+                .zip(&snapshot.segments)
+                .all(|(covered, segment)| {
+                    std::ptr::eq(covered.as_ptr(), Arc::as_ptr(&segment.reader))
+                });
+        if !current {
+            self.synced_generation = None;
+            self.refresh(snapshot, &mut checkpoint)?;
+            self.synced_generation = Some(generation);
+        }
+        let filter: &'a Self = self;
+        Ok(PublishedIdProbe {
+            filter: filter.answers_absence.then_some(filter),
+            snapshot,
+        })
+    }
+
+    fn refresh<E>(
+        &mut self,
+        snapshot: &KeeperSnapshot,
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.answers_absence = false;
+        let manifest = &snapshot.loaded.manifest;
+        if !snapshot
+            .segments
+            .iter()
+            .all(|segment| segment.identity_probe_fails_only_on_hits(manifest))
+        {
+            return Ok(());
+        }
+        let backing = |segment: &RecoveredSegment| Arc::as_ptr(&segment.reader).addr();
+        let mut covered: BTreeSet<usize> = self
+            .covered
+            .iter()
+            .map(|covered| covered.as_ptr().addr())
+            .collect();
+        let incoming = snapshot
+            .segments
+            .iter()
+            .filter(|segment| !covered.contains(&backing(segment)))
+            .map(|segment| u64::from(segment.manifest.doc_count))
+            .fold(0_u64, u64::saturating_add);
+        if self.blocks.is_empty()
+            || self.inserted_keys.saturating_add(incoming) > self.key_capacity()
+        {
+            let keys = snapshot
+                .segments
+                .iter()
+                .map(|segment| u64::from(segment.manifest.doc_count))
+                .fold(0_u64, u64::saturating_add);
+            if !self.resize(keys) {
+                return Ok(());
+            }
+            covered.clear();
+        }
+        for segment in &snapshot.segments {
+            if !covered.insert(backing(segment)) {
+                continue;
+            }
+            checkpoint()?;
+            let blocks = &mut self.blocks;
+            let block_count = blocks.len();
+            let mut inserted = 0_u64;
+            segment.for_each_identity_key_hash(|key_hash| {
+                if let Some(block) =
+                    blocks.get_mut(PublishedIdFilterBlock::index(key_hash, block_count))
+                {
+                    let masks = PublishedIdFilterBlock::lane_masks(key_hash);
+                    for (lane, mask) in block.0.iter_mut().zip(masks) {
+                        *lane |= mask;
+                    }
+                }
+                inserted += 1;
+            });
+            self.inserted_keys = self.inserted_keys.saturating_add(inserted);
+            self.covered.push(Arc::downgrade(&segment.reader));
+        }
+        // Every current backing is covered now; forget the ones the snapshot
+        // dropped, whose keys stay set until the next resize.
+        self.covered.clear();
+        self.covered.extend(
+            snapshot
+                .segments
+                .iter()
+                .map(|segment| Arc::downgrade(&segment.reader)),
+        );
+        self.answers_absence = true;
+        Ok(())
+    }
+
+    /// Replace the table with an empty one sized for `keys`. Returns `false`,
+    /// leaving the filter empty, when that table cannot be allocated: the
+    /// filter is only an accelerator, so admission then probes as before.
+    fn resize(&mut self, keys: u64) -> bool {
+        self.blocks = Vec::new();
+        self.inserted_keys = 0;
+        self.covered.clear();
+        let blocks = keys
+            .saturating_mul(PUBLISHED_ID_FILTER_BUILD_BITS_PER_KEY)
+            .div_ceil(PUBLISHED_ID_FILTER_BLOCK_BITS)
+            .max(PUBLISHED_ID_FILTER_MIN_BLOCKS);
+        let Ok(blocks) = usize::try_from(blocks) else {
+            return false;
+        };
+        if self.blocks.try_reserve_exact(blocks).is_err() {
+            return false;
+        }
+        self.blocks
+            .resize(blocks, PublishedIdFilterBlock::default());
+        true
+    }
+
+    /// Inserted keys the table holds before it falls below the minimum density.
+    fn key_capacity(&self) -> u64 {
+        u64::try_from(self.blocks.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(PUBLISHED_ID_FILTER_BLOCK_BITS)
+            / PUBLISHED_ID_FILTER_MIN_BITS_PER_KEY
+    }
+
+    /// `false` only when no covered backing holds a slot keyed `key_hash`.
+    fn may_contain(&self, key_hash: u64) -> bool {
+        self.blocks
+            .get(PublishedIdFilterBlock::index(key_hash, self.blocks.len()))
+            .is_none_or(|block| {
+                block
+                    .0
+                    .iter()
+                    .zip(PublishedIdFilterBlock::lane_masks(key_hash))
+                    .all(|(lane, mask)| lane & mask != 0)
+            })
+    }
+
+    /// Table bytes and inserted keys, for benchmark receipts.
+    #[cfg(feature = "bench-internals")]
+    pub(crate) fn footprint(&self) -> (usize, u64) {
+        (
+            std::mem::size_of_val(self.blocks.as_slice()),
+            self.inserted_keys,
+        )
+    }
+}
+
+/// A [`PublishedIdFilter`] bound to the exact snapshot it was synchronized to.
+#[derive(Clone, Copy)]
+pub(crate) struct PublishedIdProbe<'a> {
+    /// `None` when the snapshot must answer every identifier by probing.
+    filter: Option<&'a PublishedIdFilter>,
+    snapshot: &'a KeeperSnapshot,
+}
+
+impl PublishedIdProbe<'_> {
+    /// [`KeeperSnapshot::resolve_document_id`], answering `Ok(None)` without
+    /// probing any segment when the filter proves the identifier absent.
+    ///
+    /// # Errors
+    ///
+    /// Exactly the errors of [`KeeperSnapshot::resolve_document_id`].
+    pub(crate) fn resolve_document_id(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<ResolvedDocumentId>, KeeperError> {
+        if let Some(filter) = self.filter
+            && !filter.may_contain(seeded_id_hash(document_id.as_bytes()))
+        {
+            return Ok(None);
+        }
+        self.snapshot.resolve_document_id(document_id)
+    }
+
+    /// Whether the filter, rather than the full probe, answers misses.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub(crate) const fn answers_absence(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    /// Whether `document_id` reaches the full probe.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub(crate) fn passes_to_probe(&self, document_id: &str) -> bool {
+        self.filter
+            .is_none_or(|filter| filter.may_contain(seeded_id_hash(document_id.as_bytes())))
     }
 }
 
@@ -23017,6 +23332,119 @@ mod tests {
                 ..
             })
         ));
+        let mut filter = PublishedIdFilter::default();
+        let probe = filter.sync(&duplicate, || Ok::<(), KeeperError>(()))?;
+        assert!(probe.answers_absence());
+        assert!(matches!(
+            probe.resolve_document_id("repeated"),
+            Err(KeeperError::MultipleLiveDocumentIds {
+                first_global_docid: 0,
+                duplicate_global_docid: 20,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    /// Resolve every identifier through a synchronized [`PublishedIdFilter`]
+    /// and through the full probe, and require the same answer for each.
+    /// Returns how many of `absent` the filter let through to the probe.
+    fn assert_filtered_resolution_matches(
+        filter: &mut PublishedIdFilter,
+        snapshot: &KeeperSnapshot,
+        published: &[String],
+        absent: &[String],
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let probe = filter.sync(snapshot, || Ok::<(), KeeperError>(()))?;
+        assert!(
+            probe.answers_absence(),
+            "a consistent snapshot is filterable"
+        );
+        for document_id in published.iter().chain(absent) {
+            assert_eq!(
+                format!("{:?}", probe.resolve_document_id(document_id)),
+                format!("{:?}", snapshot.resolve_document_id(document_id)),
+                "filtered resolution diverged for {document_id:?}"
+            );
+        }
+        for document_id in absent {
+            assert_eq!(snapshot.resolve_document_id(document_id)?, None);
+        }
+        Ok(absent
+            .iter()
+            .filter(|document_id| probe.passes_to_probe(document_id))
+            .count())
+    }
+
+    #[test]
+    fn published_id_filter_resolves_exactly_as_the_full_probe() -> TestResult {
+        const SEGMENTS: u64 = 12;
+        const DOCS_PER_SEGMENT: u64 = 512;
+        let absent = (0..2_048)
+            .map(|ordinal| format!("absent-{ordinal}"))
+            .collect::<Vec<_>>();
+        let mut snapshot = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let mut filter = PublishedIdFilter::default();
+        let mut published = Vec::new();
+        // One publication per segment: incremental insertion, plus several
+        // resizes as 6,144 keys outgrow the 2,048-key minimum table.
+        for segment in 0..SEGMENTS {
+            let ids = (0..DOCS_PER_SEGMENT)
+                .map(|ordinal| format!("seg{segment}-doc{ordinal}"))
+                .collect::<Vec<_>>();
+            let slots = ids.iter().map(|id| Some(id.as_str())).collect::<Vec<_>>();
+            let docid_lo = segment * DOCS_PER_SEGMENT;
+            let encoded = encoded_identity_test_segment(0x900 + segment, docid_lo, &slots)?;
+            let mut proposed = snapshot.next_manifest()?;
+            proposed.docid_high_watermark = docid_lo + DOCS_PER_SEGMENT;
+            proposed
+                .segments
+                .push(manifest_segment(&encoded, segment + 1));
+            snapshot = snapshot.publish_owned_segments(&proposed, vec![encoded])?;
+            published.extend(ids);
+            let passed =
+                assert_filtered_resolution_matches(&mut filter, &snapshot, &published, &absent)?;
+            assert!(
+                passed * 50 < absent.len(),
+                "the filter must answer nearly every miss itself ({passed} of {} probed)",
+                absent.len()
+            );
+        }
+
+        // Tombstones rebind the same backings under a new generation: a
+        // deleted identifier keeps its IDHASH key, so it must still reach the
+        // probe, which skips the tombstoned row and answers `None`.
+        let mut deleted = snapshot.next_manifest()?;
+        for ordinal in 0..DOCS_PER_SEGMENT / 2 {
+            assert!(snapshot.delete_document(&mut deleted, &format!("seg3-doc{ordinal}"))?);
+        }
+        snapshot = snapshot.publish_owned_segments(&deleted, Vec::new())?;
+        assert_eq!(snapshot.resolve_document_id("seg3-doc0")?, None);
+        assert_filtered_resolution_matches(&mut filter, &snapshot, &published, &absent)?;
+
+        // A second live row for one identifier is diagnosed, not masked.
+        let docid_lo = SEGMENTS * DOCS_PER_SEGMENT;
+        let encoded = encoded_identity_test_segment(0x9ff, docid_lo, &[Some("seg5-doc7")])?;
+        let mut duplicated = snapshot.next_manifest()?;
+        duplicated.docid_high_watermark = docid_lo + 1;
+        duplicated
+            .segments
+            .push(manifest_segment(&encoded, SEGMENTS + 1));
+        let duplicate = snapshot.publish_owned_segments(&duplicated, vec![encoded])?;
+        assert!(matches!(
+            duplicate.resolve_document_id("seg5-doc7"),
+            Err(KeeperError::MultipleLiveDocumentIds { .. })
+        ));
+        assert_filtered_resolution_matches(&mut filter, &duplicate, &published, &absent)?;
+
+        // An emptied index answers `None` everywhere, through stale keys too.
+        let mut emptied = snapshot.next_manifest()?;
+        snapshot.delete_all(&mut emptied)?;
+        let emptied = snapshot.publish_owned_segments(&emptied, Vec::new())?;
+        assert_filtered_resolution_matches(&mut filter, &emptied, &published, &absent)?;
+        for document_id in &published {
+            assert_eq!(emptied.resolve_document_id(document_id)?, None);
+        }
         Ok(())
     }
 
