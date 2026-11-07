@@ -39022,8 +39022,8 @@ mod tests {
     struct ObservedTreeEntry {
         file_kind: u8,
         len: u64,
-        modified: SystemTime,
-        created: Option<SystemTime>,
+        modified: std::time::SystemTime,
+        created: Option<std::time::SystemTime>,
         changed: Option<(i64, i64)>,
         permission_key: u64,
         bytes: Option<Vec<u8>>,
