@@ -495,6 +495,12 @@ impl GenerationBuild {
         &self.path
     }
 
+    /// Whether this leased build replaces an existing selection, independently
+    /// of whether its source rebuild can reuse any predecessor artifacts.
+    pub(crate) const fn has_predecessor(&self) -> bool {
+        self.predecessor.is_some()
+    }
+
     /// Validate the engine-level bundle, seal its complete inventory, and switch
     /// the selection. No predecessor file is overwritten or removed.
     ///

@@ -578,6 +578,13 @@ impl FsfsRuntime {
         // unrelated runtime with no blocking pool.
         let mut candidate = self.clone().with_cli_input(input);
         candidate.config.indexing.watch_mode = false;
+        if kind == RetainedBuildKind::Recovery
+            || build.has_predecessor()
+            || IndexSourcePolicy::for_index_root(store.root())?
+                == IndexSourcePolicy::RequireReadable
+        {
+            candidate.source_policy = IndexSourcePolicy::RequireReadable;
+        }
         if kind == RetainedBuildKind::Recovery {
             // A fresh recovery never inherits the selected generation. Only
             // an explicitly scoped resume may consult its own inactive

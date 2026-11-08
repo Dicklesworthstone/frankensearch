@@ -294,7 +294,11 @@ impl SourceRoot {
         // hash with ahash, as the RRF maps do; SipHash's flood resistance buys
         // nothing for paths this process lists itself.
         let mut discoverable = ahash::AHashSet::new();
-        for entry in index_discovery_walker(&self.path, discovery).build() {
+        // The walker hides global-ignore errors; use the same fallible policy
+        // admission as one-shot indexing and the legacy watcher.
+        let mut ignore_rules = crate::watcher::IgnoreRules::new()?;
+        for entry in index_discovery_walker(&self.path, discovery, self.excluded.as_deref()).build()
+        {
             retained_search_checkpoint(cx)?;
             let entry = entry.map_err(|source| SearchError::SubsystemError {
                 subsystem: "fsfs.complete_generation.watch.discovery",
@@ -307,6 +311,13 @@ impl SourceRoot {
                     subsystem: "fsfs.complete_generation.watch.discovery",
                     source: Box::new(std::io::Error::other(error.to_string())),
                 });
+            }
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                super::validate_index_directory_rules(
+                    &mut ignore_rules,
+                    entry.path(),
+                    super::IndexSourcePolicy::RequireReadable,
+                )?;
             }
             let path = entry.into_path();
             if !self

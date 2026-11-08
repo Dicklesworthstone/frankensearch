@@ -2755,14 +2755,53 @@ fn record_content_skip(
     );
 }
 
-/// Whether `path` still holds the bytes `recorded` digests.
-async fn file_matches_digest(path: &Path, recorded: Option<&str>) -> bool {
-    let Some(recorded) = recorded else {
-        return false;
+fn validate_index_directory_rules(
+    rules: &mut crate::watcher::IgnoreRules,
+    directory: &Path,
+    policy: IndexSourcePolicy,
+) -> SearchResult<()> {
+    let Err(policy_error) = rules.validate_directory(directory) else {
+        return Ok(());
     };
-    async_file_read(path)
-        .await
-        .is_ok_and(|bytes| content_sha256_hex(&bytes) == recorded)
+    // Policy metadata inside an entirely unreadable directory fails too. Keep
+    // first-scan omission semantics for that source-access failure, but never
+    // ignore an unreadable policy file in an otherwise readable directory.
+    match fs::read_dir(directory) {
+        Err(error) if policy.can_skip(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(policy_error),
+    }
+}
+
+/// Whether `path` still holds the bytes `recorded` digests.
+async fn file_matches_digest(
+    cx: &Cx,
+    path: &Path,
+    recorded: Option<&str>,
+    policy: IndexSourcePolicy,
+) -> SearchResult<bool> {
+    let Some(recorded) = recorded else {
+        return Ok(false);
+    };
+    Ok(read_source_for_reuse(cx, path, policy)
+        .await?
+        .is_some_and(|bytes| content_sha256_hex(&bytes) == recorded))
+}
+
+async fn read_source_for_reuse(
+    cx: &Cx,
+    path: &Path,
+    policy: IndexSourcePolicy,
+) -> SearchResult<Option<Vec<u8>>> {
+    FsfsRuntime::semantic_retry_checkpoint(cx, "index.resume_validation")?;
+    let result = async_file_read(path).await;
+    // An interrupted/cancelled read is never evidence of source deletion.
+    FsfsRuntime::semantic_retry_checkpoint(cx, "index.resume_validation")?;
+    match result {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if policy.can_skip(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6956,6 +6995,9 @@ pub struct FsfsRuntime {
     /// digest still matches is then carried forward like an observed-unchanged
     /// one; a legacy root proves the same through its own receipt.
     seeded_from_receipt: bool,
+    /// Successor and recovery builds need a readable source observation before
+    /// absence can remove indexed membership, including cold/forced rebuilds.
+    source_policy: IndexSourcePolicy,
     /// A complete-generation build discovers no file beneath its whole store,
     /// not only beneath the generation it writes. A store inside the source
     /// sits beneath a hidden directory the walker skips, but a `.gitignore`
@@ -7034,6 +7076,7 @@ impl FsfsRuntime {
             lexical_only_indexing,
             unchanged_sources: None,
             seeded_from_receipt: false,
+            source_policy: IndexSourcePolicy::BestEffort,
             discovery_excluded_root: None,
         }
     }
@@ -19973,6 +20016,12 @@ impl FsfsRuntime {
         // boundary below so a substituted lock file aborts the publication.
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         publication_lease.fence("one-shot index entry")?;
+        let source_policy = if self.source_policy == IndexSourcePolicy::RequireReadable {
+            self.source_policy
+        } else {
+            IndexSourcePolicy::for_index_root(&index_root)?
+        };
+        let source_root = IndexSourceRoot::open(&target_root)?;
         if retain_legacy_reuse {
             retained_reuse::prepare_legacy_reuse(cx).await?;
         }
@@ -19997,8 +20046,10 @@ impl FsfsRuntime {
             &mut control,
             &target_root,
             &index_root,
+            source_policy,
             &mut candidates,
         )?;
+        source_root.check()?;
         let discovery_elapsed_ms = discovery_start.elapsed().as_millis();
         info!(
             target_root = %target_root.display(),
@@ -20540,10 +20591,12 @@ impl FsfsRuntime {
                         if same_stamp(candidate, skipped.stamp.as_ref()) {
                             unchanged_skips.insert(candidate.file_key.clone());
                         } else if file_matches_digest(
+                            cx,
                             &candidate.file_path,
                             skipped.content_hash_hex.as_deref(),
+                            source_policy,
                         )
-                        .await
+                        .await?
                         {
                             unchanged_skips.insert(candidate.file_key.clone());
                             digest_proven.insert(candidate.file_key.clone());
@@ -20572,7 +20625,9 @@ impl FsfsRuntime {
                     // the settled stamp they were read under.
                     entry.content_hash_hex.clone()
                 } else {
-                    let Ok(bytes) = async_file_read(&candidate.file_path).await else {
+                    let Some(bytes) =
+                        read_source_for_reuse(cx, &candidate.file_path, source_policy).await?
+                    else {
                         continue;
                     };
                     content_sha256_hex(&bytes)
@@ -20861,7 +20916,7 @@ impl FsfsRuntime {
 
                 let prepared = match prepared {
                     Ok(prepared) => prepared,
-                    Err(SearchError::Io(error)) if is_ignorable_index_walk_error(&error) => {
+                    Err(SearchError::Io(error)) if source_policy.can_skip(&error) => {
                         if error.kind() == ErrorKind::PermissionDenied {
                             observed_reason_codes
                                 .insert(REASON_DISCOVERY_FILE_PERMISSION_DENIED.to_owned());
@@ -21653,6 +21708,7 @@ impl FsfsRuntime {
         // 4. Publish the final durable generation. The checkpoint is always
         // last, so every row it advertises is already represented on disk.
         control.checkpoint(cx, "index.final_publication", true)?;
+        source_root.check()?;
         if checkpoint_durable_on_disk {
             publication_lease.fence("final generation checkpoint publication")?;
             checkpoint.artifacts_durable = false;
@@ -21799,6 +21855,7 @@ impl FsfsRuntime {
         // window, so a concurrent search cannot combine the successor vector
         // generation with the predecessor lexical CURRENT.
         control.checkpoint(cx, "index.final_admission", true)?;
+        source_root.check()?;
         publication_lease.fence("final generation admission publication")?;
         self.write_index_sentinel(&index_root, &sentinel)?;
         publication_lease.fence("final checkpoint admission transition")?;
@@ -25453,6 +25510,7 @@ impl FsfsRuntime {
         control: &mut IndexRunControl,
         target_root: &Path,
         index_root: &Path,
+        source_policy: IndexSourcePolicy,
         output: &mut Vec<IndexCandidate>,
     ) -> SearchResult<IndexDiscoveryStats> {
         let mut discovered_files = 0_usize;
@@ -25461,7 +25519,19 @@ impl FsfsRuntime {
         let mount_overrides = self.config.discovery.mount_override_map();
         let mount_table = MountTable::new(read_system_mounts(), &mount_overrides);
 
-        let walker = index_discovery_walker(target_root, &self.config.discovery);
+        let walker = index_discovery_walker(
+            target_root,
+            &self.config.discovery,
+            Some(
+                self.discovery_excluded_root
+                    .as_deref()
+                    .unwrap_or(index_root),
+            ),
+        );
+        // The ignore walker suppresses global-ignore read/parse errors. Share
+        // the watcher's fallible policy admission so a partial global matcher
+        // cannot silently expand either first-scan or replacement membership.
+        let mut ignore_rules = crate::watcher::IgnoreRules::new()?;
         // Precedes every stat below and every read of the files they describe.
         #[cfg(unix)]
         let walk_started = SystemTime::now();
@@ -25472,7 +25542,7 @@ impl FsfsRuntime {
                 Ok(entry) => entry,
                 Err(error) => {
                     if let Some(io_error) = error.io_error() {
-                        if is_ignorable_index_walk_error(io_error) {
+                        if source_policy.can_skip(io_error) {
                             continue;
                         }
                         return Err(
@@ -25509,6 +25579,7 @@ impl FsfsRuntime {
                 continue;
             };
             if file_type.is_dir() {
+                validate_index_directory_rules(&mut ignore_rules, entry.path(), source_policy)?;
                 continue;
             }
             if !file_type.is_file() && !path_is_symlink {
@@ -25534,7 +25605,7 @@ impl FsfsRuntime {
 
             let metadata = match fs::metadata(&entry_path) {
                 Ok(metadata) => metadata,
-                Err(error) if is_ignorable_index_walk_error(&error) => continue,
+                Err(error) if source_policy.can_skip(&error) => continue,
                 Err(error) => return Err(error.into()),
             };
 
@@ -32462,6 +32533,84 @@ fn try_extract_pdf_text(bytes: &[u8], path: &Path) -> Option<String> {
     }
 }
 
+/// A first scan may skip inaccessible content. A replacement or recovery must
+/// not turn a failed read into evidence that previously indexed content is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexSourcePolicy {
+    BestEffort,
+    RequireReadable,
+}
+
+impl IndexSourcePolicy {
+    fn for_index_root(root: &Path) -> std::io::Result<Self> {
+        for marker in [
+            crate::generation_store::COMPLETE_GENERATION_POINTER,
+            FSFS_SENTINEL_FILE,
+            FSFS_CHECKPOINT_FILE,
+            FSFS_LEXICAL_MANIFEST_FILE,
+            FSFS_VECTOR_MANIFEST_FILE,
+            FSFS_VECTOR_INDEX_FILE,
+            FSFS_VECTOR_QUALITY_INDEX_FILE,
+        ] {
+            match fs::symlink_metadata(root.join(marker)) {
+                // Even a dangling or malformed marker is existing index state,
+                // not permission to downgrade a forced rebuild to a first scan.
+                Ok(_) => return Ok(Self::RequireReadable),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Self::BestEffort)
+    }
+
+    fn can_skip(self, error: &std::io::Error) -> bool {
+        error.kind() == ErrorKind::NotFound
+            || (self == Self::BestEffort && is_ignorable_index_walk_error(error))
+    }
+}
+
+/// Keep the selected directory alive through final admission. A disappearing
+/// root is not an empty source tree, and on Unix a replacement must retain the
+/// same inode as the held directory, never merely reuse its path spelling.
+struct IndexSourceRoot {
+    path: PathBuf,
+    #[cfg(unix)]
+    directory: fs::File,
+}
+
+impl IndexSourceRoot {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let root = Self {
+            path: path.to_path_buf(),
+            #[cfg(unix)]
+            directory: fs::File::open(path)?,
+        };
+        root.check()?;
+        Ok(root)
+    }
+
+    fn check(&self) -> std::io::Result<()> {
+        let current = fs::symlink_metadata(&self.path)?;
+        let same_directory = current.is_dir();
+        #[cfg(unix)]
+        let same_directory = {
+            use std::os::unix::fs::MetadataExt;
+
+            let original = self.directory.metadata()?;
+            same_directory
+                && original.is_dir()
+                && (original.dev(), original.ino()) == (current.dev(), current.ino())
+        };
+        if !same_directory {
+            return Err(std::io::Error::other(format!(
+                "index source root was replaced or is not a directory: {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn is_ignorable_index_walk_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -32478,6 +32627,7 @@ fn is_ignorable_index_walk_error(error: &std::io::Error) -> bool {
 fn index_discovery_walker(
     target_root: &Path,
     discovery: &crate::config::DiscoveryConfig,
+    excluded_root: Option<&Path>,
 ) -> WalkBuilder {
     let mut walker = WalkBuilder::new(target_root);
     walker.follow_links(discovery.follow_symlinks);
@@ -32486,6 +32636,26 @@ fn index_discovery_walker(
     walker.git_exclude(true);
     walker.hidden(false);
     walker.standard_filters(true);
+    let discovery = discovery.clone();
+    let excluded_root = excluded_root.map(Path::to_path_buf);
+    let mounts = MountTable::new(read_system_mounts(), &discovery.mount_override_map());
+    walker.filter_entry(move |entry| {
+        if excluded_root
+            .as_deref()
+            .is_some_and(|root| entry.path().starts_with(root))
+        {
+            return false;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            return true;
+        }
+        // Prune directory exclusions before opening their contents or ignore
+        // files. Each visited parent was already admitted, so the directory's
+        // own name plus full-path patterns suffice here. File-only rules such
+        // as binary extensions must not prune a directory named `archive.zip`.
+        let category = mounts.lookup(entry.path()).map(|(mount, _)| mount.category);
+        discovery.evaluate_root(entry.path(), category).include()
+    });
     walker
 }
 
@@ -32726,6 +32896,215 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::future::{Future, poll_fn};
+
+    #[test]
+    fn source_policy_distinguishes_absence_from_incomplete_observation() {
+        use std::io::{Error, ErrorKind};
+
+        use super::IndexSourcePolicy::{BestEffort, RequireReadable};
+
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Interrupted] {
+            let error = Error::from(kind);
+            assert!(BestEffort.can_skip(&error));
+            assert!(!RequireReadable.can_skip(&error));
+        }
+        for policy in [BestEffort, RequireReadable] {
+            assert!(policy.can_skip(&Error::from(ErrorKind::NotFound)));
+            for kind in [ErrorKind::InvalidData, ErrorKind::Other] {
+                assert!(!policy.can_skip(&Error::from(kind)));
+            }
+        }
+    }
+
+    #[test]
+    fn source_policy_requires_readable_sources_for_each_existing_index_marker() {
+        use super::IndexSourcePolicy::{self, BestEffort, RequireReadable};
+
+        for marker in [
+            crate::generation_store::COMPLETE_GENERATION_POINTER,
+            super::FSFS_SENTINEL_FILE,
+            super::FSFS_CHECKPOINT_FILE,
+            super::FSFS_LEXICAL_MANIFEST_FILE,
+            super::FSFS_VECTOR_MANIFEST_FILE,
+            super::FSFS_VECTOR_INDEX_FILE,
+            super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            assert_eq!(IndexSourcePolicy::for_index_root(root).unwrap(), BestEffort);
+            let marker_path = root.join(marker);
+            fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+            fs::write(marker_path, "incomplete or incompatible index state").unwrap();
+            assert_eq!(
+                IndexSourcePolicy::for_index_root(root).unwrap(),
+                RequireReadable,
+                "marker {marker} must not become first-scan authority"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_policy_does_not_treat_a_dangling_index_marker_as_a_fresh_root() {
+        let directory = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            "missing-sentinel",
+            directory.path().join(super::FSFS_SENTINEL_FILE),
+        )
+        .unwrap();
+        assert_eq!(
+            super::IndexSourcePolicy::for_index_root(directory.path()).unwrap(),
+            super::IndexSourcePolicy::RequireReadable
+        );
+    }
+
+    #[test]
+    fn source_directory_policy_failures_are_not_best_effort_file_skips() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let ignore_file = root.join(".ignore");
+        for unreadable in [false, true] {
+            if unreadable {
+                fs::rename(&ignore_file, temporary.path().join("old-ignore")).unwrap();
+                fs::create_dir(&ignore_file).unwrap();
+            } else {
+                fs::write(&ignore_file, "private[9-0].md\n").unwrap();
+            }
+            for policy in [
+                super::IndexSourcePolicy::BestEffort,
+                super::IndexSourcePolicy::RequireReadable,
+            ] {
+                let mut rules = crate::watcher::IgnoreRules::new().unwrap();
+                let error = super::validate_index_directory_rules(&mut rules, &root, policy)
+                    .expect_err("a readable source cannot discard its broken ignore policy");
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, .. } if field == "discovery.ignore_rules"
+                ));
+            }
+        }
+        let file = temporary.path().join("not-a-directory");
+        fs::write(&file, "source replaced by a file").unwrap();
+        for policy in [
+            super::IndexSourcePolicy::BestEffort,
+            super::IndexSourcePolicy::RequireReadable,
+        ] {
+            let mut rules = crate::watcher::IgnoreRules::new().unwrap();
+            assert!(matches!(
+                super::validate_index_directory_rules(&mut rules, &file, policy),
+                Err(SearchError::Io(_))
+            ));
+            super::validate_index_directory_rules(
+                &mut rules,
+                &temporary.path().join("removed-child"),
+                policy,
+            )
+            .expect("an absent child remains a legitimate source removal");
+        }
+    }
+
+    #[test]
+    fn source_root_guard_refuses_a_missing_root_but_allows_membership_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        fs::create_dir(&path).unwrap();
+        let source = super::IndexSourceRoot::open(&path).unwrap();
+        fs::write(path.join("new.md"), "new source membership").unwrap();
+        source.check().unwrap();
+        fs::rename(&path, directory.path().join("moved-source")).unwrap();
+        assert_eq!(
+            source.check().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_guard_refuses_replacement_directories_and_symlinks() {
+        for replace_with_symlink in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source");
+            fs::create_dir(&path).unwrap();
+            let source = super::IndexSourceRoot::open(&path).unwrap();
+            let old_path = directory.path().join("old-source");
+            fs::rename(&path, &old_path).unwrap();
+            if replace_with_symlink {
+                std::os::unix::fs::symlink(&old_path, &path).unwrap();
+            } else {
+                fs::create_dir(&path).unwrap();
+            }
+            assert!(source.check().is_err());
+        }
+    }
+
+    #[test]
+    fn source_reuse_validation_preserves_cancellation_before_missing_file_reads() {
+        let cx = Cx::for_request();
+        cx.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel source scan"),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        for policy in [
+            super::IndexSourcePolicy::BestEffort,
+            super::IndexSourcePolicy::RequireReadable,
+        ] {
+            let result = futures_lite_block_on(super::read_source_for_reuse(
+                &cx,
+                &directory.path().join("absent.md"),
+                policy,
+            ));
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+        }
+    }
+
+    #[test]
+    fn index_walker_prunes_excluded_subtrees_before_reading_their_ignore_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("build/notes");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("visible.md"), "visible source").unwrap();
+        fs::create_dir(root.join("archive.zip")).unwrap();
+        fs::write(
+            root.join("archive.zip/notes.md"),
+            "directory, not binary file",
+        )
+        .unwrap();
+        for excluded in ["node_modules", "custom-cache", "index-store"] {
+            let subtree = root.join(excluded);
+            fs::create_dir(&subtree).unwrap();
+            fs::write(subtree.join(".ignore"), "private[9-0].md\n").unwrap();
+            fs::write(subtree.join("private.md"), "excluded source").unwrap();
+        }
+        let mut discovery = crate::config::DiscoveryConfig::default();
+        discovery.exclude_patterns.push("custom-cache".to_owned());
+        let files =
+            super::index_discovery_walker(&root, &discovery, Some(&root.join("index-store")))
+                .build()
+                .map(|entry| {
+                    let entry = entry.expect("excluded subtrees cannot fail the walk");
+                    assert!(entry.error().is_none());
+                    entry
+                })
+                .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+                .map(|entry| entry.path().strip_prefix(&root).unwrap().to_path_buf())
+                .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            files,
+            ["visible.md", "archive.zip/notes.md"]
+                .map(std::path::PathBuf::from)
+                .into_iter()
+                .collect()
+        );
+        fs::write(root.join(".ignore"), "private[9-0].md\n").unwrap();
+        assert!(
+            super::index_discovery_walker(&root, &discovery, Some(&root.join("index-store")))
+                .build()
+                .any(|entry| entry.is_err() || entry.is_ok_and(|entry| entry.error().is_some())),
+            "a relevant malformed ignore policy must remain visible to strict discovery"
+        );
+    }
 
     #[cfg(not(unix))]
     #[test]
@@ -61339,10 +61718,7 @@ mod tests {
             resources.fast_embedder = None;
             resources.fast_embedder_attempted = false;
             let generation = resources.generation_fingerprint.clone();
-            let shared = Arc::new(asupersync::sync::Mutex::new((
-                resources,
-                HashMap::new(),
-            )));
+            let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
             let mut config = FsfsConfig::default();
             config.storage.index_dir = temp.path().display().to_string();
             config.search.fast_only = true;
@@ -61400,10 +61776,16 @@ mod tests {
                 .await
                 .expect("a refused admission must not poison later requests");
             assert!(!recovered.cached);
-            assert!(recovered.payloads[0].hits.iter().any(|hit| {
-                hit.path == "a.rs" && hit.semantic_rank.is_some()
-            }));
-            assert_eq!(shared.try_lock_owned().unwrap().0.generation_fingerprint, generation);
+            assert!(
+                recovered.payloads[0]
+                    .hits
+                    .iter()
+                    .any(|hit| { hit.path == "a.rs" && hit.semantic_rank.is_some() })
+            );
+            assert_eq!(
+                shared.try_lock_owned().unwrap().0.generation_fingerprint,
+                generation
+            );
             let warm = runtime
                 .execute_shared_search_serve_request_with_sink(
                     &cx,
