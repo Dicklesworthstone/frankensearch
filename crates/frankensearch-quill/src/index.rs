@@ -9015,8 +9015,12 @@ impl QuillWriterState {
                 return Ok(());
             };
             let created_unix_s = self.created_unix_s()?;
-            let output_segment_id =
-                self.derive_policy_segment_id(&plan.source_segment_ids, b"tier", created_unix_s)?;
+            let output_segment_id = self.derive_policy_segment_id(
+                &plan.source_segment_ids,
+                b"tier",
+                created_unix_s,
+                &[],
+            )?;
             let policy_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
                 crate::tracing_conventions::KEEPER_LIFECYCLE,
@@ -9043,7 +9047,19 @@ impl QuillWriterState {
         }
     }
 
-    async fn finish_bulk_load(&mut self, cx: &Cx) -> Result<&KeeperSnapshot, QuillIndexError> {
+    /// Return how many runs reused an output built before its publication.
+    async fn finish_bulk_load(&mut self, cx: &Cx) -> Result<usize, QuillIndexError> {
+        let width = std::thread::available_parallelism()
+            .unwrap_or(NonZeroUsize::MIN)
+            .min(crate::keeper::DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY);
+        self.finish_bulk_load_with_width(cx, width).await
+    }
+
+    async fn finish_bulk_load_with_width(
+        &mut self,
+        cx: &Cx,
+        width: NonZeroUsize,
+    ) -> Result<usize, QuillIndexError> {
         if !self.config.bulk_load_mode {
             return Err(invalid_state(
                 "finish_bulk_load requires bulk_load_mode in QuillConfig",
@@ -9075,27 +9091,73 @@ impl QuillWriterState {
                 })
                 .collect::<Vec<_>>()
         };
-        // Publish each compatible run through the ordinary concat protocol.
-        // If a later run fails or is cancelled, earlier publications remain
-        // valid and the bulk flag allows recovery to resume the remaining work.
-        for source_segment_ids in source_groups {
-            let created_unix_s = self.created_unix_s()?;
-            let output_segment_id =
-                self.derive_policy_segment_id(&source_segment_ids, b"bulk-finish", created_unix_s)?;
-            let bulk_span = tracing::info_span!(
-                target: crate::tracing_conventions::TARGET,
-                crate::tracing_conventions::KEEPER_LIFECYCLE,
-                phase = "merge",
-                trigger = LifecycleTrigger::BulkFinish.as_str(),
-                action = "concat_merge",
-                source_count = source_segment_ids.len(),
-                segment_id = output_segment_id,
-                duration_us = tracing::field::Empty,
-            );
-            let _bulk_timer = crate::tracing_conventions::StageTimer::new(&bulk_span);
-            self.concat_merge(cx, &source_segment_ids, output_segment_id, created_unix_s)
-                .instrument(bulk_span)
-                .await?;
+        // Build independent runs in bounded windows, then publish them in
+        // order through the ordinary concat protocol. Project each identity
+        // from the generation and seal sequence at its serial turn, including
+        // the preceding runs' replacement ids, so deterministic builds retain
+        // the serial loop's complete segment bytes.
+        let width = width.get();
+        let mut reused_outputs = 0;
+        for source_window in source_groups.chunks(width) {
+            check_cancel(cx, "bulk merge planning")?;
+            let mut runs = Vec::with_capacity(source_window.len());
+            let mut planning_error = None;
+            for source_segment_ids in source_window {
+                let planned = self.created_unix_s().and_then(|created_unix_s| {
+                    self.derive_policy_segment_id(
+                        source_segment_ids,
+                        b"bulk-finish",
+                        created_unix_s,
+                        &runs,
+                    )
+                    .map(|output_segment_id| ConcatMergeRun {
+                        source_segment_ids: source_segment_ids.clone(),
+                        output_segment_id,
+                        created_unix_s,
+                    })
+                });
+                match planned {
+                    Ok(run) => runs.push(run),
+                    Err(error) => {
+                        // An exhausted generation/sequence or clock failure
+                        // at a later run must not discard the successful
+                        // prefix that the serial loop would have published.
+                        planning_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            let mut prebuilt = self
+                .prebuild_concat_merge_window(cx, &runs, width)
+                .await?
+                .into_iter();
+            for run in runs {
+                let bulk_span = tracing::info_span!(
+                    target: crate::tracing_conventions::TARGET,
+                    crate::tracing_conventions::KEEPER_LIFECYCLE,
+                    phase = "merge",
+                    trigger = LifecycleTrigger::BulkFinish.as_str(),
+                    action = "concat_merge",
+                    source_count = run.source_segment_ids.len(),
+                    segment_id = run.output_segment_id,
+                    duration_us = tracing::field::Empty,
+                );
+                let _bulk_timer = crate::tracing_conventions::StageTimer::new(&bulk_span);
+                let reused = self
+                    .concat_merge_reusing(
+                        cx,
+                        &run.source_segment_ids,
+                        run.output_segment_id,
+                        run.created_unix_s,
+                        prebuilt.next().flatten(),
+                    )
+                    .instrument(bulk_span)
+                    .await?;
+                reused_outputs += usize::from(reused);
+            }
+            if let Some(error) = planning_error {
+                return Err(error);
+            }
         }
         // Ordinary tier merges resume here, over the segments earlier writers
         // finished as well, which bounds the segment count across sessions.
@@ -9105,7 +9167,8 @@ impl QuillWriterState {
         self.apply_tier_policy(cx).await?;
         self.publish_bulk_completion(cx).await?;
         self.reader.config.bulk_load_mode = false;
-        self.authority_snapshot()
+        self.authority_snapshot()?;
+        Ok(reused_outputs)
     }
 
     async fn publish_bulk_completion(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
@@ -9218,24 +9281,10 @@ impl QuillWriterState {
             .min(concurrency.get());
         let mut reused_outputs = 0;
         for window in runs.chunks(width) {
-            check_cancel(cx, "concat merge")?;
-            if self.has_uncommitted_changes() {
-                return Err(invalid_state(
-                    "concat merge requires a fully committed scalar index",
-                ));
-            }
-            let prebuilt = if window.len() > 1 {
-                let source_snapshot = match &mut self.backend {
-                    IndexBackend::Durable(writer) => writer.proven_snapshot(cx).await?,
-                    IndexBackend::Memory(snapshot) => snapshot.clone(),
-                };
-                let window_runs = window.to_vec();
-                spawn_blocking(move || source_snapshot.build_concat_merge_runs(&window_runs, width))
-                    .await
-            } else {
-                Vec::new()
-            };
-            let mut prebuilt = prebuilt.into_iter();
+            let mut prebuilt = self
+                .prebuild_concat_merge_window(cx, window, width)
+                .await?
+                .into_iter();
             for run in window {
                 let reused = self
                     .concat_merge_reusing(
@@ -9250,6 +9299,34 @@ impl QuillWriterState {
             }
         }
         Ok(reused_outputs)
+    }
+
+    /// Build a bounded window against proven authority without publishing.
+    /// Every output is revalidated at its ordered publication turn.
+    async fn prebuild_concat_merge_window(
+        &mut self,
+        cx: &Cx,
+        window: &[ConcatMergeRun],
+        width: usize,
+    ) -> Result<Vec<Option<PrebuiltConcatMerge>>, QuillIndexError> {
+        check_cancel(cx, "concat merge")?;
+        if self.has_uncommitted_changes() {
+            return Err(invalid_state(
+                "concat merge requires a fully committed scalar index",
+            ));
+        }
+        if window.len() <= 1 {
+            return Ok(Vec::new());
+        }
+        let source_snapshot = match &mut self.backend {
+            IndexBackend::Durable(writer) => writer.proven_snapshot(cx).await?,
+            IndexBackend::Memory(snapshot) => snapshot.clone(),
+        };
+        let window_runs = window.to_vec();
+        Ok(
+            spawn_blocking(move || source_snapshot.build_concat_merge_runs(&window_runs, width))
+                .await,
+        )
     }
 
     /// One concat merge; `prebuilt` is published when it was built from
@@ -10470,19 +10547,29 @@ impl QuillWriterState {
         ))
     }
 
+    /// Derive an identity at the serial turn following independent planned
+    /// replacements. Empty `preceding_runs` describes the current authority.
     fn derive_policy_segment_id(
         &self,
         source_segment_ids: &[u64],
         domain: &[u8],
         created_unix_s: i64,
+        preceding_runs: &[ConcatMergeRun],
     ) -> Result<u64, QuillIndexError> {
         let authority = self.authority_snapshot()?;
+        let preceding = u64::try_from(preceding_runs.len())
+            .map_err(|_| invalid_state("planned merge count exceeds u64"))?;
         let generation = authority
             .loaded_manifest()
             .manifest
             .generation
-            .checked_add(1)
+            .checked_add(preceding)
+            .and_then(|generation| generation.checked_add(1))
             .ok_or_else(|| invalid_state("manifest generation exhausted"))?;
+        let next_seal_seq = self
+            .next_seal_seq
+            .checked_add(preceding)
+            .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
         let schema_id = self.schema.schema_id()?;
         let mut source_hasher = Xxh3::new();
         source_hasher.update(domain);
@@ -10495,19 +10582,27 @@ impl QuillWriterState {
             preimage[..8].copy_from_slice(&schema_id.to_le_bytes());
             preimage[8..16].copy_from_slice(&generation.to_le_bytes());
             preimage[16..24].copy_from_slice(&source_digest.to_le_bytes());
-            preimage[24..32].copy_from_slice(&self.next_seal_seq.to_le_bytes());
+            preimage[24..32].copy_from_slice(&next_seal_seq.to_le_bytes());
             // Creation time is part of the encoded segment. A later retry
             // must not reuse an installed orphan's identity for new bytes.
             preimage[32..40].copy_from_slice(&created_unix_s.to_le_bytes());
             preimage[40..].copy_from_slice(&salt.to_le_bytes());
             let candidate = xxh3_64(&preimage);
-            if authority
-                .loaded_manifest()
-                .manifest
-                .segments
+            let collision = preceding_runs
                 .iter()
-                .all(|segment| segment.segment_id != candidate)
-            {
+                .any(|run| run.output_segment_id == candidate)
+                || authority
+                    .loaded_manifest()
+                    .manifest
+                    .segments
+                    .iter()
+                    .any(|segment| {
+                        segment.segment_id == candidate
+                            && !preceding_runs
+                                .iter()
+                                .any(|run| run.source_segment_ids.contains(&candidate))
+                    });
+            if !collision {
                 return Ok(candidate);
             }
         }
@@ -38388,6 +38483,276 @@ mod tests {
         });
     }
 
+    fn bulk_finish_runs_config() -> QuillConfig {
+        QuillConfig {
+            bulk_load_mode: true,
+            max_ingest_shards: 1,
+            max_visibility_lag_ms: u64::MAX,
+            ..concat_merge_runs_config()
+        }
+    }
+
+    /// Six small, valid segments form three independent representable runs.
+    /// The gaps make a cross-run dense IDMAP exceed its durable byte limit;
+    /// no large source or merged allocation is needed to exercise grouping.
+    async fn seal_bulk_finish_runs(cx: &Cx, index: &QuillIndex) -> Vec<Vec<u64>> {
+        for group in 0..3_u64 {
+            let mut writer = index
+                .lock_writer(cx, "bulk finish fixture writer lock")
+                .await
+                .expect("bulk fixture writer");
+            writer
+                .retire_ingest_leases()
+                .expect("retire the preceding fixture lease");
+            let lease_base = group * (1_u64 << 30);
+            writer.next_lease_base = lease_base;
+            writer.docid_allocator =
+                DocIdAllocator::open(lease_base, writer.shard_router.shard_count())
+                    .expect("open a sparse fixture lease");
+            drop(writer);
+            for leaf in 0..2_u64 {
+                let ordinal = group * 2 + leaf;
+                let content = if leaf == 0 {
+                    "rust ownership shared"
+                } else {
+                    "python rust shared"
+                };
+                let document = IndexableDocument::new(format!("bulk-run-{ordinal}"), content)
+                    .with_metadata("ordinal", ordinal.to_string());
+                index
+                    .index_documents(cx, std::slice::from_ref(&document))
+                    .await
+                    .expect("stage a bulk run leaf");
+                index.commit(cx).await.expect("publish a bulk run leaf");
+            }
+        }
+        let snapshot = index.snapshot().expect("committed bulk run leaves");
+        let groups = ConcatMergeSizing::new(snapshot.schema(), snapshot.segments())
+            .expect("bulk fixture sizing")
+            .groups(0)
+            .expect("bulk fixture groups");
+        assert_eq!(groups, vec![0..2, 2..4, 4..6]);
+        groups
+            .into_iter()
+            .map(|range| {
+                snapshot.loaded_manifest().manifest.segments[range]
+                    .iter()
+                    .map(|segment| segment.segment_id)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bulk_finish_prebuilds_independent_runs_and_preserves_serial_output() {
+        run_with_cx(|cx| async move {
+            let serial = QuillIndex::in_memory(bulk_finish_runs_config()).expect("serial bulk");
+            let candidate =
+                QuillIndex::in_memory(bulk_finish_runs_config()).expect("candidate bulk");
+            let groups = seal_bulk_finish_runs(&cx, &serial).await;
+            assert_eq!(seal_bulk_finish_runs(&cx, &candidate).await, groups);
+            let before = concat_merge_query_results(&serial, &cx);
+
+            // Reference the previous serial policy: derive each id from the
+            // authority at its turn, then build and publish only that run.
+            let mut writer = serial
+                .lock_writer(&cx, "serial bulk finish writer lock")
+                .await
+                .expect("serial writer");
+            for source_segment_ids in &groups {
+                let created_unix_s = writer
+                    .created_unix_s()
+                    .expect("deterministic creation time");
+                let output_segment_id = writer
+                    .derive_policy_segment_id(
+                        source_segment_ids,
+                        b"bulk-finish",
+                        created_unix_s,
+                        &[],
+                    )
+                    .expect("serial policy identity");
+                writer
+                    .concat_merge(&cx, source_segment_ids, output_segment_id, created_unix_s)
+                    .await
+                    .expect("serial bulk merge");
+            }
+            writer
+                .apply_tier_policy(&cx)
+                .await
+                .expect("serial tier pass");
+            writer
+                .publish_bulk_completion(&cx)
+                .await
+                .expect("serial completion marker");
+            writer.reader.config.bulk_load_mode = false;
+            drop(writer);
+            let expected = concat_merge_runs_state(&serial, &cx);
+            assert_eq!(expected.0.segments.len(), 3);
+            assert_eq!(expected.0.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, 0);
+            assert_eq!(expected.2, before);
+
+            let mut writer = candidate
+                .lock_writer(&cx, "candidate bulk finish writer lock")
+                .await
+                .expect("candidate writer");
+            let reused = writer
+                .finish_bulk_load(&cx)
+                .await
+                .expect("batched bulk finish");
+            drop(writer);
+            let width = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(crate::keeper::DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY.get());
+            let expected_reuse = match width {
+                1 => 0,
+                2 => 2,
+                _ => 3,
+            };
+            assert_eq!(
+                reused, expected_reuse,
+                "the shipping finish must reuse its prebuilds"
+            );
+            assert!(
+                concat_merge_runs_state(&candidate, &cx) == expected,
+                "bulk finish must preserve the serial manifest, bytes, ranks and scores"
+            );
+
+            // Also enter a two-run window on single-CPU test hosts. The
+            // production entry point above still verifies the actual CPU
+            // cap, while this call cannot pass by exercising only serial
+            // construction and publication.
+            let forced = QuillIndex::in_memory(bulk_finish_runs_config()).expect("two-run bulk");
+            assert_eq!(seal_bulk_finish_runs(&cx, &forced).await, groups);
+            let mut writer = forced
+                .lock_writer(&cx, "two-run bulk finish writer lock")
+                .await
+                .expect("two-run writer");
+            assert_eq!(
+                writer
+                    .finish_bulk_load_with_width(&cx, NonZeroUsize::new(2).expect("two runs"))
+                    .await
+                    .expect("two-run bulk finish"),
+                2,
+            );
+            drop(writer);
+            assert!(concat_merge_runs_state(&forced, &cx) == expected);
+
+            seal_after_concat_merge_runs(&cx, &serial).await;
+            seal_after_concat_merge_runs(&cx, &candidate).await;
+            seal_after_concat_merge_runs(&cx, &forced).await;
+            assert!(
+                concat_merge_runs_state(&candidate, &cx) == concat_merge_runs_state(&serial, &cx),
+                "bulk finish must preserve the next seal's identity and lease state"
+            );
+            assert!(
+                concat_merge_runs_state(&forced, &cx) == concat_merge_runs_state(&serial, &cx),
+                "two-run windows must preserve the next seal's identity and lease state"
+            );
+        });
+    }
+
+    #[test]
+    fn bulk_finish_planning_failure_preserves_successful_prefix() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(bulk_finish_runs_config()).expect("bulk index");
+            seal_bulk_finish_runs(&cx, &index).await;
+            let before = concat_merge_runs_state(&index, &cx);
+            let mut writer = index
+                .lock_writer(&cx, "exhausted bulk finish writer lock")
+                .await
+                .expect("bulk writer");
+            writer.next_seal_seq = u64::MAX - 1;
+            let error = writer
+                .finish_bulk_load(&cx)
+                .await
+                .expect_err("the second run cannot advance the seal sequence");
+            assert!(matches!(
+                error,
+                QuillIndexError::InvalidState { detail } if detail == "seal sequence exhausted"
+            ));
+            drop(writer);
+            let partial = concat_merge_runs_state(&index, &cx);
+            assert_eq!(partial.0.generation, before.0.generation + 1);
+            assert_eq!(
+                partial.0.segments.len(),
+                5,
+                "the first run remains published"
+            );
+            assert_ne!(partial.0.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, 0);
+            assert_eq!(partial.2, before.2);
+        });
+    }
+
+    #[test]
+    fn bulk_finish_cancellation_preserves_published_run_and_bulk_marker() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("interrupted bulk directory");
+            let index = QuillIndex::create(&cx, directory.path(), bulk_finish_runs_config())
+                .await
+                .expect("durable bulk index");
+            seal_bulk_finish_runs(&cx, &index).await;
+            let before = concat_merge_runs_state(&index, &cx);
+            let cancelled_cx = Cx::for_testing();
+            let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                crate::keeper::PublishCheckpoint::DirectorySynced,
+            );
+            let mut finish = Box::pin(index.finish_bulk_load(&cancelled_cx));
+            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                &mut finish,
+                &pause,
+                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
+            )
+            .await
+            .expect("reach the first durable bulk merge");
+            cancelled_cx.set_cancel_requested(true);
+            pause.release();
+            let error = finish
+                .await
+                .map(|_| ())
+                .expect_err("cancellation must stop later bulk publications");
+            assert!(matches!(error, QuillIndexError::Cancelled { .. }));
+
+            let partial = concat_merge_runs_state(&index, &cx);
+            assert_eq!(partial.0.generation, before.0.generation + 1);
+            assert_eq!(partial.0.segments.len(), 5);
+            assert_ne!(partial.0.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, 0);
+            assert_eq!(partial.2, before.2);
+            let published_run = partial.0.segments[0].clone();
+            drop(index);
+
+            let resumed = QuillIndex::open(&cx, directory.path(), bulk_finish_runs_config())
+                .await
+                .expect("resume the interrupted bulk load");
+            assert!(
+                concat_merge_runs_state(&resumed, &cx) == partial,
+                "the exact successful prefix and its bulk marker must survive reopening"
+            );
+            let finished = resumed
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finish the remaining independent runs");
+            assert_eq!(finished.segments().len(), 3);
+            assert_eq!(finished.doc_count(), 6);
+            assert_eq!(
+                finished.loaded_manifest().manifest.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
+                0
+            );
+            assert_eq!(
+                finished.loaded_manifest().manifest.segments[0],
+                published_run
+            );
+            assert_eq!(concat_merge_query_results(&resumed, &cx), before.2);
+            seal_after_concat_merge_runs(&cx, &resumed).await;
+            drop(resumed);
+            let reopened = QuillSearchIndex::open(&cx, directory.path(), bulk_finish_runs_config())
+                .await
+                .expect("reopen the completed bulk load and later seal");
+            assert_eq!(reopened.doc_count().expect("reopened live count"), 7);
+        });
+    }
+
     /// bd-k07zw: fsfs publishes every complete-generation edit, delete, and
     /// append through a short single-shard writer session that ends in a
     /// bulk finish. Each session used to open a fresh 65,536-docid lease, and
@@ -39059,7 +39424,7 @@ mod tests {
                 let later_created_unix_s = first_created_unix_s + 1;
                 let first_id = index
                     .writer_mut()
-                    .derive_policy_segment_id(&source_ids, domain, first_created_unix_s)
+                    .derive_policy_segment_id(&source_ids, domain, first_created_unix_s, &[])
                     .expect("derive first policy output identity");
                 let blocked_temp = directory
                     .path()
@@ -39104,14 +39469,14 @@ mod tests {
                 assert_eq!(
                     resumed
                         .writer_mut()
-                        .derive_policy_segment_id(&source_ids, domain, first_created_unix_s)
+                        .derive_policy_segment_id(&source_ids, domain, first_created_unix_s, &[])
                         .expect("derive the same policy attempt after reopening"),
                     first_id,
                     "recovery must retain the authority, source run, and seal sequence"
                 );
                 let later_id = resumed
                     .writer_mut()
-                    .derive_policy_segment_id(&source_ids, domain, later_created_unix_s)
+                    .derive_policy_segment_id(&source_ids, domain, later_created_unix_s, &[])
                     .expect("derive the later policy attempt");
                 assert_ne!(
                     later_id, first_id,
