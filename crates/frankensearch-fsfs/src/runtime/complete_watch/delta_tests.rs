@@ -162,13 +162,12 @@ fn exact_source_ids_do_not_admit_lossy_aliases_or_escape_paths() {
         source_id(root, Path::new("/src/dir/α.md")),
         Some("dir/α.md".to_owned())
     );
-    for path in [
-        "/src",
-        "/elsewhere/a",
-        "/src/../a",
-        "/src/a\\b",
-        "/src-sibling/a",
-    ] {
+    assert_eq!(
+        source_id(root, Path::new("/src/a\\b")),
+        Some("a\\b".to_owned()),
+        "a Unix filename is not a directory hierarchy"
+    );
+    for path in ["/src", "/elsewhere/a", "/src/../a", "/src-sibling/a"] {
         assert!(source_id(root, Path::new(path)).is_none(), "{path}");
     }
     let path = PathBuf::from(std::ffi::OsString::from_vec(b"/src/a\xff.md".to_vec()));
@@ -264,6 +263,93 @@ async fn change(session: &mut CompleteWatchSession, cx: &Cx, path: &Path) -> Pub
     }
     require_durable_publication(session.advance(cx, now + DEBOUNCE).await.unwrap().unwrap())
         .unwrap()
+}
+
+#[test]
+fn backslash_sources_remain_distinct_through_index_update_and_removal() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, source, root) = fixture(directory.path());
+        let literal = source.join("dir\\notes.md");
+        let nested = source.join("dir/notes.md");
+        fs::create_dir(source.join("dir")).unwrap();
+        fs::write(&literal, "literalword first source").unwrap();
+        fs::write(&nested, "nestedword second source").unwrap();
+        let mut session = controlled_session(&runtime, &cx, &root);
+        let first = initial(&mut session, &cx).await;
+        let before = FsfsRuntime::read_matching_manifest_generation(first.path())
+            .unwrap()
+            .unwrap();
+        assert!(before.contains_key("dir\\notes.md"));
+        assert!(before.contains_key("dir/notes.md"));
+        let mut pinned = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+        for (query, id) in [("literalword", "dir\\notes.md"), ("nestedword", "dir/notes.md")] {
+            let result = pinned.search(&cx, query, 10).await.unwrap();
+            let hits = &result.last().unwrap().hits;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].path, id);
+        }
+
+        fs::write(&literal, "replacementword changed literal source").unwrap();
+        let second = change(&mut session, &cx, &literal).await;
+        assert_eq!(
+            FsfsRuntime::read_index_sentinel(second.path())
+                .unwrap()
+                .unwrap()
+                .command,
+            "retained-batch",
+            "literal backslashes must stay eligible for exact incremental mutations"
+        );
+        let updated = FsfsRuntime::read_matching_manifest_generation(second.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&updated["dir/notes.md"]).unwrap(),
+            serde_json::to_value(&before["dir/notes.md"]).unwrap(),
+            "updating the literal filename must preserve the nested document"
+        );
+        let mut reader = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+        let result = reader.search(&cx, "replacementword", 10).await.unwrap();
+        assert_eq!(result.last().unwrap().hits[0].path, "dir\\notes.md");
+
+        // Move it out of scope so the source remains available for inspection.
+        fs::rename(&literal, directory.path().join("retained-literal.md")).unwrap();
+        let third = change(&mut session, &cx, &literal).await;
+        let remaining = FsfsRuntime::read_matching_manifest_generation(third.path())
+            .unwrap()
+            .unwrap();
+        assert!(!remaining.contains_key("dir\\notes.md"));
+        assert_eq!(
+            serde_json::to_value(&remaining["dir/notes.md"]).unwrap(),
+            serde_json::to_value(&before["dir/notes.md"]).unwrap(),
+            "removing the literal filename must not delete its normalized alias"
+        );
+        let mut current = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+        let result = current.search(&cx, "nestedword", 10).await.unwrap();
+        assert_eq!(result.last().unwrap().hits[0].path, "dir/notes.md");
+        assert!(
+            current
+                .search(&cx, "replacementword", 10)
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let original = pinned.search(&cx, "literalword", 10).await.unwrap();
+        assert_eq!(original.last().unwrap().hits[0].path, "dir\\notes.md");
+        assert_eq!(pinned.generation(), &first);
+    });
 }
 
 #[test]

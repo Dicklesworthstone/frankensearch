@@ -159,7 +159,7 @@ struct ReuseReceipt {
     // cold misses. Absence never grants cross-process reuse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executable_sha256: Option<String>,
-    // Explicit indexing-pipeline contract digest (`IndexingContractDigestV2`, bd-ky0j2).
+    // Explicit versioned indexing-pipeline contract digest (bd-ky0j2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     indexing_contract_sha256: Option<String>,
     configuration_sha256: String,

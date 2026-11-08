@@ -32222,10 +32222,20 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 }
 
 fn normalize_file_key_for_index(path: &Path, target_root: &Path) -> String {
-    path.strip_prefix(target_root)
+    let relative = path
+        .strip_prefix(target_root)
         .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+        .to_string_lossy();
+    // Only Windows treats backslashes as separators. On Unix, `a\b.md`
+    // and `a/b.md` are different files and must never share a document ID.
+    #[cfg(windows)]
+    {
+        relative.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        relative.into_owned()
+    }
 }
 
 const fn ingestion_class_label(class: IngestionClass) -> &'static str {

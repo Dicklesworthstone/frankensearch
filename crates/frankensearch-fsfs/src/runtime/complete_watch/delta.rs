@@ -109,10 +109,10 @@ fn unambiguous_source(root: &Path, path: &Path) -> bool {
     let Some(text) = relative.to_str() else {
         return false;
     };
-    // The original indexer has lossy filename normalization. Do not use a
-    // potentially colliding spelling as authority for an exact-ID deletion.
+    // The indexer requires UTF-8 and preserves Unix backslashes. A source ID
+    // must still be a nonempty relative path with no traversal components.
     !(text.is_empty()
-        || text.contains(['\\', '\0'])
+        || text.contains('\0')
         || text.len() > usize::from(u16::MAX)
         || relative
             .components()

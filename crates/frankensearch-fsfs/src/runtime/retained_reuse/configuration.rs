@@ -12,10 +12,13 @@ use crate::config::{FsfsConfig, SearchConfig, UpgradeReusePolicy};
 
 use super::content_sha256_hex;
 
-pub(super) const INDEXING_CONTRACT_VERSION_V2: &str = "fsfs.indexing_contract.v2";
+pub(super) const INDEXING_CONTRACT_VERSION_V3: &str = "fsfs.indexing_contract.v3";
 
 /// Explicit, versioned indexing-pipeline contract (`bd-ky0j2`).
-/// V2 binds exact JSON number parsing, including model and API input parsing.
+/// V3 retains exact JSON number parsing and binds native source-key spelling:
+/// Unix backslashes are filename bytes, while Windows separators become '/'.
+/// Earlier contracts could conflate two source paths, so even an opted-in
+/// compatible executable upgrade must rebuild their lexical metadata.
 ///
 /// Binds every compile-time and configuration-derived contract that shapes
 /// persisted lexical segments, vector rows, window plans, and catalog records:
@@ -26,7 +29,7 @@ pub(super) const INDEXING_CONTRACT_VERSION_V2: &str = "fsfs.indexing_contract.v2
 /// - fast semantic windowing contract (`WINDOW_CHARS`, `MAX_WINDOWS_PER_FILE`)
 /// - indexing configuration digest (`digest(config)`)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct IndexingContractDigestV2 {
+pub(super) struct IndexingContractDigestV3 {
     pub contract_version: String,
     pub checkpoint_schema_version: u16,
     pub fsvi_format_version: u16,
@@ -44,12 +47,12 @@ pub(super) struct IndexingContractDigestV2 {
     pub configuration_sha256: String,
 }
 
-impl IndexingContractDigestV2 {
+impl IndexingContractDigestV3 {
     pub(super) fn from_config(config: &FsfsConfig) -> SearchResult<Self> {
         let embedding_canonicalizer = DefaultCanonicalizer::default();
         let lexical_canonicalizer = crate::runtime::LEXICAL_CANONICALIZER;
         Ok(Self {
-            contract_version: INDEXING_CONTRACT_VERSION_V2.to_owned(),
+            contract_version: INDEXING_CONTRACT_VERSION_V3.to_owned(),
             checkpoint_schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
             fsvi_format_version: frankensearch_index::FSVI_V2_VERSION,
             quill_engine_version: frankensearch_quill::CURRENT_ENGINE_VERSION,
@@ -77,7 +80,7 @@ impl IndexingContractDigestV2 {
 }
 
 pub(super) fn contract_digest(config: &FsfsConfig) -> SearchResult<String> {
-    IndexingContractDigestV2::from_config(config)?.sha256_hex()
+    IndexingContractDigestV3::from_config(config)?.sha256_hex()
 }
 
 pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
@@ -201,12 +204,14 @@ mod tests {
     #[test]
     fn indexing_contract_digest_changes_when_schema_or_window_or_canonicalizer_contract_drifts() {
         let config = FsfsConfig::default();
-        let baseline = IndexingContractDigestV2::from_config(&config).unwrap();
+        let baseline = IndexingContractDigestV3::from_config(&config).unwrap();
         let expected = baseline.sha256_hex().unwrap();
         assert_eq!(expected.len(), 64);
 
         let mut changed_version = baseline.clone();
-        changed_version.contract_version = "fsfs.indexing_contract.v3".to_owned();
+        // The previous contract admitted lossy Unix source-key aliases.
+        // Equal file bytes and timestamps cannot authorize carrying its metadata.
+        changed_version.contract_version = "fsfs.indexing_contract.v2".to_owned();
         assert_ne!(changed_version.sha256_hex().unwrap(), expected);
 
         let mut changed_fsvi = baseline.clone();

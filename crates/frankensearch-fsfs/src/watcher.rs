@@ -3939,6 +3939,12 @@ fn event_to_ingest_op(
     event: &WatchEvent,
     mount_table: Option<&MountTable>,
 ) -> SearchResult<Option<WatchIngestOp>> {
+    // The initial indexer skips non-UTF-8 source names. Do the same before
+    // constructing either mutation: lossy conversion can alias an unrelated
+    // valid Unicode path, including on a deletion after the source is gone.
+    if event.path.to_str().is_none() {
+        return Ok(None);
+    }
     let revision = i64::try_from(event.observed_at_ms).unwrap_or(i64::MAX);
     let file_key = normalize_file_key(&event.path);
 
@@ -4843,7 +4849,15 @@ fn reduce_batch_size(base_batch_size: usize, divisor: usize) -> usize {
 }
 
 fn normalize_file_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let key = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        key.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        key.into_owned()
+    }
 }
 
 const fn pressure_state_to_code(state: PressureState) -> u8 {
@@ -5605,6 +5619,79 @@ mod tests {
             assert_eq!(outcome.reindexed, 0);
             assert_eq!(outcome.skipped, 1);
             assert!(pipeline.all_ops().is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_keys_preserve_backslashes_in_watch_mutations() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("source");
+            fs::create_dir_all(root.join("dir")).unwrap();
+            let literal = root.join("dir\\notes.md");
+            let nested = root.join("dir/notes.md");
+            fs::write(&literal, "literal source").unwrap();
+            fs::write(&nested, "nested source").unwrap();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher =
+                FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+            let outcome = watcher
+                .process_events_now(
+                    &cx,
+                    &[
+                        WatchEvent::modified(&literal, 1_000, Some(14)),
+                        WatchEvent::modified(&nested, 1_001, Some(13)),
+                        WatchEvent::deleted(&literal, 1_002),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.accepted, 3);
+            let ops = pipeline.all_ops();
+            assert_eq!(ops.len(), 3);
+            assert!(matches!(&ops[0], WatchIngestOp::Upsert { file_key, .. }
+                if file_key == literal.to_str().unwrap()));
+            assert!(matches!(&ops[1], WatchIngestOp::Upsert { file_key, .. }
+                if file_key == nested.to_str().unwrap()));
+            assert!(matches!(&ops[2], WatchIngestOp::Delete { file_key, .. }
+                if file_key == literal.to_str().unwrap()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_watch_events_never_mutate_a_lossy_unicode_alias() {
+        use std::os::unix::ffi::OsStrExt;
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("source");
+            fs::create_dir(&root).unwrap();
+            let valid = root.join("caf\u{fffd}.md");
+            fs::write(&valid, "valid Unicode source").unwrap();
+            let invalid = root.join(std::ffi::OsStr::from_bytes(b"caf\xff.md"));
+            assert_eq!(invalid.to_string_lossy(), valid.to_string_lossy());
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher =
+                FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+            let outcome = watcher
+                .process_events_now(
+                    &cx,
+                    &[
+                        WatchEvent::modified(&valid, 1_000, Some(20)),
+                        WatchEvent::modified(&invalid, 1_001, Some(20)),
+                        WatchEvent::deleted(&invalid, 1_002),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.accepted, 1);
+            assert_eq!(outcome.skipped, 2);
+            let ops = pipeline.all_ops();
+            assert_eq!(ops.len(), 1);
+            assert!(matches!(&ops[0], WatchIngestOp::Upsert { file_key, .. }
+                if file_key == valid.to_str().unwrap()));
         });
     }
 
