@@ -286,7 +286,10 @@ fn backslash_sources_remain_distinct_through_index_update_and_removal() {
             .open_retained_search(&cx, &root)
             .await
             .unwrap();
-        for (query, id) in [("literalword", "dir\\notes.md"), ("nestedword", "dir/notes.md")] {
+        for (query, id) in [
+            ("literalword", "dir\\notes.md"),
+            ("nestedword", "dir/notes.md"),
+        ] {
             let result = pinned.search(&cx, query, 10).await.unwrap();
             let hits = &result.last().unwrap().hits;
             assert_eq!(hits.len(), 1);

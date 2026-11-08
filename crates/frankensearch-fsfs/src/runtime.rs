@@ -10328,14 +10328,15 @@ impl FsfsRuntime {
             Ok(())
         };
         let payloads = if let Some(payloads) = cached_payloads {
-            Self::replay_cached_search_payloads(
+            Box::pin(runtime.replay_cached_search_payloads(
                 cx,
                 resources,
                 mode,
-                &resources.generation_fingerprint,
+                &fingerprint,
                 payloads,
                 Some(&mut publish),
-            )?
+            ))
+            .await?
         } else {
             runtime
                 .execute_search_phase_artifacts_with_mode_using_resources(
@@ -12612,15 +12613,16 @@ impl FsfsRuntime {
                         &lookup_fingerprint,
                         mode,
                     )?;
-                    let payloads = if let Some(resources) = &admitted_resources {
-                        Self::replay_cached_search_payloads(
+                    let payloads = if let Some(resources) = &mut admitted_resources {
+                        Box::pin(prepared.replay_cached_search_payloads(
                             cx,
                             resources,
                             mode,
                             &lookup_fingerprint,
                             &payloads,
                             phase_sink.take(),
-                        )?
+                        ))
+                        .await?
                     } else {
                         if let Some(sink) = phase_sink.as_deref_mut() {
                             for payload in &payloads {
@@ -13413,9 +13415,10 @@ impl FsfsRuntime {
     }
 
     /// A stored answer is not evidence that this process still has the exact
-    /// producers admitted by its vector generations. Admit before replaying
-    /// any phase. Optional quality failure turns a Full cache hit into ordinary
-    /// progressive execution, preserving Initial/RefinementFailed behavior.
+    /// producers admitted by its vector generations. Admit each phase's
+    /// producers before replay. Cold optional quality is admitted after Initial
+    /// has escaped; its exact execution certificate still gates Refined.
+    /// A loaded quality producer that no longer validates returns to ordinary execution.
     async fn admit_cached_search_producers(
         &self,
         cx: &Cx,
@@ -13440,10 +13443,21 @@ impl FsfsRuntime {
                 mode,
                 SearchExecutionMode::Full | SearchExecutionMode::QualityOnly
             ) || (matches!(mode, SearchExecutionMode::Full)
-                && (self.quality_disabled_by_policy() || resources.quality_embedder.is_none())))
+                && self.quality_disabled_by_policy()))
         {
-            // Optional quality initialization belongs after Initial. Never
-            // spend its load gate or timeout budget admitting a cache entry.
+            return Ok(false);
+        }
+        let defer_quality = needs_quality
+            && matches!(mode, SearchExecutionMode::Full)
+            && resources.quality_embedder.is_none();
+        if defer_quality
+            && !matches!(payloads, [initial, refined]
+                if initial.phase == SearchOutputPhase::Initial
+                    && refined.phase == SearchOutputPhase::Refined
+                    && !Self::cached_search_requires_quality(mode, std::slice::from_ref(initial)))
+        {
+            // Only an ordinary progressive pair can defer quality admission.
+            // Ambiguous provenance/order must run the live planner instead.
             return Ok(false);
         }
         if Self::cached_search_requires_fast(resources, mode, payloads) {
@@ -13462,6 +13476,13 @@ impl FsfsRuntime {
             self.maybe_prepare_cached_fast_producer(cx, resources)
                 .await?;
             Self::validate_cached_fast_producer(resources)?;
+        }
+        if defer_quality {
+            // Do not acquire quality's load gate or spend its deadline before
+            // Initial. Replay will run the actual loader, including its exact
+            // runtime conformance probe, before exposing any cached Refined.
+            Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
+            return Ok(true);
         }
         if needs_quality {
             let quality = if matches!(mode, SearchExecutionMode::Full) {
@@ -13551,9 +13572,10 @@ impl FsfsRuntime {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")
     }
 
-    fn replay_cached_search_payloads(
+    async fn replay_cached_search_payloads(
+        &self,
         cx: &Cx,
-        resources: &SearchExecutionResources,
+        resources: &mut SearchExecutionResources,
         mode: SearchExecutionMode,
         cache_generation: &str,
         payloads: &[SearchPayload],
@@ -13571,9 +13593,28 @@ impl FsfsRuntime {
         let mut replayed: Vec<SearchPayload> = Vec::with_capacity(payloads.len());
         for payload in payloads {
             Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
-            if Self::cached_search_requires_quality(mode, std::slice::from_ref(payload))
-                && let Err(error) = Self::validate_required_quality_resources(resources)
-            {
+            let quality =
+                if Self::cached_search_requires_quality(mode, std::slice::from_ref(payload)) {
+                    if matches!(mode, SearchExecutionMode::Full)
+                        && resources.quality_embedder.is_none()
+                    {
+                        // A verified artifact manifest alone cannot attest an
+                        // ONNX/native execution certificate. Initial is already
+                        // delivered; the normal quality deadline owns this load.
+                        let outcome = self
+                            .with_quality_deadline(cx, self.admit_required_quality(cx, resources))
+                            .await;
+                        // Admission can yield to another task after Initial.
+                        // Recheck the primary before publishing a later phase.
+                        Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
+                        outcome
+                    } else {
+                        Self::validate_required_quality_resources(resources)
+                    }
+                } else {
+                    Ok(())
+                };
+            if let Err(error) = quality {
                 if matches!(error, SearchError::Cancelled { .. })
                     || !matches!(mode, SearchExecutionMode::Full)
                 {
@@ -13586,23 +13627,9 @@ impl FsfsRuntime {
                     return Err(error);
                 };
                 // Initial has already escaped. Preserve its admitted scores
-                // and the normal optional-quality failure contract, without
-                // replaying stale Refined scores or delivering Initial twice.
-                let mut failed = initial.clone();
-                failed.phase = SearchOutputPhase::RefinementFailed;
-                failed.semantic_blend = None;
-                failed.rerank = None;
-                failed.skip_reason = None;
-                failed.quality_timeout = None;
-                let advice = Self::sanitized_semantic_degradation_advice(
-                    classify_search_error(&error),
-                    &failed.query,
-                    &resources.index_root,
-                    &error,
-                );
-                failed
-                    .degradation_advice
-                    .insert(advice.reason_code.clone(), advice);
+                // without replaying stale Refined or delivering Initial twice.
+                let failed =
+                    Self::cached_refinement_failure(initial, &resources.index_root, &error);
                 Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
                 if let Some(sink) = phase_sink.as_deref_mut() {
                     sink(&failed)?;
@@ -13618,6 +13645,41 @@ impl FsfsRuntime {
         }
         Self::validate_cached_search_producers(cx, resources, mode, payloads)?;
         Ok(replayed)
+    }
+
+    fn cached_refinement_failure(
+        initial: &SearchPayload,
+        index_root: &Path,
+        error: &SearchError,
+    ) -> SearchPayload {
+        let mut failed = initial.clone();
+        failed.phase = SearchOutputPhase::RefinementFailed;
+        failed.semantic_blend = None;
+        failed.rerank = None;
+        failed.skip_reason = None;
+        failed.quality_timeout = None;
+        let advice = Self::sanitized_semantic_degradation_advice(
+            classify_search_error(error),
+            &failed.query,
+            index_root,
+            error,
+        );
+        failed
+            .degradation_advice
+            .insert(advice.reason_code.clone(), advice);
+        if let SearchError::SearchTimeout {
+            elapsed_ms,
+            budget_ms,
+        } = error
+        {
+            failed.skip_reason = Some("quality_timeout".to_owned());
+            failed.quality_timeout = Some(crate::output_schema::QualityTimeoutPayload {
+                budget_ms: *budget_ms,
+                elapsed_ms: *elapsed_ms,
+                reason_code: "query.quality.timeout".to_owned(),
+            });
+        }
+        failed
     }
 
     #[cfg(test)]
@@ -61009,7 +61071,7 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let index_root = temp.path().join("index");
             std::fs::create_dir_all(&index_root).expect("create index root");
-            let resources = disagreeing_blend_resources(&index_root);
+            let mut resources = disagreeing_blend_resources(&index_root);
 
             let mut config = FsfsConfig::default();
             config.storage.index_dir = index_root.display().to_string();
@@ -61117,9 +61179,8 @@ mod tests {
                 .write_search_payload_cache(&key, &payloads, &cache_fingerprint)
                 .unwrap();
 
-            // A two-phase cache replay needs producers already admitted to
-            // these actual vector files. Cold CLI quality admission instead
-            // recomputes progressively so it cannot withhold Initial.
+            // Warm replay uses the producers already admitted to these actual
+            // vector files. Cold quality admission is tested independently.
             let cached = runtime
                 .try_load_search_payload_cache(&key, &cache_fingerprint)
                 .unwrap()
@@ -61130,15 +61191,17 @@ mod tests {
                     replayed.push(payload.clone());
                     Ok(())
                 };
-                FsfsRuntime::replay_cached_search_payloads(
-                    &cx,
-                    &resources,
-                    SearchExecutionMode::Full,
-                    &cache_fingerprint,
-                    &cached,
-                    Some(&mut sink),
-                )
-                .expect("replay cached phases")
+                runtime
+                    .replay_cached_search_payloads(
+                        &cx,
+                        &mut resources,
+                        SearchExecutionMode::Full,
+                        &cache_fingerprint,
+                        &cached,
+                        Some(&mut sink),
+                    )
+                    .await
+                    .expect("replay cached phases")
             };
             assert_eq!(replayed, payloads, "cache hit must replay each phase once");
             assert_eq!(replayed_payloads, payloads);
@@ -61185,14 +61248,16 @@ mod tests {
                 }
                 Ok(())
             };
-            let cancelled = FsfsRuntime::replay_cached_search_payloads(
-                &cx,
-                &resources,
-                SearchExecutionMode::Full,
-                &cache_fingerprint,
-                &cached,
-                Some(&mut cancel_last_phase),
-            );
+            let cancelled = runtime
+                .replay_cached_search_payloads(
+                    &cx,
+                    &mut resources,
+                    SearchExecutionMode::Full,
+                    &cache_fingerprint,
+                    &cached,
+                    Some(&mut cancel_last_phase),
+                )
+                .await;
             cx.set_cancel_requested(false);
             assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
 
@@ -61626,17 +61691,21 @@ mod tests {
                     in_both_sources: false,
                 }],
             )];
-            let replay = |sink| {
-                FsfsRuntime::replay_cached_search_payloads(
-                    &cx,
-                    &resources,
-                    mode,
-                    &resources.generation_fingerprint,
-                    &payloads,
-                    sink,
-                )
-            };
-            assert_eq!(replay(None).unwrap(), payloads);
+            let cache_generation = resources.generation_fingerprint.clone();
+            assert_eq!(
+                runtime
+                    .replay_cached_search_payloads(
+                        &cx,
+                        &mut resources,
+                        mode,
+                        &cache_generation,
+                        &payloads,
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                payloads
+            );
             assert!(resources.fast_embedder.is_none());
             assert!(!resources.fast_embedder_attempted);
 
@@ -61648,19 +61717,28 @@ mod tests {
                 verify_dir_and_record(producer.registration.download_manifest(), &model_dir)
                     .unwrap();
                 let mut published = 0;
-                let error = replay(Some(&mut |phase: &SearchPayload| {
-                    assert_eq!(phase, &payloads[0]);
-                    published += 1;
-                    if missing {
-                        fs::rename(&artifact, &saved)?;
-                    } else {
-                        let mut changed = original.clone();
-                        changed[0] ^= 1;
-                        fs::write(&artifact, changed)?;
-                    }
-                    Ok(())
-                }))
-                .expect_err("a callback cannot invalidate the producer and receive success");
+                let error = runtime
+                    .replay_cached_search_payloads(
+                        &cx,
+                        &mut resources,
+                        mode,
+                        &cache_generation,
+                        &payloads,
+                        Some(&mut |phase: &SearchPayload| {
+                            assert_eq!(phase, &payloads[0]);
+                            published += 1;
+                            if missing {
+                                fs::rename(&artifact, &saved)?;
+                            } else {
+                                let mut changed = original.clone();
+                                changed[0] ^= 1;
+                                fs::write(&artifact, changed)?;
+                            }
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .expect_err("a callback cannot invalidate the producer and receive success");
                 assert_eq!(
                     published, 1,
                     "the mutation follows the admitted Initial phase"
@@ -61678,7 +61756,20 @@ mod tests {
                 } else {
                     fs::write(&artifact, &original).unwrap();
                 }
-                assert_eq!(replay(None).unwrap(), payloads);
+                assert_eq!(
+                    runtime
+                        .replay_cached_search_payloads(
+                            &cx,
+                            &mut resources,
+                            mode,
+                            &cache_generation,
+                            &payloads,
+                            None,
+                        )
+                        .await
+                        .unwrap(),
+                    payloads
+                );
                 assert!(resources.fast_embedder.is_none());
                 assert!(!resources.fast_embedder_attempted);
             }
@@ -61752,18 +61843,20 @@ mod tests {
             .unwrap();
 
             let mut published = 0;
-            let error = FsfsRuntime::replay_cached_search_payloads(
-                &cx,
-                &resources,
-                SearchExecutionMode::Full,
-                &lookup_generation,
-                &cached,
-                Some(&mut |_| {
-                    published += 1;
-                    Ok(())
-                }),
-            )
-            .unwrap_err();
+            let error = runtime
+                .replay_cached_search_payloads(
+                    &cx,
+                    &mut resources,
+                    SearchExecutionMode::Full,
+                    &lookup_generation,
+                    &cached,
+                    Some(&mut |_| {
+                        published += 1;
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap_err();
             assert!(
                 matches!(error, SearchError::InvalidConfig { field, .. } if field == "index.generation")
             );
@@ -61945,88 +62038,323 @@ mod tests {
     #[cfg(feature = "semantic-support")]
     #[test]
     fn cold_quality_cache_admission_never_holds_initial_behind_the_load_gate() {
-        run_on_runtime_task(|cx| async move {
-            let _restore = AppendEmbedderOverrides::install();
-            super::set_test_quality_embedder(Some(Arc::new(BlendQueryEmbedder("blend-quality-2"))));
-            let temp = tempfile::tempdir().unwrap();
-            let mut resources = disagreeing_blend_resources(temp.path());
-            let mut config = FsfsConfig::default();
-            config.storage.index_dir = temp.path().display().to_string();
-            config.search.quality_timeout_ms = 5_000;
-            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-                index_dir: Some(temp.path().to_path_buf()),
-                ..CliInput::default()
-            });
-            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
-                "query": "why does semantic ranking find these files", "mode": "full",
-                "limit": 10, "rerank": false,
-            }))
-            .unwrap();
-            let mut cache = HashMap::new();
-            let original = runtime
-                .execute_search_serve_request(
+        for change_generation in [false, true] {
+            run_on_runtime_task(move |cx| async move {
+                let _restore = AppendEmbedderOverrides::install();
+                super::set_test_quality_embedder(Some(Arc::new(BlendQueryEmbedder(
+                    "blend-quality-2",
+                ))));
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = temp.path().display().to_string();
+                config.search.quality_timeout_ms = 5_000;
+                config.indexing.quality_model = "all-MiniLM-L6-v2".to_owned();
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                });
+                let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                    "query": "why does semantic ranking find these files", "mode": "full",
+                    "limit": 10, "rerank": false,
+                }))
+                .unwrap();
+                let mut cache = HashMap::new();
+                let original = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        request.clone(),
+                        &mut resources,
+                        &mut cache,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    original
+                        .payloads
+                        .iter()
+                        .any(|payload| payload.phase == SearchOutputPhase::Refined)
+                );
+                let fast = Arc::new(PendingSemanticEmbedder::new("blend-fast-2", 2));
+                let quality = Arc::new(PendingSemanticEmbedder::new("blend-quality-2", 2));
+                resources.fast_embedder = Some(admitted_shared(&fast));
+                super::set_test_quality_embedder(Some(quality.clone()));
+                resources.quality_embedder = None;
+                resources.quality_embedder_attempted = false;
+                let held = asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&runtime.quality_load_gate),
                     &cx,
-                    request.clone(),
-                    &mut resources,
-                    &mut cache,
-                    true,
                 )
                 .await
                 .unwrap();
-            assert!(
-                original
-                    .payloads
-                    .iter()
-                    .any(|payload| payload.phase == SearchOutputPhase::Refined)
-            );
-            resources.quality_embedder = None;
-            resources.quality_embedder_attempted = false;
-            let held = asupersync::sync::OwnedMutexGuard::lock(
-                Arc::clone(&runtime.quality_load_gate),
-                &cx,
-            )
-            .await
-            .unwrap();
-            let initials = Arc::new(AtomicUsize::new(0));
-            let seen = Arc::clone(&initials);
-            let mut sink = move |frame| {
-                if let super::SearchServeFrame::Phase { payload } = frame
-                    && payload.phase == SearchOutputPhase::Initial
-                {
-                    seen.fetch_add(1, Ordering::SeqCst);
+                let published = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let seen = Arc::clone(&published);
+                let mut sink = move |frame| {
+                    if let super::SearchServeFrame::Phase { payload } = frame {
+                        seen.lock().unwrap().push(payload.phase);
+                    }
+                    Ok(())
+                };
+                let mut operation = Box::pin(runtime.execute_search_serve_request_with_sink(
+                    &cx,
+                    request,
+                    &mut resources,
+                    &mut cache,
+                    super::SearchServeOptions {
+                        hot_cache_enabled: true,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut sink),
+                ));
+                std::future::poll_fn(|task| {
+                    assert!(operation.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let before_release = published.lock().unwrap().clone();
+                if change_generation {
+                    // This mutation happens after the Initial callback returned,
+                    // while quality admission is suspended behind the load gate.
+                    fs::write(
+                        temp.path().join(super::FSFS_SENTINEL_FILE),
+                        b"generation changed during quality admission",
+                    )
+                    .unwrap();
                 }
-                Ok(())
+                drop(held);
+                assert_eq!(
+                    before_release,
+                    [SearchOutputPhase::Initial],
+                    "Initial must precede optional quality load admission"
+                );
+                let result = operation.await;
+                if change_generation {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::InvalidConfig { field, .. }) if field == "index.generation"
+                    ));
+                    assert_eq!(*published.lock().unwrap(), [SearchOutputPhase::Initial]);
+                } else {
+                    let response = result.unwrap();
+                    assert!(response.cached);
+                    assert_eq!(response.payloads, original.payloads);
+                    assert_eq!(
+                        *published.lock().unwrap(),
+                        [SearchOutputPhase::Initial, SearchOutputPhase::Refined]
+                    );
+                }
+                assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            });
+        }
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn persistent_progressive_cache_replays_before_cold_quality_admission() {
+        run_on_runtime_task(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            let temp = tempfile::tempdir().unwrap();
+            drop(published_blend_resources(temp.path()));
+            super::set_test_fast_embedder(Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))));
+            super::set_test_quality_embedder(Some(Arc::new(BlendQueryEmbedder("blend-quality-2"))));
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            config.indexing.quality_model = "all-MiniLM-L6-v2".to_owned();
+            let input = CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
             };
-            let mut operation = Box::pin(runtime.execute_search_serve_request_with_sink(
-                &cx,
-                request,
-                &mut resources,
-                &mut cache,
-                super::SearchServeOptions {
-                    hot_cache_enabled: true,
-                    persist_explain_session: false,
-                },
-                Some(&mut sink),
-            ));
-            std::future::poll_fn(|task| {
-                assert!(operation.as_mut().poll(task).is_pending());
-                Poll::Ready(())
-            })
-            .await;
-            let before_release = initials.load(Ordering::SeqCst);
-            drop(held);
-            assert_eq!(
-                before_release, 1,
-                "Initial must precede optional quality load admission"
-            );
-            let response = operation.await.unwrap();
-            assert!(!response.cached);
-            assert_eq!(initials.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                response.payloads.last().unwrap().phase,
-                SearchOutputPhase::Refined
-            );
+            let runtime = FsfsRuntime::new(config.clone()).with_cli_input(input.clone());
+            let query = "why does semantic ranking find these files";
+            let original = runtime
+                .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                .await
+                .unwrap();
+            assert_eq!(original.last().unwrap().phase, SearchOutputPhase::Refined);
+            let key = runtime
+                .search_cache_key(query, 10, SearchExecutionMode::Full)
+                .unwrap();
+            let cache_path = runtime.search_cache_path(&key).unwrap();
+            let cached_bytes = fs::read(&cache_path).unwrap();
+            let fast = Arc::new(PendingSemanticEmbedder::new("blend-fast-2", 2));
+            super::set_test_fast_embedder(Some(fast.clone()));
+
+            for quality_id in [Some("blend-quality-2"), None, Some("foreign-quality-2")] {
+                let quality = quality_id.map(|id| Arc::new(PendingSemanticEmbedder::new(id, 2)));
+                super::set_test_quality_embedder(
+                    quality
+                        .clone()
+                        .map(|embedder| embedder as Arc<dyn Embedder>),
+                );
+                // Each request has cold runtime resources and a new quality
+                // load gate. The only shared answer is the persisted JSON file.
+                let cold = FsfsRuntime::new(config.clone()).with_cli_input(input.clone());
+                let mut published = Vec::new();
+                let payloads = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(10),
+                    cold.execute_search_payloads_cached_for_cli_with_phase_sink(
+                        &cx,
+                        query,
+                        10,
+                        &mut |phase| {
+                            published.push(phase.phase);
+                            if phase.phase == SearchOutputPhase::Initial {
+                                let gate = cold.quality_load_gate.try_lock_owned().unwrap();
+                                assert!(gate.0.is_none(), "Initial must precede quality loading");
+                            }
+                            Ok(())
+                        },
+                    ),
+                )
+                .await
+                .expect("cache replay must not run a pending query embedder")
+                .unwrap();
+                assert_eq!(payloads[0], original[0]);
+                if quality_id == Some("blend-quality-2") {
+                    assert_eq!(payloads, original);
+                    assert_eq!(
+                        published,
+                        [SearchOutputPhase::Initial, SearchOutputPhase::Refined]
+                    );
+                } else {
+                    assert_eq!(
+                        published,
+                        [
+                            SearchOutputPhase::Initial,
+                            SearchOutputPhase::RefinementFailed
+                        ]
+                    );
+                    assert_eq!(payloads[1].hits, original[0].hits);
+                    assert!(payloads[1].semantic_blend.is_none());
+                    assert!(!payloads[1].degradation_advice.is_empty());
+                }
+                assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+                if let Some(quality) = quality {
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+                }
+                assert_eq!(fs::read(&cache_path).unwrap(), cached_bytes);
+            }
         });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn cold_cached_quality_wait_observes_timeout_and_cancellation_after_initial() {
+        for cancel in [false, true] {
+            run_on_runtime_task(move |cx| async move {
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                resources.quality_embedder = None;
+                resources.quality_embedder_attempted = false;
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = temp.path().display().to_string();
+                config.search.quality_timeout_ms = if cancel { 5_000 } else { 50 };
+                config.indexing.quality_model = "all-MiniLM-L6-v2".to_owned();
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                });
+                let query = "why does semantic ranking find these files";
+                let mut initial = SearchPayload::new(
+                    query,
+                    SearchOutputPhase::Initial,
+                    1,
+                    vec![SearchHitPayload {
+                        rank: 1,
+                        path: "a.rs".to_owned(),
+                        line: None,
+                        score: 0.5,
+                        snippet: None,
+                        lexical_rank: None,
+                        semantic_rank: Some(0),
+                        hash_rank: None,
+                        in_both_sources: false,
+                    }],
+                );
+                initial.vector_generation_id = Some("blend-fast-2".to_owned());
+                let mut refined = initial.clone();
+                refined.phase = SearchOutputPhase::Refined;
+                refined.hits[0].score = 0.9;
+                let key = runtime
+                    .search_cache_key(query, 10, SearchExecutionMode::Full)
+                    .unwrap();
+                let mut cache = HashMap::from([(key, vec![initial.clone(), refined])]);
+                let request = serde_json::from_value(serde_json::json!({
+                    "query": query, "mode": "full", "limit": 10, "rerank": false,
+                }))
+                .unwrap();
+                let held = asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&runtime.quality_load_gate),
+                    &cx,
+                )
+                .await
+                .unwrap();
+                let published = std::sync::Mutex::new(Vec::new());
+                let mut sink = |frame| {
+                    if let super::SearchServeFrame::Phase { payload } = frame {
+                        published.lock().unwrap().push(payload.phase);
+                    }
+                    Ok(())
+                };
+                let mut operation = Box::pin(runtime.execute_search_serve_request_with_sink(
+                    &cx,
+                    request,
+                    &mut resources,
+                    &mut cache,
+                    super::SearchServeOptions {
+                        hot_cache_enabled: true,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut sink),
+                ));
+                if cancel {
+                    poll_fn(|task| {
+                        assert!(operation.as_mut().poll(task).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    assert_eq!(*published.lock().unwrap(), [SearchOutputPhase::Initial]);
+                    cx.cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel cached quality load"),
+                    );
+                }
+                let result = operation.await;
+                drop(held);
+                if cancel {
+                    cx.set_cancel_requested(false);
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                    assert_eq!(*published.lock().unwrap(), [SearchOutputPhase::Initial]);
+                } else {
+                    let response = result.unwrap();
+                    assert!(response.cached);
+                    assert_eq!(
+                        *published.lock().unwrap(),
+                        [
+                            SearchOutputPhase::Initial,
+                            SearchOutputPhase::RefinementFailed
+                        ]
+                    );
+                    let failed = response.payloads.last().unwrap();
+                    assert_eq!(failed.hits, initial.hits);
+                    assert_eq!(failed.skip_reason.as_deref(), Some("quality_timeout"));
+                    let timeout = failed.quality_timeout.as_ref().unwrap();
+                    assert_eq!(timeout.budget_ms, 50);
+                    assert!(timeout.elapsed_ms >= timeout.budget_ms);
+                    assert_eq!(timeout.reason_code, "query.quality.timeout");
+                    assert!(
+                        cache.is_empty(),
+                        "timed-out quality must evict the cached refinement"
+                    );
+                }
+                assert!(resources.quality_embedder.is_none());
+                assert!(!resources.quality_embedder_attempted);
+            });
+        }
     }
 
     #[cfg(all(feature = "semantic-support", unix))]

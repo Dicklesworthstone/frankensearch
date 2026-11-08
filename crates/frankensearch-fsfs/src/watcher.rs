@@ -5634,8 +5634,7 @@ mod tests {
             fs::write(&literal, "literal source").unwrap();
             fs::write(&nested, "nested source").unwrap();
             let pipeline = Arc::new(RecordingPipeline::default());
-            let watcher =
-                FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+            let watcher = FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
             let outcome = watcher
                 .process_events_now(
                     &cx,
@@ -5673,8 +5672,7 @@ mod tests {
             let invalid = root.join(std::ffi::OsStr::from_bytes(b"caf\xff.md"));
             assert_eq!(invalid.to_string_lossy(), valid.to_string_lossy());
             let pipeline = Arc::new(RecordingPipeline::default());
-            let watcher =
-                FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+            let watcher = FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
             let outcome = watcher
                 .process_events_now(
                     &cx,
