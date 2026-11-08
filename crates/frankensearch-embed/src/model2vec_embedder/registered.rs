@@ -13,6 +13,7 @@ use frankensearch_core::{SearchError, SearchResult};
 
 use crate::model_manifest::{
     MODEL_CONFORMANCE_TEXTS_V1, ModelArtifactManifestV1, ModelManifest, ModelTier,
+    VerifiedModelArtifactsV1,
 };
 
 use super::{
@@ -212,12 +213,28 @@ impl RegisteredModel2Vec {
         let verified = self
             .artifact_manifest
             .verify_dir_cached(&self.download_manifest, model_dir)?;
-        let identity = verified.identity_bundle(
-            frankensearch_core::generation::QuantizationFormat::F32,
-            "in-memory-f32-v1",
-        )?;
-        validate_registered_execution_contract(&identity)?;
-        Ok(identity)
+        verified_native_identity(&verified)
+    }
+
+    /// Verify the producer and retain artifact evidence for repeated replay checks.
+    ///
+    /// The returned proof remains observational: it never creates or repairs a
+    /// persistent receipt. Call [`VerifiedModelArtifactsV1::revalidate`] before
+    /// each replay boundary, using this registration's download manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact-verification, verification-race, or native
+    /// execution-contract error.
+    pub fn verify_identity_for_replay(
+        &self,
+        model_dir: &Path,
+    ) -> SearchResult<(EmbeddingIdentityBundleV1, VerifiedModelArtifactsV1)> {
+        let verified = self
+            .artifact_manifest
+            .verify_dir_cached_for_replay(&self.download_manifest, model_dir)?;
+        let identity = verified_native_identity(&verified)?;
+        Ok((identity, verified))
     }
 
     fn verify_execution(&self, embedder: &Model2VecEmbedder) -> SearchResult<()> {
@@ -312,6 +329,17 @@ impl Model2VecEmbedder {
         cache.insert(key, Arc::downgrade(&embedder));
         Ok(embedder)
     }
+}
+
+fn verified_native_identity(
+    verified: &VerifiedModelArtifactsV1,
+) -> SearchResult<EmbeddingIdentityBundleV1> {
+    let identity = verified.identity_bundle(
+        frankensearch_core::generation::QuantizationFormat::F32,
+        "in-memory-f32-v1",
+    )?;
+    validate_registered_execution_contract(&identity)?;
+    Ok(identity)
 }
 
 fn registration_error(reason: &str) -> SearchError {
@@ -480,6 +508,11 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(selected.verify_identity(dir.path()).unwrap(), identity);
         }
+        let (replay_identity, artifacts) = selected.verify_identity_for_replay(dir.path()).unwrap();
+        assert_eq!(replay_identity, identity);
+        artifacts
+            .revalidate(selected.download_manifest(), dir.path())
+            .unwrap();
         assert_eq!(loads(), 0, "receipt-backed admission must not load weights");
 
         // A malformed receipt is not authority. Rehash intact artifacts rather

@@ -1119,6 +1119,7 @@ struct CachedFastProducer {
     registration: frankensearch_embed::RegisteredModel2Vec,
     model_dir: PathBuf,
     identity: frankensearch_core::EmbeddingIdentityBundleV1,
+    artifacts: frankensearch_embed::VerifiedModelArtifactsV1,
 }
 
 #[cfg(feature = "semantic-support")]
@@ -1131,11 +1132,12 @@ impl CachedFastProducer {
             self.registration.dimension() as usize,
         )?;
         FsfsRuntime::validate_vector_producer_identity(index, &self.identity)?;
-        // A callback or another process may have replaced the files since
-        // admission. Reuse only a still-current receipt; otherwise the shared
-        // verifier hashes the artifacts and fails closed on any mismatch.
-        let current = self.registration.verify_identity(&self.model_dir)?;
-        FsfsRuntime::validate_vector_producer_identity(index, &current)
+        // Keep checking after callbacks without hashing the same unchanged
+        // matrix at every boundary when no disk receipt exists. This sealed
+        // proof binds the exact admitted manifest and file identities; changed
+        // or unavailable states still go through ordinary artifact verification.
+        self.artifacts
+            .revalidate(self.registration.download_manifest(), &self.model_dir)
     }
 }
 
@@ -23012,7 +23014,7 @@ impl FsfsRuntime {
         self.prepare_bundled_semantic_models_for_execution()?;
 
         let registration = select_fast_model(&self.config.indexing.fast_model)?;
-        let (model_dir, identity) = if registration.download_manifest().id
+        let (model_dir, identity, artifacts) = if registration.download_manifest().id
             == frankensearch_embed::RegisteredModel2Vec::BUILTIN_IDS[0]
         {
             EmbedderStack::verify_fast_semantic_identity_with_options(
@@ -23023,13 +23025,14 @@ impl FsfsRuntime {
             )?
         } else {
             let model_dir = self.selected_fast_model_path(&registration)?;
-            let identity = registration.verify_identity(&model_dir)?;
-            (model_dir, identity)
+            let (identity, artifacts) = registration.verify_identity_for_replay(&model_dir)?;
+            (model_dir, identity, artifacts)
         };
         Ok(CachedFastProducer {
             registration,
             model_dir,
             identity,
+            artifacts,
         })
     }
 
@@ -61649,7 +61652,8 @@ mod tests {
                 RegisteredModel2Vec::new(manifest, "fsfs-cache-replay-fixture", certificate)
                     .unwrap();
             verify_dir_and_record(registration.download_manifest(), &model_dir).unwrap();
-            let identity = registration.verify_identity(&model_dir).unwrap();
+            let (identity, artifacts) =
+                registration.verify_identity_for_replay(&model_dir).unwrap();
             let mut writer = VectorIndex::create_with_revision(
                 &index_root.join(super::FSFS_VECTOR_INDEX_FILE),
                 registration.id(),
@@ -61674,6 +61678,7 @@ mod tests {
                 registration,
                 model_dir: model_dir.clone(),
                 identity,
+                artifacts,
             });
             let payloads = vec![SearchPayload::new(
                 "cached artifact identity",

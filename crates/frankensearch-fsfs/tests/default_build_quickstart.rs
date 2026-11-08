@@ -16,7 +16,7 @@ mod loader_only {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(any(feature = "semantic-loaders", all(unix, feature = "semantic-support")))]
     use frankensearch_embed::model_manifest::is_verification_cached;
     use frankensearch_embed::model_manifest::{ModelManifest, ModelTier};
     #[cfg(feature = "semantic-loaders")]
@@ -24,7 +24,7 @@ mod loader_only {
     use serde_json::Value;
 
     const FAILURE_TIMEOUT: Duration = Duration::from_secs(30);
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(any(feature = "semantic-loaders", all(unix, feature = "semantic-support")))]
     const QUICKSTART_TIMEOUT: Duration = Duration::from_secs(240);
     #[cfg(feature = "semantic-loaders")]
     const QUICKSTART_DOCUMENT_COUNT: usize = 10;
@@ -631,7 +631,7 @@ mod loader_only {
         .expect("write typography document");
     }
 
-    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[cfg(all(unix, feature = "semantic-support"))]
     fn verify_real_fast_model_cache_isolation(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
@@ -989,18 +989,34 @@ mod loader_only {
         );
     }
 
-    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[cfg(all(unix, feature = "semantic-support"))]
     #[test]
     #[ignore = "real Model2Vec cache replay; provision Potion, then run with --ignored --nocapture"]
     fn default_build_replays_fast_answers_without_loading_weights() {
         log_binary_profile("fast-answer-cache");
-        let model_root = configured_model_root();
-        frankensearch_embed::model_manifest::verify_dir_and_record(
-            &ModelManifest::potion_128m(),
-            &model_root.join("potion-multilingual-128M"),
-        )
-        .expect("the focused answer-cache regression requires the exact registered Potion model");
+        let source_models = configured_model_root();
         let temp = tempfile::tempdir().unwrap();
+        let model_root = temp.path().join("models");
+        let install = model_root.join("potion-multilingual-128M");
+        let manifest = ModelManifest::potion_128m();
+        // The full quickstart deliberately invalidates the external cache's
+        // receipt. This independently runnable test must not race it or write
+        // to that shared installation. Copy only registered artifact bytes and
+        // mint the receipt under this test's private root.
+        for artifact in &manifest.files {
+            let destination = install.join(&artifact.name);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(
+                source_models
+                    .join("potion-multilingual-128M")
+                    .join(&artifact.name),
+                destination,
+            )
+            .expect("copy registered Potion artifact into the private model installation");
+        }
+        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install).expect(
+            "the focused answer-cache regression requires the exact registered Potion model",
+        );
         let corpus = temp.path().join("corpus");
         let index = temp.path().join("index");
         write_quickstart_corpus(&corpus);
@@ -1235,7 +1251,7 @@ mod loader_only {
         );
     }
 
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(any(feature = "semantic-loaders", all(unix, feature = "semantic-support")))]
     fn configured_model_root() -> PathBuf {
         for key in [
             "FSFS_DEFAULT_E2E_MODEL_DIR",

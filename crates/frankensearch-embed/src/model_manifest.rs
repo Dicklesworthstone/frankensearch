@@ -323,6 +323,41 @@ pub struct FrozenModelArtifactManifestV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedModelArtifactsV1 {
     frozen: FrozenModelArtifactManifestV1,
+    snapshot: Option<VerifiedArtifactSnapshot>,
+}
+
+/// Process-local evidence captured around successful artifact verification.
+/// No caller can construct or deserialize this proof, and it is never written
+/// to the model directory as a replacement for the verification receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedArtifactSnapshot {
+    model_dir: PathBuf,
+    download_manifest_fingerprint: String,
+    file_states: BTreeMap<String, FileVerificationState>,
+}
+
+impl VerifiedArtifactSnapshot {
+    fn still_matches(&self, manifest: &ModelManifest, model_dir: &Path) -> bool {
+        if self.model_dir != model_dir
+            || !manifest
+                .freeze_verification_manifest()
+                .is_ok_and(|frozen| frozen.fingerprint == self.download_manifest_fingerprint)
+        {
+            return false;
+        }
+        let Ok(current) = capture_manifest_file_states_from_names(
+            self.file_states.keys().map(String::as_str),
+            model_dir,
+        ) else {
+            return false;
+        };
+        self.file_states.iter().all(|(name, state)| {
+            state.has_strong_change_identity()
+                && current
+                    .get(name)
+                    .is_some_and(|observed| state.still_matches(observed))
+        })
+    }
 }
 
 impl VerifiedModelArtifactsV1 {
@@ -345,6 +380,39 @@ impl VerifiedModelArtifactsV1 {
         self.frozen
             .manifest
             .identity_bundle(quantization, storage_format)
+    }
+
+    /// Revalidate the same artifacts before replaying a cached result.
+    ///
+    /// A stable snapshot from [`ModelArtifactManifestV1::verify_dir_cached_for_replay`]
+    /// avoids repeated hashing within a request, including when no persistent
+    /// receipt exists. Every check still examines the registered files and
+    /// rejects added semantic artifacts. Changed files, a different directory or
+    /// download manifest, and platforms without strong change stamps use the
+    /// ordinary verifier; exact-byte restoration remains admissible.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same artifact-verification errors as
+    /// [`ModelArtifactManifestV1::verify_dir_cached`].
+    pub fn revalidate(
+        &self,
+        download_manifest: &ModelManifest,
+        model_dir: &Path,
+    ) -> SearchResult<()> {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.still_matches(download_manifest, model_dir))
+        {
+            return verify_no_extra_artifacts(model_dir, &self.frozen.manifest.artifacts);
+        }
+        // Preserve ordinary error ordering: a missing or corrupt registered
+        // artifact must not be hidden by an additional unregistered artifact.
+        self.frozen
+            .manifest
+            .verify_dir_cached(download_manifest, model_dir)
+            .map(|_| ())
     }
 }
 
@@ -1059,7 +1127,10 @@ impl ModelArtifactManifestV1 {
             });
         }
         verify_no_extra_artifacts(model_dir, &self.artifacts)?;
-        Ok(VerifiedModelArtifactsV1 { frozen })
+        Ok(VerifiedModelArtifactsV1 {
+            frozen,
+            snapshot: None,
+        })
     }
 
     /// Verify a model directory against this frozen manifest, reusing the
@@ -1101,9 +1172,65 @@ impl ModelArtifactManifestV1 {
                 receipt_manifest_fingerprint = %receipt_manifest.fingerprint,
                 "model verification receipt accepted"
             );
-            return Ok(VerifiedModelArtifactsV1 { frozen });
+            return Ok(VerifiedModelArtifactsV1 {
+                frozen,
+                snapshot: None,
+            });
         }
         self.verify_dir(model_dir)
+    }
+
+    /// Verify artifacts once and retain a sealed snapshot for result replay.
+    ///
+    /// File states must be stable across successful ordinary verification, and
+    /// the snapshot binds the exact download manifest used for admission. This
+    /// writes no receipt. Filesystems without file identity and change stamps
+    /// retain ordinary verification at each replay boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary artifact-verification error, or `HashMismatch` if
+    /// registered file states change across successful verification.
+    pub fn verify_dir_cached_for_replay(
+        &self,
+        download_manifest: &ModelManifest,
+        model_dir: &Path,
+    ) -> SearchResult<VerifiedModelArtifactsV1> {
+        let capture = || {
+            capture_manifest_file_states_from_names(
+                self.artifacts
+                    .iter()
+                    .map(|artifact| artifact.relative_path.as_str()),
+                model_dir,
+            )
+            .ok()
+        };
+        // A failed metadata capture cannot mask the verifier's typed missing,
+        // corrupt, or unreadable-artifact error. Unsupported metadata simply
+        // prevents retaining a reusable snapshot after successful verification.
+        let before = capture();
+        let mut verified = self.verify_dir_cached(download_manifest, model_dir)?;
+        after_full_hash_boundary();
+        let after = capture();
+        if before != after {
+            return Err(model_changed_during_verification(model_dir));
+        }
+        if (self.artifacts_match_download_manifest(download_manifest)
+            || self.matches_registered_native_installation(download_manifest))
+            && let Ok(frozen_download) = download_manifest.freeze_verification_manifest()
+            && let Some(file_states) = after
+            && file_states
+                .values()
+                .all(FileVerificationState::has_strong_change_identity)
+        {
+            verify_no_extra_artifacts(model_dir, &self.artifacts)?;
+            verified.snapshot = Some(VerifiedArtifactSnapshot {
+                model_dir: model_dir.to_path_buf(),
+                download_manifest_fingerprint: frozen_download.fingerprint,
+                file_states,
+            });
+        }
+        Ok(verified)
     }
 
     /// Bind the separate native installation catalog entry to the two already
@@ -3232,6 +3359,13 @@ pub struct FileVerificationState {
 }
 
 impl FileVerificationState {
+    /// A request-local proof must detect a same-size rewrite even when mtime
+    /// is restored. Where these platform fields are unavailable, keep hashing
+    /// through the ordinary verifier instead of adding a weaker reuse path.
+    fn has_strong_change_identity(&self) -> bool {
+        self.platform_file_id.is_some() && self.platform_change_stamp.is_some()
+    }
+
     /// Whether a freshly captured state still matches this recorded one.
     ///
     /// Every field must match, except a creation timestamp that only one side
@@ -7134,6 +7268,183 @@ mod tests {
             native.verify_dir_cached(&manifest, tmp.path()).is_err(),
             "without a receipt the cached path must still hash and reject drift"
         );
+    }
+
+    #[test]
+    fn native_replay_proof_avoids_repeated_hashes_without_writing_a_receipt() {
+        for receipt in ["absent", "malformed", "valid"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (manifest, native) = native_fixture(b"tokenizer-snapshot", b"weights-snapshot");
+            write_temp_file(&tmp.path().join("tokenizer.json"), b"tokenizer-snapshot");
+            write_temp_file(&tmp.path().join("model.safetensors"), b"weights-snapshot");
+            let marker_path = tmp.path().join(VERIFIED_MARKER_FILE);
+            match receipt {
+                "malformed" => write_temp_file(&marker_path, b"malformed receipt"),
+                "valid" => verify_dir_and_record(&manifest, tmp.path()).unwrap(),
+                _ => {}
+            }
+            let marker_before = fs::read(&marker_path).ok();
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+            let verified = native
+                .verify_dir_cached_for_replay(&manifest, tmp.path())
+                .unwrap();
+            assert_eq!(verified.snapshot.is_some(), cfg!(unix));
+            for _ in 0..5 {
+                verified.revalidate(&manifest, tmp.path()).unwrap();
+            }
+            let expected_hashes = if receipt == "valid" {
+                0
+            } else if cfg!(unix) {
+                manifest.files.len()
+            } else {
+                // No platform file id/change stamp: preserve ordinary full
+                // verification rather than relying on size and mtime alone.
+                manifest.files.len() * 6
+            };
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| {
+                assert_eq!(count.get(), expected_hashes, "receipt={receipt}");
+            });
+            assert_eq!(fs::read(marker_path).ok(), marker_before);
+        }
+    }
+
+    #[test]
+    fn native_replay_proof_binds_the_download_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, native) = native_fixture(b"tokenizer-bound", b"weights-bound");
+        write_temp_file(&tmp.path().join("tokenizer.json"), b"tokenizer-bound");
+        write_temp_file(&tmp.path().join("model.safetensors"), b"weights-bound");
+        let verified = native
+            .verify_dir_cached_for_replay(&manifest, tmp.path())
+            .unwrap();
+        let mut changed = manifest.clone();
+        changed.revision = "b".repeat(40);
+        TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+        verified.revalidate(&changed, tmp.path()).unwrap();
+        TEST_VERIFY_FILE_HASH_CALLS.with(|count| {
+            assert_eq!(
+                count.get(),
+                manifest.files.len(),
+                "another manifest cannot borrow the proof"
+            );
+        });
+
+        // A native manifest can still verify its own pinned bytes when the
+        // supplied download manifest differs, but that does not mint a proof
+        // claiming the mismatched download artifacts have been verified.
+        changed.files[0].sha256 = "0".repeat(64);
+        let incompatible = native
+            .verify_dir_cached_for_replay(&changed, tmp.path())
+            .unwrap();
+        assert!(incompatible.snapshot.is_none());
+        TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+        incompatible.revalidate(&changed, tmp.path()).unwrap();
+        TEST_VERIFY_FILE_HASH_CALLS.with(|count| assert_eq!(count.get(), manifest.files.len()));
+
+        #[cfg(unix)]
+        {
+            let alias_root = tempfile::tempdir().unwrap();
+            let alias = alias_root.path().join("same-files-another-path");
+            std::os::unix::fs::symlink(tmp.path(), &alias).unwrap();
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+            verified.revalidate(&manifest, &alias).unwrap();
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| {
+                assert_eq!(
+                    count.get(),
+                    manifest.files.len(),
+                    "the directory binding must also match"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn native_replay_proof_rejects_mutation_during_admission() {
+        for with_receipt in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (manifest, native) = native_fixture(b"tokenizer-race", b"weights-race");
+            write_temp_file(&tmp.path().join("tokenizer.json"), b"tokenizer-race");
+            let weights = tmp.path().join("model.safetensors");
+            write_temp_file(&weights, b"weights-race");
+            if with_receipt {
+                verify_dir_and_record(&manifest, tmp.path()).unwrap();
+            }
+            let marker_path = tmp.path().join(VERIFIED_MARKER_FILE);
+            let marker_before = fs::read(&marker_path).ok();
+            TEST_AFTER_FULL_HASH_HOOK.with(|slot| {
+                assert!(slot.borrow().is_none());
+                slot.replace(Some(Box::new(move || {
+                    fs::write(weights, b"changed after verification").unwrap();
+                })));
+            });
+            let error = native
+                .verify_dir_cached_for_replay(&manifest, tmp.path())
+                .unwrap_err();
+            assert!(matches!(error, SearchError::HashMismatch { .. }));
+            assert_eq!(fs::read(marker_path).ok(), marker_before);
+        }
+    }
+
+    #[test]
+    fn native_replay_proof_rechecks_changed_missing_and_added_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let (manifest, native) = native_fixture(b"tokenizer-integrity", b"weights-integrity");
+        write_temp_file(&tmp.path().join("tokenizer.json"), b"tokenizer-integrity");
+        let weights = tmp.path().join("model.safetensors");
+        write_temp_file(&weights, b"weights-integrity");
+        let verified = native
+            .verify_dir_cached_for_replay(&manifest, tmp.path())
+            .unwrap();
+        let extra = tmp.path().join("model.onnx");
+        write_temp_file(&extra, b"unregistered semantic artifact");
+        TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+        assert!(matches!(
+            verified.revalidate(&manifest, tmp.path()),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+        #[cfg(unix)]
+        TEST_VERIFY_FILE_HASH_CALLS.with(|count| assert_eq!(count.get(), 0));
+
+        // Changed registered files take precedence over an added artifact,
+        // exactly as in the ordinary verifier. The snapshot is no authority
+        // once even a same-size write has changed the file state.
+        #[cfg(unix)]
+        let original_mtime = fs::metadata(&weights).unwrap().modified().unwrap();
+        write_temp_file(&weights, b"weights-integritY");
+        #[cfg(unix)]
+        fs::File::options()
+            .write(true)
+            .open(&weights)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        assert!(matches!(
+            verified.revalidate(&manifest, tmp.path()),
+            Err(SearchError::ModelLoadFailed { .. })
+        ));
+        let saved = backup.path().join("saved-weights");
+        fs::rename(&weights, &saved).unwrap();
+        assert!(matches!(
+            verified.revalidate(&manifest, tmp.path()),
+            Err(SearchError::ModelNotFound { .. })
+        ));
+        fs::rename(extra, backup.path().join("extra-model.onnx")).unwrap();
+        // The symlink must point to valid bytes so rejection proves the
+        // regular-file policy, rather than an unrelated checksum failure.
+        write_temp_file(&saved, b"weights-integrity");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&saved, &weights).unwrap();
+            assert!(matches!(
+                verified.revalidate(&manifest, tmp.path()),
+                Err(SearchError::ModelLoadFailed { .. })
+            ));
+            fs::rename(&weights, backup.path().join("retired-symlink")).unwrap();
+        }
+        fs::rename(saved, &weights).unwrap();
+        verified.revalidate(&manifest, tmp.path()).unwrap();
+        assert!(!tmp.path().join(VERIFIED_MARKER_FILE).exists());
     }
 
     /// Prove the receipt path does not re-hash without resting on an

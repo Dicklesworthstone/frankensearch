@@ -75,6 +75,8 @@ use crate::model_download::{DownloadProgress, ModelDownloader};
 use crate::model_manifest::ModelArtifactManifestV1;
 #[cfg(any(feature = "model2vec", feature = "fastembed"))]
 use crate::model_manifest::ModelManifest;
+#[cfg(feature = "model2vec")]
+use crate::model_manifest::VerifiedModelArtifactsV1;
 #[cfg(all(
     feature = "download",
     any(feature = "model2vec", feature = "fastembed")
@@ -421,8 +423,9 @@ impl EmbedderStack {
     ///
     /// This uses the same policy gate and candidate order as
     /// [`Self::auto_detect_fast_semantic_with_options`], but only verifies the
-    /// actual artifacts and their native execution identity. A caller can use
-    /// this proof to admit cached results against a stored producer revision.
+    /// actual artifacts and their native execution identity. It returns the
+    /// selected directory, complete identity, and sealed artifact proof for
+    /// replay checks against a stored producer revision.
     /// It never downloads a missing model or substitutes a lazy embedder's
     /// declared identity for verified artifacts. Inference still requires the
     /// normal model loader and its execution checks.
@@ -435,7 +438,7 @@ impl EmbedderStack {
     pub fn verify_fast_semantic_identity_with_options(
         model_root: Option<&Path>,
         options: &DetectOptions,
-    ) -> SearchResult<(PathBuf, EmbeddingIdentityBundleV1)> {
+    ) -> SearchResult<(PathBuf, EmbeddingIdentityBundleV1, VerifiedModelArtifactsV1)> {
         let remote_env = RemoteIntentEnv::from_environment();
         resolve_remote_intent(*options, &remote_env)?;
         let registration = RegisteredModel2Vec::potion_128m()?;
@@ -443,8 +446,8 @@ impl EmbedderStack {
             if !missing_manifest_files(registration.download_manifest(), &candidate).is_empty() {
                 continue;
             }
-            if let Ok(identity) = registration.verify_identity(&candidate) {
-                return Ok((candidate, identity));
+            if let Ok((identity, verified)) = registration.verify_identity_for_replay(&candidate) {
+                return Ok((candidate, identity, verified));
             }
         }
 
