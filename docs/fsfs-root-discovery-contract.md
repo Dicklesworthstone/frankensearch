@@ -42,6 +42,12 @@ glob exclusions still match the full path; explicit root selection does not
 override those rules. Scope matching MUST use path components, reject parent
 traversal below the root, and preserve the existing symlink and mount guards.
 
+Root admission MUST resolve relative paths, `.` and `..` before checking the
+selected directory's own name. Watchers MUST keep the same resolved boundary
+for snapshots and absolute filesystem events, including overlapping roots.
+Normalization MUST preserve a final symlink for the existing no-follow check;
+it MUST NOT add filesystem resolution to each candidate evaluation.
+
 ## Deterministic Precedence Order
 
 Rule precedence MUST be applied in this exact order:

@@ -603,10 +603,20 @@ impl DiscoveryConfig {
             };
         }
 
-        // An explicitly selected root starts the component-exclusion scope.
-        // Its own name still participates; unrelated parents do not (#72).
-        let component_path = root.file_name().map_or(root, Path::new);
-        if self.matches_exclude_patterns(root, component_path) {
+        // Resolve alternate root spellings before inspecting the root's own
+        // name or full-path custom rules. A `child/..` suffix must not pull
+        // unrelated ancestors back into component-exclusion scope (#72).
+        let Ok(policy_root) = resolve_discovery_root(root) else {
+            reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
+            return RootDiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                reason_codes,
+            };
+        };
+        let component_path = policy_root
+            .file_name()
+            .map_or(policy_root.as_path(), Path::new);
+        if self.matches_exclude_patterns(&policy_root, component_path) {
             reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
             return RootDiscoveryDecision {
                 scope: DiscoveryScopeDecision::Exclude,
@@ -3704,6 +3714,25 @@ where
     f64::deserialize(deserializer)
 }
 
+/// Resolve a traversal boundary once, without erasing a final symlink that
+/// still needs to pass the walker's no-follow policy. `absolute` handles `.`
+/// but deliberately retains `..`; resolve those through the filesystem so a
+/// symlinked parent is not incorrectly reduced by lexical path normalization.
+pub(crate) fn resolve_discovery_root(root: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(root)?;
+    if !absolute
+        .components()
+        .any(|part| part == Component::ParentDir)
+    {
+        return Ok(absolute);
+    }
+    if let (Some(name), Some(parent)) = (absolute.file_name(), absolute.parent()) {
+        Ok(parent.canonicalize()?.join(name))
+    } else {
+        absolute.canonicalize()
+    }
+}
+
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
@@ -6703,6 +6732,52 @@ mod tests {
             crate::mount_info::FsCategory::Nfs,
         ] {
             assert!(!config.evaluate_root(root, Some(category)).include());
+        }
+    }
+
+    #[test]
+    fn discovery_scope_resolves_roots_spelled_with_parent_components() {
+        let temp = tempfile::tempdir().expect("scope fixture");
+        let config = super::DiscoveryConfig::default();
+        for name in ["build", "target"] {
+            let root = temp.path().join(name);
+            fs::create_dir_all(root.join("child")).expect("fixture directories");
+            assert!(!config.evaluate_root(&root.join("child/.."), None).include());
+            assert!(config.evaluate_root(&root.join("child"), None).include());
+            fs::create_dir_all(root.join("notes/child")).expect("nested fixture directories");
+            assert!(
+                config
+                    .evaluate_root(&root.join("notes/child/.."), None)
+                    .include()
+            );
+            assert!(
+                !config
+                    .evaluate_root(&root.join("missing/.."), None)
+                    .include()
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_scope_absolute_patterns_match_relative_root_spellings() {
+        let relative = Path::new("build/notes");
+        let absolute = std::path::absolute(relative).expect("absolute fixture path");
+        for pattern in [
+            absolute.display().to_string(),
+            absolute
+                .parent()
+                .unwrap()
+                .join("notes*")
+                .display()
+                .to_string(),
+        ] {
+            let config = super::DiscoveryConfig {
+                exclude_patterns: vec![pattern],
+                ..super::DiscoveryConfig::default()
+            };
+            for root in [relative, Path::new("./build/notes/"), absolute.as_path()] {
+                assert!(!config.evaluate_root(root, None).include(), "{root:?}");
+            }
         }
     }
 

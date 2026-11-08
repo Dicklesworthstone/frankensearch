@@ -9,7 +9,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use crate::catalog::{ReplayDecision, classify_replay_sequence};
-use crate::config::{DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision};
+use crate::config::{
+    DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision, resolve_discovery_root,
+};
 use crate::mount_info::ChangeDetectionStrategy;
 use crate::pressure::{DegradationStage, PressureState};
 use asupersync::Cx;
@@ -801,6 +803,7 @@ impl ObservedFileState {
 pub struct FsWatcher {
     config: FsWatcherConfig,
     discovery: DiscoveryConfig,
+    roots: Vec<PathBuf>,
     pending: HashMap<PathBuf, DebouncedWatchEvent>,
     stats: WatcherStats,
     running: bool,
@@ -809,9 +812,16 @@ pub struct FsWatcher {
 impl FsWatcher {
     #[must_use]
     pub fn new(config: FsWatcherConfig, discovery: DiscoveryConfig) -> Self {
+        let roots = discovery
+            .roots
+            .iter()
+            .map(PathBuf::from)
+            .map(|root| resolve_discovery_root(&root).unwrap_or(root))
+            .collect();
         Self {
             config: config.normalized(),
             discovery,
+            roots,
             pending: HashMap::new(),
             stats: WatcherStats::default(),
             running: false,
@@ -880,7 +890,15 @@ impl FsWatcher {
         }
 
         if !matches!(event.kind, WatchEventKind::Delete) {
-            let candidate = DiscoveryCandidate::new(event.path.as_path(), event.byte_len);
+            let mut candidate = DiscoveryCandidate::new(event.path.as_path(), event.byte_len);
+            if let Some(root) = self
+                .roots
+                .iter()
+                .filter(|root| event.path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+            {
+                candidate = candidate.with_root(root);
+            }
             let decision = self.discovery.evaluate_candidate(&candidate);
             if matches!(decision.scope, DiscoveryScopeDecision::Exclude)
                 || !decision.ingestion_class.is_indexed()
@@ -1514,6 +1532,90 @@ mod tests {
             assert_eq!(watcher.stats().files_skipped, 2);
 
             watcher.stop(&cx).await;
+        });
+    }
+
+    #[test]
+    fn watcher_scope_uses_configured_roots_before_debouncing() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let outer = temp.path().join("build/project");
+            let inner = outer.join("target/notes");
+            let excluded_root = temp.path().join("selected/target");
+            let mut discovery = DiscoveryConfig {
+                roots: [&outer, &inner, &excluded_root]
+                    .map(|root| root.to_string_lossy().into_owned())
+                    .to_vec(),
+                ..DiscoveryConfig::default()
+            };
+            discovery.exclude_patterns.push("private".to_owned());
+            discovery.roots.push(String::new());
+            let mut watcher = FsWatcher::new(FsWatcherConfig::default(), discovery);
+            watcher.start(&cx, 3).await.expect("watcher start");
+
+            let included = [outer.join("main.rs"), inner.join("nested/guide.md")];
+            let excluded = [
+                outer.join("target/generated.rs"),
+                inner.join("vendor/library.rs"),
+                inner.join("private/secret.md"),
+                outer.join("target/notes-other/secret.md"),
+                excluded_root.join("main.rs"),
+                inner.join("../escaped.md"),
+                temp.path().join("unselected/main.rs"),
+            ];
+            for path in &included {
+                assert_eq!(
+                    watcher.enqueue_event(WatchEvent::new(path, WatchEventKind::Modify, 100, 64)),
+                    "watcher.event.queued",
+                    "{path:?}"
+                );
+            }
+            for path in &excluded {
+                assert_eq!(
+                    watcher.enqueue_event(WatchEvent::new(path, WatchEventKind::Modify, 100, 64)),
+                    "watcher.skip.discovery_policy",
+                    "{path:?}"
+                );
+            }
+            let dispatch = watcher.flush_ready(601, PressureState::Normal, DegradationStage::Full);
+            assert_eq!(dispatch.actions.len(), included.len());
+            for path in &included {
+                assert!(dispatch.actions.iter().any(|action| &action.path == path));
+            }
+            assert_eq!(watcher.stats().files_skipped, excluded.len() as u64);
+        });
+    }
+
+    #[test]
+    fn watcher_scope_resolves_relative_configured_roots() {
+        run_test_with_cx(|cx| async move {
+            let relative_root = PathBuf::from("build/notes");
+            let absolute_root = std::env::current_dir()
+                .expect("current directory")
+                .join(&relative_root);
+            let discovery = DiscoveryConfig {
+                roots: vec!["./build/notes".to_owned()],
+                ..DiscoveryConfig::default()
+            };
+            let mut watcher = FsWatcher::new(FsWatcherConfig::default(), discovery);
+            watcher.start(&cx, 1).await.expect("watcher start");
+            let included = absolute_root.join("main.rs");
+            assert_eq!(
+                watcher.enqueue_event(WatchEvent::new(&included, WatchEventKind::Modify, 100, 64)),
+                "watcher.event.queued"
+            );
+            assert_eq!(
+                watcher.enqueue_event(WatchEvent::new(
+                    absolute_root.join("target/generated.rs"),
+                    WatchEventKind::Modify,
+                    100,
+                    64,
+                )),
+                "watcher.skip.discovery_policy"
+            );
+            let dispatch = watcher.flush_ready(601, PressureState::Normal, DegradationStage::Full);
+            assert_eq!(dispatch.actions.len(), 1);
+            assert_eq!(dispatch.actions[0].path, included);
         });
     }
 

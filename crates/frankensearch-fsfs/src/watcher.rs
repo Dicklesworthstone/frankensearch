@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{
     DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision, FsfsConfig, IngestionClass,
+    resolve_discovery_root,
 };
 use crate::mount_info::{FsCategory, MountTable, read_system_mounts};
 use crate::pressure::PressureState;
@@ -1500,6 +1501,14 @@ impl FsWatcher {
         discovery: DiscoveryConfig,
         ingest: Arc<dyn WatchIngestPipeline>,
     ) -> Self {
+        // Notify reports absolute paths. Resolve each selected boundary once
+        // while retaining a final symlink for the walker's no-follow check.
+        // An unresolved spelling cannot authorize removing ancestors from an
+        // unrelated absolute notification path.
+        let roots = roots
+            .into_iter()
+            .map(|root| resolve_discovery_root(&root).unwrap_or(root))
+            .collect();
         Self {
             roots,
             discovery,
@@ -5651,6 +5660,101 @@ mod tests {
                 normalize_file_key(&selected_file),
             ])
         );
+    }
+
+    #[test]
+    fn watcher_scope_resolves_relative_roots_for_absolute_events() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let temp = tempfile::Builder::new()
+            .prefix("fsfs-scope-")
+            .tempdir_in(&cwd)
+            .expect("temporary directory beneath cwd");
+        let root = temp.path().join("build/notes");
+        fs::create_dir_all(root.join("target")).expect("create fixture");
+        fs::create_dir(root.join(".git")).expect("isolate repository ignore rules");
+        fs::create_dir_all(temp.path().join("build/scratch")).expect("create path through parent");
+        let included = root.join("main.rs");
+        let excluded = root.join("target/generated.rs");
+        fs::write(&included, "fn main() {}\n").expect("write source");
+        fs::write(&excluded, "generated\n").expect("write generated source");
+        let relative_root = root.strip_prefix(&cwd).expect("relative root");
+        let discovery = DiscoveryConfig::default();
+        let events = super::map_notify_event(
+            Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )))
+            .add_path(included.clone())
+            .add_path(excluded),
+        );
+        for spelling in [
+            PathBuf::from(".").join(relative_root),
+            relative_root
+                .parent()
+                .expect("relative parent")
+                .join("scratch/../notes"),
+        ] {
+            let watcher = FsWatcher::new(
+                vec![spelling],
+                discovery.clone(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            assert_eq!(watcher.roots(), [root.clone()]);
+            let (snapshot, completeness) = watcher.collect_snapshot().expect("relative root scan");
+            assert!(completeness.is_complete());
+            assert_eq!(snapshot.keys().collect::<Vec<_>>(), [&included]);
+            let prepared = super::prepare_event_batch(&discovery, watcher.roots(), &events);
+            assert_eq!(prepared.skipped, 1);
+            assert!(matches!(
+                prepared.ops.as_slice(),
+                [WatchIngestOp::Upsert { file_key, .. }]
+                    if file_key == &normalize_file_key(&included)
+            ));
+        }
+    }
+
+    #[test]
+    fn watcher_scope_empty_root_cannot_admit_events() {
+        let discovery = DiscoveryConfig::default();
+        let watcher = FsWatcher::new(
+            vec![PathBuf::new()],
+            discovery.clone(),
+            Arc::new(NoopWatchIngestPipeline),
+        );
+        let events = [WatchEvent::modified("/unselected/main.rs", 100, Some(13))];
+        let prepared = super::prepare_event_batch(&discovery, watcher.roots(), &events);
+        assert_eq!(prepared.skipped, 1);
+        assert!(prepared.ops.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_scope_parent_resolution_preserves_root_symlink_policy() {
+        let temp = tempdir().expect("tempdir");
+        let parent = temp
+            .path()
+            .canonicalize()
+            .expect("canonical fixture parent");
+        let target = parent.join("target");
+        fs::create_dir(&target).expect("create target");
+        fs::write(target.join("lib.rs"), "fn main() {}\n").expect("write source");
+        fs::create_dir_all(parent.join("build/scratch")).expect("create path through parent");
+        let root = parent.join("build/linked-root");
+        std::os::unix::fs::symlink(&target, &root).expect("create root symlink");
+        for follow_symlinks in [false, true] {
+            let watcher = FsWatcher::new(
+                vec![parent.join("build/scratch/../linked-root")],
+                DiscoveryConfig {
+                    follow_symlinks,
+                    ..DiscoveryConfig::default()
+                },
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            assert_eq!(watcher.roots(), [root.clone()]);
+            let (snapshot, completeness) = watcher.collect_snapshot().expect("symlink root scan");
+            assert!(completeness.is_complete());
+            assert_eq!(snapshot.contains_key(&root.join("lib.rs")), follow_symlinks);
+            assert_eq!(snapshot.len(), usize::from(follow_symlinks));
+        }
     }
 
     /// A tree exercising every ignore source the index walk reads: an

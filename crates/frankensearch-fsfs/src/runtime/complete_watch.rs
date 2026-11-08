@@ -1377,10 +1377,13 @@ mod tests {
                 fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
                 let mut discovery = DiscoveryConfig::default();
                 discovery.exclude_patterns.push("private".to_owned());
+                let mut excluded_paths = Vec::new();
                 for excluded in &discovery.exclude_patterns {
                     let directory = root.join("nested").join(excluded);
                     fs::create_dir_all(&directory).unwrap();
-                    fs::write(directory.join("secret.md"), "excluded source").unwrap();
+                    let path = directory.join("secret.md");
+                    fs::write(&path, "excluded source").unwrap();
+                    excluded_paths.push(path);
                 }
                 let outside = temporary.path().join("outside.md");
                 fs::write(&outside, "outside the selected root").unwrap();
@@ -1393,6 +1396,29 @@ mod tests {
                 assert_eq!(
                     observed.classes[&included],
                     IngestionClass::FullSemanticLexical
+                );
+                assert_eq!(
+                    observed
+                        .directories
+                        .keys()
+                        .map(|path| path.strip_prefix(&source.path).unwrap())
+                        .collect::<Vec<_>>(),
+                    [Path::new(""), Path::new("nested"), Path::new("src")],
+                    "excluded descendant directories must be pruned: {ancestor}"
+                );
+                for path in excluded_paths {
+                    fs::write(path, "changed excluded source content").unwrap();
+                }
+                assert_eq!(
+                    source.observe(&cx, &discovery).unwrap(),
+                    observed,
+                    "excluded edits must not change the observation: {ancestor}"
+                );
+                fs::write(&included, "fn changed() {}\n").unwrap();
+                assert_ne!(
+                    source.observe(&cx, &discovery).unwrap(),
+                    observed,
+                    "{ancestor}"
                 );
                 assert_eq!(
                     fs::read_to_string(outside).unwrap(),

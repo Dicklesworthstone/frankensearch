@@ -231,6 +231,31 @@ fn discovery_cli_accepts_roots_and_temporary_stores_beneath_excluded_ancestors()
 }
 
 #[test]
+fn discovery_cli_accepts_relative_roots_beneath_excluded_ancestors() {
+    for ancestor in ["build", "target"] {
+        let outer = tempfile::tempdir().expect("outer fixture");
+        let temporary_parent = outer.path().join(ancestor);
+        fs::create_dir(&temporary_parent).unwrap();
+        let mut fixture = Fixture::with_source(
+            tempfile::tempdir_in(&temporary_parent).expect("temporary fixture below exclusion"),
+            "notes",
+        );
+        let excluded = fixture.source.join("vendor/nested");
+        fs::create_dir_all(&excluded).unwrap();
+        fs::write(
+            excluded.join("excluded.md"),
+            "sharedtoken excluded descendant",
+        )
+        .unwrap();
+
+        // The child starts in the fixture directory. The CLI-selected root is
+        // relative, and differs from the discovery roots in its config file.
+        fixture.source = PathBuf::from("./notes");
+        assert_only_selected_document_is_searchable(&fixture, None);
+    }
+}
+
+#[test]
 fn discovery_cli_scopes_custom_components_and_keeps_path_and_wildcard_exclusions() {
     let outer = tempfile::tempdir().expect("outer fixture");
     let temporary_parent = outer.path().join("private");

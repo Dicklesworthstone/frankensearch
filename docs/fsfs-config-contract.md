@@ -55,6 +55,14 @@ Path expansion rule:
 - `max_file_size_mb: int` (`1..1024`)
 - `follow_symlinks: bool`
 
+Bare component exclusions apply at and below the actual selected root. An
+ancestor named `build` does not reject `build/notes`, while a selected root
+named `build` and excluded descendants remain rejected. Custom path and glob
+exclusions retain their full-path behavior. Relative roots and roots containing
+`.` or `..` are resolved before root admission, and watchers reuse that boundary
+for absolute event paths. Normalization preserves final symlinks for the
+configured follow policy.
+
 Discovery skips hidden entries and applies the same ignore files as ripgrep:
 `.ignore` files, plus `.gitignore`, `.git/info/exclude` and the global Git
 excludes file inside a Git repository. Git rules are scoped the way Git scopes

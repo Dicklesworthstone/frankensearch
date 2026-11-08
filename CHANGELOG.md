@@ -1,5 +1,17 @@
 # Changelog
 
+### Unreleased — Complete discovery root handling (#72)
+
+- Normalize relative and parent-component discovery roots before admission and
+  watch registration, preserving the final symlink for the existing follow
+  policy. A `..` suffix no longer brings unrelated excluded ancestors back into
+  the selected root's scope; the root's own name remains subject to exclusions.
+- Carry the resolved root into orchestration events, keeping watcher admission
+  and utility scoring within the selected scope while retaining custom path
+  exclusions, descendant exclusions and mount restrictions.
+- Extend regressions for relative CLI roots, absolute watcher events and
+  complete-search startup beneath excluded temporary-directory ancestors.
+
 ### Unreleased — Signed installer and proxy qualification (2026-11-04)
 
 - Installer `--verify` authenticates the established `.minisig` release

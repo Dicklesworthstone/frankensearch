@@ -2458,7 +2458,10 @@ mod tests {
     use std::sync::Arc;
 
     fn fixture(parent: &Path) -> (FsfsRuntime, PathBuf, PathBuf) {
-        let source = parent.join("source");
+        fixture_with_source(parent, parent.join("source"))
+    }
+
+    fn fixture_with_source(parent: &Path, source: PathBuf) -> (FsfsRuntime, PathBuf, PathBuf) {
         let root = parent.join("store");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
@@ -3044,7 +3047,17 @@ mod tests {
 
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
-            let (runtime, _, root) = fixture(directory.path());
+            let excluded_ancestors = directory.path().join("build/target");
+            fs::create_dir_all(&excluded_ancestors).unwrap();
+            let temporary = tempfile::tempdir_in(&excluded_ancestors).unwrap();
+            let (runtime, source, root) =
+                fixture_with_source(directory.path(), temporary.path().join("source"));
+            fs::create_dir(source.join("target")).unwrap();
+            fs::write(
+                source.join("target/generated.md"),
+                "sharedtoken generated document",
+            )
+            .unwrap();
             publish(&runtime, &cx, &root).await;
             let socket = runtime.complete_generation_socket_path(&root).unwrap();
 
@@ -3114,11 +3127,15 @@ mod tests {
                 .await
                 .unwrap();
             let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
-            assert!(
+            assert_eq!(
                 envelope["data"]["hits"]
                     .as_array()
-                    .is_some_and(|hits| !hits.is_empty()),
-                "{envelope}"
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit["path"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["alpha.md"],
+                "ancestors must not hide the selected source; descendants remain excluded: {envelope}"
             );
             assert_eq!(
                 spawns.lock().unwrap().as_slice(),
