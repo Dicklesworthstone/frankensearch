@@ -33665,6 +33665,7 @@ mod tests {
                     );
                     let error = commit
                         .await
+                        .map(|_| ())
                         .expect_err("automatic maintenance failure is not swallowed");
                     assert!(matches!(
                         error,
