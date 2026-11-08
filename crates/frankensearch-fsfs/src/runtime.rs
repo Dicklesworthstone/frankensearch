@@ -24377,8 +24377,6 @@ impl FsfsRuntime {
         } else {
             self.resolve_fast_embedder()
         };
-        resources.fast_embedder_attempted = true;
-
         match resolved {
             Ok(embedder) => {
                 if let Some(index) = resources.vector_index.as_ref()
@@ -24389,6 +24387,7 @@ impl FsfsRuntime {
                     )
                 {
                     if Self::hash_control_can_degrade_to_lexical(resources) {
+                        resources.fast_embedder_attempted = true;
                         warn!(
                             error = %error,
                             "hash control generation is not an admissible semantic lane; continuing lexical-only"
@@ -24414,10 +24413,15 @@ impl FsfsRuntime {
                     self.admit_search_embedder(cx, embedder, WorkloadClass::Query)
                         .await?,
                 );
+                // Shared daemon resources survive this request. Only a
+                // completed admission is stable; a refused or cancelled
+                // attempt must let a later caller try the producer again.
+                resources.fast_embedder_attempted = true;
                 Ok(())
             }
             Err(error) => {
                 if Self::hash_control_can_degrade_to_lexical(resources) {
+                    resources.fast_embedder_attempted = true;
                     warn!(
                         error = %error,
                         "hash control generation has no admitted embedder; continuing lexical-only"
@@ -61263,6 +61267,96 @@ mod tests {
                 response.payloads.last().unwrap().phase,
                 SearchOutputPhase::Refined
             );
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn shared_search_retries_fast_admission_after_a_refused_provider() {
+        run_on_runtime_task(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = published_blend_resources(temp.path());
+            resources.fast_embedder = None;
+            resources.fast_embedder_attempted = false;
+            let generation = resources.generation_fingerprint.clone();
+            let shared = Arc::new(asupersync::sync::Mutex::new((
+                resources,
+                HashMap::new(),
+            )));
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.fast_only = true;
+            let runtime = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                })
+                .with_daemon_coalescers();
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": "why does semantic ranking find these files",
+                "mode": "full", "limit": 10, "rerank": false,
+            }))
+            .unwrap();
+            let options = super::SearchServeOptions {
+                hot_cache_enabled: true,
+                persist_explain_session: false,
+            };
+
+            super::set_test_fast_embedder(Some(Arc::new(BlendQueryEmbedder("foreign-fast-2"))));
+            let mut refused_phases = 0;
+            let refused = runtime
+                .execute_shared_search_serve_request_with_sink(
+                    &cx,
+                    request.clone(),
+                    Arc::clone(&shared),
+                    options,
+                    Some(&mut |frame| {
+                        if matches!(frame, super::SearchServeFrame::Phase { .. }) {
+                            refused_phases += 1;
+                        }
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                refused,
+                SearchError::UnverifiableRemoteSpace { .. }
+                    | SearchError::EmbedderUnavailable { .. }
+            ));
+            assert_eq!(refused_phases, 0, "a refused producer publishes no scores");
+
+            // Repair only the provider. The same daemon state, generation,
+            // request and policy must be able to admit a subsequent caller.
+            super::set_test_fast_embedder(Some(Arc::new(BlendQueryEmbedder("blend-fast-2"))));
+            let recovered = runtime
+                .execute_shared_search_serve_request_with_sink(
+                    &cx,
+                    request.clone(),
+                    Arc::clone(&shared),
+                    options,
+                    None,
+                )
+                .await
+                .expect("a refused admission must not poison later requests");
+            assert!(!recovered.cached);
+            assert!(recovered.payloads[0].hits.iter().any(|hit| {
+                hit.path == "a.rs" && hit.semantic_rank.is_some()
+            }));
+            assert_eq!(shared.try_lock_owned().unwrap().0.generation_fingerprint, generation);
+            let warm = runtime
+                .execute_shared_search_serve_request_with_sink(
+                    &cx,
+                    request,
+                    Arc::clone(&shared),
+                    options,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(warm.cached);
+            assert_eq!(warm.payloads, recovered.payloads);
         });
     }
 
