@@ -10182,8 +10182,7 @@ impl FsfsRuntime {
         let cached = if options.hot_cache_enabled
             && let Some(payloads) = hot_cache.get(&cache_key)
         {
-            match runtime
-                .admit_cached_search_producers(cx, resources, mode, payloads)
+            match Box::pin(runtime.admit_cached_search_producers(cx, resources, mode, payloads))
                 .await
             {
                 Ok(true) => true,
@@ -12507,9 +12506,13 @@ impl FsfsRuntime {
                             mode,
                         )
                         .await?;
-                    let replay = prepared
-                        .admit_cached_search_producers(cx, &mut resources, mode, &payloads)
-                        .await?;
+                    let replay = Box::pin(prepared.admit_cached_search_producers(
+                        cx,
+                        &mut resources,
+                        mode,
+                        &payloads,
+                    ))
+                    .await?;
                     admitted_resources = Some(resources);
                     replay
                 };
@@ -60400,6 +60403,7 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let index_root = temp.path().join("index");
             std::fs::create_dir_all(&index_root).expect("create index root");
+            let resources = disagreeing_blend_resources(&index_root);
 
             let mut config = FsfsConfig::default();
             config.storage.index_dir = index_root.display().to_string();
@@ -60418,7 +60422,7 @@ mod tests {
                 1,
                 vec![SearchHitPayload {
                     rank: 1,
-                    path: "src/lib.rs".to_owned(),
+                    path: "a.rs".to_owned(),
                     line: None,
                     score: 0.75,
                     snippet: Some("cached snippet".to_owned()),
@@ -60507,53 +60511,84 @@ mod tests {
                 .write_search_payload_cache(&key, &payloads, &cache_fingerprint)
                 .unwrap();
 
+            // A two-phase cache replay needs producers already admitted to
+            // these actual vector files. Cold CLI quality admission instead
+            // recomputes progressively so it cannot withhold Initial.
+            let cached = runtime
+                .try_load_search_payload_cache(&key, &cache_fingerprint)
+                .unwrap()
+                .expect("restored current-schema cache entry");
             let mut replayed = Vec::new();
             let replayed_payloads = {
                 let mut sink = |payload: &SearchPayload| {
                     replayed.push(payload.clone());
                     Ok(())
                 };
-                runtime
-                    .execute_search_payloads_cached_for_cli_with_phase_sink(
-                        &cx, "cache me", 25, &mut sink,
-                    )
-                    .await
-                    .expect("replay cached phases")
+                FsfsRuntime::replay_cached_search_payloads(
+                    &cx,
+                    &resources,
+                    SearchExecutionMode::Full,
+                    &cache_fingerprint,
+                    &cached,
+                    Some(&mut sink),
+                )
+                .expect("replay cached phases")
             };
             assert_eq!(replayed, payloads, "cache hit must replay each phase once");
             assert_eq!(replayed_payloads, payloads);
 
-            runtime
-                .persist_explain_session(
-                    &index_root,
-                    "previous completed query",
-                    SearchOutputPhase::Initial,
-                    &[],
-                )
+            // Also keep the production warm-server cache-hit path covered on
+            // builds that can serve Full mode. Lite retains the same bound
+            // phase replay above and the CLI cancellation test below.
+            #[cfg(feature = "semantic-support")]
+            {
+                let mut warm_resources = resources.clone();
+                let mut hot_cache = HashMap::from([(key.clone(), cached.clone())]);
+                let request = serde_json::from_value(serde_json::json!({
+                    "query": "cache me", "limit": 25, "mode": "full", "filter": "ext:rs",
+                }))
                 .unwrap();
-            let previous_context =
-                fs::read(index_root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap();
+                let mut streamed = Vec::new();
+                let response = runtime
+                    .execute_search_serve_request_with_sink(
+                        &cx,
+                        request,
+                        &mut warm_resources,
+                        &mut hot_cache,
+                        super::SearchServeOptions {
+                            hot_cache_enabled: true,
+                            persist_explain_session: false,
+                        },
+                        Some(&mut |frame| {
+                            if let super::SearchServeFrame::Phase { payload } = frame {
+                                streamed.push(*payload);
+                            }
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .expect("warm server replays the persisted admitted phases");
+                assert!(response.cached);
+                assert_eq!(response.payloads, payloads);
+                assert_eq!(streamed, payloads);
+            }
+
             let mut cancel_last_phase = |payload: &SearchPayload| {
                 if payload.phase == SearchOutputPhase::Refined {
                     cx.set_cancel_requested(true);
                 }
                 Ok(())
             };
-            let cancelled = runtime
-                .execute_search_payloads_cached_for_cli_with_phase_sink(
-                    &cx,
-                    "cache me",
-                    25,
-                    &mut cancel_last_phase,
-                )
-                .await;
+            let cancelled = FsfsRuntime::replay_cached_search_payloads(
+                &cx,
+                &resources,
+                SearchExecutionMode::Full,
+                &cache_fingerprint,
+                &cached,
+                Some(&mut cancel_last_phase),
+            );
             cx.set_cancel_requested(false);
             assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
-            assert_eq!(
-                fs::read(index_root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap(),
-                previous_context,
-                "cancelled cached delivery must preserve the prior explanation"
-            );
 
             let vector_dir = index_root.join("vector");
             std::fs::create_dir_all(&vector_dir).expect("create vector dir");
@@ -61340,7 +61375,7 @@ mod tests {
                                     phases.push(*payload);
                                     initial && !at_attestation
                                 }
-                                _ => false,
+                                super::SearchServeFrame::Terminal { .. } => false,
                             };
                             if change {
                                 if drift_fast {
@@ -61523,6 +61558,16 @@ mod tests {
             runtime
                 .write_search_payload_cache(&key, &payloads, &fingerprint)
                 .unwrap();
+            runtime
+                .persist_explain_session(
+                    temp.path(),
+                    "previous completed query",
+                    SearchOutputPhase::Initial,
+                    &[],
+                )
+                .unwrap();
+            let previous_context =
+                fs::read(temp.path().join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap();
             for cancelled_at_entry in [true, false] {
                 cx.set_cancel_requested(cancelled_at_entry);
                 let mut published = 0;
@@ -61545,6 +61590,11 @@ mod tests {
                 assert!(matches!(error, SearchError::Cancelled { .. }));
                 assert_eq!(published, usize::from(!cancelled_at_entry));
                 cx.set_cancel_requested(false);
+                assert_eq!(
+                    fs::read(temp.path().join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap(),
+                    previous_context,
+                    "cancelled cached delivery must preserve the prior explanation"
+                );
             }
         });
     }
