@@ -9,6 +9,7 @@ use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroUsize;
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,14 +80,14 @@ use crate::keeper::BenchmarkQuillDirectorySyncState;
 #[cfg(feature = "durability")]
 use crate::keeper::UnrepairableSegmentPolicy;
 use crate::keeper::{
-    BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, ConcatMergeSizing,
-    CurrentPointer, CurrentPointerError, GarbageCollectionOptions, GarbageCollectionReport,
-    KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout, LiveDocumentFloor,
-    MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
-    PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState, PublishIntent,
-    PublishedIdFilter, PublishedIdProbe, RecoveredSegment, TierMergePolicy, TierPolicyError,
-    TombstoneSet, inspect_lexical_layout, load_manifest_pair, plan_tier_merge_with_fit,
-    validate_manifest_successor,
+    BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, ConcatMergeRun,
+    ConcatMergeSizing, CurrentPointer, CurrentPointerError, GarbageCollectionOptions,
+    GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout,
+    LiveDocumentFloor, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats,
+    ManifestSegment, PrebuiltConcatMerge, PublicationAuthorityPhase, PublicationAuthorityState,
+    PublicationReadState, PublishIntent, PublishedIdFilter, PublishedIdProbe, RecoveredSegment,
+    TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout, load_manifest_pair,
+    plan_tier_merge_with_fit, validate_manifest_successor,
 };
 use crate::query::{
     BooleanClause, BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError,
@@ -9163,6 +9164,104 @@ impl QuillWriterState {
         output_segment_id: u64,
         created_unix_s: i64,
     ) -> Result<&KeeperSnapshot, QuillIndexError> {
+        self.concat_merge_reusing(
+            cx,
+            source_segment_ids,
+            output_segment_id,
+            created_unix_s,
+            None,
+        )
+        .await?;
+        self.authority_snapshot()
+    }
+
+    /// Apply `runs` in order, exactly as one [`Self::concat_merge`] call per
+    /// run would, while building up to `concurrency` runs' merged segments at
+    /// once.
+    ///
+    /// Each window of `concurrency` consecutive runs is built against the
+    /// current authority on scoped threads, then the runs are published one
+    /// by one in order through the one-run path. A run is published from its
+    /// prebuilt output only when it still names exactly the MANIFEST entries
+    /// that output was built from; otherwise (an invalid run, or one whose
+    /// sources include an earlier run's output) it is built afresh, so its
+    /// result or error is the one-run path's. Every published segment,
+    /// MANIFEST generation, seal sequence and error is therefore the serial
+    /// loop's. `concurrency` is capped by the available parallelism; peak
+    /// memory grows with it, by one run's merge buffers per run in flight.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::concat_merge`] for the first run that fails; the runs before
+    /// it stay published.
+    pub async fn concat_merge_runs(
+        &mut self,
+        cx: &Cx,
+        runs: &[ConcatMergeRun],
+        concurrency: NonZeroUsize,
+    ) -> Result<&KeeperSnapshot, QuillIndexError> {
+        self.concat_merge_runs_reusing(cx, runs, concurrency)
+            .await?;
+        self.authority_snapshot()
+    }
+
+    /// [`Self::concat_merge_runs`]; returns how many runs were published from
+    /// the output built ahead for them rather than built at their turn.
+    async fn concat_merge_runs_reusing(
+        &mut self,
+        cx: &Cx,
+        runs: &[ConcatMergeRun],
+        concurrency: NonZeroUsize,
+    ) -> Result<usize, QuillIndexError> {
+        let width = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(concurrency.get());
+        let mut reused_outputs = 0;
+        for window in runs.chunks(width) {
+            check_cancel(cx, "concat merge")?;
+            if self.has_uncommitted_changes() {
+                return Err(invalid_state(
+                    "concat merge requires a fully committed scalar index",
+                ));
+            }
+            let prebuilt = if window.len() > 1 {
+                let source_snapshot = match &mut self.backend {
+                    IndexBackend::Durable(writer) => writer.proven_snapshot(cx).await?,
+                    IndexBackend::Memory(snapshot) => snapshot.clone(),
+                };
+                let window_runs = window.to_vec();
+                spawn_blocking(move || source_snapshot.build_concat_merge_runs(&window_runs, width))
+                    .await
+            } else {
+                Vec::new()
+            };
+            let mut prebuilt = prebuilt.into_iter();
+            for run in window {
+                let reused = self
+                    .concat_merge_reusing(
+                        cx,
+                        &run.source_segment_ids,
+                        run.output_segment_id,
+                        run.created_unix_s,
+                        prebuilt.next().flatten(),
+                    )
+                    .await?;
+                reused_outputs += usize::from(reused);
+            }
+        }
+        Ok(reused_outputs)
+    }
+
+    /// One concat merge; `prebuilt` is published when it was built from
+    /// exactly this run's MANIFEST entries. Returns whether it was.
+    async fn concat_merge_reusing(
+        &mut self,
+        cx: &Cx,
+        source_segment_ids: &[u64],
+        output_segment_id: u64,
+        created_unix_s: i64,
+        prebuilt: Option<PrebuiltConcatMerge>,
+    ) -> Result<bool, QuillIndexError> {
         check_cancel(cx, "concat merge")?;
         if self.has_uncommitted_changes() {
             return Err(invalid_state(
@@ -9200,11 +9299,18 @@ impl QuillWriterState {
             .published_snapshot
             .prepare_equivalent_sealed_successor()?;
         Self::preflight_prepared_publication(&prepared_publication)?;
-        match &mut self.backend {
+        let reused_output = match &mut self.backend {
             IndexBackend::Durable(writer) => {
                 writer
-                    .concat_merge(cx, source_segment_ids, output_segment_id, created_unix_s)
-                    .await?;
+                    .concat_merge_reusing(
+                        cx,
+                        source_segment_ids,
+                        output_segment_id,
+                        created_unix_s,
+                        prebuilt,
+                    )
+                    .await?
+                    .1
             }
             IndexBackend::Memory(snapshot) => {
                 check_cancel(cx, "concat merge")?;
@@ -9214,24 +9320,26 @@ impl QuillWriterState {
                     .try_reserve_exact(source_segment_ids.len())
                     .map_err(|_| invalid_state("could not allocate concat-merge source ids"))?;
                 source_ids.extend_from_slice(source_segment_ids);
-                let successor = spawn_blocking(move || {
-                    source_snapshot.concat_merge_owned(
+                let (successor, reused_output) = spawn_blocking(move || {
+                    source_snapshot.concat_merge_owned_reusing(
                         &source_ids,
                         output_segment_id,
                         created_unix_s,
+                        prebuilt,
                     )
                 })
                 .await?;
                 check_cancel(cx, "concat merge")?;
                 *snapshot = successor;
+                reused_output
             }
-        }
+        };
         let authority = Arc::new(self.proven_authority_snapshot()?.clone());
         SnapshotPublisher::validate_prepared_sealed(authority.as_ref(), &prepared_publication)?;
         self.reader
             .install_validated_prepared_sealed(authority, prepared_publication)?;
         self.next_seal_seq = next_seal_seq;
-        self.authority_snapshot()
+        Ok(reused_output)
     }
 
     fn retire_ingest_leases(&mut self) -> Result<(), QuillIndexError> {
@@ -13640,6 +13748,35 @@ impl QuillIndex {
         writer
             .concat_merge(cx, source_segment_ids, output_segment_id, created_unix_s)
             .await?;
+        drop(writer);
+        self.snapshot()
+    }
+
+    /// Apply several concat merges in order under one writer lock, building
+    /// up to `concurrency` of their merged segments at once.
+    ///
+    /// Every publication, segment byte, MANIFEST generation, seal sequence and
+    /// error is the one a [`Self::concat_merge`] call per run, in order, would
+    /// produce: runs are published one at a time in order, and a run whose
+    /// output could not be built ahead of time (or whose sources changed since)
+    /// is built afresh at its turn. Disjoint runs, such as a capped fold plan,
+    /// all build ahead. [`DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY`] is a sane
+    /// default; peak memory grows by one run's merge buffers per run in flight.
+    ///
+    /// [`DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY`]: crate::keeper::DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::concat_merge`] for the first run that fails; the runs before
+    /// it stay published.
+    pub async fn concat_merge_runs(
+        &self,
+        cx: &Cx,
+        runs: &[ConcatMergeRun],
+        concurrency: NonZeroUsize,
+    ) -> Result<Arc<KeeperSnapshot>, QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "concat merge writer lock").await?;
+        writer.concat_merge_runs(cx, runs, concurrency).await?;
         drop(writer);
         self.snapshot()
     }
@@ -39418,6 +39555,324 @@ mod tests {
             assert_eq!(direct_results, results_before);
             assert_eq!(left_results, results_before);
             assert_eq!(right_results, results_before);
+        });
+    }
+
+    const CONCAT_MERGE_RUNS_LEAVES: usize = 12;
+    const CONCAT_MERGE_RUNS_OUTPUT_BASE: u64 = 0x2a1e_0000_0000_0000;
+
+    /// Deterministic, with no same-tier merge: the eighth leaf commit would
+    /// otherwise fold the leaves before the runs see them.
+    fn concat_merge_runs_config() -> QuillConfig {
+        QuillConfig {
+            tier_fanout: usize::MAX,
+            ..deterministic_config()
+        }
+    }
+
+    /// Seal one segment per document, `CONCAT_MERGE_RUNS_LEAVES` of them.
+    async fn seal_concat_merge_runs_leaves(cx: &Cx, index: &QuillIndex) {
+        for leaf in 0..CONCAT_MERGE_RUNS_LEAVES {
+            let topic = if leaf % 2 == 0 { "python" } else { "ownership" };
+            let document = IndexableDocument::new(
+                format!("runs-{leaf:02}"),
+                format!("rust {topic} shared leaf{leaf}"),
+            )
+            .with_metadata("leaf", leaf.to_string());
+            index
+                .index_documents(cx, std::slice::from_ref(&document))
+                .await
+                .expect("stage a concat-merge-runs leaf");
+            index
+                .commit(cx)
+                .await
+                .expect("seal a concat-merge-runs leaf");
+        }
+        assert_eq!(
+            committed_segment_ids(index).len(),
+            CONCAT_MERGE_RUNS_LEAVES,
+            "each commit seals one leaf segment"
+        );
+    }
+
+    fn concat_merge_runs_run(sources: Vec<u64>, offset: u64) -> ConcatMergeRun {
+        ConcatMergeRun {
+            source_segment_ids: sources,
+            output_segment_id: CONCAT_MERGE_RUNS_OUTPUT_BASE + offset,
+            created_unix_s: 1_700_000_100 + i64::try_from(offset).expect("run offset"),
+        }
+    }
+
+    /// Two disjoint runs (the first later in the MANIFEST than the second), a
+    /// run over the second run's output, and one more disjoint run.
+    fn concat_merge_runs_plan(leaves: &[u64]) -> Vec<ConcatMergeRun> {
+        let plan = vec![
+            concat_merge_runs_run(leaves[8..11].to_vec(), 0),
+            concat_merge_runs_run(leaves[0..2].to_vec(), 1),
+            concat_merge_runs_run(vec![CONCAT_MERGE_RUNS_OUTPUT_BASE + 1, leaves[2]], 2),
+            concat_merge_runs_run(leaves[4..7].to_vec(), 3),
+        ];
+        assert!(
+            plan.iter()
+                .all(|run| !leaves.contains(&run.output_segment_id)),
+            "fixed output ids must not collide with the leaves"
+        );
+        plan
+    }
+
+    /// Runs the plan publishes from outputs built ahead, at an effective
+    /// window `width`: a run is built ahead only in a window of two or more,
+    /// and the run over run 1's output only when run 1 is in an earlier window.
+    fn concat_merge_runs_expected_reuse(width: usize) -> usize {
+        match width {
+            0 | 1 => 0,
+            2 => 4,
+            3 => 2,
+            _ => 3,
+        }
+    }
+
+    type ConcatMergeRunsState = (Manifest, Vec<Vec<u8>>, Vec<QuillSearchResult>);
+
+    /// The MANIFEST (wall-clock publish time cleared), every segment's
+    /// complete bytes in MANIFEST order, and the fixture query results.
+    fn concat_merge_runs_state(index: &QuillIndex, cx: &Cx) -> ConcatMergeRunsState {
+        let snapshot = index
+            .snapshot()
+            .expect("concat-merge-runs snapshot is authoritative");
+        let mut manifest = snapshot.loaded_manifest().manifest.clone();
+        manifest.last_publish_unix_s = 0;
+        let bytes = snapshot
+            .segments()
+            .iter()
+            .map(|segment| segment.source_bytes().to_vec())
+            .collect();
+        (manifest, bytes, concat_merge_query_results(index, cx))
+    }
+
+    /// Seal one more document, which exercises the writer's own seal sequence
+    /// and lease state after the fold.
+    async fn seal_after_concat_merge_runs(cx: &Cx, index: &QuillIndex) {
+        index
+            .index_documents(
+                cx,
+                &[IndexableDocument::new(
+                    "runs-after",
+                    "rust python after fold",
+                )],
+            )
+            .await
+            .expect("stage a document after the fold");
+        index.commit(cx).await.expect("seal after the fold");
+    }
+
+    async fn serial_concat_merge_runs(
+        cx: &Cx,
+        index: &QuillIndex,
+        plan: &[ConcatMergeRun],
+    ) -> Result<(), QuillIndexError> {
+        for run in plan {
+            index
+                .concat_merge(
+                    cx,
+                    &run.source_segment_ids,
+                    run.output_segment_id,
+                    run.created_unix_s,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concat_merge_runs_publishes_exactly_what_one_concat_merge_per_run_does() {
+        run_with_cx(|cx| async move {
+            let serial = QuillIndex::in_memory(concat_merge_runs_config()).expect("serial index");
+            seal_concat_merge_runs_leaves(&cx, &serial).await;
+            let leaves = committed_segment_ids(&serial);
+            let plan = concat_merge_runs_plan(&leaves);
+            serial_concat_merge_runs(&cx, &serial, &plan)
+                .await
+                .expect("serial concat merges");
+            let folded = concat_merge_runs_state(&serial, &cx);
+            assert_eq!(folded.0.segments.len(), 6, "four runs fold ten leaves");
+            seal_after_concat_merge_runs(&cx, &serial).await;
+            let sealed = concat_merge_runs_state(&serial, &cx);
+
+            let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+            for concurrency in [1, 2, 3, 4, 8] {
+                let candidate =
+                    QuillIndex::in_memory(concat_merge_runs_config()).expect("candidate index");
+                seal_concat_merge_runs_leaves(&cx, &candidate).await;
+                assert_eq!(committed_segment_ids(&candidate), leaves);
+                let concurrency = NonZeroUsize::new(concurrency).expect("nonzero concurrency");
+                let mut writer = candidate
+                    .lock_writer(&cx, "concat merge runs test writer lock")
+                    .await
+                    .expect("candidate writer");
+                let reused = writer
+                    .concat_merge_runs_reusing(&cx, &plan, concurrency)
+                    .await
+                    .expect("concat merge runs");
+                drop(writer);
+                assert_eq!(
+                    reused,
+                    concat_merge_runs_expected_reuse(parallelism.min(concurrency.get())),
+                    "concurrency {concurrency}: runs published from their prebuilt outputs"
+                );
+                assert!(
+                    concat_merge_runs_state(&candidate, &cx) == folded,
+                    "concurrency {concurrency}: the fold must equal one concat merge per run"
+                );
+                seal_after_concat_merge_runs(&cx, &candidate).await;
+                assert!(
+                    concat_merge_runs_state(&candidate, &cx) == sealed,
+                    "concurrency {concurrency}: the next seal must equal the serial writer's"
+                );
+            }
+
+            let public = QuillIndex::in_memory(concat_merge_runs_config()).expect("public index");
+            seal_concat_merge_runs_leaves(&cx, &public).await;
+            let returned = public
+                .concat_merge_runs(
+                    &cx,
+                    &plan,
+                    crate::keeper::DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY,
+                )
+                .await
+                .expect("public concat merge runs");
+            assert_eq!(
+                returned.loaded_manifest().manifest.generation,
+                folded.0.generation
+            );
+            assert!(
+                concat_merge_runs_state(&public, &cx) == folded,
+                "the public batch at the default concurrency must equal the serial fold"
+            );
+        });
+    }
+
+    #[test]
+    fn concat_merge_runs_stops_at_the_first_failing_run_like_the_serial_loop() {
+        run_with_cx(|cx| async move {
+            let serial = QuillIndex::in_memory(concat_merge_runs_config()).expect("serial index");
+            seal_concat_merge_runs_leaves(&cx, &serial).await;
+            let leaves = committed_segment_ids(&serial);
+            let plan = vec![
+                concat_merge_runs_run(leaves[0..2].to_vec(), 0),
+                // Skips leaf 4: not one uninterrupted MANIFEST slice.
+                concat_merge_runs_run(vec![leaves[3], leaves[5]], 1),
+                concat_merge_runs_run(leaves[8..10].to_vec(), 2),
+            ];
+            let Err(serial_error) = serial_concat_merge_runs(&cx, &serial, &plan).await else {
+                panic!("the skipped run unexpectedly published"); // ubs:ignore -- Test requires the serial loop to fail.
+            };
+            assert!(matches!(
+                serial_error,
+                QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                    source: ConcatMergeError::NonConsecutiveSources { position: 1, .. }
+                })
+            ));
+            let expected = concat_merge_runs_state(&serial, &cx);
+            assert_eq!(
+                expected.0.segments.len(),
+                CONCAT_MERGE_RUNS_LEAVES - 1,
+                "only the run before the failure is published"
+            );
+            for concurrency in [2, 4] {
+                let candidate =
+                    QuillIndex::in_memory(concat_merge_runs_config()).expect("candidate index");
+                seal_concat_merge_runs_leaves(&cx, &candidate).await;
+                let concurrency = NonZeroUsize::new(concurrency).expect("nonzero concurrency");
+                let Err(error) = candidate.concat_merge_runs(&cx, &plan, concurrency).await else {
+                    panic!("concat merge runs published past the skipped run"); // ubs:ignore -- Test requires the batch to fail.
+                };
+                assert_eq!(
+                    format!("{error:?}"),
+                    format!("{serial_error:?}"),
+                    "concurrency {concurrency}: the serial loop's error"
+                );
+                assert!(
+                    concat_merge_runs_state(&candidate, &cx) == expected,
+                    "concurrency {concurrency}: the serial loop's publications and no more"
+                );
+            }
+        });
+    }
+
+    fn copy_closed_index(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("copy target directory");
+        for entry in std::fs::read_dir(from).expect("read the closed index") {
+            let entry = entry.expect("closed index entry");
+            let kind = entry.file_type().expect("closed index entry type");
+            if kind.is_dir() {
+                copy_closed_index(&entry.path(), &to.join(entry.file_name()));
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name()))
+                    .expect("copy a closed index file");
+            }
+        }
+    }
+
+    #[test]
+    fn durable_concat_merge_runs_publishes_exactly_what_one_concat_merge_per_run_does() {
+        run_with_cx(|cx| async move {
+            let root = tempfile::tempdir().expect("index root");
+            let template = root.path().join("template");
+            let template_index = QuillIndex::create(&cx, &template, concat_merge_runs_config())
+                .await
+                .expect("create the durable fixture");
+            seal_concat_merge_runs_leaves(&cx, &template_index).await;
+            let leaves = committed_segment_ids(&template_index);
+            drop(template_index);
+            let plan = concat_merge_runs_plan(&leaves);
+
+            copy_closed_index(&template, &root.path().join("serial"));
+            let serial =
+                QuillIndex::open(&cx, root.path().join("serial"), concat_merge_runs_config())
+                    .await
+                    .expect("open the serial copy");
+            serial_concat_merge_runs(&cx, &serial, &plan)
+                .await
+                .expect("serial durable concat merges");
+            let folded = concat_merge_runs_state(&serial, &cx);
+            assert_eq!(folded.0.segments.len(), 6, "four runs fold ten leaves");
+
+            let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+            for concurrency in [2, 4] {
+                let directory = root.path().join(format!("candidate-{concurrency}"));
+                copy_closed_index(&template, &directory);
+                let candidate = QuillIndex::open(&cx, &directory, concat_merge_runs_config())
+                    .await
+                    .expect("open the candidate copy");
+                let concurrency = NonZeroUsize::new(concurrency).expect("nonzero concurrency");
+                let mut writer = candidate
+                    .lock_writer(&cx, "durable concat merge runs test writer lock")
+                    .await
+                    .expect("candidate writer");
+                let reused = writer
+                    .concat_merge_runs_reusing(&cx, &plan, concurrency)
+                    .await
+                    .expect("durable concat merge runs");
+                drop(writer);
+                assert_eq!(
+                    reused,
+                    concat_merge_runs_expected_reuse(parallelism.min(concurrency.get())),
+                    "concurrency {concurrency}: runs published from their prebuilt outputs"
+                );
+                assert!(
+                    concat_merge_runs_state(&candidate, &cx) == folded,
+                    "concurrency {concurrency}: the durable fold must equal the serial one"
+                );
+                drop(candidate);
+                let reopened = QuillIndex::open(&cx, &directory, concat_merge_runs_config())
+                    .await
+                    .expect("reopen the candidate");
+                assert!(
+                    concat_merge_runs_state(&reopened, &cx) == folded,
+                    "concurrency {concurrency}: the durable fold must survive reopen"
+                );
+            }
         });
     }
 

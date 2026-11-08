@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "bench-internals")]
@@ -4323,15 +4324,111 @@ impl KeeperSnapshot {
         output_segment_id: u64,
         created_unix_s: i64,
     ) -> Result<Self, KeeperError> {
-        let artifact =
-            build_concat_merge(self, source_segment_ids, output_segment_id, created_unix_s)?;
+        self.concat_merge_owned_reusing(source_segment_ids, output_segment_id, created_unix_s, None)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// [`Self::concat_merge_owned`], publishing `prebuilt` when it was built
+    /// from exactly this run's MANIFEST entries instead of building again.
+    /// The flag is whether `prebuilt` was the output published.
+    pub(crate) fn concat_merge_owned_reusing(
+        &self,
+        source_segment_ids: &[u64],
+        output_segment_id: u64,
+        created_unix_s: i64,
+        prebuilt: Option<PrebuiltConcatMerge>,
+    ) -> Result<(Self, bool), KeeperError> {
+        let reused = prebuilt.and_then(|prebuilt| {
+            reuse_prebuilt_concat_merge(
+                self,
+                source_segment_ids,
+                output_segment_id,
+                created_unix_s,
+                prebuilt,
+            )
+        });
+        let reused_output = reused.is_some();
+        let artifact = match reused {
+            Some(artifact) => artifact,
+            None => {
+                build_concat_merge(self, source_segment_ids, output_segment_id, created_unix_s)?
+            }
+        };
         // A merge rewrites rows; it never removes a live one, so it is held to
         // the live-document floor like any other additive publication.
-        self.publish_owned_segments_with_intent(
+        let snapshot = self.publish_owned_segments_with_intent(
             &artifact.manifest,
             vec![artifact.encoded],
             PublishIntent::PreserveLiveDocuments,
-        )
+        )?;
+        Ok((snapshot, reused_output))
+    }
+
+    /// Build the merged segment of every run against this snapshot, at most
+    /// `concurrency` at once, without publishing any of them.
+    ///
+    /// Slot `i` holds run `i`'s output, or `None` when it cannot be built
+    /// here (an invalid run, or one whose sources are an earlier run's
+    /// output); publication then builds that run afresh, which reports the
+    /// one-run path's error. Scoped OS threads are used rather than the rayon
+    /// pool, as in segment open, so a caller holding the writer never waits on
+    /// or steals unrelated pool work; if a helper cannot be spawned the
+    /// calling thread builds the remaining runs itself.
+    pub(crate) fn build_concat_merge_runs(
+        &self,
+        runs: &[ConcatMergeRun],
+        concurrency: usize,
+    ) -> Vec<Option<PrebuiltConcatMerge>> {
+        let build = |run: &ConcatMergeRun| {
+            let (start, end) =
+                locate_concat_sources(self, &run.source_segment_ids, run.output_segment_id).ok()?;
+            let sources = self.loaded.manifest.segments.get(start..end)?.to_vec();
+            let output = encode_concat_merge(
+                self,
+                &run.source_segment_ids,
+                start..end,
+                run.output_segment_id,
+                run.created_unix_s,
+            )
+            .ok()?;
+            Some(PrebuiltConcatMerge {
+                sources,
+                created_unix_s: run.created_unix_s,
+                output,
+            })
+        };
+        let workers = concurrency.min(runs.len());
+        if workers <= 1 {
+            return runs.iter().map(build).collect();
+        }
+        let slots: Vec<OnceLock<Option<PrebuiltConcatMerge>>> =
+            runs.iter().map(|_| OnceLock::new()).collect();
+        let next = AtomicUsize::new(0);
+        let work = || {
+            loop {
+                let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                let Some(run) = runs.get(index) else {
+                    break;
+                };
+                let _ = slots[index].set(build(run));
+            }
+        };
+        std::thread::scope(|scope| {
+            for _ in 1..workers {
+                if std::thread::Builder::new()
+                    .name("quill-concat-merge".to_owned())
+                    .spawn_scoped(scope, work)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            work();
+        });
+        slots
+            .into_iter()
+            .map(|slot| slot.into_inner().flatten())
+            .collect()
     }
 
     /// Fold every segment above `policy` into a new immutable snapshot.
@@ -6235,25 +6332,68 @@ impl KeeperWriter {
         output_segment_id: u64,
         created_unix_s: i64,
     ) -> Result<&KeeperSnapshot, KeeperError> {
+        self.concat_merge_reusing(
+            cx,
+            source_segment_ids,
+            output_segment_id,
+            created_unix_s,
+            None,
+        )
+        .await
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    /// The proven authority snapshot: any abandoned publication reconciled
+    /// first, as [`Self::concat_merge`] does before it plans.
+    pub(crate) async fn proven_snapshot(&mut self, cx: &Cx) -> Result<KeeperSnapshot, KeeperError> {
+        self.reconcile_pending_publication(cx).await?;
+        Ok(self.snapshot.clone())
+    }
+
+    /// [`Self::concat_merge`], publishing `prebuilt` when it was built from
+    /// exactly this run's MANIFEST entries instead of building again. The
+    /// flag is whether `prebuilt` was the output published.
+    pub(crate) async fn concat_merge_reusing(
+        &mut self,
+        cx: &Cx,
+        source_segment_ids: &[u64],
+        output_segment_id: u64,
+        created_unix_s: i64,
+        prebuilt: Option<PrebuiltConcatMerge>,
+    ) -> Result<(&KeeperSnapshot, bool), KeeperError> {
         if cx.is_cancel_requested() {
             return Err(ConcatMergeError::Cancelled.into());
         }
         // Plan against proven authority: an abandoned publication may have
         // advanced disk past the retained snapshot these source ids name.
         self.reconcile_pending_publication(cx).await?;
-        let mut source_ids = Vec::new();
-        source_ids
-            .try_reserve_exact(source_segment_ids.len())
-            .map_err(|_| ConcatMergeError::Allocation {
-                resource: "source ids",
-                count: source_segment_ids.len(),
-            })?;
-        source_ids.extend_from_slice(source_segment_ids);
-        let snapshot = self.snapshot.clone();
-        let artifact = spawn_blocking(move || {
-            build_concat_merge(&snapshot, &source_ids, output_segment_id, created_unix_s)
-        })
-        .await?;
+        let reused = prebuilt.and_then(|prebuilt| {
+            reuse_prebuilt_concat_merge(
+                &self.snapshot,
+                source_segment_ids,
+                output_segment_id,
+                created_unix_s,
+                prebuilt,
+            )
+        });
+        let reused_output = reused.is_some();
+        let artifact = if let Some(artifact) = reused {
+            artifact
+        } else {
+            let mut source_ids = Vec::new();
+            source_ids
+                .try_reserve_exact(source_segment_ids.len())
+                .map_err(|_| ConcatMergeError::Allocation {
+                    resource: "source ids",
+                    count: source_segment_ids.len(),
+                })?;
+            source_ids.extend_from_slice(source_segment_ids);
+            let snapshot = self.snapshot.clone();
+            spawn_blocking(move || {
+                build_concat_merge(&snapshot, &source_ids, output_segment_id, created_unix_s)
+            })
+            .await?
+        };
         if cx.is_cancel_requested() {
             return Err(ConcatMergeError::Cancelled.into());
         }
@@ -6274,6 +6414,7 @@ impl KeeperWriter {
         // the live-document floor like any other additive publication.
         self.publish_with_intent(cx, &manifest, PublishIntent::PreserveLiveDocuments)
             .await
+            .map(|snapshot| (snapshot, reused_output))
     }
 
     /// Rewrite every segment above the selected tombstone-density threshold.
@@ -6407,6 +6548,43 @@ struct ConcatMergeArtifact {
     encoded: EncodedSegment,
     manifest: Manifest,
 }
+
+/// A verified concat-merge output and the replacement entry's fields that
+/// come from its sources; the seal sequence and the successor MANIFEST come
+/// from the snapshot it is published against.
+struct ConcatMergeOutput {
+    encoded: EncodedSegment,
+    segment_id: u64,
+    docid_lo: u64,
+    docid_hi: u64,
+    doc_count: u32,
+    tombstones: TombstoneSet,
+}
+
+/// A concat-merge output built before its publication, with the exact
+/// MANIFEST entries it was built from.
+pub(crate) struct PrebuiltConcatMerge {
+    sources: Vec<ManifestSegment>,
+    created_unix_s: i64,
+    output: ConcatMergeOutput,
+}
+
+/// One concat merge for [`crate::QuillIndex::concat_merge_runs`]: the
+/// arguments of one [`crate::QuillIndex::concat_merge`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcatMergeRun {
+    /// Source segment ids, one uninterrupted MANIFEST slice in order.
+    pub source_segment_ids: Vec<u64>,
+    /// Collision-free id of the merged segment.
+    pub output_segment_id: u64,
+    /// Creation time recorded in the merged segment's header.
+    pub created_unix_s: i64,
+}
+
+/// Default number of runs [`crate::QuillIndex::concat_merge_runs`] builds at
+/// once. Each run in flight holds its merged output and the section buffers
+/// it is assembled from, so peak memory grows with this.
+pub const DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 struct CompactionArtifact {
     encoded: Vec<EncodedSegment>,
@@ -7516,6 +7694,53 @@ fn build_concat_merge(
     output_segment_id: u64,
     created_unix_s: i64,
 ) -> Result<ConcatMergeArtifact, ConcatMergeError> {
+    let (start, end) = locate_concat_sources(snapshot, source_segment_ids, output_segment_id)?;
+    let output = encode_concat_merge(
+        snapshot,
+        source_segment_ids,
+        start..end,
+        output_segment_id,
+        created_unix_s,
+    )?;
+    concat_merge_artifact(snapshot, start..end, output)
+}
+
+/// The artifact [`build_concat_merge`] would return for this run against
+/// `snapshot`, made from an output built against an earlier snapshot.
+///
+/// `None` unless the run still names exactly the MANIFEST entries (ids,
+/// lengths, hashes, docid ranges, counts, tombstones) the output was built
+/// from, with the same output id and creation time, and the successor can be
+/// formed. The output's bytes depend only on those entries' segments, the
+/// schema, the output id and the creation time, so it is then the output a
+/// build against `snapshot` would produce. On `None` the caller builds the run
+/// afresh, exactly as the one-run path does, which also reports its error.
+fn reuse_prebuilt_concat_merge(
+    snapshot: &KeeperSnapshot,
+    source_segment_ids: &[u64],
+    output_segment_id: u64,
+    created_unix_s: i64,
+    prebuilt: PrebuiltConcatMerge,
+) -> Option<ConcatMergeArtifact> {
+    if prebuilt.output.segment_id != output_segment_id || prebuilt.created_unix_s != created_unix_s
+    {
+        return None;
+    }
+    let (start, end) =
+        locate_concat_sources(snapshot, source_segment_ids, output_segment_id).ok()?;
+    if snapshot.loaded.manifest.segments.get(start..end)? != prebuilt.sources.as_slice() {
+        return None;
+    }
+    concat_merge_artifact(snapshot, start..end, prebuilt.output).ok()
+}
+
+/// Locate `source_segment_ids` as one uninterrupted slice of the MANIFEST
+/// and refuse an output id the snapshot already uses.
+fn locate_concat_sources(
+    snapshot: &KeeperSnapshot,
+    source_segment_ids: &[u64],
+    output_segment_id: u64,
+) -> Result<(usize, usize), ConcatMergeError> {
     if source_segment_ids.len() < 2 {
         return Err(ConcatMergeError::TooFewSources {
             count: source_segment_ids.len(),
@@ -7576,9 +7801,22 @@ fn build_concat_merge(
             field: "source manifest slice end",
         },
     )?;
+    Ok((start, end))
+}
+
+/// Build and verify the merged FSLX segment for the located MANIFEST slice.
+fn encode_concat_merge(
+    snapshot: &KeeperSnapshot,
+    source_segment_ids: &[u64],
+    slice: Range<usize>,
+    output_segment_id: u64,
+    created_unix_s: i64,
+) -> Result<ConcatMergeOutput, ConcatMergeError> {
+    let first_id = source_segment_ids[0];
     let selected =
-        segments
-            .get(start..end)
+        snapshot
+            .segments()
+            .get(slice)
             .ok_or_else(|| ConcatMergeError::SourceRunPastManifest {
                 position: source_segment_ids.len(),
                 actual: *source_segment_ids.last().unwrap_or(&first_id),
@@ -7896,7 +8134,30 @@ fn build_concat_merge(
     reader
         .verify()
         .map_err(|source| ConcatMergeError::Segment { source })?;
+    Ok(ConcatMergeOutput {
+        encoded,
+        segment_id: output_segment_id,
+        docid_lo,
+        docid_hi,
+        doc_count,
+        tombstones,
+    })
+}
 
+/// Pair `output` with the successor MANIFEST that replaces `sources` with it.
+fn concat_merge_artifact(
+    snapshot: &KeeperSnapshot,
+    sources: Range<usize>,
+    output: ConcatMergeOutput,
+) -> Result<ConcatMergeArtifact, ConcatMergeError> {
+    let ConcatMergeOutput {
+        encoded,
+        segment_id,
+        docid_lo,
+        docid_hi,
+        doc_count,
+        tombstones,
+    } = output;
     let next_seal_seq = snapshot
         .loaded
         .manifest
@@ -7910,7 +8171,7 @@ fn build_concat_merge(
             field: "seal sequence",
         })?;
     let replacement = ManifestSegment {
-        segment_id: output_segment_id,
+        segment_id,
         seal_seq: next_seal_seq,
         file_len: encoded.file_len(),
         file_xxh3: encoded.file_xxh3(),
@@ -7929,7 +8190,7 @@ fn build_concat_merge(
             })?;
     manifest.engine_version = CURRENT_ENGINE_VERSION;
     manifest.last_publish_unix_s = 0;
-    manifest.segments.splice(start..end, [replacement]);
+    manifest.segments.splice(sources, [replacement]);
     manifest
         .validate()
         .map_err(|error| ConcatMergeError::InvalidManifest {

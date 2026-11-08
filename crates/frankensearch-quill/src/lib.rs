@@ -73,17 +73,17 @@ pub use index::{
 pub use keeper::UnrepairableSegmentPolicy;
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
-    CompactionError, CompactionPolicy, CompactionReport, ConcatMergeError, CurrentPointer,
-    CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES,
-    EXACT_LEXICAL_SNAPSHOT_IMAGE_DOMAIN, ExactLexicalSnapshotDescriptor, ExactLexicalSnapshotImage,
-    GarbageCollectionOptions, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
-    LexicalLayout, LoadedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1,
-    MANIFEST_MAGIC, Manifest, ManifestCodecError, ManifestFieldStats, ManifestSegment,
-    ManifestSource, PublishIntent, QuarantinedSegment, RecoveredSegment, ResolvedCurrent,
-    ResolvedDocumentId, SegmentSizeTier, TierMergePlan, TierMergePolicy, TierPolicyError,
-    TombstoneSet, WRITER_LOCK_FORMAT_VERSION, WRITER_LOCK_MAGIC, WRITER_LOCK_RECORD_BYTES,
-    inspect_lexical_layout, load_manifest_pair, pack_engine_version, plan_tier_merge,
-    publish_current, resolve_current, unpack_engine_version,
+    CompactionError, CompactionPolicy, CompactionReport, ConcatMergeError, ConcatMergeRun,
+    CurrentPointer, CurrentPointerError, DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY,
+    DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES, EXACT_LEXICAL_SNAPSHOT_IMAGE_DOMAIN,
+    ExactLexicalSnapshotDescriptor, ExactLexicalSnapshotImage, GarbageCollectionOptions,
+    GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout,
+    LoadedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC, Manifest,
+    ManifestCodecError, ManifestFieldStats, ManifestSegment, ManifestSource, PublishIntent,
+    QuarantinedSegment, RecoveredSegment, ResolvedCurrent, ResolvedDocumentId, SegmentSizeTier,
+    TierMergePlan, TierMergePolicy, TierPolicyError, TombstoneSet, WRITER_LOCK_FORMAT_VERSION,
+    WRITER_LOCK_MAGIC, WRITER_LOCK_RECORD_BYTES, inspect_lexical_layout, load_manifest_pair,
+    pack_engine_version, plan_tier_merge, publish_current, resolve_current, unpack_engine_version,
 };
 pub use query::{
     BooleanClause, BooleanOperator, CassQueryFilters, CassQueryParser, CassQueryParserConfigError,

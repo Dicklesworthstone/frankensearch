@@ -155,5 +155,10 @@ name = "durable_commit_retention_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "concat_merge_runs_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true
