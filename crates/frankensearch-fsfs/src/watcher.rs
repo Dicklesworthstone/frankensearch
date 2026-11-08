@@ -1893,7 +1893,7 @@ impl FsWatcher {
     ///
     /// # Errors
     ///
-    /// Returns any downstream ingest error.
+    /// Returns incomplete ignore-policy errors or downstream ingest errors.
     pub fn process_events_now<'a>(
         &'a self,
         cx: &'a Cx,
@@ -1934,7 +1934,7 @@ impl FsWatcher {
             // Runs on the caller's executor under the caller's `Cx`: this path
             // builds no runtime of its own and therefore cannot strand ingest work
             // on a private one that the caller cannot cancel.
-            let prepared = prepare_event_batch(&self.discovery, &self.roots, events);
+            let prepared = prepare_event_batch(&self.discovery, &self.roots, events)?;
             if prepared.ops.is_empty() {
                 let outcome = prepared.outcome(0);
                 self.stats.add_skipped(outcome.skipped);
@@ -2994,7 +2994,10 @@ fn run_ingest_loop<'a>(
                 continue;
             };
 
-            let prepared = prepare_event_batch(discovery, roots, lease.events());
+            let prepared =
+                prepare_event_batch(discovery, roots, lease.events()).inspect_err(|_| {
+                    stats.add_error();
+                })?;
             if prepared.ops.is_empty() {
                 stats.add_skipped(prepared.skipped);
                 lease.commit();
@@ -3162,7 +3165,10 @@ fn drain_final_batches<'a>(
             let Some(mut lease) = PendingBatchLease::acquire(ready_batches, reconciliation) else {
                 return Ok(());
             };
-            let prepared = prepare_event_batch(discovery, roots, lease.events());
+            let prepared =
+                prepare_event_batch(discovery, roots, lease.events()).inspect_err(|_| {
+                    stats.add_error();
+                })?;
             if prepared.ops.is_empty() {
                 stats.add_skipped(prepared.skipped);
                 lease.commit();
@@ -3556,7 +3562,17 @@ fn run_authoritative_reconciliation<'a>(
                     )),
                 });
             }
-            let prepared = prepare_event_batch(discovery, roots, event_batch);
+            let prepared = match prepare_event_batch(discovery, roots, event_batch) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // Earlier chunks may already have landed. Reject this
+                    // batch without acknowledging their reconciliation debt.
+                    if !attempted_prefix.is_empty() {
+                        lock_or_recover(reconciliation).require_for_events(&attempted_prefix)?;
+                    }
+                    return Err(error);
+                }
+            };
             if prepared.ops.is_empty() {
                 staged_skipped = staged_skipped.saturating_add(prepared.skipped);
                 continue;
@@ -3886,24 +3902,34 @@ fn prepare_event_batch(
     discovery: &DiscoveryConfig,
     roots: &[PathBuf],
     events: &[WatchEvent],
-) -> PreparedWatchBatch {
+) -> SearchResult<PreparedWatchBatch> {
     let mut ops = Vec::new();
     let mut skipped = 0_usize;
-    let mut ignore_rules = IgnoreRules::new();
+    let mut ignore_rules = IgnoreRules::new()?;
+    let mut delete_mounts = None;
 
     for event in events {
-        if let Some(op) = event_to_ingest_op(discovery, roots, &mut ignore_rules, event) {
+        if matches!(event.kind, WatchEventKind::Deleted) && delete_mounts.is_none() {
+            delete_mounts = Some(build_mount_table(discovery));
+        }
+        if let Some(op) = event_to_ingest_op(
+            discovery,
+            roots,
+            &mut ignore_rules,
+            event,
+            delete_mounts.as_ref(),
+        )? {
             ops.push(op);
         } else {
             skipped = skipped.saturating_add(1);
         }
     }
 
-    PreparedWatchBatch {
+    Ok(PreparedWatchBatch {
         accepted: ops.len(),
         ops,
         skipped,
-    }
+    })
 }
 
 fn event_to_ingest_op(
@@ -3911,21 +3937,24 @@ fn event_to_ingest_op(
     roots: &[PathBuf],
     ignore_rules: &mut IgnoreRules,
     event: &WatchEvent,
-) -> Option<WatchIngestOp> {
+    mount_table: Option<&MountTable>,
+) -> SearchResult<Option<WatchIngestOp>> {
     let revision = i64::try_from(event.observed_at_ms).unwrap_or(i64::MAX);
     let file_key = normalize_file_key(&event.path);
 
-    if matches!(event.kind, WatchEventKind::Deleted) {
-        return Some(WatchIngestOp::Delete { file_key, revision });
-    }
     // Judge the path from the innermost root that holds it, as the walk that
     // `fsfs index` runs from that root would.
     let root = roots
         .iter()
         .filter(|root| event.path.starts_with(root))
         .max_by_key(|root| root.components().count());
-    if root.is_some_and(|root| ignore_rules.skips_under(root, &event.path, false)) {
-        return None;
+    // Deletes still remove previously indexed paths even when today's rules
+    // exclude them, but an unreadable policy must reject the entire batch.
+    if matches!(event.kind, WatchEventKind::Deleted) {
+        if let Some(root) = root {
+            validate_delete_ignore_policy(discovery, root, &event.path, ignore_rules, mount_table)?;
+        }
+        return Ok(Some(WatchIngestOp::Delete { file_key, revision }));
     }
 
     let byte_len = event.byte_len.unwrap_or_else(|| {
@@ -3946,14 +3975,102 @@ fn event_to_ingest_op(
     if matches!(decision.scope, DiscoveryScopeDecision::Exclude)
         || !decision.ingestion_class.is_indexed()
     {
-        return None;
+        return Ok(None);
     }
 
-    Some(WatchIngestOp::Upsert {
+    // A scope or safety exclusion already settled above must not activate
+    // ignore files inside a subtree the snapshot walk would never enter.
+    if let Some(root) = root
+        && ignore_rules.skips_under(root, &event.path, false)?
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(WatchIngestOp::Upsert {
         file_key,
         revision,
         ingestion_class: decision.ingestion_class,
-    })
+    }))
+}
+
+/// A deletion may clean up an excluded old document, but its policy scope ends
+/// where a current snapshot would stop descending. Do not load ignore files
+/// from inside that excluded subtree, even when the deleted name was deeper.
+fn validate_delete_ignore_policy(
+    discovery: &DiscoveryConfig,
+    root: &Path,
+    path: &Path,
+    ignore_rules: &mut IgnoreRules,
+    mount_table: Option<&MountTable>,
+) -> SearchResult<()> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(());
+    };
+    // Explicit file roots bypass descendant ignore policy just as the scan and
+    // upsert paths do; do not try to read `selected-file/.ignore`.
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+    ignore_rules.validate_directory(root)?;
+    let mut directory = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        // The final component is the deleted entry, not a directory to enter.
+        if components.peek().is_none() {
+            break;
+        }
+        directory.push(component);
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let is_symlink = metadata.is_symlink();
+        if is_symlink && !discovery.follow_symlinks {
+            break;
+        }
+        let mut candidate = DiscoveryCandidate::new(&directory, 0)
+            .with_root(root)
+            .with_symlink(is_symlink);
+        if let Some(category) = lookup_mount_category(mount_table, &directory) {
+            candidate = candidate.with_mount_category(category);
+        }
+        if matches!(
+            discovery.evaluate_candidate(&candidate).scope,
+            DiscoveryScopeDecision::Exclude
+        ) || ignore_rules.skips_entry(&directory, true)?
+        {
+            break;
+        }
+        let metadata = if is_symlink {
+            match fs::metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            metadata
+        };
+        if !metadata.is_dir() {
+            break;
+        }
+        ignore_rules.validate_directory(&directory)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4226,115 +4343,174 @@ fn scan_interrupted_error() -> SearchError {
 /// deepest `.gitignore` and `.git/info/exclude` at or below the repository
 /// root, then the global gitignore. An entry no rule matches is skipped when
 /// its name starts with a dot.
-struct IgnoreRules {
-    global: Gitignore,
+pub(crate) struct IgnoreRules {
+    global: Result<Gitignore, ignore::Error>,
     directories: HashMap<PathBuf, DirectoryIgnoreFiles>,
 }
 
 /// One directory's ignore files, read as the walker reads them.
 struct DirectoryIgnoreFiles {
-    dot_ignore: Gitignore,
-    gitignore: Gitignore,
-    git_exclude: Gitignore,
-    has_git: bool,
+    dot_ignore: Result<Gitignore, ignore::Error>,
+    gitignore: Result<Gitignore, ignore::Error>,
+    git_exclude: Result<Gitignore, ignore::Error>,
+    has_git: Result<bool, ignore::Error>,
 }
 
 impl DirectoryIgnoreFiles {
     fn read(directory: &Path) -> Self {
-        let git_type = fs::metadata(directory.join(".git"))
-            .ok()
-            .map(|metadata| metadata.file_type());
-        let git_exclude = match git_type {
-            Some(file_type) if file_type.is_file() => git_common_dir(directory)
-                .map_or_else(Gitignore::empty, |common| {
-                    gitignore_at(directory, &common.join("info/exclude"))
-                }),
-            Some(_) => gitignore_at(directory, &directory.join(".git/info/exclude")),
-            None => Gitignore::empty(),
+        let git_path = directory.join(".git");
+        let git_type = match fs::metadata(&git_path) {
+            Ok(metadata) => Ok(Some(metadata.file_type())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ignore::Error::WithPath {
+                path: git_path,
+                err: Box::new(ignore::Error::Io(error)),
+            }),
         };
+        let git_exclude = match git_type.as_ref() {
+            Ok(Some(file_type)) if file_type.is_file() => {
+                git_common_dir(directory).and_then(|common| {
+                    common.map_or_else(
+                        || Ok(Gitignore::empty()),
+                        |common| gitignore_at(directory, &common.join("info/exclude")),
+                    )
+                })
+            }
+            Ok(Some(_)) => gitignore_at(directory, &directory.join(".git/info/exclude")),
+            Ok(None) => Ok(Gitignore::empty()),
+            Err(error) => Err(error.clone()),
+        };
+        let jj_path = directory.join(".jj");
+        let has_git = git_type.and_then(|git_type| {
+            if git_type.is_some() {
+                Ok(true)
+            } else {
+                jj_path
+                    .try_exists()
+                    .map_err(|error| ignore::Error::WithPath {
+                        path: jj_path,
+                        err: Box::new(ignore::Error::Io(error)),
+                    })
+            }
+        });
         Self {
             dot_ignore: gitignore_at(directory, &directory.join(".ignore")),
             gitignore: gitignore_at(directory, &directory.join(".gitignore")),
             git_exclude,
-            has_git: git_type.is_some() || directory.join(".jj").exists(),
+            has_git,
         }
     }
 }
 
-/// A missing or unreadable file, or one whose patterns fail to compile, is
-/// an empty matcher, as it is for the walker.
-fn gitignore_at(root: &Path, file: &Path) -> Gitignore {
-    if !file.exists() {
-        return Gitignore::empty();
-    }
+/// Missing files supply no rules. All other read/parse failures retain their
+/// error, never the builder's surviving subset of patterns.
+fn gitignore_at(root: &Path, file: &Path) -> Result<Gitignore, ignore::Error> {
     let mut builder = GitignoreBuilder::new(root);
     if let Some(error) = builder.add(file) {
-        debug!(path = %file.display(), %error, "ignore file read partially");
+        if error
+            .io_error()
+            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(Gitignore::empty());
+        }
+        return Err(error);
     }
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
+    builder.build()
+}
+
+fn incomplete_ignore_rules(path: &Path, error: &impl std::fmt::Display) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "discovery.ignore_rules".to_owned(),
+        value: path.display().to_string(),
+        reason: format!(
+            "cannot discover with incomplete ignore rules; correct the ignore file and retry: {error}"
+        ),
+    }
 }
 
 /// The common directory of a linked worktree whose `.git` is a file.
-fn git_common_dir(directory: &Path) -> Option<PathBuf> {
-    let first_line = |path: &Path| {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|text| text.lines().next().map(str::to_owned))
+fn git_common_dir(directory: &Path) -> Result<Option<PathBuf>, ignore::Error> {
+    let first_line = |path: &Path| match fs::read_to_string(path) {
+        Ok(text) => Ok(text.lines().next().map(str::to_owned)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ignore::Error::WithPath {
+            path: path.to_path_buf(),
+            err: Box::new(ignore::Error::Io(error)),
+        }),
     };
-    let git_dir = PathBuf::from(first_line(&directory.join(".git"))?.strip_prefix("gitdir: ")?);
-    let common = first_line(&git_dir.join("commondir"))?;
-    Some(if common.starts_with('.') {
+    let Some(git_file) = first_line(&directory.join(".git"))? else {
+        return Ok(None);
+    };
+    let Some(git_dir) = git_file.strip_prefix("gitdir: ").map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let Some(common) = first_line(&git_dir.join("commondir"))? else {
+        return Ok(None);
+    };
+    Ok(Some(if common.starts_with('.') {
         git_dir.join(common)
     } else {
         PathBuf::from(common)
-    })
+    }))
 }
 
 impl IgnoreRules {
-    fn new() -> Self {
+    pub(crate) fn new() -> SearchResult<Self> {
         // The walker resolves global patterns relative to the working directory.
-        let global = std::env::current_dir().map_or_else(
-            |_| Gitignore::empty(),
-            |cwd| GitignoreBuilder::new(cwd).build_global().0,
-        );
+        let cwd = std::env::current_dir()
+            .map_err(|error| incomplete_ignore_rules(Path::new("."), &error))?;
+        Ok(Self::with_global_file(
+            &cwd,
+            ignore::gitignore::gitconfig_excludes_path().as_deref(),
+        ))
+    }
+
+    fn with_global_file(cwd: &Path, file: Option<&Path>) -> Self {
+        // `build_global` deliberately suppresses I/O errors. A watcher must
+        // retain those errors until it knows whether Git rules apply here.
+        let global = file.map_or_else(|| Ok(Gitignore::empty()), |file| gitignore_at(cwd, file));
         Self {
             global,
             directories: HashMap::new(),
         }
     }
 
+    pub(crate) fn validate_directory(&mut self, directory: &Path) -> SearchResult<()> {
+        self.matched(directory, directory, true).map(|_| ())
+    }
+
     /// Whether a walk that reached `path` would skip it.
-    fn skips_entry(&mut self, path: &Path, is_dir: bool) -> bool {
+    fn skips_entry(&mut self, path: &Path, is_dir: bool) -> SearchResult<bool> {
         let Some(parent) = path.parent() else {
-            return false;
+            return Ok(false);
         };
-        match self.matched(parent, path, is_dir) {
+        Ok(match self.matched(parent, path, is_dir)? {
             Match::Ignore(()) => true,
             Match::Whitelist(()) => false,
             Match::None => path
                 .file_name()
                 .is_some_and(|name| name.as_encoded_bytes().starts_with(b".")),
-        }
+        })
     }
 
     /// Whether a walk from `root` would skip `path` or a directory on the
     /// way to it. A path outside `root` is not this walk's to judge.
-    fn skips_under(&mut self, root: &Path, path: &Path, is_dir: bool) -> bool {
+    fn skips_under(&mut self, root: &Path, path: &Path, is_dir: bool) -> SearchResult<bool> {
         let Ok(relative) = path.strip_prefix(root) else {
-            return false;
+            return Ok(false);
         };
         let mut current = root.to_path_buf();
         let mut components = relative.components().peekable();
         while let Some(component) = components.next() {
             current.push(component);
-            if self.skips_entry(&current, components.peek().is_some() || is_dir) {
-                return true;
+            if self.skips_entry(&current, components.peek().is_some() || is_dir)? {
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
-    fn matched(&mut self, parent: &Path, path: &Path, is_dir: bool) -> Match<()> {
+    fn matched(&mut self, parent: &Path, path: &Path, is_dir: bool) -> SearchResult<Match<()>> {
         for directory in parent.ancestors() {
             if !self.directories.contains_key(directory) {
                 let files = DirectoryIgnoreFiles::read(directory);
@@ -4345,30 +4521,58 @@ impl IgnoreRules {
             .ancestors()
             .filter_map(|directory| self.directories.get(directory))
             .collect::<Vec<_>>();
-        let any_git = chain.iter().any(|files| files.has_git);
+        let mut repository_boundary = None;
+        for (depth, files) in chain.iter().enumerate() {
+            if *files
+                .has_git
+                .as_ref()
+                .map_err(|error| incomplete_ignore_rules(parent, error))?
+            {
+                repository_boundary = Some(depth);
+                break;
+            }
+        }
         let (mut dot_ignore, mut gitignore, mut git_exclude) =
             (Match::None, Match::None, Match::None);
-        let mut saw_git = false;
-        for files in chain {
+        for (depth, files) in chain.into_iter().enumerate() {
+            // Validate every applicable rule source even when a deeper rule
+            // matches this entry. Partial policy cannot authorize a batch or a
+            // complete snapshot, and errors above a nested Git root must not
+            // activate rules that the normal precedence chain never consults.
+            let dot_rules = files
+                .dot_ignore
+                .as_ref()
+                .map_err(|error| incomplete_ignore_rules(parent, error))?;
             if dot_ignore.is_none() {
-                dot_ignore = files.dot_ignore.matched(path, is_dir).map(|_| ());
+                dot_ignore = dot_rules.matched(path, is_dir).map(|_| ());
             }
-            if any_git && !saw_git {
+            if repository_boundary.is_some_and(|boundary| depth <= boundary) {
+                let git_rules = files
+                    .gitignore
+                    .as_ref()
+                    .map_err(|error| incomplete_ignore_rules(parent, error))?;
+                let exclude_rules = files
+                    .git_exclude
+                    .as_ref()
+                    .map_err(|error| incomplete_ignore_rules(parent, error))?;
                 if gitignore.is_none() {
-                    gitignore = files.gitignore.matched(path, is_dir).map(|_| ());
+                    gitignore = git_rules.matched(path, is_dir).map(|_| ());
                 }
                 if git_exclude.is_none() {
-                    git_exclude = files.git_exclude.matched(path, is_dir).map(|_| ());
+                    git_exclude = exclude_rules.matched(path, is_dir).map(|_| ());
                 }
             }
-            saw_git |= files.has_git;
         }
-        let global = if any_git {
-            self.global.matched(path, is_dir).map(|_| ())
+        let global = if repository_boundary.is_some() {
+            self.global
+                .as_ref()
+                .map_err(|error| incomplete_ignore_rules(parent, error))?
+                .matched(path, is_dir)
+                .map(|_| ())
         } else {
             Match::None
         };
-        dot_ignore.or(gitignore).or(git_exclude).or(global)
+        Ok(dot_ignore.or(gitignore).or(git_exclude).or(global))
     }
 }
 
@@ -4458,7 +4662,7 @@ fn collect_snapshot_for_root(
         return Ok(());
     }
 
-    let mut ignore_rules = IgnoreRules::new();
+    let mut ignore_rules = IgnoreRules::new()?;
     let mut stack = vec![root.to_path_buf()];
     let mut visited_dirs = HashSet::new();
     while let Some(dir_path) = stack.pop() {
@@ -4473,6 +4677,11 @@ fn collect_snapshot_for_root(
         if !visited_dirs.insert(canonical_dir) {
             continue;
         }
+
+        // An empty directory can still carry a broken policy (including a
+        // global one). Validate before listing so absence never grants deletion
+        // authority under rules we could not read completely.
+        ignore_rules.validate_directory(&dir_path)?;
 
         // Every skip below leaves part of the tree unobserved, so each one
         // records the path it could not resolve. Skipping silently is what
@@ -4539,7 +4748,7 @@ fn collect_snapshot_for_root(
             if is_symlink && !discovery.follow_symlinks {
                 continue;
             }
-            if ignore_rules.skips_entry(&path, metadata.is_dir()) {
+            if ignore_rules.skips_entry(&path, metadata.is_dir())? {
                 continue;
             }
 
@@ -4832,7 +5041,7 @@ mod tests {
     ) -> WatchIngestFuture<'a, ()> {
         Box::pin(async move {
             let prepared =
-                super::prepare_event_batch(&watcher.discovery, &watcher.roots, catchup.events());
+                super::prepare_event_batch(&watcher.discovery, &watcher.roots, catchup.events())?;
             if !prepared.ops.is_empty() {
                 pipeline.apply_batch(cx, &prepared.ops).await?;
             }
@@ -5601,7 +5810,8 @@ mod tests {
             assert!(completeness.is_complete());
             assert_eq!(snapshot.keys().collect::<Vec<_>>(), vec![&included]);
 
-            let prepared = super::prepare_event_batch(&discovery, &[root], &events);
+            let prepared = super::prepare_event_batch(&discovery, &[root], &events)
+                .expect("valid ignore policy");
             assert_eq!(prepared.accepted, 1, "ancestor: {ancestor}");
             assert_eq!(prepared.skipped, 9, "ancestor: {ancestor}");
             assert_eq!(
@@ -5637,7 +5847,8 @@ mod tests {
                 .expect("scan outer root");
         assert!(completeness.is_complete());
         assert_eq!(snapshot.keys().collect::<Vec<_>>(), vec![&outer_file]);
-        let prepared = super::prepare_event_batch(&discovery, &outer_roots, &events);
+        let prepared = super::prepare_event_batch(&discovery, &outer_roots, &events)
+            .expect("valid ignore policy");
         assert_eq!(prepared.accepted, 1);
         assert_eq!(prepared.skipped, 3);
 
@@ -5648,7 +5859,8 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
         assert!(snapshot.contains_key(&outer_file));
         assert!(snapshot.contains_key(&selected_file));
-        let prepared = super::prepare_event_batch(&discovery, &roots, &events);
+        let prepared =
+            super::prepare_event_batch(&discovery, &roots, &events).expect("valid ignore policy");
         assert_eq!(prepared.accepted, 2);
         assert_eq!(prepared.skipped, 2);
         let admitted = prepared
@@ -5708,7 +5920,8 @@ mod tests {
             let (snapshot, completeness) = watcher.collect_snapshot().expect("relative root scan");
             assert!(completeness.is_complete());
             assert_eq!(snapshot.keys().collect::<Vec<_>>(), [&included]);
-            let prepared = super::prepare_event_batch(&discovery, watcher.roots(), &events);
+            let prepared = super::prepare_event_batch(&discovery, watcher.roots(), &events)
+                .expect("valid discovery policy");
             assert_eq!(prepared.skipped, 1);
             assert!(matches!(
                 prepared.ops.as_slice(),
@@ -5727,7 +5940,8 @@ mod tests {
             Arc::new(NoopWatchIngestPipeline),
         );
         let events = [WatchEvent::modified("/unselected/main.rs", 100, Some(13))];
-        let prepared = super::prepare_event_batch(&discovery, watcher.roots(), &events);
+        let prepared = super::prepare_event_batch(&discovery, watcher.roots(), &events)
+            .expect("valid discovery policy");
         assert_eq!(prepared.skipped, 1);
         assert!(prepared.ops.is_empty());
     }
@@ -5842,10 +6056,14 @@ mod tests {
 
         let mut every = BTreeSet::new();
         every_file_under(&root, &mut every);
-        let mut rules = super::IgnoreRules::new();
+        let mut rules = super::IgnoreRules::new().expect("load ignore policy");
         let admitted = every
             .into_iter()
-            .filter(|path| !rules.skips_under(&root, path, false))
+            .filter(|path| {
+                !rules
+                    .skips_under(&root, path, false)
+                    .expect("valid ignore policy")
+            })
             .collect::<BTreeSet<_>>();
 
         assert_eq!(admitted, index_discovers);
@@ -5898,12 +6116,531 @@ mod tests {
             WatchEvent::modified(root.join("ignored_dir/a.md"), now, Some(5)),
             WatchEvent::deleted(root.join(".hidden.md"), now),
         ];
-        let prepared = super::prepare_event_batch(&DiscoveryConfig::default(), &[root], &events);
+        let prepared = super::prepare_event_batch(&DiscoveryConfig::default(), &[root], &events)
+            .expect("valid ignore policy");
         assert_eq!(prepared.skipped, 3, "{:?}", prepared.ops);
         assert!(matches!(
             prepared.ops.as_slice(),
             [WatchIngestOp::Upsert { .. }, WatchIngestOp::Delete { .. }]
         ));
+    }
+
+    fn assert_incomplete_ignore_policy(error: SearchError, file: &Path) {
+        let SearchError::InvalidConfig { field, reason, .. } = error else {
+            panic!("expected an incomplete ignore-policy error, got {error:?}");
+        };
+        assert_eq!(field, "discovery.ignore_rules");
+        assert!(reason.contains("incomplete ignore rules"), "{reason}");
+        assert!(reason.contains(file.to_string_lossy().as_ref()), "{reason}");
+    }
+
+    #[test]
+    fn watcher_rejects_partial_ignore_rules_before_ingestion_or_snapshot() {
+        run_test_with_cx(|cx| async move {
+            for ignore_name in [".ignore", ".gitignore", ".git/info/exclude"] {
+                // Both failures follow a valid rule. Keeping the builder's
+                // surviving subset would silently admit or delete documents.
+                for contents in [
+                    b"private.md\nprivate[9-0].md\n".as_slice(),
+                    b"private.md\n\xff\n".as_slice(),
+                ] {
+                    let temp = tempdir().expect("tempdir");
+                    let root = temp.path().join("project");
+                    fs::create_dir_all(root.join(".git/info")).expect("repository");
+                    let public = root.join("public.md");
+                    let private = root.join("private.md");
+                    fs::write(&public, "public content").expect("public source");
+                    fs::write(&private, "private content").expect("private source");
+                    let ignore_file = root.join(ignore_name);
+                    fs::write(&ignore_file, contents).expect("broken ignore policy");
+                    let pipeline = Arc::new(RecordingPipeline::default());
+                    let watcher = FsWatcher::new(
+                        vec![root.clone()],
+                        DiscoveryConfig::default(),
+                        pipeline.clone(),
+                    );
+                    assert_incomplete_ignore_policy(
+                        watcher
+                            .collect_snapshot()
+                            .expect_err("reject incomplete policy"),
+                        &ignore_file,
+                    );
+                    let events = [
+                        WatchEvent::modified(&public, 100, None),
+                        WatchEvent::modified(&private, 100, None),
+                        WatchEvent::deleted(root.join("old.md"), 100),
+                    ];
+                    assert_incomplete_ignore_policy(
+                        watcher
+                            .process_events_now(&cx, &events)
+                            .await
+                            .expect_err("reject entire batch"),
+                        &ignore_file,
+                    );
+                    assert!(lock_or_recover(&pipeline.attempts).is_empty());
+                    let previous = FileSnapshot::from([(private.clone(), 1)]);
+                    assert_incomplete_ignore_policy(
+                        watcher
+                            .build_catchup_events(&previous)
+                            .err()
+                            .expect("cannot grant catch-up authority"),
+                        &ignore_file,
+                    );
+                    assert!(watcher.holds_unverified_legacy_baseline());
+                    assert!(
+                        lock_or_recover(&watcher.reconciliation)
+                            .authority
+                            .established()
+                            .is_none()
+                    );
+
+                    fs::write(&ignore_file, "private.md\n").expect("repair ignore policy");
+                    let (snapshot, completeness) =
+                        watcher.collect_snapshot().expect("repaired policy");
+                    assert!(completeness.is_complete());
+                    assert_eq!(snapshot.keys().cloned().collect::<Vec<_>>(), vec![public]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn watcher_rejects_ignore_file_read_errors_but_allows_missing_files() {
+        for ignore_name in [".ignore", ".gitignore", ".git/info/exclude"] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            fs::create_dir_all(root.join(".git/info")).expect("repository");
+            let source = root.join("public.md");
+            fs::write(&source, "public content").expect("source");
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            let (snapshot, completeness) = watcher.collect_snapshot().expect("missing is normal");
+            assert!(completeness.is_complete());
+            assert!(snapshot.contains_key(&source));
+
+            // A directory at the policy path fails to read as a file even when
+            // tests run as root, unlike a permissions-only fixture.
+            let ignore_file = root.join(ignore_name);
+            fs::create_dir(&ignore_file).expect("unreadable policy file");
+            assert_incomplete_ignore_policy(
+                watcher.collect_snapshot().expect_err("cannot read policy"),
+                &ignore_file,
+            );
+            assert_incomplete_ignore_policy(
+                super::prepare_event_batch(
+                    &DiscoveryConfig::default(),
+                    &[root],
+                    &[WatchEvent::deleted(source, 100)],
+                )
+                .err()
+                .expect("deletes cannot bypass incomplete policy"),
+                &ignore_file,
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_global_ignore_errors_apply_only_inside_repositories() {
+        for contents in [b"private[9-0].md\n".as_slice(), b"\xff\n".as_slice()] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            let plain = temp.path().join("plain");
+            fs::create_dir_all(root.join(".git")).expect("repository");
+            fs::create_dir(&plain).expect("non-repository");
+            let global = temp.path().join("global-ignore");
+            fs::write(&global, contents).expect("broken global policy");
+            // Exercise the production loader without mutating process-global
+            // Git or HOME settings while other tests are running.
+            let mut rules = super::IgnoreRules::with_global_file(temp.path(), Some(&global));
+            assert_incomplete_ignore_policy(
+                rules
+                    .skips_under(&root, &root.join("private.md"), false)
+                    .expect_err("global policy applies in repository"),
+                &global,
+            );
+            assert!(
+                !rules
+                    .skips_under(&plain, &plain.join("private.md"), false)
+                    .expect("global policy is inactive outside repositories")
+            );
+            fs::write(&global, "private.md\n").expect("repair global policy");
+            let mut rules = super::IgnoreRules::with_global_file(temp.path(), Some(&global));
+            assert!(
+                rules
+                    .skips_under(&root, &root.join("private.md"), false)
+                    .unwrap()
+            );
+            fs::write(root.join(".gitignore"), "!private.md\n").expect("local whitelist");
+            let mut rules = super::IgnoreRules::with_global_file(temp.path(), Some(&global));
+            assert!(
+                !rules
+                    .skips_under(&root, &root.join("private.md"), false)
+                    .expect("local rules retain precedence")
+            );
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(root.join(".git")).expect("repository");
+        let global = temp.path().join("global-ignore");
+        let mut rules = super::IgnoreRules::with_global_file(temp.path(), Some(&global));
+        assert!(
+            !rules
+                .skips_under(&root, &root.join("public.md"), false)
+                .unwrap()
+        );
+        fs::create_dir(&global).expect("unreadable global policy");
+        let mut rules = super::IgnoreRules::with_global_file(temp.path(), Some(&global));
+        assert_incomplete_ignore_policy(
+            rules
+                .skips_under(&root, &root.join("public.md"), false)
+                .expect_err("global read error"),
+            &global,
+        );
+    }
+
+    #[test]
+    fn watcher_does_not_activate_invalid_gitignore_above_nested_repository() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(root.join(".git")).expect("repository");
+        fs::write(temp.path().join(".gitignore"), "private[9-0].md\n")
+            .expect("inapplicable ancestor gitignore");
+        let mut rules = super::IgnoreRules::with_global_file(temp.path(), None);
+        assert!(
+            !rules
+                .skips_under(&root, &root.join("public.md"), false)
+                .expect("Git rules stop at the nested repository boundary")
+        );
+        #[cfg(unix)]
+        {
+            // An unresolvable repository indicator above the selected nested
+            // repository is just as irrelevant as that ancestor's Git rules.
+            std::os::unix::fs::symlink(".git", temp.path().join(".git"))
+                .expect("looping ancestor Git indicator");
+            let mut rules = super::IgnoreRules::with_global_file(temp.path(), None);
+            rules
+                .validate_directory(&root)
+                .expect("nearest repository settles Git scope");
+            let nested = root.join("nested");
+            fs::create_dir(&nested).expect("nested directory");
+            let nested_git = nested.join(".git");
+            std::os::unix::fs::symlink(".git", &nested_git)
+                .expect("looping relevant Git indicator");
+            let mut rules = super::IgnoreRules::with_global_file(temp.path(), None);
+            assert_incomplete_ignore_policy(
+                rules
+                    .validate_directory(&nested)
+                    .expect_err("unresolved indicator before the nearest repository"),
+                &nested_git,
+            );
+        }
+        let ancestor_ignore = temp.path().join(".ignore");
+        fs::write(&ancestor_ignore, "private[9-0].md\n").expect("applicable ancestor ignore");
+        let mut rules = super::IgnoreRules::with_global_file(temp.path(), None);
+        assert_incomplete_ignore_policy(
+            rules
+                .skips_under(&root, &root.join("public.md"), false)
+                .expect_err("dot-ignore still applies above the root"),
+            &ancestor_ignore,
+        );
+    }
+
+    #[test]
+    fn watcher_does_not_activate_ignore_rules_inside_excluded_descendants() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        let excluded = root.join("node_modules/dependency");
+        fs::create_dir_all(&excluded).expect("excluded subtree");
+        let public = root.join("public.md");
+        let dependency = excluded.join("private.md");
+        fs::write(&public, "public").expect("public source");
+        fs::write(&dependency, "private").expect("excluded source");
+        fs::write(excluded.join(".ignore"), "private[9-0].md\n")
+            .expect("irrelevant invalid ignore policy");
+        let watcher = FsWatcher::new(
+            vec![root.clone()],
+            DiscoveryConfig::default(),
+            Arc::new(NoopWatchIngestPipeline),
+        );
+        let (snapshot, completeness) = watcher.collect_snapshot().expect("excluded subtree");
+        assert!(completeness.is_complete());
+        assert_eq!(
+            snapshot.keys().cloned().collect::<Vec<_>>(),
+            vec![public.clone()]
+        );
+        let prepared = super::prepare_event_batch(
+            &DiscoveryConfig::default(),
+            &[root],
+            &[
+                WatchEvent::modified(&public, 100, None),
+                WatchEvent::modified(&dependency, 100, None),
+                WatchEvent::deleted(&dependency, 100),
+            ],
+        )
+        .expect("excluded events cannot activate descendant rules");
+        assert_eq!(prepared.skipped, 1);
+        assert!(matches!(
+            prepared.ops.as_slice(),
+            [WatchIngestOp::Upsert { file_key: public_key, .. },
+             WatchIngestOp::Delete { file_key: deleted_key, .. }]
+                if public_key == &normalize_file_key(&public)
+                    && deleted_key == &normalize_file_key(&dependency)
+        ));
+    }
+
+    #[test]
+    fn watcher_delete_policy_stops_at_pruned_directories_but_checks_root_rules() {
+        for excluded in ["node_modules", "custom-cache", ".hidden"] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            let nested = root.join(excluded).join("dependency");
+            fs::create_dir_all(&nested).expect("pruned subtree");
+            let public = root.join("public.md");
+            let deleted = nested.join("old.md");
+            fs::write(&public, "public").expect("visible source");
+            fs::write(nested.join(".ignore"), "private[9-0].md\n")
+                .expect("irrelevant descendant rules");
+            let mut discovery = DiscoveryConfig::default();
+            discovery.exclude_patterns.push("custom-cache".to_owned());
+            let events = [
+                WatchEvent::modified(&public, 100, None),
+                WatchEvent::deleted(&deleted, 100),
+            ];
+            let prepared =
+                super::prepare_event_batch(&discovery, std::slice::from_ref(&root), &events)
+                    .expect("cleanup deletion cannot activate policy inside a pruned subtree");
+            assert!(matches!(
+                prepared.ops.as_slice(),
+                [WatchIngestOp::Upsert { file_key: public_key, .. },
+                 WatchIngestOp::Delete { file_key: deleted_key, .. }]
+                    if public_key == &normalize_file_key(&public)
+                        && deleted_key == &normalize_file_key(&deleted)
+            ));
+
+            let root_ignore = root.join(".ignore");
+            fs::write(&root_ignore, "private[9-0].md\n").expect("relevant root policy");
+            assert_incomplete_ignore_policy(
+                super::prepare_event_batch(&discovery, std::slice::from_ref(&root), &events)
+                    .err()
+                    .expect("pruning must not bypass root-policy errors"),
+                &root_ignore,
+            );
+
+            let file_root = root.join("explicit-file.md");
+            fs::write(&file_root, "explicit source").expect("file root");
+            let prepared = super::prepare_event_batch(
+                &discovery,
+                std::slice::from_ref(&file_root),
+                &[WatchEvent::deleted(&file_root, 100)],
+            )
+            .expect("explicit file roots have no descendant policy");
+            assert!(matches!(
+                prepared.ops.as_slice(),
+                [WatchIngestOp::Delete { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn watcher_delete_policy_accepts_missing_or_replaced_parent_directories() {
+        for replace_with_file in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            let former_directory = root.join("sub");
+            fs::create_dir_all(&former_directory).expect("initial directory");
+            let public = root.join("public.md");
+            let deleted = former_directory.join("old.md");
+            fs::write(&public, "public").expect("visible source");
+            fs::write(&deleted, "old source").expect("previous source");
+            fs::rename(&former_directory, root.join("moved-sub")).expect("move old directory");
+            if replace_with_file {
+                fs::write(&former_directory, "replacement file").expect("replace directory");
+            }
+            let prepared = super::prepare_event_batch(
+                &DiscoveryConfig::default(),
+                &[root],
+                &[
+                    WatchEvent::modified(&public, 100, None),
+                    WatchEvent::deleted(&deleted, 100),
+                ],
+            )
+            .expect("a vanished directory's descendant remains eligible for deletion");
+            assert!(matches!(
+                prepared.ops.as_slice(),
+                [WatchIngestOp::Upsert { file_key: public_key, .. },
+                 WatchIngestOp::Delete { file_key: deleted_key, .. }]
+                    if public_key == &normalize_file_key(&public)
+                        && deleted_key == &normalize_file_key(&deleted)
+            ));
+        }
+    }
+
+    #[test]
+    fn watcher_ignore_policy_failure_keeps_queued_batch_for_retry() {
+        for stopping in [false, true] {
+            run_on_local_runtime_task(move |cx| async move {
+                let temp = tempdir().expect("tempdir");
+                let root = temp.path().join("project");
+                fs::create_dir_all(root.join("nested")).expect("root");
+                let public = root.join("public.md");
+                let private = root.join("nested/private.md");
+                fs::write(&public, "public").expect("public source");
+                fs::write(&private, "private").expect("private source");
+                let ignore_file = root.join("nested/.ignore");
+                fs::write(&ignore_file, "private[9-0].md\n").expect("invalid nested policy");
+                let events = vec![
+                    WatchEvent::modified(&public, 100, None),
+                    WatchEvent::modified(&private, 100, None),
+                ];
+                let roots = [root];
+                let discovery = DiscoveryConfig::default();
+                let pipeline = RecordingPipeline::default();
+                let queue = Arc::new(Mutex::new(VecDeque::from([events.clone()])));
+                let reconciliation = Arc::new(Mutex::new(ReconciliationState::default()));
+                let stats = WatcherStatsInner::default();
+                let stop = WatcherStop::default();
+                let producer_done = AtomicBool::new(true);
+                if stopping {
+                    stop.request();
+                }
+                assert_incomplete_ignore_policy(
+                    run_ingest_loop(
+                        &cx,
+                        &roots,
+                        &discovery,
+                        &pipeline,
+                        &queue,
+                        &stop,
+                        &stats,
+                        &reconciliation,
+                        100,
+                        &producer_done,
+                        &collect_snapshot_from_roots,
+                        &|| true,
+                    )
+                    .await
+                    .expect_err("reject admission before the sink boundary"),
+                    &ignore_file,
+                );
+                assert!(lock_or_recover(&pipeline.attempts).is_empty());
+                assert_eq!(lock_or_recover(&queue).front(), Some(&events));
+                assert!(!lock_or_recover(&reconciliation).required);
+
+                fs::write(&ignore_file, "private.md\n").expect("repair policy");
+                stop.request();
+                run_ingest_loop(
+                    &cx,
+                    &roots,
+                    &discovery,
+                    &pipeline,
+                    &queue,
+                    &stop,
+                    &stats,
+                    &reconciliation,
+                    100,
+                    &producer_done,
+                    &collect_snapshot_from_roots,
+                    &|| true,
+                )
+                .await
+                .expect("retry retained batch during graceful drain");
+                assert!(matches!(
+                    pipeline.all_ops().as_slice(),
+                    [WatchIngestOp::Upsert { file_key, .. }]
+                        if file_key == &normalize_file_key(&public)
+                ));
+                assert!(lock_or_recover(&queue).is_empty());
+                assert!(lock_or_recover(&reconciliation).required);
+            });
+        }
+    }
+
+    #[test]
+    fn watcher_ignore_policy_failure_cannot_advance_deletion_authority() {
+        run_on_local_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            fs::create_dir_all(root.join(".git")).expect("repository");
+            let public = root.join("public.md");
+            let private = root.join("private.md");
+            fs::write(&public, "public").expect("public source");
+            fs::write(&private, "private").expect("private source");
+            let roots = [root.clone()];
+            let discovery = DiscoveryConfig::default();
+            let (baseline, _) = collect_snapshot_from_roots(&roots, &discovery, &|| false)
+                .expect("initial valid policy");
+            assert!(baseline.contains_key(&private));
+            let authority = super::DeletionAuthorityState::Established {
+                authority: authority_over(baseline.clone(), &roots),
+                legacy: None,
+            };
+            let reconciliation = Arc::new(Mutex::new(ReconciliationState {
+                indexed_snapshot: baseline.clone(),
+                baseline_initialized: true,
+                required: true,
+                authority: authority.clone(),
+                ..ReconciliationState::default()
+            }));
+            let ignore_file = root.join(".gitignore");
+            fs::write(&ignore_file, "private.md\nprivate[9-0].md\n").expect("partial policy");
+            let pipeline = RecordingPipeline::default();
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+            assert_incomplete_ignore_policy(
+                run_authoritative_reconciliation(
+                    &cx,
+                    &roots,
+                    &discovery,
+                    &pipeline,
+                    &reconciliation,
+                    &queue,
+                    &stats,
+                    100,
+                    &collect_snapshot_from_roots,
+                    &|| false,
+                )
+                .await
+                .expect_err("partial ignore policy supplies no deletion authority"),
+                &ignore_file,
+            );
+            assert!(lock_or_recover(&pipeline.attempts).is_empty());
+            {
+                let state = lock_or_recover(&reconciliation);
+                assert!(state.required);
+                assert_eq!(state.indexed_snapshot, baseline);
+                assert_eq!(state.authority, authority);
+            }
+
+            fs::write(&ignore_file, "private.md\n").expect("complete exclusion policy");
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                &pipeline,
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect("corrected policy can reconcile exclusions");
+            let ops = pipeline.all_ops();
+            assert!(ops.iter().any(|op| matches!(
+                op, WatchIngestOp::Delete { file_key, .. }
+                    if file_key == &normalize_file_key(&private)
+            )));
+            assert!(!ops.iter().any(|op| matches!(
+                op, WatchIngestOp::Upsert { file_key, .. }
+                    if file_key == &normalize_file_key(&private)
+            )));
+            assert!(!lock_or_recover(&reconciliation).required);
+        });
     }
 
     #[test]
@@ -6206,9 +6943,12 @@ mod tests {
             if let Some(op) = super::event_to_ingest_op(
                 &DiscoveryConfig::default(),
                 &[],
-                &mut super::IgnoreRules::new(),
+                &mut super::IgnoreRules::new().expect("load ignore policy"),
                 &lineage_event,
-            ) {
+                None,
+            )
+            .expect("valid ignore policy")
+            {
                 let _ = pipeline.apply_batch(&cx, std::slice::from_ref(&op)).await;
             }
             assert!(
