@@ -13850,7 +13850,9 @@ impl FsfsRuntime {
             subsystem: "fsfs.search.cache",
             source: Box::new(source),
         })?;
-        fs::write(cache_path, json).map_err(SearchError::Io)?;
+        // Publish a whole record so a concurrent reader never mistakes a
+        // partial write for cache corruption and needlessly reloads a model.
+        write_replace(cache_path, json).map_err(SearchError::Io)?;
         Ok(())
     }
 
@@ -61135,6 +61137,68 @@ mod tests {
         assert_eq!(
             FsfsRuntime::model_doctor_check(&unregistered, temp.path(), &mut None).verdict,
             super::DoctorVerdict::Fail
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_payload_cache_publication_preserves_open_readers() {
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            index_dir: Some(temp.path().to_path_buf()),
+            ..CliInput::default()
+        });
+        let query = "cache publication";
+        let key = runtime
+            .search_cache_key(query, 1, SearchExecutionMode::LexicalOnly)
+            .unwrap();
+        let generation = "cache-publication-fixture";
+        let initial = vec![SearchPayload::new(
+            query,
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "original.rs".to_owned(),
+                line: None,
+                score: 0.75,
+                snippet: Some("original cached answer".to_owned()),
+                lexical_rank: Some(0),
+                semantic_rank: None,
+                hash_rank: None,
+                in_both_sources: false,
+            }],
+        )];
+        runtime
+            .write_search_payload_cache(&key, &initial, generation)
+            .unwrap();
+        let cache_path = runtime.search_cache_path(&key).unwrap();
+        let original_bytes = fs::read(&cache_path).unwrap();
+        let mut reader = fs::File::open(&cache_path).unwrap();
+
+        let mut replacement = initial.clone();
+        "replacement-with-a-longer-path.rs".clone_into(&mut replacement[0].hits[0].path);
+        replacement[0].hits[0].score = 0.25;
+        replacement[0].hits[0].snippet = Some("a different, longer cached answer".repeat(32));
+        runtime
+            .write_search_payload_cache(&key, &replacement, generation)
+            .unwrap();
+
+        // A reader that opened the previous record must finish that exact
+        // JSON document even after another search publishes its replacement.
+        let mut retained_bytes = Vec::new();
+        reader.read_to_end(&mut retained_bytes).unwrap();
+        assert_eq!(retained_bytes, original_bytes);
+        let retained: super::SearchCacheRecord = serde_json::from_slice(&retained_bytes).unwrap();
+        assert_eq!(retained.payloads, initial);
+        assert_eq!(
+            runtime
+                .try_load_search_payload_cache(&key, generation)
+                .unwrap()
+                .unwrap(),
+            replacement
         );
     }
 

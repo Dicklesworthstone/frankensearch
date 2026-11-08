@@ -63,8 +63,12 @@ with planned commands after an unsuccessful build.
 The runner verifies the supplied evidence's source and binary bindings; it cannot
 reconstruct an unrecorded build.
 
+This measures the persisted answer cache in the legacy index layout, explicitly
+setting FSFS_COMPLETE_GENERATIONS=0. Complete-generation stores are the default
+for new roots on Linux and macOS; their one-shot searches deliberately do not
+persist answer caches and are outside this measurement's scope.
 Cold/warm here means the persisted ANSWER cache, not the OS page cache. Each arm
-and round receives a copy of one index. The baseline must load Model2Vec once on
+and round receives a copy of one legacy index. The baseline must load Model2Vec once on
 both requests; the candidate must load once cold and zero times warm. Payloads,
 ordered hits/scores, and cache bytes, mtime, and record count are checked.
 Registered model verification remains mandatory in every receipt mode. Timing is
@@ -582,7 +586,10 @@ def run_benchmark(args):
             "qualifies_promotion": False, "qualifies_competitive_win": False,
             "feature_profile": metadata["feature_profile"],
             "receipt_mode": args.receipt_mode,
-            "cache_scope": "answer cache cold/warm; no OS page cache eviction",
+            "cache_scope": (
+                "persisted legacy-layout answer cache (FSFS_COMPLETE_GENERATIONS=0); "
+                "fresh --no-daemon processes; no OS page cache eviction"
+            ),
             "build_metadata": metadata, "source_provenance": sources,
             "model": {"id": MODEL_ID, "repository": MODEL_REPOSITORY,
                       "revision": MODEL_REVISION, "artifacts": MODEL_ARTIFACTS,
