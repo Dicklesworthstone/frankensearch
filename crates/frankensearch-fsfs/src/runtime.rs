@@ -9015,7 +9015,9 @@ impl FsfsRuntime {
             .collect();
 
         if self.cli_input.format == OutputFormat::Table {
-            if let Some(mode_hint) = search_runtime.search_readiness_warning()? {
+            if let Some(mode_hint) =
+                search_runtime.search_readiness_warning_for_payload(&payload)?
+            {
                 // Same color rule as the table below: NO_COLOR and a piped
                 // stdout both mean plain text.
                 let no_color = self.cli_input.no_color
@@ -9121,6 +9123,24 @@ impl FsfsRuntime {
 
     fn search_mode_hint(&self) -> SearchResult<Option<String>> {
         Ok(self.search_readiness()?.map(|(hint, _)| hint))
+    }
+
+    /// Rendering follows successful search or cache admission. A fast-only
+    /// semantic Initial already proves the primary producer was available;
+    /// inspecting its model directory again adds no readiness information and
+    /// can rehash the entire model when its verification receipt is absent.
+    /// Other results retain the usual actionable installation/index guidance.
+    fn search_readiness_warning_for_payload(
+        &self,
+        payload: &SearchPayload,
+    ) -> SearchResult<Option<String>> {
+        if self.quality_disabled_by_policy()
+            && payload.phase == SearchOutputPhase::Initial
+            && payload_has_admitted_semantic_hits(payload)
+        {
+            return Ok(None);
+        }
+        self.search_readiness_warning()
     }
 
     /// The readiness hint to print above a table of results: only one that
@@ -61050,6 +61070,106 @@ mod tests {
                 "doctor must prescribe a loader-capable build"
             );
         }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn admitted_fast_table_result_avoids_redundant_readiness_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_root = temp.path().join("index");
+        let mut config = FsfsConfig::default();
+        config.indexing.model_dir = temp.path().join("models").display().to_string();
+        config.storage.index_dir = index_root.display().to_string();
+        config.indexing.offline = true;
+        config.search.fast_only = true;
+        let runtime = FsfsRuntime::new(config);
+        let fallback = runtime.search_readiness_warning().unwrap();
+        assert!(
+            fallback.is_some(),
+            "missing model cache is the observation control"
+        );
+
+        // An admitted daemon can retain its producer after the installation
+        // was moved. Rendering a successful result must not inspect it again.
+        let semantic = SearchPayload::new(
+            "readiness",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "result.rs".to_owned(),
+                line: None,
+                score: 0.75,
+                snippet: None,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                hash_rank: None,
+                in_both_sources: false,
+            }],
+        )
+        .with_vector_generation("potion-multilingual-128M", false);
+        assert!(
+            runtime
+                .search_readiness_warning_for_payload(&semantic)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut lexical = semantic.clone();
+        lexical.hits[0].semantic_rank = None;
+        lexical.hits[0].lexical_rank = Some(0);
+        let hash = semantic.clone().with_vector_generation("fnv1a-256", true);
+        let empty = SearchPayload::new("readiness", SearchOutputPhase::Initial, 0, Vec::new());
+        let mut refined = semantic.clone();
+        refined.phase = SearchOutputPhase::Refined;
+        let mut failed = semantic.clone();
+        failed.phase = SearchOutputPhase::RefinementFailed;
+        for (label, payload) in [
+            ("lexical", &lexical),
+            ("hash control", &hash),
+            ("empty", &empty),
+            ("refined or expanded", &refined),
+            ("failed refinement", &failed),
+        ] {
+            assert_eq!(
+                runtime
+                    .search_readiness_warning_for_payload(payload)
+                    .unwrap(),
+                fallback,
+                "{label} must retain its actionable warning"
+            );
+        }
+
+        let mut full = runtime.clone();
+        full.config.search.fast_only = false;
+        assert_eq!(
+            full.search_readiness_warning_for_payload(&semantic)
+                .unwrap(),
+            full.search_readiness_warning().unwrap(),
+            "an Initial alone does not establish optional quality readiness"
+        );
+        full.config.pressure.degradation_override = DegradationOverrideMode::ForceEmbedDeferred;
+        assert!(
+            full.search_readiness_warning_for_payload(&semantic)
+                .unwrap()
+                .is_none(),
+            "explicit quality deferral retains the admitted fast result"
+        );
+
+        fs::create_dir_all(&index_root).unwrap();
+        fs::write(index_root.join(super::FSFS_VECTOR_MANIFEST_FILE), b"[]").unwrap();
+        let missing_vector = runtime.search_readiness_warning().unwrap();
+        assert!(
+            missing_vector
+                .as_deref()
+                .is_some_and(|hint| hint.contains("no readable vector generation"))
+        );
+        assert_eq!(
+            runtime
+                .search_readiness_warning_for_payload(&empty)
+                .unwrap(),
+            missing_vector
+        );
     }
 
     #[cfg(all(feature = "semantic-support", not(feature = "embedded-models")))]

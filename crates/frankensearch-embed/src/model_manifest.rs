@@ -3276,6 +3276,11 @@ pub fn verify_file_sha256(
         path: path.to_path_buf(),
         source: Box::new(source),
     })?;
+    tracing::debug!(
+        path = %path.display(),
+        expected_size,
+        "verifying model artifact bytes"
+    );
     let mut reader = BufReader::new(file);
     let mut buffer = [0_u8; HASH_BUFFER_SIZE];
     let mut hasher = Sha256::new();

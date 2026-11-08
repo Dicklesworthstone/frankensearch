@@ -684,31 +684,60 @@ mod loader_only {
             "[indexing]\nfast_model = \"potion-multilingual-128M\"\n",
         )
         .unwrap();
+        let run_formatted_search =
+            |runner: &IsolatedFsfs, label: &str, config: &Path, uncached: bool, format: &str| {
+                let mut env = vec![(
+                    "FRANKENSEARCH_LOG",
+                    "info,frankensearch_embed::model_manifest=debug",
+                )];
+                if uncached {
+                    env.push(("FSFS_DISABLE_QUERY_CACHE", "1"));
+                }
+                runner.run_with_env(
+                    root,
+                    label,
+                    [
+                        "search",
+                        query,
+                        "--config",
+                        config.to_str().unwrap(),
+                        "--index-dir",
+                        index.to_str().unwrap(),
+                        "--no-daemon",
+                        "--fast-only",
+                        "--limit",
+                        "3",
+                        "--format",
+                        format,
+                    ],
+                    QUICKSTART_TIMEOUT,
+                    &env,
+                )
+            };
         let run_search = |runner: &IsolatedFsfs, label: &str, config: &Path, uncached: bool| {
-            let mut env = vec![("FRANKENSEARCH_LOG", "info")];
-            if uncached {
-                env.push(("FSFS_DISABLE_QUERY_CACHE", "1"));
+            run_formatted_search(runner, label, config, uncached, "json")
+        };
+        let manifest = ModelManifest::potion_128m();
+        let assert_hash_attempts = |label: &str, outcome: &CommandOutcome, expected: usize| {
+            let attempts = outcome
+                .stderr
+                .lines()
+                .filter(|line| line.contains("verifying model artifact bytes"))
+                .collect::<Vec<_>>();
+            assert_eq!(attempts.len(), expected, "{label}: {outcome:?}");
+            for artifact in &manifest.files {
+                let size_field = format!("expected_size={}", artifact.size);
+                assert_eq!(
+                    attempts
+                        .iter()
+                        .filter(|line| {
+                            line.contains(&artifact.name) && line.contains(&size_field)
+                        })
+                        .count(),
+                    usize::from(expected != 0),
+                    "each intact artifact must be hashed once or reuse its receipt: {label}: {outcome:?}"
+                );
             }
-            runner.run_with_env(
-                root,
-                label,
-                [
-                    "search",
-                    query,
-                    "--config",
-                    config.to_str().unwrap(),
-                    "--index-dir",
-                    index.to_str().unwrap(),
-                    "--no-daemon",
-                    "--fast-only",
-                    "--limit",
-                    "3",
-                    "--format",
-                    "json",
-                ],
-                QUICKSTART_TIMEOUT,
-                &env,
-            )
         };
         let search = |label: &str, config: &Path| run_search(fsfs, label, config, false);
         let cold = search("fast-model-cache-cold", &selected);
@@ -752,6 +781,7 @@ mod loader_only {
                 warm.stderr.contains("model verification receipt accepted"),
                 "replay must still verify the installed producer: {warm:?}"
             );
+            assert_hash_attempts("warm JSON with valid receipt", &warm, 0);
             assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
             warm_elapsed.push(warm.elapsed);
         }
@@ -852,14 +882,40 @@ mod loader_only {
             let cached = run_search(&probe, &format!("cached-{label}"), &selected, false);
             let uncached = run_search(&probe, &format!("uncached-{label}"), &selected, true);
             assert_same_fast_producer_refusal(label, &cached, &uncached);
+            if matches!(label, "missing-model-install" | "changed-weights") {
+                let table = run_formatted_search(
+                    &probe,
+                    &format!("table-{label}"),
+                    &selected,
+                    false,
+                    "table",
+                );
+                assert!(!table.timed_out, "{label}: {table:?}");
+                assert!(!table.status.success(), "{label}: {table:?}");
+                assert_eq!(table.status.code(), cached.status.code(), "{label}");
+                let error: Value = serde_json::from_str(&cached.stdout).unwrap();
+                assert!(
+                    table
+                        .stderr
+                        .contains(error["error"]["code"].as_str().unwrap()),
+                    "{label}: {table:?}"
+                );
+                assert!(
+                    table.stdout.is_empty(),
+                    "table output must not publish results before producer refusal: {label}: {table:?}"
+                );
+                assert!(
+                    !table.stderr.contains("Model2Vec model loaded"),
+                    "{label}: {table:?}"
+                );
+            }
             assert_preserved();
         };
         assert_refused("missing-model-install");
 
-        let manifest = ModelManifest::potion_128m();
         let install = models.join("potion-multilingual-128M");
         copy_verified_potion_install(&fsfs.model_root.join("potion-multilingual-128M"), &install);
-        let assert_replayed = |label: &str| {
+        let assert_replayed = |label: &str, expected_hashes: usize| {
             let outcome = run_search(&probe, label, &selected, false);
             let replayed = parse_success_envelope(label, &outcome);
             assert_eq!(replayed["data"], original["data"], "{label}");
@@ -867,9 +923,38 @@ mod loader_only {
                 !outcome.stderr.contains("Model2Vec model loaded"),
                 "{label}: {outcome:?}"
             );
+            assert_hash_attempts(label, &outcome, expected_hashes);
             assert_preserved();
         };
-        assert_replayed("identical-producer-at-new-model-root");
+        let assert_table_replayed = |label: &str, expected_hashes: usize| {
+            let outcome = run_formatted_search(&probe, label, &selected, false, "table");
+            assert_finished_successfully(label, &outcome);
+            assert!(
+                outcome.stdout.contains("PHASE INITIAL"),
+                "{label}: {outcome:?}"
+            );
+            for hit in original["data"]["hits"].as_array().unwrap() {
+                assert!(
+                    outcome.stdout.contains(hit["path"].as_str().unwrap()),
+                    "the table must render the cached hits: {label}: {outcome:?}"
+                );
+            }
+            assert!(
+                !outcome.stderr.contains("Model2Vec model loaded"),
+                "{label}: {outcome:?}"
+            );
+            assert_eq!(
+                outcome
+                    .stderr
+                    .contains("model verification receipt accepted"),
+                expected_hashes == 0,
+                "{label}: {outcome:?}"
+            );
+            assert_hash_attempts(label, &outcome, expected_hashes);
+            assert_preserved();
+        };
+        assert_replayed("identical-producer-at-new-model-root", 0);
+        assert_table_replayed("verified-table-with-receipt", 0);
 
         // Reusing a pathname does not preserve its receipt's file identities.
         // Authentic replacement bytes can still pass full verification, but
@@ -885,12 +970,12 @@ mod loader_only {
         fs::copy(retained_install.join(".verified"), &replacement_receipt).unwrap();
         let stale_receipt_bytes = fs::read(&replacement_receipt).unwrap();
         assert!(!is_verification_cached(&manifest, &install));
-        assert_replayed("replaced-directory-with-stale-receipt");
+        assert_replayed("replaced-directory-with-stale-receipt", 2);
         assert_eq!(fs::read(&replacement_receipt).unwrap(), stale_receipt_bytes);
         assert!(!is_verification_cached(&manifest, &install));
         fs::rename(&install, fixture.join("retained-replacement-install")).unwrap();
         fs::rename(&retained_install, &install).unwrap();
-        assert_replayed("restored-original-install");
+        assert_replayed("restored-original-install", 0);
 
         // A receipt covers the registered files only. An extra semantic-role
         // artifact must still be rejected by the frozen producer manifest.
@@ -905,7 +990,7 @@ mod loader_only {
             receipt_before_extra
         );
         fs::rename(&extra_weights, fixture.join("retained-extra-weights")).unwrap();
-        assert_replayed("restored-registered-artifact-set");
+        assert_replayed("restored-registered-artifact-set", 0);
 
         let tokenizer = install.join("tokenizer.json");
         let retained_tokenizer = fixture.join("retained-tokenizer.json");
@@ -952,7 +1037,7 @@ mod loader_only {
             drop(file);
             frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install)
                 .expect("restore and fully verify the exact producer bytes");
-            assert_replayed(&format!("restored-{label}"));
+            assert_replayed(&format!("restored-{label}"), 0);
         }
 
         // A missing receipt is not a missing producer: full verification of
@@ -961,18 +1046,24 @@ mod loader_only {
         let retained_receipt = fixture.join("retained-verification-receipt");
         fs::rename(&receipt, &retained_receipt).unwrap();
         assert!(!is_verification_cached(&manifest, &install));
-        assert_replayed("verified-without-receipt");
+        // The nonzero count proves DEBUG observations are enabled. Table
+        // rendering must not run the same full hash pass again for its hint.
+        assert_replayed("verified-without-receipt", 2);
+        assert!(!receipt.exists(), "read admission must not mint a receipt");
+        assert_table_replayed("verified-table-without-receipt", 2);
         assert!(!receipt.exists(), "read admission must not mint a receipt");
         fs::rename(&retained_receipt, &receipt).unwrap();
-        assert_replayed("restored-producer-receipt");
+        assert_replayed("restored-producer-receipt", 0);
         let intact_receipt = fs::read(&receipt).unwrap();
         let malformed_receipt = b"{invalid verification receipt";
         fs::write(&receipt, malformed_receipt).unwrap();
         assert!(!is_verification_cached(&manifest, &install));
-        assert_replayed("verified-with-malformed-receipt");
+        assert_replayed("verified-with-malformed-receipt", 2);
+        assert_eq!(fs::read(&receipt).unwrap(), malformed_receipt);
+        assert_table_replayed("verified-table-with-malformed-receipt", 2);
         assert_eq!(fs::read(&receipt).unwrap(), malformed_receipt);
         fs::write(&receipt, intact_receipt).unwrap();
-        assert_replayed("restored-well-formed-receipt");
+        assert_replayed("restored-well-formed-receipt", 0);
 
         // Valid model files cannot authorize an answer from a different
         // embedding contract. Keep the cache filename so key admission must
@@ -1038,7 +1129,7 @@ mod loader_only {
             assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
         }
         eprintln!(
-            "[default-build-e2e] stage=fast-model-answer-cache real_potion=true cold_ms={} warm_median_ms={} warm_samples_ms={:?} warm_replay=true missing_producer_refused=true changed_artifacts_refused=true extra_artifact_refused=true same_error_as_uncached=true replaced_directory_reverified=true full_verification_without_receipt=true malformed_receipt_reverified=true changed_contract_recomputed=true corrupt_answer_recomputed=true repaired_answer_replayed=true changed_producer_refused=true malformed_selection_refused=true canonical_alias_reused=true generation_preserved=true",
+            "[default-build-e2e] stage=fast-model-answer-cache real_potion=true cold_ms={} warm_median_ms={} warm_samples_ms={:?} warm_replay=true missing_producer_refused=true changed_artifacts_refused=true extra_artifact_refused=true same_error_as_uncached=true replaced_directory_reverified=true full_verification_without_receipt=true malformed_receipt_reverified=true warm_json_table_hashes=valid:0,absent:2,malformed:2 table_missing_changed_refused=true changed_contract_recomputed=true corrupt_answer_recomputed=true repaired_answer_replayed=true changed_producer_refused=true malformed_selection_refused=true canonical_alias_reused=true generation_preserved=true",
             cold.elapsed.as_millis(),
             warm_median.as_millis(),
             warm_elapsed
