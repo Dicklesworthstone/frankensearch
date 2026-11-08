@@ -5935,6 +5935,11 @@ struct QuillWriterState {
     /// an ambiguous partial batch must be reconciled by `commit` before any
     /// further scalar indexing is accepted.
     ingest_retry_required: bool,
+    /// Bench/test-only, default OFF: seal simultaneous fan-out lease cuts one
+    /// shard at a time, as the incumbent did, so one binary can compare it
+    /// against the concurrent build in [`Self::seal_lease_cuts`].
+    #[cfg(any(test, feature = "bench-internals"))]
+    serial_lease_cut_seals: bool,
     /// Test-only, per index, default OFF. When set, the shared-nothing routes
     /// arm the shard rendezvous from their REAL plan so a test can force
     /// overlap. It must stay opt-in: arming it for every `cfg(test)` fan-out
@@ -6403,6 +6408,8 @@ impl QuillWriterState {
             pending_delta_seal: None,
             unpublished_since: None,
             ingest_retry_required: false,
+            #[cfg(any(test, feature = "bench-internals"))]
+            serial_lease_cut_seals: false,
             #[cfg(test)]
             force_ingest_overlap_rendezvous: false,
             #[cfg(test)]
@@ -8650,6 +8657,13 @@ impl QuillWriterState {
 
             for round in 0..rounds {
                 // Seal any shard whose lease rolled before its ordinals are used.
+                // Every shard receives the same share of a wave, so shards fill
+                // their leases in lockstep and roll together; their seals are
+                // independent and are built together (see `seal_lease_cuts`).
+                let mut rolled_shards = Vec::new();
+                rolled_shards
+                    .try_reserve_exact(allocations.len())
+                    .map_err(|_| invalid_state("could not reserve rolled-lease seal set"))?;
                 for (shard, _, spans) in &allocations {
                     let Some(span) = spans.get(round) else {
                         continue;
@@ -8658,10 +8672,14 @@ impl QuillWriterState {
                         .current_lease_base
                         .is_some_and(|base| base != span.lease_base);
                     if lease_changed {
-                        self.flush_shard(cx, *shard, LifecycleTrigger::LeaseBoundary)
-                            .await?;
+                        rolled_shards.push(*shard);
                     }
-                    self.shards[*shard].current_lease_base = Some(span.lease_base);
+                }
+                self.seal_lease_cuts(cx, &rolled_shards, false).await?;
+                for (shard, _, spans) in &allocations {
+                    if let Some(span) = spans.get(round) {
+                        self.shards[*shard].current_lease_base = Some(span.lease_base);
+                    }
                 }
 
                 // Shared-nothing parallel accumulate. Disjoint `&mut` shard
@@ -8720,9 +8738,15 @@ impl QuillWriterState {
                 // Seal shards that filled their budget, or that still have a
                 // span waiting behind a lease boundary. Lease cuts remain
                 // ordered because a later span cannot be consumed until its
-                // predecessor is installed. Budget cuts are independent, so
-                // build every crossing shard together instead of serializing
-                // several full accumulated-segment encodes on this one batch.
+                // predecessor is installed. Cuts of different shards are
+                // independent, so every crossing shard of one kind is built
+                // together instead of serializing several full
+                // accumulated-segment encodes on this one batch: lease cuts
+                // first, then budget cuts, each installed in shard order.
+                let mut boundary_shards = Vec::new();
+                boundary_shards
+                    .try_reserve_exact(allocations.len())
+                    .map_err(|_| invalid_state("could not reserve lease-cut seal set"))?;
                 let mut budget_flushes = Vec::new();
                 budget_flushes
                     .try_reserve_exact(allocations.len())
@@ -8731,23 +8755,17 @@ impl QuillWriterState {
                     let Some(span) = spans.get(round) else {
                         continue;
                     };
-                    let boundary_pending = spans.len() > round + 1;
-                    let budget_reached = self.shards[*shard]
+                    if spans.len() > round + 1 {
+                        boundary_shards.push(*shard);
+                    } else if self.shards[*shard]
                         .accumulator
-                        .should_flush(self.config.scribe_shard_budget_bytes);
-                    if !boundary_pending && !budget_reached {
-                        continue;
-                    }
-                    if boundary_pending {
-                        self.flush_shard(cx, *shard, LifecycleTrigger::LeaseBoundary)
-                            .await?;
-                        if allow_automatic_publication {
-                            self.publish_bulk_cadence_if_due(cx).await?;
-                        }
-                    } else {
+                        .should_flush(self.config.scribe_shard_budget_bytes)
+                    {
                         budget_flushes.push((*shard, span.lease_base));
                     }
                 }
+                self.seal_lease_cuts(cx, &boundary_shards, allow_automatic_publication)
+                    .await?;
                 let mut budget_shards = Vec::new();
                 budget_shards
                     .try_reserve_exact(budget_flushes.len())
@@ -9827,6 +9845,58 @@ impl QuillWriterState {
             .collect::<Vec<_>>();
         self.flush_selected_shards(cx, &nonempty, trigger, false)
             .await
+    }
+
+    /// Seal the lease cuts several fan-out shards reached in one round.
+    ///
+    /// A fan-out gives every shard the same share of a wave, so shards
+    /// exhaust their leases in lockstep and reach this point together. Each
+    /// cut is independent of the others, so [`Self::flush_selected_shards`]
+    /// builds them concurrently and installs them in the given ascending
+    /// shard order: the same segment bytes, seal sequence, segment-identity
+    /// inputs and bulk-cadence publications as sealing them one at a time.
+    async fn seal_lease_cuts(
+        &mut self,
+        cx: &Cx,
+        shards: &[usize],
+        allow_automatic_publication: bool,
+    ) -> Result<(), QuillIndexError> {
+        // The incumbent sealed one cut at a time; benches and tests can still
+        // select it to compare the two in one binary.
+        #[cfg(any(test, feature = "bench-internals"))]
+        if self.serial_lease_cut_seals {
+            for &shard in shards {
+                self.flush_selected_shards(
+                    cx,
+                    &[shard],
+                    LifecycleTrigger::LeaseBoundary,
+                    allow_automatic_publication,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        // A budget seal that empties a shard exactly where its lease runs out
+        // leaves the old base recorded, so the next wave reports that lease as
+        // rolled with nothing to seal. `flush_shard` skips such a shard, and a
+        // concurrent build cannot encode an empty accumulator, so skip it here.
+        let mut nonempty = Vec::new();
+        nonempty
+            .try_reserve_exact(shards.len())
+            .map_err(|_| invalid_state("could not reserve nonempty lease-cut seal set"))?;
+        nonempty.extend(
+            shards
+                .iter()
+                .copied()
+                .filter(|&shard| self.shards[shard].accumulator.document_count() != 0),
+        );
+        self.flush_selected_shards(
+            cx,
+            &nonempty,
+            LifecycleTrigger::LeaseBoundary,
+            allow_automatic_publication,
+        )
+        .await
     }
 
     async fn flush_selected_shards(
@@ -13944,6 +14014,48 @@ impl QuillIndex {
         Ok(BenchAdmissionSession {
             writer: self.lock_writer(cx, "index writer lock").await?,
         })
+    }
+
+    /// Bench-only: seal simultaneous fan-out lease cuts one shard at a time
+    /// (`true`, the incumbent) or build them together (`false`, shipping), for
+    /// a same-invocation A/B.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation or writer-lock failures.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn bench_set_serial_lease_cut_seals(
+        &self,
+        cx: &Cx,
+        serial: bool,
+    ) -> Result<(), QuillIndexError> {
+        self.lock_writer(cx, "index writer lock")
+            .await?
+            .serial_lease_cut_seals = serial;
+        Ok(())
+    }
+
+    /// Bench-only: verify each new segment at publication through its mapping
+    /// (`true`, the incumbent) or through its file descriptor (`false`,
+    /// shipping), for a same-invocation A/B. No-op for an in-memory index.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation or writer-lock failures.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn bench_set_mapped_preflight(
+        &self,
+        cx: &Cx,
+        mapped: bool,
+    ) -> Result<(), QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "index writer lock").await?;
+        if let IndexBackend::Durable(keeper) = &mut writer.backend {
+            keeper.set_benchmark_mapped_preflight(mapped);
+        }
+        drop(writer);
+        Ok(())
     }
 }
 
@@ -35761,6 +35873,414 @@ mod tests {
             parallel_budget_seals, 4,
             "every simultaneously crossing shard must use the parallel build path:\n{captured}",
         );
+    }
+
+    /// Two fan-out batches over four shards whose leases are nearly exhausted,
+    /// so every shard reaches a lease cut in the same round: the first batch
+    /// crosses its lease inside a wave (a second span is pending), the second
+    /// exhausts it exactly at a wave end (the next wave rolls the lease). The
+    /// scribe budget is far too large to cut first, as in CASS bulk rebuilds.
+    async fn lease_cut_fixture(cx: &Cx, serial_lease_cut_seals: bool) -> QuillIndex {
+        let lease = usize::try_from(crate::scribe::DOC_ORDS_PER_LEASE).expect("lease fits usize");
+        let mut index = QuillIndex::in_memory(QuillConfig {
+            max_ingest_shards: 4,
+            max_visibility_lag_ms: u64::MAX,
+            tier_fanout: usize::MAX,
+            scribe_shard_budget_bytes: 4 << 30,
+            ..QuillConfig::default()
+        })
+        .expect("lease-cut index");
+        index.writer_mut().serial_lease_cut_seals = serial_lease_cut_seals;
+        // Burn ordinals so each shard's live lease keeps exactly `leave`.
+        let leave_in_every_lease = |index: &mut QuillIndex, leave: usize| {
+            let writer = index.writer_mut();
+            assert_eq!(writer.shards.len(), 4, "the pool sizes four ingest shards");
+            for shard in 0..4 {
+                let (_, next_ord) = writer.docid_allocator.live_lease(shard).unwrap_or((0, 0));
+                let used = usize::try_from(next_ord).expect("ordinal fits usize");
+                let count = u32::try_from(lease - used - leave).expect("count fits u32");
+                writer
+                    .docid_allocator
+                    .alloc_batch(shard, count)
+                    .expect("burn lease ordinals");
+            }
+        };
+        let documents = |batch: usize, count: usize| {
+            (0..count)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("lease-cut-{batch}-{ordinal:05}"),
+                        format!("alpha w{} w{} lease", ordinal % 13, ordinal % 7),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        leave_in_every_lease(&mut index, 100);
+        index
+            .index_documents(cx, &documents(0, 1_600))
+            .await
+            .expect("cross every lease inside a wave");
+        index.commit(cx).await.expect("publish the first batch");
+        leave_in_every_lease(&mut index, 256);
+        index
+            .index_documents(cx, &documents(1, 2_048))
+            .await
+            .expect("exhaust every lease at a wave end");
+        index.commit(cx).await.expect("publish the second batch");
+        index
+    }
+
+    /// Count lease-cut lifecycle spans by `action`. Only lines whose innermost
+    /// span is the lifecycle span count: a span nested inside it (the scribe
+    /// flush of a one-at-a-time seal) repeats the lifecycle fields as context.
+    fn lease_cut_span_count(captured: &str, action: &str) -> usize {
+        captured
+            .lines()
+            .filter(|line| {
+                let context = line.split("}: ").next().unwrap_or_default();
+                let innermost = context.rsplit('{').next().unwrap_or_default();
+                innermost.contains(&format!("action=\"{action}\""))
+                    && innermost.contains("trigger=\"lease_boundary\"")
+            })
+            .count()
+    }
+
+    #[test]
+    fn shipping_fanout_builds_simultaneous_lease_cuts_in_parallel() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread lease-cut pool");
+        let captured = pool.install(|| {
+            capture_ingest_spans(|| {
+                run_with_cx(|cx| async move {
+                    let index = lease_cut_fixture(&cx, false).await;
+                    let snapshot = index.snapshot().expect("lease-cut snapshot");
+                    assert_eq!(snapshot.doc_count(), 3_648);
+                    let manifest = &snapshot.loaded_manifest().manifest;
+                    assert_pairwise_disjoint_manifest(&manifest.segments);
+                    let mut by_seal = manifest
+                        .segments
+                        .iter()
+                        .map(|segment| {
+                            (
+                                segment.seal_seq,
+                                segment.docid_lo,
+                                segment.docid_hi,
+                                segment.doc_count,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    by_seal.sort_unstable();
+                    assert_eq!(
+                        by_seal.iter().map(|row| row.0).collect::<Vec<_>>(),
+                        (1..=16).collect::<Vec<u64>>(),
+                    );
+                    let lease = u64::from(crate::scribe::DOC_ORDS_PER_LEASE);
+                    // Seals 1-4 and 9-12 are the two lease-cut rounds, 5-8 and
+                    // 13-16 the commits. A round's cuts are installed in shard
+                    // order, whose leases ascend.
+                    for (round, docs) in [(0..4, 100), (4..8, 300), (8..12, 256), (12..16, 256)] {
+                        let rows = &by_seal[round.clone()];
+                        assert!(rows.iter().all(|row| row.3 == docs), "{rows:?}");
+                        assert!(
+                            rows.windows(2).all(|pair| pair[0].1 < pair[1].1),
+                            "{rows:?}"
+                        );
+                        if round.start % 8 == 0 {
+                            assert!(rows.iter().all(|row| row.2 % lease == 0), "{rows:?}");
+                        }
+                    }
+                    drop(snapshot);
+                    assert_eq!(
+                        index
+                            .search_paginated(&cx, "lease", 4_096, 0, true)
+                            .expect("search committed lease-cut index")
+                            .total_count,
+                        Some(3_648),
+                    );
+                });
+            })
+        });
+
+        assert_eq!(
+            lease_cut_span_count(&captured, "install_parallel_build"),
+            8,
+            "every simultaneous lease cut must use the parallel build path:\n{captured}",
+        );
+        assert_eq!(lease_cut_span_count(&captured, "seal"), 0, "{captured}");
+    }
+
+    /// The concurrent lease-cut build publishes exactly what sealing the cuts
+    /// one at a time did: the same segments (ranges, counts, seal sequences,
+    /// section bytes), field statistics, watermark and ranked hits. Segment
+    /// identifiers and creation times are wall-clock derived in both arms.
+    #[test]
+    fn concurrent_lease_cuts_publish_what_one_at_a_time_cuts_did() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread lease-cut pool");
+        let build = |serial: bool| {
+            pool.install(|| {
+                let built = std::cell::RefCell::new(None);
+                let captured = capture_ingest_spans(|| {
+                    let built = &built;
+                    run_with_cx(|cx| async move {
+                        let index = lease_cut_fixture(&cx, serial).await;
+                        let hits = lease_cut_probe(&cx, &index);
+                        *built.borrow_mut() = Some((index.snapshot().expect("snapshot"), hits));
+                    });
+                });
+                let (snapshot, hits) = built.into_inner().expect("fixture ran");
+                (snapshot, hits, captured)
+            })
+        };
+        let (incumbent, incumbent_hits, incumbent_spans) = build(true);
+        let (candidate, candidate_hits, candidate_spans) = build(false);
+
+        // The incumbent arm really ran the one-at-a-time path.
+        assert_eq!(lease_cut_span_count(&incumbent_spans, "seal"), 8);
+        assert_eq!(
+            lease_cut_span_count(&incumbent_spans, "install_parallel_build"),
+            0
+        );
+        assert_eq!(
+            lease_cut_span_count(&candidate_spans, "install_parallel_build"),
+            8
+        );
+        assert_eq!(incumbent.segments().len(), 16);
+        assert_lease_cut_arms_match(&incumbent, &incumbent_hits, &candidate, &candidate_hits);
+    }
+
+    /// Ranked hits (identifier, global docid, score bits) and exact count of
+    /// each lease-cut probe query.
+    type LeaseCutHits = Vec<(Vec<(String, u32, u32)>, Option<u64>)>;
+
+    fn lease_cut_probe(cx: &Cx, index: &QuillIndex) -> LeaseCutHits {
+        ["alpha", "w3", "w5 w6", "\"w2 w2\""]
+            .iter()
+            .map(|query| {
+                index
+                    .search_paginated(cx, query, 64, 0, true)
+                    .expect("probe query")
+            })
+            .map(|result| {
+                (
+                    result
+                        .hits
+                        .iter()
+                        .map(|hit| {
+                            (
+                                hit.document_id.clone(),
+                                hit.global_docid,
+                                hit.score.to_bits(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    result.total_count,
+                )
+            })
+            .collect()
+    }
+
+    /// Both arms published the same segments (ranges, counts, seal sequences,
+    /// section bytes), field statistics, watermark, live documents and ranked
+    /// hits. Segment identifiers and creation times are wall-clock derived in
+    /// both arms and are not compared.
+    fn assert_lease_cut_arms_match(
+        incumbent: &KeeperSnapshot,
+        incumbent_hits: &LeaseCutHits,
+        candidate: &KeeperSnapshot,
+        candidate_hits: &LeaseCutHits,
+    ) {
+        let (left, right) = (
+            &incumbent.loaded_manifest().manifest,
+            &candidate.loaded_manifest().manifest,
+        );
+        assert_eq!(left.docid_high_watermark, right.docid_high_watermark);
+        assert_eq!(left.field_stats, right.field_stats);
+        assert_eq!(incumbent.doc_count(), candidate.doc_count());
+        assert_eq!(incumbent.segments().len(), candidate.segments().len());
+        for (left, right) in incumbent.segments().iter().zip(candidate.segments()) {
+            let (lm, rm) = (left.manifest(), right.manifest());
+            assert_eq!(
+                (lm.docid_lo, lm.docid_hi, lm.doc_count, lm.seal_seq),
+                (rm.docid_lo, rm.docid_hi, rm.doc_count, rm.seal_seq),
+            );
+            assert_eq!(left.section_entries().len(), right.section_entries().len());
+            for (le, re) in left.section_entries().iter().zip(right.section_entries()) {
+                assert_eq!(le.kind, re.kind);
+                let range = |entry: &crate::segment::SectionEntry| {
+                    let start = usize::try_from(entry.offset).expect("offset fits usize");
+                    start..start + usize::try_from(entry.len).expect("length fits usize")
+                };
+                assert!(
+                    left.source_bytes()[range(le)] == right.source_bytes()[range(re)],
+                    "section {:?} of segment {lm:?} differs",
+                    le.kind
+                );
+            }
+        }
+        assert!(incumbent_hits.iter().all(|(hits, _)| !hits.is_empty()));
+        assert_eq!(incumbent_hits, candidate_hits);
+    }
+
+    /// Four shards whose leases one fan-out uses up exactly at a wave end,
+    /// under a budget that the long documents of shards 0 and 1 reach and the
+    /// short documents of shards 2 and 3 do not. The budget seal empties shards
+    /// 0 and 1 but keeps their used-up leases recorded, so the next fan-out
+    /// rolls all four leases in one round: two cuts with rows to seal and two
+    /// with nothing, which `flush_shard` skips. `budget: None` keeps the 4 GiB
+    /// budget and stops after the lease-ending batch, before any seal, so a
+    /// caller can read each shard's arena use.
+    async fn rolled_after_budget_seal_fixture(
+        cx: &Cx,
+        serial_lease_cut_seals: bool,
+        budget: Option<usize>,
+    ) -> QuillIndex {
+        let lease = usize::try_from(crate::scribe::DOC_ORDS_PER_LEASE).expect("lease fits usize");
+        let wave = FANOUT_WAVE_SHARD_DOCUMENTS;
+        let mut index = QuillIndex::in_memory(QuillConfig {
+            max_ingest_shards: 4,
+            max_visibility_lag_ms: u64::MAX,
+            tier_fanout: usize::MAX,
+            scribe_shard_budget_bytes: 4 << 30,
+            ..QuillConfig::default()
+        })
+        .expect("rolled-lease index");
+        let writer = index.writer_mut();
+        writer.serial_lease_cut_seals = serial_lease_cut_seals;
+        assert_eq!(writer.shards.len(), 4, "the pool sizes four ingest shards");
+        // Leave two waves of ordinals in every lease.
+        for shard in 0..4 {
+            let count = u32::try_from(lease - 2 * wave).expect("count fits u32");
+            writer
+                .docid_allocator
+                .alloc_batch(shard, count)
+                .expect("burn lease ordinals");
+        }
+        // One wave per shard; shard `s` receives the `s`-th contiguous quarter,
+        // so the first `long_shards` quarters hold the long documents.
+        let documents = |batch: usize, long_shards: usize| {
+            (0..4 * wave)
+                .map(|ordinal| {
+                    let mut body = format!("alpha w{} w{} lease", ordinal % 13, ordinal % 7);
+                    if ordinal < long_shards * wave {
+                        body.push_str(&" filler".repeat(48));
+                    }
+                    IndexableDocument::new(format!("rolled-{batch}-{ordinal:05}"), body)
+                })
+                .collect::<Vec<_>>()
+        };
+        index
+            .index_documents(cx, &documents(0, 0))
+            .await
+            .expect("leave rows in every shard");
+        if let Some(budget) = budget {
+            index.writer_mut().reader.config.scribe_shard_budget_bytes = budget;
+        }
+        index
+            .index_documents(cx, &documents(1, 2))
+            .await
+            .expect("use up every lease at a wave end");
+        if budget.is_none() {
+            return index;
+        }
+        let writer = index.writer_mut();
+        for (shard, state) in writer.shards.iter().enumerate() {
+            assert!(
+                state.current_lease_base.is_some(),
+                "shard {shard} keeps its used-up lease"
+            );
+            assert_eq!(
+                state.accumulator.document_count(),
+                if shard < 2 { 0 } else { 2 * wave },
+                "only the budget seal of shards 0 and 1 emptied them"
+            );
+        }
+        index
+            .index_documents(cx, &documents(2, 0))
+            .await
+            .expect("roll every lease in one round");
+        index.commit(cx).await.expect("publish the rolled leases");
+        index
+    }
+
+    #[test]
+    fn concurrent_lease_cuts_skip_leases_a_budget_seal_emptied() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread lease-cut pool");
+        // Without a budget seal, read each shard's arena use after the
+        // lease-ending batch; the budget then sits just above the short shards.
+        let budget = pool.install(|| {
+            let budget = std::cell::Cell::new(0);
+            run_with_cx(|cx| {
+                let budget = &budget;
+                async move {
+                    let mut index = rolled_after_budget_seal_fixture(&cx, false, None).await;
+                    let shards = &index.writer_mut().shards;
+                    let used = |shard: usize| shards[shard].accumulator.bytes_used();
+                    let short = used(2).max(used(3));
+                    assert!(
+                        short < used(0).min(used(1)),
+                        "long documents use more arena"
+                    );
+                    budget.set(short + 1);
+                }
+            });
+            budget.get()
+        });
+        let build = |serial: bool| {
+            pool.install(|| {
+                let built = std::cell::RefCell::new(None);
+                let captured = capture_ingest_spans(|| {
+                    let built = &built;
+                    run_with_cx(|cx| async move {
+                        let index =
+                            rolled_after_budget_seal_fixture(&cx, serial, Some(budget)).await;
+                        let hits = lease_cut_probe(&cx, &index);
+                        *built.borrow_mut() = Some((index.snapshot().expect("snapshot"), hits));
+                    });
+                });
+                let (snapshot, hits) = built.into_inner().expect("fixture ran");
+                (snapshot, hits, captured)
+            })
+        };
+        let (incumbent, incumbent_hits, incumbent_spans) = build(true);
+        let (candidate, candidate_hits, candidate_spans) = build(false);
+
+        // Only shards 2 and 3 had rows behind their rolled leases.
+        assert_eq!(lease_cut_span_count(&incumbent_spans, "seal"), 2);
+        assert_eq!(
+            lease_cut_span_count(&incumbent_spans, "install_parallel_build"),
+            0
+        );
+        assert_eq!(
+            lease_cut_span_count(&candidate_spans, "install_parallel_build"),
+            2
+        );
+        assert_eq!(lease_cut_span_count(&candidate_spans, "seal"), 0);
+        // Budget seals of shards 0 and 1, lease cuts of shards 2 and 3, then
+        // the commit's four seals.
+        let mut by_seal = candidate
+            .segments()
+            .iter()
+            .map(|segment| (segment.manifest().seal_seq, segment.manifest().doc_count))
+            .collect::<Vec<_>>();
+        by_seal.sort_unstable();
+        assert_eq!(
+            by_seal,
+            [512, 512, 512, 512, 256, 256, 256, 256]
+                .into_iter()
+                .zip(1..)
+                .map(|(docs, seal)| (seal, docs))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(candidate.doc_count(), 3_072);
+        assert_lease_cut_arms_match(&incumbent, &incumbent_hits, &candidate, &candidate_hits);
     }
 
     #[test]

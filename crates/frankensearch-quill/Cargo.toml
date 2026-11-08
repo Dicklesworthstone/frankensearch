@@ -145,5 +145,15 @@ name = "admission_filter_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "lease_cut_seal_ab"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "durable_commit_retention_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true

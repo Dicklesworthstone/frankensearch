@@ -5443,6 +5443,10 @@ pub struct KeeperWriter {
     /// Benchmark-only observer for the exact post-MANIFEST-sync checkpoint.
     #[cfg(feature = "bench-internals")]
     benchmark_qg4_directory_sync_state: Option<Arc<BenchmarkQuillDirectorySyncState>>,
+    /// Bench-only, default OFF: verify each new proposal segment through its
+    /// mapping, as the incumbent preflight did, for a same-binary A/B.
+    #[cfg(feature = "bench-internals")]
+    benchmark_mapped_preflight: bool,
     /// Bound only by the process-local Quill facade. Standalone Keeper users
     /// have no `ArcSwap` reader to coordinate, so they do not install this
     /// state word.
@@ -5763,6 +5767,8 @@ impl KeeperWriter {
             protection,
             #[cfg(feature = "bench-internals")]
             benchmark_qg4_directory_sync_state: None,
+            #[cfg(feature = "bench-internals")]
+            benchmark_mapped_preflight: false,
             publication_read_state: None,
             pending_publication: None,
         })
@@ -5812,6 +5818,11 @@ impl KeeperWriter {
         state: Arc<BenchmarkQuillDirectorySyncState>,
     ) {
         self.benchmark_qg4_directory_sync_state = Some(state);
+    }
+
+    #[cfg(feature = "bench-internals")]
+    pub(crate) fn set_benchmark_mapped_preflight(&mut self, mapped: bool) {
+        self.benchmark_mapped_preflight = mapped;
     }
 
     fn publication_read_state_is_stable_at(&self, generation: u64) -> bool {
@@ -5971,6 +5982,10 @@ impl KeeperWriter {
         // Segments the current snapshot verified are reused while their files
         // are unchanged, so a commit hashes only what it adds (bd-sw905).
         let retained = self.snapshot.segments().to_vec();
+        #[cfg(feature = "bench-internals")]
+        let mapped_preflight = self.benchmark_mapped_preflight;
+        #[cfg(not(feature = "bench-internals"))]
+        let mapped_preflight = false;
         let verified = spawn_blocking(move || {
             validate_proposed_manifest_segments(
                 &preflight_directory,
@@ -5978,6 +5993,7 @@ impl KeeperWriter {
                 schema,
                 &preflight_protection,
                 &retained,
+                mapped_preflight,
             )
         })
         .await?;
@@ -12089,6 +12105,7 @@ fn validate_proposed_manifest_segments(
     schema: SchemaDescriptor,
     protection: &WriterProtection,
     retained: &[RecoveredSegment],
+    mapped_preflight: bool,
 ) -> Result<Vec<VerifiedProposalSegment>, KeeperError> {
     let mut verified = Vec::new();
     verified
@@ -12107,18 +12124,30 @@ fn validate_proposed_manifest_segments(
             verified.push(VerifiedProposalSegment { segment, identity });
             continue;
         }
-        let (reader, stamp) = SegmentReader::open_published_checked(
+        let (reader, (stamp, streamed_file_xxh3)) = SegmentReader::open_published_checked(
             &path,
             schema,
             crate::segment::SegmentLimits::default(),
-            |_, file| Ok(verified_file_stamp(&file.metadata()?)),
+            |reader, file| {
+                let stamp = verified_file_stamp(&file.metadata()?);
+                if mapped_preflight {
+                    return Ok((stamp, None));
+                }
+                // Read the bytes to verify through this descriptor, not the
+                // mapping: a writer that hashed every new segment through
+                // its mapping kept every page it ever published resident.
+                Ok((stamp, Some(reader.verify_streamed_with_file_witness(file)?)))
+            },
         )
         .map_err(|source| KeeperError::SegmentOpen {
             path: path.clone(),
             source,
         })?;
         let identity = stamp.map(|stamp| stamp.identity);
-        let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
+        let file_xxh3 = match streamed_file_xxh3 {
+            Some(file_xxh3) => file_xxh3,
+            None => fully_verified_file_witness(&path, &reader)?,
+        };
         validate_segment_witnesses(&path, manifest_segment, &reader, || Ok(file_xxh3))?;
         #[cfg(test)]
         let full_prefix_hash_count = Arc::new(AtomicU64::new(0));
@@ -18922,6 +18951,7 @@ mod tests {
                 DEFAULT_SCHEMA,
                 &WriterProtection::Disabled,
                 &[],
+                false,
             )
         };
 
@@ -18976,6 +19006,7 @@ mod tests {
                 DEFAULT_SCHEMA,
                 &WriterProtection::Disabled,
                 retained,
+                false,
             )
         };
 
@@ -19032,6 +19063,52 @@ mod tests {
             .open(&path)?
             .write_all(&bytes)?;
         assert!(preflight(&grown, retained).is_err());
+        Ok(())
+    }
+
+    /// The publication preflight reads a new segment through its descriptor
+    /// rather than its mapping; the binding it returns, or the error it
+    /// refuses with, is the mapped read's for every byte of the file.
+    #[cfg(unix)]
+    #[test]
+    fn the_publication_preflight_reads_through_its_descriptor_with_the_mapped_verdict() -> TestResult
+    {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let manifest = publish_fixture_segment(&directory, 0x5e9f_0005)?;
+        let path = directory.join(canonical_segment_name(manifest.segments[0].segment_id));
+        let verdict = |mapped: bool| {
+            validate_proposed_manifest_segments(
+                &directory,
+                &manifest,
+                DEFAULT_SCHEMA,
+                &WriterProtection::Disabled,
+                &[],
+                mapped,
+            )
+            .map(|verified| {
+                let segment = &verified[0].segment;
+                (
+                    segment.authenticated_file_witness.file_xxh3(),
+                    segment.manifest.clone(),
+                    segment.verified_stamp,
+                    verified[0].identity,
+                )
+            })
+            .map_err(|error| error.to_string())
+        };
+        let clean = verdict(false);
+        assert!(clean.is_ok());
+        assert_eq!(clean, verdict(true));
+        let original = std::fs::read(&path)?;
+        for position in 0..original.len() {
+            let mut bytes = original.clone();
+            bytes[position] ^= 0x81;
+            std::fs::write(&path, &bytes)?;
+            let streamed = verdict(false);
+            assert!(streamed.is_err(), "byte {position} was accepted");
+            assert_eq!(streamed, verdict(true), "byte {position}");
+        }
         Ok(())
     }
 
