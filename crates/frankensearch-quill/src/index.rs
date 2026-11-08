@@ -5179,6 +5179,7 @@ enum LifecycleTrigger {
     BulkCadence,
     BulkFinish,
     TierFanout,
+    TombstoneDensity,
 }
 
 impl LifecycleTrigger {
@@ -5191,6 +5192,7 @@ impl LifecycleTrigger {
             Self::BulkCadence => "bulk_cadence",
             Self::BulkFinish => "bulk_finish",
             Self::TierFanout => "tier_fanout",
+            Self::TombstoneDensity => "tombstone_density",
         }
     }
 }
@@ -8794,6 +8796,11 @@ impl QuillWriterState {
     /// Returns typed flush, segment-install, manifest-transition, durability,
     /// or cancellation failures. Installed-but-unreferenced segments remain
     /// invisible and are retained for a publication retry.
+    ///
+    /// Content publication precedes automatic compaction and tier merges.
+    /// An error from that maintenance, including cancellation, does not undo
+    /// the committed batch. Reconcile publication if required, then retry
+    /// `commit` without replaying documents that were already published.
     pub async fn commit(&mut self, cx: &Cx) -> Result<&KeeperSnapshot, QuillIndexError> {
         self.commit_with_trigger(cx, LifecycleTrigger::ExplicitFlush)
             .await
@@ -8818,6 +8825,7 @@ impl QuillWriterState {
         self.flush_all_shards(cx, trigger).await?;
         self.publish_pending_segments(cx, trigger).await?;
         if !self.config.bulk_load_mode {
+            self.apply_automatic_compaction(cx).await?;
             self.apply_tier_policy(cx).await?;
         }
         self.ingest_retry_required = false;
@@ -8943,6 +8951,54 @@ impl QuillWriterState {
         Ok(())
     }
 
+    /// Admit one source by metadata only. The source-byte allowance bounds
+    /// scheduled input, not decoded allocations or process RSS; the existing
+    /// compactor retains all of its codec, document-span, and allocation gates.
+    async fn apply_automatic_compaction(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
+        let policy = CompactionPolicy::new(self.config.compaction_tombstone_density);
+        if policy.tombstone_density >= 1.0 {
+            return Ok(());
+        }
+        let snapshot = self.authority_snapshot()?;
+        if snapshot.tombstone_count() == 0 {
+            return Ok(());
+        }
+        let budget_bytes = u64::try_from(self.config.scribe_shard_budget_bytes).unwrap_or(u64::MAX);
+        let mut selected = None;
+        for segment in &snapshot.loaded_manifest().manifest.segments {
+            check_cancel(cx, "automatic compaction planning")?;
+            if segment.file_len <= budget_bytes && policy.selects_segment(segment) {
+                selected = Some((segment.segment_id, segment.file_len));
+                break;
+            }
+        }
+        let Some((segment_id, input_bytes)) = selected else {
+            return Ok(());
+        };
+        let policy_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::KEEPER_LIFECYCLE,
+            phase = "compact",
+            trigger = LifecycleTrigger::TombstoneDensity.as_str(),
+            action = "compact",
+            generation = snapshot.loaded_manifest().manifest.generation,
+            source_count = 1,
+            segment_id,
+            input_bytes,
+            budget_bytes,
+            tombstone_density = policy.tombstone_density,
+            result_count = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _policy_timer = crate::tracing_conventions::StageTimer::new(&policy_span);
+        let report = self
+            .compact_with_selection(cx, policy, Some(segment_id))
+            .instrument(policy_span.clone())
+            .await?;
+        policy_span.record("result_count", report.compacted_segments);
+        Ok(())
+    }
+
     async fn apply_tier_policy(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
         loop {
             let policy = TierMergePolicy::from_config(&self.config);
@@ -8994,6 +9050,9 @@ impl QuillWriterState {
         }
         self.commit_with_trigger(cx, LifecycleTrigger::BulkFinish)
             .await?;
+        // Bulk commits defer maintenance. Admit one tombstoned source before
+        // the final concat pass can combine it into a larger, over-budget run.
+        self.apply_automatic_compaction(cx).await?;
         // Every docid this session issued lies at or above the frontier it
         // opened at, so its segments are the manifest's consecutive tail.
         let frontier = self.bulk_session_docid_lo;
@@ -9212,6 +9271,15 @@ impl QuillWriterState {
         cx: &Cx,
         policy: CompactionPolicy,
     ) -> Result<CompactionReport, QuillIndexError> {
+        self.compact_with_selection(cx, policy, None).await
+    }
+
+    async fn compact_with_selection(
+        &mut self,
+        cx: &Cx,
+        policy: CompactionPolicy,
+        selected_segment_id: Option<u64>,
+    ) -> Result<CompactionReport, QuillIndexError> {
         check_cancel(cx, "compaction")?;
         if self.has_uncommitted_changes() {
             return Err(invalid_state(
@@ -9225,7 +9293,10 @@ impl QuillWriterState {
         }
         let authority = self.authority_snapshot()?;
         let next_seal_seq = policy
-            .next_seal_seq_after_compaction(&authority.loaded_manifest().manifest.segments)
+            .next_seal_seq_after_compaction(
+                &authority.loaded_manifest().manifest.segments,
+                selected_segment_id,
+            )
             .map_err(KeeperError::from)?;
         let authority_generation = authority.loaded_manifest().manifest.generation;
         let authority_segment_count = authority.segments().len();
@@ -9246,13 +9317,20 @@ impl QuillWriterState {
         let report = async {
             match &mut self.backend {
                 IndexBackend::Durable(writer) => Ok::<CompactionReport, QuillIndexError>(
-                    writer.compact(cx, policy, created_unix_s).await?,
+                    writer
+                        .compact_with_selection(cx, policy, selected_segment_id, created_unix_s)
+                        .await?,
                 ),
                 IndexBackend::Memory(snapshot) => {
                     let source = snapshot.clone();
-                    let (successor, report) =
-                        spawn_blocking(move || source.compact_owned(policy, created_unix_s))
-                            .await?;
+                    let (successor, report) = spawn_blocking(move || {
+                        source.compact_owned_with_selection(
+                            policy,
+                            selected_segment_id,
+                            created_unix_s,
+                        )
+                    })
+                    .await?;
                     check_cancel(cx, "compaction")?;
                     PublicationReadState::validate_generation(
                         successor.loaded_manifest().manifest.generation,
@@ -13424,7 +13502,10 @@ impl QuillIndex {
     /// # Errors
     ///
     /// Returns typed writer-lock, flush, segment-install, manifest-transition,
-    /// durability, or cancellation failures.
+    /// durability, maintenance, or cancellation failures. Automatic compaction
+    /// and tier merges follow content publication, so an error from that work
+    /// can leave the batch durably committed. Reconcile publication if required
+    /// and retry `commit`; do not replay already-published documents.
     pub async fn commit(&self, cx: &Cx) -> Result<Arc<KeeperSnapshot>, QuillIndexError> {
         let mut writer = self.lock_writer(cx, "commit writer lock").await?;
         writer.commit(cx).await?;
@@ -22083,7 +22164,13 @@ mod tests {
     }
 
     async fn e6_5_watch_oracle(cx: &Cx) -> Vec<E6_5QueryArtifact> {
-        let index = QuillIndex::in_memory(deterministic_config()).expect("E6.5 watch oracle");
+        let index = QuillIndex::in_memory(QuillConfig {
+            // This oracle pins four content-publication states; maintenance
+            // generations are covered by the automatic-compaction tests.
+            compaction_tombstone_density: 1.0,
+            ..deterministic_config()
+        })
+        .expect("E6.5 watch oracle");
         LexicalWrite::index_documents(
             &index,
             cx,
@@ -23927,7 +24014,7 @@ mod tests {
             );
             LexicalWrite::commit(&index, &cx)
                 .await
-                .expect("no-op commit after atomic replacement");
+                .expect("commit maintenance after atomic replacement");
             assert!(
                 LexicalRead::search(&index, &cx, "ownership", 10)
                     .await
@@ -24079,13 +24166,27 @@ mod tests {
 
             LexicalWrite::commit(&index, &cx)
                 .await
-                .expect("commit after replacement is a no-op");
+                .expect("commit reclaims the fully replaced source");
             assert_eq!(
                 index
                     .segment_stats()
                     .expect("read committed segment stats")
                     .published_generation,
-                seed_generation.saturating_add(1)
+                seed_generation.saturating_add(2),
+                "ordinary commit must publish the automatic maintenance generation"
+            );
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("maintenance snapshot is authoritative")
+                    .tombstone_count(),
+                0
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "new")
+                    .expect("maintenance preserves every replacement"),
+                vec![3, 4, 5]
             );
             assert_eq!(
                 index
@@ -28655,8 +28756,14 @@ mod tests {
 
             for seed in e6_5_seed_corpus() {
                 let directory = tempfile::tempdir().expect("E6.5 watch directory");
+                let config = QuillConfig {
+                    // Keep the four content-publication states identical to
+                    // the dedicated oracle, without extra maintenance states.
+                    compaction_tombstone_density: 1.0,
+                    ..deterministic_config()
+                };
                 let index = Arc::new(
-                    QuillIndex::create(&cx, directory.path(), deterministic_config())
+                    QuillIndex::create(&cx, directory.path(), config.clone())
                         .await
                         .expect("create E6.5 watch index"),
                 );
@@ -28795,7 +28902,7 @@ mod tests {
 
                 drop(index);
                 for recovery_round in 0..2 {
-                    let reopened = QuillIndex::open(&cx, directory.path(), deterministic_config())
+                    let reopened = QuillIndex::open(&cx, directory.path(), config.clone())
                         .await
                         .unwrap_or_else(|error| {
                             panic!("{replay}: recovery round {recovery_round} failed: {error}") // ubs:ignore -- Failed recovery must fail this replay test.
@@ -33170,6 +33277,440 @@ mod tests {
                     .iter()
                     .all(|hit| hit.score.to_bits() == 2.5_f32.to_bits())
             );
+        });
+    }
+
+    #[test]
+    fn automatic_compaction_honors_density_boundary_and_opt_out() {
+        run_with_blocking_cx(|cx| async move {
+            for threshold in [0.2, 1.0] {
+                let config = QuillConfig {
+                    compaction_tombstone_density: threshold,
+                    tier_fanout: usize::MAX,
+                    ..deterministic_config()
+                };
+                let index = QuillIndex::in_memory(config).expect("automatic compaction index");
+                let documents = (0..5)
+                    .map(|ordinal| {
+                        IndexableDocument::new(format!("auto-{ordinal}"), "retained token")
+                            .with_metadata("source", "automatic")
+                    })
+                    .collect::<Vec<_>>();
+                index
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("stage rows");
+                index.commit(&cx).await.expect("publish rows");
+                let held = index.search_snapshot().expect("pin original reader");
+                let metadata = held
+                    .stored_field_value(METADATA_FIELD, 4)
+                    .expect("original stored metadata");
+
+                assert!(
+                    index
+                        .delete_document(&cx, "auto-0")
+                        .await
+                        .expect("delete one row")
+                );
+                let boundary = index.snapshot().expect("20-percent tombstone snapshot");
+                let unchanged = index.commit(&cx).await.expect("commit at density boundary");
+                assert_eq!(
+                    unchanged.loaded_manifest().manifest,
+                    boundary.loaded_manifest().manifest
+                );
+                assert_eq!(unchanged.tombstone_count(), 1);
+
+                assert!(
+                    index
+                        .delete_document(&cx, "auto-1")
+                        .await
+                        .expect("delete another row")
+                );
+                let eligible = index.snapshot().expect("40-percent tombstone snapshot");
+                let after = index.commit(&cx).await.expect("apply automatic policy");
+                assert_eq!(after.doc_count(), 3);
+                if threshold >= 1.0 {
+                    assert_eq!(
+                        after.loaded_manifest().manifest,
+                        eligible.loaded_manifest().manifest
+                    );
+                    assert_eq!(after.tombstone_count(), 2);
+                    assert!(
+                        index
+                            .compact(&cx, CompactionPolicy::default())
+                            .await
+                            .expect("explicit compaction remains independently available")
+                            .changed()
+                    );
+                } else {
+                    assert_eq!(after.tombstone_count(), 0);
+                    assert_eq!(after.at_seal_doc_count(), 3);
+                    assert_eq!(
+                        after.loaded_manifest().manifest.generation,
+                        eligible.loaded_manifest().manifest.generation + 1
+                    );
+                    assert_ne!(
+                        after.segments()[0].manifest().segment_id,
+                        eligible.segments()[0].manifest().segment_id
+                    );
+                }
+                assert_eq!(
+                    index
+                        .collect_docids(&cx, "retained")
+                        .expect("live query ids"),
+                    vec![2, 3, 4]
+                );
+                assert_eq!(
+                    index
+                        .search_snapshot()
+                        .expect("current reader")
+                        .stored_field_value(METADATA_FIELD, 4)
+                        .expect("retained metadata"),
+                    metadata
+                );
+                assert_eq!(held.live_doc_count(), 5);
+                assert_eq!(held.materialize_document_id(0).as_deref(), Some("auto-0"));
+                let stable = index.snapshot().expect("finished maintenance");
+                assert_eq!(
+                    index
+                        .commit(&cx)
+                        .await
+                        .expect("idempotent commit")
+                        .loaded_manifest()
+                        .manifest,
+                    stable.loaded_manifest().manifest
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn automatic_compaction_bounds_each_commit_and_skips_oversized_sources() {
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("bounded automatic compaction directory");
+            let mut config = QuillConfig {
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            };
+            let index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("create bounded compaction fixture");
+            for (family, content) in [
+                ("large", "retained payload ".repeat(4_096)),
+                ("first", "retained small".to_owned()),
+                ("second", "retained small".to_owned()),
+            ] {
+                index
+                    .index_documents(
+                        &cx,
+                        &[
+                            IndexableDocument::new(format!("{family}-live"), content.clone())
+                                .with_metadata("family", family),
+                            IndexableDocument::new(format!("{family}-dead"), content)
+                                .with_metadata("family", family),
+                        ],
+                    )
+                    .await
+                    .expect("stage a separate source");
+                index.commit(&cx).await.expect("publish a separate source");
+            }
+            let source = index.snapshot().expect("three original sources");
+            assert_eq!(source.segments().len(), 3);
+            let budget_bytes = source.segments()[1..]
+                .iter()
+                .map(|segment| segment.manifest().file_len)
+                .max()
+                .expect("small source lengths");
+            assert!(source.segments()[0].manifest().file_len > budget_bytes);
+            let original_ids = source
+                .segments()
+                .iter()
+                .map(|segment| segment.manifest().segment_id)
+                .collect::<Vec<_>>();
+            let held = QuillSearchIndex::open(&cx, directory.path(), config.clone())
+                .await
+                .expect("pin the original durable reader");
+            drop(index);
+            config.scribe_shard_budget_bytes =
+                usize::try_from(budget_bytes).expect("small input budget");
+            let index = QuillIndex::open(&cx, directory.path(), config.clone())
+                .await
+                .expect("reopen with a bounded automatic source allowance");
+            assert_eq!(
+                index
+                    .delete_documents(&cx, &["large-dead", "first-dead", "second-dead"])
+                    .await
+                    .expect("tombstone one row in every source"),
+                3
+            );
+
+            let first = index
+                .commit(&cx)
+                .await
+                .expect("compact the first admissible source");
+            assert_eq!(first.tombstone_count(), 2);
+            assert_eq!(first.segments()[0].manifest().segment_id, original_ids[0]);
+            assert_ne!(first.segments()[1].manifest().segment_id, original_ids[1]);
+            assert_eq!(first.segments()[2].manifest().segment_id, original_ids[2]);
+            let second = index
+                .commit(&cx)
+                .await
+                .expect("drain the next admissible source");
+            assert_eq!(second.tombstone_count(), 1);
+            assert_eq!(second.segments()[0].manifest().segment_id, original_ids[0]);
+            assert_ne!(second.segments()[2].manifest().segment_id, original_ids[2]);
+            let unchanged = index
+                .commit(&cx)
+                .await
+                .expect("leave oversized work for explicit compaction");
+            assert_eq!(
+                unchanged.loaded_manifest().manifest,
+                second.loaded_manifest().manifest
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "retained")
+                    .expect("preserved live docids"),
+                vec![0, 2, 4]
+            );
+            assert_eq!(held.doc_count().expect("held reader count"), 6);
+            assert_eq!(
+                held.search_paginated(&cx, "retained", 10, 0, true)
+                    .expect("held reader still searches its original files")
+                    .total_count,
+                Some(6)
+            );
+
+            let explicit = index
+                .compact(&cx, CompactionPolicy::default())
+                .await
+                .expect("explicit compaction is not capped by automatic source bytes");
+            assert_eq!(explicit.compacted_segments, 1);
+            assert!(explicit.input_bytes > budget_bytes);
+            index
+                .index_document(&cx, &IndexableDocument::new("fresh", "retained fresh"))
+                .await
+                .expect("append after selected compaction");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish with an advanced seal sequence");
+            assert_eq!(
+                index.collect_docids(&cx, "fresh").expect("new document id"),
+                vec![6]
+            );
+            let reopened = QuillSearchIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("cold reader after automatic and explicit maintenance");
+            assert_eq!(
+                reopened
+                    .collect_docids(&cx, "retained")
+                    .expect("cold live docids"),
+                vec![0, 2, 4, 6]
+            );
+            let hits = reopened
+                .search_results(&cx, "retained", 10)
+                .expect("cold stored metadata");
+            assert_eq!(
+                hits.iter()
+                    .find(|hit| hit.doc_id == "large-live")
+                    .and_then(|hit| hit.metadata.as_ref())
+                    .and_then(|metadata| metadata.get("family"))
+                    .and_then(serde_json::Value::as_str),
+                Some("large")
+            );
+        });
+    }
+
+    #[test]
+    fn automatic_compaction_is_deferred_until_bulk_finish() {
+        run_with_blocking_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                bulk_load_mode: true,
+                tier_fanout: usize::MAX,
+                ..deterministic_config()
+            })
+            .expect("bulk automatic compaction index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("keep", "retained"),
+                        IndexableDocument::new("drop", "retired"),
+                    ],
+                )
+                .await
+                .expect("stage bulk source");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish resumable bulk source");
+            assert!(
+                index
+                    .delete_document(&cx, "drop")
+                    .await
+                    .expect("tombstone bulk source")
+            );
+            let deferred = index
+                .commit(&cx)
+                .await
+                .expect("bulk commit defers compaction");
+            assert_eq!(deferred.tombstone_count(), 1);
+            let finished = index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finish bulk maintenance");
+            assert_eq!(finished.tombstone_count(), 0);
+            assert_eq!(finished.at_seal_doc_count(), 1);
+            assert_eq!(
+                finished.loaded_manifest().manifest.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
+                0
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "retained OR retired")
+                    .expect("bulk live ids"),
+                vec![0]
+            );
+        });
+    }
+
+    #[test]
+    fn automatic_compaction_interruption_preserves_the_committed_batch() {
+        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
+        run_with_blocking_cx(|cx| async move {
+            for abandon_published_compaction in [false, true] {
+                let directory =
+                    tempfile::tempdir().expect("interrupted automatic compaction directory");
+                let config = QuillConfig {
+                    tier_fanout: usize::MAX,
+                    max_visibility_lag_ms: u64::MAX,
+                    ..deterministic_config()
+                };
+                let index = QuillIndex::create(&cx, directory.path(), config.clone())
+                    .await
+                    .expect("create interrupted automatic compaction index");
+                index
+                    .index_documents(
+                        &cx,
+                        &[
+                            IndexableDocument::new("keep", "retained original"),
+                            IndexableDocument::new("drop", "retired original"),
+                        ],
+                    )
+                    .await
+                    .expect("stage original source");
+                index.commit(&cx).await.expect("publish original source");
+                assert!(
+                    index
+                        .delete_document(&cx, "drop")
+                        .await
+                        .expect("make source eligible")
+                );
+                index
+                    .index_document(&cx, &IndexableDocument::new("fresh", "retained fresh"))
+                    .await
+                    .expect("stage the new content batch");
+
+                let content_pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
+                    directory.path(),
+                    crate::keeper::PublishCheckpoint::DirectorySynced,
+                );
+                let mut commit = Box::pin(index.commit(&cx));
+                crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                    &mut commit,
+                    &content_pause,
+                    PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
+                )
+                .await
+                .expect("the content publication precedes maintenance");
+                let content_generation = load_manifest_pair(directory.path())
+                    .expect("the content MANIFEST is durable")
+                    .manifest
+                    .generation;
+                // No async continuation is polled between releasing the first
+                // publisher and arming the second. The next rendezvous/failure
+                // therefore belongs to automatic compaction, not content.
+                content_pause.release();
+                if abandon_published_compaction {
+                    let maintenance_pause =
+                        crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
+                            directory.path(),
+                            crate::keeper::PublishCheckpoint::DirectorySynced,
+                        );
+                    crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
+                        &mut commit,
+                        &maintenance_pause,
+                        PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
+                    )
+                    .await
+                    .expect("reach the automatic compaction publication");
+                    drop(commit);
+                    assert_public_authority_refuses_stale_publication(
+                        &index, &cx, "retained", "fresh",
+                    )
+                    .await;
+                    assert!(index.has_uncommitted_changes());
+                    maintenance_pause.release();
+                    let reconciled = index
+                        .reconcile_publication(&cx)
+                        .await
+                        .expect("reconcile the abandoned maintenance publication");
+                    assert_eq!(reconciled.keeper_generation(), content_generation + 1);
+                } else {
+                    let failure = crate::keeper::fail_manifest_publish_at_checkpoint_for_test(
+                        directory.path(),
+                        crate::keeper::PublishCheckpoint::TempWritten,
+                    );
+                    let error = commit
+                        .await
+                        .expect_err("automatic maintenance failure is not swallowed");
+                    assert!(matches!(
+                        error,
+                        QuillIndexError::Keeper(KeeperError::InvalidTransition { .. })
+                    ));
+                    drop(failure);
+                    assert_eq!(
+                        index
+                            .snapshot()
+                            .expect("committed content remains authoritative")
+                            .loaded_manifest()
+                            .manifest
+                            .generation,
+                        content_generation
+                    );
+                }
+                assert_eq!(
+                    index
+                        .collect_docids(&cx, "retained")
+                        .expect("committed batch survived"),
+                    vec![0, 2]
+                );
+                let retried = index
+                    .commit(&cx)
+                    .await
+                    .expect("retry maintenance without replaying documents");
+                assert_eq!(retried.doc_count(), 2);
+                assert_eq!(retried.tombstone_count(), 0);
+                assert!(!index.has_uncommitted_changes());
+                let reopened = QuillSearchIndex::open(&cx, directory.path(), config)
+                    .await
+                    .expect("cold reader after interrupted maintenance recovery");
+                assert_eq!(
+                    reopened
+                        .collect_docids(&cx, "retained")
+                        .expect("cold committed batch"),
+                    vec![0, 2]
+                );
+                assert!(
+                    reopened
+                        .search_paginated(&cx, "retired", 10, 0, true)
+                        .expect("deleted row stays deleted")
+                        .hits
+                        .is_empty()
+                );
+            }
         });
     }
 

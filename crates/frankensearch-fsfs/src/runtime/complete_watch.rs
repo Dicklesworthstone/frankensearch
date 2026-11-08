@@ -366,6 +366,7 @@ impl SourceRoot {
                     &path,
                     if metadata.is_dir() { 0 } else { metadata.len() },
                 )
+                .with_root(&self.path)
                 .with_symlink(is_symlink);
                 let mount = mounts.lookup_entry(directory_mount, &path);
                 if let Some((mount, _)) = mount {
@@ -1360,6 +1361,44 @@ mod tests {
 
             fs::write(&tracked, "tracked prose, edited").unwrap();
             assert_ne!(source.observe(&cx, &discovery).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn complete_watch_discovers_temporary_roots_beneath_excluded_ancestors() {
+        run_test_with_cx(|cx| async move {
+            let fixture = tempfile::tempdir().unwrap();
+            for ancestor in ["build", "target"] {
+                let temporary_parent = fixture.path().join(ancestor);
+                fs::create_dir(&temporary_parent).unwrap();
+                let temporary = tempfile::tempdir_in(&temporary_parent).unwrap();
+                let root = temporary.path().join("notes");
+                fs::create_dir_all(root.join("src")).unwrap();
+                fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+                let mut discovery = DiscoveryConfig::default();
+                discovery.exclude_patterns.push("private".to_owned());
+                for excluded in &discovery.exclude_patterns {
+                    let directory = root.join("nested").join(excluded);
+                    fs::create_dir_all(&directory).unwrap();
+                    fs::write(directory.join("secret.md"), "excluded source").unwrap();
+                }
+                let outside = temporary.path().join("outside.md");
+                fs::write(&outside, "outside the selected root").unwrap();
+                std::os::unix::fs::symlink(&outside, root.join("linked.md")).unwrap();
+
+                let source = SourceRoot::open(fs::canonicalize(&root).unwrap()).unwrap();
+                let observed = source.observe(&cx, &discovery).unwrap();
+                let included = source.path.join("src/main.rs");
+                assert_eq!(observed.stamps.keys().collect::<Vec<_>>(), [&included]);
+                assert_eq!(
+                    observed.classes[&included],
+                    IngestionClass::FullSemanticLexical
+                );
+                assert_eq!(
+                    fs::read_to_string(outside).unwrap(),
+                    "outside the selected root"
+                );
+            }
         });
     }
 

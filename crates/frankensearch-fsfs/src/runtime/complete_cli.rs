@@ -12,9 +12,9 @@ use frankensearch_core::{GenerationRootSecurityProfileV1, SearchError, SearchRes
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
-    SearchDashboardState, SearchExecutionFlags, SearchStreamResources, canonical_store_root,
-    degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms, retained_search_checkpoint,
-    store_overlaps_source, validate_retained_catalog_path,
+    RetainedSearchReader, SearchDashboardState, SearchExecutionFlags, SearchStreamResources,
+    canonical_store_root, degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms,
+    retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
@@ -26,6 +26,9 @@ use crate::generation_store::{
 };
 use crate::output_schema::OutputEnvelope;
 use crate::{CliCommand, OutputFormat, ShutdownCoordinator};
+
+#[path = "search_recovery.rs"]
+mod search_recovery;
 
 /// Keep the admitted bundle alive until every diagnostic read and output has
 /// completed. A copied index path alone does not retain its reader pin. Drop
@@ -190,7 +193,8 @@ impl FsfsRuntime {
                     | CliCommand::Delete
                     | CliCommand::Compact
                     | CliCommand::Flush
-            ) || (effective_command == CliCommand::Daemon && !self.cli_input.daemon_stop));
+            ) || (effective_command == CliCommand::Daemon && !self.cli_input.daemon_stop)
+                || self.cli_input.recover_source.is_some());
         if writes
             && self.config.pressure.degradation_override
                 == crate::config::DegradationOverrideMode::ForcePaused
@@ -501,7 +505,7 @@ impl FsfsRuntime {
         reader.runtime.run_status_command()
     }
 
-    fn complete_generation_command_root(
+    pub(super) fn complete_generation_command_root(
         &self,
         initialize_store: bool,
     ) -> SearchResult<Option<PathBuf>> {
@@ -543,6 +547,15 @@ impl FsfsRuntime {
                     "a sealed generation and its descendants cannot be used as a mutable index root; select its complete-generation store instead",
                 ));
             }
+        }
+
+        // Explicit source recovery chooses a fresh complete-store build even
+        // when no selection exists. A malformed incumbent remains expected-old
+        // evidence for the existing guarded recovery publisher, never fallback
+        // authority for the mutable layout.
+        if self.cli_input.recover_source.is_some() {
+            self.cli_input.validate_search_recovery()?;
+            return Ok(Some(root));
         }
 
         // Complete-store entries select the authority protocol, not merely a
@@ -1097,12 +1110,14 @@ impl FsfsRuntime {
         }
     }
 
-    async fn run_complete_generation_search_with_writer<W: Write + Send>(
+    #[allow(clippy::future_not_send)]
+    pub(super) async fn run_complete_generation_search_with_writer<W: Write + Send>(
         &self,
         cx: &Cx,
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
+        self.cli_input.validate_search_recovery()?;
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
             self.requested_search_mode(),
@@ -1147,6 +1162,12 @@ impl FsfsRuntime {
             }
         }
         let started = Instant::now();
+        if self.cli_input.recover_source.is_some() {
+            return Box::pin(
+                self.run_complete_search_recovery_with_writer(cx, root, started, writer),
+            )
+            .await;
+        }
         if self.cli_input.expand {
             return self
                 .run_complete_expanded_search(cx, root, query, limit, started, writer)
@@ -1204,7 +1225,31 @@ impl FsfsRuntime {
                 "complete-generation daemon forwarding requires Unix sockets",
             ));
         }
-        let mut reader = self.open_retained_search(cx, root).await?;
+        let reader = self.open_retained_search(cx, root).await?;
+        Box::pin(self.run_retained_search_with_writer(cx, root, reader, started, writer)).await
+    }
+
+    /// Render one search against the already admitted reader. Source recovery
+    /// uses the reader returned by publication rather than reopening a possibly
+    /// newer selection between validation and the original request's replay.
+    async fn run_retained_search_with_writer<W: Write + Send>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        mut reader: RetainedSearchReader,
+        started: Instant,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let query = self
+            .cli_input
+            .query
+            .as_deref()
+            .ok_or_else(|| complete_cli_error("query", "missing search query argument"))?;
+        let limit = self
+            .cli_input
+            .overrides
+            .limit
+            .unwrap_or(self.config.search.default_limit);
         reader
             .runtime
             .enable_complete_generation_explanations(root, &reader.generation)?;
@@ -2443,6 +2488,7 @@ mod tests {
     }
 
     #[cfg(feature = "semantic-support")]
+    #[allow(clippy::future_not_send)]
     async fn search_under_override(
         runtime: &FsfsRuntime,
         cx: &Cx,

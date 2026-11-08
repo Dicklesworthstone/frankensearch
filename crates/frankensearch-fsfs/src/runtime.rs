@@ -8802,7 +8802,21 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    #[allow(clippy::future_not_send)]
     async fn run_search_command(&self, cx: &Cx) -> SearchResult<()> {
+        if self.cli_input.recover_source.is_some() {
+            let root = self
+                .complete_generation_command_root(false)?
+                .ok_or_else(|| {
+                    retained_recovery_error("source recovery requires a complete-generation store")
+                })?;
+            return Box::pin(self.run_complete_generation_search_with_writer(
+                cx,
+                &root,
+                &mut std::io::stdout(),
+            ))
+            .await;
+        }
         let query = self
             .cli_input
             .query
@@ -25542,8 +25556,9 @@ impl FsfsRuntime {
                 reason_codes.insert(REASON_DISCOVERY_FILE_NON_UTF8_PATH.to_owned());
                 continue;
             }
-            let mut candidate =
-                DiscoveryCandidate::new(&entry_path, metadata.len()).with_symlink(path_is_symlink);
+            let mut candidate = DiscoveryCandidate::new(&entry_path, metadata.len())
+                .with_root(target_root)
+                .with_symlink(path_is_symlink);
             if let Some((mount_entry, _policy)) = mount_table.lookup(&entry_path) {
                 candidate = candidate.with_mount_category(mount_entry.category);
             }
@@ -25653,6 +25668,12 @@ impl FsfsRuntime {
     }
 
     fn validate_command_inputs(&self, command: CliCommand) -> SearchResult<()> {
+        self.cli_input.validate_search_recovery()?;
+        if self.cli_input.recover_source.is_some() && command != CliCommand::Search {
+            return Err(retained_recovery_error(
+                "source recovery requires a foreground CLI search, not an interactive or background command",
+            ));
+        }
         self.cli_input.validate_quality_completion()?;
         // Refuse before the initial scan/build, not merely before starting the
         // watcher after that build has already changed the index.
@@ -27674,6 +27695,12 @@ fn print_cli_help() {
     );
     println!(
         "              --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
+    );
+    println!(
+        "              --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once."
+    );
+    println!(
+        "              Recovery requires installed models; it never downloads, retries automatically, or replaces a newer concurrent publication."
     );
     println!(
         "Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>"
@@ -46489,6 +46516,38 @@ mod tests {
                 if field == "file_key"
             ));
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_ingest_rejects_symlink_escape_from_root_beneath_build() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let root = directory.path().join("build/notes");
+        fs::create_dir_all(&root).expect("source root");
+        let root = fs::canonicalize(root).expect("canonical source root");
+        let outside = directory.path().join("outside.md");
+        fs::write(&outside, "outside source must stay isolated").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked.md")).unwrap();
+        fs::write(root.join("inside.md"), "selected source").unwrap();
+
+        assert!(
+            FsfsConfig::default()
+                .discovery
+                .evaluate_root(&root, None)
+                .include()
+        );
+        assert!(super::resolve_watched_paths(&root, "inside.md").is_ok());
+        for key in ["linked.md", "../outside.md"] {
+            assert!(matches!(
+                super::resolve_watched_paths(&root, key),
+                Err(frankensearch_core::SearchError::InvalidConfig { field, .. })
+                    if field == "file_key"
+            ));
+        }
+        assert_eq!(
+            fs::read_to_string(outside).unwrap(),
+            "outside source must stay isolated"
+        );
     }
 
     #[cfg(unix)]

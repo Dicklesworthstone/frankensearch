@@ -482,7 +482,7 @@ impl CompactionPolicy {
         Self { tombstone_density }
     }
 
-    fn selects_segment(self, segment: &ManifestSegment) -> bool {
+    pub(crate) fn selects_segment(self, segment: &ManifestSegment) -> bool {
         let physical = segment.doc_count;
         let deleted = segment.tombstones.cardinality();
         physical != 0
@@ -498,6 +498,7 @@ impl CompactionPolicy {
     pub(crate) fn next_seal_seq_after_compaction(
         self,
         segments: &[ManifestSegment],
+        selected_segment_id: Option<u64>,
     ) -> Result<u64, CompactionError> {
         validate_compaction_policy(self)?;
         let mut maximum = segments
@@ -506,7 +507,10 @@ impl CompactionPolicy {
             .max()
             .unwrap_or(0);
         for segment in segments {
-            if self.selects_segment(segment) && segment.live_doc_count() != 0 {
+            if selected_segment_id.is_none_or(|id| id == segment.segment_id)
+                && self.selects_segment(segment)
+                && segment.live_doc_count() != 0
+            {
                 maximum = maximum
                     .checked_add(1)
                     .ok_or(CompactionError::ArithmeticOverflow {
@@ -4346,7 +4350,18 @@ impl KeeperSnapshot {
         policy: CompactionPolicy,
         created_unix_s: i64,
     ) -> Result<(Self, CompactionReport), KeeperError> {
-        let artifact = build_compaction(self, policy, created_unix_s)?;
+        self.compact_owned_with_selection(policy, None, created_unix_s)
+    }
+
+    /// Use the ordinary compaction transaction for either every eligible
+    /// source or one source admitted by the automatic maintenance budget.
+    pub(crate) fn compact_owned_with_selection(
+        &self,
+        policy: CompactionPolicy,
+        selected_segment_id: Option<u64>,
+        created_unix_s: i64,
+    ) -> Result<(Self, CompactionReport), KeeperError> {
+        let artifact = build_compaction(self, policy, selected_segment_id, created_unix_s)?;
         if !artifact.report.changed() {
             return Ok((self.clone(), artifact.report));
         }
@@ -6278,6 +6293,19 @@ impl KeeperWriter {
         policy: CompactionPolicy,
         created_unix_s: i64,
     ) -> Result<CompactionReport, KeeperError> {
+        self.compact_with_selection(cx, policy, None, created_unix_s)
+            .await
+    }
+
+    /// Preserve the explicit compaction protocol while allowing automatic
+    /// maintenance to admit only one bounded source.
+    pub(crate) async fn compact_with_selection(
+        &mut self,
+        cx: &Cx,
+        policy: CompactionPolicy,
+        selected_segment_id: Option<u64>,
+        created_unix_s: i64,
+    ) -> Result<CompactionReport, KeeperError> {
         if cx.is_cancel_requested() {
             return Err(CompactionError::Cancelled.into());
         }
@@ -6286,8 +6314,10 @@ impl KeeperWriter {
         // propose a generation that exists.
         self.reconcile_pending_publication(cx).await?;
         let snapshot = self.snapshot.clone();
-        let artifact =
-            spawn_blocking(move || build_compaction(&snapshot, policy, created_unix_s)).await?;
+        let artifact = spawn_blocking(move || {
+            build_compaction(&snapshot, policy, selected_segment_id, created_unix_s)
+        })
+        .await?;
         if !artifact.report.changed() {
             return Ok(artifact.report);
         }
@@ -6415,6 +6445,7 @@ struct ConcatSource<'a> {
 fn build_compaction(
     snapshot: &KeeperSnapshot,
     policy: CompactionPolicy,
+    selected_segment_id: Option<u64>,
     created_unix_s: i64,
 ) -> Result<CompactionArtifact, CompactionError> {
     validate_compaction_policy(policy)?;
@@ -6426,14 +6457,21 @@ fn build_compaction(
         ..CompactionReport::default()
     };
     let mut eligible = Vec::new();
+    let eligible_capacity = if selected_segment_id.is_some() {
+        snapshot.segments.len().min(1)
+    } else {
+        snapshot.segments.len()
+    };
     eligible
-        .try_reserve_exact(snapshot.segments.len())
+        .try_reserve_exact(eligible_capacity)
         .map_err(|_| CompactionError::Allocation {
             resource: "eligible segment indexes",
-            count: snapshot.segments.len(),
+            count: eligible_capacity,
         })?;
     for (index, segment) in snapshot.segments.iter().enumerate() {
-        if policy.selects_segment(&segment.manifest) {
+        if selected_segment_id.is_none_or(|id| id == segment.manifest.segment_id)
+            && policy.selects_segment(&segment.manifest)
+        {
             eligible.push(index);
         }
     }

@@ -69,7 +69,19 @@ pub struct QuillConfig {
     pub bulk_load_mode: bool,
     /// Sealed mini-segments between crash-resumable bulk MANIFEST publishes.
     pub bulk_publish_segment_cadence: usize,
-    /// Per-segment tombstone density that triggers compaction.
+    /// Per-segment tombstone density that triggers automatic compaction.
+    ///
+    /// After content publication, an ordinary commit compacts at most one
+    /// source whose density is strictly greater than this threshold and whose
+    /// file length is at most [`Self::scribe_shard_budget_bytes`]. That ceiling
+    /// bounds selected source bytes, not decoded heap or RSS. Oversized sources
+    /// remain eligible for explicit [`crate::QuillIndex::compact`]. Later
+    /// commits continue draining eligible sources in document-id order.
+    ///
+    /// `1.0` disables automatic compaction. Bulk-load commits defer it until
+    /// [`crate::QuillIndex::finish_bulk_load`]. Explicit compaction always uses
+    /// its caller-supplied [`crate::CompactionPolicy`] independently of this
+    /// setting and the automatic source-byte allowance.
     pub compaction_tombstone_density: f64,
     /// Maximum fraction of holes tolerated by concat-merge policy.
     ///
