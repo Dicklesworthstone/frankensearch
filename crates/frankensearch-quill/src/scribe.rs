@@ -3747,15 +3747,19 @@ fn flush_accumulator_with_stored_meta_mode<A: TokenAnalyzer>(
 
     let (expected_field_ords, doclen_columns) =
         build_doclen_columns(accumulator, first_doc_ord, span)?;
-    let partition = partition_flush_rows(accumulator, mode)?;
-    let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) =
+    let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) = {
+        let partition = partition_flush_rows(accumulator, mode)?;
         encode_ordered_term_streams(
             accumulator,
             &partition,
             input.lease_docid_base,
             docid_lo,
             &doclen_columns,
-        )?;
+        )?
+        // The encoded streams borrow only the accumulator's term dictionary.
+        // Release all partition rows before constructing the other sections
+        // and the complete segment, while retaining the accumulator for retry.
+    };
 
     let doclen_inputs = expected_field_ords
         .iter()
@@ -4728,8 +4732,9 @@ fn stable_radix_partition_spans(
 }
 
 /// Stably partition one chunk of `row_count` rows by dense term id. `rows`
-/// is read once to check term ids and twice per digit pass (count, scatter);
-/// it is never collected. The only full-size buffer is the sorted output.
+/// is read once to check term ids and twice to count and scatter; it is never
+/// collected. The only row-sized buffer is the sorted output, even when one
+/// high-digit bucket contains almost every token in a wide vocabulary.
 fn stable_radix_partition_rows<I>(
     rows: I,
     row_count: usize,
@@ -4754,62 +4759,100 @@ where
     }
 
     let mut sorted = filled_vec(row_count, FlushTokenRow::default(), "radix output")?;
-    if term_count <= RADIX_DIGIT_BUCKETS {
-        stable_digit_scatter_into(rows, 0, term_count, &mut sorted)?;
+    let ranges = if term_count <= RADIX_DIGIT_BUCKETS {
+        stable_digit_scatter_into(rows, 0, term_count, &mut sorted)?
     } else {
-        // MSD partition first, then one stable low-digit scatter inside each
-        // disjoint high-digit range, through a scratch copy of that range
-        // only. This preserves source order among equal ids, avoids a
-        // term-count-sized second histogram, and never holds a second
-        // full-size copy of the rows.
-        let high_bucket_count = term_count.div_ceil(RADIX_DIGIT_BUCKETS);
-        let high_ranges =
-            stable_digit_scatter_into(rows, RADIX_DIGIT_BITS, high_bucket_count, &mut sorted)?;
-        let mut scratch = Vec::new();
-        for (high_digit, range) in high_ranges.into_iter().enumerate() {
-            if range.len() < 2 {
-                continue;
-            }
-            let remaining_terms = term_count.saturating_sub(high_digit * RADIX_DIGIT_BUCKETS);
-            let low_bucket_count = remaining_terms.min(RADIX_DIGIT_BUCKETS);
-            let bucket = sorted
-                .get_mut(range)
-                .ok_or(FlushError::ArithmeticOverflow {
-                    field: "radix high-digit range",
-                })?;
-            scratch.clear();
-            scratch
-                .try_reserve(bucket.len())
-                .map_err(|_| FlushError::Allocation {
-                    resource: "radix high-digit scratch",
-                    count: bucket.len(),
-                })?;
-            scratch.extend_from_slice(bucket);
-            stable_digit_scatter_into(scratch.iter().copied(), 0, low_bucket_count, bucket)?;
-        }
-    }
-
-    let mut ranges = filled_vec(term_count, 0..0, "term ranges")?;
-    let mut cursor = 0_usize;
-    for (term_id, range) in ranges.iter_mut().enumerate() {
-        let start = cursor;
-        while sorted
-            .get(cursor)
-            .is_some_and(|row| row.term_id as usize == term_id)
-        {
-            cursor += 1;
-        }
-        *range = start..cursor;
-    }
-    if cursor != sorted.len() {
-        return Err(FlushError::ArithmeticOverflow {
-            field: "radix partition coverage",
-        });
-    }
+        stable_dense_term_scatter_into(rows, term_count, &mut sorted)?
+    };
     Ok(RadixPartition {
         rows: sorted,
         ranges,
     })
+}
+
+/// Scatter directly from the borrowed columns for vocabularies wider than one
+/// radix digit. The final term ranges double as the histogram and write
+/// cursors, so this needs no scratch copy of a potentially row-sized bucket
+/// and no additional term-sized histogram. Equal-term rows retain source order.
+fn stable_dense_term_scatter_into<I>(
+    rows: I,
+    term_count: usize,
+    output: &mut [FlushTokenRow],
+) -> Result<Vec<Range<usize>>, FlushError>
+where
+    I: Iterator<Item = FlushTokenRow> + Clone,
+{
+    let mut ranges = filled_vec(term_count, 0_usize..0, "term ranges")?;
+    for row in rows.clone() {
+        let term_id = usize::try_from(row.term_id).map_err(|_| FlushError::TermIdOutOfRange {
+            field_ord: 0,
+            term_id: row.term_id,
+        })?;
+        let range = ranges
+            .get_mut(term_id)
+            .ok_or(FlushError::TermIdOutOfRange {
+                field_ord: 0,
+                term_id: row.term_id,
+            })?;
+        range.end = range
+            .end
+            .checked_add(1)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "radix histogram count",
+            })?;
+    }
+
+    let mut cursor = 0_usize;
+    for range in &mut ranges {
+        let count = range.end;
+        *range = cursor..cursor;
+        cursor = cursor
+            .checked_add(count)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "radix prefix sum",
+            })?;
+    }
+    if cursor != output.len() {
+        return Err(FlushError::ArithmeticOverflow {
+            field: "radix prefix coverage",
+        });
+    }
+
+    for row in rows {
+        let term_id = usize::try_from(row.term_id).map_err(|_| FlushError::TermIdOutOfRange {
+            field_ord: 0,
+            term_id: row.term_id,
+        })?;
+        let range = ranges
+            .get_mut(term_id)
+            .ok_or(FlushError::TermIdOutOfRange {
+                field_ord: 0,
+                term_id: row.term_id,
+            })?;
+        let slot = output
+            .get_mut(range.end)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "radix scatter destination",
+            })?;
+        *slot = row;
+        range.end += 1;
+    }
+
+    let mut previous_end = 0_usize;
+    for range in &ranges {
+        if range.start != previous_end {
+            return Err(FlushError::ArithmeticOverflow {
+                field: "radix partition coverage",
+            });
+        }
+        previous_end = range.end;
+    }
+    if previous_end != output.len() {
+        return Err(FlushError::ArithmeticOverflow {
+            field: "radix partition coverage",
+        });
+    }
+    Ok(ranges)
 }
 
 /// Stable counting scatter of `rows` by one 16-bit digit of the term id into
@@ -9203,6 +9246,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wide_term_flush_preserves_bytes_and_accumulator_after_failed_seal() {
+        use std::fmt::Write as _;
+
+        // One high-digit bucket owns almost every row, although the vocabulary
+        // crosses the 16-bit boundary. The frequent term also crosses chunks.
+        let mut text = String::from("hot ");
+        for term in 0..RADIX_DIGIT_BUCKETS {
+            write!(&mut text, "t{term} hot hot hot ").expect("write to String");
+        }
+        let mut accumulator =
+            ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+        accumulator
+            .add_document_with_stored(
+                2,
+                &[
+                    IndexedFieldValue::new(0, "wide-first"),
+                    IndexedFieldValue::new(1, &text),
+                    IndexedFieldValue::new(2, "hot hot"),
+                ],
+                &[StoredFieldValue::new(3, b"stored-first")],
+            )
+            .expect("wide-vocabulary document accumulates");
+        accumulator
+            .add_document_with_stored(
+                5,
+                &[
+                    IndexedFieldValue::new(0, "wide-second"),
+                    IndexedFieldValue::new(1, "hot t65535 hot"),
+                    IndexedFieldValue::new(2, "hot"),
+                ],
+                &[StoredFieldValue::new(3, b"stored-second")],
+            )
+            .expect("second sparse document accumulates");
+        assert!(accumulator.terms().len() > RADIX_DIGIT_BUCKETS);
+        let token_count = accumulator.token_count();
+        let reserved_bytes = accumulator.bytes_reserved();
+        let identities = [
+            FlushDocumentInput::from_canonical_content(2, "wide-first", text.as_bytes()),
+            FlushDocumentInput::from_canonical_content(5, "wide-second", b"hot t65535 hot"),
+        ];
+        let input = FlushSegmentInput {
+            segment_id: 0x0006_5537,
+            lease_docid_base: 65_536,
+            created_unix_s: 1_700_000_000,
+            engine_version: 0x0001_0002,
+            documents: &identities,
+        };
+        let scalar = flush_accumulator_with_mode(&accumulator, input, FlushMode::Scalar)
+            .expect("scalar wide-vocabulary flush");
+
+        // Duplicate external IDs fail after the token partition and streams
+        // have been built. The original accumulator must remain retryable.
+        let duplicates = [
+            FlushDocumentInput::new(2, "duplicate", 1),
+            FlushDocumentInput::new(5, "duplicate", 2),
+        ];
+        assert!(matches!(
+            flush_accumulator_with_mode(
+                &accumulator,
+                FlushSegmentInput {
+                    documents: &duplicates,
+                    ..input
+                },
+                FlushMode::Scalar,
+            ),
+            Err(FlushError::IdHash(
+                IdHashCodecError::DuplicateDocumentId { .. }
+            ))
+        ));
+        let retried = flush_accumulator_with_mode(&accumulator, input, FlushMode::Scalar)
+            .expect("retry after a failed wide-vocabulary seal");
+        assert_eq!(retried.as_bytes(), scalar.as_bytes());
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread flush pool");
+        let automatic = pool
+            .install(|| flush_accumulator(&accumulator, input))
+            .expect("automatic wide-vocabulary flush");
+        assert_eq!(automatic.as_bytes(), scalar.as_bytes());
+        assert_eq!(accumulator.document_ords(), &[2, 5]);
+        assert_eq!(accumulator.token_count(), token_count);
+        assert_eq!(accumulator.bytes_reserved(), reserved_bytes);
+        let reader = SegmentReader::from_bytes(automatic.as_bytes(), MIXED_POSITION_SCHEMA)
+            .expect("wide-vocabulary segment reopens");
+        reader.verify().expect("all section witnesses verify");
+        assert_eq!(reader.header().doc_count, 2);
+        assert_eq!(reader.header().docid_lo, 65_538);
+        assert_eq!(reader.header().docid_hi, 65_542);
+    }
+
     /// Partition `rows` through the seal's span partitioner, presented as
     /// consecutive column spans of `span_lens` rows (the rest in a final
     /// span), and flatten the chunks back into one term-ordered row list.
@@ -9361,6 +9497,94 @@ mod tests {
     }
 
     #[test]
+    fn wide_term_partition_preserves_skewed_rows_across_span_and_chunk_cuts() {
+        let term_count = RADIX_DIGIT_BUCKETS + 1;
+        let row_count = 4 * RADIX_DIGIT_BUCKETS + 1;
+        let source = (0..u32::try_from(row_count).expect("row count fits u32"))
+            .map(|ordinal| FlushTokenRow {
+                term_id: if ordinal.is_multiple_of(4) {
+                    ordinal / 4
+                } else {
+                    0
+                },
+                doc_ord: ordinal / 8,
+                position: ordinal % 8,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source.iter().filter(|row| row.term_id >= 65_536).count(),
+            1,
+            "the former high-digit scratch would hold all but one token row"
+        );
+        let mut expected = source.clone();
+        expected.sort_by_key(|row| row.term_id);
+        let span_lens = [0, 3, RADIX_DIGIT_BUCKETS, 1, RADIX_DIGIT_BUCKETS - 2];
+        for chunk_count in [1, 2, 4] {
+            let partition = partition_rows_in_spans(&source, &span_lens, term_count, chunk_count)
+                .expect("skewed wide-vocabulary partition");
+            assert_eq!(partition.rows, expected, "chunks {chunk_count}");
+            let mut cursor = 0;
+            for (term_id, range) in partition.ranges.iter().enumerate() {
+                assert_eq!(range.start, cursor);
+                assert!(
+                    partition.rows[range.clone()]
+                        .iter()
+                        .all(|row| row.term_id as usize == term_id)
+                );
+                cursor = range.end;
+            }
+            assert_eq!(cursor, source.len());
+        }
+    }
+
+    #[test]
+    fn wide_term_partition_handles_empty_ranges_and_rejects_row_count_drift() {
+        let term_count = RADIX_DIGIT_BUCKETS + 1;
+        let empty = stable_radix_partition_rows(std::iter::empty(), 0, term_count)
+            .expect("empty wide-vocabulary partition");
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.ranges.len(), term_count);
+        assert!(empty.ranges.iter().all(Range::is_empty));
+
+        let rows = [
+            FlushTokenRow {
+                term_id: 65_536,
+                doc_ord: 0,
+                position: 3,
+            },
+            FlushTokenRow {
+                term_id: 65_536,
+                doc_ord: 0,
+                position: 5,
+            },
+        ];
+        let partition = stable_radix_partition_rows(rows.into_iter(), rows.len(), term_count)
+            .expect("one populated high term");
+        assert_eq!(partition.rows, rows);
+        assert!(
+            partition.ranges[..RADIX_DIGIT_BUCKETS]
+                .iter()
+                .all(Range::is_empty)
+        );
+        assert_eq!(partition.ranges[RADIX_DIGIT_BUCKETS], 0..2);
+        for incorrect_count in [1, 3] {
+            assert!(matches!(
+                stable_radix_partition_rows(rows.into_iter(), incorrect_count, term_count),
+                Err(FlushError::ArithmeticOverflow {
+                    field: "radix prefix coverage"
+                })
+            ));
+        }
+        assert!(matches!(
+            stable_radix_partition_rows(rows.into_iter(), rows.len(), RADIX_DIGIT_BUCKETS),
+            Err(FlushError::TermIdOutOfRange {
+                term_id: 65_536,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn radix_partition_preserves_equal_term_source_order_in_both_widths() {
         let one_pass = partition_rows(
             &[
@@ -9404,7 +9628,7 @@ mod tests {
             ]
         );
 
-        let two_pass = partition_rows(
+        let wide_terms = partition_rows(
             &[
                 FlushTokenRow {
                     term_id: 65_536,
@@ -9429,9 +9653,9 @@ mod tests {
             ],
             65_537,
         )
-        .expect("two-pass radix partition");
+        .expect("wide-vocabulary partition");
         assert_eq!(
-            two_pass
+            wide_terms
                 .rows
                 .iter()
                 .map(|row| (row.term_id, row.doc_ord))
@@ -9472,10 +9696,10 @@ mod tests {
         }
         let high_cardinality_serial =
             partition_rows_with_chunks(&high_cardinality_source, 65_537, 1)
-                .expect("two-pass serial reference partition");
+                .expect("wide-vocabulary serial reference partition");
         let high_cardinality_parallel =
             partition_rows_with_chunks(&high_cardinality_source, 65_537, 4)
-                .expect("two-pass four-chunk parallel partition");
+                .expect("wide-vocabulary four-chunk parallel partition");
         assert_eq!(high_cardinality_parallel.rows, high_cardinality_serial.rows);
         assert_eq!(
             high_cardinality_parallel.ranges,
