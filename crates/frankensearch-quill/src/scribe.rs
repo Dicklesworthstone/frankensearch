@@ -3358,6 +3358,17 @@ enum StoredMetaBuildMode {
     Staged,
 }
 
+/// Where an accumulator seal finds a posting's fieldnorm id for BLOCKMAX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldnormLookup {
+    /// The per-document columns of [`build_fieldnorm_columns`].
+    Column,
+    /// `fieldnorm_to_id` of the DOCLEN length at every posting: the former
+    /// lookup, kept as the same-binary benchmark and test incumbent.
+    #[cfg(any(test, feature = "bench-internals"))]
+    PerPosting,
+}
+
 /// Typed failures from [`flush_accumulator`].
 #[derive(Debug, Error)]
 pub enum FlushError {
@@ -3666,7 +3677,13 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
     input: FlushSegmentInput<'_>,
     mode: FlushMode,
 ) -> Result<EncodedSegment, FlushError> {
-    flush_accumulator_with_stored_meta_mode(accumulator, input, mode, StoredMetaBuildMode::Borrowed)
+    flush_accumulator_with_stored_meta_mode(
+        accumulator,
+        input,
+        mode,
+        StoredMetaBuildMode::Borrowed,
+        FieldnormLookup::Column,
+    )
 }
 
 /// Seal one shard with the former materialized STOREDMETA section.
@@ -3683,7 +3700,36 @@ pub fn flush_accumulator_with_staged_stored_meta<A: TokenAnalyzer>(
     input: FlushSegmentInput<'_>,
     mode: FlushMode,
 ) -> Result<EncodedSegment, FlushError> {
-    flush_accumulator_with_stored_meta_mode(accumulator, input, mode, StoredMetaBuildMode::Staged)
+    flush_accumulator_with_stored_meta_mode(
+        accumulator,
+        input,
+        mode,
+        StoredMetaBuildMode::Staged,
+        FieldnormLookup::Column,
+    )
+}
+
+/// Seal one shard with the former per-posting BLOCKMAX fieldnorm lookup.
+///
+/// This benchmark-only control binary-searches the fieldnorm table for every
+/// posting, as seals did before the per-document fieldnorm columns.
+///
+/// # Errors
+///
+/// Returns [`FlushError`] under the same conditions as [`flush_accumulator`].
+#[cfg(feature = "bench-internals")]
+pub fn flush_accumulator_with_per_posting_fieldnorms<A: TokenAnalyzer>(
+    accumulator: &ColumnarAccumulator<A>,
+    input: FlushSegmentInput<'_>,
+    mode: FlushMode,
+) -> Result<EncodedSegment, FlushError> {
+    flush_accumulator_with_stored_meta_mode(
+        accumulator,
+        input,
+        mode,
+        StoredMetaBuildMode::Borrowed,
+        FieldnormLookup::PerPosting,
+    )
 }
 
 fn flush_accumulator_with_stored_meta_mode<A: TokenAnalyzer>(
@@ -3691,6 +3737,7 @@ fn flush_accumulator_with_stored_meta_mode<A: TokenAnalyzer>(
     input: FlushSegmentInput<'_>,
     mode: FlushMode,
     stored_meta_mode: StoredMetaBuildMode,
+    fieldnorm_lookup: FieldnormLookup,
 ) -> Result<EncodedSegment, FlushError> {
     let flush_span = tracing::info_span!(
         target: crate::tracing_conventions::TARGET,
@@ -3747,6 +3794,11 @@ fn flush_accumulator_with_stored_meta_mode<A: TokenAnalyzer>(
 
     let (expected_field_ords, doclen_columns) =
         build_doclen_columns(accumulator, first_doc_ord, span)?;
+    let fieldnorm_columns = match fieldnorm_lookup {
+        FieldnormLookup::Column => Some(build_fieldnorm_columns(&doclen_columns)?),
+        #[cfg(any(test, feature = "bench-internals"))]
+        FieldnormLookup::PerPosting => None,
+    };
     let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) = {
         let partition = partition_flush_rows(accumulator, mode)?;
         encode_ordered_term_streams(
@@ -3755,6 +3807,7 @@ fn flush_accumulator_with_stored_meta_mode<A: TokenAnalyzer>(
             input.lease_docid_base,
             docid_lo,
             &doclen_columns,
+            fieldnorm_columns.as_deref(),
         )?
         // The encoded streams borrow only the accumulator's term dictionary.
         // Release all partition rows before constructing the other sections
@@ -4525,6 +4578,34 @@ fn build_doclen_columns<A: TokenAnalyzer>(
     Ok((field_ords, columns))
 }
 
+/// Every DOCLEN column mapped slot for slot through `fieldnorm_to_id`, holes
+/// staying `None`: BLOCKMAX then reads a posting's fieldnorm id by index
+/// instead of searching the fieldnorm table once per posting, which repeats
+/// the same search for every term a document holds.
+fn build_fieldnorm_columns(
+    doclen_columns: &[Vec<Option<u32>>],
+) -> Result<Vec<Vec<Option<u8>>>, FlushError> {
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(doclen_columns.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "fieldnorm columns",
+            count: doclen_columns.len(),
+        })?;
+    for doclens in doclen_columns {
+        let mut column = Vec::new();
+        column
+            .try_reserve_exact(doclens.len())
+            .map_err(|_| FlushError::Allocation {
+                resource: "fieldnorm span",
+                count: doclens.len(),
+            })?;
+        column.extend(doclens.iter().map(|length| length.map(fieldnorm_to_id)));
+        columns.push(column);
+    }
+    Ok(columns)
+}
+
 fn build_id_map_inputs<'a>(
     documents: &'a [FlushDocumentInput<'a>],
     first_doc_ord: u32,
@@ -4936,6 +5017,7 @@ fn encode_ordered_term_streams<'a, A: TokenAnalyzer>(
     lease_docid_base: u64,
     docid_lo: u64,
     doclen_columns: &[Vec<Option<u32>>],
+    fieldnorm_columns: Option<&[Vec<Option<u8>>]>,
 ) -> Result<OrderedTermStreams<'a>, FlushError> {
     let sorted_ids = accumulator.terms().sorted_ids();
     let mut postings_bytes = Vec::new();
@@ -4980,20 +5062,50 @@ fn encode_ordered_term_streams<'a, A: TokenAnalyzer>(
                     detail: "missing DOCLEN source column",
                 })?;
         let (field_ord, term) = accumulator.terms().field_and_term(term_id_u32);
-        append_canonical_term(
-            &mut postings_bytes,
-            &mut positions_bytes,
-            &mut blockmax_bytes,
-            &mut inputs,
-            field_ord,
-            term,
-            &postings,
-            positions.as_deref(),
-            docid_lo,
-            field_doclens,
-        )?;
+        if let Some(fieldnorm_columns) = fieldnorm_columns {
+            let field_fieldnorms =
+                fieldnorm_columns
+                    .get(field_index)
+                    .ok_or(FlushError::InvalidTokenColumn {
+                        field_ord,
+                        detail: "missing fieldnorm source column",
+                    })?;
+            append_canonical_term(
+                &mut postings_bytes,
+                &mut positions_bytes,
+                &mut blockmax_bytes,
+                &mut inputs,
+                field_ord,
+                term,
+                &postings,
+                positions.as_deref(),
+                |global_docid| span_column_value(field_fieldnorms, docid_lo, global_docid),
+            )?;
+        } else {
+            append_canonical_term(
+                &mut postings_bytes,
+                &mut positions_bytes,
+                &mut blockmax_bytes,
+                &mut inputs,
+                field_ord,
+                term,
+                &postings,
+                positions.as_deref(),
+                |global_docid| {
+                    span_column_value(field_doclens, docid_lo, global_docid).map(fieldnorm_to_id)
+                },
+            )?;
+        }
     }
     Ok((postings_bytes, positions_bytes, blockmax_bytes, inputs))
+}
+
+/// The value `column`, indexed from `docid_lo` like DOCLEN, holds for
+/// `global_docid`; `None` outside the span or at a hole.
+fn span_column_value<T: Copy>(column: &[Option<T>], docid_lo: u64, global_docid: u32) -> Option<T> {
+    let relative = u64::from(global_docid).checked_sub(docid_lo)?;
+    let relative = usize::try_from(relative).ok()?;
+    column.get(relative).copied().flatten()
 }
 
 fn encode_delta_term_streams<'a>(
@@ -5089,15 +5201,18 @@ fn encode_delta_term_streams<'a>(
             term.term(),
             &postings,
             positions.as_deref(),
-            docid_lo,
-            field_doclens,
+            |global_docid| {
+                span_column_value(field_doclens, docid_lo, global_docid).map(fieldnorm_to_id)
+            },
         )?;
     }
     Ok((postings_bytes, positions_bytes, blockmax_bytes, inputs))
 }
 
+/// `fieldnorm_for_doc` yields a posting's BLOCKMAX fieldnorm id, `None` for a
+/// document without a DOCLEN length in this field.
 #[allow(clippy::too_many_arguments)]
-fn append_canonical_term<'a>(
+fn append_canonical_term<'a, F>(
     postings_bytes: &mut Vec<u8>,
     positions_bytes: &mut Vec<u8>,
     blockmax_bytes: &mut Vec<u8>,
@@ -5106,19 +5221,13 @@ fn append_canonical_term<'a>(
     term: &'a [u8],
     postings: &[Posting],
     positions: Option<&[u32]>,
-    docid_lo: u64,
-    field_doclens: &[Option<u32>],
-) -> Result<(), FlushError> {
+    fieldnorm_for_doc: F,
+) -> Result<(), FlushError>
+where
+    F: FnMut(u32) -> Option<u8>,
+{
     let (encoded_postings, encoded_blockmax) =
-        EncodedPostingList::encode_with_block_max(postings, |global_docid| {
-            let relative = u64::from(global_docid).checked_sub(docid_lo)?;
-            let relative = usize::try_from(relative).ok()?;
-            field_doclens
-                .get(relative)
-                .copied()
-                .flatten()
-                .map(fieldnorm_to_id)
-        })?;
+        EncodedPostingList::encode_with_block_max(postings, fieldnorm_for_doc)?;
     let encoded_positions = positions
         .map(|values| EncodedPositionList::encode(postings, values))
         .transpose()?;
@@ -9006,6 +9115,114 @@ mod tests {
                 .expect("seeded segment reopens")
                 .verify()
                 .expect("seeded segment witnesses verify");
+        }
+    }
+
+    #[test]
+    fn fieldnorm_columns_seal_the_per_posting_lookup_bytes() {
+        // The per-document fieldnorm columns must seal exactly the bytes of
+        // the former per-posting `fieldnorm_to_id` lookup: sparse document
+        // ordinals (DOCLEN holes), lengths past the linear fieldnorm buckets,
+        // terms spanning several 128-posting BLOCKMAX blocks, and positional
+        // and non-positional fields, under both radix modes.
+        const WORDS: [&str; 4] = ["hot", "warm", "cold", "rare"];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread flush pool");
+        for seed in 0..4_u64 {
+            let mut rng = DeterministicRng(0x6f1e_1d0c_0b0a_0901 ^ seed.wrapping_mul(0x9E37_79B9));
+            let mut accumulator =
+                ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+            let mut identities = Vec::new();
+            let mut doc_ord = u32::try_from(1 + rng.choose(50)).expect("small first ordinal");
+            for index in 0..300 {
+                let keyword = format!("doc-{seed}-{index}");
+                let mut positional = String::from("hot");
+                for _ in 0..rng.choose(400) {
+                    positional.push(' ');
+                    positional.push_str(WORDS[rng.choose(WORDS.len())]);
+                }
+                let plain = format!("{} hot", randomized_text(&mut rng));
+                let values = [
+                    IndexedFieldValue::new(0, &keyword),
+                    IndexedFieldValue::new(1, &positional),
+                    IndexedFieldValue::new(2, &plain),
+                ];
+                // Every fifth document leaves the non-positional field out.
+                let present = if rng.choose(5) == 0 { 2 } else { 3 };
+                accumulator
+                    .add_document(doc_ord, &values[..present])
+                    .expect("seeded document accumulates");
+                identities.push((doc_ord, keyword));
+                doc_ord += 1 + u32::try_from(rng.choose(4)).expect("small ordinal gap");
+            }
+
+            let first_doc_ord = accumulator.first_doc_ord().expect("non-empty fixture");
+            let last_doc_ord = accumulator.last_doc_ord().expect("non-empty fixture");
+            let span = usize::try_from(last_doc_ord - first_doc_ord + 1).expect("span fits usize");
+            let (_, doclen_columns) = build_doclen_columns(&accumulator, first_doc_ord, span)
+                .expect("fixture DOCLEN columns");
+            let fieldnorm_columns =
+                build_fieldnorm_columns(&doclen_columns).expect("fixture fieldnorm columns");
+            assert!(
+                doclen_columns.iter().flatten().any(Option::is_none),
+                "seed {seed}: the fixture must leave DOCLEN holes"
+            );
+            assert!(
+                doclen_columns
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .any(|&length| u32::from(fieldnorm_to_id(length)) != length),
+                "seed {seed}: the fixture must reach the nonlinear fieldnorm buckets"
+            );
+            for (doclens, fieldnorms) in doclen_columns.iter().zip(&fieldnorm_columns) {
+                let expected: Vec<Option<u8>> = doclens
+                    .iter()
+                    .map(|length| length.map(fieldnorm_to_id))
+                    .collect();
+                assert_eq!(fieldnorms, &expected, "seed {seed}: fieldnorm column drift");
+            }
+
+            let flush_docs: Vec<FlushDocumentInput<'_>> = identities
+                .iter()
+                .map(|(ord, id)| {
+                    FlushDocumentInput::from_canonical_content(*ord, id, id.as_bytes())
+                })
+                .collect();
+            let input = FlushSegmentInput {
+                segment_id: 0x00f1_e1d0 | seed,
+                lease_docid_base: 2 * 65_536,
+                created_unix_s: 1_700_000_000,
+                engine_version: 0x0001_0002,
+                documents: &flush_docs,
+            };
+            for mode in [FlushMode::Scalar, FlushMode::Automatic] {
+                let seal = |lookup| {
+                    pool.install(|| {
+                        flush_accumulator_with_stored_meta_mode(
+                            &accumulator,
+                            input,
+                            mode,
+                            StoredMetaBuildMode::Borrowed,
+                            lookup,
+                        )
+                    })
+                    .expect("seeded seal")
+                };
+                let column = seal(FieldnormLookup::Column);
+                let per_posting = seal(FieldnormLookup::PerPosting);
+                assert_eq!(
+                    column.as_bytes(),
+                    per_posting.as_bytes(),
+                    "seed {seed} {mode:?}: fieldnorm columns must seal the per-posting bytes"
+                );
+                SegmentReader::from_bytes(column.as_bytes(), MIXED_POSITION_SCHEMA)
+                    .expect("seeded segment reopens")
+                    .verify()
+                    .expect("seeded segment witnesses verify");
+            }
         }
     }
 
