@@ -1,5 +1,17 @@
 # Changelog
 
+### Unreleased — Recover watcher changes after notification overflow
+
+- Honor filesystem backend rescan flags even when the notification has no paths
+  or would otherwise be filtered as an access event. Kernel queue overflow now
+  schedules the existing authoritative reconciliation instead of silently losing
+  source changes.
+- Preserve reconciliation work across pressure pauses and invalidate older scan
+  acknowledgements when a new overflow occurs. Normal attached file events keep
+  their existing debounce and ingestion behavior.
+- Add deterministic regressions for notification loss and recovery of missed
+  creates, updates and deletes while retaining descendant exclusions.
+
 ### Unreleased — Complete discovery root handling (#72)
 
 - Normalize relative and parent-component discovery roots before admission and

@@ -3850,6 +3850,12 @@ fn process_notify_result(
     let mut skipped = 0_usize;
     match event {
         Ok(event) => {
+            // Backend overflow can arrive as a successful, pathless `Other`
+            // event. Record the lost-notification debt before kind or pressure
+            // filtering, and invalidate any scan already in flight.
+            if event.need_rescan() {
+                lock_or_recover(reconciliation).require_full_scan()?;
+            }
             for watch_event in map_notify_event_with_mount_table(event, mount_table) {
                 stats.mark_event(watch_event.observed_at_ms);
                 if !policy.watching_enabled {
@@ -5022,7 +5028,7 @@ mod tests {
     use asupersync::test_utils::run_test_with_cx;
     use asupersync::types::{CancelKind, CancelReason};
     use frankensearch_core::{SearchError, SearchResult};
-    use notify::event::{CreateKind, ModifyKind, RenameMode};
+    use notify::event::{AccessKind, CreateKind, Flag, ModifyKind, RenameMode};
     use notify::{Event, EventKind};
     use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
     use std::fs;
@@ -9957,6 +9963,258 @@ mod tests {
             1
         );
         assert!(pending.by_path.is_empty());
+    }
+
+    #[test]
+    fn notify_rescan_survives_kind_filtering_and_pressure() {
+        for pressure in [PressureState::Normal, PressureState::Emergency] {
+            for kind in [EventKind::Other, EventKind::Access(AccessKind::Any)] {
+                for rescan in [false, true] {
+                    let stats = WatcherStatsInner::default();
+                    let mut pending = PendingEvents::default();
+                    let reconciliation: ReconciliationTracker =
+                        Arc::new(Mutex::new(ReconciliationState::default()));
+                    let mut event = Event::new(kind);
+                    if rescan {
+                        // This pathless Other event is exactly what the Linux
+                        // notify backend emits on IN_Q_OVERFLOW.
+                        event = event.set_flag(Flag::Rescan);
+                    }
+                    let skipped = super::process_notify_result(
+                        Ok(event),
+                        WatcherExecutionPolicy::for_pressure(pressure, 500, 10),
+                        &stats,
+                        &mut pending,
+                        None,
+                        &reconciliation,
+                    )
+                    .expect("rescan ingress succeeds without a named path");
+
+                    let state = lock_or_recover(&reconciliation);
+                    assert_eq!(state.required, rescan, "{pressure:?} {kind:?}");
+                    assert_eq!(state.epoch, u64::from(rescan));
+                    assert_eq!(skipped, 0, "a rescan signal is not a skipped file");
+                    assert!(pending.by_path.is_empty());
+                    assert_eq!(stats.snapshot().events_received, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn notify_rescan_preserves_pending_changes_and_invalidates_old_plans() {
+        for pressure in [PressureState::Normal, PressureState::Emergency] {
+            let prior = WatchEvent::modified("/tmp/repo/prior.rs", 1, Some(13));
+            let current = PathBuf::from("/tmp/repo/current.rs");
+            let mut state = ReconciliationState::default();
+            state
+                .require_for_events(std::slice::from_ref(&prior))
+                .expect("existing event debt");
+            state.unsettled_passes = super::MAX_UNSETTLED_PASSES;
+            let old_token = state.planning_token().expect("pre-overflow plan");
+            let reconciliation = Arc::new(Mutex::new(state));
+            let stats = WatcherStatsInner::default();
+            let mut pending = PendingEvents::default();
+            pending.push(prior.clone());
+            let policy = WatcherExecutionPolicy::for_pressure(pressure, 500, 10);
+            let skipped = super::process_notify_result(
+                Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(current.clone())
+                .set_flag(Flag::Rescan)),
+                policy,
+                &stats,
+                &mut pending,
+                None,
+                &reconciliation,
+            )
+            .expect("a flagged change retains normal event handling");
+            assert_eq!(skipped, usize::from(!policy.watching_enabled));
+            assert_eq!(pending.by_path.get(&prior.path), Some(&prior));
+            assert_eq!(
+                pending.by_path.contains_key(&current),
+                policy.watching_enabled
+            );
+            assert_eq!(stats.snapshot().events_received, 1);
+
+            // An ordinary read following the overflow must neither clear the
+            // owed pass nor manufacture another one.
+            super::process_notify_result(
+                Ok(Event::new(EventKind::Access(AccessKind::Any))),
+                policy,
+                &stats,
+                &mut pending,
+                None,
+                &reconciliation,
+            )
+            .expect("ordinary read");
+            let state = lock_or_recover(&reconciliation);
+            assert!(state.required);
+            assert_eq!(state.epoch, old_token.epoch + 1);
+            assert_ne!(state.planning_token().unwrap(), old_token);
+            assert_eq!(state.unsettled_passes, 0);
+            assert_eq!(state.affected_paths, BTreeSet::from([prior.path]));
+        }
+    }
+
+    #[test]
+    fn notify_rescan_epoch_exhaustion_preserves_debt_and_reports_failure() {
+        let reconciliation = Arc::new(Mutex::new(ReconciliationState {
+            epoch: u64::MAX,
+            ..ReconciliationState::default()
+        }));
+        let prior = WatchEvent::modified("/tmp/repo/prior.rs", 1, Some(13));
+        let mut pending = PendingEvents::default();
+        pending.push(prior.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(PathBuf::from("/tmp/repo/new.rs"))
+        .set_flag(Flag::Rescan)))
+            .expect("queue overflow witness");
+        tx.send(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)))
+            .expect("queue another rescan after exhaustion");
+
+        let error = drain_notify_channel(
+            &rx,
+            WatcherExecutionPolicy::for_pressure(PressureState::Normal, 500, 10),
+            &WatcherStatsInner::default(),
+            &mut pending,
+            None,
+            &reconciliation,
+        )
+        .expect_err("the first lineage failure must reach the producer");
+        assert!(error.to_string().contains("epoch counter exhausted"));
+        assert!(is_retryable_error(&error));
+        assert_eq!(pending.drain_all(10), [prior]);
+        let state = lock_or_recover(&reconciliation);
+        assert!(state.required);
+        assert!(state.lineage_exhausted);
+        assert_eq!(state.epoch, u64::MAX);
+        assert!(state.planning_token().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_rescan_recovers_lost_changes_after_pressure_and_failed_apply() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("build/notes");
+            fs::create_dir_all(root.join("target")).expect("create selected root");
+            let changed = root.join("changed.md");
+            let removed = root.join("removed.md");
+            let created = root.join("created.md");
+            fs::write(&changed, "old searchable content").unwrap();
+            fs::write(&removed, "previously indexed document").unwrap();
+            let roots = vec![root];
+            let discovery = DiscoveryConfig::default();
+            let (baseline, completeness) =
+                collect_snapshot_from_roots(&roots, &discovery, &|| false).unwrap();
+            assert!(completeness.is_complete());
+            let mut state = ReconciliationState::default();
+            assert!(
+                state
+                    .seed_initial_authority(
+                        baseline.clone(),
+                        completeness.root_identities().clone()
+                    )
+                    .unwrap()
+            );
+            let reconciliation = Arc::new(Mutex::new(state));
+
+            // None of these changes delivers its own notification. Moving the
+            // old file out of the root represents a missed deletion safely.
+            fs::rename(&removed, temp.path().join("moved-outside.md")).unwrap();
+            fs::write(&changed, "new searchable content after a missed update").unwrap();
+            fs::write(&created, "new document after a missed create").unwrap();
+            fs::write(roots[0].join("target/generated.md"), "excluded content").unwrap();
+
+            let stats = WatcherStatsInner::default();
+            let mut pending = PendingEvents::default();
+            // A stale pending delete must be superseded by the authoritative
+            // scan, which can see that this path currently exists.
+            pending.push(WatchEvent::deleted(&changed, 1));
+            super::process_notify_result(
+                Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+                WatcherExecutionPolicy::for_pressure(PressureState::Emergency, 500, 10),
+                &stats,
+                &mut pending,
+                None,
+                &reconciliation,
+            )
+            .expect("pathless overflow while watching is paused");
+            assert!(lock_or_recover(&reconciliation).required);
+            let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
+            flush_pending_batches(&mut pending, &queue, 10);
+            let pipeline = RecordingPipeline::default();
+            pipeline.fail_next.store(true, Ordering::Release);
+
+            // On pressure relief the ordinary reconciliation path consumes
+            // the signal. A failed sink must leave the same recovery owed.
+            let failed = run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                &pipeline,
+                &reconciliation,
+                &queue,
+                &stats,
+                10,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect_err("first recovery apply is refused");
+            assert!(failed.to_string().contains("forced failure"));
+            assert!(pipeline.all_ops().is_empty());
+            assert_eq!(stats.snapshot().files_reindexed, 0);
+            {
+                let state = lock_or_recover(&reconciliation);
+                assert!(state.required);
+                assert_eq!(state.indexed_snapshot, baseline);
+            }
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                &pipeline,
+                &reconciliation,
+                &queue,
+                &stats,
+                10,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .expect("retry reconciles every missed change");
+            let operations = pipeline
+                .all_ops()
+                .into_iter()
+                .map(|op| match op {
+                    WatchIngestOp::Upsert { file_key, .. } => ("upsert", file_key),
+                    WatchIngestOp::Delete { file_key, .. } => ("delete", file_key),
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                operations,
+                BTreeSet::from([
+                    ("upsert", normalize_file_key(&changed)),
+                    ("upsert", normalize_file_key(&created)),
+                    ("delete", normalize_file_key(&removed)),
+                ])
+            );
+            assert_eq!(stats.snapshot().files_reindexed, 3);
+            assert!(lock_or_recover(&queue).is_empty());
+            let state = lock_or_recover(&reconciliation);
+            assert!(!state.required);
+            assert!(state.affected_paths.is_empty());
+            assert_eq!(
+                state.indexed_snapshot.keys().collect::<BTreeSet<_>>(),
+                BTreeSet::from([&changed, &created])
+            );
+        });
     }
 
     #[test]

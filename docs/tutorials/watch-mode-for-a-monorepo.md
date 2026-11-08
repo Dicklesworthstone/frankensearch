@@ -25,6 +25,13 @@ fsfs watch .
 
 `watch` listens for file changes and incrementally updates index state.
 
+If the filesystem backend reports lost notifications, such as an inotify queue
+overflow, the incremental watcher requests a full reconciliation of its selected
+roots. It retains that work while resource pressure pauses ingestion and resumes
+it when the policy permits. Recovery applies the same discovery exclusions and
+deletion safeguards as ordinary catch-up; a notification without file paths can
+still require this scan.
+
 ## 3) Searching from another terminal while `watch` runs
 
 On Linux, a new index created in `.frankensearch` (or outside the source tree)
