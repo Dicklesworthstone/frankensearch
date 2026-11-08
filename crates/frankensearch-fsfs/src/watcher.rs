@@ -3920,6 +3920,9 @@ fn event_to_ingest_op(
     });
     let mut candidate =
         DiscoveryCandidate::new(&event.path, byte_len).with_symlink(event.is_symlink);
+    if let Some(root) = root {
+        candidate = candidate.with_root(root);
+    }
     if let Some(category) = event.mount_category {
         candidate = candidate.with_mount_category(category);
     }
@@ -4420,7 +4423,9 @@ fn collect_snapshot_for_root(
     }
 
     if metadata.is_file() {
-        let mut candidate = DiscoveryCandidate::new(root, metadata.len()).with_symlink(is_symlink);
+        let mut candidate = DiscoveryCandidate::new(root, metadata.len())
+            .with_root(root)
+            .with_symlink(is_symlink);
         if let Some(category) = lookup_mount_category(mount_table, root) {
             candidate = candidate.with_mount_category(category);
         }
@@ -4524,8 +4529,9 @@ fn collect_snapshot_for_root(
             }
 
             if metadata.is_dir() {
-                let mut directory_candidate =
-                    DiscoveryCandidate::new(&path, 0).with_symlink(is_symlink);
+                let mut directory_candidate = DiscoveryCandidate::new(&path, 0)
+                    .with_root(root)
+                    .with_symlink(is_symlink);
                 if let Some(category) = lookup_mount_category(mount_table, &path) {
                     directory_candidate = directory_candidate.with_mount_category(category);
                 }
@@ -4541,8 +4547,9 @@ fn collect_snapshot_for_root(
                 continue;
             }
 
-            let mut candidate =
-                DiscoveryCandidate::new(&path, metadata.len()).with_symlink(is_symlink);
+            let mut candidate = DiscoveryCandidate::new(&path, metadata.len())
+                .with_root(root)
+                .with_symlink(is_symlink);
             if let Some(category) = lookup_mount_category(mount_table, &path) {
                 candidate = candidate.with_mount_category(category);
             }
@@ -4801,14 +4808,16 @@ mod tests {
     /// Exercise the public catch-up handoff against a real sink. The caller
     /// still owns acknowledgement, which deliberately makes a dropped or
     /// rejected capability fail closed through `CatchupEvents::Drop`.
+    /// Classify events within the same roots that produced the snapshot.
     fn apply_catchup_events<'a>(
         cx: &'a Cx,
-        discovery: &'a DiscoveryConfig,
+        watcher: &'a FsWatcher,
         pipeline: &'a dyn WatchIngestPipeline,
         catchup: &'a CatchupEvents,
     ) -> WatchIngestFuture<'a, ()> {
         Box::pin(async move {
-            let prepared = super::prepare_event_batch(discovery, &[], catchup.events());
+            let prepared =
+                super::prepare_event_batch(&watcher.discovery, &watcher.roots, catchup.events());
             if !prepared.ops.is_empty() {
                 pipeline.apply_batch(cx, &prepared.ops).await?;
             }
@@ -5540,6 +5549,110 @@ mod tests {
         assert!(!snapshot.contains_key(&root.join("image.png")));
     }
 
+    #[test]
+    fn watcher_scan_and_events_scope_exclusions_beneath_build_and_target() {
+        let temp = tempdir().expect("tempdir");
+        for ancestor in ["build", "target"] {
+            let root = temp.path().join(ancestor).join("notes");
+            fs::create_dir_all(root.join("docs")).expect("create source directories");
+            let included = root.join("docs/notes.md");
+            fs::write(&included, "Selected notes remain searchable.\n").expect("write notes");
+            let mut events = vec![WatchEvent::modified(&included, 1_000, Some(32))];
+            for excluded in [
+                "build",
+                "dist",
+                "vendor",
+                "target",
+                "node_modules",
+                ".venv",
+                ".next",
+                "__pycache__",
+                ".git",
+            ] {
+                let directory = root.join("docs").join(excluded);
+                fs::create_dir_all(&directory).expect("create excluded directory");
+                let file = directory.join("excluded.md");
+                fs::write(&file, "Excluded descendant.\n").expect("write excluded source");
+                events.push(WatchEvent::modified(file, 1_000, Some(32)));
+            }
+
+            let discovery = DiscoveryConfig::default();
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                discovery.clone(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            let (snapshot, completeness) = watcher.collect_snapshot().expect("collect snapshot");
+            assert!(completeness.is_complete());
+            assert_eq!(snapshot.keys().collect::<Vec<_>>(), vec![&included]);
+
+            let prepared = super::prepare_event_batch(&discovery, &[root], &events);
+            assert_eq!(prepared.accepted, 1, "ancestor: {ancestor}");
+            assert_eq!(prepared.skipped, 9, "ancestor: {ancestor}");
+            assert_eq!(
+                prepared.ops,
+                vec![WatchIngestOp::Upsert {
+                    file_key: normalize_file_key(&included),
+                    revision: 1_000,
+                    ingestion_class: crate::config::IngestionClass::FullSemanticLexical,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_scan_and_events_honor_explicit_nested_roots() {
+        let temp = tempdir().expect("tempdir");
+        let outer = temp.path().join("project");
+        let selected = outer.join("build/notes");
+        fs::create_dir_all(selected.join("target")).expect("create source directories");
+        let outer_file = outer.join("main.md");
+        let selected_file = selected.join("selected.md");
+        let sibling_file = outer.join("build/sibling.md");
+        let excluded_file = selected.join("target/generated.md");
+        let files = [&outer_file, &selected_file, &sibling_file, &excluded_file];
+        for file in files {
+            fs::write(file, "Source document.\n").expect("write source");
+        }
+        let events = files.map(|file| WatchEvent::modified(file, 1_000, Some(17)));
+        let discovery = DiscoveryConfig::default();
+        let outer_roots = vec![outer.clone()];
+        let (snapshot, completeness) =
+            collect_snapshot_from_roots(&outer_roots, &discovery, &|| false)
+                .expect("scan outer root");
+        assert!(completeness.is_complete());
+        assert_eq!(snapshot.keys().collect::<Vec<_>>(), vec![&outer_file]);
+        let prepared = super::prepare_event_batch(&discovery, &outer_roots, &events);
+        assert_eq!(prepared.accepted, 1);
+        assert_eq!(prepared.skipped, 3);
+
+        let roots = vec![outer, selected];
+        let (snapshot, completeness) = collect_snapshot_from_roots(&roots, &discovery, &|| false)
+            .expect("scan explicitly selected nested root");
+        assert!(completeness.is_complete());
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.contains_key(&outer_file));
+        assert!(snapshot.contains_key(&selected_file));
+        let prepared = super::prepare_event_batch(&discovery, &roots, &events);
+        assert_eq!(prepared.accepted, 2);
+        assert_eq!(prepared.skipped, 2);
+        let admitted = prepared
+            .ops
+            .iter()
+            .map(|op| match op {
+                WatchIngestOp::Upsert { file_key, .. } => file_key.clone(),
+                WatchIngestOp::Delete { .. } => panic!("modified source produced a delete"),
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            admitted,
+            BTreeSet::from([
+                normalize_file_key(&outer_file),
+                normalize_file_key(&selected_file),
+            ])
+        );
+    }
+
     /// A tree exercising every ignore source the index walk reads: an
     /// `.ignore` above the root, `.ignore`, nested `.gitignore` with
     /// whitelists, `.git/info/exclude`, a nested repository, hidden entries
@@ -5732,7 +5845,8 @@ mod tests {
         fs::create_dir_all(&target_root).expect("create target");
         fs::write(target_root.join("lib.rs"), "fn main() {}\n").expect("write source");
 
-        let symlink_root = temp.path().join("linked-root");
+        fs::create_dir_all(temp.path().join("build")).expect("create excluded ancestor");
+        let symlink_root = temp.path().join("build/linked-root");
         std::os::unix::fs::symlink(&target_root, &symlink_root).expect("create symlink");
 
         let discovery = DiscoveryConfig {
@@ -5764,8 +5878,17 @@ mod tests {
         let target_root = temp.path().join("target");
         fs::create_dir_all(&target_root).expect("create target");
         fs::write(target_root.join("lib.rs"), "fn main() {}\n").expect("write source");
+        fs::create_dir_all(target_root.join("node_modules")).expect("create excluded directory");
+        fs::write(
+            target_root.join("node_modules/dependency.md"),
+            "Excluded dependency.\n",
+        )
+        .expect("write excluded source");
+        std::os::unix::fs::symlink(&target_root, target_root.join("loop"))
+            .expect("create symlink loop");
 
-        let symlink_root = temp.path().join("linked-root");
+        fs::create_dir_all(temp.path().join("build")).expect("create excluded ancestor");
+        let symlink_root = temp.path().join("build/linked-root");
         std::os::unix::fs::symlink(&target_root, &symlink_root).expect("create symlink");
 
         let discovery = DiscoveryConfig {
@@ -5788,6 +5911,7 @@ mod tests {
             snapshot.contains_key(&symlink_root.join("lib.rs")),
             "root symlink contents should be indexed when follow_symlinks=true"
         );
+        assert_eq!(snapshot.len(), 1, "excluded descendants and loops stay out");
     }
 
     #[test]
@@ -6435,7 +6559,7 @@ mod tests {
                     .any(|event| event.kind == WatchEventKind::Deleted),
                 "an incomplete catch-up must derive no deletes, got {events:?}"
             );
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &events)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &events)
                 .await
                 .expect("the incomplete receipt's visible operations apply");
 
@@ -6475,7 +6599,7 @@ mod tests {
                     watcher.holds_unverified_legacy_baseline(),
                     "the inherited name must still be retained after pass {pass}"
                 );
-                apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &observed)
+                apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &observed)
                     .await
                     .expect("the complete catch-up observation applies before acknowledgement");
                 observed
@@ -6497,7 +6621,7 @@ mod tests {
                 "the retained name must be settled by the explicit grant, and it can only \
                  have come from retention because the argument was empty, got {recovered:?}"
             );
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &recovered)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &recovered)
                 .await
                 .expect("the stale delete applies before acknowledgement");
             recovered
@@ -6554,7 +6678,7 @@ mod tests {
                     .any(|event| event.kind == WatchEventKind::Deleted),
                 "the first inherited observation cannot delete stale state"
             );
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &first)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &first)
                 .await
                 .expect("first catch-up operations apply");
             first
@@ -6563,7 +6687,7 @@ mod tests {
             let confirmation = watcher
                 .build_catchup_events(&FileSnapshot::new())
                 .expect("confirming public catch-up");
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &confirmation)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &confirmation)
                 .await
                 .expect("confirming catch-up operations apply");
             confirmation
@@ -6600,7 +6724,7 @@ mod tests {
                     .any(|event| { event.kind == WatchEventKind::Deleted && event.path == stale }),
                 "the dropped delete must be rederived from retained legacy"
             );
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &rederived)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &rederived)
                 .await
                 .expect("the retried delete applies before acknowledgement");
             rederived
@@ -6636,7 +6760,7 @@ mod tests {
             let initial = watcher
                 .build_catchup_events(&FileSnapshot::new())
                 .expect("initial catch-up");
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &initial)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &initial)
                 .await
                 .expect("initial sink apply");
             initial
@@ -6655,7 +6779,7 @@ mod tests {
                 "the first proposal must contain the new path, got {partial:?}"
             );
             pipeline.fail_after_first.store(true, Ordering::Release);
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &partial)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &partial)
                 .await
                 .expect_err("the sink must report its partial post-mutation failure");
             assert!(
@@ -6694,7 +6818,7 @@ mod tests {
                 }),
                 "the authorized retry must derive the delete from affected-path debt, got {retry:?}"
             );
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &retry)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &retry)
                 .await
                 .expect("retry sink apply");
             retry
@@ -6735,7 +6859,7 @@ mod tests {
             let initial = watcher
                 .build_catchup_events(&FileSnapshot::new())
                 .expect("initial authority catch-up");
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &initial)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &initial)
                 .await
                 .expect("initial sink apply");
             initial
@@ -6790,7 +6914,7 @@ mod tests {
                     .any(|event| event.kind == WatchEventKind::Deleted && event.path == stale),
                 "a scan captured before the new generation must not derive its stale delete, got {stale_plan:?}"
             );
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &stale_plan)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &stale_plan)
                 .await
                 .expect("the rejected-plan receipt still applies only safe upserts");
             let reconciliation_state = lock_or_recover(&watcher.reconciliation);
@@ -6824,7 +6948,7 @@ mod tests {
             let initial = watcher
                 .build_catchup_events(&FileSnapshot::new())
                 .expect("initial authority catch-up");
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &initial)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &initial)
                 .await
                 .expect("initial sink apply");
             initial
@@ -6841,7 +6965,7 @@ mod tests {
                     .any(|event| event.kind == WatchEventKind::Deleted && event.path == stale),
                 "the pre-race proposal must contain the stale delete"
             );
-            apply_catchup_events(&cx, &discovery, pipeline.as_ref(), &pending)
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &pending)
                 .await
                 .expect("the recording sink applies the pre-race proposal");
             let late = root.join("late-during-ack.rs");
@@ -10227,22 +10351,26 @@ mod tests {
     #[test]
     fn collect_snapshot_supports_file_root() {
         let temp = tempdir().expect("tempdir");
-        let file_root = temp.path().join("single.rs");
-        fs::write(&file_root, "fn main() {}").expect("write");
+        for ancestor in ["build", "target"] {
+            let parent = temp.path().join(ancestor);
+            fs::create_dir_all(&parent).expect("create excluded ancestor");
+            let file_root = parent.join("single.rs");
+            fs::write(&file_root, "fn main() {}").expect("write");
 
-        let watcher = FsWatcher::new(
-            vec![file_root.clone()],
-            DiscoveryConfig::default(),
-            Arc::new(NoopWatchIngestPipeline),
-        );
-        let (snapshot, completeness) = watcher.collect_snapshot().expect("collect snapshot");
-        assert!(
-            completeness.is_complete(),
-            "readable fixture scans complete"
-        );
+            let watcher = FsWatcher::new(
+                vec![file_root.clone()],
+                DiscoveryConfig::default(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            let (snapshot, completeness) = watcher.collect_snapshot().expect("collect snapshot");
+            assert!(
+                completeness.is_complete(),
+                "readable fixture scans complete"
+            );
 
-        assert!(snapshot.contains_key(&file_root));
-        assert_eq!(snapshot.len(), 1);
+            assert!(snapshot.contains_key(&file_root));
+            assert_eq!(snapshot.len(), 1);
+        }
     }
 
     fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

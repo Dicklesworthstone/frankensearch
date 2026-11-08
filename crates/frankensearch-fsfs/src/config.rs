@@ -437,6 +437,9 @@ pub enum DiscoveryScopeDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryCandidate<'a> {
     pub path: &'a Path,
+    /// The actual traversal root, in the same path spelling as `path`.
+    /// Component exclusions apply at and below this root, not to its ancestors.
+    pub discovery_root: Option<&'a Path>,
     pub byte_len: u64,
     pub is_symlink: bool,
     pub mount_category: Option<crate::mount_info::FsCategory>,
@@ -447,10 +450,20 @@ impl<'a> DiscoveryCandidate<'a> {
     pub const fn new(path: &'a Path, byte_len: u64) -> Self {
         Self {
             path,
+            discovery_root: None,
             byte_len,
             is_symlink: false,
             mount_category: None,
         }
+    }
+
+    /// Bind component-based discovery policy to the root used by this walk.
+    /// A path outside the root, or containing `..` below it, is rejected.
+    /// This does not resolve symlinks or replace the traversal's safety checks.
+    #[must_use]
+    pub const fn with_root(mut self, root: &'a Path) -> Self {
+        self.discovery_root = Some(root);
+        self
     }
 
     #[must_use]
@@ -563,7 +576,6 @@ impl DiscoveryConfig {
         mount_category: Option<crate::mount_info::FsCategory>,
     ) -> RootDiscoveryDecision {
         let mut reason_codes = Vec::new();
-        let normalized = normalize_path(root);
 
         if root.as_os_str().is_empty() {
             reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
@@ -591,7 +603,10 @@ impl DiscoveryConfig {
             };
         }
 
-        if self.matches_exclude_patterns(root, &normalized) {
+        // An explicitly selected root starts the component-exclusion scope.
+        // Its own name still participates; unrelated parents do not (#72).
+        let component_path = root.file_name().map_or(root, Path::new);
+        if self.matches_exclude_patterns(root, component_path) {
             reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
             return RootDiscoveryDecision {
                 scope: DiscoveryScopeDecision::Exclude,
@@ -612,7 +627,13 @@ impl DiscoveryConfig {
     pub fn evaluate_candidate(&self, candidate: &DiscoveryCandidate<'_>) -> DiscoveryDecision {
         let mut reason_codes = Vec::new();
 
-        if candidate.path.as_os_str().is_empty() {
+        let scoped_path = candidate
+            .discovery_root
+            .map_or(Some(candidate.path), |root| {
+                discovery_scope_path(candidate.path, root)
+            });
+        let Some(scoped_path) = scoped_path.filter(|_| !candidate.path.as_os_str().is_empty())
+        else {
             reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
             reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
             normalize_reason_codes(&mut reason_codes);
@@ -622,7 +643,7 @@ impl DiscoveryConfig {
                 utility_score: i32::MIN,
                 reason_codes,
             };
-        }
+        };
 
         if candidate
             .mount_category
@@ -656,9 +677,8 @@ impl DiscoveryConfig {
         }
 
         reason_codes.push(REASON_DISCOVERY_ROOT_ACCEPTED.to_string());
-        let normalized = normalize_path(candidate.path);
 
-        if self.matches_exclude_patterns(candidate.path, &normalized) {
+        if self.matches_exclude_patterns(candidate.path, scoped_path) {
             reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
             normalize_reason_codes(&mut reason_codes);
             return DiscoveryDecision {
@@ -723,7 +743,7 @@ impl DiscoveryConfig {
             utility_score -= 10;
         }
 
-        if has_low_utility_component(candidate.path) {
+        if has_low_utility_component(scoped_path) {
             utility_score -= 30;
         }
 
@@ -808,13 +828,20 @@ impl DiscoveryConfig {
         }
     }
 
-    fn matches_exclude_patterns(&self, path: &Path, normalized_path: &str) -> bool {
-        let components = normalized_components(path);
+    fn matches_exclude_patterns(&self, path: &Path, component_path: &Path) -> bool {
+        // Bare directory names are scope-relative. Explicit path/glob rules
+        // keep the full path so selecting a root cannot bypass a custom deny.
+        let normalized_path = normalize_path(path);
+        let components = normalized_components(component_path);
         self.exclude_patterns.iter().any(|pattern| {
+            let pattern = pattern.replace('\\', "/").to_ascii_lowercase();
+            // The matcher trims slashes, so `/private` and `private/` have
+            // historically used component matching over the full path too.
+            let full_components = pattern.contains('/').then(|| normalized_components(path));
             path_matches_pattern(
-                &pattern.replace('\\', "/").to_ascii_lowercase(),
-                normalized_path,
-                &components,
+                &pattern,
+                &normalized_path,
+                full_components.as_ref().unwrap_or(&components),
             )
         })
     }
@@ -3683,6 +3710,27 @@ fn normalize_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// Keep the root's name and its descendants without touching filesystem state.
+/// Do not collapse `..`: doing so before resolving symlinks changes its meaning.
+fn discovery_scope_path<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+    if root.as_os_str().is_empty() {
+        return None;
+    }
+    let relative = path.strip_prefix(root).ok()?;
+    if relative
+        .components()
+        .any(|part| part == Component::ParentDir)
+    {
+        return None;
+    }
+    if root.file_name().is_some() {
+        path.strip_prefix(root.parent()?).ok()
+    } else {
+        // Filesystem roots and relative `.` have no basename to retain.
+        Some(path)
+    }
+}
+
 fn normalized_components(path: &Path) -> Vec<String> {
     path.components()
         .filter_map(|component| match component {
@@ -3699,7 +3747,14 @@ fn path_matches_pattern(pattern: &str, normalized_path: &str, components: &[Stri
     }
 
     if trimmed.contains('*') {
-        if wildcard_match(normalized_path, trimmed) {
+        // Keep the anchor for absolute globs. Removing the leading slash
+        // makes `/root/private/*` fail against every absolute candidate.
+        let wildcard_pattern = if pattern.starts_with('/') {
+            pattern.trim_end_matches('/')
+        } else {
+            trimmed
+        };
+        if wildcard_match(normalized_path, wildcard_pattern) {
             return true;
         }
         // Relative patterns (no leading /) should match against any path suffix.
@@ -6391,6 +6446,264 @@ mod tests {
         let config = super::DiscoveryConfig::default();
         let decision = config.evaluate_root(Path::new("/home/user/src"), None);
         assert!(decision.include());
+    }
+
+    #[test]
+    fn discovery_scope_ignores_excluded_ancestors_but_keeps_root_and_descendant_exclusions() {
+        let config = super::DiscoveryConfig::default();
+        for name in &config.exclude_patterns {
+            let root = PathBuf::from(format!("/workspace/{name}/notes"));
+            let source = root.join("src/main.rs");
+            assert!(config.evaluate_root(&root, None).include(), "{root:?}");
+            let decision = config
+                .evaluate_candidate(&DiscoveryCandidate::new(&source, 2_048).with_root(&root));
+            assert_eq!(
+                decision.scope,
+                DiscoveryScopeDecision::Include,
+                "{source:?}"
+            );
+            assert_eq!(
+                decision.ingestion_class,
+                IngestionClass::FullSemanticLexical
+            );
+
+            // Selecting a root does not override a rule on the root itself.
+            let excluded_root = PathBuf::from(format!("/workspace/{name}"));
+            assert!(!config.evaluate_root(&excluded_root, None).include());
+            let excluded_source = excluded_root.join("main.rs");
+            assert_eq!(
+                config
+                    .evaluate_candidate(
+                        &DiscoveryCandidate::new(&excluded_source, 2_048).with_root(&excluded_root),
+                    )
+                    .scope,
+                DiscoveryScopeDecision::Exclude,
+            );
+
+            for nested in [name.clone(), format!("src/{}", name.to_ascii_uppercase())] {
+                let excluded = root.join(nested).join("main.rs");
+                let decision = config.evaluate_candidate(
+                    &DiscoveryCandidate::new(&excluded, 2_048).with_root(&root),
+                );
+                assert_eq!(
+                    decision.scope,
+                    DiscoveryScopeDecision::Exclude,
+                    "{excluded:?}"
+                );
+                assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_scope_uses_the_actual_selected_root_not_other_configured_roots() {
+        let outer = Path::new("/workspace");
+        let selected = Path::new("/workspace/build/notes");
+        let source = selected.join("main.rs");
+        let config = super::DiscoveryConfig {
+            roots: vec![outer.display().to_string(), selected.display().to_string()],
+            ..super::DiscoveryConfig::default()
+        };
+        let candidate = DiscoveryCandidate::new(&source, 2_048);
+        assert_eq!(
+            config.evaluate_candidate(&candidate).scope,
+            DiscoveryScopeDecision::Exclude
+        );
+        assert_eq!(
+            config
+                .evaluate_candidate(&candidate.clone().with_root(outer))
+                .scope,
+            DiscoveryScopeDecision::Exclude,
+        );
+        assert_eq!(
+            config
+                .evaluate_candidate(&candidate.with_root(selected))
+                .scope,
+            DiscoveryScopeDecision::Include,
+        );
+    }
+
+    #[test]
+    fn discovery_scope_preserves_custom_component_path_and_glob_exclusions() {
+        let root = Path::new("/workspace/private/notes");
+        let mut config = super::DiscoveryConfig {
+            exclude_patterns: vec!["private".to_owned()],
+            ..super::DiscoveryConfig::default()
+        };
+        assert!(config.evaluate_root(root, None).include());
+        let public = root.join("public.md");
+        assert_eq!(
+            config
+                .evaluate_candidate(&DiscoveryCandidate::new(&public, 100).with_root(root))
+                .scope,
+            DiscoveryScopeDecision::Include,
+        );
+        let private = root.join("private/secret.md");
+        assert_eq!(
+            config
+                .evaluate_candidate(&DiscoveryCandidate::new(&private, 100).with_root(root))
+                .scope,
+            DiscoveryScopeDecision::Exclude,
+        );
+
+        // Path rules can deliberately name ancestors above an explicit root.
+        for pattern in [
+            "private/notes",
+            "/workspace/private/notes",
+            "private/**",
+            "/private",
+            "private/",
+            "\\private\\",
+        ] {
+            config.exclude_patterns = vec![pattern.to_owned()];
+            assert!(!config.evaluate_root(root, None).include(), "{pattern}");
+            assert_eq!(
+                config
+                    .evaluate_candidate(&DiscoveryCandidate::new(&public, 100).with_root(root))
+                    .scope,
+                DiscoveryScopeDecision::Exclude,
+                "{pattern}",
+            );
+        }
+
+        config.exclude_patterns = vec!["/private".to_owned()];
+        assert!(
+            config
+                .evaluate_root(Path::new("/workspace/private-other/notes"), None)
+                .include()
+        );
+
+        for pattern in ["private/secret.md", "private/**", "*.md"] {
+            config.exclude_patterns = vec![pattern.to_owned()];
+            assert_eq!(
+                config
+                    .evaluate_candidate(&DiscoveryCandidate::new(&private, 100).with_root(root))
+                    .scope,
+                DiscoveryScopeDecision::Exclude,
+                "{pattern}",
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_scope_absolute_globs_remain_anchored() {
+        let config = super::DiscoveryConfig {
+            exclude_patterns: vec!["/workspace/build/notes/private/*".to_owned()],
+            ..super::DiscoveryConfig::default()
+        };
+        for (root, expected) in [
+            ("/workspace/build/notes", DiscoveryScopeDecision::Exclude),
+            (
+                "/other/workspace/build/notes",
+                DiscoveryScopeDecision::Include,
+            ),
+        ] {
+            let root = Path::new(root);
+            assert!(config.evaluate_root(root, None).include());
+            let source = root.join("private/secret.md");
+            let candidate = DiscoveryCandidate::new(&source, 100);
+            assert_eq!(config.evaluate_candidate(&candidate).scope, expected);
+            assert_eq!(
+                config.evaluate_candidate(&candidate.with_root(root)).scope,
+                expected
+            );
+        }
+        let config = super::DiscoveryConfig {
+            exclude_patterns: vec!["/workspace/build/*".to_owned()],
+            ..super::DiscoveryConfig::default()
+        };
+        assert!(
+            !config
+                .evaluate_root(Path::new("/workspace/build/notes"), None)
+                .include()
+        );
+    }
+
+    #[test]
+    fn discovery_scope_rejects_prefix_siblings_parent_traversal_and_empty_roots() {
+        let config = super::DiscoveryConfig::default();
+        let root = Path::new("/workspace/notes");
+        for outside in [
+            "/workspace/notes-other/file.md",
+            "/workspace/notes/../outside.md",
+            "/workspace/notes/sub/../../outside.md",
+            "/workspace/NOTES/file.md",
+            "relative.md",
+        ] {
+            let candidate = DiscoveryCandidate::new(Path::new(outside), 100).with_root(root);
+            let decision = config.evaluate_candidate(&candidate);
+            assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude, "{outside}");
+            assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+            assert!(
+                decision
+                    .reason_codes
+                    .contains(&"discovery.root.rejected".to_owned())
+            );
+        }
+        let source = root.join("file.md");
+        let candidate = DiscoveryCandidate::new(&source, 100);
+        assert_eq!(
+            config
+                .evaluate_candidate(&candidate.with_root(Path::new("")))
+                .scope,
+            DiscoveryScopeDecision::Exclude,
+        );
+    }
+
+    #[test]
+    fn discovery_scope_handles_relative_paths_dot_components_and_trailing_separators() {
+        let config = super::DiscoveryConfig::default();
+        for (root, source) in [
+            ("build/notes", "build/notes/src/main.rs"),
+            ("./target/notes/", "./target/notes/./src//main.rs"),
+            (
+                "/workspace/build/notes/./",
+                "/workspace/build/notes/src/main.rs",
+            ),
+            (".", "./main.rs"),
+            ("/", "/main.rs"),
+        ] {
+            let root = Path::new(root);
+            assert!(config.evaluate_root(root, None).include());
+            let decision = config.evaluate_candidate(
+                &DiscoveryCandidate::new(Path::new(source), 2_048).with_root(root),
+            );
+            assert_eq!(decision.scope, DiscoveryScopeDecision::Include, "{source}");
+            assert_eq!(
+                decision.ingestion_class,
+                IngestionClass::FullSemanticLexical
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_scope_keeps_mount_symlink_binary_and_size_guards() {
+        let root = Path::new("/workspace/build/notes");
+        let source = root.join("main.rs");
+        let binary = root.join("module.wasm");
+        let config = super::DiscoveryConfig {
+            skip_network_mounts: true,
+            ..super::DiscoveryConfig::default()
+        };
+        for candidate in [
+            DiscoveryCandidate::new(&source, 100).with_symlink(true),
+            DiscoveryCandidate::new(&source, 100)
+                .with_mount_category(crate::mount_info::FsCategory::Virtual),
+            DiscoveryCandidate::new(&source, 100)
+                .with_mount_category(crate::mount_info::FsCategory::Nfs),
+            DiscoveryCandidate::new(&binary, 100),
+            DiscoveryCandidate::new(&source, u64::MAX),
+        ] {
+            let decision = config.evaluate_candidate(&candidate.with_root(root));
+            assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+            assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+        }
+        for category in [
+            crate::mount_info::FsCategory::Virtual,
+            crate::mount_info::FsCategory::Nfs,
+        ] {
+            assert!(!config.evaluate_root(root, Some(category)).include());
+        }
     }
 
     // ── Discovery evaluate_candidate edge cases ──

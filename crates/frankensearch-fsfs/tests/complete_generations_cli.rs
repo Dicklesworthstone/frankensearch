@@ -1,8 +1,8 @@
-//! Production-executable coverage for complete-generation routing.
+//! Production-executable coverage for complete-generation routing and discovery.
 //!
-//! Refusal cases do not need models. The positive case is explicitly ignored
-//! unless a verified semantic cache is provisioned; it never enables the
-//! library's cfg(test) hash embedder inside the shipping binary.
+//! Refusal and lexical-only discovery cases do not need models. The semantic
+//! case is explicitly ignored unless a verified cache is provisioned; it never
+//! enables the library's cfg(test) hash embedder inside the shipping binary.
 #![cfg(unix)]
 
 use std::fs;
@@ -23,8 +23,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let directory = tempfile::tempdir().expect("fixture");
-        let source = directory.path().join("source");
+        Self::with_source(tempfile::tempdir().expect("fixture"), "source")
+    }
+
+    fn with_source(directory: tempfile::TempDir, root_name: &str) -> Self {
+        let source = directory.path().join(root_name);
         let store = directory.path().join("store");
         let config = directory.path().join("fsfs.toml");
         fs::create_dir(&source).expect("source");
@@ -85,6 +88,24 @@ impl Fixture {
             .args(["--format", format, "--quiet"]);
         child
     }
+
+    fn lexical_discovery_command(&self, command: &str) -> Command {
+        let mut child = self.command(command, "json");
+        let home = self.directory.path().join("home");
+        child
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("TMPDIR", self.directory.path())
+            .env("FRANKENSEARCH_MODEL_DIR", home.join("models"))
+            .env("FRANKENSEARCH_ALLOW_DOWNLOAD", "0")
+            .env(
+                "FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE",
+                "force_lexical_only",
+            );
+        child
+    }
 }
 
 fn execute(command: &mut Command) -> Output {
@@ -139,6 +160,166 @@ fn json_output(output: &Output, success: bool) -> Value {
     let value: Value = serde_json::from_slice(&output.stdout).expect("one JSON envelope");
     assert_eq!(value["ok"], success);
     value
+}
+
+fn assert_only_selected_document_is_searchable(fixture: &Fixture, excludes: Option<&str>) {
+    let mut index = fixture.lexical_discovery_command("index");
+    index.arg("--no-watch-mode");
+    if let Some(patterns) = excludes {
+        index.args(["--exclude", patterns]);
+    }
+    let indexed = json_output(&execute(&mut index), true);
+    assert_eq!(indexed["data"]["indexed_files"], 1, "{indexed}");
+
+    let result = json_output(
+        &execute(fixture.lexical_discovery_command("search").args([
+            "--no-daemon",
+            "--limit",
+            "100",
+        ])),
+        true,
+    );
+    let hits = result["data"]["hits"].as_array().expect("search hits");
+    assert_eq!(
+        hits.len(),
+        1,
+        "excluded or out-of-root content leaked: {result}"
+    );
+    assert_eq!(hits[0]["path"], "alpha.md", "{result}");
+}
+
+#[test]
+fn discovery_cli_accepts_roots_and_temporary_stores_beneath_excluded_ancestors() {
+    for ancestor in ["build", "target"] {
+        let outer = tempfile::tempdir().expect("outer fixture");
+        let temporary_parent = outer.path().join(ancestor);
+        fs::create_dir(&temporary_parent).unwrap();
+        let fixture = Fixture::with_source(
+            tempfile::tempdir_in(&temporary_parent).expect("temporary fixture below exclusion"),
+            "notes",
+        );
+        // Both the selected root and the index store are below the excluded
+        // ancestor. Child-only TMPDIR also exercises this layout without
+        // changing the test runner's process-wide environment.
+        for excluded in [
+            "build",
+            "dist",
+            "vendor",
+            "target",
+            "node_modules",
+            ".venv",
+            ".next",
+            "__pycache__",
+            ".git",
+        ] {
+            let nested = fixture.source.join(excluded).join("nested");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(
+                nested.join("excluded.md"),
+                "sharedtoken excluded descendant",
+            )
+            .unwrap();
+        }
+        let outside = fixture.directory.path().join("outside.md");
+        let outside_body = "sharedtoken outside the selected root";
+        fs::write(&outside, outside_body).unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.source.join("linked-outside.md")).unwrap();
+
+        assert_only_selected_document_is_searchable(&fixture, None);
+        assert_eq!(fs::read_to_string(outside).unwrap(), outside_body);
+    }
+}
+
+#[test]
+fn discovery_cli_scopes_custom_components_and_keeps_path_and_wildcard_exclusions() {
+    let outer = tempfile::tempdir().expect("outer fixture");
+    let temporary_parent = outer.path().join("private");
+    fs::create_dir(&temporary_parent).unwrap();
+    let fixture = Fixture::with_source(
+        tempfile::tempdir_in(&temporary_parent).expect("temporary fixture below custom exclusion"),
+        "notes",
+    );
+    for relative in [
+        "private/secret.md",
+        "generated/nested/cache.md",
+        "docs/draft-secrets.md",
+    ] {
+        let path = fixture.source.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "sharedtoken custom excluded descendant").unwrap();
+    }
+
+    assert_only_selected_document_is_searchable(&fixture, Some("private,generated/**,draft-*.md"));
+}
+
+#[test]
+fn discovery_cli_preserves_absolute_wildcard_exclusions_beneath_build() {
+    let outer = tempfile::tempdir().expect("outer fixture");
+    let temporary_parent = outer.path().join("build");
+    fs::create_dir(&temporary_parent).unwrap();
+    let fixture = Fixture::with_source(
+        tempfile::tempdir_in(&temporary_parent).expect("temporary fixture below build"),
+        "notes",
+    );
+    let private = fixture.source.join("private/nested");
+    fs::create_dir_all(&private).unwrap();
+    fs::write(
+        private.join("secret.md"),
+        "sharedtoken absolute excluded descendant",
+    )
+    .unwrap();
+    // The CLI canonicalizes its root, so anchor the custom rule to the same
+    // path even on platforms whose temporary directory has a symlink alias.
+    let canonical_root = fs::canonicalize(&fixture.source).unwrap();
+    let descendant_pattern = format!("build,{}/private/**", canonical_root.display());
+    assert_only_selected_document_is_searchable(&fixture, Some(&descendant_pattern));
+
+    let root_pattern = format!("build,{}*", canonical_root.display());
+    let value = json_output(
+        &execute(fixture.lexical_discovery_command("index").args([
+            "--no-watch-mode",
+            "--exclude",
+            &root_pattern,
+        ])),
+        false,
+    );
+    assert_eq!(value["error"]["field"], "discovery.roots", "{value}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("target root excluded by discovery policy"),
+        "{value}"
+    );
+}
+
+#[test]
+fn discovery_cli_still_rejects_explicitly_selected_excluded_root_names() {
+    for (root_name, excludes) in [
+        ("build", None),
+        ("target", None),
+        ("private", Some("private")),
+    ] {
+        let fixture = Fixture::with_source(tempfile::tempdir().expect("fixture"), root_name);
+        let mut index = fixture.lexical_discovery_command("index");
+        index.arg("--no-watch-mode");
+        if let Some(patterns) = excludes {
+            index.args(["--exclude", patterns]);
+        }
+        let value = json_output(&execute(&mut index), false);
+        assert_eq!(value["error"]["field"], "discovery.roots", "{value}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("target root excluded by discovery policy"),
+            "{root_name}: {value}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.source.join("alpha.md")).unwrap(),
+            "sharedtoken alpha document"
+        );
+    }
 }
 
 #[test]

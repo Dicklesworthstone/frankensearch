@@ -31,6 +31,17 @@ System/global roots (`/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/var`) require ex
 
 Both modes MUST emit auditable reason codes for final decisions.
 
+## Explicit Root Exclusion Scope
+
+Bare component exclusions (such as `build`, `target`, or a custom directory name)
+apply to the selected root itself and its descendants, not to unrelated ancestors.
+Thus `/home/user/build/notes` is an eligible root, while a selected root named
+`build` and a `build` directory inside `notes` remain excluded. Indexing and watch
+discovery MUST use the actual traversal root for this boundary. Custom path and
+glob exclusions still match the full path; explicit root selection does not
+override those rules. Scope matching MUST use path components, reject parent
+traversal below the root, and preserve the existing symlink and mount guards.
+
 ## Deterministic Precedence Order
 
 Rule precedence MUST be applied in this exact order:

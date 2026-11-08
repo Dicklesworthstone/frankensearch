@@ -25552,8 +25552,9 @@ impl FsfsRuntime {
                 reason_codes.insert(REASON_DISCOVERY_FILE_NON_UTF8_PATH.to_owned());
                 continue;
             }
-            let mut candidate =
-                DiscoveryCandidate::new(&entry_path, metadata.len()).with_symlink(path_is_symlink);
+            let mut candidate = DiscoveryCandidate::new(&entry_path, metadata.len())
+                .with_root(target_root)
+                .with_symlink(path_is_symlink);
             if let Some((mount_entry, _policy)) = mount_table.lookup(&entry_path) {
                 candidate = candidate.with_mount_category(mount_entry.category);
             }
@@ -46511,6 +46512,38 @@ mod tests {
                 if field == "file_key"
             ));
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_ingest_rejects_symlink_escape_from_root_beneath_build() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let root = directory.path().join("build/notes");
+        fs::create_dir_all(&root).expect("source root");
+        let root = fs::canonicalize(root).expect("canonical source root");
+        let outside = directory.path().join("outside.md");
+        fs::write(&outside, "outside source must stay isolated").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked.md")).unwrap();
+        fs::write(root.join("inside.md"), "selected source").unwrap();
+
+        assert!(
+            FsfsConfig::default()
+                .discovery
+                .evaluate_root(&root, None)
+                .include()
+        );
+        assert!(super::resolve_watched_paths(&root, "inside.md").is_ok());
+        for key in ["linked.md", "../outside.md"] {
+            assert!(matches!(
+                super::resolve_watched_paths(&root, key),
+                Err(frankensearch_core::SearchError::InvalidConfig { field, .. })
+                    if field == "file_key"
+            ));
+        }
+        assert_eq!(
+            fs::read_to_string(outside).unwrap(),
+            "outside source must stay isolated"
+        );
     }
 
     #[cfg(unix)]
