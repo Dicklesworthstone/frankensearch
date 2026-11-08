@@ -1100,10 +1100,43 @@ struct SearchExecutionResources {
     /// run; present only when `fsfs index` built it. Drives the REFINED phase.
     quality_vector_index: Option<Arc<VectorIndex>>,
     fast_embedder: Option<AdmittedEmbedder>,
+    /// Artifact-verified fast producer for answer replay only. This is not an
+    /// executable embedder and never marks model initialization as attempted.
+    #[cfg(feature = "semantic-support")]
+    cached_fast_producer: Option<CachedFastProducer>,
     quality_embedder: Option<AdmittedEmbedder>,
     fast_embedder_attempted: bool,
     quality_embedder_attempted: bool,
     degradation_advice: Vec<DegradationAdvice>,
+}
+
+/// A cached answer needs the exact local producer, but no new embeddings.
+/// Keep its verified artifacts separate from the tokenizer and weight matrix
+/// that ordinary execution will still initialize on demand.
+#[cfg(feature = "semantic-support")]
+#[derive(Clone)]
+struct CachedFastProducer {
+    registration: frankensearch_embed::RegisteredModel2Vec,
+    model_dir: PathBuf,
+    identity: frankensearch_core::EmbeddingIdentityBundleV1,
+}
+
+#[cfg(feature = "semantic-support")]
+impl CachedFastProducer {
+    fn validate(&self, index: &VectorIndex) -> SearchResult<()> {
+        FsfsRuntime::validate_fast_generation_kind(index, false)?;
+        FsfsRuntime::validate_fast_producer_shape(
+            index,
+            self.registration.id(),
+            self.registration.dimension() as usize,
+        )?;
+        FsfsRuntime::validate_vector_producer_identity(index, &self.identity)?;
+        // A callback or another process may have replaced the files since
+        // admission. Reuse only a still-current receipt; otherwise the shared
+        // verifier hashes the artifacts and fails closed on any mismatch.
+        let current = self.registration.verify_identity(&self.model_dir)?;
+        FsfsRuntime::validate_vector_producer_identity(index, &current)
+    }
 }
 
 /// A tier's embedder with the identity it was admitted under.
@@ -13426,7 +13459,8 @@ impl FsfsRuntime {
             if resources.vector_index.is_none() {
                 return Err(Self::cached_fast_generation_missing());
             }
-            self.maybe_prepare_fast_embedder(cx, resources).await?;
+            self.maybe_prepare_cached_fast_producer(cx, resources)
+                .await?;
             Self::validate_cached_fast_producer(resources)?;
         }
         if needs_quality {
@@ -13469,15 +13503,20 @@ impl FsfsRuntime {
             .vector_index
             .as_ref()
             .ok_or_else(Self::cached_fast_generation_missing)?;
-        let admitted = resources.fast_embedder.as_ref().ok_or_else(|| {
-            SearchError::EmbedderUnavailable {
-                model: "fast".to_owned(),
-                reason: "cached semantic results require the verified producer for their stored fast tier"
+        if let Some(admitted) = resources.fast_embedder.as_ref() {
+            Self::validate_fast_embedder_for_vector_index(index, admitted.embedder(), cfg!(test))?;
+            return admitted.check_current_identity();
+        }
+        #[cfg(feature = "semantic-support")]
+        if let Some(producer) = resources.cached_fast_producer.as_ref() {
+            return producer.validate(index);
+        }
+        Err(SearchError::EmbedderUnavailable {
+            model: "fast".to_owned(),
+            reason:
+                "cached semantic results require the verified producer for their stored fast tier"
                     .to_owned(),
-            }
-        })?;
-        Self::validate_fast_embedder_for_vector_index(index, admitted.embedder(), cfg!(test))?;
-        admitted.check_current_identity()
+        })
     }
 
     /// Recheck after every externally supplied sink callback as well as before
@@ -22282,6 +22321,16 @@ impl FsfsRuntime {
         embedder: &dyn Embedder,
         allow_hash_control: bool,
     ) -> SearchResult<()> {
+        Self::validate_fast_generation_kind(index, allow_hash_control)?;
+        Self::ensure_semantic_embedder_admissible(embedder, allow_hash_control)?;
+        Self::validate_fast_producer_shape(index, embedder.id(), embedder.dimension())?;
+        Self::validate_vector_producer_revision(index, embedder)
+    }
+
+    fn validate_fast_generation_kind(
+        index: &VectorIndex,
+        allow_hash_control: bool,
+    ) -> SearchResult<()> {
         if !allow_hash_control && Self::is_legacy_hash_vector_generation(index.embedder_id()) {
             return Err(SearchError::InvalidConfig {
                 field: "semantic.vector_generation".to_owned(),
@@ -22290,28 +22339,41 @@ impl FsfsRuntime {
                     .to_owned(),
             });
         }
-        Self::ensure_semantic_embedder_admissible(embedder, allow_hash_control)?;
-        if !index.embedder_id().eq_ignore_ascii_case(embedder.id()) {
+        Ok(())
+    }
+
+    fn validate_fast_producer_shape(
+        index: &VectorIndex,
+        producer_id: &str,
+        dimension: usize,
+    ) -> SearchResult<()> {
+        if !index.embedder_id().eq_ignore_ascii_case(producer_id) {
             return Err(SearchError::UnverifiableRemoteSpace {
                 producer: "fsfs.vector_generation".to_owned(),
                 reason: "the active embedder identity does not match the stored vector generation"
                     .to_owned(),
             });
         }
-        if embedder.dimension() != index.dimension() {
+        if dimension != index.dimension() {
             return Err(SearchError::DimensionMismatch {
                 expected: index.dimension(),
-                found: embedder.dimension(),
+                found: dimension,
             });
         }
-        Self::validate_vector_producer_revision(index, embedder)
+        Ok(())
     }
 
     fn validate_vector_producer_revision(
         index: &VectorIndex,
         embedder: &dyn Embedder,
     ) -> SearchResult<()> {
-        let identity = embedder.identity()?;
+        Self::validate_vector_producer_identity(index, embedder.identity()?)
+    }
+
+    fn validate_vector_producer_identity(
+        index: &VectorIndex,
+        identity: &frankensearch_core::EmbeddingIdentityBundleV1,
+    ) -> SearchResult<()> {
         identity.validate()?;
         if index.embedder_revision() != identity.fingerprint() {
             return Err(SearchError::UnverifiableRemoteSpace {
@@ -22878,13 +22940,43 @@ impl FsfsRuntime {
         }
     }
 
-    /// Load an explicitly selected registered fast model from its verified
-    /// install under `indexing.model_dir`, through the shared process cache.
+    /// Verify a registered local fast producer without constructing inference
+    /// resources. Default discovery retains the loader's candidate ordering;
+    /// explicit alternatives retain their own installation and error policy.
     #[cfg(all(feature = "semantic-support", not(test)))]
-    fn load_selected_fast_model(
+    fn resolve_cached_fast_producer(&self) -> SearchResult<CachedFastProducer> {
+        self.validate_registered_local_model_intent()?;
+        #[cfg(feature = "embedded-models")]
+        self.prepare_bundled_semantic_models_for_execution()?;
+
+        let registration = select_fast_model(&self.config.indexing.fast_model)?;
+        let (model_dir, identity) = if registration.download_manifest().id
+            == frankensearch_embed::RegisteredModel2Vec::BUILTIN_IDS[0]
+        {
+            EmbedderStack::verify_fast_semantic_identity_with_options(
+                Some(Path::new(&self.config.indexing.model_dir)),
+                &DetectOptions {
+                    offline: Some(self.config.indexing.offline),
+                },
+            )?
+        } else {
+            let model_dir = self.selected_fast_model_path(&registration)?;
+            let identity = registration.verify_identity(&model_dir)?;
+            (model_dir, identity)
+        };
+        Ok(CachedFastProducer {
+            registration,
+            model_dir,
+            identity,
+        })
+    }
+
+    /// Resolve the same explicit installation for identity admission and load.
+    #[cfg(all(feature = "semantic-support", not(test)))]
+    fn selected_fast_model_path(
         &self,
         registration: &frankensearch_embed::RegisteredModel2Vec,
-    ) -> SearchResult<Arc<dyn Embedder>> {
+    ) -> SearchResult<PathBuf> {
         let manifest_id = registration.download_manifest().id.as_str();
         let inspection = Self::inspect_registered_model_cache(
             "fast",
@@ -22900,8 +22992,19 @@ impl FsfsRuntime {
                 ),
             });
         }
+        Ok(inspection.path)
+    }
+
+    /// Load an explicitly selected registered fast model from its verified
+    /// install under `indexing.model_dir`, through the shared process cache.
+    #[cfg(all(feature = "semantic-support", not(test)))]
+    fn load_selected_fast_model(
+        &self,
+        registration: &frankensearch_embed::RegisteredModel2Vec,
+    ) -> SearchResult<Arc<dyn Embedder>> {
+        let model_dir = self.selected_fast_model_path(registration)?;
         let embedder: Arc<dyn Embedder> =
-            Model2VecEmbedder::load_shared_registered(&inspection.path, registration)?;
+            Model2VecEmbedder::load_shared_registered(&model_dir, registration)?;
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
         info!(
             fast_embedder = embedder.id(),
@@ -24212,6 +24315,8 @@ impl FsfsRuntime {
             fast_window_mapping: fast_window_mapping.map(Arc::new),
             quality_vector_index: quality_vector_index.map(Arc::new),
             fast_embedder: None,
+            #[cfg(feature = "semantic-support")]
+            cached_fast_producer: None,
             quality_embedder: None,
             fast_embedder_attempted: false,
             quality_embedder_attempted: false,
@@ -24420,6 +24525,27 @@ impl FsfsRuntime {
             return Ok(admitted);
         }
         Ok(admitted)
+    }
+
+    async fn maybe_prepare_cached_fast_producer(
+        &self,
+        cx: &Cx,
+        resources: &mut SearchExecutionResources,
+    ) -> SearchResult<()> {
+        #[cfg(all(feature = "semantic-support", not(test)))]
+        if resources.fast_embedder.is_none() && !resources.fast_embedder_attempted {
+            let producer = if cx.blocking_pool_handle().is_some() {
+                let runtime = self.clone();
+                Self::search_blocking(cx, move || runtime.resolve_cached_fast_producer()).await??
+            } else {
+                self.resolve_cached_fast_producer()?
+            };
+            resources.cached_fast_producer = Some(producer);
+            return Ok(());
+        }
+        // Already loaded daemon/custom producers keep their live identity
+        // checks. Test builds use the same injected providers as execution.
+        self.maybe_prepare_fast_embedder(cx, resources).await
     }
 
     async fn maybe_prepare_fast_embedder(
@@ -35192,6 +35318,8 @@ mod tests {
             fast_window_mapping: None,
             quality_vector_index: Some(Arc::new(quality)),
             fast_embedder: Some(admitted(BlendQueryEmbedder("blend-fast-2"))),
+            #[cfg(feature = "semantic-support")]
+            cached_fast_producer: None,
             quality_embedder: Some(admitted(BlendQueryEmbedder("blend-quality-2"))),
             fast_embedder_attempted: true,
             quality_embedder_attempted: true,
@@ -35814,6 +35942,8 @@ mod tests {
                 fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: Some(admitted(BlendQueryEmbedder("blend-fast-2"))),
+                #[cfg(feature = "semantic-support")]
+                cached_fast_producer: None,
                 quality_embedder: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
@@ -41423,6 +41553,8 @@ mod tests {
             fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: None,
+            #[cfg(feature = "semantic-support")]
+            cached_fast_producer: None,
             quality_embedder: None,
             fast_embedder_attempted: false,
             quality_embedder_attempted: false,
@@ -43460,6 +43592,8 @@ mod tests {
                     VectorIndex::open_read_only(&quality_path).unwrap(),
                 )),
                 fast_embedder: Some(admitted(fast_embedder)),
+                #[cfg(feature = "semantic-support")]
+                cached_fast_producer: None,
                 quality_embedder: Some(admitted(FailedQualityEmbedder)),
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
@@ -43572,6 +43706,8 @@ mod tests {
                 fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: None,
+                #[cfg(feature = "semantic-support")]
+                cached_fast_producer: None,
                 quality_embedder: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
@@ -51917,6 +52053,8 @@ mod tests {
                 fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: None,
+                #[cfg(feature = "semantic-support")]
+                cached_fast_producer: None,
                 quality_embedder: None,
                 fast_embedder_attempted: false,
                 quality_embedder_attempted: false,
@@ -53519,6 +53657,8 @@ mod tests {
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
                 )),
                 fast_embedder: Some(admitted(fast_embedder)),
+                #[cfg(feature = "semantic-support")]
+                cached_fast_producer: None,
                 quality_embedder: Some(admitted(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
                 fast_window_mapping: None,
                 fast_embedder_attempted: true,
@@ -53660,6 +53800,8 @@ mod tests {
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
                 )),
                 fast_embedder: Some(admitted(fast_embedder)),
+                #[cfg(feature = "semantic-support")]
+                cached_fast_producer: None,
                 quality_embedder: Some(admitted(FailedQualityEmbedder)),
                 fast_window_mapping: None,
                 fast_embedder_attempted: true,
@@ -53911,6 +54053,8 @@ mod tests {
                 fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: Some(admitted(CancelledEmbedder)),
+                #[cfg(feature = "semantic-support")]
+                cached_fast_producer: None,
                 quality_embedder: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
@@ -54002,6 +54146,8 @@ mod tests {
                     VectorIndex::open_read_only(&vector_path).expect("open quality index"),
                 )),
                 fast_embedder: Some(admitted(fast_embedder)),
+                #[cfg(feature = "semantic-support")]
+                cached_fast_producer: None,
                 quality_embedder: Some(admitted(CancelledEmbedder)),
                 fast_window_mapping: None,
                 fast_embedder_attempted: true,
@@ -57207,6 +57353,8 @@ mod tests {
             fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: loaded.then(|| admitted(HashEmbedder::default_256())),
+            #[cfg(feature = "semantic-support")]
+            cached_fast_producer: None,
             quality_embedder: None,
             fast_embedder_attempted: attempted,
             quality_embedder_attempted: attempted,
@@ -57247,6 +57395,8 @@ mod tests {
             fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: Some(admitted(HashEmbedder::default_256())),
+            #[cfg(feature = "semantic-support")]
+            cached_fast_producer: None,
             quality_embedder: None,
             fast_embedder_attempted: true,
             quality_embedder_attempted: true,
@@ -57289,6 +57439,8 @@ mod tests {
             fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: None,
+            #[cfg(feature = "semantic-support")]
+            cached_fast_producer: None,
             quality_embedder: None,
             fast_embedder_attempted: true,
             quality_embedder_attempted: true,
@@ -58130,6 +58282,8 @@ mod tests {
             fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: None,
+            #[cfg(feature = "semantic-support")]
+            cached_fast_producer: None,
             quality_embedder: None,
             fast_embedder_attempted: true,
             quality_embedder_attempted: true,
@@ -61360,6 +61514,163 @@ mod tests {
                     );
                     assert_eq!(fs::read(&cache_path).unwrap(), original_bytes);
                 }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn persistent_cache_rechecks_verified_artifacts_after_a_replay_callback() {
+        use frankensearch_core::generation::GoldenVectorCertificateV1;
+        use frankensearch_embed::RegisteredModel2Vec;
+        use frankensearch_embed::model_manifest::{
+            MODEL_CONFORMANCE_TEXTS_V1, ModelFile, ModelTier, verify_dir_and_record,
+        };
+        use sha2::{Digest as _, Sha256};
+
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let model_dir = temp.path().join("model");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(&model_dir).unwrap();
+            fs::create_dir_all(index_root.join("vector")).unwrap();
+            // These pinned bytes are an artifact-admission fixture, not an
+            // executable model or evidence of inference qualification. A cache
+            // proof must never try to parse their tokenizer or weight matrix.
+            let files = [
+                ("tokenizer.json", b"fixture tokenizer".as_slice()),
+                ("model.safetensors", b"fixture weights".as_slice()),
+            ]
+            .into_iter()
+            .map(|(name, bytes)| {
+                fs::write(model_dir.join(name), bytes).unwrap();
+                ModelFile {
+                    name: name.to_owned(),
+                    sha256: super::sha256_digest_hex(Sha256::digest(bytes)),
+                    size: u64::try_from(bytes.len()).unwrap(),
+                    url: None,
+                }
+            })
+            .collect::<Vec<_>>();
+            let manifest = ModelManifest {
+                id: "cached-local-fixture".to_owned(),
+                version: "1".to_owned(),
+                display_name: None,
+                description: None,
+                repo: "fixtures/fsfs-cache-replay".to_owned(),
+                revision: "a".repeat(40),
+                download_size_bytes: files.iter().map(|file| file.size).sum(),
+                files,
+                license: "MIT".to_owned(),
+                dimension: Some(2),
+                tier: Some(ModelTier::Fast),
+            };
+            let certificate = GoldenVectorCertificateV1::from_exact_f32(
+                &MODEL_CONFORMANCE_TEXTS_V1,
+                &vec![vec![1.0, 0.0]; MODEL_CONFORMANCE_TEXTS_V1.len()],
+            )
+            .unwrap();
+            let registration =
+                RegisteredModel2Vec::new(manifest, "fsfs-cache-replay-fixture", certificate)
+                    .unwrap();
+            verify_dir_and_record(registration.download_manifest(), &model_dir).unwrap();
+            let identity = registration.verify_identity(&model_dir).unwrap();
+            let mut writer = VectorIndex::create_with_revision(
+                &index_root.join(super::FSFS_VECTOR_INDEX_FILE),
+                registration.id(),
+                &identity.fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer.write_record("admitted.rs", &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let mode = SearchExecutionMode::FastOnly;
+            let mut resources = runtime
+                .prepare_search_execution_resources_at_root_with_modes(&cx, &index_root, mode, mode)
+                .await
+                .unwrap();
+            resources.cached_fast_producer = Some(super::CachedFastProducer {
+                registration,
+                model_dir: model_dir.clone(),
+                identity,
+            });
+            let payloads = vec![SearchPayload::new(
+                "cached artifact identity",
+                SearchOutputPhase::Initial,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "admitted.rs".to_owned(),
+                    line: None,
+                    score: 1.0,
+                    snippet: None,
+                    lexical_rank: None,
+                    semantic_rank: Some(0),
+                    hash_rank: None,
+                    in_both_sources: false,
+                }],
+            )];
+            let replay = |sink| {
+                FsfsRuntime::replay_cached_search_payloads(
+                    &cx,
+                    &resources,
+                    mode,
+                    &resources.generation_fingerprint,
+                    &payloads,
+                    sink,
+                )
+            };
+            assert_eq!(replay(None).unwrap(), payloads);
+            assert!(resources.fast_embedder.is_none());
+            assert!(!resources.fast_embedder_attempted);
+
+            let artifact = model_dir.join("tokenizer.json");
+            let saved = temp.path().join("saved-tokenizer.json");
+            let original = fs::read(&artifact).unwrap();
+            for missing in [false, true] {
+                let producer = resources.cached_fast_producer.as_ref().unwrap();
+                verify_dir_and_record(producer.registration.download_manifest(), &model_dir)
+                    .unwrap();
+                let mut published = 0;
+                let error = replay(Some(&mut |phase: &SearchPayload| {
+                    assert_eq!(phase, &payloads[0]);
+                    published += 1;
+                    if missing {
+                        fs::rename(&artifact, &saved)?;
+                    } else {
+                        let mut changed = original.clone();
+                        changed[0] ^= 1;
+                        fs::write(&artifact, changed)?;
+                    }
+                    Ok(())
+                }))
+                .expect_err("a callback cannot invalidate the producer and receive success");
+                assert_eq!(
+                    published, 1,
+                    "the mutation follows the admitted Initial phase"
+                );
+                assert!(
+                    if missing {
+                        matches!(error, SearchError::ModelNotFound { .. })
+                    } else {
+                        matches!(error, SearchError::ModelLoadFailed { .. })
+                    },
+                    "{error:?}"
+                );
+                if missing {
+                    fs::rename(&saved, &artifact).unwrap();
+                } else {
+                    fs::write(&artifact, &original).unwrap();
+                }
+                assert_eq!(replay(None).unwrap(), payloads);
+                assert!(resources.fast_embedder.is_none());
+                assert!(!resources.fast_embedder_attempted);
             }
         });
     }

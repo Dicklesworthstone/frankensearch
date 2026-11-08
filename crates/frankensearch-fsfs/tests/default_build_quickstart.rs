@@ -633,6 +633,8 @@ mod loader_only {
 
     #[cfg(all(unix, feature = "semantic-loaders"))]
     fn verify_real_fast_model_cache_isolation(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
         let query = "producer policy controls retained network retries";
         let selected = root.join("cached-fast-model.toml");
         fs::write(
@@ -640,8 +642,12 @@ mod loader_only {
             "[indexing]\nfast_model = \"potion-multilingual-128M\"\n",
         )
         .unwrap();
-        let search = |label: &str, config: &Path| {
-            fsfs.run_with_env(
+        let run_search = |runner: &IsolatedFsfs, label: &str, config: &Path, uncached: bool| {
+            let mut env = vec![("FRANKENSEARCH_LOG", "info")];
+            if uncached {
+                env.push(("FSFS_DISABLE_QUERY_CACHE", "1"));
+            }
+            runner.run_with_env(
                 root,
                 label,
                 [
@@ -659,9 +665,10 @@ mod loader_only {
                     "json",
                 ],
                 QUICKSTART_TIMEOUT,
-                &[("FRANKENSEARCH_LOG", "info")],
+                &env,
             )
         };
+        let search = |label: &str, config: &Path| run_search(fsfs, label, config, false);
         let cold = search("fast-model-cache-cold", &selected);
         let original = parse_success_envelope("real fast-model cache seed", &cold);
         assert!(cold.stderr.contains("Model2Vec model loaded"), "{cold:?}");
@@ -687,12 +694,31 @@ mod loader_only {
         assert_eq!(record["schema_version"], "fsfs.search.cache.v21");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
 
-        let warm = search("fast-model-cache-warm", &selected);
-        let replayed = parse_success_envelope("real fast-model cache replay", &warm);
-        assert_eq!(replayed["data"], original["data"]);
+        // Multiple fresh processes keep an isolated scheduling delay from
+        // deciding the latency gate. The load-log assertion is the
+        // deterministic oracle even on a machine where the timing is noisy.
+        let mut warm_elapsed = Vec::new();
+        for ordinal in 0..3 {
+            let warm = search(&format!("fast-model-cache-warm-{ordinal}"), &selected);
+            let replayed = parse_success_envelope("real fast-model cache replay", &warm);
+            assert_eq!(replayed["data"], original["data"]);
+            assert!(
+                !warm.stderr.contains("Model2Vec model loaded"),
+                "the positive control must actually reuse the persisted answer: {warm:?}"
+            );
+            assert!(
+                warm.stderr.contains("model verification receipt accepted"),
+                "replay must still verify the installed producer: {warm:?}"
+            );
+            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            warm_elapsed.push(warm.elapsed);
+        }
+        warm_elapsed.sort_unstable();
+        let warm_median = warm_elapsed[1];
         assert!(
-            !warm.stderr.contains("Model2Vec model loaded"),
-            "the positive control must actually reuse the persisted answer: {warm:?}"
+            warm_median * 2 < cold.elapsed,
+            "warm answer replay must avoid the dominant model-load cost: cold={:?} warm={warm_elapsed:?}",
+            cold.elapsed
         );
 
         for (label, model) in [
@@ -746,10 +772,256 @@ mod loader_only {
                 "{outcome:?}"
             );
         }
-        assert_eq!(fs::read(cache_path).unwrap(), cache_bytes);
-        eprintln!(
-            "[default-build-e2e] stage=fast-model-answer-cache real_potion=true warm_replay=true changed_producer_refused=true malformed_selection_refused=true canonical_alias_reused=true original_preserved=true"
+        assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+
+        // A valid answer and unchanged configuration do not establish that
+        // the current process can still verify the installed producer. Use
+        // independent files: mutating a hard link would invalidate the real
+        // model cache used by the rest of the quickstart.
+        let fixture = root.join("fast-model-cache-artifacts");
+        let models = fixture.join("models");
+        let probe = IsolatedFsfs::new(&fixture, models.clone());
+        let generation = [
+            "index_checkpoint.json",
+            "index_sentinel.json",
+            "CURRENT",
+            "lexical/CURRENT",
+            "lexical/index_manifest.json",
+            "vector/index_manifest.json",
+            "vector/index.fsvi",
+            "vector/quality.fsvi",
+        ]
+        .into_iter()
+        .map(|relative| index.join(relative))
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+        let assert_preserved = || {
+            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            assert_eq!(matching_records().len(), 1);
+            for (path, bytes) in &generation {
+                assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+            }
+        };
+        let assert_refused = |label: &str| {
+            let cached = run_search(&probe, &format!("cached-{label}"), &selected, false);
+            let uncached = run_search(&probe, &format!("uncached-{label}"), &selected, true);
+            for outcome in [&cached, &uncached] {
+                assert!(!outcome.timed_out, "{label}: {outcome:?}");
+                assert!(!outcome.status.success(), "{label}: {outcome:?}");
+                assert!(
+                    !outcome.stderr.contains("Model2Vec model loaded"),
+                    "an unverified producer must not load weights: {label}: {outcome:?}"
+                );
+            }
+            let cached_error: Value = serde_json::from_str(&cached.stdout).unwrap();
+            let uncached_error: Value = serde_json::from_str(&uncached.stdout).unwrap();
+            assert_eq!(cached_error["ok"], false, "{cached_error}");
+            assert!(cached_error["data"].is_null(), "{cached_error}");
+            assert!(
+                cached_error["error"]["code"]
+                    .as_str()
+                    .is_some_and(|code| !code.is_empty()),
+                "producer rejection must remain a typed error: {cached_error}"
+            );
+            assert_eq!(cached.status.code(), uncached.status.code(), "{label}");
+            assert_eq!(cached_error["error"], uncached_error["error"], "{label}");
+            assert_preserved();
+        };
+        assert_refused("missing-model-install");
+
+        let manifest = ModelManifest::potion_128m();
+        let install = models.join("potion-multilingual-128M");
+        for artifact in &manifest.files {
+            let destination = install.join(&artifact.name);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(
+                fsfs.model_root
+                    .join("potion-multilingual-128M")
+                    .join(&artifact.name),
+                destination,
+            )
+            .unwrap();
+        }
+        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install)
+            .expect("verify the independent fast producer");
+        let assert_replayed = |label: &str| {
+            let outcome = run_search(&probe, label, &selected, false);
+            let replayed = parse_success_envelope(label, &outcome);
+            assert_eq!(replayed["data"], original["data"], "{label}");
+            assert!(
+                !outcome.stderr.contains("Model2Vec model loaded"),
+                "{label}: {outcome:?}"
+            );
+            assert_preserved();
+        };
+        assert_replayed("identical-producer-at-new-model-root");
+
+        // A receipt covers the registered files only. An extra semantic-role
+        // artifact must still be rejected by the frozen producer manifest.
+        let extra_weights = install.join("model_f32.safetensors");
+        assert!(!extra_weights.exists());
+        let receipt_before_extra = fs::read(install.join(".verified")).unwrap();
+        fs::write(&extra_weights, b"unregistered alternate weights").unwrap();
+        assert!(is_verification_cached(&manifest, &install));
+        assert_refused("unregistered-semantic-artifact");
+        assert_eq!(
+            fs::read(install.join(".verified")).unwrap(),
+            receipt_before_extra
         );
+        fs::rename(&extra_weights, fixture.join("retained-extra-weights")).unwrap();
+        assert_replayed("restored-registered-artifact-set");
+
+        let tokenizer = install.join("tokenizer.json");
+        let retained_tokenizer = fixture.join("retained-tokenizer.json");
+        fs::rename(&tokenizer, &retained_tokenizer).unwrap();
+        assert_refused("missing-tokenizer");
+        fs::rename(&retained_tokenizer, &tokenizer).unwrap();
+        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install).unwrap();
+
+        let weights = manifest
+            .files
+            .iter()
+            .find(|artifact| artifact.name.ends_with(".safetensors"))
+            .expect("registered Model2Vec weights");
+        for (label, artifact) in [
+            ("changed-tokenizer", tokenizer),
+            ("changed-weights", install.join(&weights.name)),
+        ] {
+            let metadata = fs::metadata(&artifact).unwrap();
+            let modified = metadata.modified().unwrap();
+            let receipt = fs::read(install.join(".verified")).unwrap();
+            let mut file = File::options()
+                .read(true)
+                .write(true)
+                .open(&artifact)
+                .unwrap();
+            let mut original_byte = [0];
+            file.read_exact(&mut original_byte).unwrap();
+            file.rewind().unwrap();
+            file.write_all(&[original_byte[0] ^ 1]).unwrap();
+            file.set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert_eq!(file.metadata().unwrap().len(), metadata.len());
+            assert_eq!(file.metadata().unwrap().modified().unwrap(), modified);
+            assert!(
+                !is_verification_cached(&manifest, &install),
+                "same-size, restored-mtime corruption must invalidate the receipt"
+            );
+            assert_refused(label);
+            assert_eq!(fs::read(install.join(".verified")).unwrap(), receipt);
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&original_byte).unwrap();
+            file.set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            drop(file);
+            frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install)
+                .expect("restore and fully verify the exact producer bytes");
+            assert_replayed(&format!("restored-{label}"));
+        }
+
+        // A missing receipt is not a missing producer: full verification of
+        // intact artifacts must still authorize replay without loading them.
+        let receipt = install.join(".verified");
+        let retained_receipt = fixture.join("retained-verification-receipt");
+        fs::rename(&receipt, &retained_receipt).unwrap();
+        assert!(!is_verification_cached(&manifest, &install));
+        assert_replayed("verified-without-receipt");
+        assert!(!receipt.exists(), "read admission must not mint a receipt");
+        fs::rename(&retained_receipt, &receipt).unwrap();
+        assert_replayed("restored-producer-receipt");
+        let intact_receipt = fs::read(&receipt).unwrap();
+        let malformed_receipt = b"{invalid verification receipt";
+        fs::write(&receipt, malformed_receipt).unwrap();
+        assert!(!is_verification_cached(&manifest, &install));
+        assert_replayed("verified-with-malformed-receipt");
+        assert_eq!(fs::read(&receipt).unwrap(), malformed_receipt);
+        fs::write(&receipt, intact_receipt).unwrap();
+        assert_replayed("restored-well-formed-receipt");
+
+        // A corrupt answer record is a cache miss, unlike an invalid producer:
+        // fresh retrieval is legitimate here because the producer is intact.
+        // Require a real load and identical hits, then prove the repaired
+        // record itself is replayable and no generation data was changed.
+        fs::write(&cache_path, br#"{"payloads":"#).unwrap();
+        let recovery = search("fast-model-corrupt-answer-cache", &selected);
+        let recovered = parse_success_envelope("corrupt answer-cache recovery", &recovery);
+        assert_eq!(recovered["data"]["hits"], original["data"]["hits"]);
+        assert!(
+            recovery.stderr.contains("fsfs search cache read failed"),
+            "corrupt cache JSON must take the cache-read error path: {recovery:?}"
+        );
+        assert!(
+            recovery.stderr.contains("Model2Vec model loaded"),
+            "corrupt cache JSON must perform fresh retrieval: {recovery:?}"
+        );
+        let repaired_bytes = fs::read(&cache_path).unwrap();
+        let repaired_record: Value = serde_json::from_slice(&repaired_bytes).unwrap();
+        assert_eq!(repaired_record["schema_version"], record["schema_version"]);
+        assert_eq!(repaired_record["key"], record["key"]);
+        assert_eq!(
+            repaired_record["index_fingerprint"],
+            record["index_fingerprint"]
+        );
+        assert_eq!(matching_records().len(), 1);
+        let repaired_warm = search("fast-model-repaired-answer-cache-warm", &selected);
+        let replayed = parse_success_envelope("repaired answer-cache replay", &repaired_warm);
+        assert_eq!(replayed["data"], recovered["data"]);
+        assert!(
+            !repaired_warm.stderr.contains("Model2Vec model loaded"),
+            "the repaired answer must replay without weights: {repaired_warm:?}"
+        );
+        assert_eq!(fs::read(&cache_path).unwrap(), repaired_bytes);
+        for (path, bytes) in &generation {
+            assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+        }
+        eprintln!(
+            "[default-build-e2e] stage=fast-model-answer-cache real_potion=true cold_ms={} warm_median_ms={} warm_samples_ms={:?} warm_replay=true missing_producer_refused=true changed_artifacts_refused=true extra_artifact_refused=true same_error_as_uncached=true full_verification_without_receipt=true malformed_receipt_reverified=true corrupt_answer_recomputed=true repaired_answer_replayed=true changed_producer_refused=true malformed_selection_refused=true canonical_alias_reused=true generation_preserved=true",
+            cold.elapsed.as_millis(),
+            warm_median.as_millis(),
+            warm_elapsed
+                .iter()
+                .map(Duration::as_millis)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[test]
+    #[ignore = "real Model2Vec cache replay; provision Potion, then run with --ignored --nocapture"]
+    fn default_build_replays_fast_answers_without_loading_weights() {
+        log_binary_profile("fast-answer-cache");
+        let model_root = configured_model_root();
+        frankensearch_embed::model_manifest::verify_dir_and_record(
+            &ModelManifest::potion_128m(),
+            &model_root.join("potion-multilingual-128M"),
+        )
+        .expect("the focused answer-cache regression requires the exact registered Potion model");
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = temp.path().join("corpus");
+        let index = temp.path().join("index");
+        write_quickstart_corpus(&corpus);
+        let fsfs = IsolatedFsfs::new(temp.path(), model_root);
+        let indexed = fsfs.run_with_env(
+            temp.path(),
+            "fast-answer-cache-index",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--fast-only",
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FSFS_COMPLETE_GENERATIONS", "0")],
+        );
+        parse_success_envelope("fast answer-cache index", &indexed);
+        verify_real_fast_model_cache_isolation(&fsfs, temp.path(), &index);
     }
 
     #[cfg(feature = "semantic-loaders")]

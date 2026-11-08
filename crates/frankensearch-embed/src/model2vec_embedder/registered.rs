@@ -192,7 +192,21 @@ impl RegisteredModel2Vec {
         &self.artifact_manifest
     }
 
-    fn admit(&self, model_dir: &Path) -> SearchResult<EmbeddingIdentityBundleV1> {
+    /// Verify the installed artifacts and derive their complete producer identity
+    /// without constructing a tokenizer or loading the embedding matrix.
+    ///
+    /// A valid manifest-bound receipt avoids rehashing unchanged files. Missing,
+    /// changed, or unexpected artifacts still fail verification. This admits the
+    /// registered identity for replaying existing results; it does not qualify a
+    /// new executable model. The loading APIs also check the matrix, tokenizer,
+    /// and exact golden-vector certificate before returning an embedder.
+    /// Replay callers must match the complete identity to their stored producer
+    /// and recheck availability before publishing results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact-verification or native execution-contract error.
+    pub fn verify_identity(&self, model_dir: &Path) -> SearchResult<EmbeddingIdentityBundleV1> {
         // This runs on EVERY load, including a shared-cache hit. A fingerprint
         // key alone cannot detect files replaced under an already-resident model.
         let verified = self
@@ -233,7 +247,7 @@ impl RegisteredModel2Vec {
         self.verify_execution(&embedder)?;
         // Recheck admission before publication as well: a detected source
         // mutation during loading must not leave an instance in the cache.
-        self.admit(model_dir)?;
+        self.verify_identity(model_dir)?;
         Ok(embedder)
     }
 }
@@ -255,7 +269,7 @@ impl Model2VecEmbedder {
         registration: &RegisteredModel2Vec,
     ) -> SearchResult<Self> {
         let model_dir = model_dir.as_ref();
-        let identity = registration.admit(model_dir)?;
+        let identity = registration.verify_identity(model_dir)?;
         registration.load_admitted(model_dir, identity)
     }
 
@@ -276,7 +290,7 @@ impl Model2VecEmbedder {
         registration: &RegisteredModel2Vec,
     ) -> SearchResult<Arc<Self>> {
         let model_dir = model_dir.as_ref();
-        let identity = registration.admit(model_dir)?;
+        let identity = registration.verify_identity(model_dir)?;
         let key = SharedModelKey {
             dir: canonical_model_dir(model_dir),
             name: registration.id().to_owned(),
@@ -290,7 +304,7 @@ impl Model2VecEmbedder {
             // cache hit must prove the selected certificate, not assume that a
             // prior constructor executed it merely because the identity agrees.
             registration.verify_execution(&existing)?;
-            registration.admit(model_dir)?;
+            registration.verify_identity(model_dir)?;
             return Ok(existing);
         }
         let embedder = Arc::new(registration.load_admitted(model_dir, identity)?);
@@ -316,7 +330,7 @@ mod tests {
     use frankensearch_core::traits::Embedder;
     use sha2::{Digest, Sha256};
 
-    use crate::model_manifest::ModelFile;
+    use crate::model_manifest::{ModelFile, is_verification_cached, verify_dir_and_record};
 
     use super::*;
 
@@ -445,6 +459,103 @@ mod tests {
     }
 
     #[test]
+    fn verified_identity_never_loads_weights_and_matches_the_executable_producer() {
+        let (dir, selected) = fixture("identity-only", 2, 0);
+        let canonical = canonical_model_dir(dir.path());
+        let loads = || super::super::model2vec_full_loads_for(&canonical);
+
+        let identity = selected.verify_identity(dir.path()).unwrap();
+        assert_eq!(
+            loads(),
+            0,
+            "full artifact hashing must not initialize a model"
+        );
+        assert!(!dir.path().join(".verified").exists());
+
+        verify_dir_and_record(selected.download_manifest(), dir.path()).unwrap();
+        assert!(is_verification_cached(
+            selected.download_manifest(),
+            dir.path()
+        ));
+        for _ in 0..3 {
+            assert_eq!(selected.verify_identity(dir.path()).unwrap(), identity);
+        }
+        assert_eq!(loads(), 0, "receipt-backed admission must not load weights");
+
+        // A malformed receipt is not authority. Rehash intact artifacts rather
+        // than denying a valid producer or initializing an execution backend.
+        fs::write(dir.path().join(".verified"), b"malformed receipt").unwrap();
+        assert_eq!(selected.verify_identity(dir.path()).unwrap(), identity);
+        assert_eq!(loads(), 0);
+        assert_eq!(
+            fs::read(dir.path().join(".verified")).unwrap(),
+            b"malformed receipt"
+        );
+
+        let loaded = Model2VecEmbedder::load_registered(dir.path(), &selected).unwrap();
+        assert_eq!(loads(), 1, "the load counter needs a real positive control");
+        assert_eq!(loaded.identity().unwrap(), &identity);
+    }
+
+    #[test]
+    fn verified_identity_refuses_mutated_missing_and_unregistered_artifacts() {
+        let (dir, selected) = fixture("identity-integrity", 2, 0);
+        let backup = tempfile::tempdir().unwrap();
+        let original_identity = selected.verify_identity(dir.path()).unwrap();
+        for name in REQUIRED_FILES {
+            verify_dir_and_record(selected.download_manifest(), dir.path()).unwrap();
+            let path = dir.path().join(name);
+            let original = fs::read(&path).unwrap();
+            let mut changed = original.clone();
+            *changed.last_mut().unwrap() ^= 1;
+            fs::write(&path, changed).unwrap();
+            assert!(!is_verification_cached(
+                selected.download_manifest(),
+                dir.path()
+            ));
+            assert!(matches!(
+                selected.verify_identity(dir.path()),
+                Err(SearchError::ModelLoadFailed { .. })
+            ));
+            fs::write(&path, original).unwrap();
+            assert_eq!(
+                selected.verify_identity(dir.path()).unwrap(),
+                original_identity
+            );
+
+            verify_dir_and_record(selected.download_manifest(), dir.path()).unwrap();
+            let saved = backup.path().join(name);
+            fs::rename(&path, &saved).unwrap();
+            assert!(matches!(
+                selected.verify_identity(dir.path()),
+                Err(SearchError::ModelNotFound { .. })
+            ));
+            fs::rename(saved, path).unwrap();
+        }
+
+        verify_dir_and_record(selected.download_manifest(), dir.path()).unwrap();
+        fs::write(dir.path().join("model.onnx"), b"unexpected producer").unwrap();
+        assert!(matches!(
+            selected.verify_identity(dir.path()),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+        fs::rename(
+            dir.path().join("model.onnx"),
+            backup.path().join("model.onnx"),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.verify_identity(dir.path()).unwrap(),
+            original_identity
+        );
+        assert_eq!(
+            super::super::model2vec_full_loads_for(&canonical_model_dir(dir.path())),
+            0,
+            "availability and integrity checks must not load the matrix"
+        );
+    }
+
+    #[test]
     fn selected_models_load_their_own_dimensions_values_and_identities() {
         for (dimension, axis) in [(2, 0), (3, 2), (8, 5)] {
             let (dir, selected) = fixture("selected-model", dimension, axis);
@@ -463,7 +574,7 @@ mod tests {
                     .iter()
                     .all(|value| *value == 0.0)
             );
-            let expected_identity = selected.admit(dir.path()).unwrap();
+            let expected_identity = selected.verify_identity(dir.path()).unwrap();
             assert_eq!(embedder.identity().unwrap(), &expected_identity);
             assert_eq!(expected_identity.space.logical_model_id, "selected-model");
             assert_eq!(expected_identity.producer.backend, "model2vec-native");
@@ -544,7 +655,7 @@ mod tests {
         let key = SharedModelKey {
             dir: canonical_model_dir(dir.path()),
             name: wrong.id().to_owned(),
-            identity: wrong.admit(dir.path()).unwrap().fingerprint(),
+            identity: wrong.verify_identity(dir.path()).unwrap().fingerprint(),
         };
         assert!(!shared_model_cache().lock().unwrap().contains_key(&key));
         let valid = Model2VecEmbedder::load_shared_registered(dir.path(), &selected).unwrap();
@@ -565,7 +676,7 @@ mod tests {
         .unwrap();
         // Model the existing legacy constructor: byte-admitted but without the
         // selected-registration execution probe. This is not a new public bypass.
-        let identity = wrong.admit(dir.path()).unwrap();
+        let identity = wrong.verify_identity(dir.path()).unwrap();
         let legacy =
             Model2VecEmbedder::load_shared_preverified(dir.path(), wrong.id(), identity).unwrap();
         assert_eq!(legacy.embed_sync("hello").unwrap(), vec![1.0, 0.0]);

@@ -89,7 +89,7 @@ use crate::model_manifest::{
 use crate::model_registry::ensure_model_storage_layout_checked;
 #[cfg(feature = "model2vec")]
 use crate::model2vec_embedder::{
-    Model2VecEmbedder, find_model_dir_with_hf_id as find_model2vec_model_dir,
+    Model2VecEmbedder, RegisteredModel2Vec, find_model_dir_with_hf_id as find_model2vec_model_dir,
 };
 
 #[cfg(feature = "model2vec")]
@@ -417,6 +417,46 @@ impl EmbedderStack {
         stack.require_semantic()
     }
 
+    /// Verify the installed default fast producer without loading its weights.
+    ///
+    /// This uses the same policy gate and candidate order as
+    /// [`Self::auto_detect_fast_semantic_with_options`], but only verifies the
+    /// actual artifacts and their native execution identity. A caller can use
+    /// this proof to admit cached results against a stored producer revision.
+    /// It never downloads a missing model or substitutes a lazy embedder's
+    /// declared identity for verified artifacts. Inference still requires the
+    /// normal model loader and its execution checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same policy errors as [`Self::auto_detect_with_options`], or
+    /// [`SearchError::EmbedderUnavailable`] when no candidate can be verified.
+    #[cfg(feature = "model2vec")]
+    pub fn verify_fast_semantic_identity_with_options(
+        model_root: Option<&Path>,
+        options: &DetectOptions,
+    ) -> SearchResult<(PathBuf, EmbeddingIdentityBundleV1)> {
+        let remote_env = RemoteIntentEnv::from_environment();
+        resolve_remote_intent(*options, &remote_env)?;
+        let registration = RegisteredModel2Vec::potion_128m()?;
+        for candidate in fast_model_candidate_directories(model_root) {
+            if !missing_manifest_files(registration.download_manifest(), &candidate).is_empty() {
+                continue;
+            }
+            if let Ok(identity) = registration.verify_identity(&candidate) {
+                return Ok((candidate, identity));
+            }
+        }
+
+        // Keep the ordinary detection refusal and its provisioning guidance.
+        // Constructing this diagnostic needs no semantic model or inference.
+        let hash = hash_fallback_embedder().ok_or_else(|| SearchError::EmbedderUnavailable {
+            model: "fast-tier".to_owned(),
+            reason: "no model2vec/hash embedder available in this build".to_owned(),
+        })?;
+        Err(Self::from_parts(hash, None).semantic_unavailable_error())
+    }
+
     /// Detect only the quality tier under caller-supplied policy.
     ///
     /// The complement of [`Self::auto_detect_fast_semantic_with_options`]:
@@ -470,14 +510,18 @@ impl EmbedderStack {
     /// Returns [`SearchError::EmbedderUnavailable`] for a hash-only stack.
     pub fn require_semantic(self) -> SearchResult<Self> {
         if matches!(self.availability, TwoTierAvailability::HashOnly) {
-            return Err(SearchError::EmbedderUnavailable {
-                model: "semantic".to_owned(),
-                reason: self.degradation_message().unwrap_or_else(|| {
-                    "no semantic model; hash-only stacks are not a working search engine".to_owned()
-                }),
-            });
+            return Err(self.semantic_unavailable_error());
         }
         Ok(self)
+    }
+
+    fn semantic_unavailable_error(&self) -> SearchError {
+        SearchError::EmbedderUnavailable {
+            model: "semantic".to_owned(),
+            reason: self.degradation_message().unwrap_or_else(|| {
+                "no semantic model; hash-only stacks are not a working search engine".to_owned()
+            }),
+        }
     }
 
     /// Auto-detect embedders under caller-supplied policy (bd-p6z6.2).
@@ -1988,8 +2032,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 #[cfg(feature = "model2vec")]
-fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> {
-    let manifest = ModelManifest::potion_128m();
+fn fast_model_candidate_directories(model_root: Option<&Path>) -> Vec<PathBuf> {
     // When an explicit model_root is provided, skip system-wide discovery
     // to ensure test isolation and deterministic behavior.
     let discovered = if model_root.is_some() {
@@ -1997,7 +2040,13 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
     } else {
         find_model2vec_model_dir(POTION_MODEL_NAME, POTION_HF_ID)
     };
-    let candidates = candidate_directories(model_root, POTION_MODEL_NAME, discovered.as_deref());
+    candidate_directories(model_root, POTION_MODEL_NAME, discovered.as_deref())
+}
+
+#[cfg(feature = "model2vec")]
+fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> {
+    let manifest = ModelManifest::potion_128m();
+    let candidates = fast_model_candidate_directories(model_root);
     let checked_candidates = candidates.len();
 
     for candidate in candidates {
@@ -2806,6 +2855,75 @@ mod tests {
         .unwrap();
         assert_eq!(stack.fast().id(), POTION_MODEL_NAME);
         assert_eq!(stack.fast().category(), ModelCategory::StaticEmbedder);
+    }
+
+    #[cfg(all(feature = "model2vec", feature = "hash"))]
+    #[test]
+    fn fast_identity_lookup_preserves_the_missing_producer_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = DetectOptions {
+            offline: Some(true),
+        };
+        let replay_error =
+            EmbedderStack::verify_fast_semantic_identity_with_options(Some(temp.path()), &options)
+                .unwrap_err();
+        let execution_error =
+            EmbedderStack::auto_detect_fast_semantic_with_options(Some(temp.path()), &options)
+                .unwrap_err();
+        match (replay_error, execution_error) {
+            (
+                SearchError::EmbedderUnavailable { model, reason },
+                SearchError::EmbedderUnavailable {
+                    model: execution_model,
+                    reason: execution_reason,
+                },
+            ) => {
+                assert_eq!(model, "semantic");
+                assert_eq!(model, execution_model);
+                assert_eq!(reason, execution_reason);
+                assert!(reason.contains("fsfs download-models"));
+            }
+            errors => panic!("producer refusal changed: {errors:?}"),
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(all(feature = "download", feature = "model2vec", feature = "hash"))]
+    #[test]
+    fn fast_identity_lookup_cannot_admit_a_lazy_declared_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let lazy = maybe_lazy_fast_embedder(
+            Some(temp.path()),
+            DownloadPolicy::for_tests(
+                DownloadConsent::granted(ConsentSource::Programmatic),
+                false,
+                false,
+            ),
+        )
+        .expect("download consent allows an execution-time lazy producer");
+        assert!(lazy.identity().is_ok());
+        assert!(matches!(
+            EmbedderStack::verify_fast_semantic_identity_with_options(
+                Some(temp.path()),
+                &DetectOptions { offline: Some(false) },
+            ),
+            Err(SearchError::EmbedderUnavailable { model, .. }) if model == "semantic"
+        ));
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(feature = "model2vec")]
+    #[test]
+    fn fast_identity_candidates_preserve_explicit_root_precedence_and_isolation() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            fast_model_candidate_directories(Some(temp.path())),
+            vec![
+                temp.path().join(POTION_MODEL_NAME),
+                temp.path().to_path_buf()
+            ],
+            "both execution and identity admission try the named install before a direct model root, without system discovery"
+        );
     }
 
     #[cfg(all(feature = "download", feature = "model2vec"))]

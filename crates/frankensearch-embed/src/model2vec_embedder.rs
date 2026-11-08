@@ -29,13 +29,17 @@ use safetensors::tensor::Metadata;
 use tokenizers::Tokenizer;
 use tracing::instrument;
 
+#[cfg(test)]
+use crate::model_manifest::ModelArtifactManifestV1;
 use crate::model_manifest::{
     MODEL2VEC_OUTPUT_NORMALIZATION_V1, MODEL2VEC_POOLING_V1, MODEL2VEC_PREPROCESSING_V1,
-    MODEL2VEC_PREPROCESSING_V2, MODEL2VEC_SEQUENCE_POLICY_V1, ModelArtifactManifestV1,
+    MODEL2VEC_PREPROCESSING_V2, MODEL2VEC_SEQUENCE_POLICY_V1,
 };
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
+use frankensearch_core::generation::EmbeddingIdentityBundleV1;
+#[cfg(test)]
+use frankensearch_core::generation::QuantizationFormat;
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
 
 /// Required files for a `Model2Vec` model.
@@ -871,13 +875,7 @@ fn discover_tensor_name(names: &[&str]) -> Option<String> {
 /// back to the full pass, so a model replaced or rewritten on disk cannot be
 /// admitted on the strength of the old receipt.
 fn admit_registered_potion(model_dir: &Path) -> SearchResult<EmbeddingIdentityBundleV1> {
-    let verified = ModelArtifactManifestV1::potion_128m_native()?.verify_dir_cached(
-        &crate::model_manifest::ModelManifest::potion_128m(),
-        model_dir,
-    )?;
-    let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
-    validate_registered_execution_contract(&identity)?;
-    Ok(identity)
+    RegisteredModel2Vec::potion_128m()?.verify_identity(model_dir)
 }
 
 /// Length prefix of a safetensors file: a little-endian `u64` header size.
