@@ -315,7 +315,7 @@ mod loader_only {
     /// complete generations (`FSFS_COMPLETE_GENERATIONS=1`), whose layout
     /// inside is the same.
     /// Whether `index` is a store of complete generations.
-    #[cfg(all(unix, any(feature = "semantic-loaders", feature = "rerank")))]
+    #[cfg(all(unix, any(feature = "semantic-support", feature = "rerank")))]
     fn is_complete_store(index: &Path) -> bool {
         index.join("FSFS-CURRENT").exists()
     }
@@ -324,7 +324,7 @@ mod loader_only {
     /// legacy daemon; a complete store's daemon takes only its versioned
     /// control message (what `fsfs daemon --stop` sends), so that no ordinary
     /// query can stop it.
-    #[cfg(all(unix, any(feature = "semantic-loaders", feature = "rerank")))]
+    #[cfg(all(unix, any(feature = "semantic-support", feature = "rerank")))]
     fn request_daemon_stop(socket: &Path, complete: bool) {
         use std::io::{Read as _, Write as _};
         if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) {
@@ -632,6 +632,48 @@ mod loader_only {
     }
 
     #[cfg(all(unix, feature = "semantic-support"))]
+    fn copy_verified_potion_install(source: &Path, install: &Path) {
+        let manifest = ModelManifest::potion_128m();
+        for artifact in &manifest.files {
+            let destination = install.join(&artifact.name);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            // Independent inodes keep fixture mutations from invalidating
+            // the shared model cache used by other qualification tests.
+            fs::copy(source.join(&artifact.name), destination).unwrap();
+        }
+        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, install)
+            .expect("verify the independent fast producer");
+    }
+
+    #[cfg(all(unix, feature = "semantic-support"))]
+    fn assert_same_fast_producer_refusal(
+        label: &str,
+        cached: &CommandOutcome,
+        uncached: &CommandOutcome,
+    ) {
+        for outcome in [cached, uncached] {
+            assert!(!outcome.timed_out, "{label}: {outcome:?}");
+            assert!(!outcome.status.success(), "{label}: {outcome:?}");
+            assert!(
+                !outcome.stderr.contains("Model2Vec model loaded"),
+                "an unverified producer must not load weights: {label}: {outcome:?}"
+            );
+        }
+        let cached_error: Value = serde_json::from_str(&cached.stdout).unwrap();
+        let uncached_error: Value = serde_json::from_str(&uncached.stdout).unwrap();
+        assert_eq!(cached_error["ok"], false, "{cached_error}");
+        assert!(cached_error["data"].is_null(), "{cached_error}");
+        assert!(
+            cached_error["error"]["code"]
+                .as_str()
+                .is_some_and(|code| !code.is_empty()),
+            "producer rejection must remain a typed error: {cached_error}"
+        );
+        assert_eq!(cached.status.code(), uncached.status.code(), "{label}");
+        assert_eq!(cached_error["error"], uncached_error["error"], "{label}");
+    }
+
+    #[cfg(all(unix, feature = "semantic-support"))]
     fn verify_real_fast_model_cache_isolation(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
@@ -809,45 +851,14 @@ mod loader_only {
         let assert_refused = |label: &str| {
             let cached = run_search(&probe, &format!("cached-{label}"), &selected, false);
             let uncached = run_search(&probe, &format!("uncached-{label}"), &selected, true);
-            for outcome in [&cached, &uncached] {
-                assert!(!outcome.timed_out, "{label}: {outcome:?}");
-                assert!(!outcome.status.success(), "{label}: {outcome:?}");
-                assert!(
-                    !outcome.stderr.contains("Model2Vec model loaded"),
-                    "an unverified producer must not load weights: {label}: {outcome:?}"
-                );
-            }
-            let cached_error: Value = serde_json::from_str(&cached.stdout).unwrap();
-            let uncached_error: Value = serde_json::from_str(&uncached.stdout).unwrap();
-            assert_eq!(cached_error["ok"], false, "{cached_error}");
-            assert!(cached_error["data"].is_null(), "{cached_error}");
-            assert!(
-                cached_error["error"]["code"]
-                    .as_str()
-                    .is_some_and(|code| !code.is_empty()),
-                "producer rejection must remain a typed error: {cached_error}"
-            );
-            assert_eq!(cached.status.code(), uncached.status.code(), "{label}");
-            assert_eq!(cached_error["error"], uncached_error["error"], "{label}");
+            assert_same_fast_producer_refusal(label, &cached, &uncached);
             assert_preserved();
         };
         assert_refused("missing-model-install");
 
         let manifest = ModelManifest::potion_128m();
         let install = models.join("potion-multilingual-128M");
-        for artifact in &manifest.files {
-            let destination = install.join(&artifact.name);
-            fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            fs::copy(
-                fsfs.model_root
-                    .join("potion-multilingual-128M")
-                    .join(&artifact.name),
-                destination,
-            )
-            .unwrap();
-        }
-        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install)
-            .expect("verify the independent fast producer");
+        copy_verified_potion_install(&fsfs.model_root.join("potion-multilingual-128M"), &install);
         let assert_replayed = |label: &str| {
             let outcome = run_search(&probe, label, &selected, false);
             let replayed = parse_success_envelope(label, &outcome);
@@ -859,6 +870,27 @@ mod loader_only {
             assert_preserved();
         };
         assert_replayed("identical-producer-at-new-model-root");
+
+        // Reusing a pathname does not preserve its receipt's file identities.
+        // Authentic replacement bytes can still pass full verification, but
+        // replay must neither trust nor refresh the copied stale receipt.
+        let retained_install = fixture.join("retained-original-install");
+        fs::rename(&install, &retained_install).unwrap();
+        for artifact in &manifest.files {
+            let destination = install.join(&artifact.name);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(retained_install.join(&artifact.name), destination).unwrap();
+        }
+        let replacement_receipt = install.join(".verified");
+        fs::copy(retained_install.join(".verified"), &replacement_receipt).unwrap();
+        let stale_receipt_bytes = fs::read(&replacement_receipt).unwrap();
+        assert!(!is_verification_cached(&manifest, &install));
+        assert_replayed("replaced-directory-with-stale-receipt");
+        assert_eq!(fs::read(&replacement_receipt).unwrap(), stale_receipt_bytes);
+        assert!(!is_verification_cached(&manifest, &install));
+        fs::rename(&install, fixture.join("retained-replacement-install")).unwrap();
+        fs::rename(&retained_install, &install).unwrap();
+        assert_replayed("restored-original-install");
 
         // A receipt covers the registered files only. An extra semantic-role
         // artifact must still be rejected by the frozen producer manifest.
@@ -942,6 +974,33 @@ mod loader_only {
         fs::write(&receipt, intact_receipt).unwrap();
         assert_replayed("restored-well-formed-receipt");
 
+        // Valid model files cannot authorize an answer from a different
+        // embedding contract. Keep the cache filename so key admission must
+        // reject the record before a fresh search with the intact producer.
+        let mut stale_contract = record.clone();
+        stale_contract["key"]["embedding_contracts"] = "previous-embedding-contract".into();
+        fs::write(&cache_path, serde_json::to_vec(&stale_contract).unwrap()).unwrap();
+        let recomputed = run_search(
+            &probe,
+            "fast-model-changed-embedding-contract",
+            &selected,
+            false,
+        );
+        let recomputed_payload = parse_success_envelope("changed embedding contract", &recomputed);
+        assert!(
+            recomputed.stderr.contains("Model2Vec model loaded"),
+            "a mismatched embedding contract must perform fresh retrieval: {recomputed:?}"
+        );
+        assert_eq!(recomputed_payload["data"]["hits"], original["data"]["hits"]);
+        let current_record: Value =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(current_record["key"], record["key"]);
+        assert_eq!(
+            current_record["index_fingerprint"],
+            record["index_fingerprint"]
+        );
+        assert_eq!(matching_records().len(), 1);
+
         // A corrupt answer record is a cache miss, unlike an invalid producer:
         // fresh retrieval is legitimate here because the producer is intact.
         // Require a real load and identical hits, then prove the repaired
@@ -979,13 +1038,175 @@ mod loader_only {
             assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
         }
         eprintln!(
-            "[default-build-e2e] stage=fast-model-answer-cache real_potion=true cold_ms={} warm_median_ms={} warm_samples_ms={:?} warm_replay=true missing_producer_refused=true changed_artifacts_refused=true extra_artifact_refused=true same_error_as_uncached=true full_verification_without_receipt=true malformed_receipt_reverified=true corrupt_answer_recomputed=true repaired_answer_replayed=true changed_producer_refused=true malformed_selection_refused=true canonical_alias_reused=true generation_preserved=true",
+            "[default-build-e2e] stage=fast-model-answer-cache real_potion=true cold_ms={} warm_median_ms={} warm_samples_ms={:?} warm_replay=true missing_producer_refused=true changed_artifacts_refused=true extra_artifact_refused=true same_error_as_uncached=true replaced_directory_reverified=true full_verification_without_receipt=true malformed_receipt_reverified=true changed_contract_recomputed=true corrupt_answer_recomputed=true repaired_answer_replayed=true changed_producer_refused=true malformed_selection_refused=true canonical_alias_reused=true generation_preserved=true",
             cold.elapsed.as_millis(),
             warm_median.as_millis(),
             warm_elapsed
                 .iter()
                 .map(Duration::as_millis)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(all(unix, feature = "semantic-support"))]
+    #[allow(clippy::too_many_lines)]
+    fn verify_fast_cache_resident_daemon(
+        fsfs: &IsolatedFsfs,
+        root: &Path,
+        index: &Path,
+        config: &Path,
+        query: &str,
+        original: &Value,
+        assert_fresh_cli_refused: impl FnOnce(),
+    ) {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+
+        struct Owner {
+            child: std::process::Child,
+            socket: PathBuf,
+        }
+        impl Owner {
+            fn stop(&mut self) -> Option<ExitStatus> {
+                request_daemon_stop(&self.socket, false);
+                let deadline = Instant::now() + FAILURE_TIMEOUT;
+                while Instant::now() < deadline {
+                    match self.child.try_wait() {
+                        Ok(Some(status)) => return Some(status),
+                        Ok(None) => thread::sleep(Duration::from_millis(10)),
+                        Err(_) => break,
+                    }
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                None
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.stop();
+            }
+        }
+
+        // This fixture builds the legacy layout explicitly. Its raw request,
+        // readiness, and shutdown protocols differ from a complete store's.
+        assert!(
+            !is_complete_store(index),
+            "resident cache identity control requires a legacy generation"
+        );
+        // Unix sockets have a small pathname limit. Keep this unique socket
+        // outside the nested model fixture, including under a long TMPDIR.
+        let socket_root = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let socket_fixture = tempfile::Builder::new()
+            .prefix("fsfs-cache-")
+            .tempdir_in(socket_root)
+            .expect("create short unique cache identity socket directory");
+        let socket = socket_fixture.path().join("resident.sock");
+        assert!(
+            socket.as_os_str().len() < 100,
+            "cache identity socket path too long for AF_UNIX; set XDG_RUNTIME_DIR or TMPDIR to a short directory: {}",
+            socket.display()
+        );
+        let log = fsfs.log_root.join("cache-identity-daemon.stderr.log");
+        let child = fsfs
+            .command(root)
+            .args([
+                "serve",
+                "--daemon",
+                "--daemon-socket",
+                socket.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+            ])
+            .env("FRANKENSEARCH_LOG", "info")
+            .stdout(File::create(fsfs.log_root.join("cache-identity-daemon.stdout.log")).unwrap())
+            .stderr(File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let mut owner = Owner { child, socket };
+        let started = Instant::now();
+        while !owner.socket.exists() {
+            let status = owner.child.try_wait().unwrap();
+            assert!(
+                status.is_none(),
+                "cache daemon exited: {status:?}\n{}",
+                fs::read_to_string(&log).unwrap()
+            );
+            assert!(
+                started.elapsed() < QUICKSTART_TIMEOUT,
+                "cache daemon startup"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let request = |message: &str| {
+            let mut socket = UnixStream::connect(&owner.socket).unwrap();
+            socket.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+            socket.set_write_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+            writeln!(socket, "{message}").unwrap();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut raw = String::new();
+            socket.read_to_string(&mut raw).unwrap();
+            serde_json::from_str::<Value>(&raw).unwrap()
+        };
+        let ready = request("ready");
+        assert_eq!(ready["ok"], true, "{ready}");
+        assert_eq!(ready["pid"], owner.child.id(), "{ready}");
+        assert_eq!(ready["semantic_admitted"], false);
+        let message = serde_json::json!({
+            "query": query, "limit": 3, "mode": "fast_only", "fast_only": true,
+        })
+        .to_string();
+        let cold = request(&message);
+        assert_eq!(cold["ok"], true, "{cold}");
+        assert_eq!(cold["cached"], false, "{cold}");
+        assert_eq!(cold["payloads"].as_array().unwrap().len(), 1);
+        assert_eq!(cold["payloads"][0]["hits"], original["data"]["hits"]);
+        let warm = request(&message);
+        assert_eq!(warm["ok"], true, "{warm}");
+        assert_eq!(warm["cached"], true, "{warm}");
+        assert_eq!(warm["payloads"], cold["payloads"]);
+        assert_eq!(warm["policy"], cold["policy"]);
+
+        // Resident immutable weights remain an authenticated producer after
+        // the install path disappears. A new CLI process has no such proof.
+        let directory = fsfs.model_root.join("potion-multilingual-128M");
+        let retained = root.join("resident-model-retained");
+        fs::rename(&directory, &retained).unwrap();
+        let resident = request(&message);
+        assert_eq!(resident["ok"], true, "{resident}");
+        assert_eq!(resident["cached"], true, "{resident}");
+        assert_eq!(resident["payloads"], cold["payloads"]);
+        assert_eq!(resident["policy"], cold["policy"]);
+        let still_ready = request("ready");
+        assert_eq!(still_ready["semantic_admitted"], true);
+        assert_eq!(
+            still_ready["vector_generation_id"],
+            ready["vector_generation_id"]
+        );
+        assert_eq!(still_ready["pid"], ready["pid"]);
+        assert_fresh_cli_refused();
+        fs::rename(&retained, &directory).unwrap();
+        let shutdown = owner
+            .stop()
+            .expect("cache identity daemon failed graceful shutdown");
+        assert!(
+            shutdown.success(),
+            "cache identity daemon shutdown: {shutdown}"
+        );
+        drop(owner);
+        let diagnostics = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            diagnostics.matches("Model2Vec model loaded").count(),
+            1,
+            "{diagnostics}"
+        );
+        eprintln!(
+            "[default-build-e2e] stage=fast-cache-resident-daemon same_pid=true weight_loads=1 warm_payload_identity_equal=true removed_install_resident_valid=true new_cli_refused=true"
         );
     }
 
@@ -998,25 +1219,11 @@ mod loader_only {
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
         let install = model_root.join("potion-multilingual-128M");
-        let manifest = ModelManifest::potion_128m();
         // The full quickstart deliberately invalidates the external cache's
         // receipt. This independently runnable test must not race it or write
         // to that shared installation. Copy only registered artifact bytes and
         // mint the receipt under this test's private root.
-        for artifact in &manifest.files {
-            let destination = install.join(&artifact.name);
-            fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            fs::copy(
-                source_models
-                    .join("potion-multilingual-128M")
-                    .join(&artifact.name),
-                destination,
-            )
-            .expect("copy registered Potion artifact into the private model installation");
-        }
-        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install).expect(
-            "the focused answer-cache regression requires the exact registered Potion model",
-        );
+        copy_verified_potion_install(&source_models.join("potion-multilingual-128M"), &install);
         let corpus = temp.path().join("corpus");
         let index = temp.path().join("index");
         write_quickstart_corpus(&corpus);
@@ -1038,6 +1245,116 @@ mod loader_only {
         );
         parse_success_envelope("fast answer-cache index", &indexed);
         verify_real_fast_model_cache_isolation(&fsfs, temp.path(), &index);
+    }
+
+    #[cfg(all(unix, feature = "semantic-support"))]
+    #[test]
+    #[ignore = "real Model2Vec daemon and CLI cache behavior; provision Potion and run with --ignored --nocapture"]
+    fn default_build_keeps_resident_fast_producer_after_install_move() {
+        log_binary_profile("resident-fast-producer");
+        let temp = tempfile::tempdir().unwrap();
+        let models = temp.path().join("models");
+        let fsfs = IsolatedFsfs::new(temp.path(), models.clone());
+        copy_verified_potion_install(
+            &configured_model_root().join("potion-multilingual-128M"),
+            &models.join("potion-multilingual-128M"),
+        );
+        let corpus = temp.path().join("corpus");
+        let index = temp.path().join("index");
+        write_quickstart_corpus(&corpus);
+        let indexed = fsfs.run_with_env(
+            temp.path(),
+            "resident-fast-producer-index",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--fast-only",
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FSFS_COMPLETE_GENERATIONS", "0")],
+        );
+        parse_success_envelope("resident fast-producer index", &indexed);
+        let config = temp.path().join("resident-fast-model.toml");
+        fs::write(
+            &config,
+            "[indexing]\nfast_model = \"potion-multilingual-128M\"\n",
+        )
+        .unwrap();
+        let query = "producer policy controls retained network retries";
+        let run_cli = |label: &str, uncached: bool| {
+            let mut env = vec![("FRANKENSEARCH_LOG", "info")];
+            if uncached {
+                env.push(("FSFS_DISABLE_QUERY_CACHE", "1"));
+            }
+            fsfs.run_with_env(
+                temp.path(),
+                label,
+                [
+                    "search",
+                    query,
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--no-daemon",
+                    "--fast-only",
+                    "--limit",
+                    "3",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &env,
+            )
+        };
+        let cold = run_cli("resident-fast-cache-seed", false);
+        let original = parse_success_envelope("resident fast-cache seed", &cold);
+        assert!(cold.stderr.contains("Model2Vec model loaded"), "{cold:?}");
+        assert!(
+            original["data"]["hits"]
+                .as_array()
+                .is_some_and(|hits| !hits.is_empty())
+        );
+        let warm = run_cli("resident-fast-cache-replay", false);
+        let replayed = parse_success_envelope("resident fast-cache replay", &warm);
+        assert_eq!(replayed["data"], original["data"]);
+        assert!(!warm.stderr.contains("Model2Vec model loaded"), "{warm:?}");
+        let (cache_path, cache_bytes) = fs::read_dir(index.join("query_cache"))
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).ok()?;
+                let record: Value = serde_json::from_slice(&bytes).ok()?;
+                (record["key"]["query"] == query).then_some((path, bytes))
+            })
+            .expect("the real CLI query must persist its answer");
+        let vector_path = index.join("vector/index.fsvi");
+        let vector_bytes = fs::read(&vector_path).unwrap();
+        verify_fast_cache_resident_daemon(
+            &fsfs,
+            temp.path(),
+            &index,
+            &config,
+            query,
+            &original,
+            || {
+                let cached = run_cli("resident-missing-install-cached", false);
+                let uncached = run_cli("resident-missing-install-uncached", true);
+                assert_same_fast_producer_refusal(
+                    "missing install for new CLI",
+                    &cached,
+                    &uncached,
+                );
+                assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+                assert_eq!(fs::read(&vector_path).unwrap(), vector_bytes);
+            },
+        );
+        assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+        assert_eq!(fs::read(&vector_path).unwrap(), vector_bytes);
     }
 
     #[cfg(feature = "semantic-loaders")]

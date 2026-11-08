@@ -393,25 +393,32 @@ impl VerifiedModelArtifactsV1 {
     ///
     /// # Errors
     ///
-    /// Returns the same artifact-verification errors as
-    /// [`ModelArtifactManifestV1::verify_dir_cached`].
+    /// Returns the same artifact-verification and verification-race errors as
+    /// [`ModelArtifactManifestV1::verify_dir_cached_for_replay`].
     pub fn revalidate(
         &self,
         download_manifest: &ModelManifest,
         model_dir: &Path,
     ) -> SearchResult<()> {
-        if self
-            .snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.still_matches(download_manifest, model_dir))
+        if let Some(snapshot) = self.snapshot.as_ref()
+            && snapshot.still_matches(download_manifest, model_dir)
         {
-            return verify_no_extra_artifacts(model_dir, &self.frozen.manifest.artifacts);
+            let artifact_set =
+                verify_no_extra_artifacts(model_dir, &self.frozen.manifest.artifacts);
+            #[cfg(test)]
+            after_replay_artifact_inspection();
+            // A registered file may change while the directory is inspected.
+            // Do not return the old proof or an extra-file error until its
+            // authenticated states still match on the other side of the scan.
+            if snapshot.still_matches(download_manifest, model_dir) {
+                return artifact_set;
+            }
         }
         // Preserve ordinary error ordering: a missing or corrupt registered
         // artifact must not be hidden by an additional unregistered artifact.
         self.frozen
             .manifest
-            .verify_dir_cached(download_manifest, model_dir)
+            .verify_dir_cached_for_replay(download_manifest, model_dir)
             .map(|_| ())
     }
 }
@@ -1211,10 +1218,14 @@ impl ModelArtifactManifestV1 {
         let before = capture();
         let mut verified = self.verify_dir_cached(download_manifest, model_dir)?;
         after_full_hash_boundary();
+        let artifact_set = verify_no_extra_artifacts(model_dir, &self.artifacts);
+        #[cfg(test)]
+        after_replay_artifact_inspection();
         let after = capture();
         if before != after {
             return Err(model_changed_during_verification(model_dir));
         }
+        artifact_set?;
         if (self.artifacts_match_download_manifest(download_manifest)
             || self.matches_registered_native_installation(download_manifest))
             && let Ok(frozen_download) = download_manifest.freeze_verification_manifest()
@@ -1223,7 +1234,6 @@ impl ModelArtifactManifestV1 {
                 .values()
                 .all(FileVerificationState::has_strong_change_identity)
         {
-            verify_no_extra_artifacts(model_dir, &self.artifacts)?;
             verified.snapshot = Some(VerifiedArtifactSnapshot {
                 model_dir: model_dir.to_path_buf(),
                 download_manifest_fingerprint: frozen_download.fingerprint,
@@ -3621,6 +3631,18 @@ fn capture_manifest_file_states(
 thread_local! {
     static TEST_AFTER_FULL_HASH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static TEST_AFTER_REPLAY_ARTIFACT_INSPECTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_replay_artifact_inspection() {
+    TEST_AFTER_REPLAY_ARTIFACT_INSPECTION_HOOK.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
 }
 
 fn after_full_hash_boundary() {
@@ -7305,6 +7327,129 @@ mod tests {
                 assert_eq!(count.get(), expected_hashes, "receipt={receipt}");
             });
             assert_eq!(fs::read(marker_path).ok(), marker_before);
+        }
+    }
+
+    #[test]
+    fn native_replay_proof_retains_verified_files_when_the_receipt_disappears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, native) = native_fixture(b"tokenizer-receipt", b"weights-receipt");
+        write_temp_file(&tmp.path().join("tokenizer.json"), b"tokenizer-receipt");
+        write_temp_file(&tmp.path().join("model.safetensors"), b"weights-receipt");
+        verify_dir_and_record(&manifest, tmp.path()).unwrap();
+        let verified = native
+            .verify_dir_cached_for_replay(&manifest, tmp.path())
+            .unwrap();
+        let marker = tmp.path().join(VERIFIED_MARKER_FILE);
+        let original = fs::read(&marker).unwrap();
+        let retained = tmp.path().join("retained-receipt");
+        fs::rename(&marker, &retained).unwrap();
+        for malformed in [false, true] {
+            if malformed {
+                write_temp_file(&marker, b"malformed replacement receipt");
+            }
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+            for _ in 0..5 {
+                verified.revalidate(&manifest, tmp.path()).unwrap();
+            }
+            let expected_hashes = if cfg!(unix) {
+                0
+            } else {
+                manifest.files.len() * 5
+            };
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| assert_eq!(count.get(), expected_hashes));
+            if malformed {
+                assert_eq!(fs::read(&marker).unwrap(), b"malformed replacement receipt");
+            } else {
+                assert!(!marker.exists(), "replay must not mint a missing receipt");
+            }
+            assert_eq!(fs::read(&retained).unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_replay_proof_rechecks_file_states_after_artifact_inspection() {
+        for with_extra_artifact in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (manifest, native) = native_fixture(b"tokenizer-inspection", b"weights-inspection");
+            write_temp_file(&tmp.path().join("tokenizer.json"), b"tokenizer-inspection");
+            let weights = tmp.path().join("model.safetensors");
+            write_temp_file(&weights, b"weights-inspection");
+            let verified = native
+                .verify_dir_cached_for_replay(&manifest, tmp.path())
+                .unwrap();
+            if with_extra_artifact {
+                write_temp_file(&tmp.path().join("model.onnx"), b"unregistered weights");
+            }
+            let changed = weights.clone();
+            TEST_AFTER_REPLAY_ARTIFACT_INSPECTION_HOOK.with(|slot| {
+                assert!(
+                    slot.replace(Some(Box::new(move || {
+                        fs::write(changed, b"changed during directory inspection").unwrap();
+                    })))
+                    .is_none()
+                );
+            });
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+            let error = verified.revalidate(&manifest, tmp.path()).unwrap_err();
+            assert!(
+                matches!(error, SearchError::ModelLoadFailed { .. }),
+                "registered corruption must not escape or be hidden by the extra artifact: {error:?}"
+            );
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| assert_eq!(count.get(), manifest.files.len()));
+            assert_eq!(
+                fs::read(weights).unwrap(),
+                b"changed during directory inspection"
+            );
+            assert!(!tmp.path().join(VERIFIED_MARKER_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn native_replay_proof_rejects_mutation_during_changed_state_reverification() {
+        for after_inspection in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (manifest, native) =
+                native_fixture(b"tokenizer-reverification", b"weights-reverification");
+            write_temp_file(
+                &tmp.path().join("tokenizer.json"),
+                b"tokenizer-reverification",
+            );
+            let weights = tmp.path().join("model.safetensors");
+            write_temp_file(&weights, b"weights-reverification");
+            let verified = native
+                .verify_dir_cached_for_replay(&manifest, tmp.path())
+                .unwrap();
+            // A valid replacement makes the old file-state proof stale. The
+            // fallback must bind its successful hash pass to stable new states.
+            fs::rename(&weights, tmp.path().join("retained-model-bytes")).unwrap();
+            write_temp_file(&weights, b"weights-reverification");
+            let changed = weights.clone();
+            let mutation: Box<dyn FnOnce()> = Box::new(move || {
+                fs::write(changed, b"changed during fallback verification").unwrap();
+            });
+            if after_inspection {
+                TEST_AFTER_REPLAY_ARTIFACT_INSPECTION_HOOK.with(|slot| {
+                    assert!(slot.replace(Some(mutation)).is_none());
+                });
+            } else {
+                TEST_AFTER_FULL_HASH_HOOK.with(|slot| {
+                    assert!(slot.replace(Some(mutation)).is_none());
+                });
+            }
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| count.set(0));
+            let error = verified.revalidate(&manifest, tmp.path()).unwrap_err();
+            assert!(
+                matches!(error, SearchError::HashMismatch { .. }),
+                "{error:?}"
+            );
+            TEST_VERIFY_FILE_HASH_CALLS.with(|count| assert_eq!(count.get(), manifest.files.len()));
+            assert_eq!(
+                fs::read(weights).unwrap(),
+                b"changed during fallback verification"
+            );
+            assert!(!tmp.path().join(VERIFIED_MARKER_FILE).exists());
         }
     }
 

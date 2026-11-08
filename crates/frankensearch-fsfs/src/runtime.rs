@@ -13531,7 +13531,9 @@ impl FsfsRuntime {
             return admitted.check_current_identity();
         }
         #[cfg(feature = "semantic-support")]
-        if let Some(producer) = resources.cached_fast_producer.as_ref() {
+        if !resources.fast_embedder_attempted
+            && let Some(producer) = resources.cached_fast_producer.as_ref()
+        {
             return producer.validate(index);
         }
         Err(SearchError::EmbedderUnavailable {
@@ -19977,16 +19979,7 @@ impl FsfsRuntime {
             });
         };
 
-        let canonical_path = model_root.join(Self::manifest_install_dir_name(&manifest));
-        let root_is_direct_model = manifest
-            .files
-            .iter()
-            .any(|file| model_root.join(&file.name).exists());
-        let path = if canonical_path.exists() || !root_is_direct_model {
-            canonical_path
-        } else {
-            model_root.to_path_buf()
-        };
+        let path = Self::registered_model_cache_path(&manifest, model_root);
         if !path.exists() {
             return Ok(ModelCacheInspection {
                 path,
@@ -20020,6 +20013,19 @@ impl FsfsRuntime {
             size_bytes,
             diagnostic,
         })
+    }
+
+    fn registered_model_cache_path(manifest: &ModelManifest, model_root: &Path) -> PathBuf {
+        let canonical_path = model_root.join(Self::manifest_install_dir_name(manifest));
+        let root_is_direct_model = manifest
+            .files
+            .iter()
+            .any(|file| model_root.join(&file.name).exists());
+        if canonical_path.exists() || !root_is_direct_model {
+            canonical_path
+        } else {
+            model_root.to_path_buf()
+        }
     }
 
     fn registered_manifest_for_model(tier: &str, model_name: &str) -> Option<ModelManifest> {
@@ -23024,9 +23030,22 @@ impl FsfsRuntime {
                 },
             )?
         } else {
-            let model_dir = self.selected_fast_model_path(&registration)?;
-            let (identity, artifacts) = registration.verify_identity_for_replay(&model_dir)?;
-            (model_dir, identity, artifacts)
+            let model_dir = Self::registered_model_cache_path(
+                registration.download_manifest(),
+                Path::new(&self.config.indexing.model_dir),
+            );
+            match registration.verify_identity_for_replay(&model_dir) {
+                Ok((identity, artifacts)) => (model_dir, identity, artifacts),
+                Err(_) => {
+                    // Keep explicit-selection diagnostics without making a
+                    // valid receipt-less producer hash once in inspection
+                    // and again in admission.
+                    let model_dir = self.selected_fast_model_path(&registration)?;
+                    let (identity, artifacts) =
+                        registration.verify_identity_for_replay(&model_dir)?;
+                    (model_dir, identity, artifacts)
+                }
+            }
         };
         Ok(CachedFastProducer {
             registration,
@@ -24605,6 +24624,7 @@ impl FsfsRuntime {
             } else {
                 self.resolve_cached_fast_producer()?
             };
+            Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
             resources.cached_fast_producer = Some(producer);
             return Ok(());
         }
@@ -52851,6 +52871,56 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn cached_fast_identity_requires_the_exact_stored_embedding_contract() {
+        use frankensearch_core::generation::QuantizationFormat;
+        use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
+
+        let identity = ModelArtifactManifestV1::potion_128m_native()
+            .unwrap()
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fast.fsvi");
+        let mut writer = VectorIndex::create_with_revision(
+            &path,
+            &identity.space.logical_model_id,
+            &identity.fingerprint(),
+            identity.space.dimension as usize,
+            frankensearch_index::Quantization::F16,
+        )
+        .unwrap();
+        let mut vector = vec![0.0; identity.space.dimension as usize];
+        vector[0] = 1.0;
+        writer.write_record("fixture", &vector).unwrap();
+        writer.finish().unwrap();
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // This is an admission test over a real FSVI, not a claim of model
+        // execution. Replay and inference share this complete revision fence.
+        FsfsRuntime::validate_fast_producer_shape(
+            &index,
+            &identity.space.logical_model_id.to_ascii_uppercase(),
+            identity.space.dimension as usize,
+        )
+        .unwrap();
+        FsfsRuntime::validate_vector_producer_identity(&index, &identity).unwrap();
+        let mut changed = identity.clone();
+        changed
+            .producer
+            .implementation_revision
+            .push_str("-changed");
+        changed.validate().unwrap();
+        assert_eq!(changed.space, identity.space);
+        assert!(matches!(
+            FsfsRuntime::validate_vector_producer_identity(&index, &changed),
+            Err(SearchError::UnverifiableRemoteSpace { .. })
+        ));
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
     #[test]
     fn production_vector_admission_rejects_legacy_fnv_generation() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -61135,6 +61205,16 @@ mod tests {
             let cache_path = runtime.search_cache_path(&key).unwrap();
             let mut old_record: serde_json::Value =
                 serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+            let mut changed_contract = old_record.clone();
+            changed_contract["key"]["embedding_contracts"] = "prior-producer-contracts".into();
+            fs::write(&cache_path, serde_json::to_vec(&changed_contract).unwrap()).unwrap();
+            assert!(
+                runtime
+                    .try_load_search_payload_cache(&key, &cache_fingerprint)
+                    .unwrap()
+                    .is_none(),
+                "a record under the current filename still needs the exact embedding contract"
+            );
             for old_schema in [
                 "fsfs.search.cache.v3",
                 "fsfs.search.cache.v4",
@@ -61697,6 +61777,28 @@ mod tests {
                 }],
             )];
             let cache_generation = resources.generation_fingerprint.clone();
+            // A disk proof may admit an unopened producer. It cannot replace
+            // an admitted provider that retained resources have since lost.
+            let mut lost_provider = resources.clone();
+            lost_provider.fast_embedder_attempted = true;
+            let mut published = 0;
+            let refused = runtime
+                .replay_cached_search_payloads(
+                    &cx,
+                    &mut lost_provider,
+                    mode,
+                    &cache_generation,
+                    &payloads,
+                    Some(&mut |_| {
+                        published += 1;
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(refused, SearchError::EmbedderUnavailable { .. }));
+            assert_eq!(published, 0);
+
             assert_eq!(
                 runtime
                     .replay_cached_search_payloads(
