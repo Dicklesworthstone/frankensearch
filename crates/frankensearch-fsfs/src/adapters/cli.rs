@@ -205,6 +205,9 @@ pub struct CliInput {
     pub query: Option<String>,
     /// Search only the independently admitted quality vector tier.
     pub quality_only: bool,
+    /// Explicitly rebuild a complete store from these sources before searching.
+    /// This operation uses locally available models and never downloads them.
+    pub recover_source: Option<PathBuf>,
     /// Optional target path for index/watch.
     pub target_path: Option<PathBuf>,
     /// Optional explicit index directory override for index/status commands.
@@ -278,6 +281,67 @@ pub struct CliInput {
 }
 
 impl CliInput {
+    pub(crate) fn validate_search_recovery(&self) -> SearchResult<()> {
+        let Some(source) = &self.recover_source else {
+            return Ok(());
+        };
+        let reason = if self.command != CliCommand::Search {
+            Some("--recover-source is only valid for the search command")
+        } else if source.as_os_str().is_empty()
+            || self
+                .index_dir
+                .as_ref()
+                .is_none_or(|root| root.as_os_str().is_empty())
+        {
+            Some(
+                "--recover-source requires a source directory and an explicit nonempty --index-dir STORE",
+            )
+        } else if self
+            .query
+            .as_deref()
+            .is_none_or(|query| query.trim().is_empty())
+            || self.overrides.limit == Some(0)
+        {
+            Some(
+                "source recovery requires a nonblank query and a positive limit so the rebuilt generation can be verified before publication",
+            )
+        } else if self.daemon || self.daemon_socket.is_some() {
+            Some(
+                "--recover-source runs locally against its exact rebuilt generation; omit --daemon and --daemon-socket",
+            )
+        } else if self.expand {
+            Some(
+                "--recover-source cannot be combined with --expand; recovery must verify and replay the exact original query",
+            )
+        } else if self.overrides.offline == Some(false) {
+            Some(
+                "--recover-source uses locally available models and cannot be combined with --online; provision models explicitly before recovery",
+            )
+        } else if self.target_path.is_some()
+            || self.watch
+            || self.full_reindex
+            || self.complete_quality
+            || self.overrides.allow_background_indexing == Some(true)
+            || self.overrides.roots.is_some()
+            || self.overrides.exclude_patterns.is_some()
+            || self.overrides.upgrade_reuse.is_some()
+        {
+            Some(
+                "--recover-source always performs one complete source rebuild; omit index/watch flags, discovery overrides and --upgrade-reuse",
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.search.recover_source".into(),
+                value: "--recover-source".into(),
+                reason: reason.into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_quality_completion(&self) -> SearchResult<()> {
         if !self.complete_quality {
             return Ok(());
@@ -467,6 +531,7 @@ where
             "--help" | "-h" => {
                 input.command = CliCommand::Help;
                 input.command_source = CommandSource::Explicit;
+                input.recover_source = None;
                 return Ok(input);
             }
             "--roots" => {
@@ -872,6 +937,11 @@ where
                 input.index_dir = Some(PathBuf::from(value));
                 idx += 2;
             }
+            "--recover-source" => {
+                let value = expect_value(&tokens, idx, "--recover-source")?;
+                input.recover_source = Some(PathBuf::from(value));
+                idx += 2;
+            }
             _ => {
                 if command == CliCommand::Search && input.query.is_none() {
                     if flag == "--" {
@@ -920,7 +990,7 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
     #[cfg(unix)]
     {
         // Default search path uses daemon transport to amortize startup/index warmup.
-        input.daemon = input.command == CliCommand::Search;
+        input.daemon = input.command == CliCommand::Search && input.recover_source.is_none();
     }
 
     #[cfg(not(unix))]
@@ -930,6 +1000,7 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
 }
 
 fn validate_required_args(input: &CliInput) -> SearchResult<()> {
+    input.validate_search_recovery()?;
     input.validate_quality_completion()?;
     if input.quality_only && input.overrides.fast_only == Some(true) {
         return Err(SearchError::InvalidConfig {
@@ -1228,6 +1299,7 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--theme"
             | "--config"
             | "--index-dir"
+            | "--recover-source"
             | "--expand"
             | "--file"
             | "--prefix"
@@ -1242,6 +1314,140 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn search_recovery_preserves_search_flags_and_selects_local_transport() {
+        let input = parse_cli_args([
+            "search",
+            "original query",
+            "--recover-source=/sources",
+            "--index-dir=/store",
+            "--filter=path:src",
+            "--limit=all",
+            "--quality-only",
+            "--ranking-priors",
+            "--rerank",
+            "--explain",
+            "--format=toon",
+            "--stream",
+        ])
+        .unwrap();
+        assert_eq!(input.recover_source.as_deref(), Some(Path::new("/sources")));
+        assert_eq!(input.index_dir.as_deref(), Some(Path::new("/store")));
+        assert_eq!(input.query.as_deref(), Some("original query"));
+        assert_eq!(input.filter.as_deref(), Some("path:src"));
+        assert_eq!(input.overrides.limit, Some(usize::MAX));
+        assert_eq!(input.overrides.ranking_priors, Some(true));
+        assert_eq!(input.overrides.rerank, Some(true));
+        assert_eq!(input.overrides.explain, Some(true));
+        assert!(input.quality_only);
+        assert!(input.stream);
+        assert_eq!(input.format, OutputFormat::Toon);
+        assert!(!input.daemon);
+        assert!(input.target_path.is_none());
+    }
+
+    #[test]
+    fn search_recovery_refuses_missing_scope_and_noop_requests() {
+        for arguments in [
+            vec!["search", "query", "--recover-source", "/sources"],
+            vec![
+                "search",
+                "query",
+                "--recover-source",
+                "",
+                "--index-dir",
+                "/store",
+            ],
+            vec![
+                "search",
+                "query",
+                "--recover-source",
+                "/sources",
+                "--index-dir",
+                "",
+            ],
+            vec![
+                "search",
+                " ",
+                "--recover-source",
+                "/sources",
+                "--index-dir",
+                "/store",
+            ],
+            vec![
+                "search",
+                "query",
+                "--recover-source",
+                "/sources",
+                "--index-dir",
+                "/store",
+                "--limit",
+                "0",
+            ],
+            vec![
+                "index",
+                "--recover-source",
+                "/sources",
+                "--index-dir",
+                "/store",
+            ],
+            vec![
+                "watch",
+                "--recover-source",
+                "/sources",
+                "--index-dir",
+                "/store",
+            ],
+            vec![
+                "tui",
+                "--recover-source",
+                "/sources",
+                "--index-dir",
+                "/store",
+            ],
+        ] {
+            let error = parse_cli_args(arguments.clone()).unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref field, .. }
+                if field == "cli.search.recover_source"),
+                "{arguments:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_recovery_refuses_modifiers_that_change_its_scope() {
+        for modifiers in [
+            vec!["--daemon"],
+            vec!["--daemon-socket", "/socket"],
+            vec!["--expand"],
+            vec!["--online"],
+            vec!["--watch"],
+            vec!["--watch-mode"],
+            vec!["--full"],
+            vec!["--complete-quality"],
+            vec!["--roots", "/other"],
+            vec!["--exclude", "*.md"],
+            vec!["--upgrade-reuse", "same-executable"],
+        ] {
+            let mut arguments = vec![
+                "search",
+                "query",
+                "--recover-source",
+                "/sources",
+                "--index-dir",
+                "/store",
+            ];
+            arguments.extend(modifiers);
+            let error = parse_cli_args(arguments.clone()).unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref field, .. }
+                if field == "cli.search.recover_source"),
+                "{arguments:?}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn parse_command_and_overrides() {

@@ -8802,7 +8802,21 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    #[allow(clippy::future_not_send)]
     async fn run_search_command(&self, cx: &Cx) -> SearchResult<()> {
+        if self.cli_input.recover_source.is_some() {
+            let root = self
+                .complete_generation_command_root(false)?
+                .ok_or_else(|| {
+                    retained_recovery_error("source recovery requires a complete-generation store")
+                })?;
+            return Box::pin(self.run_complete_generation_search_with_writer(
+                cx,
+                &root,
+                &mut std::io::stdout(),
+            ))
+            .await;
+        }
         let query = self
             .cli_input
             .query
@@ -25649,6 +25663,12 @@ impl FsfsRuntime {
     }
 
     fn validate_command_inputs(&self, command: CliCommand) -> SearchResult<()> {
+        self.cli_input.validate_search_recovery()?;
+        if self.cli_input.recover_source.is_some() && command != CliCommand::Search {
+            return Err(retained_recovery_error(
+                "source recovery requires a foreground CLI search, not an interactive or background command",
+            ));
+        }
         self.cli_input.validate_quality_completion()?;
         // Refuse before the initial scan/build, not merely before starting the
         // watcher after that build has already changed the index.
@@ -27670,6 +27690,12 @@ fn print_cli_help() {
     );
     println!(
         "              --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
+    );
+    println!(
+        "              --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once."
+    );
+    println!(
+        "              Recovery requires installed models; it never downloads, retries automatically, or replaces a newer concurrent publication."
     );
     println!(
         "Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>"
