@@ -993,6 +993,91 @@ impl SegmentReader<ReadOnlyMappedFile> {
         Ok(actual)
     }
 
+    /// [`Self::verify_with_file_witness`], reading the payload through `file`.
+    ///
+    /// Used only inside the same-descriptor open callback. The container is
+    /// re-parsed from the mapping (header, section table, alignment padding
+    /// and trailer), then every section checksum is compared in table order
+    /// and the prefix witness last, with the same errors. The bytes those
+    /// checksums cover are read once through the descriptor that backs the
+    /// mapping, which leaves the mapped pages unfaulted: verifying a segment
+    /// no longer makes all of it resident in this process.
+    pub(crate) fn verify_streamed_with_file_witness(
+        &self,
+        file: &mut fs::File,
+    ) -> Result<u64, QuillError> {
+        use std::io::Read;
+
+        let bytes = self.source.as_ref();
+        let parsed = parse_container(bytes, &self.path, self.schema, self.limits)?;
+        let prefix_len = bytes
+            .len()
+            .checked_sub(TRAILER_LEN)
+            .ok_or_else(|| corrupted(&self.path, "file is shorter than its trailer"))?;
+        let mut sections = Vec::new();
+        sections
+            .try_reserve_exact(parsed.sections.len())
+            .map_err(|_| {
+                resource(
+                    "streamed section checks",
+                    format!("allocation failed for {}", self.path.display()),
+                )
+            })?;
+        for entry in &parsed.sections {
+            let range = usize::try_from(entry.offset)
+                .ok()
+                .zip(usize::try_from(entry.len).ok())
+                .and_then(|(start, len)| Some(start..start.checked_add(len)?))
+                .filter(|range| range.end <= bytes.len())
+                .ok_or_else(|| corrupted(&self.path, "validated section range became invalid"))?;
+            sections.push((range, Xxh3::new()));
+        }
+        let mut prefix = Xxh3::new();
+        let mut buffer = vec![0_u8; STREAMED_WITNESS_READ_BYTES.min(bytes.len().max(1))];
+        let mut position = 0;
+        while position < bytes.len() {
+            let count = (bytes.len() - position).min(buffer.len());
+            file.read_exact(&mut buffer[..count])?;
+            let end = position + count;
+            let chunk = &buffer[..count];
+            if position < prefix_len {
+                prefix.update(&chunk[..prefix_len.min(end) - position]);
+            }
+            for (range, hasher) in &mut sections {
+                let start = range.start.max(position);
+                let stop = range.end.min(end);
+                if start < stop {
+                    hasher.update(&chunk[start - position..stop - position]);
+                }
+            }
+            position = end;
+        }
+        for (entry, (_, hasher)) in parsed.sections.iter().zip(&sections) {
+            let actual = hasher.digest();
+            if actual != entry.xxh3 {
+                return Err(corrupted(
+                    &self.path,
+                    format!(
+                        "section {} checksum mismatch: expected {:#018x}, got {actual:#018x}",
+                        entry.kind.raw(),
+                        entry.xxh3
+                    ),
+                ));
+            }
+        }
+        let actual = prefix.digest();
+        if actual != self.file_xxh3 {
+            return Err(corrupted(
+                &self.path,
+                format!(
+                    "file checksum mismatch: expected {:#018x}, got {actual:#018x}",
+                    self.file_xxh3
+                ),
+            ));
+        }
+        Ok(actual)
+    }
+
     /// Open and validate an immutable, published FSLX file through the shared mmap facade.
     ///
     /// Only canonical `seg-<hex16>.fslx` generation files are accepted. Keeper
@@ -2894,6 +2979,109 @@ mod tests {
                 "truncation at {length} must fail"
             );
         }
+        Ok(())
+    }
+
+    /// The descriptor-read full verification is the mapped one: over a clean
+    /// file and over every corruption class it returns the same witness or the
+    /// same error. Sections straddle the 1 MiB read chunks and carry
+    /// position-dependent bytes, so feeding any section a misaligned slice
+    /// changes its hash.
+    #[test]
+    fn streamed_full_verification_matches_mapped_verification() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("seg-0123456789abcdef.fslx");
+        let mut owned = fixture_sections(DEFAULT_SCHEMA, true);
+        for (index, section) in owned.iter_mut().enumerate() {
+            let len = match index {
+                0 => STREAMED_WITNESS_READ_BYTES - 1_000,
+                1 => STREAMED_WITNESS_READ_BYTES + 77_777,
+                3 => 2 * STREAMED_WITNESS_READ_BYTES + 5,
+                _ => section.bytes.len(),
+            };
+            section.bytes = (0..len)
+                .map(|offset| {
+                    let mixed = u32::try_from(offset % 0x00ff_ffff)
+                        .unwrap_or(0)
+                        .wrapping_add(u32::try_from(index).unwrap_or(0) << 24)
+                        .wrapping_mul(0x9e37_79b1);
+                    mixed.to_le_bytes()[3]
+                })
+                .collect();
+        }
+        let encoded = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
+        let clean = encoded.as_bytes().to_vec();
+        assert!(clean.len() > 4 * STREAMED_WITNESS_READ_BYTES);
+        let verdicts = |bytes: &[u8]| -> Result<(String, String), Box<dyn Error>> {
+            fs::write(&path, bytes)?;
+            let verdict = |streamed: bool| {
+                SegmentReader::open_published_checked(
+                    &path,
+                    DEFAULT_SCHEMA,
+                    SegmentLimits::default(),
+                    |reader, file| {
+                        if streamed {
+                            reader.verify_streamed_with_file_witness(file)
+                        } else {
+                            reader.verify_with_file_witness()
+                        }
+                    },
+                )
+                .map_or_else(
+                    |error| error.to_string(),
+                    |(_, witness)| format!("{witness:#x}"),
+                )
+            };
+            Ok((verdict(true), verdict(false)))
+        };
+
+        let (streamed, mapped) = verdicts(&clean)?;
+        assert_eq!(streamed, mapped);
+        assert_eq!(streamed, format!("{:#x}", encoded.file_xxh3()));
+
+        let mut positions = vec![0, 13, FILE_PREFIX_LEN + 3, clean.len() - 1];
+        for entry in encoded.section_entries() {
+            let start = usize::try_from(entry.offset)?;
+            let end = start + usize::try_from(entry.len)?;
+            positions.extend([start, start + 1, end - 1, start - 1]);
+        }
+        for chunk in 1..=4 {
+            let boundary = chunk * STREAMED_WITNESS_READ_BYTES;
+            positions.extend([boundary - 1, boundary, boundary + 1]);
+        }
+        positions.extend(clean.len() - TRAILER_LEN..clean.len());
+        for position in positions {
+            let mut corrupt = clean.clone();
+            corrupt[position] ^= 0x24;
+            let (streamed, mapped) = verdicts(&corrupt)?;
+            assert_eq!(streamed, mapped, "byte {position}");
+            assert!(!streamed.starts_with("0x"), "byte {position} was accepted");
+        }
+
+        // Two damaged sections: both report the first in table order.
+        let entries = encoded.section_entries();
+        let mut corrupt = clean.clone();
+        for entry in [entries[3], entries[1]] {
+            corrupt[usize::try_from(entry.offset)? + 9] ^= 0x01;
+        }
+        let (streamed, mapped) = verdicts(&corrupt)?;
+        assert_eq!(streamed, mapped);
+        assert!(streamed.contains(&format!("section {} checksum", entries[1].kind.raw())));
+
+        // Every section checksum re-pinned to damaged bytes: only the prefix
+        // witness can refuse it, and both refuse it the same way.
+        let mut corrupt = clean;
+        let damaged = entries[3];
+        let start = usize::try_from(damaged.offset)?;
+        let end = start + usize::try_from(damaged.len)?;
+        corrupt[start + STREAMED_WITNESS_READ_BYTES] ^= 0x10;
+        let hash = xxh3_64(&corrupt[start..end]);
+        let hash_offset = table_entry_offset(3) + 20;
+        corrupt[hash_offset..hash_offset + 8].copy_from_slice(&hash.to_le_bytes());
+        rewrite_header_crc(&mut corrupt);
+        let (streamed, mapped) = verdicts(&corrupt)?;
+        assert_eq!(streamed, mapped);
+        assert!(streamed.contains("file checksum mismatch"), "{streamed}");
         Ok(())
     }
 

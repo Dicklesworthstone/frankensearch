@@ -14035,6 +14035,28 @@ impl QuillIndex {
             .serial_lease_cut_seals = serial;
         Ok(())
     }
+
+    /// Bench-only: verify each new segment at publication through its mapping
+    /// (`true`, the incumbent) or through its file descriptor (`false`,
+    /// shipping), for a same-invocation A/B. No-op for an in-memory index.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation or writer-lock failures.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn bench_set_mapped_preflight(
+        &self,
+        cx: &Cx,
+        mapped: bool,
+    ) -> Result<(), QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "index writer lock").await?;
+        if let IndexBackend::Durable(keeper) = &mut writer.backend {
+            keeper.set_benchmark_mapped_preflight(mapped);
+        }
+        drop(writer);
+        Ok(())
+    }
 }
 
 impl RootBoundQuillSearchIndex {
