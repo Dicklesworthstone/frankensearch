@@ -25319,7 +25319,6 @@ impl FsfsRuntime {
         resources: &mut SearchExecutionResources,
         resolved: SearchResult<Option<Arc<dyn Embedder>>>,
     ) -> SearchResult<()> {
-        resources.quality_embedder_attempted = true;
         match resolved {
             Ok(Some(embedder)) => {
                 // Bind to the QUALITY generation: same producer identity and
@@ -25332,6 +25331,11 @@ impl FsfsRuntime {
                     self.admit_search_embedder(cx, embedder, WorkloadClass::Embed)
                         .await?,
                 );
+                // Reused serve/TUI resources may outlive a missing model,
+                // failed load, or cancelled admission. Only a completed
+                // admission is stable: otherwise the next request must be
+                // able to retry against this same retained generation.
+                resources.quality_embedder_attempted = true;
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -36978,6 +36982,189 @@ mod tests {
     }
 
     #[test]
+    fn quality_admission_failures_leave_retained_resources_retryable() {
+        run_on_runtime_task(|cx| async move {
+            for failure in ["load", "identity", "cancel"] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                resources.quality_embedder = None;
+                resources.quality_embedder_attempted = false;
+                let retained = Arc::clone(resources.quality_vector_index.as_ref().unwrap());
+                let runtime = FsfsRuntime::new(FsfsConfig::default());
+                let matching: Arc<dyn Embedder> = Arc::new(BlendQueryEmbedder("blend-quality-2"));
+                let resolved = match failure {
+                    "load" => Err(SearchError::Io(std::io::Error::new(
+                        ErrorKind::NotFound,
+                        "quality model has not been provisioned",
+                    ))),
+                    "identity" => {
+                        let foreign: Arc<dyn Embedder> =
+                            Arc::new(BlendQueryEmbedder("foreign-quality-2"));
+                        Ok(Some(foreign))
+                    }
+                    "cancel" => {
+                        cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("cancel quality admission"),
+                        );
+                        Ok(Some(Arc::clone(&matching)))
+                    }
+                    _ => unreachable!(),
+                };
+                let error = runtime
+                    .admit_prepared_quality_embedder(&cx, &mut resources, resolved)
+                    .await
+                    .expect_err("failed admission cannot expose quality scores");
+                cx.set_cancel_requested(false);
+                match failure {
+                    "load" => assert!(matches!(error, SearchError::Io(_))),
+                    "identity" => {
+                        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+                    }
+                    "cancel" => assert!(matches!(error, SearchError::Cancelled { .. })),
+                    _ => unreachable!(),
+                }
+                assert!(resources.quality_embedder.is_none(), "{failure}");
+                assert!(!resources.quality_embedder_attempted, "{failure}");
+                assert!(resources.quality_stage_viable(false), "{failure}");
+
+                runtime
+                    .admit_prepared_quality_embedder(
+                        &cx,
+                        &mut resources,
+                        Ok(Some(Arc::clone(&matching))),
+                    )
+                    .await
+                    .expect("a later request can admit the exact producer");
+                assert!(resources.quality_embedder_attempted);
+                assert!(Arc::ptr_eq(
+                    &retained,
+                    resources.quality_vector_index.as_ref().unwrap(),
+                ));
+                let phases = runtime
+                    .execute_quality_only_search(
+                        &cx,
+                        "quality query",
+                        10,
+                        &mut resources,
+                        SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(phases[0].payload.hits[0].path, "b.rs", "{failure}");
+                assert!(
+                    phases[0]
+                        .payload
+                        .hits
+                        .iter()
+                        .any(|hit| hit.path == "quality-only.rs")
+                );
+            }
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn reused_serve_resources_recover_quality_without_caching_degraded_answers() {
+        run_on_runtime_task(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = published_blend_resources(temp.path());
+            resources.quality_embedder = None;
+            resources.quality_embedder_attempted = false;
+            let retained = Arc::clone(resources.quality_vector_index.as_ref().unwrap());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": "why does semantic ranking find these files",
+                "mode": "full", "limit": 10, "rerank": false,
+            }))
+            .unwrap();
+            let mut cache = HashMap::new();
+
+            super::set_test_quality_embedder(None);
+            for _ in 0..2 {
+                let response = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        request.clone(),
+                        &mut resources,
+                        &mut cache,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response
+                        .payloads
+                        .iter()
+                        .map(|payload| payload.phase)
+                        .collect::<Vec<_>>(),
+                    [
+                        SearchOutputPhase::Initial,
+                        SearchOutputPhase::RefinementFailed
+                    ],
+                );
+                assert!(
+                    !response
+                        .payloads
+                        .last()
+                        .unwrap()
+                        .degradation_advice
+                        .is_empty()
+                );
+                assert!(!response.cached);
+                assert!(
+                    cache.is_empty(),
+                    "a failed quality attempt cannot become a cached success"
+                );
+                assert!(!resources.quality_embedder_attempted);
+            }
+
+            super::set_test_quality_embedder(Some(Arc::new(BlendQueryEmbedder("blend-quality-2"))));
+            let recovered = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(!recovered.cached);
+            let refined = recovered.payloads.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            assert!(refined.hits.iter().any(|hit| hit.path == "quality-only.rs"));
+            assert!(refined.degradation_advice.is_empty());
+            assert_eq!(cache.len(), 1);
+            assert!(resources.quality_embedder_attempted);
+            assert!(Arc::ptr_eq(
+                &retained,
+                resources.quality_vector_index.as_ref().unwrap(),
+            ));
+            let warm = runtime
+                .execute_search_serve_request(&cx, request, &mut resources, &mut cache, true)
+                .await
+                .unwrap();
+            assert!(warm.cached);
+            let refined = warm.payloads.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            assert!(refined.hits.iter().any(|hit| hit.path == "quality-only.rs"));
+            assert!(refined.degradation_advice.is_empty());
+        });
+    }
+
+    #[test]
     fn quality_preparation_reuses_model_but_rechecks_each_generation() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
@@ -37016,9 +37203,9 @@ mod tests {
                 .unwrap();
             assert!(resources.quality_embedder.is_none());
 
-            // An unavailable provider is not retained: a later resource set
-            // can initialize it once provisioning succeeds.
-            resources.quality_embedder_attempted = false;
+            // Provisioning must recover the same resource set without a
+            // generation change or a manually reset admission flag.
+            assert!(!resources.quality_embedder_attempted);
             super::set_test_quality_embedder(Some(Arc::clone(&embedder)));
             runtime
                 .maybe_prepare_quality_embedder(&cx, &mut resources)
