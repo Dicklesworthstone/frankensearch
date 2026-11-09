@@ -314,19 +314,27 @@ pub enum QuillClauseKind {
     Phrase,
     /// A glob pattern.
     Glob,
+    /// A match-all clause with a constant score.
+    All,
+    /// A field range with a constant score.
+    Range,
+    /// Exact field-set membership with a constant score.
+    Set,
 }
 
-/// One query clause's share of a document's BM25 score in one field.
+/// One query clause's share of a document's lexical score in one field.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuillTermScore {
-    /// The analyzed term, a phrase's terms joined by spaces, or a glob pattern.
+    /// The analyzed term, a phrase's terms joined by spaces, a glob pattern,
+    /// or the normalized match-all/range/set expression.
     pub text: String,
     /// What kind of clause `text` came from.
     pub kind: QuillClauseKind,
-    /// Schema name of the field the clause was scored in.
+    /// Schema name of the field the clause was scored in, or `*` for match-all.
     pub field: &'static str,
     /// Contribution to the document's score, field and query boosts
-    /// included; `0.0` when the clause does not match the document there.
+    /// included; `0.0` when the clause or an enclosing Boolean branch does not
+    /// match the document there.
     pub score: f32,
     /// Documents holding the term in this field, as the scorer counts them
     /// (terms only).
@@ -335,15 +343,15 @@ pub struct QuillTermScore {
     pub idf: Option<f32>,
 }
 
-/// A document's BM25 score split by query clause and field; see
+/// A document's lexical score split by query clause and field; see
 /// [`QuillSearchIndex::explain_document`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuillScoreExplanation {
     /// The document's score for the whole query, as a search reports it.
     pub score: f32,
-    /// One entry per term, phrase or glob clause and field, in query order.
-    /// Their scores add up to `score` up to f32 rounding; set, range and
-    /// match-all clauses score a constant and are not itemized.
+    /// One entry per scoring clause and field, in query order. Their scores
+    /// add up to `score` up to f32 rounding. Constant-scoring match-all, range
+    /// and set clauses are included; prohibited clauses are not itemized.
     pub terms: Vec<QuillTermScore>,
 }
 
@@ -12423,11 +12431,11 @@ impl QuillReader {
 
     /// Split one document's score for `query` by clause and field.
     ///
-    /// Every term, phrase and glob leaf of the parsed query is scored alone,
-    /// once per field and under the boosts above it, by the same evaluator
-    /// the search runs, restricted to the one document by a zero-weight
-    /// identifier clause. A Boolean score is the sum of its matching
-    /// clauses', so the parts add up to the whole.
+    /// Every scoring leaf of the parsed query is evaluated once per field
+    /// under its inherited boosts, restricted to the one document by a
+    /// zero-weight identifier clause. Enclosing Boolean branches must match
+    /// before their descendants contribute: a term can occur in the document
+    /// while the conjunction or exclusion containing it still fails.
     fn explain_document_on(
         &self,
         cx: &Cx,
@@ -12470,17 +12478,38 @@ impl QuillReader {
         };
         let doc_count = snapshot.bm25_doc_count();
         let mut terms = Vec::new();
-        let mut pending = vec![(parsed.query.root_id(), 1.0_f32)];
-        while let Some((node, boost)) = pending.pop() {
+        let mut pending = vec![(parsed.query.root_id(), 1.0_f32, true)];
+        while let Some((node, boost, branch_matches)) = pending.pop() {
+            check_cancel(cx, "explain")?;
+            let contribution_of = |clause: Query| -> Result<f32, QuillIndexError> {
+                if branch_matches {
+                    Ok(score_of(Query::boost(clause, boost))?.unwrap_or(0.0))
+                } else {
+                    Ok(0.0)
+                }
+            };
             match parsed.query.node(node) {
-                QueryNode::Boolean { clauses, .. } => pending.extend(
-                    clauses
-                        .iter()
-                        .rev()
-                        .filter(|clause| clause.occur != Occur::MustNot)
-                        .map(|clause| (clause.query, boost)),
-                ),
-                QueryNode::Boost { query, factor } => pending.push((*query, boost * factor)),
+                QueryNode::Boolean { clauses, .. } => {
+                    // The whole query has already matched. Every nested
+                    // branch is admitted by the same evaluator, including
+                    // required children and prohibited subqueries. Zero
+                    // scores still match; testing score > 0 would incorrectly
+                    // discard zero-boost branches.
+                    let branch_matches = branch_matches
+                        && (node == parsed.query.root_id()
+                            || score_of(copy_explanation_subquery(cx, &parsed.query, node)?)?
+                                .is_some());
+                    pending.extend(
+                        clauses
+                            .iter()
+                            .rev()
+                            .filter(|clause| clause.occur != Occur::MustNot)
+                            .map(|clause| (clause.query, boost, branch_matches)),
+                    );
+                }
+                QueryNode::Boost { query, factor } => {
+                    pending.push((*query, boost * factor, branch_matches));
+                }
                 QueryNode::Term { fields, text } => {
                     for field in fields {
                         let doc_freq = snapshot.bm25_doc_freq(field.field_id, text.as_bytes())?;
@@ -12489,7 +12518,7 @@ impl QuillReader {
                             text: text.clone(),
                             kind: QuillClauseKind::Term,
                             field: field_name(field.field_id),
-                            score: score_of(Query::boost(clause, boost))?.unwrap_or(0.0),
+                            score: contribution_of(clause)?,
                             doc_freq: Some(doc_freq),
                             idf: (doc_freq <= doc_count)
                                 .then(|| crate::contract::idf(doc_freq, doc_count)),
@@ -12513,7 +12542,7 @@ impl QuillReader {
                             text: text.clone(),
                             kind: QuillClauseKind::Phrase,
                             field: field_name(field.field_id),
-                            score: score_of(Query::boost(clause, boost))?.unwrap_or(0.0),
+                            score: contribution_of(clause)?,
                             doc_freq: None,
                             idf: None,
                         });
@@ -12526,17 +12555,64 @@ impl QuillReader {
                             text: pattern.clone(),
                             kind: QuillClauseKind::Glob,
                             field: field_name(field_id),
-                            score: score_of(Query::boost(clause, boost))?.unwrap_or(0.0),
+                            score: contribution_of(clause)?,
                             doc_freq: None,
                             idf: None,
                         });
                     }
                 }
-                QueryNode::Empty
-                | QueryNode::AllocationFailure { .. }
-                | QueryNode::All
-                | QueryNode::Range { .. }
-                | QueryNode::Set { .. } => {}
+                QueryNode::All => terms.push(QuillTermScore {
+                    text: "*".to_owned(),
+                    kind: QuillClauseKind::All,
+                    field: "*",
+                    score: contribution_of(Query::all())?,
+                    doc_freq: None,
+                    idf: None,
+                }),
+                QueryNode::Range {
+                    field_id,
+                    lower,
+                    upper,
+                } => {
+                    let (opening, lower_text) = match lower {
+                        Bound::Included(value) => ('[', explanation_query_value(value)),
+                        Bound::Excluded(value) => ('{', explanation_query_value(value)),
+                        Bound::Unbounded => ('[', "*".to_owned()),
+                    };
+                    let (upper_text, closing) = match upper {
+                        Bound::Included(value) => (explanation_query_value(value), ']'),
+                        Bound::Excluded(value) => (explanation_query_value(value), '}'),
+                        Bound::Unbounded => ("*".to_owned(), ']'),
+                    };
+                    terms.push(QuillTermScore {
+                        text: format!("{opening}{lower_text} TO {upper_text}{closing}"),
+                        kind: QuillClauseKind::Range,
+                        field: field_name(*field_id),
+                        score: contribution_of(Query::range(
+                            *field_id,
+                            lower.clone(),
+                            upper.clone(),
+                        ))?,
+                        doc_freq: None,
+                        idf: None,
+                    });
+                }
+                QueryNode::Set { field_id, values } => terms.push(QuillTermScore {
+                    text: format!(
+                        "IN [{}]",
+                        values
+                            .iter()
+                            .map(explanation_query_value)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                    kind: QuillClauseKind::Set,
+                    field: field_name(*field_id),
+                    score: contribution_of(Query::set(*field_id, values.clone()))?,
+                    doc_freq: None,
+                    idf: None,
+                }),
+                QueryNode::Empty | QueryNode::AllocationFailure { .. } => {}
             }
         }
         Ok(Some(QuillScoreExplanation { score, terms }))
@@ -13060,12 +13136,13 @@ impl QuillSearchIndex {
         )
     }
 
-    /// Split one document's BM25 score for `query` by clause and field.
+    /// Split one document's lexical score for `query` by clause and field.
     ///
-    /// Each term, phrase and glob clause of the parsed query is scored on its
-    /// own against `document_id` by the evaluator a search runs, so the parts
-    /// add up to the score that search reports for the document. Returns
-    /// `None` when the document is not live or `query` does not match it.
+    /// Each scoring clause of the parsed query is evaluated against
+    /// `document_id` under its enclosing Boolean conditions. The parts include
+    /// constant-scoring clauses and add up to the score a search reports, up
+    /// to f32 rounding. Returns `None` when the document is not live or `query`
+    /// does not match it.
     ///
     /// # Errors
     ///
@@ -14223,7 +14300,7 @@ impl QuillIndex {
         )
     }
 
-    /// Split one document's BM25 score by clause and field on the published
+    /// Split one document's lexical score by clause and field on the published
     /// snapshot; see [`QuillSearchIndex::explain_document`].
     ///
     /// # Errors
@@ -18299,6 +18376,103 @@ fn snapshot_glob_terms(
         }
     }
     Ok(terms.into_iter().collect())
+}
+
+/// Copy one subtree without introducing recursive ownership or traversal.
+/// Explanation membership checks must retain the real Boolean occurrences,
+/// phrase options and boosts instead of approximating them from leaf matches.
+fn copy_explanation_subquery(
+    cx: &Cx,
+    query: &Query,
+    root: QueryNodeId,
+) -> Result<Query, QuillIndexError> {
+    let mut pending = Vec::new();
+    let mut values = Vec::<Query>::new();
+    pending
+        .try_reserve_exact(query.node_count())
+        .map_err(|_| invalid_state("could not allocate explanation query traversal"))?;
+    values
+        .try_reserve_exact(query.node_count())
+        .map_err(|_| invalid_state("could not allocate explanation subqueries"))?;
+    pending.push((root, false));
+    while let Some((node, children_ready)) = pending.pop() {
+        check_cancel(cx, "explain")?;
+        let copied = match query.node(node) {
+            QueryNode::Boolean { clauses, operator } if children_ready => {
+                let start = values.len().checked_sub(clauses.len()).ok_or_else(|| {
+                    invalid_state("explanation Boolean query lost its child queries")
+                })?;
+                Query::boolean(
+                    values
+                        .drain(start..)
+                        .zip(clauses)
+                        .map(|(query, clause)| BooleanClause::new(clause.occur, query))
+                        .collect(),
+                    *operator,
+                )
+            }
+            QueryNode::Boolean { clauses, .. } => {
+                pending.push((node, true));
+                pending.extend(clauses.iter().rev().map(|clause| (clause.query, false)));
+                continue;
+            }
+            QueryNode::Boost { factor, .. } if children_ready => Query::boost(
+                values.pop().ok_or_else(|| {
+                    invalid_state("explanation boosted query lost its child query")
+                })?,
+                *factor,
+            ),
+            QueryNode::Boost { query: child, .. } => {
+                pending.push((node, true));
+                pending.push((*child, false));
+                continue;
+            }
+            QueryNode::Empty => Query::empty(),
+            QueryNode::All => Query::all(),
+            QueryNode::Term { fields, text } => Query::term(fields.clone(), text.clone()),
+            QueryNode::Phrase {
+                fields,
+                terms,
+                slop,
+                prefix,
+            } => Query::phrase(fields.clone(), terms.clone(), *slop, *prefix),
+            QueryNode::Range {
+                field_id,
+                lower,
+                upper,
+            } => Query::range(*field_id, lower.clone(), upper.clone()),
+            QueryNode::Set { field_id, values } => Query::set(*field_id, values.clone()),
+            QueryNode::Glob { field_ids, pattern } => {
+                Query::glob(field_ids.clone(), pattern.clone())
+            }
+            QueryNode::AllocationFailure { requested } => {
+                return Err(ArgusError::Allocation {
+                    resource: "query arena",
+                    count: *requested,
+                }
+                .into());
+            }
+        };
+        values.push(copied);
+    }
+    if values.len() != 1 {
+        return Err(invalid_state(
+            "explanation query traversal did not produce one subtree",
+        ));
+    }
+    values
+        .pop()
+        .ok_or_else(|| invalid_state("explanation query traversal lost its subtree"))
+}
+
+/// Only normalized query values enter these labels, never stored document data.
+/// Quoting strings makes boundaries and literal metacharacters unambiguous.
+fn explanation_query_value(value: &QueryValue) -> String {
+    match value {
+        QueryValue::I64(value) => value.to_string(),
+        QueryValue::U64(value) => value.to_string(),
+        QueryValue::Str(value) => format!("{value:?}"),
+    }
 }
 
 fn compiled_snippet_terms(
@@ -24113,6 +24287,190 @@ mod tests {
                     .expect("explain"),
                 None
             );
+        });
+    }
+
+    #[test]
+    fn explain_document_only_scores_matching_boolean_branches() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("create index");
+            for document in [
+                IndexableDocument::new("partial", "alpha gamma").with_title("Alpha guide"),
+                IndexableDocument::new("complete", "alpha beta gamma delta"),
+                IndexableDocument::new("excluded", "alpha beta gamma blocked"),
+                IndexableDocument::new("other", "alpha beta"),
+            ] {
+                LexicalWrite::index_document(&index, &cx, &document)
+                    .await
+                    .expect("index document");
+            }
+            for sealed in [false, true] {
+                if sealed {
+                    LexicalWrite::commit(&index, &cx).await.expect("commit");
+                }
+                for query in [
+                    "(alpha AND beta) OR gamma",
+                    "((alpha AND beta)^3 OR gamma)^2",
+                    "(alpha AND (beta OR delta)) OR gamma",
+                    "(alpha AND beta)^0 OR gamma",
+                    "(alpha -blocked) OR gamma",
+                    "(\"alpha beta\" AND delta) OR gamma",
+                    "(alp* AND delta) OR gamma",
+                ] {
+                    let hits = index
+                        .search_paginated(&cx, query, 10, 0, false)
+                        .expect("search")
+                        .hits;
+                    assert!(
+                        hits.iter().any(|hit| hit.document_id == "partial"),
+                        "{query}: fixture must match through its gamma branch"
+                    );
+                    for hit in &hits {
+                        let explanation = index
+                            .explain_document(&cx, query, &hit.document_id)
+                            .expect("explain")
+                            .expect("a ranked document has an explanation");
+                        assert_eq!(
+                            explanation.score.to_bits(),
+                            hit.score.to_bits(),
+                            "{query} {} sealed={sealed}",
+                            hit.document_id
+                        );
+                        let parts = explanation
+                            .terms
+                            .iter()
+                            .map(|term| f64::from(term.score))
+                            .sum::<f64>();
+                        assert!(
+                            (parts - f64::from(hit.score)).abs() <= 1e-4 * f64::from(hit.score),
+                            "{query} {} sealed={sealed}: parts {parts} vs {} in {:?}",
+                            hit.document_id,
+                            hit.score,
+                            explanation.terms
+                        );
+                    }
+                }
+                for (query, document_id) in [
+                    ("(alpha AND beta) OR gamma", "partial"),
+                    ("((alpha AND beta)^3 OR gamma)^2", "partial"),
+                    ("(alpha AND (beta OR delta)) OR gamma", "partial"),
+                    ("(alpha -blocked) OR gamma", "excluded"),
+                ] {
+                    let explanation = index
+                        .explain_document(&cx, query, document_id)
+                        .expect("explain nested Boolean query")
+                        .expect("gamma matches");
+                    let rejected = explanation
+                        .terms
+                        .iter()
+                        .filter(|term| term.text == "alpha")
+                        .collect::<Vec<_>>();
+                    assert!(!rejected.is_empty(), "retain rejected positive clauses");
+                    assert!(
+                        rejected.iter().all(|term| term.score == 0.0),
+                        "{query} {document_id} sealed={sealed}: {rejected:?}"
+                    );
+                    assert!(
+                        explanation
+                            .terms
+                            .iter()
+                            .any(|term| term.text == "gamma" && term.score > 0.0)
+                    );
+                    assert!(explanation.terms.iter().all(|term| term.text != "blocked"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn explain_document_itemizes_constant_scoring_clauses() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("create index");
+            for document in [
+                IndexableDocument::new("a", "alpha beta").with_title("Alpha guide"),
+                IndexableDocument::new("b", "beta gamma"),
+                IndexableDocument::new("c", "gamma delta"),
+            ] {
+                LexicalWrite::index_document(&index, &cx, &document)
+                    .await
+                    .expect("index document");
+            }
+            for sealed in [false, true] {
+                if sealed {
+                    LexicalWrite::commit(&index, &cx).await.expect("commit");
+                }
+                for query in [
+                    "*",
+                    "*^2",
+                    "id:[a TO c]",
+                    "id:{a TO c}",
+                    "id:[* TO b]",
+                    "id:IN [a c]",
+                    "ord:[0 TO 18446744073709551615]",
+                    "*^2 OR id:[a TO c]^3 OR id:IN [a c]^4",
+                    "alpha OR id:[a TO b]^3",
+                    "alpha AND id:IN [a c]",
+                    "(* AND (id:[a TO b] AND content:missing)) OR content:alpha",
+                    "(id:IN [b c] AND content:missing) OR content:alpha",
+                    "*^0 OR id:IN [a c]^0",
+                ] {
+                    let hits = index
+                        .search_paginated(&cx, query, 10, 0, false)
+                        .expect("search")
+                        .hits;
+                    assert!(!hits.is_empty(), "{query}: fixture must match");
+                    for hit in &hits {
+                        let explanation = index
+                            .explain_document(&cx, query, &hit.document_id)
+                            .expect("explain")
+                            .expect("a ranked document has an explanation");
+                        assert_eq!(
+                            explanation.score.to_bits(),
+                            hit.score.to_bits(),
+                            "{query} {} sealed={sealed}",
+                            hit.document_id
+                        );
+                        let parts = explanation
+                            .terms
+                            .iter()
+                            .map(|term| f64::from(term.score))
+                            .sum::<f64>();
+                        assert!(
+                            (parts - f64::from(hit.score)).abs() <= 1e-4 * f64::from(hit.score),
+                            "{query} {} sealed={sealed}: parts {parts} vs {} in {:?}",
+                            hit.document_id,
+                            hit.score,
+                            explanation.terms
+                        );
+                    }
+                }
+                let explanation = index
+                    .explain_document(&cx, "*^2 OR id:[a TO c]^3 OR id:IN [a c]^4", "a")
+                    .expect("explain constant scores")
+                    .expect("all constant clauses match");
+                assert_eq!(explanation.score, 9.0);
+                assert_eq!(
+                    explanation.terms.iter().map(|term| term.score).sum::<f32>(),
+                    9.0,
+                    "constant contributions conserve the score exactly"
+                );
+                for (kind, field, text, score) in [
+                    (QuillClauseKind::All, "*", "*", 2.0),
+                    (QuillClauseKind::Range, "id", "[\"a\" TO \"c\"]", 3.0),
+                    (QuillClauseKind::Set, "id", "IN [\"a\" \"c\"]", 4.0),
+                ] {
+                    let part = explanation
+                        .terms
+                        .iter()
+                        .find(|term| term.kind == kind)
+                        .expect("constant clause is itemized");
+                    assert_eq!(part.field, field);
+                    assert_eq!(part.text, text);
+                    assert_eq!(part.score, score);
+                    assert_eq!(part.doc_freq, None);
+                    assert_eq!(part.idf, None);
+                }
+            }
         });
     }
 
