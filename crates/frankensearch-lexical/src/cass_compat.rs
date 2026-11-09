@@ -4687,6 +4687,62 @@ mod cass_query_tests {
         );
     }
 
+    /// `CassTokenizer` indexes `kérlek` as `k` + `rlek`; a query for the whole
+    /// word must reach those terms, split like the tokenizer splits, before
+    /// lowercasing (`İ`) and at hyphen runs. A word with no indexable fragment
+    /// (`привет`) must still match nothing.
+    #[test]
+    fn accented_latin_index_and_search_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+        let doc = |msg_idx: u64, title: &str, content: &str| CassDocument {
+            agent: "claude".to_string(),
+            workspace: None,
+            workspace_original: None,
+            source_path: format!("/tmp/test-{msg_idx}"),
+            msg_idx,
+            created_at: Some(1_700_000_000_000),
+            title: Some(title.to_string()),
+            content: content.to_string(),
+            conversation_id: None,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+        idx.add_cass_documents(&[
+            doc(0, "Mentés", "Kérlek ellenőrizd a mentést İstanbulban"),
+            doc(1, "Backup", "please check the backup"),
+        ])
+        .expect("add");
+        idx.commit().expect("commit");
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+        let fields = idx.fields();
+
+        for (raw, expected) in [
+            ("kérlek", 1),
+            ("Kérlek", 1),
+            ("ellenőrizd", 1),
+            ("mentést", 1),
+            ("İstanbulban", 1),
+            ("kérlek--mentést", 1),
+            ("\"kérlek ellenőrizd\"", 1),
+            ("\"ellenőrizd kérlek\"", 0),
+            ("kér*", 1),
+            ("kérlek AND backup", 0),
+            ("kérlek OR backup", 2),
+            ("please", 1),
+            ("привет", 0),
+        ] {
+            let query = cass_build_tantivy_query(raw, &CassQueryFilters::default(), &fields);
+            let hits = searcher
+                .search(&query, &tantivy::collector::Count)
+                .expect("search");
+            assert_eq!(hits, expected, "query {raw:?}");
+        }
+    }
+
     #[test]
     fn korean_index_and_search_roundtrip() {
         let dir = tempfile::TempDir::new().expect("temp dir");
