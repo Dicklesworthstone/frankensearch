@@ -13537,10 +13537,10 @@ impl FsfsRuntime {
     fn search_payloads_cacheable(payloads: &[SearchPayload]) -> bool {
         !payloads.iter().any(|payload| {
             payload.phase == SearchOutputPhase::RefinementFailed
-                || payload
-                    .rerank
-                    .as_ref()
-                    .is_some_and(|stage| stage.reason_code == REASON_RERANK_TIMEOUT)
+                || payload.rerank.as_ref().is_some_and(|stage| {
+                    stage.status == RerankStageStatus::Failed
+                        || stage.reason_code == REASON_RERANK_TIMEOUT
+                })
         })
     }
 
@@ -13593,6 +13593,12 @@ impl FsfsRuntime {
     ) -> SearchResult<bool> {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
         Self::validate_cached_query_exclusions(resources, payloads)?;
+        if !Self::search_payloads_cacheable(payloads) {
+            // A cache created before the current admission policy may retain
+            // a transient stage failure. Retry retrieval before publishing any
+            // of that answer, including its Initial phase.
+            return Ok(false);
+        }
         if matches!(mode, SearchExecutionMode::LexicalOnly)
             && payloads.iter().any(|payload| {
                 payload
@@ -13986,6 +13992,9 @@ impl FsfsRuntime {
             return Ok(None);
         }
         if record.index_fingerprint != expected_fingerprint {
+            return Ok(None);
+        }
+        if !Self::search_payloads_cacheable(&record.payloads) {
             return Ok(None);
         }
         Ok(Some(record.payloads))
@@ -43297,25 +43306,26 @@ mod tests {
             2,
             Vec::new(),
         );
-        let mut stage =
-            crate::output_schema::RerankStagePayload::skipped("query.stage.rerank.timeout", 2);
-        stage.status = crate::output_schema::RerankStageStatus::Failed;
-        payload.rerank = Some(stage);
-        assert!(
-            !FsfsRuntime::search_payloads_cacheable(std::slice::from_ref(&payload)),
-            "daemon memory cache must reject timed-out reranking"
-        );
-        runtime
-            .write_search_payload_cache(
-                &key,
-                std::slice::from_ref(&payload),
-                "deadline-test-generation",
-            )
-            .unwrap();
-        assert!(
-            !runtime.search_cache_path(&key).unwrap().exists(),
-            "disk cache must reject timed-out reranking"
-        );
+        for reason in [super::REASON_RERANK_TIMEOUT, super::REASON_RERANK_FAILED] {
+            let mut stage = crate::output_schema::RerankStagePayload::skipped(reason, 2);
+            stage.status = crate::output_schema::RerankStageStatus::Failed;
+            payload.rerank = Some(stage);
+            assert!(
+                !FsfsRuntime::search_payloads_cacheable(std::slice::from_ref(&payload)),
+                "daemon memory cache must reject failed reranking: {reason}"
+            );
+            runtime
+                .write_search_payload_cache(
+                    &key,
+                    std::slice::from_ref(&payload),
+                    "deadline-test-generation",
+                )
+                .unwrap();
+            assert!(
+                !runtime.search_cache_path(&key).unwrap().exists(),
+                "disk cache must reject failed reranking: {reason}"
+            );
+        }
         payload.rerank.as_mut().unwrap().status = crate::output_schema::RerankStageStatus::Applied;
         payload.rerank.as_mut().unwrap().reason_code = super::REASON_RERANK_APPLIED.to_owned();
         assert!(
@@ -43354,6 +43364,190 @@ mod tests {
         fn model_name(&self) -> &'static str {
             "reverse reranker (test double)"
         }
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    struct RecoveringReranker(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    impl frankensearch_core::SyncRerank for RecoveringReranker {
+        fn rerank_sync(
+            &self,
+            query: &str,
+            documents: &[frankensearch_core::RerankDocument],
+        ) -> SearchResult<Vec<frankensearch_core::RerankScore>> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(SearchError::RerankFailed {
+                    model: "recovering-reranker-test".to_owned(),
+                    source: "temporary inference failure".into(),
+                });
+            }
+            frankensearch_core::SyncRerank::rerank_sync(&ReverseReranker, query, documents)
+        }
+
+        fn id(&self) -> &'static str {
+            "recovering-reranker-test"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "recovering reranker (test double)"
+        }
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn failed_reranking_retries_in_serve_and_rejects_old_persisted_and_hot_answers() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = published_blend_resources(temp.path());
+            let lexical = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            for id in ["a.rs", "b.rs", "fast-only.rs", "quality-only.rs"] {
+                lexical
+                    .index_document(
+                        &cx,
+                        &IndexableDocument::new(id, "recover search after a transient failure"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            lexical.commit(&cx).await.unwrap();
+            drop(lexical);
+            resources.lexical_index = Some(
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.rerank = true;
+            config.search.quality_timeout_ms = 5_000;
+            config.search.rerank_timeout_ms = 5_000;
+            let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reranker: Arc<dyn frankensearch_core::Reranker> = Arc::new(
+                frankensearch_core::SyncRerankerAdapter(RecoveringReranker(Arc::clone(&calls))),
+            );
+            runtime.reranker = Arc::new(std::sync::OnceLock::from(super::RerankerSlot(Some(
+                reranker,
+            ))));
+            let query = "how do we recover search after a transient failure";
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": query, "mode": "full", "limit": 4, "rerank": true,
+            }))
+            .unwrap();
+            let mut cache = HashMap::new();
+            let failed = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(!failed.cached);
+            let refined = failed.payloads.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            let stage = refined.rerank.as_ref().unwrap();
+            assert_eq!(
+                stage.status,
+                crate::output_schema::RerankStageStatus::Failed
+            );
+            assert_eq!(stage.reason_code, super::REASON_RERANK_FAILED);
+            assert!(stage.scores.is_empty());
+            assert!(
+                cache.is_empty(),
+                "transient inference failure must remain retryable"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            let key = runtime
+                .search_cache_key(query, 4, SearchExecutionMode::Full)
+                .unwrap();
+            let fingerprint = resources.generation_fingerprint.clone();
+            runtime
+                .write_search_payload_cache(&key, &failed.payloads, &fingerprint)
+                .unwrap();
+            let path = runtime.search_cache_path(&key).unwrap();
+            assert!(!path.exists());
+            // Reproduce records produced by the old policy using the actual
+            // failed execution above, with otherwise exact key/generation.
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let old_record = super::SearchCacheRecord {
+                schema_version: super::FSFS_SEARCH_CACHE_SCHEMA_VERSION.to_owned(),
+                index_fingerprint: fingerprint.clone(),
+                key: key.clone(),
+                payloads: failed.payloads.clone(),
+            };
+            fs::write(&path, serde_json::to_vec(&old_record).unwrap()).unwrap();
+            assert!(
+                runtime
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !runtime
+                    .admit_cached_search_producers(
+                        &cx,
+                        &mut resources,
+                        SearchExecutionMode::Full,
+                        &failed.payloads
+                    )
+                    .await
+                    .unwrap()
+            );
+            cache.insert(key.clone(), failed.payloads);
+
+            let recovered = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !recovered.cached,
+                "old failed hot answers must trigger live retrieval"
+            );
+            let refined = recovered.payloads.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            let stage = refined.rerank.as_ref().unwrap();
+            assert_eq!(
+                stage.status,
+                crate::output_schema::RerankStageStatus::Applied
+            );
+            assert_eq!(stage.reranked_hits, 4);
+            assert_eq!(stage.scores.len(), 4);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(cache.len(), 1);
+            runtime
+                .write_search_payload_cache(&key, &recovered.payloads, &fingerprint)
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap(),
+                Some(recovered.payloads.clone()),
+            );
+
+            let warm = runtime
+                .execute_search_serve_request(&cx, request, &mut resources, &mut cache, true)
+                .await
+                .unwrap();
+            assert!(warm.cached);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(warm.payloads, recovered.payloads);
+        });
     }
 
     /// The opt-in rerank stage, end to end inside the runtime: with
