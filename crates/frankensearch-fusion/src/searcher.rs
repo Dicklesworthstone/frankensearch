@@ -37,7 +37,7 @@ use frankensearch_core::generation::{
 use frankensearch_core::host_adapter::{AdapterLifecycleEvent, HostAdapter};
 use frankensearch_core::query_class::QueryClass;
 use frankensearch_core::traits::{
-    Embedder, LexicalHydrationContext, LexicalRead, ModelCategory, Reranker,
+    Embedder, LexicalHydrationContext, LexicalRead, ModelCategory, Reranker, SearchFuture,
 };
 use frankensearch_core::types::{
     BoundQueryEmbedding, EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics,
@@ -1927,7 +1927,12 @@ impl TwoTierSearcher {
             });
         if lexical_short_circuit && let Some(lex) = self.lexical.as_ref() {
             let start_lex = Instant::now();
-            let lex_res = lex.search(cx, &lexical_query, lexical_budget).await;
+            let lex_res = frankensearch_core::with_cancellation(
+                cx,
+                "lexical_search",
+                lex.search(cx, &lexical_query, lexical_budget),
+            )
+            .await;
             match lex_res {
                 Ok(results) => {
                     metrics.lexical_search_ms = start_lex.elapsed().as_secs_f64() * 1000.0;
@@ -1964,11 +1969,14 @@ impl TwoTierSearcher {
             }
         }
 
-        // If the embedder is an API embedder (genuinely async), we sequentially await
-        // the futures to avoid blocking the executor inside `rayon::join` and to prevent
-        // `poll_immediate` from aborting the Pending futures.
-        let is_async_embedder =
-            self.fast_embedder.category() == frankensearch_core::traits::ModelCategory::ApiEmbedder;
+        // Transformer inference, like remote inference, can submit work to the
+        // caller's runtime and suspend. Keep those providers on its async lane.
+        // Static providers retain the first-poll Rayon overlap below, but a
+        // category is never a promise that a future cannot return Pending.
+        let is_async_embedder = matches!(
+            self.fast_embedder.category(),
+            ModelCategory::ApiEmbedder | ModelCategory::TransformerEmbedder
+        );
         let embed_fast = || {
             embed_admitted_query(
                 cx,
@@ -1991,9 +1999,12 @@ impl TwoTierSearcher {
                 (None, Duration::ZERO)
             } else if let Some(lex) = self.lexical.as_ref() {
                 let start_lex = Instant::now();
-                let res = lex
-                    .search_candidates(cx, &lexical_query, lexical_budget)
-                    .await;
+                let res = frankensearch_core::with_cancellation(
+                    cx,
+                    "lexical_candidates",
+                    lex.search_candidates(cx, &lexical_query, lexical_budget),
+                )
+                .await;
                 (Some(res), start_lex.elapsed())
             } else {
                 (None, Duration::ZERO)
@@ -2001,41 +2012,83 @@ impl TwoTierSearcher {
 
             ((embed_res, embed_elapsed), lex_res)
         } else {
-            // Run embedding and lexical search in parallel via rayon::join.
-            // Both trait methods are sync-in-async (complete on first poll), so
-            // rayon gives true thread-level parallelism without an async runtime.
-            rayon::join(
-                || {
-                    let start = Instant::now();
-                    let result = poll_immediate(Box::pin(embed_fast()))
-                        .unwrap_or_else(|| {
-                            Err(SearchError::EmbeddingFailed {
-                                model: self.fast_embedder.id().to_owned(),
-                                source: "embedder returned Pending; only sync-in-async embedders are supported in the rayon path".into(),
-                            })
-                        });
-                    (result, start.elapsed())
-                },
-                || {
-                    self.lexical.as_ref().map_or_else(
-                        || (None, Duration::ZERO),
-                        |lex| {
-                            let start = Instant::now();
-                            let result = poll_immediate(lex.search_candidates(
-                                cx,
-                                &lexical_query,
-                                lexical_budget,
-                            ))
-                            .unwrap_or_else(|| {
-                                    Err(SearchError::SubsystemError {
-                                        subsystem: "lexical",
-                                        source: "lexical search returned Pending; only sync-in-async implementations are supported in the rayon path".into(),
-                                    })
-                                });
-                            (Some(result), start.elapsed())
+            // The common static embedding / lexical pair still executes its
+            // synchronous work in parallel. Retain any suspended future and
+            // continue polling it on the caller's lane with its real Waker;
+            // never drop and retry an operation that has already begun.
+            let mut embedding = SearchLane::new(Box::pin(embed_fast()));
+            let mut lexical = self.lexical.as_ref().map(|lex| {
+                SearchLane::new(Box::pin(frankensearch_core::with_cancellation(
+                    cx,
+                    "lexical_candidates",
+                    lex.search_candidates(cx, &lexical_query, lexical_budget),
+                )))
+            });
+            let mut first_poll = true;
+            std::future::poll_fn(|task| {
+                let ambient = first_poll.then(Cx::current).flatten();
+                first_poll = false;
+                if let Some(ambient) = ambient {
+                    // Context itself is not Sync; the Waker can safely be
+                    // shared by the two scoped workers for this single poll.
+                    // Preserve the caller's ambient capability restrictions
+                    // for providers that use runtime helpers via Cx::current.
+                    let waker = task.waker();
+                    rayon::join(
+                        || {
+                            let _ambient = Cx::set_current(Some(ambient.clone()));
+                            embedding.poll(&mut std::task::Context::from_waker(waker));
                         },
-                    )
-                },
+                        || {
+                            let _ambient = Cx::set_current(Some(ambient.clone()));
+                            if let Some(lane) = lexical.as_mut() {
+                                lane.poll(&mut std::task::Context::from_waker(waker));
+                            }
+                        },
+                    );
+                } else {
+                    // With no caller ambient context, stay here: installing
+                    // None on a Rayon worker cannot mask an unrelated nested
+                    // task's context. Later polls also stay on this async lane.
+                    embedding.poll(task);
+                    if !embedding.has_error(terminal_query_embedding_error)
+                        && let Some(lane) = lexical.as_mut()
+                    {
+                        lane.poll(task);
+                    }
+                }
+                // Identity refusal must not wait on a suspended lexical
+                // sibling. Likewise, a lexical cancellation ends this phase
+                // even if a provider has not completed its embedding yet.
+                let terminal = embedding.has_error(terminal_query_embedding_error)
+                    || lexical.as_ref().is_some_and(|lane| {
+                        lane.has_error(|error| matches!(error, SearchError::Cancelled { .. }))
+                    });
+                if terminal
+                    || (embedding.is_complete()
+                        && lexical.as_ref().is_none_or(SearchLane::is_complete))
+                {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            // Taking the results drops any unfinished sibling before later
+            // admission checkpoints or caller-visible phases can run.
+            let lexical_timed = lexical.and_then(|lane| lane.into_output());
+            let Some(embed_timed) = embedding.into_output() else {
+                cancellation_checkpoint(cx, "fast_embed_to_activation")?;
+                let Some((Err(error), _)) = lexical_timed else {
+                    unreachable!("only lexical cancellation can leave embedding unfinished");
+                };
+                return Err(error);
+            };
+            (
+                embed_timed,
+                lexical_timed.map_or((None, Duration::ZERO), |(result, elapsed)| {
+                    (Some(result), elapsed)
+                }),
             )
         };
 
@@ -2414,9 +2467,12 @@ impl TwoTierSearcher {
                     && let Some(lexical) = self.lexical.as_ref()
                     && let Some(context) = lexical_context.as_ref()
                 {
-                    lexical
-                        .hydrate_candidates(cx, Some(context), &mut results)
-                        .await?;
+                    frankensearch_core::with_cancellation(
+                        cx,
+                        "lexical_hydration",
+                        lexical.hydrate_candidates(cx, Some(context), &mut results),
+                    )
+                    .await?;
                 }
                 metrics.rrf_fusion_ms = fuse_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -2491,9 +2547,12 @@ impl TwoTierSearcher {
         let mut results = fusion_candidates.to_vec();
         if let (Some(lexical), Some(context)) = (self.lexical.as_ref(), context) {
             let start = Instant::now();
-            lexical
-                .hydrate_candidates(cx, Some(context), &mut results)
-                .await?;
+            frankensearch_core::with_cancellation(
+                cx,
+                "lexical_hydration",
+                lexical.hydrate_candidates(cx, Some(context), &mut results),
+            )
+            .await?;
             metrics.lexical_search_ms += start.elapsed().as_secs_f64() * 1000.0;
         }
         metrics.lexical_candidates = results.len();
@@ -4367,22 +4426,46 @@ fn contains_term_with_word_boundaries(text: &str, term: &str) -> bool {
     false
 }
 
-/// Poll an immediately-ready future to completion without an async runtime.
-///
-/// All frankensearch `Embedder::embed` and `LexicalRead::search` implementations
-/// are synchronous code wrapped in `Box::pin(async move { ... })` — they complete
-/// on the first poll. This helper exploits that property to call them from
-/// synchronous contexts (e.g., `rayon::join` threads).
-///
-/// Returns `None` if the future is not immediately ready (i.e., yields `Pending`).
-fn poll_immediate<T>(
-    mut fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>>,
-) -> Option<T> {
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    match fut.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(val) => Some(val),
-        std::task::Poll::Pending => None,
+/// One owned phase-one operation. Synchronous completion and suspension share
+/// the same result/timing path; a completed future is dropped, never repolled.
+struct SearchLane<'a, T> {
+    future: Option<SearchFuture<'a, T>>,
+    started: Option<Instant>,
+    output: Option<(SearchResult<T>, Duration)>,
+}
+
+impl<'a, T> SearchLane<'a, T> {
+    fn new(future: SearchFuture<'a, T>) -> Self {
+        Self {
+            future: Some(future),
+            started: None,
+            output: None,
+        }
+    }
+
+    fn poll(&mut self, task: &mut std::task::Context<'_>) {
+        let Some(future) = self.future.as_mut() else {
+            return;
+        };
+        let started = *self.started.get_or_insert_with(Instant::now);
+        if let std::task::Poll::Ready(result) = future.as_mut().poll(task) {
+            self.future = None;
+            self.output = Some((result, started.elapsed()));
+        }
+    }
+
+    fn has_error(&self, predicate: impl FnOnce(&SearchError) -> bool) -> bool {
+        self.output
+            .as_ref()
+            .is_some_and(|(result, _)| result.as_ref().err().is_some_and(predicate))
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn into_output(self) -> Option<(SearchResult<T>, Duration)> {
+        self.output
     }
 }
 
@@ -4448,11 +4531,16 @@ mod tests {
     struct StubEmbedder {
         id: &'static str,
         dimension: usize,
+        category: ModelCategory,
     }
 
     impl StubEmbedder {
         const fn new(id: &'static str, dimension: usize) -> Self {
-            Self { id, dimension }
+            Self {
+                id,
+                dimension,
+                category: ModelCategory::StaticEmbedder,
+            }
         }
     }
 
@@ -4485,7 +4573,7 @@ mod tests {
         }
 
         fn category(&self) -> ModelCategory {
-            ModelCategory::StaticEmbedder
+            self.category
         }
     }
 
@@ -4686,6 +4774,7 @@ mod tests {
     #[derive(Default)]
     struct SilentPendingProvider {
         identity: Option<EmbeddingIdentityBundleV1>,
+        category: Option<ModelCategory>,
         started: AtomicU64,
         dropped: AtomicU64,
         cancel_on_drop: bool,
@@ -4753,7 +4842,22 @@ mod tests {
         }
 
         fn category(&self) -> ModelCategory {
-            ModelCategory::ApiEmbedder
+            self.category.unwrap_or(ModelCategory::ApiEmbedder)
+        }
+    }
+
+    impl LexicalRead for SilentPendingProvider {
+        fn search<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _query: &'a str,
+            _limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            self.pending(cx)
+        }
+
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(3)
         }
     }
 
@@ -4822,6 +4926,71 @@ mod tests {
         fn doc_count(&self) -> SearchResult<usize> {
             Ok(3)
         }
+    }
+
+    #[derive(Default)]
+    struct YieldingLexical {
+        calls: AtomicU64,
+        polls: AtomicU64,
+        failure: Option<bool>,
+        expected_ambient: Option<Cx>,
+    }
+
+    impl LexicalRead for YieldingLexical {
+        fn search<'a>(
+            &'a self,
+            cx: &'a Cx,
+            query: &'a str,
+            limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if let Some(expected) = &self.expected_ambient {
+                    assert_current_ambient(expected);
+                }
+                let mut yielded = false;
+                std::future::poll_fn(|task| {
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        task.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                if let Some(expected) = &self.expected_ambient {
+                    assert_current_ambient(expected);
+                }
+                match self.failure {
+                    Some(true) => Err(SearchError::Cancelled {
+                        phase: "yielding_lexical".to_owned(),
+                        reason: "provider cancelled its operation".to_owned(),
+                    }),
+                    Some(false) => Err(SearchError::SubsystemError {
+                        subsystem: "yielding_lexical",
+                        source: "provider failure after suspension".into(),
+                    }),
+                    None => StubLexical.search(cx, query, limit).await,
+                }
+            })
+        }
+
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(3)
+        }
+    }
+
+    fn assert_current_ambient(expected: &Cx) {
+        let current = Cx::current().expect("provider retains caller ambient context");
+        assert_eq!(current.task_id(), expected.task_id());
+        assert_eq!(current.region_id(), expected.region_id());
+        assert_eq!(current.capabilities(), expected.capabilities());
+        assert_eq!(
+            current.blocking_pool_handle().is_some(),
+            expected.blocking_pool_handle().is_some()
+        );
     }
 
     struct DeferredMetadataLexical;
@@ -5345,6 +5514,8 @@ mod tests {
         bound_response_identity: Option<EmbeddingIdentityBundleV1>,
         bound_response_values: Option<Vec<f32>>,
         async_bound_response: bool,
+        category: ModelCategory,
+        expected_ambient: Option<Cx>,
         identity_calls: Arc<AtomicU64>,
         cancel_on_identity_call: Option<(Cx, u64)>,
         replacement_identity: Option<EmbeddingIdentityBundleV1>,
@@ -5365,6 +5536,8 @@ mod tests {
                 bound_response_identity: None,
                 bound_response_values: None,
                 async_bound_response: false,
+                category: ModelCategory::StaticEmbedder,
+                expected_ambient: None,
                 identity_calls: Arc::new(AtomicU64::new(0)),
                 cancel_on_identity_call: None,
                 replacement_identity: None,
@@ -5391,6 +5564,7 @@ mod tests {
 
         fn with_async_bound_response(mut self) -> Self {
             self.async_bound_response = true;
+            self.category = ModelCategory::ApiEmbedder;
             self
         }
 
@@ -5418,6 +5592,9 @@ mod tests {
         ) -> SearchFuture<'a, IdentityBoundEmbedding> {
             self.bound_embeds.fetch_add(1, Ordering::Relaxed);
             Box::pin(async move {
+                if let Some(expected) = &self.expected_ambient {
+                    assert_current_ambient(expected);
+                }
                 if self.async_bound_response {
                     let mut yielded = false;
                     std::future::poll_fn(|task| {
@@ -5430,6 +5607,9 @@ mod tests {
                         }
                     })
                     .await;
+                }
+                if let Some(expected) = &self.expected_ambient {
+                    assert_current_ambient(expected);
                 }
                 if let Some(action) = self.bound_action {
                     if !matches!(action, BoundResponseAction::Fail) {
@@ -5509,11 +5689,63 @@ mod tests {
         }
 
         fn category(&self) -> ModelCategory {
-            if self.async_bound_response {
-                ModelCategory::ApiEmbedder
-            } else {
-                ModelCategory::StaticEmbedder
-            }
+            self.category
+        }
+    }
+
+    /// Real runtime/worker ownership, with the same asynchronous dispatch shape
+    /// as FastEmbed. Values are fixed so this tests scheduling, not model quality.
+    struct BlockingPoolEmbedder {
+        identity: EmbeddingIdentityBundleV1,
+        caller_thread: std::thread::ThreadId,
+        workers: Arc<AtomicU64>,
+    }
+
+    impl Embedder for BlockingPoolEmbedder {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                assert_eq!(std::thread::current().id(), self.caller_thread);
+                assert!(
+                    Cx::is_active(),
+                    "inference admission stays on the runtime lane"
+                );
+                let workers = Arc::clone(&self.workers);
+                let caller_thread = self.caller_thread;
+                let mut worker = cx
+                    .spawn_blocking(move |child| {
+                        assert!(!Cx::is_active(), "inference executes on the blocking pool");
+                        assert_ne!(std::thread::current().id(), caller_thread);
+                        child.checkpoint().expect("worker context remains live");
+                        workers.fetch_add(1, Ordering::SeqCst);
+                        vec![1.0, 0.0, 0.0, 0.0]
+                    })
+                    .expect("admit caller-owned inference worker");
+                Ok(worker.join(cx).await.expect("join inference worker"))
+            })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        fn id(&self) -> &str {
+            "blocking-pool-test"
+        }
+
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::TransformerEmbedder
         }
     }
 
@@ -6058,6 +6290,323 @@ mod tests {
                 query_admission_identity("response-quality", 6),
                 vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             )
+        }
+    }
+
+    #[test]
+    fn yielding_phase_one_providers_preserve_vector_and_hybrid_results() {
+        const QUERY: &str = "find the quality document beyond the fast pool";
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_index_dir, index) = query_admission_index(layout);
+                for category in [
+                    ModelCategory::StaticEmbedder,
+                    ModelCategory::TransformerEmbedder,
+                    ModelCategory::ApiEmbedder,
+                ] {
+                    for hybrid in [false, true] {
+                        let config = TwoTierConfig {
+                            fast_only: true,
+                            ..TwoTierConfig::default()
+                        };
+                        let mut fast = query_admission_embedder("fast").with_async_bound_response();
+                        fast.category = category;
+                        let fast = Arc::new(fast);
+                        let lexical = Arc::new(YieldingLexical::default());
+                        let mut searcher =
+                            TwoTierSearcher::new(Arc::clone(&index), fast.clone(), config.clone());
+                        let mut reference = TwoTierSearcher::new(
+                            Arc::clone(&index),
+                            Arc::new(query_admission_embedder("fast")),
+                            config,
+                        );
+                        if hybrid {
+                            searcher = searcher.with_lexical(lexical.clone());
+                            reference = reference.with_lexical(Arc::new(StubLexical));
+                        }
+                        let (expected, _) = reference.search_collect(&cx, QUERY, 5).await.unwrap();
+                        let (results, metrics) =
+                            searcher.search_collect(&cx, QUERY, 5).await.unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&results).unwrap(),
+                            serde_json::to_value(expected).unwrap(),
+                            "{layout}/{category:?}/hybrid={hybrid}"
+                        );
+                        assert!(results.iter().any(|hit| hit.fast_score.is_some()));
+                        assert_eq!(metrics.semantic_candidates, 2);
+                        assert_eq!(fast.bound_embeds.load(Ordering::SeqCst), 1);
+                        assert_eq!(fast.embed_count(), 1);
+                        assert_eq!(lexical.calls.load(Ordering::SeqCst), u64::from(hybrid));
+                        assert_eq!(lexical.polls.load(Ordering::SeqCst), 2 * u64::from(hybrid));
+                        assert_eq!(metrics.lexical_candidates, if hybrid { 3 } else { 0 });
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn transformer_fast_inference_uses_the_real_caller_owned_blocking_pool() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        let cx = runtime
+            .request_cx_with_budget(asupersync::types::Budget::INFINITE)
+            .with_blocking_pool_handle(runtime.blocking_handle());
+        let (_index_dir, index) = query_admission_index("exact-v2");
+        let workers = Arc::new(AtomicU64::new(0));
+        let fast = Arc::new(BlockingPoolEmbedder {
+            identity: query_admission_identity("response-fast", 4),
+            caller_thread: std::thread::current().id(),
+            workers: Arc::clone(&workers),
+        });
+        for hybrid in [false, true] {
+            let mut searcher = TwoTierSearcher::new(
+                Arc::clone(&index),
+                fast.clone(),
+                TwoTierConfig {
+                    fast_only: true,
+                    ..TwoTierConfig::default()
+                },
+            );
+            if hybrid {
+                searcher = searcher.with_lexical(Arc::new(YieldingLexical::default()));
+            }
+            let (results, metrics) = runtime
+                .block_on(async {
+                    timeout(
+                        cx.now(),
+                        Duration::from_secs(10),
+                        searcher.search_collect(&cx, "find the related documents", 5),
+                    )
+                    .await
+                    .expect("real worker and search must finish within the test deadline")
+                })
+                .unwrap();
+            assert!(results.iter().any(|hit| hit.doc_id == "doc-a"));
+            assert_eq!(metrics.semantic_candidates, 2);
+            assert_eq!(metrics.lexical_candidates, if hybrid { 3 } else { 0 });
+        }
+        assert_eq!(workers.load(Ordering::SeqCst), 2);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn yielding_parallel_providers_preserve_ambient_context_and_restrictions() {
+        let cx = Cx::for_testing();
+        let (_index_dir, index) = query_admission_index("exact-v2");
+        let original = Cx::current().map(|current| (current.task_id(), current.capabilities()));
+        {
+            let _ambient = Cx::set_current(Some(cx.clone()));
+            let _restriction = Cx::push_restriction(asupersync::cx::cap::CapMask::none());
+            let expected = Cx::current().unwrap();
+            assert!(!expected.capabilities().spawn);
+            assert!(!expected.capabilities().io);
+            let mut fast = query_admission_embedder("fast").with_async_bound_response();
+            fast.category = ModelCategory::StaticEmbedder;
+            fast.expected_ambient = Some(expected.clone());
+            let lexical = Arc::new(YieldingLexical {
+                expected_ambient: Some(expected.clone()),
+                ..YieldingLexical::default()
+            });
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(fast),
+                TwoTierConfig {
+                    fast_only: true,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_lexical(lexical.clone());
+            let mut future = Box::pin(searcher.search_collect(&cx, "find related documents", 5));
+            let wake = Arc::new(PendingSearchWake::default());
+            let waker = Waker::from(wake.clone());
+            let mut task = Context::from_waker(&waker);
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            assert!(wake.0.load(Ordering::SeqCst) >= 2);
+            assert_current_ambient(&expected);
+            let Poll::Ready(Ok((results, metrics))) = future.as_mut().poll(&mut task) else {
+                panic!("both retained operations must finish without resubmission");
+            };
+            assert_eq!(results.len(), 5);
+            assert_eq!(metrics.semantic_candidates, 2);
+            assert_eq!(metrics.lexical_candidates, 3);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.polls.load(Ordering::SeqCst), 2);
+            assert_current_ambient(&expected);
+        }
+        assert_eq!(
+            Cx::current().map(|current| (current.task_id(), current.capabilities())),
+            original
+        );
+    }
+
+    #[test]
+    fn yielding_fast_response_refusal_drops_pending_lexical_without_publishing() {
+        for fault in ["identity", "dimension", "non-finite"] {
+            let cx = Cx::for_testing();
+            let (_index_dir, index) = query_admission_index("exact-v2");
+            let mut fast = query_admission_embedder("fast").with_async_bound_response();
+            fast.category = ModelCategory::StaticEmbedder;
+            match fault {
+                "identity" => {
+                    fast.bound_response_identity = Some(in_memory_identity("foreign", 4));
+                }
+                "dimension" => fast.bound_response_values = Some(vec![1.0]),
+                _ => fast.bound_response_values = Some(vec![f32::NAN; 4]),
+            }
+            let fast = Arc::new(fast);
+            let lexical = Arc::new(SilentPendingProvider::default());
+            let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                .with_lexical(lexical.clone());
+            let phases = Mutex::new(Vec::new());
+            let text_reads = AtomicU64::new(0);
+            let mut future = Box::pin(searcher.search(
+                &cx,
+                "find the related documents -excluded",
+                5,
+                |_| {
+                    text_reads.fetch_add(1, Ordering::SeqCst);
+                    Some("candidate text".to_owned())
+                },
+                |phase| phases.lock().unwrap().push(phase),
+            ));
+            let wake = Arc::new(PendingSearchWake::default());
+            let waker = Waker::from(wake.clone());
+            let mut task = Context::from_waker(&waker);
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            assert!(
+                wake.0.load(Ordering::SeqCst) > 0,
+                "first poll retains the task Waker"
+            );
+            assert_eq!(lexical.started.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.dropped.load(Ordering::SeqCst), 0);
+            let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
+                panic!("{fault}: response refusal must not wait for pending lexical work");
+            };
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { .. } | SearchError::DimensionMismatch { .. }
+            ));
+            assert!(phases.lock().unwrap().is_empty());
+            assert_eq!(text_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(fast.bound_embeds.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn yielding_lexical_failure_preserves_semantic_candidates() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = query_admission_index("exact-v2");
+            let mut fast = query_admission_embedder("fast").with_async_bound_response();
+            fast.category = ModelCategory::StaticEmbedder;
+            let lexical = Arc::new(YieldingLexical {
+                failure: Some(false),
+                ..YieldingLexical::default()
+            });
+            let searcher = TwoTierSearcher::new(index, Arc::new(fast), TwoTierConfig::default())
+                .with_lexical(lexical.clone());
+            let (results, metrics) = searcher
+                .search_collect(&cx, "find the related documents", 5)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].doc_id, "doc-a");
+            assert_eq!(metrics.semantic_candidates, 2);
+            assert_eq!(metrics.lexical_candidates, 0);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.polls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn yielding_lexical_cancellation_drops_a_suspended_fast_provider() {
+        let cx = Cx::for_testing();
+        let (_index_dir, index) = build_test_index(4);
+        let fast = Arc::new(SilentPendingProvider {
+            category: Some(ModelCategory::StaticEmbedder),
+            ..SilentPendingProvider::default()
+        });
+        let lexical = Arc::new(YieldingLexical {
+            failure: Some(true),
+            ..YieldingLexical::default()
+        });
+        let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+            .with_lexical(lexical.clone());
+        let phases = Mutex::new(Vec::new());
+        let mut future = Box::pin(searcher.search(
+            &cx,
+            "find the related documents",
+            5,
+            |_| None,
+            |phase| phases.lock().unwrap().push(phase),
+        ));
+        let wake = Arc::new(PendingSearchWake::default());
+        let waker = Waker::from(wake);
+        let mut task = Context::from_waker(&waker);
+        assert!(future.as_mut().poll(&mut task).is_pending());
+        assert_eq!(fast.started.load(Ordering::SeqCst), 1);
+        assert_eq!(fast.dropped.load(Ordering::SeqCst), 0);
+        let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
+            panic!("lexical cancellation must not wait for suspended inference");
+        };
+        assert!(matches!(
+            error,
+            SearchError::Cancelled { phase, .. } if phase == "yielding_lexical"
+        ));
+        assert_eq!(fast.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lexical.polls.load(Ordering::SeqCst), 2);
+        assert!(phases.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_lexical_search_wakes_on_cancellation_in_every_phase_one_route() {
+        for category in [
+            ModelCategory::StaticEmbedder,
+            ModelCategory::TransformerEmbedder,
+            ModelCategory::ApiEmbedder,
+            ModelCategory::HashEmbedder,
+        ] {
+            let cx = Cx::for_testing();
+            let (_index_dir, index) = build_test_index(4);
+            let fast: Arc<dyn Embedder> = if category == ModelCategory::HashEmbedder {
+                Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4))
+            } else {
+                let mut fast = StubEmbedder::new("fast", 4);
+                fast.category = category;
+                Arc::new(fast)
+            };
+            let lexical = Arc::new(SilentPendingProvider::default());
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_lexical(lexical.clone());
+            let phases = Mutex::new(Vec::new());
+            let mut future = Box::pin(searcher.search(
+                &cx,
+                "find related documents",
+                5,
+                |_| None,
+                |phase| phases.lock().unwrap().push(phase),
+            ));
+            let wake = Arc::new(PendingSearchWake::default());
+            let waker = Waker::from(wake.clone());
+            let mut task = Context::from_waker(&waker);
+            assert!(future.as_mut().poll(&mut task).is_pending(), "{category:?}");
+            assert_eq!(lexical.started.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.dropped.load(Ordering::SeqCst), 0);
+            let wakes_before = wake.0.load(Ordering::SeqCst);
+            cx.cancel_with(asupersync::CancelKind::User, Some("cancel pending lexical"));
+            assert!(wake.0.load(Ordering::SeqCst) > wakes_before, "{category:?}");
+            let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
+                panic!("{category:?}: cancellation must wake and finish the lexical operation");
+            };
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            assert_eq!(lexical.dropped.load(Ordering::SeqCst), 1);
+            assert!(phases.lock().unwrap().is_empty());
+            drop(future);
+            assert_eq!(lexical.dropped.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -8580,13 +9129,17 @@ mod tests {
 
     #[test]
     fn public_search_pending_providers_wake_on_cancel_without_late_phases() {
-        for (tier, identified) in [
-            ("fast", false),
-            ("fast", true),
-            ("quality", false),
-            ("quality", true),
+        for (tier, identified, category) in [
+            ("fast", false, ModelCategory::ApiEmbedder),
+            ("fast", true, ModelCategory::ApiEmbedder),
+            ("fast", false, ModelCategory::StaticEmbedder),
+            ("fast", true, ModelCategory::StaticEmbedder),
+            ("fast", false, ModelCategory::TransformerEmbedder),
+            ("fast", true, ModelCategory::TransformerEmbedder),
+            ("quality", false, ModelCategory::ApiEmbedder),
+            ("quality", true, ModelCategory::ApiEmbedder),
             #[cfg(feature = "rerank")]
-            ("rerank", false),
+            ("rerank", false, ModelCategory::ApiEmbedder),
         ] {
             let cx = Cx::for_testing();
             let (_index_dir, index) = if identified {
@@ -8597,6 +9150,7 @@ mod tests {
             };
             let pending = Arc::new(SilentPendingProvider {
                 identity: identified.then(|| query_admission_embedder(tier).identity),
+                category: Some(category),
                 ..SilentPendingProvider::default()
             });
             let fast: Arc<dyn Embedder> = if tier == "fast" {
