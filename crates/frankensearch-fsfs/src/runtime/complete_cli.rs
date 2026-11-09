@@ -1388,11 +1388,7 @@ impl FsfsRuntime {
                     &stream_id,
                     &mut seq,
                     writer,
-                    Some((
-                        "retrieve.expansion",
-                        "query.stream.expanded_ready",
-                        "expanded query rankings fused",
-                    )),
+                    Some(Self::expanded_search_stream_stage(&payload)),
                 )?;
                 self.emit_search_stream_explanations(&payload, &stream_id, &mut seq, writer)?;
                 retained_search_checkpoint(cx)?;
@@ -3549,6 +3545,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(old.hits.len(), 1);
+            assert_eq!(old.phase, crate::output_schema::SearchOutputPhase::Initial);
             assert_eq!(old.hits[0].path, "alpha.md");
             assert!(old.explanations.is_empty());
             assert_eq!(old.explanation_warnings.len(), 1);
@@ -3568,6 +3565,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(new.hits.len(), 2);
+            assert_eq!(new.phase, crate::output_schema::SearchOutputPhase::Initial);
             assert_eq!(new.query, "sharedtoken");
             assert!(new.explanation_warnings.is_empty());
             assert_eq!(store.active(&cx).unwrap(), Some(selected));

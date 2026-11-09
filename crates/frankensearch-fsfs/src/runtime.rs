@@ -11446,10 +11446,17 @@ impl FsfsRuntime {
                 "quality refinement failed; returning initial results",
             ),
         });
-        let timeout_message = payload.quality_timeout.as_ref().map(|timeout| format!(
-            "quality refinement exceeded {}ms (observed {}ms); returning initial results; increase search.quality_timeout_ms; running backend work remains owned until completion",
-            timeout.budget_ms, timeout.elapsed_ms,
-        ));
+        let timeout_message = payload.quality_timeout.as_ref().map(|timeout| {
+            let fallback = if stage_override.is_some() {
+                "using the available expanded-query rankings"
+            } else {
+                "returning initial results"
+            };
+            format!(
+                "quality refinement exceeded {}ms (observed {}ms); {fallback}; increase search.quality_timeout_ms; running backend work remains owned until completion",
+                timeout.budget_ms, timeout.elapsed_ms,
+            )
+        });
         let progress_frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
@@ -13056,24 +13063,136 @@ impl FsfsRuntime {
             .collect();
 
         let freshness = payloads.iter().find_map(|payload| payload.index_freshness);
-        let mut payload = Self::attach_index_freshness(
+        let payload = Self::attach_index_freshness(
             SearchPayload::new(
                 original_query,
-                SearchOutputPhase::Refined,
+                SearchOutputPhase::Initial,
                 total_candidates,
                 hits,
             ),
             freshness,
         );
-        if let Some(source) = payloads.first() {
-            payload.skip_reason.clone_from(&source.skip_reason);
-            payload
-                .vector_generation_id
-                .clone_from(&source.vector_generation_id);
-            payload.vector_generation_is_hash = source.vector_generation_is_hash;
-            payload.remap_hash_control_ranks();
+        Self::attach_expanded_query_outcomes(payload, payloads)
+    }
+
+    /// Query fusion changes ranks, not the outcome of the model stages that
+    /// produced them. Keep every failure visible without assigning one query's
+    /// blend or cross-encoder scores to the aggregate ranking.
+    fn attach_expanded_query_outcomes(
+        mut payload: SearchPayload,
+        sources: &[SearchPayload],
+    ) -> SearchPayload {
+        let quality_failed = sources.iter().any(|source| {
+            source.phase == SearchOutputPhase::RefinementFailed || source.quality_timeout.is_some()
+        });
+        payload.phase = if quality_failed {
+            SearchOutputPhase::RefinementFailed
+        } else if sources
+            .iter()
+            .any(|source| source.phase == SearchOutputPhase::Refined)
+        {
+            SearchOutputPhase::Refined
+        } else {
+            SearchOutputPhase::Initial
+        };
+        for source in sources {
+            for (reason, advice) in &source.degradation_advice {
+                payload
+                    .degradation_advice
+                    .entry(reason.clone())
+                    .or_insert_with(|| advice.clone());
+            }
+            for warning in &source.explanation_warnings {
+                if !payload.explanation_warnings.contains(warning) {
+                    payload.explanation_warnings.push(warning.clone());
+                }
+            }
+        }
+        // Each variant owns its own deadline. Report one actual expiry, not
+        // a synthetic sum that could imply a different configured budget.
+        payload.quality_timeout = sources
+            .iter()
+            .filter_map(|source| source.quality_timeout.as_ref())
+            .max_by_key(|timeout| timeout.elapsed_ms)
+            .cloned();
+        if let Some(source) = sources.first() {
+            if sources
+                .iter()
+                .all(|other| other.skip_reason == source.skip_reason)
+            {
+                payload.skip_reason.clone_from(&source.skip_reason);
+            }
+            if sources.iter().all(|other| {
+                other.vector_generation_id == source.vector_generation_id
+                    && other.vector_generation_is_hash == source.vector_generation_is_hash
+            }) {
+                payload
+                    .vector_generation_id
+                    .clone_from(&source.vector_generation_id);
+                payload.vector_generation_is_hash = source.vector_generation_is_hash;
+                payload.remap_hash_control_ranks();
+            }
+        }
+        if payload.quality_timeout.is_some() {
+            payload.skip_reason = Some("quality_timeout".to_owned());
+        }
+        if quality_failed {
+            payload.explanation_warnings.push(OutputWarning::new(
+                OutputWarningCode::DEGRADED_MODE,
+                "quality refinement failed for at least one expanded query; fused results retain each query's last usable ranking",
+            ));
+        }
+
+        // An adverse per-query rerank outcome remains actionable and keeps a
+        // timeout/failure out of caches. Successful per-query scores cannot
+        // describe these new cross-query ranks, so they are never copied.
+        if let Some(stage) = sources
+            .iter()
+            .filter_map(|source| source.rerank.as_ref())
+            .filter(|stage| stage.status != RerankStageStatus::Applied)
+            .max_by_key(|stage| {
+                (
+                    stage.reason_code == REASON_RERANK_TIMEOUT,
+                    stage.status == RerankStageStatus::Failed,
+                )
+            })
+        {
+            let mut failure = stage.clone();
+            failure.scores.clear();
+            failure.reranked_hits = 0;
+            payload.explanation_warnings.push(OutputWarning::new(
+                OutputWarningCode::RERANK_SKIPPED,
+                format!(
+                    "reranking did not complete for at least one expanded query ({}); fusion keeps that query's unreranked ordering",
+                    stage.reason_code,
+                ),
+            ));
+            payload.rerank = Some(failure);
         }
         payload
+    }
+
+    fn expanded_search_stream_stage(
+        payload: &SearchPayload,
+    ) -> (&'static str, &'static str, &'static str) {
+        if payload.phase == SearchOutputPhase::RefinementFailed
+            || payload.rerank.as_ref().is_some_and(|stage| {
+                stage.status == RerankStageStatus::Failed
+                    || stage.reason_code == REASON_RERANK_TIMEOUT
+            })
+        {
+            (
+                "retrieve.expansion",
+                "query.stream.expanded_degraded",
+                "expanded query rankings fused with incomplete refinement",
+            )
+        } else {
+            (
+                "retrieve.expansion",
+                "query.stream.expanded_ready",
+                "expanded query rankings fused",
+            )
+        }
     }
 
     #[must_use]
@@ -44005,6 +44124,20 @@ mod tests {
                 assert_eq!(actual.hits, expected.hits);
             }
             let fused = FsfsRuntime::fuse_expanded_payloads(&queries[0].text, &variants, 2, 60.0);
+            assert_eq!(fused.phase, SearchOutputPhase::RefinementFailed);
+            assert!(!variants[1].degradation_advice.is_empty());
+            for source in &variants {
+                for (reason, advice) in &source.degradation_advice {
+                    assert_eq!(fused.degradation_advice.get(reason), Some(advice));
+                }
+            }
+            assert!(
+                !FsfsRuntime::search_payloads_cacheable(std::slice::from_ref(&fused)),
+                "query fusion cannot turn failed quality into a cacheable success",
+            );
+            assert!(fused.explanation_warnings.iter().any(|warning| {
+                warning.code == crate::output_schema::OutputWarningCode::DEGRADED_MODE
+            }));
             assert_eq!(fused.hits.len(), 2);
             assert_eq!(
                 fused.hits[0].path, documents[0],
@@ -44018,6 +44151,196 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn expanded_query_fusion_reports_only_the_refinement_that_ran() {
+        for skip in ["lexical_only", "fast_only", "quality_only"] {
+            let original = SearchPayload::new("original", SearchOutputPhase::Initial, 0, vec![])
+                .with_skip_reason(skip);
+            let expanded = SearchPayload::new("expanded", SearchOutputPhase::Initial, 0, vec![])
+                .with_skip_reason(skip);
+            let fused =
+                FsfsRuntime::fuse_expanded_payloads("original", &[original, expanded], 10, 60.0);
+            assert_eq!(fused.phase, SearchOutputPhase::Initial, "{skip}");
+            assert_eq!(fused.skip_reason.as_deref(), Some(skip));
+            assert!(fused.semantic_blend.is_none());
+            assert!(fused.rerank.is_none());
+            assert!(FsfsRuntime::search_payloads_cacheable(&[fused]));
+        }
+
+        // The original's planner downgrade does not describe a later variant
+        // that really used quality; neither query's raw scores describe RRF.
+        let original = SearchPayload::new("original", SearchOutputPhase::Initial, 0, vec![])
+            .with_skip_reason("malformed_query");
+        let expanded = SearchPayload::new("expanded", SearchOutputPhase::Refined, 0, vec![]);
+        let fused =
+            FsfsRuntime::fuse_expanded_payloads("original", &[original, expanded], 10, 60.0);
+        assert_eq!(fused.phase, SearchOutputPhase::Refined);
+        assert!(fused.skip_reason.is_none());
+        assert!(fused.semantic_blend.is_none());
+        assert!(fused.lexical_scores.is_empty());
+    }
+
+    #[test]
+    fn expanded_query_fusion_preserves_timeout_advice_and_streams_degradation() {
+        use crate::degradation_advisor::{
+            DegradationAdvice, DegradationAdviceInput, DegradationFailureKind,
+        };
+        use crate::output_schema::{OutputWarning, OutputWarningCode, QualityTimeoutPayload};
+
+        let advice = |failure| {
+            DegradationAdvice::from_input(DegradationAdviceInput {
+                failure,
+                query: "expanded query",
+                index_dir: None,
+                original_error: None,
+                replay_command: None,
+            })
+        };
+        let warning = OutputWarning::new(
+            OutputWarningCode::EXPLANATION_UNAVAILABLE,
+            "variant explanation unavailable",
+        );
+        let mut short = SearchPayload::new("short", SearchOutputPhase::RefinementFailed, 0, vec![])
+            .with_degradation_advice([advice(DegradationFailureKind::Timeout)]);
+        short.quality_timeout = Some(QualityTimeoutPayload {
+            budget_ms: 50,
+            elapsed_ms: 75,
+            reason_code: "query.quality.timeout".to_owned(),
+        });
+        short.explanation_warnings.push(warning.clone());
+        let mut long = SearchPayload::new("long", SearchOutputPhase::RefinementFailed, 0, vec![])
+            .with_degradation_advice([advice(DegradationFailureKind::MissingQualityModel)]);
+        long.quality_timeout = Some(QualityTimeoutPayload {
+            budget_ms: 100,
+            elapsed_ms: 125,
+            reason_code: "query.quality.timeout".to_owned(),
+        });
+        long.explanation_warnings.push(warning.clone());
+        let refined = SearchPayload::new("healthy", SearchOutputPhase::Refined, 0, vec![]);
+        let fused = FsfsRuntime::fuse_expanded_payloads(
+            "original",
+            &[refined, short.clone(), long.clone()],
+            10,
+            60.0,
+        );
+        assert_eq!(fused.phase, SearchOutputPhase::RefinementFailed);
+        assert_eq!(fused.skip_reason.as_deref(), Some("quality_timeout"));
+        assert_eq!(fused.quality_timeout, long.quality_timeout);
+        assert_eq!(fused.degradation_advice.len(), 2);
+        for source in [&short, &long] {
+            for (reason, advice) in &source.degradation_advice {
+                assert_eq!(fused.degradation_advice.get(reason), Some(advice));
+            }
+        }
+        assert_eq!(
+            fused
+                .explanation_warnings
+                .iter()
+                .filter(|item| **item == warning)
+                .count(),
+            1,
+        );
+        assert!(!FsfsRuntime::search_payloads_cacheable(
+            std::slice::from_ref(&fused)
+        ));
+        let decoded: SearchPayload =
+            serde_json::from_slice(&serde_json::to_vec(&fused).unwrap()).unwrap();
+        assert_eq!(decoded, fused, "buffered output preserves all diagnostics");
+
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            format: OutputFormat::Jsonl,
+            ..CliInput::default()
+        });
+        let mut bytes = Vec::new();
+        let mut seq = 0;
+        runtime
+            .emit_search_stream_payload_with_stage(
+                &fused,
+                "expanded",
+                &mut seq,
+                &mut bytes,
+                Some(FsfsRuntime::expanded_search_stream_stage(&fused)),
+            )
+            .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let frame: StreamFrame<SearchHitPayload> =
+            decode_stream_frame_ndjson(text.lines().next().unwrap()).unwrap();
+        let StreamEvent::Progress(progress) = frame.event else {
+            panic!("expected expanded progress");
+        };
+        assert_eq!(progress.stage, "retrieve.expansion");
+        assert_eq!(progress.reason_code, "query.stream.expanded_degraded");
+        assert!(progress.message.contains("100ms (observed 125ms)"));
+        assert!(
+            progress
+                .message
+                .contains("available expanded-query rankings")
+        );
+    }
+
+    #[test]
+    fn expanded_query_fusion_preserves_rerank_failures_without_copying_scores() {
+        use crate::output_schema::{RerankHitScore, RerankStagePayload, RerankStageStatus};
+
+        let mut refined = SearchPayload::new("healthy", SearchOutputPhase::Refined, 0, vec![]);
+        refined.rerank = Some(RerankStagePayload {
+            status: RerankStageStatus::Applied,
+            reason_code: super::REASON_RERANK_APPLIED.to_owned(),
+            candidate_budget: 1,
+            reranked_hits: 1,
+            elapsed_ms: 3,
+            model: Some("test-reranker".to_owned()),
+            scores: vec![RerankHitScore {
+                rank: 1,
+                path: "variant-only.md".to_owned(),
+                score: 0.9,
+                original_rank: 2,
+                logit: Some(2.0),
+            }],
+        });
+        let healthy = FsfsRuntime::fuse_expanded_payloads(
+            "original",
+            std::slice::from_ref(&refined),
+            10,
+            60.0,
+        );
+        assert_eq!(healthy.phase, SearchOutputPhase::Refined);
+        assert!(
+            healthy.rerank.is_none(),
+            "variant scores do not explain new ranks"
+        );
+
+        for reason in [super::REASON_RERANK_FAILED, super::REASON_RERANK_TIMEOUT] {
+            let mut failed = SearchPayload::new("failed", SearchOutputPhase::Refined, 0, vec![]);
+            let mut stage = RerankStagePayload::skipped(reason, 20);
+            stage.status = RerankStageStatus::Failed;
+            stage.elapsed_ms = 80;
+            failed.rerank = Some(stage);
+            let fused = FsfsRuntime::fuse_expanded_payloads(
+                "original",
+                &[refined.clone(), failed],
+                10,
+                60.0,
+            );
+            // Quality really succeeded; only the optional reranker failed.
+            assert_eq!(fused.phase, SearchOutputPhase::Refined);
+            let stage = fused.rerank.as_ref().unwrap();
+            assert_eq!(stage.status, RerankStageStatus::Failed);
+            assert_eq!(stage.reason_code, reason);
+            assert_eq!(stage.elapsed_ms, 80);
+            assert_eq!(stage.reranked_hits, 0);
+            assert!(stage.scores.is_empty());
+            assert!(stage.model.is_none());
+            assert_eq!(
+                FsfsRuntime::expanded_search_stream_stage(&fused).1,
+                "query.stream.expanded_degraded",
+            );
+            if reason == super::REASON_RERANK_TIMEOUT {
+                assert!(!FsfsRuntime::search_payloads_cacheable(&[fused]));
+            }
+        }
     }
 
     #[test]
