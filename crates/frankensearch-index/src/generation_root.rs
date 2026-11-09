@@ -2032,9 +2032,23 @@ pub mod authority_publisher {
             return Err(GenerationAuthorityErrorV1::RootMismatch);
         }
         let floor = record
-            .map(|record| AuthorityFloorV1::new(record.root_id, record.authority))
+            .map(|record| {
+                record.validate()?;
+                AuthorityFloorV1::new(record.root_id, record.authority)
+            })
             .transpose()?;
         Ok((record, floor))
+    }
+
+    fn floor_acknowledges(
+        receipt: AntiRollbackFloorRecordV1,
+        expected: Option<AntiRollbackFloorRecordV1>,
+        next: AuthorityFloorV1,
+    ) -> bool {
+        receipt.validate().is_ok()
+            && receipt.root_id == next.root_id
+            && receipt.authority == next.authority
+            && expected.is_none_or(|record| receipt.cas_version > record.cas_version)
     }
 
     /// Writer identity for owner/attempt frames: diagnostics and a mutation
@@ -2621,10 +2635,7 @@ pub mod authority_publisher {
                         return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
                     };
                     match provider.compare_and_advance(floor_record, next, idempotency_key) {
-                        Ok(receipt)
-                            if receipt.root_id == self.root_id
-                                && receipt.authority == candidate =>
-                        {
+                        Ok(receipt) if floor_acknowledges(receipt, floor_record, next) => {
                             Some(receipt)
                         }
                         Ok(_) | Err(_) => {
@@ -2792,6 +2803,11 @@ pub mod authority_publisher {
                     GenerationAuthorityErrorV1::RootMismatch,
                 ));
             }
+            if let Some(record) = current_floor
+                && let Err(error) = record.validate()
+            {
+                return Ok(ReconcileOutcomeV1::RepairRequired(error));
+            }
 
             let outcome = if observed == permit.expected {
                 // Reading only the target slot cannot prove abortion: its peer,
@@ -2898,10 +2914,7 @@ pub mod authority_publisher {
                             Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
                         };
                         match provider.compare_and_advance(current, next, permit.idempotency_key) {
-                            Ok(receipt)
-                                if receipt.root_id == self.root_id
-                                    && receipt.authority == candidate_authority =>
-                            {
+                            Ok(receipt) if floor_acknowledges(receipt, current, next) => {
                                 Some(receipt)
                             }
                             Ok(_) | Err(_) => return Ok(ReconcileOutcomeV1::StillUnknown(*permit)),
@@ -3343,6 +3356,227 @@ pub mod authority_publisher {
                     AuthorityFloorV1::new(root_id, authority)?,
                     idempotency_key,
                 )
+            }
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum FloorReceiptFault {
+            Schema,
+            Checksum,
+            ZeroVersion,
+            StaleVersion,
+        }
+
+        fn altered_floor_receipt(
+            fault: FloorReceiptFault,
+            mut record: AntiRollbackFloorRecordV1,
+            expected: Option<AntiRollbackFloorRecordV1>,
+        ) -> AntiRollbackFloorRecordV1 {
+            match fault {
+                FloorReceiptFault::Schema => record.schema_version += 1,
+                FloorReceiptFault::Checksum => record.record_sha256[0] ^= 1,
+                FloorReceiptFault::ZeroVersion => record.cas_version = 0,
+                FloorReceiptFault::StaleVersion => {
+                    record = AntiRollbackFloorRecordV1::new(
+                        AuthorityFloorV1::new(record.root_id, record.authority).unwrap(),
+                        expected
+                            .expect("successor has a previous floor")
+                            .cas_version,
+                    )
+                    .expect("self-consistent receipt with a non-advancing CAS version");
+                }
+            }
+            record
+        }
+
+        struct AlteredAcknowledgementFloor<'a> {
+            inner: &'a InMemoryAntiRollbackFloorStoreV1,
+            fault: FloorReceiptFault,
+            apply: bool,
+        }
+
+        impl AntiRollbackFloorProviderV1 for AlteredAcknowledgementFloor<'_> {
+            fn load(
+                &self,
+                root_id: [u8; 16],
+            ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+                self.inner.load(root_id)
+            }
+
+            fn compare_and_advance(
+                &self,
+                expected: Option<AntiRollbackFloorRecordV1>,
+                next: AuthorityFloorV1,
+                idempotency_key: [u8; 16],
+            ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+                let actual = if self.apply {
+                    self.inner
+                        .compare_and_advance(expected, next, idempotency_key)?
+                } else {
+                    AntiRollbackFloorRecordV1::new(
+                        next,
+                        expected.map_or(1, |record| record.cas_version + 1),
+                    )?
+                };
+                Ok(altered_floor_receipt(self.fault, actual, expected))
+            }
+        }
+
+        #[test]
+        fn malformed_floor_records_refuse_publication_and_reconciliation_without_mutation() {
+            let root_path = fixture_root("malformed-loaded-floor");
+            let root = admit(&root_path);
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .unwrap();
+            let floor = InMemoryAntiRollbackFloorStoreV1::new();
+            let genesis = authority(1, None);
+            let PublicationOutcomeV1::Committed { slot, .. } = publisher
+                .publish(
+                    genesis,
+                    ExpectedAuthorityPairV1::default(),
+                    Some(&floor),
+                    [0x41; 16],
+                )
+                .unwrap()
+            else {
+                panic!("fixture genesis must commit");
+            };
+            let record = floor.load(ROOT_ID).unwrap().unwrap();
+            let permit = publisher
+                .prepare_attempt(
+                    authority(2, Some(genesis.fingerprint())),
+                    ExpectedAuthorityPairV1 {
+                        first: None,
+                        second: Some(slot),
+                    },
+                    [0x42; 16],
+                    [0x43; 16],
+                )
+                .unwrap();
+            let authority_before = authority_bytes(&root_path);
+            let lock_before = fs::read(root_path.join("LOCK")).unwrap();
+            for (fault, error) in [
+                (
+                    FloorReceiptFault::Schema,
+                    GenerationAuthorityErrorV1::InvalidField {
+                        field: "anti_rollback_floor.schema_version",
+                    },
+                ),
+                (
+                    FloorReceiptFault::Checksum,
+                    GenerationAuthorityErrorV1::ChecksumMismatch,
+                ),
+                (
+                    FloorReceiptFault::ZeroVersion,
+                    GenerationAuthorityErrorV1::InvalidField {
+                        field: "anti_rollback_floor.cas_version",
+                    },
+                ),
+            ] {
+                let invalid = ForeignLoadedFloor(altered_floor_receipt(fault, record, None));
+                assert_eq!(floor_head(Some(&invalid), ROOT_ID), Err(error));
+                assert_eq!(
+                    publisher.publish_prepared(&permit, Some(&invalid)).unwrap(),
+                    PublicationOutcomeV1::NotCommitted(NotCommittedV1::FloorRefused(error)),
+                );
+                assert_eq!(
+                    publisher.reconcile(&permit, Some(&invalid)).unwrap(),
+                    ReconcileOutcomeV1::RepairRequired(error),
+                );
+                assert_eq!(authority_bytes(&root_path), authority_before);
+                assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_before);
+                assert_eq!(floor.load(ROOT_ID).unwrap(), Some(record));
+            }
+        }
+
+        #[test]
+        fn malformed_or_nonadvancing_floor_acknowledgements_never_complete_an_attempt() {
+            for fault in [
+                FloorReceiptFault::Schema,
+                FloorReceiptFault::Checksum,
+                FloorReceiptFault::ZeroVersion,
+                FloorReceiptFault::StaleVersion,
+            ] {
+                for apply in [false, true] {
+                    let root_path = fixture_root(&format!("altered-floor-{fault:?}-{apply}"));
+                    let root = admit(&root_path);
+                    let floor = InMemoryAntiRollbackFloorStoreV1::new();
+                    let bootstrap = root
+                        .authority_publisher(
+                            ROOT_ID,
+                            WRITER_A,
+                            GenerationRootSecurityProfileV1::CooperativeLocal,
+                        )
+                        .unwrap();
+                    let genesis = authority(1, None);
+                    let PublicationOutcomeV1::Committed { slot, .. } = bootstrap
+                        .publish(
+                            genesis,
+                            ExpectedAuthorityPairV1::default(),
+                            Some(&floor),
+                            [0x44; 16],
+                        )
+                        .unwrap()
+                    else {
+                        panic!("fixture genesis must commit");
+                    };
+                    let publisher = root
+                        .authority_publisher(
+                            ROOT_ID,
+                            WRITER_B,
+                            GenerationRootSecurityProfileV1::RequiredExternal,
+                        )
+                        .unwrap();
+                    let successor = authority(2, Some(genesis.fingerprint()));
+                    let defective = AlteredAcknowledgementFloor {
+                        inner: &floor,
+                        fault,
+                        apply,
+                    };
+                    let outcome = publisher
+                        .publish(
+                            successor,
+                            ExpectedAuthorityPairV1 {
+                                first: None,
+                                second: Some(slot),
+                            },
+                            Some(&defective),
+                            [0x45; 16],
+                        )
+                        .unwrap();
+                    let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome else {
+                        panic!("invalid receipt must not acknowledge a commit: {outcome:?}");
+                    };
+                    assert_eq!(permit.stage, AttemptStageV1::FloorAdvance);
+                    assert_eq!(publisher.owner_frame().unwrap().unwrap().fence, 1);
+                    let authority_after = authority_bytes(&root_path);
+                    if !apply {
+                        let lock_after = fs::read(root_path.join("LOCK")).unwrap();
+                        assert_eq!(
+                            publisher.reconcile(&permit, Some(&defective)).unwrap(),
+                            ReconcileOutcomeV1::StillUnknown(permit),
+                            "a reconciliation CAS must validate the same receipt contract",
+                        );
+                        assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_after);
+                        assert_eq!(floor.load(ROOT_ID).unwrap().unwrap().authority, genesis);
+                    }
+                    let ReconcileOutcomeV1::Committed {
+                        floor: Some(receipt),
+                        ..
+                    } = publisher.reconcile(&permit, Some(&floor)).unwrap()
+                    else {
+                        panic!("the exact valid floor must reconcile the retained attempt");
+                    };
+                    assert_eq!(receipt.authority, successor);
+                    assert_eq!(receipt.cas_version, 2);
+                    assert_eq!(authority_bytes(&root_path), authority_after);
+                    assert_eq!(publisher.owner_frame().unwrap().unwrap().fence, 2);
+                }
             }
         }
 
@@ -7380,6 +7614,8 @@ pub mod generation_reader {
                 let SourceOpenOutcomeV1::Opened(source) = root
                     .open_expected_generation_source_for_recovery_with_budget(
                         ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
                         authority,
                         manifest.generation(),
                         source_bytes,
@@ -7434,6 +7670,8 @@ pub mod generation_reader {
                     matches!(
                         root.open_expected_generation_source_for_recovery_with_budget(
                             ROOT_ID,
+                            GenerationRootSecurityProfileV1::CooperativeLocal,
+                            None,
                             authority,
                             manifest.generation(),
                             0,
@@ -7466,6 +7704,8 @@ pub mod generation_reader {
             assert!(matches!(
                 root.open_expected_generation_source_for_recovery_with_budget(
                     ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
                     authority,
                     manifest.generation(),
                     u64::MAX,
@@ -7503,6 +7743,8 @@ pub mod generation_reader {
                 assert!(matches!(
                     root.open_expected_generation_source_for_recovery_with_budget(
                         ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
                         authority,
                         manifest.generation(),
                         u64::MAX,
@@ -7516,6 +7758,8 @@ pub mod generation_reader {
             assert!(matches!(
                 root.open_expected_generation_source_for_recovery_with_budget(
                     ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
                     authority,
                     ArtifactGenerationIdentityV1::new(2, [0x21; 16]).expect("different generation"),
                     u64::MAX,
@@ -7542,7 +7786,12 @@ pub mod generation_reader {
             ] {
                 assert!(matches!(
                     root.open_expected_generation_source_for_recovery_with_budget(
-                        ROOT_ID, authority, manifest.generation(), limit,
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                        authority,
+                        manifest.generation(),
+                        limit,
                     ).expect("bounded source admission"),
                     SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ImageBudget {
                         required: actual_required, limit: actual_limit,
@@ -7553,6 +7802,8 @@ pub mod generation_reader {
                 matches!(
                     root.open_expected_generation_source_for_recovery_with_budget(
                         ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
                         authority,
                         manifest.generation(),
                         required,
@@ -7581,6 +7832,8 @@ pub mod generation_reader {
             assert!(matches!(
                 root.open_expected_generation_source_for_recovery_with_budget(
                     ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
                     authority,
                     manifest.generation(),
                     u64::MAX,
@@ -7590,6 +7843,287 @@ pub mod generation_reader {
                     ClosureViolationV1::UndeclaredEntry { .. },
                 )),
             ));
+        }
+
+        struct RecoveryFloorSequence {
+            first: AntiRollbackFloorRecordV1,
+            later: Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1>,
+            change_after: usize,
+            loads: std::cell::Cell<usize>,
+        }
+
+        impl AntiRollbackFloorProviderV1 for RecoveryFloorSequence {
+            fn load(
+                &self,
+                root_id: [u8; 16],
+            ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+                assert_eq!(root_id, ROOT_ID);
+                let load = self.loads.get();
+                self.loads.set(load + 1);
+                if load >= self.change_after {
+                    self.later
+                } else {
+                    Ok(Some(self.first))
+                }
+            }
+
+            fn compare_and_advance(
+                &self,
+                _expected: Option<AntiRollbackFloorRecordV1>,
+                _next: frankensearch_core::generation::AuthorityFloorV1,
+                _idempotency_key: [u8; 16],
+            ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+                panic!("admitting a recovery source must never mutate the external floor");
+            }
+        }
+
+        fn recovery_root_bytes(
+            path: &Path,
+        ) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+            fs::read_dir(path)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect()
+        }
+
+        #[test]
+        fn source_and_vector_recovery_retain_the_exact_external_floor_without_mutation() {
+            let (path, root, authority, manifest) =
+                source_recovery_fixture("source-external-floor", true, true, None);
+            let record = AntiRollbackFloorRecordV1::new(
+                frankensearch_core::generation::AuthorityFloorV1::new(ROOT_ID, authority).unwrap(),
+                17,
+            )
+            .unwrap();
+            let floor = RecoveryFloorSequence {
+                first: record,
+                later: Ok(Some(record)),
+                change_after: usize::MAX,
+                loads: std::cell::Cell::new(0),
+            };
+            let before = recovery_root_bytes(&path);
+            let SourceOpenOutcomeV1::Opened(source) = root
+                .open_expected_generation_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    Some(&floor),
+                    authority,
+                    manifest.generation(),
+                    u64::MAX,
+                )
+                .unwrap()
+            else {
+                panic!("anchored intact source must not need the damaged derived components");
+            };
+            assert_eq!(
+                source.profile(),
+                GenerationRootSecurityProfileV1::RequiredExternal
+            );
+            assert_eq!(source.floor(), Some(record));
+            assert_eq!(
+                source.health(),
+                SnapshotHealthV1::ExternallyAnchored { cas_version: 17 }
+            );
+            assert_eq!(floor.loads.get(), 2);
+            assert_eq!(recovery_root_bytes(&path), before);
+
+            let vector = component_bytes(GenerationComponentRole::Vector, 1);
+            write_sealed_object(
+                &path,
+                &component_object_name_v1(
+                    GenerationComponentRole::Vector,
+                    manifest.components().vector.sha256,
+                ),
+                &vector,
+            );
+            let before = recovery_root_bytes(&path);
+            let VectorSourceOpenOutcomeV1::Opened(retained) = root
+                .open_expected_generation_vector_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    Some(&floor),
+                    authority,
+                    manifest.generation(),
+                    u64::MAX,
+                )
+                .unwrap()
+            else {
+                panic!("anchored vectors must remain usable without an ANN object");
+            };
+            assert_eq!(retained.source().floor(), Some(record));
+            assert_eq!(retained.source().health(), source.health());
+            assert_eq!(retained.source().authority_pair(), source.authority_pair());
+            assert_eq!(retained.vector_bytes().as_ref(), vector);
+            assert_eq!(
+                floor.loads.get(),
+                5,
+                "vector admission rechecks the floor after its read"
+            );
+            assert_eq!(recovery_root_bytes(&path), before);
+        }
+
+        #[test]
+        fn recovery_refuses_missing_malformed_or_changed_external_floors_at_every_read_fence() {
+            use frankensearch_core::generation::AuthorityFloorV1;
+            let (path, root, authority, manifest) =
+                source_recovery_fixture("source-external-floor-fences", true, true, None);
+            write_sealed_object(
+                &path,
+                &component_object_name_v1(
+                    GenerationComponentRole::Vector,
+                    manifest.components().vector.sha256,
+                ),
+                &component_bytes(GenerationComponentRole::Vector, 1),
+            );
+            let record = AntiRollbackFloorRecordV1::new(
+                AuthorityFloorV1::new(ROOT_ID, authority).unwrap(),
+                7,
+            )
+            .unwrap();
+            let revised = AntiRollbackFloorRecordV1::new(
+                AuthorityFloorV1::new(ROOT_ID, authority).unwrap(),
+                8,
+            )
+            .unwrap();
+            let foreign = AntiRollbackFloorRecordV1::new(
+                AuthorityFloorV1::new([0x99; 16], authority).unwrap(),
+                7,
+            )
+            .unwrap();
+            let mut corrupt = record;
+            corrupt.record_sha256[0] ^= 1;
+            let before = recovery_root_bytes(&path);
+            for (later, refusal) in [
+                (Ok(Some(revised)), SnapshotRefusalV1::ExpectedCurrentChanged),
+                (
+                    Ok(None),
+                    SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::ExternalFloorRequired),
+                ),
+                (
+                    Err(GenerationAuthorityErrorV1::FloorStoreUnavailable),
+                    SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::FloorStoreUnavailable),
+                ),
+                (
+                    Ok(Some(foreign)),
+                    SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::RootMismatch),
+                ),
+                (
+                    Ok(Some(corrupt)),
+                    SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::ChecksumMismatch),
+                ),
+            ] {
+                // A change after the first source resolution or after source
+                // admission must both fail. The latter only appears at the
+                // third resolution, after retained-vector admission.
+                for change_after in [1, 2] {
+                    let floor = RecoveryFloorSequence {
+                        first: record,
+                        later,
+                        change_after,
+                        loads: std::cell::Cell::new(0),
+                    };
+                    let result = root
+                        .open_expected_generation_vector_source_for_recovery_with_budget(
+                            ROOT_ID,
+                            GenerationRootSecurityProfileV1::RequiredExternal,
+                            Some(&floor),
+                            authority,
+                            manifest.generation(),
+                            u64::MAX,
+                        )
+                        .unwrap();
+                    let VectorSourceOpenOutcomeV1::Refused(observed) = result else {
+                        panic!(
+                            "recovery must retain one exact external authority across all reads"
+                        );
+                    };
+                    assert_eq!(observed, refusal);
+                    assert_eq!(floor.loads.get(), change_after + 1);
+                    assert_eq!(recovery_root_bytes(&path), before);
+                }
+            }
+            let floor = RecoveryFloorSequence {
+                first: record,
+                later: Ok(Some(record)),
+                change_after: usize::MAX,
+                loads: std::cell::Cell::new(0),
+            };
+            for (profile, provider, expected) in [
+                (
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    None,
+                    GenerationAuthorityErrorV1::ExternalFloorRequired,
+                ),
+                (
+                    GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+                    Some(&floor as &dyn AntiRollbackFloorProviderV1),
+                    GenerationAuthorityErrorV1::ReadOnlyProfile,
+                ),
+            ] {
+                assert!(matches!(
+                    root.open_expected_generation_source_for_recovery_with_budget(
+                        ROOT_ID, profile, provider, authority, manifest.generation(), 0,
+                    ).unwrap(),
+                    SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Authority(error))
+                        if error == expected,
+                ));
+            }
+            assert_eq!(
+                floor.loads.get(),
+                0,
+                "profile refusal precedes provider and image work"
+            );
+            assert_eq!(recovery_root_bytes(&path), before);
+        }
+
+        #[test]
+        fn external_recovery_refuses_an_anchored_predecessor_while_its_successor_is_pending() {
+            let floor = BehindFloor {
+                live: InMemoryAntiRollbackFloorStoreV1::new(),
+                report: std::sync::Mutex::new(None),
+            };
+            let (path, root, current, predecessor) =
+                predecessor_root("source-pending-external-successor", true, Some(&floor));
+            let anchored = AntiRollbackFloorRecordV1::new(
+                frankensearch_core::generation::AuthorityFloorV1::new(
+                    ROOT_ID,
+                    predecessor.authority,
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap();
+            *floor.report.lock().unwrap() = Some(anchored);
+            let served = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                Some(&floor),
+            ));
+            assert_eq!(served.head().authority, predecessor.authority);
+            assert_eq!(
+                served.health(),
+                SnapshotHealthV1::PendingLocalSuccessor {
+                    pending: current.head().authority,
+                }
+            );
+            let before = recovery_root_bytes(&path);
+            assert!(matches!(
+                root.open_expected_generation_vector_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                    Some(&floor),
+                    predecessor.authority,
+                    served.manifest().generation(),
+                    0,
+                )
+                .unwrap(),
+                VectorSourceOpenOutcomeV1::Refused(SnapshotRefusalV1::PendingReconciliation),
+            ));
+            assert_eq!(recovery_root_bytes(&path), before);
+            assert_eq!(floor.load(ROOT_ID).unwrap(), Some(anchored));
         }
 
         #[test]
@@ -7631,6 +8165,8 @@ pub mod generation_reader {
                 let VectorSourceOpenOutcomeV1::Opened(retained) = root
                     .open_expected_generation_vector_source_for_recovery_with_budget(
                         ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
                         authority,
                         manifest.generation(),
                         required,
@@ -7680,6 +8216,8 @@ pub mod generation_reader {
                 assert!(matches!(
                     root.open_expected_generation_vector_source_for_recovery_with_budget(
                         ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
                         authority,
                         manifest.generation(),
                         0,
@@ -7701,7 +8239,12 @@ pub mod generation_reader {
                 + receipts.vector.byte_len;
             assert!(matches!(
                 root.open_expected_generation_vector_source_for_recovery_with_budget(
-                    ROOT_ID, authority, manifest.generation(), required - 1,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                    authority,
+                    manifest.generation(),
+                    required - 1,
                 ).expect("bounded vector-source open"),
                 VectorSourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ImageBudget { required: actual, limit })
                     if actual == required && limit == required - 1,
@@ -7709,6 +8252,8 @@ pub mod generation_reader {
             assert!(matches!(
                 root.open_expected_generation_vector_source_for_recovery_with_budget(
                     ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
                     authority,
                     manifest.generation(),
                     required,
@@ -7726,6 +8271,8 @@ pub mod generation_reader {
             assert!(matches!(
                 root.open_expected_generation_vector_source_for_recovery_with_budget(
                     ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
                     authority,
                     manifest.generation(),
                     required,
@@ -7756,6 +8303,8 @@ pub mod generation_reader {
             assert!(matches!(
                 root.open_expected_generation_vector_source_for_recovery_with_budget(
                     ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
                     authority,
                     manifest.generation(),
                     u64::MAX,

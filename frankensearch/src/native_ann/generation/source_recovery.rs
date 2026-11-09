@@ -956,13 +956,16 @@ mod tests {
         use std::io::Write as _;
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-        use frankensearch_core::generation::GenerationRootSecurityProfileV1;
+        use frankensearch_core::generation::{
+            GenerationRootSecurityProfileV1, LocalAntiRollbackFloorStoreV1,
+        };
         use frankensearch_index::generation_root::authority_publisher::{
-            AUTHORITY_PUBLISHER_LOCK_BYTES_V1, ExpectedAuthorityPairV1, PublicationOutcomeV1,
+            AUTHORITY_PUBLISHER_LOCK_BYTES_V1, AntiRollbackFloorProviderV1,
+            ExpectedAuthorityPairV1, PublicationOutcomeV1,
         };
         use frankensearch_index::generation_root::generation_reader::{
-            SnapshotOpenOutcomeV1, VectorSourceOpenOutcomeV1, activation_manifest_path_v1,
-            component_object_path_v1,
+            SnapshotHealthV1, SnapshotOpenOutcomeV1, VectorSourceOpenOutcomeV1,
+            activation_manifest_path_v1, component_object_path_v1,
         };
         use frankensearch_index::generation_root::{
             GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout,
@@ -1031,6 +1034,8 @@ mod tests {
             built: &NativeBuiltExactGeneration,
             candidate: &GenerationCandidateV1,
             expected: ExpectedAuthorityPairV1,
+            profile: GenerationRootSecurityProfileV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
         ) -> Result<GenerationPublicationResultV1, GenerationPublicationErrorV1> {
             for (role, receipt) in candidate.manifest().components().iter() {
                 root.stage_immutable_file(
@@ -1044,24 +1049,28 @@ mod tests {
                 candidate.manifest_bytes(),
             )
             .unwrap();
-            let mut publisher = GenerationPublisherV1::new(root, ROOT_ID, [0xb2; 16], PROFILE)?;
+            let mut publisher = GenerationPublisherV1::new(root, ROOT_ID, [0xb2; 16], profile)?;
             let attempt = publisher.prepare_attempt(
                 candidate,
                 expected,
                 candidate.authority().object_id,
                 candidate.authority().object_id,
             )?;
-            publisher.publish_prepared(cx, candidate, &attempt, None, BUDGET as u64)
+            publisher.publish_prepared(cx, candidate, &attempt, floor, BUDGET as u64)
         }
 
         fn open_source(
             cx: &Cx,
             root: &QualifiedGenerationRoot,
             fixture: &Fixture,
+            profile: GenerationRootSecurityProfileV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
         ) -> NativeGenerationVectorSource {
             let VectorSourceOpenOutcomeV1::Opened(opened) = root
                 .open_expected_generation_vector_source_for_recovery_with_budget(
                     ROOT_ID,
+                    profile,
+                    floor,
                     fixture.candidate.authority(),
                     fixture.built.binding().generation(),
                     BUDGET as u64,
@@ -1121,21 +1130,44 @@ mod tests {
         #[test]
         fn damaged_graph_repair_preserves_vectors_and_source_and_publishes_every_topology() {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
-                for (tier, full, empty) in [
-                    (EmbedderTierTag::Fast, false, false),
-                    (EmbedderTierTag::Quality, false, false),
-                    (EmbedderTierTag::Fast, true, false),
-                    (EmbedderTierTag::Fast, true, true),
+                for (tier, full, empty, externally_anchored) in [
+                    (EmbedderTierTag::Fast, false, false, false),
+                    (EmbedderTierTag::Quality, false, false, false),
+                    (EmbedderTierTag::Fast, true, false, false),
+                    (EmbedderTierTag::Fast, true, true, false),
+                    (EmbedderTierTag::Fast, false, false, true),
+                    (EmbedderTierTag::Quality, false, false, true),
+                    (EmbedderTierTag::Fast, true, false, true),
+                    (EmbedderTierTag::Fast, true, true, true),
                 ] {
                     let fixture =
                         fixture_with_policies(&cx, tier, full, hnsw(11), hnsw(29), empty).await;
                     let (directory, root) = root();
+                    let external_floor = externally_anchored.then(|| {
+                        LocalAntiRollbackFloorStoreV1::open(
+                            fixture.directory.path().join("external-floor"),
+                        )
+                        .unwrap()
+                    });
+                    let floor = external_floor
+                        .as_ref()
+                        .map(|floor| floor as &dyn AntiRollbackFloorProviderV1);
+                    let profile = if externally_anchored {
+                        GenerationRootSecurityProfileV1::RequiredExternal
+                    } else {
+                        PROFILE
+                    };
+                    // Bootstrap the previously unselected root with the real
+                    // external CAS. All subsequent reads and repair publication
+                    // require that floor; recovery never weakens its profile.
                     let published = publish(
                         &cx,
                         &root,
                         &fixture.built,
                         &fixture.candidate,
                         ExpectedAuthorityPairV1::default(),
+                        PROFILE,
+                        floor,
                     )
                     .unwrap();
                     assert!(matches!(
@@ -1158,16 +1190,32 @@ mod tests {
                     assert!(matches!(
                         root.open_expected_generation_snapshot_with_budget(
                             ROOT_ID,
-                            PROFILE,
-                            None,
+                            profile,
+                            floor,
                             fixture.candidate.authority(),
                             BUDGET as u64,
                         )
                         .unwrap(),
                         SnapshotOpenOutcomeV1::Refused(_)
                     ));
-                    let source = open_source(&cx, &root, &fixture);
+                    let source = open_source(&cx, &root, &fixture, profile, floor);
                     assert_eq!(source.source().retained_source().authority_pair(), expected);
+                    assert_eq!(source.source().retained_source().profile(), profile);
+                    let initial_floor = external_floor
+                        .as_ref()
+                        .map(|floor| floor.load(ROOT_ID).unwrap().unwrap());
+                    assert_eq!(source.source().retained_source().floor(), initial_floor);
+                    let preserved: Vec<_> = original
+                        .iter()
+                        .filter(|(role, _)| *role != GenerationComponentRole::Ann)
+                        .map(|(role, receipt)| {
+                            let path = directory
+                                .path()
+                                .join(component_object_name_v1(role, receipt.sha256));
+                            let bytes = fs::read(&path).unwrap();
+                            (path, bytes)
+                        })
+                        .collect();
                     let generation = ArtifactGenerationIdentityV1::new(8, [0xc1; 16]).unwrap();
                     assert!(matches!(source.rebuild(
                         &cx, fixture.directory.path().join("repeated-graph"), generation,
@@ -1244,7 +1292,16 @@ mod tests {
                     repaired.validate_candidate(&cx, &candidate).unwrap();
                     assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
                     assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
-                    let published = publish(&cx, &root, &repaired, &candidate, expected).unwrap();
+                    let published = publish(
+                        &cx,
+                        &root,
+                        &repaired,
+                        &candidate,
+                        expected,
+                        source.source().retained_source().profile(),
+                        floor,
+                    )
+                    .unwrap();
                     assert!(matches!(
                         published.publication,
                         PublicationOutcomeV1::Committed { .. }
@@ -1252,6 +1309,43 @@ mod tests {
                     let Some(GenerationActivationV1::Installed(opened)) = published.activation
                     else {
                         panic!("repaired generation must install a complete snapshot");
+                    };
+                    assert_eq!(opened.profile(), profile);
+                    if externally_anchored {
+                        let receipt = opened
+                            .floor()
+                            .expect("repair retains its external CAS receipt");
+                        assert_eq!(receipt.authority, candidate.authority());
+                        assert_eq!(receipt.cas_version, initial_floor.unwrap().cas_version + 1);
+                        assert_eq!(
+                            opened.health(),
+                            SnapshotHealthV1::ExternallyAnchored {
+                                cas_version: receipt.cas_version
+                            }
+                        );
+                    }
+                    drop(opened);
+                    let reopened_root = QualifiedGenerationRoot::admit(
+                        directory.path(),
+                        GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1).unwrap(),
+                    )
+                    .unwrap();
+                    let reopened_floor = external_floor.as_ref().map(|floor| {
+                        LocalAntiRollbackFloorStoreV1::open(floor.directory()).unwrap()
+                    });
+                    let SnapshotOpenOutcomeV1::Opened(opened) = reopened_root
+                        .open_expected_generation_snapshot_with_budget(
+                            ROOT_ID,
+                            profile,
+                            reopened_floor
+                                .as_ref()
+                                .map(|floor| floor as &dyn AntiRollbackFloorProviderV1),
+                            candidate.authority(),
+                            BUDGET as u64,
+                        )
+                        .unwrap()
+                    else {
+                        panic!("a fresh root and floor provider must admit the published repair");
                     };
                     let reader = if let Some(quality) = repaired.quality_binding() {
                         NativeGenerationSnapshot::admit_progressive(
@@ -1306,6 +1400,14 @@ mod tests {
                         fs::read(&graph_path).unwrap(),
                         b"damaged retained accelerator"
                     );
+                    for (path, bytes) in preserved {
+                        assert_eq!(
+                            fs::read(path).unwrap(),
+                            bytes,
+                            "repair preserves incumbent source and vector bytes"
+                        );
+                    }
+                    assert_eq!(source.source().retained_source().floor(), initial_floor);
                     // A second complete build cannot use its captured old physical pair
                     // after the first repair wins, even when its content is otherwise valid.
                     let stale = repaired
@@ -1317,7 +1419,12 @@ mod tests {
                         )
                         .unwrap();
                     let selected_after = fs::read(directory.path().join("AUTHORITY")).unwrap();
-                    if let Ok(result) = publish(&cx, &root, &repaired, &stale, expected) {
+                    let floor_after = external_floor
+                        .as_ref()
+                        .map(|floor| floor.load(ROOT_ID).unwrap());
+                    if let Ok(result) =
+                        publish(&cx, &root, &repaired, &stale, expected, profile, floor)
+                    {
                         assert!(matches!(
                             result.publication,
                             PublicationOutcomeV1::NotCommitted(_)
@@ -1326,6 +1433,12 @@ mod tests {
                     assert_eq!(
                         fs::read(directory.path().join("AUTHORITY")).unwrap(),
                         selected_after
+                    );
+                    assert_eq!(
+                        external_floor
+                            .as_ref()
+                            .map(|floor| floor.load(ROOT_ID).unwrap()),
+                        floor_after
                     );
                 }
             });
@@ -1342,9 +1455,11 @@ mod tests {
                     &fixture.built,
                     &fixture.candidate,
                     ExpectedAuthorityPairV1::default(),
+                    PROFILE,
+                    None,
                 )
                 .unwrap();
-                let source = open_source(&cx, &root, &fixture);
+                let source = open_source(&cx, &root, &fixture, PROFILE, None);
                 for (index, primary, quality) in [
                     (0, NativeBuildRetrieval::Exact, NativeBuildRetrieval::Exact),
                     (1, NativeBuildRetrieval::Exact, hnsw(0)),
@@ -1428,9 +1543,11 @@ mod tests {
                     &fixture.built,
                     &fixture.candidate,
                     ExpectedAuthorityPairV1::default(),
+                    PROFILE,
+                    None,
                 )
                 .unwrap();
-                let source = open_source(&cx, &root, &fixture);
+                let source = open_source(&cx, &root, &fixture, PROFILE, None);
                 let authority = fs::read(directory.path().join("AUTHORITY")).unwrap();
                 let generation = ArtifactGenerationIdentityV1::new(8, [0xe1; 16]).unwrap();
                 let path = fixture.directory.path().join("refused-work");
@@ -1479,6 +1596,8 @@ mod tests {
                 assert!(!matches!(
                     root.open_expected_generation_vector_source_for_recovery_with_budget(
                         ROOT_ID,
+                        PROFILE,
+                        None,
                         fixture.candidate.authority(),
                         fixture.built.binding().generation(),
                         BUDGET as u64,
@@ -1634,6 +1753,8 @@ mod tests {
             let SourceOpenOutcomeV1::Opened(opened) = root
                 .open_expected_generation_source_for_recovery_with_budget(
                     root_id,
+                    profile,
+                    None,
                     fixture.candidate.authority(),
                     fixture.built.binding().generation(),
                     BUDGET as u64,
@@ -1683,6 +1804,8 @@ mod tests {
             assert!(!matches!(
                 root.open_expected_generation_source_for_recovery_with_budget(
                     root_id,
+                    profile,
+                    None,
                     fixture.candidate.authority(),
                     fixture.built.binding().generation(),
                     BUDGET as u64,

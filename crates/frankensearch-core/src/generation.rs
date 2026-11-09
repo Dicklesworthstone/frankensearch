@@ -609,7 +609,19 @@ pub struct AntiRollbackFloorRecordV1 {
 }
 
 impl AntiRollbackFloorRecordV1 {
-    fn new(floor: AuthorityFloorV1, cas_version: u64) -> Result<Self, GenerationAuthorityErrorV1> {
+    /// Seal the exact result of a consumer-owned floor store's successful CAS.
+    ///
+    /// External providers use this canonical constructor instead of duplicating
+    /// the record encoding. The store remains responsible for linearizability,
+    /// durability, monotone versions and exact expected-record comparisons;
+    /// constructing a receipt is not evidence that a CAS actually happened.
+    ///
+    /// # Errors
+    /// Refuses invalid authority/root identities and the reserved zero version.
+    pub fn new(
+        floor: AuthorityFloorV1,
+        cas_version: u64,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
         floor.validate()?;
         if cas_version == 0 {
             return Err(GenerationAuthorityErrorV1::InvalidField {
@@ -627,7 +639,15 @@ impl AntiRollbackFloorRecordV1 {
         Ok(record)
     }
 
-    fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+    /// Validate a provider-supplied receipt's schema, identities, version and seal.
+    ///
+    /// This checks the record itself. Consumers must additionally bind its root
+    /// and authority to the requested operation and require CAS acknowledgements
+    /// to advance the version of the expected record.
+    ///
+    /// # Errors
+    /// Returns a typed invalid-field, identity or checksum refusal.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
         if self.schema_version != ANTI_ROLLBACK_FLOOR_SCHEMA_V1 {
             return Err(GenerationAuthorityErrorV1::InvalidField {
                 field: "anti_rollback_floor.schema_version",

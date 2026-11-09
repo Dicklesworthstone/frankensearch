@@ -280,6 +280,8 @@ fn open_vector_source(
     let budget = u64::try_from(max_image_bytes)?.min(selected.image_bytes);
     let opened = root.open_expected_generation_vector_source_for_recovery_with_budget(
         selected.root_id,
+        PROFILE,
+        None,
         selected.authority()?,
         selected.generation,
         budget,
@@ -329,6 +331,8 @@ fn open_source(
     let budget = u64::try_from(max_image_bytes)?.min(selected.image_bytes);
     let opened = root.open_expected_generation_source_for_recovery_with_budget(
         selected.root_id,
+        PROFILE,
+        None,
         selected.authority()?,
         selected.generation,
         budget,

@@ -6,11 +6,12 @@
 //! physical authority pair.
 
 use super::{
-    ActivationManifest, ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1,
-    ExpectedAuthorityPairV1, GenerationAuthorityErrorV1, GenerationComponentRole,
-    GenerationFileExpectation, GenerationRootAnchorWitness, GenerationRootErrorKind,
-    GenerationRootObjectWitness, GenerationRootResult, GenerationRootSecurityProfileV1,
-    QualifiedGenerationFile, QualifiedGenerationRoot, Round, SNAPSHOT_OPEN_MAX_ATTEMPTS_V1,
+    ActivationManifest, AntiRollbackFloorProviderV1, AntiRollbackFloorRecordV1,
+    ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1, ExpectedAuthorityPairV1,
+    GenerationAuthorityErrorV1, GenerationComponentRole, GenerationFileExpectation,
+    GenerationRootAnchorWitness, GenerationRootErrorKind, GenerationRootObjectWitness,
+    GenerationRootResult, GenerationRootSecurityProfileV1, QualifiedGenerationFile,
+    QualifiedGenerationRoot, Round, SNAPSHOT_OPEN_MAX_ATTEMPTS_V1, SnapshotHealthV1,
     SnapshotRefusalV1, activation_manifest_name_v1, activation_manifest_path_v1, admit_component,
     check_closure, check_image_budget, component_object_name_v1, same_snapshot_anchors,
     verify_authority_manifest_reference,
@@ -33,6 +34,8 @@ pub struct OpenedGenerationSourceV1 {
     profile: GenerationRootSecurityProfileV1,
     pair: ExpectedAuthorityPairV1,
     head: AuthoritySlotV1,
+    floor: Option<AntiRollbackFloorRecordV1>,
+    health: SnapshotHealthV1,
     manifest_file: QualifiedGenerationFile,
     manifest: ActivationManifest,
     lexical: QualifiedGenerationFile,
@@ -76,6 +79,25 @@ impl OpenedGenerationSourceV1 {
         self.head
     }
 
+    /// Exact floor receipt retained across both source-admission rounds.
+    ///
+    /// `RequiredExternal` always retains a receipt naming [`Self::head`].
+    /// A later repair must still publish through the same profile and provider;
+    /// this historical receipt never substitutes for a fresh floor CAS.
+    #[must_use]
+    pub const fn floor(&self) -> Option<AntiRollbackFloorRecordV1> {
+        self.floor
+    }
+
+    /// Authority health at admission, independent of the damaged components.
+    ///
+    /// A pending local successor is never admitted as a recovery source. It
+    /// must be reconciled before building or publishing a replacement.
+    #[must_use]
+    pub const fn health(&self) -> SnapshotHealthV1 {
+        self.health
+    }
+
     /// Authenticated current activation manifest.
     #[must_use]
     pub const fn manifest(&self) -> &ActivationManifest {
@@ -116,8 +138,14 @@ impl fmt::Debug for OpenedGenerationSourceV1 {
         formatter
             .debug_struct("OpenedGenerationSourceV1")
             .field("root", &self.root)
+            .field("profile", &self.profile)
             .field("head_sequence", &self.head.authority.sequence)
             .field("head_slot", &self.head.slot_index)
+            .field(
+                "floor_cas_version",
+                &self.floor.map(|record| record.cas_version),
+            )
+            .field("health", &self.health)
             .field("retained_image_bytes", &self.retained_image_bytes())
             .finish_non_exhaustive()
     }
@@ -193,9 +221,11 @@ impl QualifiedGenerationRoot {
     /// encoded bytes and is checked before vector I/O; ANN is never read.
     /// Unread ANN objects still undergo regular-file and alias inventory checks.
     ///
-    /// This read-only capability supports `CooperativeLocal` without an
-    /// external floor, exactly like source-only recovery. Engine-level vector
-    /// and source identity validation remains mandatory before a repair build.
+    /// The caller supplies the same explicit security profile and floor provider
+    /// as source-only recovery. An external floor remains bound across source
+    /// and vector admission; missing, changed or pending authority is refused.
+    /// Engine-level vector and source identity validation remains mandatory
+    /// before a repair build.
     ///
     /// # Errors
     /// Returns infrastructure errors or typed source, vector, budget, closure
@@ -203,12 +233,16 @@ impl QualifiedGenerationRoot {
     pub fn open_expected_generation_vector_source_for_recovery_with_budget(
         &self,
         root_id: [u8; 16],
+        profile: GenerationRootSecurityProfileV1,
+        floor: Option<&dyn AntiRollbackFloorProviderV1>,
         expected: AuthorityRefV1,
         expected_generation: ArtifactGenerationIdentityV1,
         max_owned_image_bytes: u64,
     ) -> GenerationRootResult<VectorSourceOpenOutcomeV1> {
         let source = match self.open_expected_generation_source_for_recovery_with_budget(
             root_id,
+            profile,
+            floor,
             expected,
             expected_generation,
             max_owned_image_bytes,
@@ -237,14 +271,18 @@ impl QualifiedGenerationRoot {
         };
         for _ in 0..SNAPSHOT_OPEN_MAX_ATTEMPTS_V1 {
             let (resolved, anchors, inventory) =
-                match self.resolution_round(root_id, source.profile(), None)? {
+                match self.resolution_round(root_id, source.profile(), floor)? {
                     Round::Resolved(resolved) => *resolved,
                     Round::Retry => continue,
                     Round::Refused(refusal) => {
                         return Ok(VectorSourceOpenOutcomeV1::Refused(refusal));
                     }
                 };
-            if resolved.pair != source.authority_pair() || resolved.head != source.head() {
+            if resolved.pair != source.authority_pair()
+                || resolved.head != source.head()
+                || resolved.floor != source.floor()
+                || resolved.health != source.health()
+            {
                 return Ok(VectorSourceOpenOutcomeV1::Refused(
                     SnapshotRefusalV1::ExpectedCurrentChanged,
                 ));
@@ -300,8 +338,14 @@ impl QualifiedGenerationRoot {
     /// Two shared-lock resolutions must agree on the entire physical pair and
     /// anchors. The first resolved state remains frozen across transient
     /// retries: a newer winner is refused instead of becoming a repair base.
-    /// Pending publication refuses recovery. Only `CooperativeLocal` without
-    /// an external floor is supported, matching explicit local recovery.
+    /// The caller selects the security profile explicitly. `RequiredExternal`
+    /// requires the supplied floor to name the exact selected head, with the
+    /// identical receipt (including its CAS version) in both rounds. Pending
+    /// publication or a locally advanced but externally unacknowledged successor
+    /// refuses recovery; it cannot be mistaken for a damaged generation that
+    /// needs replacement. `CooperativeLocal` remains explicitly unanchored.
+    /// `ReadOnlyUnanchored` is inspection-only and cannot authorize this repair
+    /// capability. No profile is silently weakened when a floor is unavailable.
     ///
     /// The budget covers the activation, lexical and metadata encoded images,
     /// and is checked before each class of reads. It excludes parsed source
@@ -314,10 +358,22 @@ impl QualifiedGenerationRoot {
     pub fn open_expected_generation_source_for_recovery_with_budget(
         &self,
         root_id: [u8; 16],
+        profile: GenerationRootSecurityProfileV1,
+        floor: Option<&dyn AntiRollbackFloorProviderV1>,
         expected: AuthorityRefV1,
         expected_generation: ArtifactGenerationIdentityV1,
         max_owned_image_bytes: u64,
     ) -> GenerationRootResult<SourceOpenOutcomeV1> {
+        if let Err(error) = profile.require_mutation_authorized() {
+            return Ok(SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Authority(
+                error,
+            )));
+        }
+        if profile == GenerationRootSecurityProfileV1::RequiredExternal && floor.is_none() {
+            return Ok(SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Authority(
+                GenerationAuthorityErrorV1::ExternalFloorRequired,
+            )));
+        }
         if root_id == [0; 16] {
             return Ok(SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Authority(
                 GenerationAuthorityErrorV1::InvalidField {
@@ -330,14 +386,18 @@ impl QualifiedGenerationRoot {
                 error,
             )));
         }
-        let profile = GenerationRootSecurityProfileV1::CooperativeLocal;
         let mut fence = None;
         for _ in 0..SNAPSHOT_OPEN_MAX_ATTEMPTS_V1 {
-            let (first, first_anchors, _) = match self.resolution_round(root_id, profile, None)? {
+            let (first, first_anchors, _) = match self.resolution_round(root_id, profile, floor)? {
                 Round::Resolved(resolved) => *resolved,
                 Round::Retry => continue,
                 Round::Refused(refusal) => return Ok(SourceOpenOutcomeV1::Refused(refusal)),
             };
+            if matches!(first.health, SnapshotHealthV1::PendingLocalSuccessor { .. }) {
+                return Ok(SourceOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::PendingReconciliation,
+                ));
+            }
             if first.head.authority != expected {
                 return Ok(SourceOpenOutcomeV1::Refused(
                     SnapshotRefusalV1::ExpectedCurrentChanged,
@@ -415,7 +475,7 @@ impl QualifiedGenerationRoot {
                 Err(refusal) => return Ok(SourceOpenOutcomeV1::Refused(refusal)),
             };
             let (second, anchors, inventory) =
-                match self.resolution_round(root_id, profile, None)? {
+                match self.resolution_round(root_id, profile, floor)? {
                     Round::Resolved(resolved) => *resolved,
                     Round::Retry => continue,
                     Round::Refused(refusal) => return Ok(SourceOpenOutcomeV1::Refused(refusal)),
@@ -463,6 +523,8 @@ impl QualifiedGenerationRoot {
                 profile,
                 pair: second.pair,
                 head: second.head,
+                floor: second.floor,
+                health: second.health,
                 manifest_file,
                 manifest,
                 lexical,
