@@ -12,7 +12,9 @@ use std::ops::Bound;
 use thiserror::Error;
 
 use crate::schema::{Analyzer as AnalyzerKind, FieldDescriptor, FieldKind, SchemaDescriptor};
-use crate::scribe::{FrankensearchTokenizer, analyze_admitted, is_cass_cjk};
+use crate::scribe::{
+    CassAnalyzer, FrankensearchTokenizer, TokenAnalyzer, analyze_admitted, is_cass_cjk,
+};
 
 /// Maximum number of Unicode scalar values admitted to either native parser.
 pub const MAX_QUERY_LENGTH: usize = 10_000;
@@ -5325,6 +5327,9 @@ impl CassQueryParser {
                 if term.is_empty() {
                     return None;
                 }
+                if let Some(fragments) = cass_indexed_fragments(raw.trim_matches('*')) {
+                    return Some(self.lower_compound(&fragments));
+                }
                 if term.chars().any(is_cass_cjk) {
                     let terms = cass_cjk_terms(&term);
                     return Some(cass_required_query(
@@ -5345,11 +5350,15 @@ impl CassQueryParser {
     }
 
     fn lower_phrase(&self, raw: &str) -> Query {
-        let terms = cass_sanitize_query(raw)
-            .split_whitespace()
-            .map(|term| term.trim_matches('*').to_lowercase())
-            .filter(|term| !term.is_empty())
-            .collect::<Vec<_>>();
+        let mut terms = Vec::new();
+        for term in cass_sanitize_query(raw).split_whitespace() {
+            let term = term.trim_matches('*');
+            match cass_indexed_fragments(term) {
+                Some(fragments) => terms.extend(fragments),
+                None if !term.is_empty() => terms.push(term.to_lowercase()),
+                None => {}
+            }
+        }
         if terms.len() <= 1 || terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
             return self.lower_compound(&terms);
         }
@@ -5367,6 +5376,30 @@ impl CassQueryParser {
             false,
         )
     }
+}
+
+/// The terms the CASS analyzer indexes for `raw`, when `raw` holds a character
+/// outside ASCII and the CJK ranges.
+///
+/// The analyzer treats such characters as separators, so it indexes `kérlek`
+/// as `k` + `rlek`, while query terms keep every Unicode letter. Running the
+/// analyzer itself on the unlowercased text keeps both sides aligned, including
+/// hyphen runs (`a--b`) and case mappings that change length (`İ`). Returns
+/// `None` when no such character occurs or no term remains (`привет`), so those
+/// terms lower exactly as before. Like the parts of a punctuated term, the
+/// fragments are required with AND, so short fragments widen the match
+/// (`mentés` needs `ment` and `s`). Suffix, substring and complex wildcards
+/// keep the accented text and still match nothing. The lexical crate's
+/// `cass_indexed_fragments` is the Tantivy twin of this function.
+fn cass_indexed_fragments(raw: &str) -> Option<Vec<String>> {
+    if raw.chars().all(|ch| ch.is_ascii() || is_cass_cjk(ch)) {
+        return None;
+    }
+    let mut fragments = Vec::new();
+    CassAnalyzer::default().analyze(AnalyzerKind::CassPrefixNormalize, raw, &mut |token| {
+        fragments.push(token.text.clone());
+    });
+    (!fragments.is_empty()).then_some(fragments)
 }
 
 fn required_cass_field<F>(
