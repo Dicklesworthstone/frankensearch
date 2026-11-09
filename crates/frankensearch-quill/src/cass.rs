@@ -8,7 +8,7 @@
 //! [`crate::query::CassQueryParser`] — so this module carries only the
 //! remaining engine-independent pieces: the ingest document shape, the
 //! derived-column rules, and the on-disk namespacing that lets an index
-//! declare which schema generation produced it.
+//! declare which schema and primary-key generation produced it.
 //!
 //! # Why the schema sentinel changes
 //!
@@ -17,8 +17,8 @@
 //! and [`CASS_SCHEMA_HASH`] is exactly the mechanism that makes that rebuild
 //! automatic rather than a corrupt read: a consumer stores the sentinel beside
 //! its index and calls [`cass_schema_hash_matches`] on open. A changed
-//! sentinel means "discard and reindex", which is the correct and only safe
-//! answer here.
+//! sentinel means "rebuild in a new generation". The older directory remains
+//! intact while the caller builds and validates its replacement.
 
 use std::path::{Path, PathBuf};
 
@@ -27,19 +27,21 @@ use crate::scribe::cass_generate_edge_ngrams;
 
 /// Schema generation namespace for Quill-backed CASS indexes.
 ///
-/// This is deliberately not `v8`: `v8` names the Tantivy-era on-disk
-/// generation, and reusing it would invite a consumer to open FSLX segments
-/// with a Tantivy reader or the reverse.
-pub const CASS_SCHEMA_VERSION: &str = "v9-quill";
+/// `v8` names the Tantivy-era on-disk generation. `v9-quill` used ambiguous
+/// delimiter-separated primary keys, so it must also be rebuilt rather than
+/// mixed with this generation's length-prefixed identities.
+pub const CASS_SCHEMA_VERSION: &str = "v10-quill";
 
 /// Rebuild sentinel recorded beside a CASS index.
 ///
 /// It is a descriptive marker rather than a computed digest, matching the
 /// incumbent contract: consumers compare it verbatim and rebuild on any
 /// difference. It names the engine because the engine determines the on-disk
-/// format, and the analyzer family because a tokenizer change silently
-/// invalidates every posting.
-pub const CASS_SCHEMA_HASH: &str = "quill-fslx-schema-v9-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
+/// format, the primary-key encoding because it controls upsert/delete
+/// identity, and the analyzer family because a tokenizer change silently
+/// invalidates every posting. The compiled field descriptor is unchanged;
+/// this application-level sentinel additionally fences document identities.
+pub const CASS_SCHEMA_HASH: &str = "quill-fslx-schema-v10-identity-v1-length-prefixed-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
 
 /// Longest preview retained in the stored `preview` column, in characters.
 pub const PREVIEW_MAX_CHARS: usize = 400;
@@ -223,9 +225,20 @@ impl CassDocument {
 /// treats the document id as a primary key and refuses duplicates, which is how
 /// the collision surfaced at all.
 ///
-/// The conversation discriminator is `conversation_id` when the store has
-/// assigned one, and the transcript path otherwise — a conversation always has
-/// one or the other, and both are stable across reindexing.
+/// The transcript path and, when assigned, `conversation_id` together
+/// discriminate conversations. Every component is kept verbatim: source and
+/// path strings are length-prefixed in UTF-8 bytes, and the conversation id
+/// carries an explicit `some`/`none` tag. Raw separator concatenation is not
+/// injective: path `/a#7` with no id would collide with path `/a` and id `7`.
+/// Such collisions can overwrite or delete a different conversation during
+/// upsert/delete, even when the documents arrive in separate batches.
+///
+/// Identity version 1 is
+/// `cass:1:<source byte length>:<source>:<path byte length>:<path>:none:<ordinal>`
+/// or the same prefix followed by `some:<signed id>:<ordinal>`. Lengths and
+/// integers use canonical decimal; consumers must treat the result as opaque.
+/// The separate [`CASS_SCHEMA_VERSION`] and [`CASS_SCHEMA_HASH`] require a
+/// rebuild of older Quill CASS indexes before this encoding is used.
 #[must_use]
 pub fn cass_document_identity(
     source_id: &str,
@@ -234,8 +247,20 @@ pub fn cass_document_identity(
 ) -> String {
     let path = conversation.source_path;
     conversation.id.map_or_else(
-        || format!("{source_id}#{path}#{msg_idx}"),
-        |id| format!("{source_id}#{path}#{id}#{msg_idx}"),
+        || {
+            format!(
+                "cass:1:{}:{source_id}:{}:{path}:none:{msg_idx}",
+                source_id.len(),
+                path.len()
+            )
+        },
+        |id| {
+            format!(
+                "cass:1:{}:{source_id}:{}:{path}:some:{id}:{msg_idx}",
+                source_id.len(),
+                path.len()
+            )
+        },
     )
 }
 
@@ -1069,6 +1094,13 @@ mod tests {
             )
             .to_schema_document()
         };
+        let message_by_identity: std::collections::BTreeMap<String, u64> = messages
+            .iter()
+            .enumerate()
+            .map(|(position, (session, index, _))| {
+                (document(position, false).id, session * 100 + index)
+            })
+            .collect();
 
         // Each layout is a list of commits; each commit a list of positions.
         let all: Vec<usize> = (0..messages.len()).collect();
@@ -1290,14 +1322,9 @@ mod tests {
                         .hits
                         .iter()
                         .map(|hit| {
-                            let session: u64 = hit.document_id[1..3].parse().expect("session");
-                            let index: u64 = hit
-                                .document_id
-                                .rsplit('#')
-                                .next()
-                                .and_then(|tail| tail.parse().ok())
-                                .expect("msg_idx");
-                            session * 100 + index
+                            *message_by_identity
+                                .get(&hit.document_id)
+                                .expect("result must identify a source message")
                         })
                         .collect();
                     let expected_count = u64::try_from(expected.len()).expect("count");
@@ -1386,8 +1413,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_sentinel_rejects_the_tantivy_generation() {
+    fn schema_sentinel_rejects_previous_identity_and_tantivy_generations() {
         assert!(cass_schema_hash_matches(CASS_SCHEMA_HASH));
+        assert!(
+            !cass_schema_hash_matches(
+                "quill-fslx-schema-v9-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external"
+            ),
+            "ambiguous Quill primary keys must force a rebuild"
+        );
         assert!(
             !cass_schema_hash_matches(
                 "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external"
@@ -1395,6 +1428,25 @@ mod tests {
             "the Tantivy-era sentinel must force a rebuild, never be accepted as current"
         );
         assert!(!cass_schema_hash_matches(""));
+    }
+
+    #[test]
+    fn identity_upgrade_uses_a_new_directory_and_preserves_the_old_generation() {
+        let base = tempfile::tempdir().expect("CASS generation root");
+        let previous = base.path().join("index").join("v9-quill");
+        std::fs::create_dir_all(&previous).expect("create previous CASS generation");
+        let previous_manifest = previous.join("MANIFEST");
+        let sentinel = b"retained previous generation";
+        std::fs::write(&previous_manifest, sentinel).expect("retain previous manifest");
+
+        let current = cass_index_dir(base.path()).expect("create current CASS generation");
+        assert_eq!(current, base.path().join("index").join("v10-quill"));
+        assert_ne!(current, previous);
+        assert!(current.is_dir());
+        assert_eq!(
+            std::fs::read(&previous_manifest).expect("previous manifest remains readable"),
+            sentinel
+        );
     }
 
     /// The ported derivation must be byte-identical to the incumbent.
@@ -1586,7 +1638,7 @@ mod tests {
         use CassConversationKey as Key;
         assert_eq!(
             cass_document_identity("local", Key::new("/a.jsonl", Some(7)), 0),
-            "local#/a.jsonl#7#0"
+            "cass:1:5:local:8:/a.jsonl:some:7:0"
         );
 
         assert_ne!(
@@ -1611,6 +1663,199 @@ mod tests {
             cass_document_identity("local", Key::new("/b.jsonl", None), 0),
             "message 0 of two unassigned conversations must not collide"
         );
+    }
+
+    #[test]
+    fn document_identity_cannot_confuse_delimiters_or_an_absent_conversation_id() {
+        use CassConversationKey as Key;
+
+        assert_ne!(
+            cass_document_identity("local", Key::new("/a#7", None), 0),
+            cass_document_identity("local", Key::new("/a", Some(7)), 0),
+            "a path suffix is not an assigned conversation id"
+        );
+        assert_ne!(
+            cass_document_identity("remote#/a", Key::new("/b", Some(7)), 0),
+            cass_document_identity("remote", Key::new("/a#/b", Some(7)), 0),
+            "source and path must have unambiguous boundaries"
+        );
+
+        let mut identities = std::collections::BTreeSet::new();
+        for source in ["", "local", "local#/a", "local:/a", "日#本", "cass:1:"] {
+            for path in ["", "/a", "/a#7", "/a#-7", "/a:1", "/a#0#", "/日本:🙂"] {
+                for conversation in [
+                    None,
+                    Some(i64::MIN),
+                    Some(-7),
+                    Some(0),
+                    Some(7),
+                    Some(i64::MAX),
+                ] {
+                    for ordinal in [0, 1, u64::MAX] {
+                        assert!(
+                            identities.insert(cass_document_identity(
+                                source,
+                                Key::new(path, conversation),
+                                ordinal,
+                            )),
+                            "distinct source/path/optional-id/ordinal tuples must never collide"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(identities.len(), 756);
+    }
+
+    /// Both historical collision classes must survive the real persistent
+    /// primary-key lifecycle. Querying through newly opened readers catches
+    /// lost postings or wrong tombstones, not just duplicate string outputs.
+    #[test]
+    fn colliding_legacy_identities_remain_independent_through_upsert_delete_and_reopen() {
+        use std::collections::BTreeSet;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("CASS identity index");
+            let config = crate::QuillConfig {
+                deterministic_ingest: true,
+                compaction_tombstone_density: 1.0,
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let mut documents = [
+                sample_document("local", 0, "codex", "identity", "shared original first"),
+                sample_document("local", 0, "codex", "identity", "shared original second"),
+                sample_document("remote#/a", 0, "codex", "identity", "shared original third"),
+                sample_document("remote", 0, "codex", "identity", "shared original fourth"),
+            ];
+            documents[0].source_path = "/a#7".to_owned();
+            documents[0].conversation_id = None;
+            documents[1].source_path = "/a".to_owned();
+            documents[1].conversation_id = Some(7);
+            documents[2].source_path = "/b".to_owned();
+            documents[3].source_path = "/a#/b".to_owned();
+            let projected: Vec<_> = documents
+                .iter()
+                .map(CassDocument::to_schema_document)
+                .collect();
+            let identities: Vec<_> = projected
+                .iter()
+                .map(|document| document.id.clone())
+                .collect();
+
+            let writer = crate::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create CASS writer");
+            writer
+                .index_schema_documents(&cx, &projected)
+                .await
+                .expect("distinct conversations must be admitted in the same batch");
+            writer.commit(&cx).await.expect("publish original messages");
+            drop(writer);
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("CASS parser");
+            let query = |reader: &crate::QuillSearchIndex, text: &str| {
+                let parsed = parser.parse(text, &crate::query::CassQueryFilters::default());
+                let page = reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                    .expect("search retained CASS messages");
+                assert_eq!(page.total_count, Some(page.hits.len() as u64));
+                page.hits
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<BTreeSet<_>>()
+            };
+            let original_reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("reopen original generation");
+            let all_ids: BTreeSet<_> = identities.iter().cloned().collect();
+            assert_eq!(query(&original_reader, "shared"), all_ids);
+
+            let writer = crate::QuillIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("reopen writer for revisions");
+            documents[0].content = "shared revised first".to_owned();
+            documents[2].content = "shared revised third".to_owned();
+            writer
+                .upsert_schema_documents(
+                    &cx,
+                    &[
+                        documents[0].to_schema_document(),
+                        documents[2].to_schema_document(),
+                    ],
+                )
+                .await
+                .expect("revise only the selected conversations");
+            writer.commit(&cx).await.expect("publish revised messages");
+            drop(writer);
+
+            let revised_reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("reopen revised generation");
+            let changed_ids = BTreeSet::from([identities[0].clone(), identities[2].clone()]);
+            let unchanged_ids = BTreeSet::from([identities[1].clone(), identities[3].clone()]);
+            assert_eq!(query(&revised_reader, "shared"), all_ids);
+            assert_eq!(query(&revised_reader, "revised"), changed_ids);
+            assert_eq!(query(&revised_reader, "original"), unchanged_ids);
+            assert_eq!(query(&original_reader, "original"), all_ids);
+
+            let writer = crate::QuillIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("reopen writer for deletions");
+            assert_eq!(
+                writer
+                    .delete_documents(&cx, &[&identities[0], &identities[2]])
+                    .await
+                    .expect("delete only the selected conversations"),
+                2
+            );
+            assert!(
+                !writer
+                    .delete_document(&cx, &identities[0])
+                    .await
+                    .expect("repeated deletion is a no-op")
+            );
+            drop(writer);
+
+            let deleted_reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config,
+            )
+            .await
+            .expect("reopen after targeted deletion");
+            assert_eq!(query(&deleted_reader, "shared"), unchanged_ids);
+            assert!(query(&deleted_reader, "revised").is_empty());
+            assert_eq!(query(&revised_reader, "revised"), changed_ids);
+        });
     }
 
     /// A batch of conversations from one source must be ingestable.
