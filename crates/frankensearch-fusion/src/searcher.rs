@@ -6,11 +6,14 @@
 //!
 //! # Callback Protocol
 //!
-//! The `on_phase` callback fires at most twice:
+//! The `on_phase` callback fires at most three times:
 //! 1. [`SearchPhase::Initial`] — fast-tier results (always fired if search starts).
 //! 2. [`SearchPhase::Refined`] or [`SearchPhase::RefinementFailed`] — quality tier
 //!    result or graceful degradation (only fired when quality embedder is available
 //!    and `fast_only` is false).
+//! 3. [`SearchPhase::Reranked`] — optional cross-encoder or MMR ranking of the
+//!    retained refined candidate pool. Every displayed phase remains bounded to
+//!    the requested result limit.
 
 use ahash::AHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,9 +65,7 @@ use crate::circuit_breaker::{CircuitBreaker, QualityOutcome};
 use crate::conformal::{AdaptiveConformalState, ConformalSearchCalibration};
 #[cfg(feature = "graph")]
 use crate::graph_rank::GraphRanker;
-use crate::mmr::MmrConfig;
-#[cfg(feature = "rerank")]
-use crate::mmr::mmr_rerank;
+use crate::mmr::{MmrConfig, mmr_rerank};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
@@ -469,6 +470,8 @@ pub struct TwoTierSearcher {
     reranker: Option<Arc<dyn Reranker>>,
     #[cfg(feature = "rerank")]
     rerank_combine: frankensearch_rerank::RerankCombine,
+    #[cfg(feature = "rerank")]
+    rerank_window: usize,
     host_adapter: Option<Arc<dyn HostAdapter>>,
     runtime_metrics_collector: Arc<RuntimeMetricsCollector>,
     live_search_stream_emitter: Arc<LiveSearchStreamEmitter>,
@@ -526,6 +529,9 @@ struct RefinementPools {
     /// Lexical pool after exclusion filtering. `None` when no lexical
     /// subsystem is configured; `Some` (possibly empty) when one answered.
     lexical: Option<Vec<ScoredResult>>,
+    /// Own the scoring snapshot until refinement finishes, including metadata
+    /// hydration for candidates promoted from outside the Initial fused pool.
+    lexical_context: Option<LexicalHydrationContext>,
 }
 
 /// What the quality tier contributed to a refinement (bd-ctzo C2).
@@ -550,6 +556,14 @@ enum QualityPool {
 enum Phase2Outcome {
     Refined(Vec<ScoredResult>),
     SkippedZeroSignal,
+}
+
+/// A final phase is emitted only when a configured ranking stage actually ran.
+/// Missing text, rejected model output or absent common-space coverage retain
+/// the already published Refined page without claiming a reranked result.
+struct Phase3Outcome {
+    results: Vec<ScoredResult>,
+    ranker_id: String,
 }
 
 /// Phase-1 fused results plus the refinement pools when refinement is
@@ -612,6 +626,8 @@ impl TwoTierSearcher {
             reranker: None,
             #[cfg(feature = "rerank")]
             rerank_combine: frankensearch_rerank::RerankCombine::PureReorder,
+            #[cfg(feature = "rerank")]
+            rerank_window: frankensearch_rerank::pipeline::DEFAULT_TOP_K_RERANK,
             host_adapter: None,
             runtime_metrics_collector: Arc::new(RuntimeMetricsCollector::default()),
             live_search_stream_emitter: Arc::new(LiveSearchStreamEmitter::default()),
@@ -797,11 +813,43 @@ impl TwoTierSearcher {
         self.rrf_semantic_weight * f64::from(factor)
     }
 
-    /// Set the cross-encoder reranker for Phase 2.
+    /// Set the cross-encoder reranker for the final phase after quality succeeds.
+    ///
+    /// With the `rerank` feature enabled, the search retains up to 100 refined
+    /// candidates by default, independently of the displayed result limit. The
+    /// initial retrieval budgets widen to support that window, so its Initial
+    /// page can differ from an otherwise identical search without reranking.
+    /// Use `with_rerank_window` to choose a different bounded window.
+    /// Without the feature, the provider is retained but never invoked.
     #[must_use]
     pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
         self.reranker = Some(reranker);
         self
+    }
+
+    /// Set the maximum refined candidate window submitted to the cross-encoder.
+    ///
+    /// This is independent of the requested output limit: a top-1 request can
+    /// promote a candidate outside its Initial and Refined pages. The window is
+    /// applied before the ordinary retrieval candidate multiplier; changing it
+    /// can therefore change fusion as well as final ordering. It has no effect
+    /// without a configured reranker. Builder order does not matter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] unless `candidates` is in
+    /// `1..=1000`. Invalid configuration starts no retrieval or model work.
+    #[cfg(feature = "rerank")]
+    pub fn with_rerank_window(mut self, candidates: usize) -> SearchResult<Self> {
+        if !(1..=1_000).contains(&candidates) {
+            return Err(SearchError::InvalidConfig {
+                field: "rerank_window".to_owned(),
+                value: candidates.to_string(),
+                reason: "cross-encoder candidate window must be in 1..=1000".to_owned(),
+            });
+        }
+        self.rerank_window = candidates;
+        Ok(self)
     }
 
     /// Choose how the cross-encoder's rerank scores combine with the retrieval order.
@@ -824,11 +872,40 @@ impl TwoTierSearcher {
         self
     }
 
-    /// Configure MMR diversity reranking for final results.
+    /// Configure MMR diversity ranking after successful quality refinement.
+    ///
+    /// MMR works independently of a cross-encoder and does not require the
+    /// `rerank` feature. Its candidate pool is retained before output is limited
+    /// to `k`, allowing a diverse result below the displayed page to be selected.
+    /// All compared vectors must come from one tier covering the entire pool;
+    /// otherwise MMR is skipped. When a cross-encoder ran first, MMR uses that
+    /// stage's final ordering as relevance, including any RRF combination.
+    /// Enabled candidate pools above 1,000 are rejected by [`Self::search`]
+    /// before retrieval or model work. Pools of zero or one disable MMR work.
     #[must_use]
     pub const fn with_mmr_config(mut self, config: MmrConfig) -> Self {
         self.mmr_config = config;
         self
+    }
+
+    fn final_ranking_enabled(&self) -> bool {
+        #[cfg(feature = "rerank")]
+        if self.reranker.is_some() {
+            return true;
+        }
+        self.mmr_config.enabled && self.mmr_config.candidate_pool > 1
+    }
+
+    fn final_candidate_target(&self, k: usize) -> usize {
+        let mut target = k;
+        #[cfg(feature = "rerank")]
+        if self.reranker.is_some() {
+            target = target.max(self.rerank_window);
+        }
+        if self.mmr_config.enabled {
+            target = target.max(self.mmr_config.candidate_pool);
+        }
+        target
     }
 
     /// Attach adaptive fusion posteriors used for dynamic RRF-K and blend weights.
@@ -1213,6 +1290,8 @@ impl TwoTierSearcher {
     /// Returns `SearchError::Cancelled` if the operation is cancelled via `cx`.
     /// Returns `SearchError::EmbeddingFailed` if fast embedding fails and no
     /// lexical backend is available as fallback.
+    /// Returns `SearchError::InvalidConfig` before retrieval or model work if
+    /// the enabled MMR candidate pool exceeds 1,000.
     #[instrument(skip_all, fields(query_len = query.len(), k))]
     #[allow(clippy::too_many_lines)]
     pub async fn search(
@@ -1227,6 +1306,14 @@ impl TwoTierSearcher {
 
         if query.is_empty() || k == 0 {
             return Ok(metrics);
+        }
+
+        if self.mmr_config.enabled && self.mmr_config.candidate_pool > 1_000 {
+            return Err(SearchError::InvalidConfig {
+                field: "mmr.candidate_pool".to_owned(),
+                value: self.mmr_config.candidate_pool.to_string(),
+                reason: "enabled MMR candidate pool must not exceed 1000".to_owned(),
+            });
         }
 
         // Canonicalize query.
@@ -1309,6 +1396,15 @@ impl TwoTierSearcher {
         }
 
         // Phase 1: Initial (fast tier).
+        // A final ranking window is a retrieval requirement, not a display
+        // limit. Request it once up front so later stages can promote an
+        // undisplayed candidate without re-querying a changing lexical index.
+        // Fast-only and absent-quality paths keep their existing work policy.
+        let candidate_target = if self.should_run_quality() {
+            self.final_candidate_target(k)
+        } else {
+            k
+        };
         let phase1_start = Instant::now();
         let initial = self
             .run_phase1(
@@ -1316,7 +1412,7 @@ impl TwoTierSearcher {
                 semantic_query,
                 &parsed_query,
                 normalized_exclusions.as_ref(),
-                k,
+                candidate_target,
                 query_class,
                 identities.fast.as_ref(),
                 &text_fn,
@@ -1461,7 +1557,7 @@ impl TwoTierSearcher {
                 cx,
                 semantic_query,
                 query_class,
-                k,
+                candidate_target,
                 &initial_hits,
                 refinement_pools.as_ref(),
                 &text_fn,
@@ -1560,7 +1656,9 @@ impl TwoTierSearcher {
                         }
 
                         let phase2_latency = phase2_start.elapsed();
-                        let refined_count = refined_results.len();
+                        let refined_display: Vec<_> =
+                            refined_results.iter().take(k).cloned().collect();
+                        let refined_count = refined_display.len();
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                         self.maybe_record_phase_gate_observation(
                             &initial_hits,
@@ -1592,7 +1690,7 @@ impl TwoTierSearcher {
                         }
                         self.export_search_metrics(query_class, &metrics, refined_count, true);
                         on_phase(SearchPhase::Refined {
-                            results: refined_results.clone(),
+                            results: refined_display,
                             latency: phase2_latency,
                             metrics: PhaseMetrics {
                                 embedder_id: self
@@ -1628,9 +1726,10 @@ impl TwoTierSearcher {
                             return Err(SearchError::Cancelled { phase, reason });
                         }
 
-                        // Phase 3: Reranking (optional, only if feature enabled and reranker present)
-                        #[cfg(feature = "rerank")]
-                        if self.reranker.is_some() {
+                        // Phase 3: optional cross-encoder and/or MMR ranking.
+                        // MMR has no model dependency and remains available in
+                        // the ordinary feature profile.
+                        if self.final_ranking_enabled() {
                             let phase3_start = Instant::now();
                             match self
                                 .run_phase3(
@@ -1643,9 +1742,9 @@ impl TwoTierSearcher {
                                 )
                                 .await
                             {
-                                Ok(reranked_results) => {
+                                Ok(Some(outcome)) => {
                                     let phase3_latency = phase3_start.elapsed();
-                                    let reranked_count = reranked_results.len();
+                                    let reranked_count = outcome.results.len();
 
                                     if let Some(root_request_id) =
                                         telemetry_root_request_id.as_deref()
@@ -1668,14 +1767,10 @@ impl TwoTierSearcher {
                                     }
 
                                     on_phase(SearchPhase::Reranked {
-                                        results: reranked_results,
+                                        results: outcome.results,
                                         latency: phase3_latency + phase2_latency,
                                         metrics: PhaseMetrics {
-                                            embedder_id: self
-                                                .reranker
-                                                .as_ref()
-                                                .map_or("none", |r| r.id())
-                                                .to_owned(),
+                                            embedder_id: outcome.ranker_id,
                                             vectors_searched: metrics.phase2_vectors_searched,
                                             lexical_candidates: metrics.lexical_candidates,
                                             fused_count: reranked_count,
@@ -1685,6 +1780,7 @@ impl TwoTierSearcher {
                                         },
                                     });
                                 }
+                                Ok(None) => {}
                                 Err(SearchError::Cancelled { phase, reason }) => {
                                     if let Some(root_request_id) =
                                         telemetry_root_request_id.as_deref()
@@ -2482,6 +2578,7 @@ impl TwoTierSearcher {
                         semantic_budget,
                         fast_hits,
                         lexical: lexical_results,
+                        lexical_context,
                     }),
                 })
             }
@@ -2559,7 +2656,7 @@ impl TwoTierSearcher {
         Ok(results)
     }
 
-    /// Run Phase 2: quality embedding + blend + optional rerank.
+    /// Run Phase 2: quality embedding and blend, retaining the final ranking pool.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_phase2(
         &self,
@@ -3164,6 +3261,38 @@ impl TwoTierSearcher {
                     &initial_fused_rank,
                 );
             }
+            if let (Some(lexical), Some(context)) = (
+                self.lexical.as_ref(),
+                pools.and_then(|pools| pools.lexical_context.as_ref()),
+            ) {
+                // A quality or final-ranking promotion need not have appeared
+                // in the Initial fused pool. Hydrate its lexical metadata from
+                // the exact snapshot that scored the retained lexical batch.
+                // Already hydrated candidates retain even a legitimate None;
+                // don't repeat their metadata work just because a later phase
+                // uses a wider pool.
+                let mut positions = Vec::new();
+                let mut pending = Vec::new();
+                for (position, result) in results.iter().enumerate() {
+                    if result.lexical_score.is_some()
+                        && !initial_by_doc.contains_key(result.doc_id.as_str())
+                    {
+                        positions.push(position);
+                        pending.push(result.clone());
+                    }
+                }
+                if !pending.is_empty() {
+                    frankensearch_core::with_cancellation(
+                        cx,
+                        "quality_lexical_hydration",
+                        lexical.hydrate_candidates(cx, Some(context), &mut pending),
+                    )
+                    .await?;
+                    for (position, hydrated) in positions.into_iter().zip(pending) {
+                        results[position].metadata = hydrated.metadata;
+                    }
+                }
+            }
             cancellation_checkpoint(cx, "quality_result_construction_to_publish")?;
             if let Some(coverage) = completed_coverage {
                 metrics.coverage = Some(coverage);
@@ -3227,7 +3356,6 @@ impl TwoTierSearcher {
     /// retry the entire pool in the fast space. A pool spanning quality-only
     /// and fast-only documents has no valid comparison space, so MMR is
     /// skipped instead of comparing unrelated coordinates.
-    #[cfg(feature = "rerank")]
     fn mmr_embeddings_in_one_space(
         &self,
         cx: &Cx,
@@ -3260,7 +3388,7 @@ impl TwoTierSearcher {
     }
 
     /// Run Phase 3: cross-encoder reranking and MMR diversity.
-    #[cfg(feature = "rerank")]
+    #[allow(clippy::too_many_lines)]
     async fn run_phase3(
         &self,
         cx: &Cx,
@@ -3269,10 +3397,15 @@ impl TwoTierSearcher {
         mut results: Vec<ScoredResult>,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         metrics: &mut TwoTierMetrics,
-    ) -> SearchResult<Vec<ScoredResult>> {
+    ) -> SearchResult<Option<Phase3Outcome>> {
+        let ranking_start = Instant::now();
+        let mut ranker_id = None;
+        #[cfg(not(feature = "rerank"))]
+        let _ = (query, text_fn);
+
+        #[cfg(feature = "rerank")]
         if let Some(ref reranker) = self.reranker {
-            let rerank_start = Instant::now();
-            let rerank_budget = k.min(results.len());
+            let rerank_budget = self.rerank_window.min(results.len());
             if rerank_budget > 0 {
                 frankensearch_rerank::pipeline::rerank_step_with_combine(
                     cx,
@@ -3281,12 +3414,17 @@ impl TwoTierSearcher {
                     &mut results,
                     text_fn,
                     rerank_budget,
-                    5,
+                    1,
                     self.rerank_combine,
                 )
                 .await?;
+                if results[..rerank_budget]
+                    .iter()
+                    .any(|result| result.rerank_score.is_some())
+                {
+                    ranker_id = Some(reranker.id().to_owned());
+                }
             }
-            metrics.rerank_ms = rerank_start.elapsed().as_secs_f64() * 1000.0;
         }
 
         cancellation_checkpoint(cx, "rerank_to_mmr")?;
@@ -3299,37 +3437,52 @@ impl TwoTierSearcher {
                     let scores = results
                         .iter()
                         .take(pool)
-                        .map(|result| f64::from(result.score))
+                        .enumerate()
+                        .map(|(rank, result)| {
+                            if ranker_id.is_some() {
+                                // The configured combination's order is the
+                                // admitted relevance signal. Retrieval scores
+                                // would undo cross-encoder promotions; raw model
+                                // scores would undo RRF combine. Ordinal weights
+                                // preserve either policy before diversification.
+                                f64::from(u32::try_from(pool - rank).unwrap_or(u32::MAX))
+                            } else {
+                                f64::from(result.score)
+                            }
+                        })
                         .collect::<Vec<_>>();
                     let refs = embeddings
                         .iter()
                         .map(std::vec::Vec::as_slice)
                         .collect::<Vec<_>>();
-                    let order = mmr_rerank(&scores, &refs, pool, &self.mmr_config);
-                    if order.len() == pool {
-                        // `order` is a distinct permutation of `0..pool` (mmr_rerank
-                        // never repeats a candidate), so reorder the head by MOVING
-                        // each element into its MMR position instead of cloning the
-                        // pool twice (once into `head`, once per `order` index). Take
-                        // each slot at most once; the tail is moved through untouched.
+                    let selected = k.min(pool);
+                    let order = mmr_rerank(&scores, &refs, selected, &self.mmr_config);
+                    if order.len() == selected {
+                        // Select only the displayed prefix: computing a full
+                        // permutation would do O(pool²) similarity work even
+                        // for a small page. Move each chosen item once, then
+                        // preserve the untouched tail if k exceeds the pool.
                         let split = pool.min(results.len());
                         let tail = results.split_off(split);
                         let mut slots: Vec<Option<ScoredResult>> =
                             results.into_iter().map(Some).collect();
-                        let mut reranked = Vec::with_capacity(slots.len() + tail.len());
+                        let mut reranked = Vec::with_capacity(k.min(selected + tail.len()));
                         for idx in order {
                             if let Some(item) = slots.get_mut(idx).and_then(Option::take) {
                                 reranked.push(item);
                             }
                         }
-                        reranked.extend(tail);
+                        reranked.extend(tail.into_iter().take(k.saturating_sub(selected)));
                         results = reranked;
+                        ranker_id.get_or_insert_with(|| "mmr".to_owned());
                     }
                 }
             }
         }
 
         cancellation_checkpoint(cx, "mmr_to_explanation")?;
+
+        results.truncate(k);
 
         if self.config.explain {
             for (final_rank, result) in results.iter_mut().enumerate() {
@@ -3356,8 +3509,9 @@ impl TwoTierSearcher {
             }
         }
 
+        metrics.rerank_ms = ranking_start.elapsed().as_secs_f64() * 1000.0;
         cancellation_checkpoint(cx, "explanation_to_publish")?;
-        Ok(results)
+        Ok(ranker_id.map(|ranker_id| Phase3Outcome { results, ranker_id }))
     }
 
     fn export_search_metrics(
@@ -4991,6 +5145,81 @@ mod tests {
             current.blocking_pool_handle().is_some(),
             expected.blocking_pool_handle().is_some()
         );
+    }
+
+    #[derive(Default)]
+    struct RetainedMetadataLexical {
+        epoch: AtomicU64,
+        searches: AtomicU64,
+        hydrated: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl LexicalRead for RetainedMetadataLexical {
+        fn search<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            _limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            panic!("refinement must reuse the original candidate batch")
+        }
+
+        fn search_candidates<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            limit: usize,
+        ) -> SearchFuture<'a, frankensearch_core::LexicalCandidateBatch> {
+            Box::pin(async move {
+                self.searches.fetch_add(1, Ordering::Relaxed);
+                let epoch = self.epoch.load(Ordering::Relaxed);
+                let results = (0..limit.min(18))
+                    .map(|rank| {
+                        let id = if rank == 17 {
+                            "doc-quality-only".to_owned()
+                        } else {
+                            format!("lex-{rank:02}")
+                        };
+                        let mut result = test_scored_result(&id, (18 - rank) as f32);
+                        result.source = ScoreSource::Lexical;
+                        result.fast_score = None;
+                        result.lexical_score = Some(result.score);
+                        result
+                    })
+                    .collect();
+                Ok(frankensearch_core::LexicalCandidateBatch::deferred(
+                    results,
+                    LexicalHydrationContext::new("retained-metadata", Box::new(epoch)),
+                ))
+            })
+        }
+
+        fn hydrate_candidates<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            context: Option<&'a LexicalHydrationContext>,
+            results: &'a mut [ScoredResult],
+        ) -> SearchFuture<'a, ()> {
+            Box::pin(async move {
+                let context = context.expect("the scoring snapshot must survive refinement");
+                assert_eq!(context.backend(), "retained-metadata");
+                let epoch = *context.downcast_ref::<u64>().expect("retained epoch");
+                let mut hydrated = Vec::new();
+                for result in results
+                    .iter_mut()
+                    .filter(|result| result.lexical_score.is_some())
+                {
+                    result.metadata = Some(Arc::new(serde_json::json!({ "epoch": epoch })));
+                    hydrated.push(result.doc_id.to_string());
+                }
+                self.hydrated.lock().unwrap().push(hydrated);
+                Ok(())
+            })
+        }
+
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(18)
+        }
     }
 
     struct DeferredMetadataLexical;
@@ -7521,7 +7750,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "rerank")]
     fn test_scored_result(doc_id: &str, score: f32) -> ScoredResult {
         ScoredResult {
             doc_id: doc_id.to_owned().into(),
@@ -7537,7 +7765,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "rerank")]
     #[test]
     fn mmr_partial_quality_pool_falls_back_entirely_to_fast_space() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -7572,7 +7799,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "rerank")]
     #[test]
     fn mmr_skips_pool_with_no_tier_covering_every_candidate() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -7599,6 +7825,237 @@ mod tests {
                     .is_none(),
                 "MMR must skip when no one vector space covers the whole pool"
             );
+        });
+    }
+
+    #[test]
+    fn mmr_rejects_unbounded_candidates_before_any_top_one_search_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = build_test_index_with_quality(4);
+            let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let text_calls = std::sync::atomic::AtomicUsize::new(0);
+            let lexical = Arc::new(RetainedMetadataLexical::default());
+            for candidate_pool in [1_001, usize::MAX] {
+                for fast_only in [false, true] {
+                    let searcher = TwoTierSearcher::new(
+                        index.clone(),
+                        Arc::new(CountingEmbedder::new("fast", 4, fast_calls.clone())),
+                        TwoTierConfig {
+                            fast_only,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_quality_embedder(Arc::new(CountingEmbedder::new(
+                        "quality",
+                        4,
+                        quality_calls.clone(),
+                    )))
+                    .with_lexical(lexical.clone())
+                    .with_mmr_config(MmrConfig {
+                        enabled: true,
+                        lambda: 0.3,
+                        candidate_pool,
+                    });
+                    let error = searcher
+                        .search(
+                            &cx,
+                            "find relevant documents",
+                            1,
+                            |_| {
+                                text_calls.fetch_add(1, Ordering::Relaxed);
+                                None
+                            },
+                            |_| panic!("invalid MMR configuration must publish no phase"),
+                        )
+                        .await
+                        .expect_err("MMR must not turn top-one into an unbounded retrieval");
+                    assert!(matches!(error,
+                        SearchError::InvalidConfig { field, value, .. }
+                            if field == "mmr.candidate_pool" && value == candidate_pool.to_string()
+                    ));
+                }
+            }
+            assert_eq!(fast_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(quality_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(text_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(lexical.searches.load(Ordering::Relaxed), 0);
+            assert!(lexical.hydrated.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn mmr_disabled_and_trivial_pools_keep_the_refined_page() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (enabled, candidate_pool) in [(true, 0), (true, 1), (false, usize::MAX)] {
+                let (_index_dir, index) = build_test_index_with_quality(4);
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(StubEmbedder::new("fast", 4)),
+                    TwoTierConfig::default(),
+                )
+                .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+                .with_mmr_config(MmrConfig {
+                    enabled,
+                    lambda: 0.3,
+                    candidate_pool,
+                });
+                let mut phases = Vec::new();
+                searcher
+                    .search(
+                        &cx,
+                        "find relevant documents",
+                        1,
+                        |_| panic!("inactive MMR must not hydrate reranking text"),
+                        |phase| match phase {
+                            SearchPhase::Initial { results, .. } => {
+                                assert_eq!(results.len(), 1);
+                                phases.push("initial");
+                            }
+                            SearchPhase::Refined { results, .. } => {
+                                assert_eq!(results.len(), 1);
+                                phases.push("refined");
+                            }
+                            phase => panic!("inactive MMR must not add a phase: {phase:?}"),
+                        },
+                    )
+                    .await
+                    .expect("disabled or trivial MMR preserves ordinary refinement");
+                assert_eq!(phases, ["initial", "refined"]);
+            }
+        });
+    }
+
+    #[test]
+    fn mmr_without_cross_encoder_promotes_an_undisplayed_diverse_candidate() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for lambda in [0.3, 1.0] {
+                let (_index_dir, index) = build_test_index_with_quality(4);
+                let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let text_calls = std::sync::atomic::AtomicUsize::new(0);
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(CountingEmbedder::new("fast", 4, fast_calls.clone())),
+                    TwoTierConfig::default(),
+                )
+                .with_quality_embedder(Arc::new(CountingEmbedder::new(
+                    "quality",
+                    4,
+                    quality_calls.clone(),
+                )))
+                .with_mmr_config(MmrConfig {
+                    enabled: true,
+                    lambda,
+                    candidate_pool: 6,
+                });
+                let mut phases = Vec::new();
+                let mut displayed = Vec::new();
+                searcher
+                    .search(
+                        &cx,
+                        "find diverse relevant documents",
+                        2,
+                        |_| {
+                            text_calls.fetch_add(1, Ordering::Relaxed);
+                            None
+                        },
+                        |phase| {
+                            let results = match phase {
+                                SearchPhase::Initial { results, .. } => {
+                                    phases.push("initial");
+                                    results
+                                }
+                                SearchPhase::Refined { results, .. } => {
+                                    phases.push("refined");
+                                    results
+                                }
+                                SearchPhase::Reranked {
+                                    results, metrics, ..
+                                } => {
+                                    phases.push("reranked");
+                                    assert_eq!(metrics.embedder_id, "mmr");
+                                    assert!(results.iter().all(|hit| hit.rerank_score.is_none()));
+                                    results
+                                }
+                                SearchPhase::RefinementFailed { error, .. } => {
+                                    panic!("quality refinement must succeed: {error}");
+                                }
+                            };
+                            assert_eq!(results.len(), 2, "the pool must not leak into a page");
+                            displayed.push(
+                                results
+                                    .into_iter()
+                                    .map(|hit| hit.doc_id.to_string())
+                                    .collect::<Vec<_>>(),
+                            );
+                        },
+                    )
+                    .await
+                    .expect("standalone MMR search");
+                assert_eq!(phases, ["initial", "refined", "reranked"]);
+                assert_eq!(displayed[0], ["doc-0", "doc-4"]);
+                assert_eq!(displayed[1], ["doc-0", "doc-4"]);
+                if lambda < 1.0 {
+                    assert_eq!(displayed[2], ["doc-0", "doc-1"]);
+                } else {
+                    assert_eq!(displayed[2], displayed[1]);
+                }
+                assert_eq!(fast_calls.load(Ordering::Relaxed), 1);
+                assert_eq!(quality_calls.load(Ordering::Relaxed), 1);
+                assert_eq!(text_calls.load(Ordering::Relaxed), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn mmr_without_a_common_space_does_not_publish_a_reranked_phase() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("mmr-no-common-space-public");
+            let fast_binding = artifact_binding("mmr-fast", 4, 43);
+            let quality_binding = artifact_binding("mmr-quality", 4, 43);
+            let index = owner_backed_partial_quality_index(&dir, &fast_binding, &quality_binding);
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(IdentityCountingEmbedder::new(
+                    "fast",
+                    in_memory_identity("mmr-fast", 4),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::new(IdentityCountingEmbedder::new(
+                "quality",
+                in_memory_identity("mmr-quality", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )))
+            .with_mmr_config(MmrConfig {
+                enabled: true,
+                lambda: 0.3,
+                candidate_pool: 4,
+            });
+            let mut phases = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "find diverse relevant documents",
+                    1,
+                    |_| panic!("MMR must not hydrate cross-encoder text"),
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => {
+                            assert_eq!(results.len(), 1);
+                            phases.push("initial");
+                        }
+                        SearchPhase::Refined { results, .. } => {
+                            assert_eq!(results.len(), 1);
+                            phases.push("refined");
+                        }
+                        phase => panic!("no shared vector space must skip MMR: {phase:?}"),
+                    },
+                )
+                .await
+                .expect("valid quality retrieval remains usable");
+            assert_eq!(phases, ["initial", "refined"]);
         });
     }
 
@@ -9044,6 +9501,72 @@ mod tests {
                     .and_then(serde_json::Value::as_str)
                     == Some("hydrated")
             }));
+        });
+    }
+
+    #[test]
+    fn expanded_refinement_hydrates_promoted_candidates_from_the_scoring_snapshot() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = query_admission_index("exact-v2");
+            let lexical = Arc::new(RetainedMetadataLexical::default());
+            let fast = Arc::new(query_admission_embedder("fast"));
+            let quality = Arc::new(query_admission_embedder("quality"));
+            // Keep the identifier's wider lexical budget, but exercise actual
+            // refinement instead of its ordinary lexical short circuit. A zero
+            // graph weight disables graph work in every feature configuration.
+            let config = TwoTierConfig {
+                graph_ranking_enabled: true,
+                graph_ranking_weight: 0.0,
+                ..TwoTierConfig::default()
+            };
+            let searcher = TwoTierSearcher::new(index, fast.clone(), config)
+                .with_quality_embedder(quality.clone())
+                .with_lexical(lexical.clone())
+                .with_mmr_config(MmrConfig {
+                    enabled: true,
+                    lambda: 0.3,
+                    candidate_pool: 3,
+                });
+            let query = "specific_identifier";
+            assert_eq!(QueryClass::classify(query), QueryClass::Identifier);
+            let mut phases = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    query,
+                    1,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => {
+                            assert_eq!(results.len(), 1);
+                            assert_ne!(results[0].doc_id, "doc-quality-only");
+                            lexical.epoch.store(1, Ordering::Relaxed);
+                            phases.push("initial");
+                        }
+                        SearchPhase::Refined { results, .. } => {
+                            assert_eq!(results.len(), 1);
+                            assert_eq!(results[0].doc_id, "doc-quality-only");
+                            assert_eq!(
+                                results[0].metadata.as_deref().unwrap()["epoch"],
+                                serde_json::json!(0),
+                                "the new live epoch must not replace the scoring snapshot"
+                            );
+                            phases.push("refined");
+                        }
+                        phase => panic!("lexical-only candidates prevent one-space MMR: {phase:?}"),
+                    },
+                )
+                .await
+                .expect("retained promoted metadata");
+            assert_eq!(phases, ["initial", "refined"]);
+            assert_eq!(fast.embed_count(), 1);
+            assert_eq!(quality.embed_count(), 1);
+            assert_eq!(lexical.searches.load(Ordering::Relaxed), 1);
+            assert_eq!(lexical.epoch.load(Ordering::Relaxed), 1);
+            let hydrated = lexical.hydrated.lock().unwrap();
+            assert_eq!(hydrated.len(), 2);
+            assert!(!hydrated[0].iter().any(|id| id == "doc-quality-only"));
+            assert_eq!(hydrated[1], ["doc-quality-only"]);
         });
     }
 
@@ -12249,6 +12772,250 @@ mod tests {
         fn model_name(&self) -> &str {
             "counting-reranker"
         }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[derive(Default)]
+    struct WindowReranker {
+        submitted: Mutex<Vec<Vec<String>>>,
+        malformed: bool,
+    }
+
+    #[cfg(feature = "rerank")]
+    impl Reranker for WindowReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            docs: &'a [frankensearch_core::RerankDocument],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::RerankScore>> {
+            Box::pin(async move {
+                self.submitted
+                    .lock()
+                    .unwrap()
+                    .push(docs.iter().map(|doc| doc.doc_id.clone()).collect());
+                Ok(docs
+                    .iter()
+                    .enumerate()
+                    .map(|(original_rank, doc)| frankensearch_core::RerankScore {
+                        doc_id: if self.malformed {
+                            "foreign-document".to_owned()
+                        } else {
+                            doc.doc_id.clone()
+                        },
+                        score: if doc.doc_id == "doc-b" { 1.0 } else { 0.1 },
+                        original_rank,
+                        raw_logit: None,
+                    })
+                    .collect())
+            })
+        }
+
+        fn id(&self) -> &str {
+            "window-reranker"
+        }
+
+        fn model_name(&self) -> &str {
+            "window-reranker"
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn rerank_window_promotes_an_undisplayed_candidate_for_top_one() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_index_dir, index) = query_admission_index(layout);
+                for window in [1, 3] {
+                    for mmr in [false, true] {
+                        let fast = Arc::new(query_admission_embedder("fast"));
+                        let quality = Arc::new(query_admission_embedder("quality"));
+                        let reranker = Arc::new(WindowReranker::default());
+                        let searcher = TwoTierSearcher::new(
+                            index.clone(),
+                            fast.clone(),
+                            TwoTierConfig::default(),
+                        )
+                        .with_quality_embedder(quality.clone());
+                        let mut searcher = if window == 1 {
+                            searcher
+                                .with_reranker(reranker.clone())
+                                .with_rerank_window(window)
+                                .unwrap()
+                        } else {
+                            searcher
+                                .with_rerank_window(window)
+                                .unwrap()
+                                .with_reranker(reranker.clone())
+                        };
+                        if mmr {
+                            searcher = searcher.with_mmr_config(MmrConfig {
+                                enabled: true,
+                                lambda: 1.0,
+                                candidate_pool: 3,
+                            });
+                        }
+                        let mut phases = Vec::new();
+                        let mut final_results = Vec::new();
+                        searcher
+                            .search(
+                                &cx,
+                                "find the most relevant document",
+                                1,
+                                |id| Some(format!("text for {id}")),
+                                |phase| match phase {
+                                    SearchPhase::Initial { results, .. } => {
+                                        assert_eq!(results.len(), 1);
+                                        assert_eq!(results[0].doc_id, "doc-a");
+                                        assert!(results[0].rerank_score.is_none());
+                                        phases.push("initial");
+                                    }
+                                    SearchPhase::Refined { results, .. } => {
+                                        assert_eq!(results.len(), 1);
+                                        assert_eq!(results[0].doc_id, "doc-quality-only");
+                                        assert!(results[0].rerank_score.is_none());
+                                        phases.push("refined");
+                                    }
+                                    SearchPhase::Reranked { results, .. } => {
+                                        assert_eq!(results.len(), 1);
+                                        final_results = results;
+                                        phases.push("reranked");
+                                    }
+                                    SearchPhase::RefinementFailed { error, .. } => {
+                                        panic!("{layout}: quality failed: {error}");
+                                    }
+                                },
+                            )
+                            .await
+                            .expect("bounded rerank window");
+                        assert_eq!(phases, ["initial", "refined", "reranked"]);
+                        let expected = if window == 1 {
+                            "doc-quality-only"
+                        } else {
+                            "doc-b"
+                        };
+                        assert_eq!(final_results[0].doc_id, expected, "{layout}/MMR={mmr}");
+                        assert!(final_results[0].rerank_score.is_some());
+                        assert_eq!(final_results[0].source, ScoreSource::Reranked);
+                        let submitted = reranker.submitted.lock().unwrap();
+                        assert_eq!(submitted.len(), 1, "inference must not restart");
+                        assert_eq!(submitted[0].len(), window);
+                        assert_eq!(submitted[0].iter().any(|id| id == "doc-b"), window == 3);
+                        assert_eq!(fast.embed_count(), 1);
+                        assert_eq!(quality.embed_count(), 1);
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn rerank_unavailable_text_or_rejected_response_keeps_the_refined_phase() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = query_admission_index("exact-v2");
+            for has_text in [false, true] {
+                let reranker = Arc::new(WindowReranker {
+                    malformed: has_text,
+                    ..WindowReranker::default()
+                });
+                let searcher = TwoTierSearcher::new(
+                    index.clone(),
+                    Arc::new(query_admission_embedder("fast")),
+                    TwoTierConfig::default(),
+                )
+                .with_quality_embedder(Arc::new(query_admission_embedder("quality")))
+                .with_reranker(reranker.clone());
+                let mut phases = Vec::new();
+                searcher
+                    .search(
+                        &cx,
+                        "find relevant documents",
+                        1,
+                        |_| has_text.then(|| "text".to_owned()),
+                        |phase| match phase {
+                            SearchPhase::Initial { .. } => phases.push("initial"),
+                            SearchPhase::Refined { results, .. } => {
+                                assert_eq!(results.len(), 1);
+                                assert_eq!(results[0].doc_id, "doc-quality-only");
+                                assert!(results[0].rerank_score.is_none());
+                                phases.push("refined");
+                            }
+                            phase => panic!("unapplied reranking must not publish: {phase:?}"),
+                        },
+                    )
+                    .await
+                    .expect("graceful final ranking skip");
+                assert_eq!(phases, ["initial", "refined"]);
+                let submitted = reranker.submitted.lock().unwrap();
+                assert_eq!(submitted.len(), usize::from(has_text));
+                if has_text {
+                    assert_eq!(
+                        submitted[0].len(),
+                        3,
+                        "default window includes the full cohort"
+                    );
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn rerank_window_rejects_unbounded_work_and_preserves_fast_only_policy() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = query_admission_index("exact-v2");
+            let fast = Arc::new(query_admission_embedder("fast"));
+            let quality = Arc::new(query_admission_embedder("quality"));
+            let reranker = Arc::new(WindowReranker::default());
+            for invalid in [0, 1_001, usize::MAX] {
+                let error =
+                    TwoTierSearcher::new(index.clone(), fast.clone(), TwoTierConfig::default())
+                        .with_reranker(reranker.clone())
+                        .with_rerank_window(invalid)
+                        .expect_err("invalid window must be rejected before work");
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, .. } if field == "rerank_window")
+                );
+            }
+            assert_eq!(fast.embed_count(), 0);
+            assert!(reranker.submitted.lock().unwrap().is_empty());
+            let searcher = TwoTierSearcher::new(
+                index,
+                fast.clone(),
+                TwoTierConfig {
+                    fast_only: true,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_quality_embedder(quality.clone())
+            .with_reranker(reranker.clone())
+            .with_mmr_config(MmrConfig {
+                enabled: true,
+                lambda: 0.3,
+                candidate_pool: 30,
+            });
+            for k in [0, 1] {
+                let mut phases = 0;
+                searcher
+                    .search(
+                        &cx,
+                        "find relevant documents",
+                        k,
+                        |_| panic!("fast-only must not start final text hydration"),
+                        |phase| {
+                            assert!(matches!(phase, SearchPhase::Initial { .. }));
+                            phases += 1;
+                        },
+                    )
+                    .await
+                    .expect("fast-only policy");
+                assert_eq!(phases, k);
+            }
+            assert_eq!(fast.embed_count(), 1);
+            assert_eq!(quality.embed_count(), 0);
+            assert!(reranker.submitted.lock().unwrap().is_empty());
+        });
     }
 
     // ─── Cache-wiring tests ────────────────────────────────────────────

@@ -474,7 +474,7 @@ pub struct TwoTierMetrics {
     pub quality_search_ms: f64,
     /// Time spent on two-tier blending.
     pub blend_ms: f64,
-    /// Time spent on cross-encoder reranking.
+    /// Time spent on final ranking (cross-encoder and/or MMR diversification).
     pub rerank_ms: f64,
     /// Total time for Phase 2 (Refined results).
     pub phase2_total_ms: f64,
