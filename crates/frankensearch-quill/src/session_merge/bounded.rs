@@ -784,6 +784,9 @@ mod publication_tests {
     fn config() -> QuillConfig {
         QuillConfig {
             deterministic_ingest: true,
+            // Keep the tombstoned source row for the bounded merge to handle;
+            // automatic compaction would fold it before this probe starts.
+            compaction_tombstone_density: 1.0,
             ..QuillConfig::default()
         }
     }
@@ -823,6 +826,7 @@ mod publication_tests {
         let snapshot = index.snapshot().expect("fixture authority");
         assert_eq!(snapshot.segments().len(), 3);
         assert_eq!(snapshot.doc_count(), 5);
+        assert_eq!(snapshot.tombstone_count(), 1);
         assert_eq!(
             snapshot
                 .loaded_manifest()
