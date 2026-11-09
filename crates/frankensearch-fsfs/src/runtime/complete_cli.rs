@@ -2,6 +2,7 @@
 //! to the legacy mutable layout, including when its selection is corrupt.
 
 use std::fs;
+use std::future::Future;
 use std::io::{ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -1314,6 +1315,32 @@ impl FsfsRuntime {
         started: Instant,
         writer: &mut W,
     ) -> SearchResult<()> {
+        self.run_complete_expanded_search_with_query_expansion(
+            cx,
+            root,
+            query,
+            limit,
+            started,
+            writer,
+            Self::expand_search_query(cx, query),
+        )
+        .await
+    }
+
+    async fn run_complete_expanded_search_with_query_expansion<W, F>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        query: &str,
+        limit: usize,
+        started: Instant,
+        writer: &mut W,
+        expansion: F,
+    ) -> SearchResult<()>
+    where
+        W: Write + Send,
+        F: Future<Output = SearchResult<crate::query_expansion::ExpansionResult>> + Send,
+    {
         // Pin before the expansion request. A publication during the LLM call
         // or between variants must not mix lexical, vector or catalog inputs.
         let mut reader = self.open_retained_search(cx, root).await?;
@@ -1326,7 +1353,7 @@ impl FsfsRuntime {
             );
         }
         if !self.cli_input.stream {
-            let expansion = Self::expand_search_query(cx, query).await?;
+            let expansion = super::with_cancellation(cx, "fsfs.query_expansion", expansion).await?;
             let payload = Self::execute_retained_expanded_queries(
                 cx,
                 &mut reader,
@@ -1344,88 +1371,33 @@ impl FsfsRuntime {
         }
 
         let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
-        let mut seq = 0;
+        // Share the progressive stream's single original retrieval, cancellation
+        // wakeups and output ownership. The retained resources keep every query
+        // variant on this admitted generation even if publication advances.
         reader
             .runtime
-            .emit_search_stream_started(query, &stream_id, &mut seq, writer)?;
-        let result = async {
-            // Deliver Initial immediately. Retain the ordinary terminal phase
-            // until expansion chooses the single final ranking for this stream.
-            let mut sink = |payload: &crate::output_schema::SearchPayload| {
-                if payload.phase == crate::output_schema::SearchOutputPhase::Initial {
-                    self.emit_search_stream_payload(payload, &stream_id, &mut seq, writer)?;
-                }
-                Ok(())
-            };
-            let mode = reader.search_mode()?;
-            let original = reader
-                .runtime
-                .execute_search_phase_artifacts_with_mode_using_resources(
-                    cx,
-                    query,
-                    limit,
-                    mode,
-                    &mut reader.resources,
-                    SearchExecutionFlags {
+            .run_search_stream_with_query_expansion(
+                cx,
+                query,
+                limit,
+                &stream_id,
+                writer,
+                Some(SearchStreamResources {
+                    resources: &mut reader.resources,
+                    flags: SearchExecutionFlags {
                         include_snippets: true,
-                        persist_explain_session: false,
+                        persist_explain_session: true,
                     },
-                    Some(&mut sink),
-                )
-                .await?;
-            let expansion = Self::expand_search_query(cx, query).await?;
-            if expansion.queries.len() > 1 {
-                let payload = Self::execute_retained_expanded_queries(
-                    cx,
-                    &mut reader,
-                    query,
-                    limit,
-                    &expansion.queries,
-                )
-                .await?;
-                self.emit_search_stream_payload_with_stage(
-                    &payload,
-                    &stream_id,
-                    &mut seq,
-                    writer,
-                    Some(Self::expanded_search_stream_stage(&payload)),
-                )?;
-                self.emit_search_stream_explanations(&payload, &stream_id, &mut seq, writer)?;
-                retained_search_checkpoint(cx)?;
-                reader
-                    .runtime
-                    .invalidate_complete_generation_explanation(query)?;
-            } else {
-                let mut last = original
-                    .last()
-                    .cloned()
-                    .ok_or_else(|| complete_cli_error("search", "search returned no phase"))?;
-                reader.runtime.attach_complete_search_explanations(
-                    cx,
-                    &mut last,
-                    &reader.resources,
-                )?;
-                if last.phase != crate::output_schema::SearchOutputPhase::Initial {
-                    self.emit_search_stream_payload(&last.payload, &stream_id, &mut seq, writer)?;
-                }
-                self.emit_search_stream_explanations(&last.payload, &stream_id, &mut seq, writer)?;
-                retained_search_checkpoint(cx)?;
-                reader.runtime.persist_search_artifact_explanation(
-                    &reader.resources.index_root,
-                    query,
-                    &last,
-                );
-            }
-            Ok(())
-        }
-        .await;
-        match result {
-            Ok(()) => self.emit_search_stream_terminal_completed(&stream_id, &mut seq, writer),
-            Err(error) => {
-                self.emit_search_stream_terminal_error(&stream_id, &error, &mut seq, writer)?;
-                Err(error)
-            }
-        }
+                    requested_mode: reader.runtime.requested_search_mode(),
+                }),
+                expansion,
+            )
+            .await
+            .map_err(|error| {
+                crate::output_schema::mark_output_reported(crate::output_schema::output_error_from(
+                    &error,
+                ))
+            })
     }
 
     async fn execute_retained_expanded_queries(
@@ -2538,6 +2510,7 @@ mod tests {
     struct DashboardEmbedder {
         identity: EmbeddingIdentityBundleV1,
         category: ModelCategory,
+        recorded_texts: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     #[cfg(feature = "semantic-support")]
@@ -2546,7 +2519,10 @@ mod tests {
             Ok(&self.identity)
         }
 
-        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            if let Some(recorded) = &self.recorded_texts {
+                recorded.lock().unwrap().push(text.to_owned());
+            }
             Box::pin(async { Ok(vec![1.0, 0.0, 0.0]) })
         }
 
@@ -2587,10 +2563,12 @@ mod tests {
             set_test_fast_embedder(Some(Arc::new(DashboardEmbedder {
                 identity: EmbeddingIdentityBundleV1::explicit_test_model("dashboard-fast", 3),
                 category: ModelCategory::StaticEmbedder,
+                recorded_texts: None,
             })));
             set_test_quality_embedder(Some(Arc::new(DashboardEmbedder {
                 identity: EmbeddingIdentityBundleV1::explicit_test_model("dashboard-quality", 3),
                 category: ModelCategory::TransformerEmbedder,
+                recorded_texts: None,
             })));
             previous
         }
@@ -3634,6 +3612,227 @@ mod tests {
                     .unwrap(),
                 Some(selected),
             );
+        });
+    }
+
+    fn expansion_stream_frames(
+        format: OutputFormat,
+        bytes: &[u8],
+    ) -> Vec<StreamFrame<SearchHitPayload>> {
+        let text = std::str::from_utf8(bytes).unwrap();
+        if format == OutputFormat::Toon {
+            text.split(crate::stream_protocol::TOON_STREAM_RECORD_SEPARATOR)
+                .filter(|frame| !frame.trim().is_empty())
+                .map(|frame| crate::stream_protocol::decode_stream_frame_toon(frame).unwrap())
+                .collect()
+        } else {
+            text.lines()
+                .map(|frame| crate::stream_protocol::decode_stream_frame_ndjson(frame).unwrap())
+                .collect()
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_expansion_stream_retrieves_original_once_and_retains_one_generation() {
+        use crate::query_expansion::{ExpandedQuery, ExpansionResult, ExpansionStrategy};
+        use crate::stream_protocol::{StreamEvent, StreamEventKind, StreamTerminalStatus};
+
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        scheduler.block_on(async move {
+            let cx = Cx::current().unwrap();
+            let _embedders = RestoreDashboardEmbedders::install();
+            let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+            set_test_fast_embedder(Some(Arc::new(DashboardEmbedder {
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("dashboard-fast", 3),
+                category: ModelCategory::StaticEmbedder,
+                recorded_texts: Some(Arc::clone(&recorded)),
+            })));
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            fs::write(source.join("beta.md"), "sharedtoken beta document").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let predecessor = store.active(&cx).unwrap().unwrap();
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            let original_selection = fs::read(&pointer).unwrap();
+            fs::write(source.join("gamma.md"), "sharedtoken gamma successor document").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let successor = store.active(&cx).unwrap().unwrap();
+            let new_selection = fs::read(&pointer).unwrap();
+            let before = sealed_inventory(predecessor.path());
+            let successor_before = sealed_inventory(successor.path());
+            let query = "how to find sharedtoken original documents";
+            let generated_query = "where is the gamma successor document";
+
+            for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+                for generate in [false, true] {
+                    fs::write(&pointer, &original_selection).unwrap();
+                    recorded.lock().unwrap().clear();
+                    let mut search = search_runtime(&runtime);
+                    search.cli_input.stream = true;
+                    search.cli_input.expand = true;
+                    search.cli_input.format = format;
+                    let mut output = Vec::new();
+                    search
+                        .run_complete_expanded_search_with_query_expansion(
+                            &cx, &root, query, 10, Instant::now(), &mut output,
+                            async {
+                                assert_eq!(recorded.lock().unwrap().iter().filter(|text| text.as_str() == query).count(), 1);
+                                // Simulate an already sealed successor becoming selected while
+                                // the query generator is in flight. Its rows must stay invisible
+                                // to this retained request and its explanation context.
+                                fs::write(&pointer, &new_selection).unwrap();
+                                let mut queries = vec![ExpandedQuery {
+                                    text: query.to_owned(), strategy: ExpansionStrategy::Original,
+                                }];
+                                if generate {
+                                    queries.push(ExpandedQuery {
+                                        text: generated_query.to_owned(), strategy: ExpansionStrategy::Keyword,
+                                    });
+                                }
+                                Ok(ExpansionResult { queries, backend_used: None, elapsed_ms: 0 })
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let texts = recorded.lock().unwrap();
+                    assert_eq!(texts.iter().filter(|text| text.as_str() == query).count(), 1);
+                    assert_eq!(texts.iter().filter(|text| text.as_str() == generated_query).count(), usize::from(generate));
+                    drop(texts);
+                    let frames = expansion_stream_frames(format, &output);
+                    assert_eq!(frames.iter().filter(|frame| frame.event.kind() == StreamEventKind::Terminal).count(), 1);
+                    assert!(matches!(frames.last().map(|frame| &frame.event),
+                        Some(StreamEvent::Terminal(terminal)) if terminal.status == StreamTerminalStatus::Completed));
+                    assert!(frames.iter().any(|frame| matches!(&frame.event, StreamEvent::Result(_))));
+                    assert!(!frames.iter().any(|frame| matches!(&frame.event,
+                        StreamEvent::Result(result) if result.item.path == "gamma.md")));
+                    assert_eq!(store.active(&cx).unwrap(), Some(successor.clone()));
+                    assert_eq!(sealed_inventory(predecessor.path()), before);
+                    assert_eq!(sealed_inventory(successor.path()), successor_before);
+                    let session = FsfsRuntime::load_explain_session_at_root(&root).unwrap().unwrap();
+                    assert_eq!(session.complete_generation.as_ref().unwrap().id, predecessor.id());
+                    assert_eq!(session.unavailable.is_some(), generate);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn complete_expansion_stream_cancels_a_pending_generator_with_one_owned_terminal() {
+        use crate::stream_protocol::{StreamEvent, StreamEventKind, StreamTerminalStatus};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        scheduler.block_on(async move {
+            let cx = Cx::current().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let before = sealed_inventory(&root);
+            for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+                let mut search = search_runtime(&runtime);
+                search.cli_input.stream = true;
+                search.cli_input.expand = true;
+                search.cli_input.format = format;
+                let entered = AtomicBool::new(false);
+                let mut output = Vec::new();
+                let mut operation = Box::pin(search.run_complete_expanded_search_with_query_expansion(
+                    &cx, &root, "sharedtoken", 10, Instant::now(), &mut output,
+                    async {
+                        entered.store(true, Ordering::SeqCst);
+                        std::future::pending::<SearchResult<crate::query_expansion::ExpansionResult>>().await
+                    },
+                ));
+                std::future::poll_fn(|task| {
+                    assert!(operation.as_mut().poll(task).is_pending());
+                    if entered.load(Ordering::SeqCst) { Poll::Ready(()) } else { Poll::Pending }
+                }).await;
+                cx.cancel_with(asupersync::CancelKind::User, Some("cancel complete expansion"));
+                let error = operation.await.unwrap_err();
+                cx.set_cancel_requested(false);
+                let reported = crate::output_schema::reported_output_error(&error)
+                    .expect("main must not append an ordinary error after this stream");
+                assert_eq!(reported.code, "cancelled");
+                assert_eq!(reported.exit_code, 130);
+                let frames = expansion_stream_frames(format, &output);
+                assert!(frames.iter().any(|frame| matches!(&frame.event, StreamEvent::Result(_))));
+                assert_eq!(frames.iter().filter(|frame| frame.event.kind() == StreamEventKind::Terminal).count(), 1);
+                assert!(matches!(frames.last().map(|frame| &frame.event),
+                    Some(StreamEvent::Terminal(terminal)) if terminal.status == StreamTerminalStatus::Cancelled));
+                assert_eq!(sealed_inventory(&root), before);
+            }
+        });
+    }
+
+    #[test]
+    fn complete_expansion_stream_never_retries_partial_output_or_a_failed_flush() {
+        struct FailingWriter {
+            flushes: usize,
+            fail_flush: bool,
+            partial: bool,
+            failed: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(!self.failed, "no terminal or replay after a partial frame");
+                if self.flushes == 1 && !self.fail_flush {
+                    if self.partial {
+                        self.failed = true;
+                        return Err(ErrorKind::BrokenPipe.into());
+                    }
+                    self.partial = true;
+                    return Ok(bytes.len().min(7));
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert!(!self.failed, "no flush after transport failure");
+                if self.flushes == 1 && self.fail_flush {
+                    self.failed = true;
+                    return Err(ErrorKind::BrokenPipe.into());
+                }
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let before = sealed_inventory(&root);
+            for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+                for fail_flush in [false, true] {
+                    let mut search = search_runtime(&runtime);
+                    search.cli_input.stream = true;
+                    search.cli_input.expand = true;
+                    search.cli_input.format = format;
+                    let mut writer = FailingWriter {
+                        flushes: 0,
+                        fail_flush,
+                        partial: false,
+                        failed: false,
+                    };
+                    let error = search
+                        .run_complete_generation_search_with_writer(&cx, &root, &mut writer)
+                        .await
+                        .unwrap_err();
+                    assert!(writer.failed, "the injected transport failure must occur");
+                    assert_eq!(writer.flushes, 1, "Started is visible before the failure");
+                    let reported = crate::output_schema::reported_output_error(&error)
+                        .expect("main must not emit another envelope after transport failure");
+                    assert_eq!(reported.code, "io_error");
+                    assert_eq!(sealed_inventory(&root), before);
+                }
+            }
         });
     }
 
