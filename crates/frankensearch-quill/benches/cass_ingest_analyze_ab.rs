@@ -34,9 +34,10 @@
 //! over the full shipping `index_schema_documents` route on a one-thread pool.
 //!
 //! ```bash
-//! RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_PROFILE_RELEASE_LTO=false \
+//! CARGO_PROFILE_RELEASE_LTO=false \
 //!   CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 QUILL_INGEST_ROUNDS=15 QUILL_INGEST_FANOUT=8 \
-//!   cargo bench -p frankensearch-quill --features bench-internals \
+//!   RCH_REQUIRE_REMOTE=1 rch exec -- \
+//!   cargo bench --locked -p frankensearch-quill --features bench-internals \
 //!     --profile release --bench cass_ingest_analyze_ab
 //! ```
 
