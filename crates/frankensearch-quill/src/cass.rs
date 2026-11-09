@@ -1769,7 +1769,7 @@ mod tests {
                 assert_eq!(page.total_count, Some(page.hits.len() as u64));
                 page.hits
                     .into_iter()
-                    .map(|hit| hit.document_id)
+                    .map(|hit| hit.document_id.clone())
                     .collect::<BTreeSet<_>>()
             };
             let original_reader = crate::QuillSearchIndex::open_with_schema(
