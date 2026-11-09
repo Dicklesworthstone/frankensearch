@@ -12432,7 +12432,7 @@ impl QuillReader {
     /// Split one document's score for `query` by clause and field.
     ///
     /// Every scoring leaf of the parsed query is evaluated once per field
-    /// under its inherited boosts, seeking the document in its owning leaf
+    /// under its inherited boosts, walking to the document in its owning leaf
     /// without changing the scorer tree. Enclosing Boolean branches must match
     /// before their descendants contribute: a term can occur in the document
     /// while the conjunction or exclusion containing it still fails.
@@ -12496,19 +12496,36 @@ impl QuillReader {
                 topdocs_root,
             )
         };
-        let score_of = |clause: Query| -> Result<Option<f32>, QuillIndexError> {
-            let mut scorer = lower_explanation(&clause, true)?;
-            let matches = scorer.advance(global_docid)? == Some(global_docid);
-            check_cancel(cx, "explain")?;
-            if matches {
-                let score = scorer.score()?;
+        let score_of =
+            |clause: Query, walk_ranked_prefix: bool| -> Result<Option<f32>, QuillIndexError> {
+                let mut scorer = lower_explanation(&clause, true)?;
+                // Seeking skips the arrivals and exhausted-child removals that
+                // determine a buffered union's f32 addition order. Score preceding
+                // matches too: RequiredOptional advances its optional tree lazily
+                // during score(), just as the ranked collector evaluates it.
+                if walk_ranked_prefix {
+                    while scorer.doc().is_some_and(|doc| doc < global_docid) {
+                        let _ = scorer.score()?;
+                        check_cancel(cx, "explain")?;
+                        scorer.next()?;
+                    }
+                } else {
+                    // Isolated clauses retain point evaluation: their ancestors
+                    // may skip earlier matches, whose scores need not be valid
+                    // outside the complete query's traversal.
+                    scorer.advance(global_docid)?;
+                }
+                let matches = scorer.doc() == Some(global_docid);
                 check_cancel(cx, "explain")?;
-                Ok(Some(score))
-            } else {
-                Ok(None)
-            }
-        };
-        let Some(score) = score_of(parsed.query.clone())? else {
+                if matches {
+                    let score = scorer.score()?;
+                    check_cancel(cx, "explain")?;
+                    Ok(Some(score))
+                } else {
+                    Ok(None)
+                }
+            };
+        let Some(score) = score_of(parsed.query.clone(), true)? else {
             return Ok(None);
         };
         let field_name = |field_id: u16| {
@@ -12524,7 +12541,7 @@ impl QuillReader {
             check_cancel(cx, "explain")?;
             let contribution_of = |clause: Query| -> Result<f32, QuillIndexError> {
                 if branch_matches {
-                    Ok(score_of(Query::boost(clause, boost))?.unwrap_or(0.0))
+                    Ok(score_of(Query::boost(clause, boost), false)?.unwrap_or(0.0))
                 } else {
                     Ok(0.0)
                 }
@@ -12538,10 +12555,13 @@ impl QuillReader {
                     // discard zero-boost branches.
                     let branch_matches = branch_matches
                         && (node == parsed.query.root_id()
-                            || score_of(Query::boost(
-                                copy_explanation_subquery(cx, &parsed.query, node)?,
-                                boost,
-                            ))?
+                            || score_of(
+                                Query::boost(
+                                    copy_explanation_subquery(cx, &parsed.query, node)?,
+                                    boost,
+                                ),
+                                false,
+                            )?
                             .is_some());
                     let mut children = Vec::new();
                     for clause in clauses
@@ -19333,7 +19353,8 @@ mod tests {
     };
     use crate::keeper::{CompactionError, ConcatMergeError, publish_current};
     #[cfg(feature = "bench-internals")]
-    use crate::query::{BooleanClause, QueryField};
+    use crate::query::BooleanClause;
+    use crate::query::QueryField;
     use crate::quiver::{
         EncodedPositionList, EncodedPostingList, StatsSection, aggregate_field_stats,
     };
@@ -24664,6 +24685,98 @@ mod tests {
         });
     }
 
+    #[test]
+    fn explain_document_preserves_ranked_union_order_across_windows() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("create index");
+            let generation = index
+                .snapshot()
+                .expect("initial snapshot")
+                .loaded_manifest()
+                .manifest
+                .generation;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta");
+            apply_tokenized_delta_document(&mut delta, 0, "anchor", "anchor");
+            apply_tokenized_delta_document(&mut delta, 4_096, "huge", "huge");
+            let small_terms = ["one", "two", "three", "four", "five", "six"];
+            for (offset, term) in small_terms.iter().enumerate() {
+                apply_tokenized_delta_document(
+                    &mut delta,
+                    4_097 + u32::try_from(offset).unwrap(),
+                    term,
+                    term,
+                );
+            }
+            let body = "huge one two three four five six";
+            apply_tokenized_delta_document(&mut delta, 6_000, "target", body);
+            apply_tokenized_delta_document(&mut delta, 10_000, "tail", body);
+            let frozen = Arc::new(delta.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&frozen)])
+                .expect("publish Delta");
+            let union = "content:anchor^0 OR content:huge^100000000 OR content:one^2 OR content:two^2 OR content:three^2 OR content:four^2 OR content:five^2 OR content:six^2";
+            for sealed in [false, true] {
+                if sealed {
+                    index
+                        .seal_delta_snapshot(
+                            &cx,
+                            Arc::clone(&frozen),
+                            Vec::new(),
+                            DeltaFlushInput {
+                                segment_id: 0xe5_4033,
+                                created_unix_s: 1_700_000_033,
+                                engine_version: CURRENT_ENGINE_VERSION,
+                            },
+                        )
+                        .await
+                        .expect("seal arrival-order fixture");
+                }
+                let snapshot = index.search_snapshot().expect("arrival-order snapshot");
+                assert_eq!(snapshot.delta_count(), usize::from(!sealed));
+                assert_eq!(snapshot.keeper_snapshot().segments().is_empty(), !sealed);
+                for query in [
+                    union.to_owned(),
+                    format!("+*^0 ({union})"),
+                    // The ancestor skips the two overflowing constants at
+                    // "one". Explaining a matching descendant must keep that
+                    // point admission instead of scoring unrelated earlier rows.
+                    "id:IN [target tail] AND (content:anchor^0 OR id:IN [one]^200000000000000000000000000000000000000 OR id:IN [one two]^200000000000000000000000000000000000000 OR id:IN [target tail])".to_owned(),
+                ] {
+                    let hits = index
+                        .search_paginated(&cx, &query, 20, 0, false)
+                        .unwrap()
+                        .hits;
+                    for document in ["target", "tail"] {
+                        let hit = hits.iter().find(|hit| hit.document_id == document).unwrap();
+                        let explanation = index
+                            .explain_document(&cx, &query, document)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            explanation.score.to_bits(),
+                            hit.score.to_bits(),
+                            "{query} {document} sealed={sealed}"
+                        );
+                        let parts = explanation
+                            .terms
+                            .iter()
+                            .map(|term| f64::from(term.score))
+                            .sum::<f64>();
+                        assert!(
+                            (parts - f64::from(hit.score)).abs() <= 1e-4 * f64::from(hit.score),
+                            "{query} {document} sealed={sealed}: {parts} vs {}",
+                            hit.score
+                        );
+                    }
+                    assert_eq!(
+                        index.explain_document(&cx, &query, "missing").unwrap(),
+                        None
+                    );
+                }
+            }
+        });
+    }
+
     /// Snippets for chosen documents equal the ranked snippet tail's for what
     /// it returns (so the same terms and document-frequency weights pick the
     /// window), fall back to the opening without query terms, stop at
@@ -25109,6 +25222,30 @@ mod tests {
         }
     }
 
+    fn pending_upsert_fixture_hits(reader: &QuillReader, cx: &Cx, word: &str) -> Arc<[QuillHit]> {
+        let result = if reader.schema == DEFAULT_SCHEMA {
+            reader.search_paginated(cx, word, 10, 0, false)
+        } else {
+            // Wider schemas have no shipping string parser. Exercise their
+            // actual typed-query path against the same retained publication.
+            let content = reader
+                .schema
+                .fields
+                .iter()
+                .find(|field| field.name == "content")
+                .expect("fixture schema has a content field")
+                .id;
+            let query = Query::term(vec![QueryField::new(content, 1.0)], word.to_owned());
+            let snapshot = reader
+                .checked_published_snapshot()
+                .expect("fixture publication is readable");
+            reader.search_preparsed_uncached_on(cx, &query, 10, 0, false, snapshot.as_ref())
+        };
+        result
+            .unwrap_or_else(|error| panic!("fixture search {word:?}: {error}"))
+            .hits
+    }
+
     #[test]
     fn pending_upsert_revisions_preserve_siblings_snapshots_and_durable_last_write() {
         run_with_cx(|cx| async move {
@@ -25202,7 +25339,11 @@ mod tests {
                     .expect("reopen the writer after repeated updates");
                 assert_eq!(reopened.doc_count().expect("reopened live count"), 4);
                 for query in ["original", "second", "discarded", "rejected", "cancelled"] {
-                    assert_eq!(hit_count(&reopened, &cx, query), 0, "{query}");
+                    assert_eq!(
+                        pending_upsert_fixture_hits(&reopened.reader, &cx, query).len(),
+                        0,
+                        "{query}"
+                    );
                 }
                 for (query, id) in [
                     ("latest", "revised"),
@@ -25210,24 +25351,18 @@ mod tests {
                     ("companion", "other"),
                     ("additional", "added"),
                 ] {
-                    let hits = reopened
-                        .search_doc_ids(&cx, query, 10)
-                        .expect("fresh search");
+                    let hits = pending_upsert_fixture_hits(&reopened.reader, &cx, query);
                     assert_eq!(hits.len(), 1, "{query}");
                     assert_eq!(hits[0].document_id, id);
                 }
                 assert_eq!(empty_reader.doc_count().expect("old empty reader count"), 0);
                 assert_eq!(second_reader.doc_count().expect("retained reader count"), 4);
-                let retained = second_reader
-                    .search_doc_ids(&cx, "second", 10)
-                    .expect("retained reader keeps its original revision");
+                let retained = pending_upsert_fixture_hits(&second_reader.reader, &cx, "second");
                 assert_eq!(retained.len(), 1);
                 assert_eq!(retained[0].document_id, "revised");
                 assert!(
-                    second_reader
-                        .search_doc_ids(&cx, "latest", 10)
-                        .expect("later revisions cannot leak into an old reader")
-                        .is_empty()
+                    pending_upsert_fixture_hits(&second_reader.reader, &cx, "latest").is_empty(),
+                    "later revisions cannot leak into an old reader"
                 );
             }
         });
@@ -25274,8 +25409,14 @@ mod tests {
                     index.doc_count().expect("accepted originals remain live"),
                     3
                 );
-                assert_eq!(hit_count(&index, &cx, "alpha"), 3);
-                assert_eq!(hit_count(&index, &cx, "omega"), 0);
+                assert_eq!(
+                    pending_upsert_fixture_hits(&index.reader, &cx, "alpha").len(),
+                    3
+                );
+                assert_eq!(
+                    pending_upsert_fixture_hits(&index.reader, &cx, "omega").len(),
+                    0
+                );
                 let generation = published_generation(&index);
                 index
                     .commit(&cx)
@@ -25294,17 +25435,12 @@ mod tests {
                 .expect("reopen the accepted originals after cancellation");
                 assert_eq!(retained.doc_count().expect("reopened count"), 3);
                 assert_eq!(
-                    retained
-                        .search_doc_ids(&cx, "alpha", 10)
-                        .expect("originals survive")
-                        .len(),
+                    pending_upsert_fixture_hits(&retained.reader, &cx, "alpha").len(),
                     3
                 );
                 assert!(
-                    retained
-                        .search_doc_ids(&cx, "omega", 10)
-                        .expect("no partial replacement")
-                        .is_empty()
+                    pending_upsert_fixture_hits(&retained.reader, &cx, "omega").is_empty(),
+                    "no partial replacement"
                 );
                 let reopened = QuillIndex::open_with_schema(&cx, directory.path(), schema, config)
                     .await
@@ -25317,13 +25453,16 @@ mod tests {
                     .await
                     .expect("commit the successful retry");
                 assert_eq!(reopened.doc_count().expect("retry count"), 3);
-                assert_eq!(hit_count(&reopened, &cx, "omega"), 2);
-                assert_eq!(hit_count(&reopened, &cx, "alpha"), 1);
                 assert_eq!(
-                    retained
-                        .search_doc_ids(&cx, "alpha", 10)
-                        .expect("retained originals")
-                        .len(),
+                    pending_upsert_fixture_hits(&reopened.reader, &cx, "omega").len(),
+                    2
+                );
+                assert_eq!(
+                    pending_upsert_fixture_hits(&reopened.reader, &cx, "alpha").len(),
+                    1
+                );
+                assert_eq!(
+                    pending_upsert_fixture_hits(&retained.reader, &cx, "alpha").len(),
                     3
                 );
             }
