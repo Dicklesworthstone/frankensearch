@@ -39277,7 +39277,7 @@ mod tests {
                 2,
             );
             drop(writer);
-            assert!(concat_merge_runs_state(&forced, &cx) == expected);
+            assert_eq!(concat_merge_runs_state(&forced, &cx), expected);
 
             seal_after_concat_merge_runs(&cx, &serial).await;
             seal_after_concat_merge_runs(&cx, &candidate).await;

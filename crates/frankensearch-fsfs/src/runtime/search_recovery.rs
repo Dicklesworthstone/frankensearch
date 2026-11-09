@@ -363,7 +363,7 @@ mod tests {
                     }
                     "paused" => {
                         search.config.pressure.degradation_override =
-                            DegradationOverrideMode::ForcePaused
+                            DegradationOverrideMode::ForcePaused;
                     }
                     "overlap" => {
                         root = source.join("unsafe-store");

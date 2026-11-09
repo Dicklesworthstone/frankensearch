@@ -19,7 +19,7 @@ mod loader_only {
     #[cfg(any(feature = "semantic-loaders", all(unix, feature = "semantic-support")))]
     use frankensearch_embed::model_manifest::is_verification_cached;
     use frankensearch_embed::model_manifest::{ModelManifest, ModelTier};
-    #[cfg(feature = "semantic-loaders")]
+    #[cfg(any(feature = "semantic-loaders", feature = "rerank"))]
     use frankensearch_index::VectorIndex;
     use serde_json::Value;
 

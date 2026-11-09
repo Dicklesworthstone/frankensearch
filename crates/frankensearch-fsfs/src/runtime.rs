@@ -3956,6 +3956,37 @@ const WATCH_PREFETCH_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// Bound on the source bytes one batch holds prefetched at once.
 const WATCH_PREFETCH_MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The stat is only an admission hint: a source can grow before or during its
+/// read. Read one extra byte to detect growth, then leave that source to its
+/// own operation without retaining a truncated payload or spending the budget.
+fn prefetch_watch_source(
+    path: &Path,
+    observed_len: u64,
+    budget: &mut u64,
+) -> Option<PrefetchedSource> {
+    if observed_len > WATCH_PREFETCH_MAX_FILE_BYTES || observed_len > *budget {
+        return None;
+    }
+    let bytes = fs::File::open(path).and_then(|file| {
+        let mut bytes = Vec::new();
+        // Admission above bounds this addition to 8 MiB plus one byte.
+        file.take(observed_len + 1).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    if bytes.as_ref().is_ok_and(|bytes| {
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) > observed_len
+    }) {
+        return None;
+    }
+    *budget -= observed_len;
+    let modified_ms = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(system_time_to_ms)
+        .unwrap_or_default();
+    Some(PrefetchedSource { bytes, modified_ms })
+}
+
 /// Read and stat every upserted source of a watch batch in one blocking-pool
 /// hop, for either watch ingest pipeline.
 ///
@@ -3998,17 +4029,9 @@ async fn prefetch_watch_sources(
             let Ok(len) = fs::metadata(&abs_path).map(|metadata| metadata.len()) else {
                 continue;
             };
-            if len > WATCH_PREFETCH_MAX_FILE_BYTES || len > budget {
-                continue;
+            if let Some(source) = prefetch_watch_source(&abs_path, len, &mut budget) {
+                prefetched.insert(file_key, source);
             }
-            budget -= len;
-            let bytes = fs::read(&abs_path);
-            let modified_ms = fs::metadata(&abs_path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .map(system_time_to_ms)
-                .unwrap_or_default();
-            prefetched.insert(file_key, PrefetchedSource { bytes, modified_ms });
         }
         prefetched
     })
@@ -6252,11 +6275,9 @@ fn extract_hash_from_sums(sums_content: &str, asset_filename: &str) -> Option<St
             if name == asset_filename {
                 return Some(hash.to_owned());
             }
-            // Handle `./filename` (common sha256sum output) or `*filename` (binary mode).
-            let stripped = name
-                .strip_prefix("./")
-                .or_else(|| name.strip_prefix('*'))
-                .unwrap_or(name);
+            // Binary mode marks the path before its optional relative prefix.
+            let stripped = name.strip_prefix('*').unwrap_or(name);
+            let stripped = stripped.strip_prefix("./").unwrap_or(stripped);
             if stripped == asset_filename {
                 return Some(hash.to_owned());
             }
@@ -37354,7 +37375,10 @@ mod tests {
             resources.quality_embedder_attempted = false;
             let provider: Arc<dyn Embedder> = Arc::new(BlendQueryEmbedder("blend-quality-2"));
             super::set_test_quality_embedder(Some(Arc::clone(&provider)));
-            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut config = FsfsConfig::default();
+            // This fixture injects the ONNX-path provider, including in native-only builds.
+            config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
+            let runtime = FsfsRuntime::new(config);
             assert!(
                 runtime
                     .prefetch_quality_initialization(&Cx::for_testing(), &resources)
@@ -37527,6 +37551,7 @@ mod tests {
             let retained = Arc::clone(resources.quality_vector_index.as_ref().unwrap());
             let mut config = FsfsConfig::default();
             config.storage.index_dir = temp.path().display().to_string();
+            config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
             config.search.quality_timeout_ms = 5_000;
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 index_dir: Some(temp.path().to_path_buf()),
@@ -45041,7 +45066,7 @@ mod tests {
                     }
                     Ok(stream_expansion_fixture("alpha", Some("beta")))
                 };
-                let error = runtime
+                let error = Box::pin(runtime
                     .run_search_stream_with_query_expansion(
                         &cx,
                         "alpha",
@@ -45050,7 +45075,7 @@ mod tests {
                         &mut transport,
                         None,
                         expansion,
-                    )
+                    ))
                     .await
                     .unwrap_err();
                 cx.set_cancel_requested(false);
@@ -54819,6 +54844,7 @@ mod tests {
         }
         let mut config = FsfsConfig::default();
         config.indexing.offline = true;
+        config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
         FsfsRuntime::new(config).with_cli_input(CliInput {
             command: CliCommand::AppendBatch,
             index_dir: Some(root),
@@ -57806,6 +57832,79 @@ mod tests {
         FsfsRuntime::new(config)
             .refuse_foreign_target_root(foreign)
             .expect("a root listed in discovery.roots is opted in");
+    }
+
+    #[test]
+    fn watch_prefetch_rejects_growth_after_size_admission_without_truncating() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("growing.log");
+        fs::write(&path, b"before").unwrap();
+        let observed_len = fs::metadata(&path).unwrap().len();
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut writer, b" after admission").unwrap();
+        drop(writer);
+        let contents = fs::read(&path).unwrap();
+        let mut budget = super::WATCH_PREFETCH_MAX_BATCH_BYTES;
+        assert!(super::prefetch_watch_source(&path, observed_len, &mut budget).is_none());
+        assert_eq!(budget, super::WATCH_PREFETCH_MAX_BATCH_BYTES);
+        assert_eq!(fs::read(&path).unwrap(), contents);
+
+        let current_len = fs::metadata(&path).unwrap().len();
+        let source = super::prefetch_watch_source(&path, current_len, &mut budget).unwrap();
+        assert_eq!(source.bytes.unwrap(), contents);
+        assert_eq!(budget, super::WATCH_PREFETCH_MAX_BATCH_BYTES - current_len);
+    }
+
+    #[test]
+    fn watch_prefetch_preserves_exact_empty_and_oversized_source_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.log");
+        fs::write(&path, b"four").unwrap();
+        let observed_len = fs::metadata(&path).unwrap().len();
+        let mut budget = observed_len - 1;
+        assert!(super::prefetch_watch_source(&path, observed_len, &mut budget).is_none());
+        assert_eq!(budget, observed_len - 1);
+        budget = observed_len;
+        let source = super::prefetch_watch_source(&path, observed_len, &mut budget).unwrap();
+        assert_eq!(source.bytes.unwrap(), b"four");
+        assert_eq!(budget, 0);
+
+        let empty = temp.path().join("empty.log");
+        fs::File::create(&empty).unwrap();
+        let source = super::prefetch_watch_source(&empty, 0, &mut budget).unwrap();
+        assert!(source.bytes.unwrap().is_empty());
+        assert_eq!(budget, 0);
+        fs::write(&empty, b"grew").unwrap();
+        assert!(super::prefetch_watch_source(&empty, 0, &mut budget).is_none());
+        assert_eq!(budget, 0);
+
+        let oversized = temp.path().join("oversized.log");
+        let file = fs::File::create(&oversized).unwrap();
+        budget = super::WATCH_PREFETCH_MAX_BATCH_BYTES;
+        file.set_len(super::WATCH_PREFETCH_MAX_FILE_BYTES).unwrap();
+        let observed_len = file.metadata().unwrap().len();
+        let source = super::prefetch_watch_source(&oversized, observed_len, &mut budget).unwrap();
+        assert_eq!(
+            u64::try_from(source.bytes.unwrap().len()).unwrap(),
+            super::WATCH_PREFETCH_MAX_FILE_BYTES
+        );
+        let remaining = super::WATCH_PREFETCH_MAX_BATCH_BYTES - observed_len;
+        assert_eq!(budget, remaining);
+        file.set_len(super::WATCH_PREFETCH_MAX_FILE_BYTES + 1).unwrap();
+        let observed_len = file.metadata().unwrap().len();
+        assert!(super::prefetch_watch_source(&oversized, observed_len, &mut budget).is_none());
+        assert_eq!(budget, remaining);
+    }
+
+    #[test]
+    fn watch_prefetch_preserves_source_read_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.log");
+        let mut budget = 4;
+        let source = super::prefetch_watch_source(&missing, 4, &mut budget).unwrap();
+        assert_eq!(source.bytes.unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(budget, 0);
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -63974,6 +64073,7 @@ mod tests {
             let mut resources = disagreeing_blend_resources(temp.path());
             let mut config = FsfsConfig::default();
             config.storage.index_dir = temp.path().display().to_string();
+            config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
             config.search.quality_timeout_ms = 5_000;
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 index_dir: Some(temp.path().to_path_buf()),
@@ -64034,6 +64134,16 @@ mod tests {
             assert_eq!(
                 recovered.payloads[0].hits[0].path,
                 original.payloads[0].hits[0].path
+            );
+            assert!(
+                recovered.payloads[1]
+                    .degradation_advice
+                    .values()
+                    .any(|advice| {
+                        advice.failure
+                            == super::DegradationFailureKind::UnverifiableEmbeddingSpace
+                    }),
+                "the planted foreign producer must cause the refinement failure"
             );
             assert!(
                 cache.is_empty(),
@@ -65922,6 +66032,22 @@ mod tests {
             Some("deadbeef0123456789abcdef".to_owned()),
             "should handle binary-mode * prefix"
         );
+    }
+
+    #[test]
+    fn extract_hash_from_sums_handles_binary_mode_relative_path() {
+        const ASSET: &str = "fsfs-2.0.0-x86_64-unknown-linux-musl.tar.xz";
+        const HASH: &str = "df0d6d1ea5ac176cd37f43c69c38c3887b457f076f259533e64dad54193dfebf";
+        // `sha256sum --binary ./file` emits both prefixes in this order.
+        let sums = format!("{HASH} *./{ASSET}\n");
+        assert_eq!(
+            super::extract_hash_from_sums(&sums, ASSET).as_deref(),
+            Some(HASH)
+        );
+        for other in [format!("nested/{ASSET}"), format!("prefix-{ASSET}")] {
+            let sums = format!("{HASH} *./{other}\n");
+            assert_eq!(super::extract_hash_from_sums(&sums, ASSET), None);
+        }
     }
 
     #[test]

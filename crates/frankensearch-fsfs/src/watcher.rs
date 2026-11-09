@@ -6001,7 +6001,7 @@ mod tests {
                 discovery.clone(),
                 Arc::new(NoopWatchIngestPipeline),
             );
-            assert_eq!(watcher.roots(), [root.clone()]);
+            assert_eq!(watcher.roots(), std::slice::from_ref(&root));
             let (snapshot, completeness) = watcher.collect_snapshot().expect("relative root scan");
             assert!(completeness.is_complete());
             assert_eq!(snapshot.keys().collect::<Vec<_>>(), [&included]);
@@ -6054,7 +6054,7 @@ mod tests {
                 },
                 Arc::new(NoopWatchIngestPipeline),
             );
-            assert_eq!(watcher.roots(), [root.clone()]);
+            assert_eq!(watcher.roots(), std::slice::from_ref(&root));
             let (snapshot, completeness) = watcher.collect_snapshot().expect("symlink root scan");
             assert!(completeness.is_complete());
             assert_eq!(snapshot.contains_key(&root.join("lib.rs")), follow_symlinks);
@@ -6267,8 +6267,7 @@ mod tests {
                     assert_incomplete_ignore_policy(
                         watcher
                             .build_catchup_events(&previous)
-                            .err()
-                            .expect("cannot grant catch-up authority"),
+                            .expect_err("cannot grant catch-up authority"),
                         &ignore_file,
                     );
                     assert!(watcher.holds_unverified_legacy_baseline());
@@ -6694,10 +6693,10 @@ mod tests {
             );
             assert!(lock_or_recover(&pipeline.attempts).is_empty());
             {
-                let state = lock_or_recover(&reconciliation);
-                assert!(state.required);
-                assert_eq!(state.indexed_snapshot, baseline);
-                assert_eq!(state.authority, authority);
+                let guard = lock_or_recover(&reconciliation);
+                assert!(guard.required);
+                assert_eq!(guard.indexed_snapshot, baseline);
+                assert_eq!(guard.authority, authority);
             }
 
             fs::write(&ignore_file, "private.md\n").expect("complete exclusion policy");
@@ -10815,9 +10814,9 @@ mod tests {
                     )
                     .expect("rescan ingress succeeds without a named path");
 
-                    let state = lock_or_recover(&reconciliation);
-                    assert_eq!(state.required, rescan, "{pressure:?} {kind:?}");
-                    assert_eq!(state.epoch, u64::from(rescan));
+                    let guard = lock_or_recover(&reconciliation);
+                    assert_eq!(guard.required, rescan, "{pressure:?} {kind:?}");
+                    assert_eq!(guard.epoch, u64::from(rescan));
                     assert_eq!(skipped, 0, "a rescan signal is not a skipped file");
                     assert!(pending.by_path.is_empty());
                     assert_eq!(stats.snapshot().events_received, 0);
@@ -10831,13 +10830,13 @@ mod tests {
         for pressure in [PressureState::Normal, PressureState::Emergency] {
             let prior = WatchEvent::modified("/tmp/repo/prior.rs", 1, Some(13));
             let current = PathBuf::from("/tmp/repo/current.rs");
-            let mut state = ReconciliationState::default();
-            state
+            let mut initial = ReconciliationState::default();
+            initial
                 .require_for_events(std::slice::from_ref(&prior))
                 .expect("existing event debt");
-            state.unsettled_passes = super::MAX_UNSETTLED_PASSES;
-            let old_token = state.planning_token().expect("pre-overflow plan");
-            let reconciliation = Arc::new(Mutex::new(state));
+            initial.unsettled_passes = super::MAX_UNSETTLED_PASSES;
+            let old_token = initial.planning_token().expect("pre-overflow plan");
+            let reconciliation = Arc::new(Mutex::new(initial));
             let stats = WatcherStatsInner::default();
             let mut pending = PendingEvents::default();
             pending.push(prior.clone());
@@ -10874,12 +10873,12 @@ mod tests {
                 &reconciliation,
             )
             .expect("ordinary read");
-            let state = lock_or_recover(&reconciliation);
-            assert!(state.required);
-            assert_eq!(state.epoch, old_token.epoch + 1);
-            assert_ne!(state.planning_token().unwrap(), old_token);
-            assert_eq!(state.unsettled_passes, 0);
-            assert_eq!(state.affected_paths, BTreeSet::from([prior.path]));
+            let guard = lock_or_recover(&reconciliation);
+            assert!(guard.required);
+            assert_eq!(guard.epoch, old_token.epoch + 1);
+            assert_ne!(guard.planning_token().unwrap(), old_token);
+            assert_eq!(guard.unsettled_passes, 0);
+            assert_eq!(guard.affected_paths, BTreeSet::from([prior.path]));
         }
     }
 
@@ -10919,6 +10918,7 @@ mod tests {
         assert!(state.lineage_exhausted);
         assert_eq!(state.epoch, u64::MAX);
         assert!(state.planning_token().is_err());
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -10938,16 +10938,16 @@ mod tests {
             let (baseline, completeness) =
                 collect_snapshot_from_roots(&roots, &discovery, &|| false).unwrap();
             assert!(completeness.is_complete());
-            let mut state = ReconciliationState::default();
+            let mut initial = ReconciliationState::default();
             assert!(
-                state
+                initial
                     .seed_initial_authority(
                         baseline.clone(),
                         completeness.root_identities().clone()
                     )
                     .unwrap()
             );
-            let reconciliation = Arc::new(Mutex::new(state));
+            let reconciliation = Arc::new(Mutex::new(initial));
 
             // None of these changes delivers its own notification. Moving the
             // old file out of the root represents a missed deletion safely.
@@ -10996,9 +10996,9 @@ mod tests {
             assert!(pipeline.all_ops().is_empty());
             assert_eq!(stats.snapshot().files_reindexed, 0);
             {
-                let state = lock_or_recover(&reconciliation);
-                assert!(state.required);
-                assert_eq!(state.indexed_snapshot, baseline);
+                let guard = lock_or_recover(&reconciliation);
+                assert!(guard.required);
+                assert_eq!(guard.indexed_snapshot, baseline);
             }
             run_authoritative_reconciliation(
                 &cx,
@@ -11032,11 +11032,11 @@ mod tests {
             );
             assert_eq!(stats.snapshot().files_reindexed, 3);
             assert!(lock_or_recover(&queue).is_empty());
-            let state = lock_or_recover(&reconciliation);
-            assert!(!state.required);
-            assert!(state.affected_paths.is_empty());
+            let guard = lock_or_recover(&reconciliation);
+            assert!(!guard.required);
+            assert!(guard.affected_paths.is_empty());
             assert_eq!(
-                state.indexed_snapshot.keys().collect::<BTreeSet<_>>(),
+                guard.indexed_snapshot.keys().collect::<BTreeSet<_>>(),
                 BTreeSet::from([&changed, &created])
             );
         });

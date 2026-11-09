@@ -5,7 +5,7 @@
 //! enables the library's cfg(test) hash embedder inside the shipping binary.
 #![cfg(unix)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -23,7 +23,7 @@ struct Fixture {
     store: PathBuf,
     config: PathBuf,
     executable: PathBuf,
-    _executable_directory: Option<tempfile::TempDir>,
+    executable_directory: Option<tempfile::TempDir>,
     child_identity: Option<(u32, u32)>,
 }
 
@@ -44,7 +44,7 @@ impl Fixture {
             store,
             config,
             executable: PathBuf::from(env!("CARGO_BIN_EXE_fsfs")),
-            _executable_directory: None,
+            executable_directory: None,
             child_identity: None,
         };
         fixture.write_config(None, "{index_dir}/catalog.sqlite");
@@ -55,7 +55,7 @@ impl Fixture {
         // A root-owned checkout or TMPDIR may have non-traversable ancestors.
         // Use a real admitted mount for source/store fixtures. Some containers
         // put /tmp on overlay, which production discovery correctly refuses.
-        let mounts = MountTable::new(read_system_mounts(), &Default::default());
+        let mounts = MountTable::new(read_system_mounts(), &HashMap::new());
         let mut parent = fs::canonicalize("/tmp").expect("Unix temporary directory");
         if mounts
             .lookup(&parent)
@@ -118,7 +118,7 @@ impl Fixture {
             // Never chmod/chown a hard-linked executable: its inode also
             // belongs to Cargo's original artifact.
             fixture.executable = executable;
-            fixture._executable_directory = Some(executable_directory);
+            fixture.executable_directory = Some(executable_directory);
             fixture.child_identity = Some((65_534, 65_534));
             for path in [
                 fixture.directory.path(),

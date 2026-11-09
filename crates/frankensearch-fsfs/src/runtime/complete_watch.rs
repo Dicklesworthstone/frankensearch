@@ -2948,7 +2948,7 @@ mod lifecycle_tests {
                 assert!(watching.baseline.is_none());
                 assert!(lock_changes(&watching.changes).unwrap().dirty.is_some());
                 let first_retry = watching.quality_retry_at.unwrap();
-                for tick in [now + IDLE_POLL, first_retry - IDLE_POLL] {
+                for tick in [now + IDLE_POLL, first_retry.checked_sub(IDLE_POLL).unwrap()] {
                     assert!(watching.advance(&cx, tick).await.unwrap().is_none());
                     assert_eq!(watching.quality_retry_at, Some(first_retry));
                     assert_eq!(candidate_count(&root), after_first_failure);
@@ -3044,7 +3044,11 @@ mod lifecycle_tests {
                             .unwrap()
                             .is_none()
                     );
-                    let tick = watching.quality_retry_at.unwrap() - IDLE_POLL;
+                    let tick = watching
+                        .quality_retry_at
+                        .unwrap()
+                        .checked_sub(IDLE_POLL)
+                        .unwrap();
                     let expected = if cancel {
                         cx.set_cancel_requested(true);
                         before.clone()

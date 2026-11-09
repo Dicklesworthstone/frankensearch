@@ -1768,7 +1768,7 @@ mod tests {
                     .expect("search retained CASS messages");
                 assert_eq!(page.total_count, Some(page.hits.len() as u64));
                 page.hits
-                    .into_iter()
+                    .iter()
                     .map(|hit| hit.document_id.clone())
                     .collect::<BTreeSet<_>>()
             };
