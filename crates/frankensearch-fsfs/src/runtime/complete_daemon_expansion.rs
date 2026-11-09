@@ -362,7 +362,7 @@ mod tests {
         ]);
         assert!(encode_variants(&request, excess).is_err());
         for invalid in [
-            "".to_owned(),
+            String::new(),
             " ".to_owned(),
             "x".repeat(MAX_VARIANT_BYTES + 1),
         ] {

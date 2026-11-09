@@ -1222,9 +1222,10 @@ impl FsfsRuntime {
             ));
         }
         if self.cli_input.expand {
-            return self
-                .run_complete_expanded_search(cx, root, query, limit, started, writer)
-                .await;
+            return Box::pin(
+                self.run_complete_expanded_search(cx, root, query, limit, started, writer),
+            )
+            .await;
         }
         let reader = self.open_retained_search(cx, root).await?;
         Box::pin(self.run_retained_search_with_writer(cx, root, reader, started, writer)).await
@@ -1315,7 +1316,7 @@ impl FsfsRuntime {
         started: Instant,
         writer: &mut W,
     ) -> SearchResult<()> {
-        self.run_complete_expanded_search_with_query_expansion(
+        Box::pin(self.run_complete_expanded_search_with_query_expansion(
             cx,
             root,
             query,
@@ -1323,7 +1324,7 @@ impl FsfsRuntime {
             started,
             writer,
             Self::expand_search_query(cx, query),
-        )
+        ))
         .await
     }
 
@@ -3674,8 +3675,7 @@ mod tests {
                     search.cli_input.expand = true;
                     search.cli_input.format = format;
                     let mut output = Vec::new();
-                    search
-                        .run_complete_expanded_search_with_query_expansion(
+                    Box::pin(search.run_complete_expanded_search_with_query_expansion(
                             &cx, &root, query, 10, Instant::now(), &mut output,
                             async {
                                 assert_eq!(recorded.lock().unwrap().iter().filter(|text| text.as_str() == query).count(), 1);
@@ -3693,7 +3693,7 @@ mod tests {
                                 }
                                 Ok(ExpansionResult { queries, backend_used: None, elapsed_ms: 0 })
                             },
-                        )
+                        ))
                         .await
                         .unwrap();
                     let texts = recorded.lock().unwrap();

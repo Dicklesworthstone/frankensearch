@@ -1656,16 +1656,17 @@ mod generation_tests {
                     };
                     let hits = if streamed {
                         let mut output = Vec::new();
-                        expanded
-                            .stream_complete_generation_daemon_with_query_expansion(
+                        Box::pin(
+                            expanded.stream_complete_generation_daemon_with_query_expansion(
                                 &cx,
                                 &root,
                                 "originaltoken",
                                 10,
                                 &mut output,
                                 generated,
-                            )
-                            .await?;
+                            ),
+                        )
+                        .await?;
                         let frames = output
                             .split(|&byte| byte == b'\n')
                             .filter(|line| !line.is_empty())
@@ -1698,16 +1699,17 @@ mod generation_tests {
                             })
                             .collect::<Vec<_>>()
                     } else {
-                        expanded
-                            .query_complete_generation_daemon_with_query_expansion(
+                        Box::pin(
+                            expanded.query_complete_generation_daemon_with_query_expansion(
                                 &cx,
                                 &root,
                                 "originaltoken",
                                 10,
                                 generated,
-                            )
-                            .await?
-                            .hits
+                            ),
+                        )
+                        .await?
+                        .hits
                     };
                     assert_eq!(
                         hits, expected.hits,
@@ -2340,7 +2342,7 @@ mod buffered_transport_tests {
                 client.read_to_end(&mut delivered).unwrap();
                 if complete_ready {
                     expansion::validate_ready(&delivered, &request).unwrap();
-                    assert_eq!(delivered.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                    assert_eq!(delivered.split(|&byte| byte == b'\n').count(), 2);
                 } else {
                     assert!(delivered.is_empty());
                 }

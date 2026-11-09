@@ -129,29 +129,28 @@ pub(super) async fn serve(
         }
         let query_runtime = query_runtime(session, &request.request.search, true)?;
         if request.request.search.expand {
-            return query_runtime
-                .run_search_stream_with_query_expansion(
+            return Box::pin(query_runtime.run_search_stream_with_query_expansion(
+                cx,
+                &request.request.search.query,
+                request.request.search.limit,
+                &request.request.request_id,
+                &mut writer,
+                Some(SearchStreamResources {
+                    resources: &mut session.reader.resources,
+                    flags: SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: true,
+                    },
+                    requested_mode: query_runtime.requested_search_mode(),
+                }),
+                expansion::receive_variants(
                     cx,
-                    &request.request.search.query,
-                    request.request.search.limit,
-                    &request.request.request_id,
-                    &mut writer,
-                    Some(SearchStreamResources {
-                        resources: &mut session.reader.resources,
-                        flags: SearchExecutionFlags {
-                            include_snippets: true,
-                            persist_explain_session: true,
-                        },
-                        requested_mode: query_runtime.requested_search_mode(),
-                    }),
-                    expansion::receive_variants(
-                        cx,
-                        &request.request,
-                        &mut expansion_peer,
-                        expansion_output,
-                    ),
-                )
-                .await;
+                    &request.request,
+                    &mut expansion_peer,
+                    expansion_output,
+                ),
+            ))
+            .await;
         }
         if !request.request.search.explain {
             return serve_cached_search(
@@ -280,12 +279,19 @@ async fn serve_cached_search(
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+enum ExpansionState {
+    #[default]
+    BeforeInitial,
+    InitialReady,
+    Sent,
+}
+
 #[derive(Default)]
 struct ReceiveState {
     next_sequence: u64,
     started: bool,
-    initial_ready: bool,
-    expansion_sent: bool,
+    expansion: ExpansionState,
     terminal: Option<Frame>,
     // Conservative: a Write error may have followed a partially written frame.
     // No other envelope or terminal may then be appended to that partial record.
@@ -335,7 +341,7 @@ impl ReceiveState {
                     StreamTerminalStatus::Completed => {
                         terminal.exit_code == 0
                             && terminal.error.is_none()
-                            && (!request.search.expand || self.expansion_sent)
+                            && (!request.search.expand || self.expansion == ExpansionState::Sent)
                     }
                     StreamTerminalStatus::Failed | StreamTerminalStatus::Cancelled => {
                         (1..=255).contains(&terminal.exit_code)
@@ -365,7 +371,9 @@ impl ReceiveState {
             StreamEvent::Progress(progress)
                 if progress.reason_code == "query.stream.initial_ready" =>
             {
-                self.initial_ready = true;
+                if self.expansion == ExpansionState::BeforeInitial {
+                    self.expansion = ExpansionState::InitialReady;
+                }
             }
             _ => {}
         }
@@ -456,8 +464,7 @@ where
                     }
                     if expansion::is_ready(&record) {
                         if !state.started
-                            || !state.initial_ready
-                            || state.expansion_sent
+                            || state.expansion != ExpansionState::InitialReady
                             || state.terminal.is_some()
                         {
                             return Err(complete_cli_error(
@@ -466,7 +473,7 @@ where
                             ));
                         }
                         expansion::validate_ready(&record, request)?;
-                        state.expansion_sent = true;
+                        state.expansion = ExpansionState::Sent;
                         let future = expansion_future.take().ok_or_else(|| {
                             complete_cli_error(
                                 "daemon_expansion",
@@ -825,7 +832,7 @@ mod tests {
                 )
                 .await;
                 finish_receive(&mut state, &request, format, &mut output, result).unwrap();
-                assert!(state.expansion_sent);
+                assert_eq!(state.expansion, ExpansionState::Sent);
                 let mut sent = Vec::new();
                 server.read_to_end(&mut sent).unwrap();
                 let variants: serde_json::Value = serde_json::from_slice(&sent).unwrap();
@@ -847,6 +854,7 @@ mod tests {
                 } else {
                     assert_eq!(text.matches('\u{001e}').count(), 3);
                 }
+                drop(visible);
             }
         });
     }
@@ -1375,7 +1383,8 @@ mod tests {
         use std::os::unix::net::UnixListener;
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            // TMPDIR can exceed sun_path before a socket name is appended.
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let root = std::fs::canonicalize(directory.path()).unwrap();
             let socket = root.join("forward.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -1445,7 +1454,8 @@ mod tests {
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for stream in [false, true] {
-                let directory = tempfile::tempdir().unwrap();
+                // Keep the real AF_UNIX fixture independent of a deep TMPDIR.
+                let directory = tempfile::tempdir_in("/tmp").unwrap();
                 let root = std::fs::canonicalize(directory.path()).unwrap();
                 let socket = root.join("expand.sock");
                 let listener = UnixListener::bind(&socket).unwrap();

@@ -1731,17 +1731,29 @@ impl TwoTierSearcher {
                         // the ordinary feature profile.
                         if self.final_ranking_enabled() {
                             let phase3_start = Instant::now();
-                            match self
-                                .run_phase3(
+                            let phase3 = async {
+                                #[cfg(feature = "rerank")]
+                                let (refined_results, ranker_id) = self
+                                    .run_cross_encoder(
+                                        cx,
+                                        semantic_query,
+                                        refined_results,
+                                        &text_fn,
+                                    )
+                                    .await?;
+                                #[cfg(not(feature = "rerank"))]
+                                let ranker_id = None;
+                                self.run_phase3(
                                     cx,
-                                    semantic_query,
                                     k,
                                     refined_results,
-                                    &text_fn,
+                                    ranker_id,
+                                    phase3_start,
                                     &mut metrics,
                                 )
-                                .await
-                            {
+                            }
+                            .await;
+                            match phase3 {
                                 Ok(Some(outcome)) => {
                                     let phase3_latency = phase3_start.elapsed();
                                     let reranked_count = outcome.results.len();
@@ -3387,23 +3399,16 @@ impl TwoTierSearcher {
         Ok(Some(fast))
     }
 
-    /// Run Phase 3: cross-encoder reranking and MMR diversity.
-    #[allow(clippy::too_many_lines)]
-    async fn run_phase3(
+    /// Run the optional asynchronous cross-encoder before MMR diversity.
+    #[cfg(feature = "rerank")]
+    async fn run_cross_encoder(
         &self,
         cx: &Cx,
         query: &str,
-        k: usize,
         mut results: Vec<ScoredResult>,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
-        metrics: &mut TwoTierMetrics,
-    ) -> SearchResult<Option<Phase3Outcome>> {
-        let ranking_start = Instant::now();
+    ) -> SearchResult<(Vec<ScoredResult>, Option<String>)> {
         let mut ranker_id = None;
-        #[cfg(not(feature = "rerank"))]
-        let _ = (query, text_fn);
-
-        #[cfg(feature = "rerank")]
         if let Some(ref reranker) = self.reranker {
             let rerank_budget = self.rerank_window.min(results.len());
             if rerank_budget > 0 {
@@ -3426,7 +3431,20 @@ impl TwoTierSearcher {
                 }
             }
         }
+        Ok((results, ranker_id))
+    }
 
+    /// Finish Phase 3 with synchronous MMR and result explanations.
+    #[allow(clippy::too_many_lines)]
+    fn run_phase3(
+        &self,
+        cx: &Cx,
+        k: usize,
+        mut results: Vec<ScoredResult>,
+        mut ranker_id: Option<String>,
+        ranking_start: Instant,
+        metrics: &mut TwoTierMetrics,
+    ) -> SearchResult<Option<Phase3Outcome>> {
         cancellation_checkpoint(cx, "rerank_to_mmr")?;
 
         if self.mmr_config.enabled && results.len() > 1 {
@@ -5923,7 +5941,7 @@ mod tests {
     }
 
     /// Real runtime/worker ownership, with the same asynchronous dispatch shape
-    /// as FastEmbed. Values are fixed so this tests scheduling, not model quality.
+    /// as `FastEmbed`. Values are fixed so this tests scheduling, not model quality.
     struct BlockingPoolEmbedder {
         identity: EmbeddingIdentityBundleV1,
         caller_thread: std::thread::ThreadId,
@@ -7930,7 +7948,37 @@ mod tests {
     fn mmr_without_cross_encoder_promotes_an_undisplayed_diverse_candidate() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for lambda in [0.3, 1.0] {
-                let (_index_dir, index) = build_test_index_with_quality(4);
+                let index_dir = fixture_tempdir("mmr-distinct-relevance-");
+                let mut builder = TwoTierIndex::create(index_dir.path(), TwoTierConfig::default())
+                    .expect("create index");
+                builder.set_fast_embedder_id("stub-fast");
+                builder.set_quality_embedder_id("stub-quality");
+                // Distinct query scores make the displayed page independent of
+                // FSVI's hash-sorted physical-row tie-break. doc-1 points away
+                // from doc-0 while doc-4 is nearly parallel, so only diversity
+                // can promote doc-1 from outside the two-result page.
+                for (doc_id, relevance, direction) in [
+                    ("doc-0", 0.8_f32, 1.0),
+                    ("doc-4", 0.75, 1.0),
+                    ("doc-1", 0.6, -1.0),
+                    ("doc-2", 0.55, 1.0),
+                    ("doc-3", 0.5, 1.0),
+                    ("doc-8", 0.45, 1.0),
+                ] {
+                    let vector = [
+                        relevance,
+                        direction * (1.0 - relevance * relevance).sqrt(),
+                        0.0,
+                        0.0,
+                    ];
+                    builder
+                        .add_fast_record(doc_id, &vector)
+                        .expect("fast vector");
+                    builder
+                        .add_quality_record(doc_id, &vector)
+                        .expect("quality vector");
+                }
+                let index = Arc::new(builder.finish().expect("finish index"));
                 let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let text_calls = std::sync::atomic::AtomicUsize::new(0);
