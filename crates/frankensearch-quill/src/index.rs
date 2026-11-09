@@ -14471,6 +14471,29 @@ impl QuillIndex {
         drop(writer);
         Ok(())
     }
+
+    /// Bench-only: find each publication's retained and preflight-verified
+    /// segment bindings by scanning (`true`, the incumbent) or by segment id
+    /// (`false`, shipping), for a same-invocation A/B. No-op for an in-memory
+    /// index.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation or writer-lock failures.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn bench_set_linear_segment_reuse(
+        &self,
+        cx: &Cx,
+        linear: bool,
+    ) -> Result<(), QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "index writer lock").await?;
+        if let IndexBackend::Durable(keeper) = &mut writer.backend {
+            keeper.set_benchmark_linear_segment_reuse(linear);
+        }
+        drop(writer);
+        Ok(())
+    }
 }
 
 impl RootBoundQuillSearchIndex {

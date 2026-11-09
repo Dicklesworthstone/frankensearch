@@ -170,5 +170,10 @@ name = "cass_ingest_analyze_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "publish_commit_scale_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true

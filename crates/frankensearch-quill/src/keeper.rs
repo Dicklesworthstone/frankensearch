@@ -4014,7 +4014,7 @@ impl KeeperSnapshot {
     }
 
     fn open_once(directory: &Path, schema: SchemaDescriptor) -> Result<Self, KeeperError> {
-        Self::open_once_reusing(directory, schema, Vec::new())
+        Self::open_once_reusing(directory, schema, Vec::new(), false)
     }
 
     /// [`Self::open_once`], reusing segments a publication preflight verified
@@ -4024,6 +4024,7 @@ impl KeeperSnapshot {
         directory: &Path,
         schema: SchemaDescriptor,
         verified: Vec<VerifiedProposalSegment>,
+        linear_reuse: bool,
     ) -> Result<Self, KeeperError> {
         let expected_schema_id = schema
             .schema_id()
@@ -4035,7 +4036,13 @@ impl KeeperSnapshot {
         let segments = if verified.is_empty() {
             open_manifest_segments(directory, &loaded.manifest.segments, schema)?
         } else {
-            reuse_verified_segments(directory, &loaded.manifest.segments, schema, verified)?
+            reuse_verified_segments(
+                directory,
+                &loaded.manifest.segments,
+                schema,
+                verified,
+                linear_reuse,
+            )?
         };
 
         let snapshot = Self::from_parts(Some(directory.to_path_buf()), schema, loaded, segments)?;
@@ -5559,6 +5566,11 @@ pub struct KeeperWriter {
     /// mapping, as the incumbent preflight did, for a same-binary A/B.
     #[cfg(feature = "bench-internals")]
     benchmark_mapped_preflight: bool,
+    /// Bench-only, default OFF: find each proposal segment's retained and
+    /// preflight-verified bindings by scanning, as the incumbent did, for a
+    /// same-binary A/B.
+    #[cfg(feature = "bench-internals")]
+    benchmark_linear_segment_reuse: bool,
     /// Bound only by the process-local Quill facade. Standalone Keeper users
     /// have no `ArcSwap` reader to coordinate, so they do not install this
     /// state word.
@@ -5881,6 +5893,8 @@ impl KeeperWriter {
             benchmark_qg4_directory_sync_state: None,
             #[cfg(feature = "bench-internals")]
             benchmark_mapped_preflight: false,
+            #[cfg(feature = "bench-internals")]
+            benchmark_linear_segment_reuse: false,
             publication_read_state: None,
             pending_publication: None,
         })
@@ -5935,6 +5949,11 @@ impl KeeperWriter {
     #[cfg(feature = "bench-internals")]
     pub(crate) fn set_benchmark_mapped_preflight(&mut self, mapped: bool) {
         self.benchmark_mapped_preflight = mapped;
+    }
+
+    #[cfg(feature = "bench-internals")]
+    pub(crate) fn set_benchmark_linear_segment_reuse(&mut self, linear: bool) {
+        self.benchmark_linear_segment_reuse = linear;
     }
 
     fn publication_read_state_is_stable_at(&self, generation: u64) -> bool {
@@ -6098,6 +6117,10 @@ impl KeeperWriter {
         let mapped_preflight = self.benchmark_mapped_preflight;
         #[cfg(not(feature = "bench-internals"))]
         let mapped_preflight = false;
+        #[cfg(feature = "bench-internals")]
+        let linear_reuse = self.benchmark_linear_segment_reuse;
+        #[cfg(not(feature = "bench-internals"))]
+        let linear_reuse = false;
         let verified = spawn_blocking(move || {
             validate_proposed_manifest_segments(
                 &preflight_directory,
@@ -6106,6 +6129,7 @@ impl KeeperWriter {
                 &preflight_protection,
                 &retained,
                 mapped_preflight,
+                linear_reuse,
             )
         })
         .await?;
@@ -6175,8 +6199,13 @@ impl KeeperWriter {
             return Err(error);
         }
         self.admission.ensure_directory_identity()?;
-        self.snapshot =
-            open_published_snapshot_blocking(directory, self.snapshot.schema(), verified).await?;
+        self.snapshot = open_published_snapshot_blocking(
+            directory,
+            self.snapshot.schema(),
+            verified,
+            linear_reuse,
+        )
+        .await?;
         self.pending_publication = None;
         Ok(self.retained_snapshot_for_bookkeeping())
     }
@@ -9083,13 +9112,14 @@ async fn open_published_snapshot_blocking(
     directory: PathBuf,
     schema: SchemaDescriptor,
     verified: Vec<VerifiedProposalSegment>,
+    linear_reuse: bool,
 ) -> Result<KeeperSnapshot, KeeperError> {
-    spawn_blocking(
-        move || match KeeperSnapshot::open_once_reusing(&directory, schema, verified) {
+    spawn_blocking(move || {
+        match KeeperSnapshot::open_once_reusing(&directory, schema, verified, linear_reuse) {
             Err(error) if recovery_retryable(&error) => KeeperSnapshot::open(&directory, schema),
             result => result,
-        },
-    )
+        }
+    })
     .await
 }
 
@@ -12371,6 +12401,57 @@ fn verified_file_stamp(_: &std::fs::Metadata) -> Option<VerifiedFileStamp> {
     None
 }
 
+/// The current snapshot's segments, looked up by MANIFEST binding. A commit
+/// proposes every retained segment again, so scanning them all for each
+/// proposal segment made every publication quadratic in the segment count.
+enum RetainedSegmentLookup<'a> {
+    /// Scan in retained order: the fallback when the index cannot be
+    /// allocated, and the bench-only incumbent for a same-binary A/B.
+    Linear(&'a [RecoveredSegment]),
+    /// `(segment_id, position)` in ascending order, so the segments that
+    /// share an id are visited in retained order.
+    Indexed {
+        retained: &'a [RecoveredSegment],
+        by_id: Vec<(u64, usize)>,
+    },
+}
+
+impl<'a> RetainedSegmentLookup<'a> {
+    fn new(retained: &'a [RecoveredSegment], linear: bool) -> Self {
+        let mut by_id = Vec::new();
+        if linear || by_id.try_reserve_exact(retained.len()).is_err() {
+            return Self::Linear(retained);
+        }
+        by_id.extend(
+            retained
+                .iter()
+                .enumerate()
+                .map(|(position, segment)| (segment.manifest.segment_id, position)),
+        );
+        by_id.sort_unstable();
+        Self::Indexed { retained, by_id }
+    }
+
+    /// The first retained segment, in retained order, bound exactly as
+    /// `manifest_segment`. Equal bindings have equal ids, so both variants
+    /// return the same segment.
+    fn find(&self, manifest_segment: &ManifestSegment) -> Option<&RecoveredSegment> {
+        match self {
+            Self::Linear(retained) => retained
+                .iter()
+                .find(|segment| segment.manifest == *manifest_segment),
+            Self::Indexed { retained, by_id } => {
+                let first = by_id.partition_point(|&(id, _)| id < manifest_segment.segment_id);
+                by_id[first..]
+                    .iter()
+                    .take_while(|&&(id, _)| id == manifest_segment.segment_id)
+                    .map(|&(_, position)| &retained[position])
+                    .find(|segment| segment.manifest == *manifest_segment)
+            }
+        }
+    }
+}
+
 /// The current snapshot's binding of a segment this proposal binds unchanged,
 /// when its file still stats exactly as it did when that binding's bytes were
 /// verified: the publication preflight then has nothing new to hash
@@ -12380,7 +12461,7 @@ fn reusable_verified_segment(
     path: &Path,
     manifest_segment: &ManifestSegment,
     protection: &WriterProtection,
-    retained: &[RecoveredSegment],
+    retained: &RetainedSegmentLookup<'_>,
 ) -> Option<RecoveredSegment> {
     #[cfg(feature = "durability")]
     if matches!(protection, WriterProtection::Enabled { .. }) {
@@ -12388,9 +12469,7 @@ fn reusable_verified_segment(
     }
     #[cfg(not(feature = "durability"))]
     let _ = protection;
-    let segment = retained
-        .iter()
-        .find(|segment| segment.manifest == *manifest_segment)?;
+    let segment = retained.find(manifest_segment)?;
     let verified = segment.verified_stamp?;
     let metadata = std::fs::symlink_metadata(path)
         .ok()
@@ -12405,6 +12484,7 @@ fn validate_proposed_manifest_segments(
     protection: &WriterProtection,
     retained: &[RecoveredSegment],
     mapped_preflight: bool,
+    linear_reuse: bool,
 ) -> Result<Vec<VerifiedProposalSegment>, KeeperError> {
     let mut verified = Vec::new();
     verified
@@ -12414,10 +12494,11 @@ fn validate_proposed_manifest_segments(
             path: directory.to_path_buf(),
             source: io::Error::other(error.to_string()),
         })?;
+    let retained = RetainedSegmentLookup::new(retained, linear_reuse);
     for manifest_segment in &manifest.segments {
         let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
         if let Some(segment) =
-            reusable_verified_segment(&path, manifest_segment, protection, retained)
+            reusable_verified_segment(&path, manifest_segment, protection, &retained)
         {
             let identity = segment.verified_stamp.map(|stamp| stamp.identity);
             verified.push(VerifiedProposalSegment { segment, identity });
@@ -12496,6 +12577,119 @@ fn validate_proposed_manifest_segments(
     Ok(verified)
 }
 
+/// The segments a publication preflight verified, each taken at most once by
+/// the snapshot that reopens the published MANIFEST. `remaining` always holds
+/// the candidates a scan of every remaining candidate would hold, in its order.
+struct VerifiedProposalCandidates {
+    remaining: Vec<VerifiedProposalSegment>,
+    /// Locates a candidate by id instead of scanning `remaining`. `None` when
+    /// two candidates share an id, when it cannot be allocated, and for the
+    /// bench-only incumbent of a same-binary A/B.
+    index: Option<VerifiedProposalIndex>,
+}
+
+impl VerifiedProposalCandidates {
+    fn new(verified: Vec<VerifiedProposalSegment>, linear: bool) -> Self {
+        let index = if linear {
+            None
+        } else {
+            VerifiedProposalIndex::new(&verified)
+        };
+        Self {
+            remaining: verified,
+            index,
+        }
+    }
+
+    /// Take the first remaining candidate bound exactly as `manifest_segment`
+    /// whose verified file identity is `current`, removing it by `swap_remove`.
+    fn take(
+        &mut self,
+        manifest_segment: &ManifestSegment,
+        current: Option<FileIdentity>,
+    ) -> Option<RecoveredSegment> {
+        let reusable = |candidate: &VerifiedProposalSegment| {
+            candidate.segment.manifest == *manifest_segment
+                && candidate.identity.is_some()
+                && candidate.identity == current
+        };
+        let position = match &mut self.index {
+            None => self.remaining.iter().position(reusable)?,
+            Some(index) => {
+                // Ids are distinct, so only the candidate with this id can be
+                // bound as `manifest_segment`.
+                let position = index.position_of(manifest_segment.segment_id)?;
+                if !reusable(&self.remaining[position]) {
+                    return None;
+                }
+                index.swap_remove(position);
+                position
+            }
+        };
+        Some(self.remaining.swap_remove(position).segment)
+    }
+}
+
+/// Where each verified candidate sits in [`VerifiedProposalCandidates`]'s
+/// `remaining`. A slot is a candidate's position as the preflight returned it.
+struct VerifiedProposalIndex {
+    /// `(segment_id, slot)` in ascending order; every id is distinct.
+    by_id: Vec<(u64, usize)>,
+    /// Slot to position in `remaining`; `usize::MAX` once taken.
+    position: Vec<usize>,
+    /// Position in `remaining` to slot.
+    slot: Vec<usize>,
+}
+
+impl VerifiedProposalIndex {
+    fn new(verified: &[VerifiedProposalSegment]) -> Option<Self> {
+        let mut by_id = Vec::new();
+        let mut position = Vec::new();
+        let mut slot = Vec::new();
+        by_id.try_reserve_exact(verified.len()).ok()?;
+        position.try_reserve_exact(verified.len()).ok()?;
+        slot.try_reserve_exact(verified.len()).ok()?;
+        by_id.extend(
+            verified
+                .iter()
+                .enumerate()
+                .map(|(at, candidate)| (candidate.segment.manifest.segment_id, at)),
+        );
+        by_id.sort_unstable();
+        if by_id.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return None;
+        }
+        position.extend(0..verified.len());
+        slot.extend(0..verified.len());
+        Some(Self {
+            by_id,
+            position,
+            slot,
+        })
+    }
+
+    /// The position in `remaining` of the candidate with `segment_id`, while
+    /// it has not been taken.
+    fn position_of(&self, segment_id: u64) -> Option<usize> {
+        let found = self
+            .by_id
+            .binary_search_by_key(&segment_id, |&(id, _)| id)
+            .ok()?;
+        let position = self.position[self.by_id[found].1];
+        (position != usize::MAX).then_some(position)
+    }
+
+    /// Mirror `remaining.swap_remove(position)`: the last candidate moves into
+    /// `position`.
+    fn swap_remove(&mut self, position: usize) {
+        let taken = self.slot.swap_remove(position);
+        if let Some(&moved) = self.slot.get(position) {
+            self.position[moved] = position;
+        }
+        self.position[taken] = usize::MAX;
+    }
+}
+
 /// The MANIFEST segments of a snapshot, reusing a segment the publication
 /// preflight verified when the MANIFEST binds it unchanged and its path still
 /// names the file the preflight read; any other segment is opened and
@@ -12504,7 +12698,8 @@ fn reuse_verified_segments(
     directory: &Path,
     manifest_segments: &[ManifestSegment],
     schema: SchemaDescriptor,
-    mut verified: Vec<VerifiedProposalSegment>,
+    verified: Vec<VerifiedProposalSegment>,
+    linear_reuse: bool,
 ) -> Result<Vec<RecoveredSegment>, KeeperError> {
     let mut segments = Vec::new();
     segments
@@ -12514,19 +12709,15 @@ fn reuse_verified_segments(
             path: directory.to_path_buf(),
             source: io::Error::other(error.to_string()),
         })?;
+    let mut candidates = VerifiedProposalCandidates::new(verified, linear_reuse);
     for manifest_segment in manifest_segments {
         let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
         let current = match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => file_identity(&metadata),
             _ => None,
         };
-        let reusable = verified.iter().position(|candidate| {
-            candidate.segment.manifest == *manifest_segment
-                && candidate.identity.is_some()
-                && candidate.identity == current
-        });
-        segments.push(match reusable {
-            Some(index) => verified.swap_remove(index).segment,
+        segments.push(match candidates.take(manifest_segment, current) {
+            Some(segment) => segment,
             None => open_manifest_segment(directory, manifest_segment, schema)?,
         });
     }
@@ -19251,6 +19442,7 @@ mod tests {
                 &WriterProtection::Disabled,
                 &[],
                 false,
+                false,
             )
         };
 
@@ -19258,14 +19450,16 @@ mod tests {
         // becomes the snapshot's, and its bytes are not hashed again.
         let verified = preflight()?;
         let backing = Arc::clone(&verified[0].segment.reader);
-        let snapshot = KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified)?;
+        let snapshot =
+            KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified, false)?;
         assert!(Arc::ptr_eq(&snapshot.segments()[0].reader, &backing));
 
         // A MANIFEST that binds the segment differently is verified again.
         let mut verified = preflight()?;
         verified[0].segment.manifest.seal_seq += 1;
         let backing = Arc::clone(&verified[0].segment.reader);
-        let snapshot = KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified)?;
+        let snapshot =
+            KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified, false)?;
         assert!(!Arc::ptr_eq(&snapshot.segments()[0].reader, &backing));
         assert_eq!(snapshot.segments()[0].manifest(), &manifest.segments[0]);
 
@@ -19277,7 +19471,8 @@ mod tests {
         let replacement = directory.join(".tmp-replacement");
         std::fs::copy(&path, &replacement)?;
         std::fs::rename(&replacement, &path)?;
-        let snapshot = KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified)?;
+        let snapshot =
+            KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified, false)?;
         assert!(!Arc::ptr_eq(&snapshot.segments()[0].reader, &backing));
         Ok(())
     }
@@ -19305,6 +19500,7 @@ mod tests {
                 DEFAULT_SCHEMA,
                 &WriterProtection::Disabled,
                 retained,
+                false,
                 false,
             )
         };
@@ -19384,6 +19580,7 @@ mod tests {
                 &WriterProtection::Disabled,
                 &[],
                 mapped,
+                false,
             )
             .map(|verified| {
                 let segment = &verified[0].segment;
@@ -19450,6 +19647,341 @@ mod tests {
             Ok::<(), String>(())
         })
         .map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    /// Publish `count` one-document segments, whose ids are a permutation out
+    /// of docid order, in one MANIFEST through a durable writer.
+    fn publish_many_segment_fixture(
+        directory: &Path,
+        count: u64,
+    ) -> Result<Manifest, Box<dyn std::error::Error>> {
+        let mut encoded = Vec::new();
+        for ordinal in 0..count {
+            let document_id = format!("many-{ordinal}");
+            encoded.push(encoded_identity_test_segment(
+                0x7e57_0000_0000 + (ordinal * 37) % count,
+                ordinal,
+                &[Some(document_id.as_str())],
+            )?);
+        }
+        let manifest = durable_test_manifest(
+            2,
+            encoded
+                .iter()
+                .zip(1..)
+                .map(|(segment, seal_seq)| manifest_segment(segment, seal_seq))
+                .collect(),
+        );
+        let publish_directory = directory.to_path_buf();
+        let published = manifest.clone();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &publish_directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            for segment in &encoded {
+                let pending = segment
+                    .write_temp(&publish_directory)
+                    .map_err(|error| error.to_string())?;
+                writer
+                    .publish_segment(&cx, pending)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            writer
+                .publish(&cx, &published)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })
+        .map_err(io::Error::other)?;
+        Ok(manifest)
+    }
+
+    /// The publication preflight finds a proposal segment's retained binding
+    /// by id. It must reuse exactly the binding a scan of the retained
+    /// segments in order reuses, or none, whatever their order, duplicates,
+    /// changed bindings or replaced files.
+    #[cfg(unix)]
+    #[test]
+    fn the_preflight_reuses_by_id_exactly_what_a_retained_scan_reuses() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let manifest = publish_many_segment_fixture(&directory, 41)?;
+        let mut grown = manifest.clone();
+        grown.generation += 1;
+        grown.docid_high_watermark = 44;
+        for ordinal in 0..3 {
+            let document_id = format!("grown-{ordinal}");
+            grown.segments.push(write_identity_test_segment(
+                &directory,
+                0x7e57_0000_0100 + ordinal,
+                42 + ordinal,
+                41 + ordinal,
+                &[Some(document_id.as_str())],
+            )?);
+        }
+        let mut rebound = grown.clone();
+        for segment in rebound.segments.iter_mut().step_by(5) {
+            segment.seal_seq += 1_000;
+        }
+
+        let snapshot = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)?;
+        let retained = snapshot.segments().to_vec();
+        let reversed: Vec<RecoveredSegment> = retained.iter().rev().cloned().collect();
+        // Unstamped duplicates ahead of segments 0, 7 and 19, so the first
+        // binding in retained order is one that cannot be reused; rebound
+        // copies of 5 and 10 and a second copy of 25 at the end.
+        let mut duplicated = Vec::new();
+        for position in [0, 7, 19] {
+            let mut unstamped = retained[position].clone();
+            unstamped.verified_stamp = None;
+            duplicated.push(unstamped);
+        }
+        duplicated.extend(retained.iter().cloned());
+        for position in [5, 10] {
+            let mut moved = retained[position].clone();
+            moved.manifest.seal_seq += 1_000;
+            duplicated.push(moved);
+        }
+        duplicated.push(retained[25].clone());
+
+        let outcome = |proposed: &Manifest, kept: &[RecoveredSegment], linear: bool| {
+            validate_proposed_manifest_segments(
+                &directory,
+                proposed,
+                DEFAULT_SCHEMA,
+                &WriterProtection::Disabled,
+                kept,
+                false,
+                linear,
+            )
+            .map(|verified| {
+                verified
+                    .iter()
+                    .map(|candidate| {
+                        let segment = &candidate.segment;
+                        (
+                            kept.iter().position(|binding| {
+                                Arc::ptr_eq(&binding.reader, &segment.reader)
+                                    && binding.manifest == segment.manifest
+                                    && binding.verified_stamp == segment.verified_stamp
+                            }),
+                            segment.manifest.clone(),
+                            segment.verified_stamp,
+                            candidate.identity,
+                            segment.authenticated_file_witness.file_xxh3(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| error.to_string())
+        };
+        let reused = |proposed: &Manifest, kept: &[RecoveredSegment], rows: &[usize]| {
+            outcome(proposed, kept, false)
+                .map(|verified| rows.iter().map(|&row| verified[row].0).collect::<Vec<_>>())
+        };
+        for proposed in [&manifest, &grown, &rebound] {
+            for kept in [&retained[..], &reversed[..], &duplicated[..], &[][..]] {
+                assert_eq!(
+                    outcome(proposed, kept, true),
+                    outcome(proposed, kept, false)
+                );
+            }
+        }
+        let every: Vec<usize> = (0..44).collect();
+        let expected: Vec<Option<usize>> =
+            every.iter().map(|&row| (row < 41).then_some(row)).collect();
+        assert_eq!(reused(&grown, &retained, &every), Ok(expected));
+        assert_eq!(
+            reused(&grown, &duplicated, &[0, 1, 7, 19, 25]),
+            Ok(vec![None, Some(4), None, None, Some(28)])
+        );
+        assert_eq!(
+            reused(&rebound, &duplicated, &[5, 10, 15]),
+            Ok(vec![Some(44), Some(45), None])
+        );
+
+        // A retained segment whose file now names another inode is verified
+        // again by both.
+        let path = directory.join(canonical_segment_name(manifest.segments[31].segment_id));
+        let replacement = directory.join(".tmp-replacement");
+        std::fs::copy(&path, &replacement)?;
+        std::fs::rename(&replacement, &path)?;
+        assert_eq!(
+            outcome(&grown, &retained, true),
+            outcome(&grown, &retained, false)
+        );
+        assert_eq!(
+            reused(&grown, &retained, &[30, 31]),
+            Ok(vec![Some(30), None])
+        );
+        Ok(())
+    }
+
+    /// The snapshot reopened after a publication takes each verified
+    /// candidate by id. It must take exactly the candidates a scan of the
+    /// remaining candidates takes, whatever their order, duplicates, changed
+    /// bindings, missing identities or replaced files.
+    #[cfg(unix)]
+    #[test]
+    fn the_reopened_snapshot_takes_by_id_exactly_the_candidates_a_scan_takes() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let manifest = publish_many_segment_fixture(&directory, 41)?;
+        let preflight = || {
+            validate_proposed_manifest_segments(
+                &directory,
+                &manifest,
+                DEFAULT_SCHEMA,
+                &WriterProtection::Disabled,
+                &[],
+                false,
+                false,
+            )
+        };
+        // Two independent verifications bind every segment to distinct backings.
+        let first = preflight()?;
+        let second = preflight()?;
+        let backings: Vec<_> = first
+            .iter()
+            .chain(&second)
+            .map(|candidate| Arc::clone(&candidate.segment.reader))
+            .collect();
+        let copy = |candidate: &VerifiedProposalSegment| VerifiedProposalSegment {
+            segment: candidate.segment.clone(),
+            identity: candidate.identity,
+        };
+        let outcome = |candidates: &[VerifiedProposalSegment], linear: bool| {
+            KeeperSnapshot::open_once_reusing(
+                &directory,
+                DEFAULT_SCHEMA,
+                candidates.iter().map(copy).collect(),
+                linear,
+            )
+            .map(|snapshot| {
+                snapshot
+                    .segments()
+                    .iter()
+                    .map(|segment| {
+                        (
+                            backings
+                                .iter()
+                                .position(|backing| Arc::ptr_eq(backing, &segment.reader)),
+                            segment.manifest.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| error.to_string())
+        };
+        let taken = |candidates: &[VerifiedProposalSegment]| {
+            outcome(candidates, false)
+                .map(|segments| segments.into_iter().map(|row| row.0).collect::<Vec<_>>())
+        };
+        // A path that now names another inode is reopened, never trusted.
+        let path = directory.join(canonical_segment_name(manifest.segments[13].segment_id));
+        let replacement = directory.join(".tmp-replacement");
+        std::fs::copy(&path, &replacement)?;
+        std::fs::rename(&replacement, &path)?;
+
+        let reversed: Vec<_> = first.iter().rev().map(copy).collect();
+        let mut mixed: Vec<_> = first.iter().map(copy).collect();
+        mixed.rotate_left(17);
+        for candidate in mixed.iter_mut().step_by(4) {
+            candidate.segment.manifest.seal_seq += 1_000;
+        }
+        for candidate in mixed.iter_mut().skip(1).step_by(6) {
+            candidate.identity = None;
+        }
+        let mut duplicated: Vec<_> = second[..10].iter().map(copy).collect();
+        duplicated.extend(first.iter().map(copy));
+        let halved: Vec<_> = first.iter().step_by(2).map(copy).collect();
+        for candidates in [
+            &first[..],
+            &reversed[..],
+            &mixed[..],
+            &duplicated[..],
+            &halved[..],
+            &[][..],
+        ] {
+            assert_eq!(outcome(candidates, true), outcome(candidates, false));
+        }
+        let expected: Vec<Option<usize>> = (0..41).map(|row| (row != 13).then_some(row)).collect();
+        assert_eq!(taken(&first), Ok(expected));
+        assert_eq!(
+            taken(&duplicated).map(|rows| rows[..10].to_vec()),
+            Ok((41..51).map(Some).collect())
+        );
+        assert_eq!(
+            taken(&halved).map(|rows| rows[..4].to_vec()),
+            Ok(vec![Some(0), None, Some(2), None])
+        );
+        Ok(())
+    }
+
+    /// bd-sw905 at scale: a publication that adds segments to a many-segment
+    /// index keeps every unchanged binding, and the MANIFEST it writes is the
+    /// proposal's exact encoding.
+    #[cfg(unix)]
+    #[test]
+    fn a_many_segment_publication_keeps_every_unchanged_binding() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let manifest = publish_many_segment_fixture(&directory, 41)?;
+        let added = (0..2)
+            .map(|ordinal| {
+                let document_id = format!("added-{ordinal}");
+                encoded_identity_test_segment(
+                    0x7e57_0000_0200 + ordinal,
+                    41 + ordinal,
+                    &[Some(document_id.as_str())],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut grown = manifest.clone();
+        grown.generation += 1;
+        grown.docid_high_watermark = 43;
+        for (segment, seal_seq) in added.iter().zip(42..) {
+            grown.segments.push(manifest_segment(segment, seal_seq));
+        }
+        let expected_bytes = grown.to_bytes()?;
+        let publish_directory = directory.clone();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::open(&cx, &publish_directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let before: Vec<_> = writer
+                .retained_snapshot_for_bookkeeping()
+                .segments()
+                .iter()
+                .map(|segment| Arc::clone(&segment.reader))
+                .collect();
+            for segment in &added {
+                let pending = segment
+                    .write_temp(&publish_directory)
+                    .map_err(|error| error.to_string())?;
+                writer
+                    .publish_segment(&cx, pending)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            let published = writer
+                .publish(&cx, &grown)
+                .await
+                .map_err(|error| error.to_string())?;
+            let kept = published
+                .segments()
+                .iter()
+                .zip(&before)
+                .all(|(segment, backing)| Arc::ptr_eq(&segment.reader, backing));
+            if before.len() != 41 || published.segments().len() != 43 || !kept {
+                return Err("an unchanged segment was reopened instead of kept".to_owned());
+            }
+            Ok::<(), String>(())
+        })
+        .map_err(io::Error::other)?;
+        assert_eq!(std::fs::read(directory.join("MANIFEST"))?, expected_bytes);
         Ok(())
     }
 
