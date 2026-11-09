@@ -9268,8 +9268,37 @@ impl FsfsRuntime {
         limit: usize,
         stream_id: &str,
         writer: &mut W,
-        mut resources_override: Option<SearchStreamResources<'_>>,
+        resources_override: Option<SearchStreamResources<'_>>,
     ) -> SearchResult<()> {
+        Box::pin(self.run_search_stream_with_query_expansion(
+            cx,
+            query,
+            limit,
+            stream_id,
+            writer,
+            resources_override,
+            Self::expand_search_query(cx, query),
+        ))
+        .await
+    }
+
+    /// The expansion future stays unpolled until Initial is visible. Keeping
+    /// query generation separate from retrieval also lets both stages share
+    /// the request's cancellation and pinned generation boundary.
+    async fn run_search_stream_with_query_expansion<W, F>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        stream_id: &str,
+        writer: &mut W,
+        mut resources_override: Option<SearchStreamResources<'_>>,
+        expansion: F,
+    ) -> SearchResult<()>
+    where
+        W: Write + Send,
+        F: Future<Output = SearchResult<query_expansion::ExpansionResult>> + Send,
+    {
         let mut tracked = SearchStreamWriter {
             inner: writer,
             failed: false,
@@ -9300,6 +9329,46 @@ impl FsfsRuntime {
             writer,
         )?;
         let search_result = async {
+            let mode = mode?;
+            // --expand is a local orchestration request. Ordinary daemon
+            // forwarding has no query-expansion contract and would drop it.
+            if self.cli_input.expand {
+                if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
+                    warn!("--expand takes precedence over daemon forwarding for streaming search");
+                }
+                let mut opened;
+                let (resources, flags) = if let Some(execution) = resources_override.as_mut() {
+                    (&mut *execution.resources, execution.flags)
+                } else {
+                    opened = self.prepare_search_execution_resources(cx, mode).await?;
+                    (
+                        &mut opened,
+                        SearchExecutionFlags {
+                            include_snippets: true,
+                            persist_explain_session: true,
+                        },
+                    )
+                };
+                return Box::pin(self.execute_progressive_expanded_queries(
+                    cx,
+                    query,
+                    limit,
+                    mode,
+                    resources,
+                    flags,
+                    expansion,
+                    |payload, expanded| {
+                        self.emit_search_stream_payload_with_stage(
+                            payload,
+                            stream_id,
+                            &mut seq,
+                            writer,
+                            expanded.then(|| Self::expanded_search_stream_stage(payload)),
+                        )
+                    },
+                ))
+                .await;
+            }
             let mut phase_sink = |stage_payload: &SearchPayload| {
                 self.emit_search_stream_payload(stage_payload, stream_id, &mut seq, writer)
             };
@@ -9308,7 +9377,7 @@ impl FsfsRuntime {
                     cx,
                     query,
                     limit,
-                    mode?,
+                    mode,
                     execution.resources,
                     execution.flags,
                     Some(&mut phase_sink),
@@ -11723,6 +11792,14 @@ impl FsfsRuntime {
                 "expanded-query explanation invalidation requires an admitted generation",
             )
         })?;
+        self.invalidate_expanded_query_explanation(target.generation.path(), query)
+    }
+
+    fn invalidate_expanded_query_explanation(
+        &self,
+        index_root: &Path,
+        query: &str,
+    ) -> SearchResult<()> {
         let mut session = ExplainSession::from_fused(
             query,
             SearchOutputPhase::Initial,
@@ -11730,7 +11807,7 @@ impl FsfsRuntime {
             &[],
         );
         session.unavailable = Some(ExplainUnavailableReason::ExpandedQueryFusion);
-        self.persist_explain_session_value(target.generation.path(), session)
+        self.persist_explain_session_value(index_root, session)
     }
 
     #[allow(clippy::future_not_send)]
@@ -12755,6 +12832,175 @@ impl FsfsRuntime {
         Ok(payloads)
     }
 
+    /// Stream the original Initial before polling query generation, then emit
+    /// either its retained terminal phase or one fused expanded ranking. Each
+    /// query runs once against the same resource generation and candidate depth.
+    async fn execute_progressive_expanded_queries<F, S>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mode: SearchExecutionMode,
+        resources: &mut SearchExecutionResources,
+        flags: SearchExecutionFlags,
+        expansion: F,
+        mut phase_sink: S,
+    ) -> SearchResult<Vec<SearchPayload>>
+    where
+        F: Future<Output = SearchResult<query_expansion::ExpansionResult>> + Send,
+        S: FnMut(&SearchPayload, bool) -> SearchResult<()> + Send,
+    {
+        Self::semantic_retry_checkpoint(cx, "fsfs.query_expansion")?;
+        self.rebind_search_resources_if_generation_changed(cx, mode, resources)
+            .await?;
+        let fingerprint = resources.generation_fingerprint.clone();
+        let index_root = resources.index_root.clone();
+        let expansion_limit = limit.saturating_mul(2).max(20);
+        let retrieval_flags = SearchExecutionFlags {
+            persist_explain_session: false,
+            ..flags
+        };
+        let mut initial_sink = |payload: &SearchPayload| {
+            Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+            if payload.phase == SearchOutputPhase::Initial {
+                if payload.hits.len() <= limit {
+                    phase_sink(payload, false)?;
+                } else {
+                    let mut preview = payload.clone();
+                    Self::limit_expanded_search_payload(&mut preview, limit);
+                    phase_sink(&preview, false)?;
+                }
+            }
+            Ok(())
+        };
+        let mut original = self
+            .execute_search_phase_artifacts_with_mode_using_resources(
+                cx,
+                query,
+                expansion_limit,
+                mode,
+                resources,
+                retrieval_flags,
+                Some(&mut initial_sink),
+            )
+            .await?;
+        Self::semantic_retry_checkpoint(cx, "fsfs.query_expansion")?;
+        Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+        let expansion = with_cancellation(cx, "fsfs.query_expansion", expansion).await?;
+        Self::semantic_retry_checkpoint(cx, "fsfs.query_expansion")?;
+        Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+        let generated = expansion
+            .queries
+            .into_iter()
+            .filter(|expanded| expanded.strategy != query_expansion::ExpansionStrategy::Original)
+            .collect::<Vec<_>>();
+        if generated.is_empty() {
+            for artifact in &mut original {
+                Self::limit_expanded_search_payload(&mut artifact.payload, limit);
+            }
+            let last = original
+                .last_mut()
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "query_expansion.phase".to_owned(),
+                    value: "original".to_owned(),
+                    reason: "original query completed without a search phase".to_owned(),
+                })?;
+            if self.complete_explain_target.is_some() {
+                self.attach_complete_search_explanations(cx, last, resources)?;
+            }
+            Self::semantic_retry_checkpoint(cx, "fsfs.query_expansion.finalize")?;
+            Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+            if last.phase != SearchOutputPhase::Initial {
+                phase_sink(&last.payload, false)?;
+            }
+            Self::semantic_retry_checkpoint(cx, "fsfs.query_expansion.finalize")?;
+            Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+            if flags.persist_explain_session {
+                self.persist_search_artifact_explanation(&index_root, query, last);
+            }
+            return Ok(original
+                .into_iter()
+                .map(|artifact| artifact.payload)
+                .collect());
+        }
+
+        let mut payloads = vec![
+            original
+                .pop()
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "query_expansion.phase".to_owned(),
+                    value: "original".to_owned(),
+                    reason: "original query completed without a search phase".to_owned(),
+                })?
+                .payload,
+        ];
+        payloads.extend(
+            self.execute_expanded_query_variants_in_mode(
+                cx,
+                query,
+                &generated,
+                expansion_limit,
+                mode,
+                resources,
+                &fingerprint,
+                retrieval_flags,
+            )
+            .await?,
+        );
+        let mut fused =
+            Self::fuse_expanded_payloads(query, &payloads, limit, self.config.search.rrf_k);
+        if self.config.search.explain {
+            fused.explanation_warnings.push(OutputWarning::new(
+                OutputWarningCode::EXPLANATION_UNAVAILABLE,
+                "expanded-query fusion has no complete per-query explanation evidence; run the search without --expand for ranking explanations",
+            ));
+        }
+        Self::semantic_retry_checkpoint(cx, "fsfs.query_expansion.finalize")?;
+        Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+        if flags.persist_explain_session {
+            self.invalidate_expanded_query_explanation(&index_root, query)?;
+        }
+        phase_sink(&fused, true)?;
+        Self::semantic_retry_checkpoint(cx, "fsfs.query_expansion.finalize")?;
+        Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+        Ok(vec![fused])
+    }
+
+    /// Expansion searches a wider candidate pool, including for its original
+    /// query. Only output is clipped; the complete ranking stays available for
+    /// cross-query fusion without rerunning the original model inference.
+    fn limit_expanded_search_payload(payload: &mut SearchPayload, limit: usize) {
+        if payload.hits.len() <= limit {
+            return;
+        }
+        payload.hits.truncate(limit);
+        payload.returned_hits = payload.hits.len();
+        let displayed = payload
+            .hits
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<HashSet<_>>();
+        payload
+            .lexical_scores
+            .retain(|path, _| displayed.contains(path.as_str()));
+        payload
+            .lexical_fallback_tail
+            .retain(|path| displayed.contains(path.as_str()));
+        payload
+            .explanations
+            .retain(|path, _| displayed.contains(path.as_str()));
+        if let Some(blend) = &mut payload.semantic_blend {
+            blend
+                .hits
+                .retain(|hit| displayed.contains(hit.path.as_str()));
+        }
+        if let Some(rerank) = &mut payload.rerank {
+            rerank
+                .scores
+                .retain(|hit| displayed.contains(hit.path.as_str()));
+        }
+    }
+
     /// Execute search with LLM-powered query expansion.
     ///
     /// Calls the query expansion module to generate additional query variants,
@@ -12855,6 +13101,30 @@ impl FsfsRuntime {
             self.config.pressure.degradation_override,
             self.requested_search_mode(),
         )?;
+        self.execute_expanded_query_variants_in_mode(
+            cx,
+            original_query,
+            queries,
+            expansion_limit,
+            mode,
+            resources,
+            expansion_fingerprint,
+            flags,
+        )
+        .await
+    }
+
+    async fn execute_expanded_query_variants_in_mode(
+        &self,
+        cx: &Cx,
+        original_query: &str,
+        queries: &[query_expansion::ExpandedQuery],
+        expansion_limit: usize,
+        mode: SearchExecutionMode,
+        resources: &mut SearchExecutionResources,
+        expansion_fingerprint: &str,
+        flags: SearchExecutionFlags,
+    ) -> SearchResult<Vec<SearchPayload>> {
         let normalized_original = Self::normalize_search_query(original_query);
         let original = ParsedQuery::parse(&normalized_original);
         if original.has_negations() && resources.lexical_index.is_none() {
@@ -44537,6 +44807,446 @@ mod tests {
         }
     }
 
+    fn stream_expansion_fixture(
+        query: &str,
+        generated: Option<&str>,
+    ) -> query_expansion::ExpansionResult {
+        let mut queries = vec![query_expansion::ExpandedQuery {
+            text: query.to_owned(),
+            strategy: query_expansion::ExpansionStrategy::Original,
+        }];
+        if let Some(text) = generated {
+            queries.push(query_expansion::ExpandedQuery {
+                text: text.to_owned(),
+                strategy: query_expansion::ExpansionStrategy::Keyword,
+            });
+        }
+        query_expansion::ExpansionResult {
+            queries,
+            backend_used: None,
+            elapsed_ms: 0,
+        }
+    }
+
+    async fn lexical_expansion_stream_fixture(cx: &Cx, root: &Path) -> (FsfsRuntime, QuillIndex) {
+        let lexical = create_test_quill(cx, &root.join("lexical")).await;
+        for (path, text) in [
+            ("original.md", "alpha"),
+            ("expanded.md", "beta"),
+            ("excluded.md", "beta secret"),
+        ] {
+            lexical
+                .index_document(cx, &IndexableDocument::new(path, text))
+                .await
+                .unwrap();
+        }
+        lexical.commit(cx).await.unwrap();
+        let mut config = FsfsConfig::default();
+        config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Search,
+            index_dir: Some(root.to_path_buf()),
+            stream: true,
+            expand: true,
+            format: OutputFormat::Jsonl,
+            ..CliInput::default()
+        });
+        (runtime, lexical)
+    }
+
+    #[test]
+    fn expanded_stream_flushes_initial_then_finds_generated_hits_and_preserves_exclusions() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runtime, _lexical) = lexical_expansion_stream_fixture(&cx, temp.path()).await;
+            runtime.cli_input.daemon = true;
+            let socket = temp.path().join("must-not-connect.sock");
+            fs::write(&socket, "not a daemon socket").unwrap();
+            runtime.cli_input.daemon_socket = Some(socket);
+            let query = "alpha -secret";
+            let writer = FlushVisibleWriter::default();
+            let mut transport = writer.clone();
+            let expansion = async {
+                let initial = decode_visible_stream(&writer);
+                assert!(initial.iter().any(|frame| matches!(
+                    &frame.event, StreamEvent::Result(result) if result.item.path == "original.md"
+                )), "Initial must be flushed before query generation begins");
+                assert!(
+                    !initial
+                        .iter()
+                        .any(|frame| frame.event.kind() == StreamEventKind::Terminal)
+                );
+                Ok(stream_expansion_fixture(query, Some("beta")))
+            };
+            runtime
+                .run_search_stream_with_query_expansion(
+                    &cx,
+                    query,
+                    2,
+                    "expanded-stream",
+                    &mut transport,
+                    None,
+                    expansion,
+                )
+                .await
+                .unwrap();
+            let frames = decode_visible_stream(&writer);
+            let expanded_at = frames
+                .iter()
+                .position(|frame| {
+                    matches!(
+                        &frame.event, StreamEvent::Progress(progress)
+                            if progress.reason_code == "query.stream.expanded_ready"
+                    )
+                })
+                .expect("expansion must not be lost to ordinary daemon forwarding");
+            let final_paths = frames[expanded_at..]
+                .iter()
+                .filter_map(|frame| match &frame.event {
+                    StreamEvent::Result(result) => Some(result.item.path.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(final_paths, ["expanded.md", "original.md"]);
+            assert!(!frames.iter().any(|frame| matches!(
+                &frame.event, StreamEvent::Result(result) if result.item.path == "excluded.md"
+            )));
+            assert!(matches!(frames.last().map(|frame| &frame.event),
+                Some(StreamEvent::Terminal(terminal)) if terminal.status == StreamTerminalStatus::Completed));
+            for (expected, frame) in frames.iter().enumerate() {
+                assert_eq!(frame.seq, expected as u64);
+            }
+            let explanation = FsfsRuntime::load_explain_session_at_root(temp.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                explanation.unavailable,
+                Some(super::ExplainUnavailableReason::ExpandedQueryFusion)
+            );
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn expanded_stream_runs_original_inference_once_with_or_without_generated_queries() {
+        run_on_runtime_task(|cx| async move {
+            for generate in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                let fast = Arc::new(ScriptedBoundEmbedder::new(BoundScript::Values(vec![
+                    1.0, 0.0,
+                ])));
+                let path = temp.path().join("expanded-stream-count.fsvi");
+                let mut vectors = VectorIndex::create_with_revision(
+                    &path,
+                    fast.id(),
+                    &fast.identity().unwrap().fingerprint(),
+                    2,
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap();
+                vectors.write_record("a.rs", &[1.0, 0.0]).unwrap();
+                vectors.write_record("b.rs", &[0.0, 1.0]).unwrap();
+                vectors.finish().unwrap();
+                resources.vector_index =
+                    Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
+                resources.fast_embedder = Some(admitted_shared(&fast));
+                resources.generation_fingerprint =
+                    FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+                let mut config = FsfsConfig::default();
+                config.search.fast_only = true;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    expand: true,
+                    stream: true,
+                    format: OutputFormat::Jsonl,
+                    ..CliInput::default()
+                });
+                let writer = FlushVisibleWriter::default();
+                let mut transport = writer.clone();
+                let query = "how do indexed alpha documents rank";
+                let expansion = async {
+                    assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        decode_visible_stream(&writer)
+                            .iter()
+                            .filter(|frame| frame.event.kind() == StreamEventKind::Result)
+                            .count(),
+                        1
+                    );
+                    Ok(stream_expansion_fixture(
+                        query,
+                        generate.then_some("how should related beta documents rank"),
+                    ))
+                };
+                runtime
+                    .run_search_stream_with_query_expansion(
+                        &cx,
+                        query,
+                        1,
+                        "expanded-once",
+                        &mut transport,
+                        Some(super::SearchStreamResources {
+                            resources: &mut resources,
+                            flags: SearchExecutionFlags {
+                                include_snippets: false,
+                                persist_explain_session: false,
+                            },
+                            requested_mode: SearchExecutionMode::Full,
+                        }),
+                        expansion,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fast.calls.load(Ordering::SeqCst),
+                    if generate { 2 } else { 1 }
+                );
+                let frames = decode_visible_stream(&writer);
+                assert_eq!(frames.iter().filter(|frame| matches!(
+                    &frame.event, StreamEvent::Progress(progress) if progress.stage == "retrieve.expansion"
+                )).count(), usize::from(generate));
+                assert_eq!(
+                    frames
+                        .iter()
+                        .filter(|frame| frame.event.kind() == StreamEventKind::Result)
+                        .count(),
+                    if generate { 2 } else { 1 }
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn expanded_stream_refuses_cancellation_or_publication_during_query_generation() {
+        run_on_runtime_task(|cx| async move {
+            for cancel in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let (runtime, lexical) = lexical_expansion_stream_fixture(&cx, temp.path()).await;
+                let writer = FlushVisibleWriter::default();
+                let mut transport = writer.clone();
+                let expansion = async {
+                    assert!(
+                        decode_visible_stream(&writer)
+                            .iter()
+                            .any(|frame| frame.event.kind() == StreamEventKind::Result)
+                    );
+                    if cancel {
+                        cx.set_cancel_requested(true);
+                    } else {
+                        lexical
+                            .index_document(&cx, &IndexableDocument::new("successor.md", "beta"))
+                            .await
+                            .unwrap();
+                        lexical.commit(&cx).await.unwrap();
+                    }
+                    Ok(stream_expansion_fixture("alpha", Some("beta")))
+                };
+                let error = runtime
+                    .run_search_stream_with_query_expansion(
+                        &cx,
+                        "alpha",
+                        2,
+                        "expanded-refusal",
+                        &mut transport,
+                        None,
+                        expansion,
+                    )
+                    .await
+                    .unwrap_err();
+                cx.set_cancel_requested(false);
+                if cancel {
+                    assert!(matches!(error, SearchError::Cancelled { .. }));
+                } else {
+                    assert!(
+                        matches!(error, SearchError::InvalidConfig { field, .. } if field == "index.generation")
+                    );
+                }
+                let frames = decode_visible_stream(&writer);
+                assert!(!frames.iter().any(|frame| matches!(
+                    &frame.event, StreamEvent::Progress(progress) if progress.stage == "retrieve.expansion"
+                )));
+                assert_eq!(
+                    frames
+                        .iter()
+                        .filter(|frame| frame.event.kind() == StreamEventKind::Result)
+                        .count(),
+                    1
+                );
+                assert!(matches!(frames.last().map(|frame| &frame.event),
+                    Some(StreamEvent::Terminal(terminal)) if terminal.status == if cancel { StreamTerminalStatus::Cancelled } else { StreamTerminalStatus::Failed }));
+            }
+        });
+    }
+
+    #[test]
+    fn expanded_stream_cancellation_wakes_an_unresponsive_query_generator() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, _lexical) = lexical_expansion_stream_fixture(&cx, temp.path()).await;
+            let writer = FlushVisibleWriter::default();
+            let mut transport = writer.clone();
+            let entered = AtomicBool::new(false);
+            let mut operation = Box::pin(runtime.run_search_stream_with_query_expansion(
+                &cx,
+                "alpha",
+                2,
+                "expanded-pending",
+                &mut transport,
+                None,
+                async {
+                    entered.store(true, Ordering::SeqCst);
+                    std::future::pending::<SearchResult<query_expansion::ExpansionResult>>().await
+                },
+            ));
+            poll_fn(|task| {
+                assert!(operation.as_mut().poll(task).is_pending());
+                if entered.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert!(
+                decode_visible_stream(&writer)
+                    .iter()
+                    .any(|frame| frame.event.kind() == StreamEventKind::Result)
+            );
+            let wake = Arc::new(RuntimeInferenceWake::default());
+            let waker = std::task::Waker::from(Arc::clone(&wake));
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("cancel expansion backend"),
+            );
+            assert!(
+                wake.0.load(Ordering::SeqCst) > 0,
+                "cancellation must wake the stream independently of the backend"
+            );
+            assert!(matches!(
+                operation.as_mut().poll(&mut context),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            drop(operation);
+            cx.set_cancel_requested(false);
+            let frames = decode_visible_stream(&writer);
+            assert!(matches!(frames.last().map(|frame| &frame.event),
+                Some(StreamEvent::Terminal(terminal)) if terminal.status == StreamTerminalStatus::Cancelled));
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.event.kind() == StreamEventKind::Result)
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn expanded_stream_without_variants_keeps_quality_timeout_without_retrying_it() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let quality = Arc::new(PendingSemanticEmbedder::new("blend-quality-2", 2));
+            resources.quality_embedder = Some(admitted_shared(&quality));
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 50;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                expand: true,
+                stream: true,
+                format: OutputFormat::Jsonl,
+                ..CliInput::default()
+            });
+            let writer = FlushVisibleWriter::default();
+            let mut transport = writer.clone();
+            let query = "how do indexed alpha documents rank";
+            runtime
+                .run_search_stream_with_query_expansion(
+                    &cx,
+                    query,
+                    1,
+                    "expanded-timeout",
+                    &mut transport,
+                    Some(super::SearchStreamResources {
+                        resources: &mut resources,
+                        flags: SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                        requested_mode: SearchExecutionMode::Full,
+                    }),
+                    async { Ok(stream_expansion_fixture(query, None)) },
+                )
+                .await
+                .unwrap();
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            let frames = decode_visible_stream(&writer);
+            assert_eq!(frames.iter().filter(|frame| matches!(
+                &frame.event, StreamEvent::Progress(progress) if progress.reason_code == "query.stream.refinement_failed"
+                    && progress.message.contains("quality refinement exceeded 50ms")
+            )).count(), 1);
+            assert!(!frames.iter().any(|frame| matches!(
+                &frame.event, StreamEvent::Progress(progress) if progress.stage == "retrieve.expansion"
+            )));
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.event.kind() == StreamEventKind::Result)
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn expanded_stream_requires_exclusion_evidence_before_query_generation() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                expand: true,
+                stream: true,
+                format: OutputFormat::Jsonl,
+                ..CliInput::default()
+            });
+            let writer = FlushVisibleWriter::default();
+            let mut transport = writer.clone();
+            let expanded = AtomicBool::new(false);
+            let error = runtime
+                .run_search_stream_with_query_expansion(
+                    &cx,
+                    "alpha -secret",
+                    2,
+                    "expanded-exclusion",
+                    &mut transport,
+                    Some(super::SearchStreamResources {
+                        resources: &mut resources,
+                        flags: SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                        requested_mode: SearchExecutionMode::Full,
+                    }),
+                    async {
+                        expanded.store(true, Ordering::SeqCst);
+                        Ok(stream_expansion_fixture("alpha -secret", Some("beta")))
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "cli.search_query")
+            );
+            assert!(!expanded.load(Ordering::SeqCst));
+            let frames = decode_visible_stream(&writer);
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0].event.kind(), StreamEventKind::Started);
+            assert_eq!(frames[1].event.kind(), StreamEventKind::Terminal);
+        });
+    }
+
     #[test]
     fn search_serve_refreshes_quill_and_invalidates_hot_cache() {
         run_test_with_cx(|cx| async move {
@@ -52126,6 +52836,26 @@ mod tests {
                 SearchExecutionMode::QualityOnly,
                 SearchExecutionMode::LexicalOnly,
             ] {
+                if matches!(mode, SearchExecutionMode::QualityOnly)
+                    && !super::SEMANTIC_LOADERS_COMPILED
+                {
+                    let error = runtime
+                        .execute_search_phase_artifacts_with_mode_using_resources(
+                            &cx,
+                            "alpha -banned",
+                            10,
+                            mode,
+                            &mut resources,
+                            flags,
+                            None,
+                        )
+                        .await
+                        .expect_err("lite retains its explicit quality-only refusal");
+                    assert!(
+                        matches!(error, SearchError::EmbedderUnavailable { model, .. } if model == "quality")
+                    );
+                    continue;
+                }
                 for query in [
                     "how do alpha documents rank -banned",
                     "how do alpha documents rank -\"internal secret\"",
@@ -52170,7 +52900,11 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                assert!(phases.iter().any(|phase| !phase.hits.is_empty()));
+                assert_eq!(
+                    phases.iter().any(|phase| !phase.hits.is_empty()),
+                    super::SEMANTIC_LOADERS_COMPILED,
+                    "vector-only positive queries require a semantic-capable build",
+                );
             }
         });
     }
@@ -54727,7 +55461,12 @@ mod tests {
                 daemon: false,
                 ..CliInput::default()
             });
-            for fail_flush in [false, true] {
+            for (expand, fail_flush) in [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let runtime = runtime.clone().with_cli_input(CliInput {
+                    expand,
+                    ..runtime.cli_input.clone()
+                });
                 let mut writer = FailingTransport {
                     bytes: Vec::new(),
                     flushes: 0,
