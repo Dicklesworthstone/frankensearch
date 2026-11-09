@@ -9594,7 +9594,8 @@ impl QuillWriterState {
         if let Err(error) = check_cancel(cx, "upsert documents") {
             return QuillObservedUpsert::new(Err(error), None);
         }
-        // Publish an unrelated pending batch before replacing a live document.
+        // Publish pending work before replacing either a live document or an
+        // identity still accumulating in that work.
         //
         // The refusal below exists because the replacement MANIFEST is derived
         // from the PUBLISHED snapshot, so pending shard state that has not been
@@ -9603,6 +9604,9 @@ impl QuillWriterState {
         // engine-neutral surface, and the pinned Tantivy backend accepts a
         // replacement with writes outstanding, so refusing here made an
         // ordinary interleaving succeed on one backend and fail on the other.
+        // The same applies when the previous revision is still uncommitted:
+        // without publishing it first, duplicate-ID admission rejects the
+        // replacement instead of honoring last-write-wins semantics.
         //
         // Deliberately narrow, and gated on ORDINARY pending work only.
         //
@@ -9631,7 +9635,7 @@ impl QuillWriterState {
         if !scalar_retry_pending
             && self.has_uncommitted_changes()
             && !self.has_active_deltas()
-            && match self.batch_replaces_published_document(cx, documents) {
+            && match self.batch_replaces_existing_document(cx, documents) {
                 Ok(replaces) => replaces,
                 Err(error) => return QuillObservedUpsert::new(Err(error), None),
             }
@@ -9783,6 +9787,26 @@ impl QuillWriterState {
             }
         }
         Ok(())
+    }
+
+    /// A revision in an ordinary pending batch needs the same publish-first
+    /// path as a published revision. Probe the writer's identity set before
+    /// touching the published snapshot; neither probe mutates ingest state.
+    fn batch_replaces_existing_document(
+        &mut self,
+        cx: &Cx,
+        documents: IngestBatch<'_>,
+    ) -> Result<bool, QuillIndexError> {
+        // Keep the published probe's authority fence even when a pending
+        // identity short-circuits it: an uncertain writer cannot auto-commit.
+        self.authority_snapshot()?;
+        for document in documents {
+            check_cancel(cx, "upsert replacement probe")?;
+            if self.uncommitted_ids.contains(document.id()) {
+                return Ok(true);
+            }
+        }
+        self.batch_replaces_published_document(cx, documents)
     }
 
     /// Whether any document in the batch replaces one that is already
@@ -24503,6 +24527,261 @@ mod tests {
         });
     }
 
+    async fn upsert_pending_fixture_documents(
+        index: &QuillIndex,
+        cx: &Cx,
+        schema: SchemaDescriptor,
+        documents: &[(&str, &str)],
+    ) -> SearchResult<()> {
+        if schema == DEFAULT_SCHEMA {
+            let documents = documents
+                .iter()
+                .map(|&(id, text)| IndexableDocument::new(id, text))
+                .collect::<Vec<_>>();
+            LexicalWrite::index_documents(index, cx, &documents).await
+        } else {
+            let content = schema
+                .fields
+                .iter()
+                .find(|field| field.name == "content")
+                .expect("fixture schema has a content field")
+                .id;
+            let documents = documents
+                .iter()
+                .map(|&(id, text)| SchemaDocument {
+                    id: id.to_owned(),
+                    indexed: vec![(content, text.to_owned())],
+                    ..SchemaDocument::default()
+                })
+                .collect::<Vec<_>>();
+            index
+                .upsert_schema_documents(cx, &documents)
+                .await
+                .map_err(SearchError::from)
+        }
+    }
+
+    #[test]
+    fn pending_upsert_revisions_preserve_siblings_snapshots_and_durable_last_write() {
+        run_with_cx(|cx| async move {
+            for schema in [DEFAULT_SCHEMA, crate::schema::CASS_SEMANTIC_SCHEMA] {
+                let directory = tempfile::tempdir().expect("pending upsert directory");
+                let config = QuillConfig {
+                    max_visibility_lag_ms: u64::MAX,
+                    tier_fanout: usize::MAX,
+                    ..deterministic_config()
+                };
+                let index =
+                    QuillIndex::create_with_schema(&cx, directory.path(), schema, config.clone())
+                        .await
+                        .expect("create persistent pending upsert fixture");
+                let empty_reader = QuillSearchIndex::open_with_schema(
+                    &cx,
+                    directory.path(),
+                    schema,
+                    config.clone(),
+                )
+                .await
+                .expect("retain the empty generation");
+                let original_generation = published_generation(&index);
+                upsert_pending_fixture_documents(
+                    &index,
+                    &cx,
+                    schema,
+                    &[("revised", "original"), ("sibling", "untouched")],
+                )
+                .await
+                .expect("stage first revisions without a commit");
+                upsert_pending_fixture_documents(&index, &cx, schema, &[("other", "companion")])
+                    .await
+                    .expect("a disjoint batch must keep accumulating");
+                assert_eq!(published_generation(&index), original_generation);
+                assert!(index.has_uncommitted_changes());
+
+                let rejected = upsert_pending_fixture_documents(
+                    &index,
+                    &cx,
+                    schema,
+                    &[("revised", "rejected"), ("", "invalid")],
+                )
+                .await;
+                assert!(rejected.is_err());
+                let cancelled = Cx::for_testing();
+                cancelled.set_cancel_requested(true);
+                assert!(matches!(
+                    upsert_pending_fixture_documents(
+                        &index,
+                        &cancelled,
+                        schema,
+                        &[("revised", "cancelled")],
+                    )
+                    .await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert_eq!(published_generation(&index), original_generation);
+                assert!(index.has_uncommitted_changes());
+
+                upsert_pending_fixture_documents(
+                    &index,
+                    &cx,
+                    schema,
+                    &[("revised", "second"), ("added", "additional")],
+                )
+                .await
+                .expect("replace an uncommitted identity and preserve pending siblings");
+                let second_reader = QuillSearchIndex::open_with_schema(
+                    &cx,
+                    directory.path(),
+                    schema,
+                    config.clone(),
+                )
+                .await
+                .expect("retain the intermediate revision");
+                assert_eq!(second_reader.doc_count().expect("intermediate count"), 4);
+                upsert_pending_fixture_documents(
+                    &index,
+                    &cx,
+                    schema,
+                    &[("revised", "discarded"), ("revised", "latest")],
+                )
+                .await
+                .expect("repeated updates and in-batch dedup must keep the last revision");
+                index.commit(&cx).await.expect("commit the final revision");
+                drop(index);
+
+                let reopened = QuillIndex::open_with_schema(&cx, directory.path(), schema, config)
+                    .await
+                    .expect("reopen the writer after repeated updates");
+                assert_eq!(reopened.doc_count().expect("reopened live count"), 4);
+                for query in ["original", "second", "discarded", "rejected", "cancelled"] {
+                    assert_eq!(hit_count(&reopened, &cx, query), 0, "{query}");
+                }
+                for (query, id) in [
+                    ("latest", "revised"),
+                    ("untouched", "sibling"),
+                    ("companion", "other"),
+                    ("additional", "added"),
+                ] {
+                    let hits = reopened
+                        .search_doc_ids(&cx, query, 10)
+                        .expect("fresh search");
+                    assert_eq!(hits.len(), 1, "{query}");
+                    assert_eq!(hits[0].document_id, id);
+                }
+                assert_eq!(empty_reader.doc_count().expect("old empty reader count"), 0);
+                assert_eq!(second_reader.doc_count().expect("retained reader count"), 4);
+                let retained = second_reader
+                    .search_doc_ids(&cx, "second", 10)
+                    .expect("retained reader keeps its original revision");
+                assert_eq!(retained.len(), 1);
+                assert_eq!(retained[0].document_id, "revised");
+                assert!(
+                    second_reader
+                        .search_doc_ids(&cx, "latest", 10)
+                        .expect("later revisions cannot leak into an old reader")
+                        .is_empty()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn pending_upsert_cancelled_after_publication_keeps_accepted_rows_on_reopen() {
+        run_with_cx(|cx| async move {
+            for schema in [DEFAULT_SCHEMA, crate::schema::CASS_SEMANTIC_SCHEMA] {
+                let directory = tempfile::tempdir().expect("cancelled pending upsert directory");
+                let config = QuillConfig {
+                    max_visibility_lag_ms: u64::MAX,
+                    tier_fanout: usize::MAX,
+                    ..deterministic_config()
+                };
+                let mut index =
+                    QuillIndex::create_with_schema(&cx, directory.path(), schema, config.clone())
+                        .await
+                        .expect("create persistent cancellation fixture");
+                upsert_pending_fixture_documents(
+                    &index,
+                    &cx,
+                    schema,
+                    &[
+                        ("first", "alpha one"),
+                        ("second", "alpha two"),
+                        ("sibling", "alpha three"),
+                    ],
+                )
+                .await
+                .expect("stage accepted originals without committing");
+                assert!(index.has_uncommitted_changes());
+                let replacements = [("first", "omega one"), ("second", "omega two")];
+                index.writer_mut().cancel_ingest_after_documents = Some(1);
+                let cancelled =
+                    upsert_pending_fixture_documents(&index, &cx, schema, &replacements).await;
+                index.writer_mut().cancel_ingest_after_documents = None;
+                cx.set_cancel_requested(false);
+                assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+                assert!(!index.has_uncommitted_changes());
+                assert!(!index.writer_mut().ingest_retry_required);
+                assert!(index.writer_mut().pending_replacement_manifest.is_none());
+                assert_eq!(
+                    index.doc_count().expect("accepted originals remain live"),
+                    3
+                );
+                assert_eq!(hit_count(&index, &cx, "alpha"), 3);
+                assert_eq!(hit_count(&index, &cx, "omega"), 0);
+                let generation = published_generation(&index);
+                index
+                    .commit(&cx)
+                    .await
+                    .expect("commit after the cancelled replacement");
+                assert_eq!(published_generation(&index), generation);
+                drop(index);
+
+                let retained = QuillSearchIndex::open_with_schema(
+                    &cx,
+                    directory.path(),
+                    schema,
+                    config.clone(),
+                )
+                .await
+                .expect("reopen the accepted originals after cancellation");
+                assert_eq!(retained.doc_count().expect("reopened count"), 3);
+                assert_eq!(
+                    retained
+                        .search_doc_ids(&cx, "alpha", 10)
+                        .expect("originals survive")
+                        .len(),
+                    3
+                );
+                assert!(
+                    retained
+                        .search_doc_ids(&cx, "omega", 10)
+                        .expect("no partial replacement")
+                        .is_empty()
+                );
+                let reopened = QuillIndex::open_with_schema(&cx, directory.path(), schema, config)
+                    .await
+                    .expect("reopen writer for a whole-batch retry");
+                upsert_pending_fixture_documents(&reopened, &cx, schema, &replacements)
+                    .await
+                    .expect("retry both revisions together");
+                reopened
+                    .commit(&cx)
+                    .await
+                    .expect("commit the successful retry");
+                assert_eq!(reopened.doc_count().expect("retry count"), 3);
+                assert_eq!(hit_count(&reopened, &cx, "omega"), 2);
+                assert_eq!(hit_count(&reopened, &cx, "alpha"), 1);
+                assert_eq!(
+                    retained
+                        .search_doc_ids(&cx, "alpha", 10)
+                        .expect("retained originals")
+                        .len(),
+                    3
+                );
+            }
+        });
+    }
+
     /// A rejected replacement batch must publish NOTHING, even though
     /// accepting it would have published pending work first.
     ///
@@ -25032,7 +25311,12 @@ mod tests {
     #[test]
     fn lexical_trait_retained_scalar_retry_states_still_refuse_a_replacement() {
         run_with_cx(|cx| async move {
-            for label in ["ingest_retry_required", "staged_flush"] {
+            for (label, replaced_id) in [
+                ("ingest_retry_required", "seeded"),
+                ("ingest_retry_required", "pending"),
+                ("staged_flush", "seeded"),
+                ("staged_flush", "pending"),
+            ] {
                 let mut index =
                     QuillIndex::in_memory(deterministic_config()).expect("memory index");
                 LexicalWrite::index_documents(
@@ -25071,7 +25355,7 @@ mod tests {
                 let refused = LexicalWrite::index_documents(
                     &index,
                     &cx,
-                    &[IndexableDocument::new("seeded", "new gamma")],
+                    &[IndexableDocument::new(replaced_id, "new gamma")],
                 )
                 .await;
                 assert!(
