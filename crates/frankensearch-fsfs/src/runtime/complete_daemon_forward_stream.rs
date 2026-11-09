@@ -5,6 +5,7 @@
 //! a bounded partial record, and one deadline across connect, send and receive.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -22,8 +23,8 @@ use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_RESPONSE_MAX_BYTES, ForwardedSearch, FsfsRuntime,
     LiveRetainedSearchReader, PeerOutcome, Reply, SearchCacheKey, SearchExecutionFlags, VERSION,
     codec_error, complete_cli_error, control, decode_reply, decode_request, encode_response,
-    error_envelope, make_request, query_runtime, retained_search_checkpoint, run_request,
-    validate_request, write_response,
+    error_envelope, expansion, make_request, query_runtime, retained_search_checkpoint,
+    run_request, validate_request, write_response,
 };
 #[cfg(test)]
 use crate::CliCommand;
@@ -117,6 +118,8 @@ pub(super) async fn serve(
     let request = parse_request(bytes)?;
     let output = streaming::PhaseWriter::new(peer)?;
     let mut writer = output.clone();
+    let expansion_output = output.clone();
+    let mut expansion_peer = peer.try_clone()?;
     let producer = async {
         validate_request(runtime, session.store.root(), &request.request)?;
         if session.refresh(cx).await?
@@ -125,6 +128,31 @@ pub(super) async fn serve(
             cache.clear();
         }
         let query_runtime = query_runtime(session, &request.request.search, true)?;
+        if request.request.search.expand {
+            return query_runtime
+                .run_search_stream_with_query_expansion(
+                    cx,
+                    &request.request.search.query,
+                    request.request.search.limit,
+                    &request.request.request_id,
+                    &mut writer,
+                    Some(SearchStreamResources {
+                        resources: &mut session.reader.resources,
+                        flags: SearchExecutionFlags {
+                            include_snippets: true,
+                            persist_explain_session: true,
+                        },
+                        requested_mode: query_runtime.requested_search_mode(),
+                    }),
+                    expansion::receive_variants(
+                        cx,
+                        &request.request,
+                        &mut expansion_peer,
+                        expansion_output,
+                    ),
+                )
+                .await;
+        }
         if !request.request.search.explain {
             return serve_cached_search(
                 cx,
@@ -156,7 +184,7 @@ pub(super) async fn serve(
     };
     let result = Box::pin(run_request(
         cx,
-        request.request.search.policy.delivery_budget(),
+        request.request.search.delivery_budget(),
         streaming::drive(cx, &output, producer),
     ))
     .await;
@@ -256,6 +284,8 @@ async fn serve_cached_search(
 struct ReceiveState {
     next_sequence: u64,
     started: bool,
+    initial_ready: bool,
+    expansion_sent: bool,
     terminal: Option<Frame>,
     // Conservative: a Write error may have followed a partially written frame.
     // No other envelope or terminal may then be appended to that partial record.
@@ -303,7 +333,9 @@ impl ReceiveState {
             StreamEvent::Terminal(terminal) => {
                 let coherent = match terminal.status {
                     StreamTerminalStatus::Completed => {
-                        terminal.exit_code == 0 && terminal.error.is_none()
+                        terminal.exit_code == 0
+                            && terminal.error.is_none()
+                            && (!request.search.expand || self.expansion_sent)
                     }
                     StreamTerminalStatus::Failed | StreamTerminalStatus::Cancelled => {
                         (1..=255).contains(&terminal.exit_code)
@@ -329,6 +361,11 @@ impl ReceiveState {
                     "daemon_stream",
                     "result rank must be positive",
                 ));
+            }
+            StreamEvent::Progress(progress)
+                if progress.reason_code == "query.stream.initial_ready" =>
+            {
+                self.initial_ready = true;
             }
             _ => {}
         }
@@ -361,7 +398,7 @@ impl ReceiveState {
 }
 
 #[allow(clippy::too_many_arguments)] // Request identity, deadline and output state remain borrowed.
-async fn receive<W: Write + Send>(
+async fn receive_with_query_expansion<W, F>(
     cx: &Cx,
     peer: &mut UnixStream,
     request: &ForwardedSearch,
@@ -370,9 +407,15 @@ async fn receive<W: Write + Send>(
     format: OutputFormat,
     state: &mut ReceiveState,
     output: &mut W,
-) -> SearchResult<Option<OutputError>> {
+    expansion_future: F,
+) -> SearchResult<Option<OutputError>>
+where
+    W: Write + Send,
+    F: Future<Output = SearchResult<crate::query_expansion::ExpansionResult>> + Send,
+{
     let mut record = Vec::new();
     let mut chunk = [0_u8; 8192];
+    let mut expansion_future = Some(expansion_future);
     loop {
         retained_search_checkpoint(cx)?;
         let remaining = control::remaining(started, timeout)?;
@@ -411,6 +454,30 @@ async fn receive<W: Write + Send>(
                     if part.last() != Some(&b'\n') {
                         continue;
                     }
+                    if expansion::is_ready(&record) {
+                        if !state.started
+                            || !state.initial_ready
+                            || state.expansion_sent
+                            || state.terminal.is_some()
+                        {
+                            return Err(complete_cli_error(
+                                "daemon_expansion",
+                                "expansion readiness is out of order or duplicated",
+                            ));
+                        }
+                        expansion::validate_ready(&record, request)?;
+                        state.expansion_sent = true;
+                        let future = expansion_future.take().ok_or_else(|| {
+                            complete_cli_error(
+                                "daemon_expansion",
+                                "query expansion already consumed",
+                            )
+                        })?;
+                        expansion::send_variants(cx, peer, request, started, timeout, future)
+                            .await?;
+                        record.clear();
+                        continue;
+                    }
                     if !state.started
                         && serde_json::from_slice::<serde_json::Value>(&record)
                             .is_ok_and(|value| value.get("fsfs_complete_cli").is_some())
@@ -437,6 +504,32 @@ async fn receive<W: Write + Send>(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn receive<W: Write + Send>(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    request: &ForwardedSearch,
+    started: Instant,
+    timeout: Duration,
+    format: OutputFormat,
+    state: &mut ReceiveState,
+    output: &mut W,
+) -> SearchResult<Option<OutputError>> {
+    receive_with_query_expansion(
+        cx,
+        peer,
+        request,
+        started,
+        timeout,
+        format,
+        state,
+        output,
+        FsfsRuntime::expand_search_query(cx, &request.search.query),
+    )
+    .await
 }
 
 fn append_record(record: &mut Vec<u8>, part: &[u8]) -> SearchResult<()> {
@@ -495,16 +588,38 @@ impl FsfsRuntime {
         limit: usize,
         output: &mut W,
     ) -> SearchResult<()> {
+        self.stream_complete_generation_daemon_with_query_expansion(
+            cx,
+            root,
+            query,
+            limit,
+            output,
+            Self::expand_search_query(cx, query),
+        )
+        .await
+    }
+
+    pub(super) async fn stream_complete_generation_daemon_with_query_expansion<W, F>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        query: &str,
+        limit: usize,
+        output: &mut W,
+        expansion_future: F,
+    ) -> SearchResult<()>
+    where
+        W: Write + Send,
+        F: Future<Output = SearchResult<crate::query_expansion::ExpansionResult>> + Send,
+    {
         retained_search_checkpoint(cx)?;
-        if self.cli_input.expand
-            || !matches!(
-                self.cli_input.format,
-                OutputFormat::Jsonl | OutputFormat::Toon
-            )
-        {
+        if !matches!(
+            self.cli_input.format,
+            OutputFormat::Jsonl | OutputFormat::Toon
+        ) {
             return Err(complete_cli_error(
                 "daemon_options",
-                "stream forwarding requires JSONL/TOON without expansion",
+                "stream forwarding requires JSONL/TOON",
             ));
         }
         let request = StreamRequest {
@@ -521,7 +636,7 @@ impl FsfsRuntime {
         }
         parse_request(&bytes)?;
         let path = self.complete_generation_socket_path(root)?;
-        let timeout = request.request.search.policy.delivery_budget();
+        let timeout = request.request.search.delivery_budget();
         let started = Instant::now();
         let mut peer = control::connect_and_send(
             cx,
@@ -532,7 +647,7 @@ impl FsfsRuntime {
         )
         .await?;
         let mut state = ReceiveState::default();
-        let result = receive(
+        let result = receive_with_query_expansion(
             cx,
             &mut peer,
             &request.request,
@@ -541,6 +656,7 @@ impl FsfsRuntime {
             self.cli_input.format,
             &mut state,
             output,
+            expansion_future,
         )
         .await;
         finish_receive(
@@ -601,6 +717,320 @@ mod tests {
             emit_stream_frame(frame, OutputFormat::Jsonl, &mut bytes).unwrap();
         }
         bytes
+    }
+
+    fn initial(request: &ForwardedSearch) -> Frame {
+        Frame::new(
+            &request.request_id,
+            1,
+            "2026-09-21T00:00:00Z",
+            "search",
+            StreamEvent::Progress(StreamProgressEvent {
+                stage: if request.search.quality_only {
+                    "retrieve.quality"
+                } else {
+                    "retrieve.fast"
+                }
+                .to_owned(),
+                completed_units: 0,
+                total_units: Some(0),
+                reason_code: "query.stream.initial_ready".to_owned(),
+                message: "original results ready".to_owned(),
+            }),
+        )
+    }
+
+    fn ready(request: &ForwardedSearch) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "fsfs_complete_cli_expansion": VERSION,
+            "request_id": request.request_id,
+            "query": request.search.query,
+        }))
+        .unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn fallback(request: &ForwardedSearch) -> crate::query_expansion::ExpansionResult {
+        crate::query_expansion::ExpansionResult {
+            queries: vec![crate::query_expansion::ExpandedQuery {
+                text: request.search.query.clone(),
+                strategy: crate::query_expansion::ExpansionStrategy::Original,
+            }],
+            backend_used: None,
+            elapsed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn client_expands_once_after_initial_and_keeps_internal_records_out_of_both_formats() {
+        use std::sync::{Arc, Mutex};
+
+        struct SharedOutput(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (quality_only, format) in [
+                (false, OutputFormat::Jsonl),
+                (true, OutputFormat::Jsonl),
+                (false, OutputFormat::Toon),
+            ] {
+                let mut request = request();
+                request.search.expand = true;
+                request.search.quality_only = quality_only;
+                let prefix = frames_bytes(&[started(&request), initial(&request)]);
+                let mut wire = prefix.clone();
+                wire.extend(ready(&request));
+                let terminal = Frame {
+                    seq: 2,
+                    ..completed(&request)
+                };
+                wire.extend(frames_bytes(&[terminal]));
+                let (mut peer, mut server) = UnixStream::pair().unwrap();
+                peer.set_nonblocking(true).unwrap();
+                server.write_all(&wire).unwrap();
+                server.shutdown(Shutdown::Write).unwrap();
+                let visible = Arc::new(Mutex::new(Vec::new()));
+                let mut output = SharedOutput(Arc::clone(&visible));
+                let mut state = ReceiveState::default();
+                let result = receive_with_query_expansion(
+                    &cx,
+                    &mut peer,
+                    &request,
+                    Instant::now(),
+                    Duration::from_secs(1),
+                    format,
+                    &mut state,
+                    &mut output,
+                    async {
+                        let visible = visible.lock().unwrap();
+                        assert!(
+                            String::from_utf8_lossy(&visible)
+                                .contains("query.stream.initial_ready")
+                        );
+                        assert!(
+                            !String::from_utf8_lossy(&visible)
+                                .contains("fsfs_complete_cli_expansion")
+                        );
+                        Ok(fallback(&request))
+                    },
+                )
+                .await;
+                finish_receive(&mut state, &request, format, &mut output, result).unwrap();
+                assert!(state.expansion_sent);
+                let mut sent = Vec::new();
+                server.read_to_end(&mut sent).unwrap();
+                let variants: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+                assert_eq!(variants["request_id"], request.request_id);
+                assert_eq!(variants["queries"].as_array().unwrap().len(), 1);
+                let visible = visible.lock().unwrap();
+                let text = std::str::from_utf8(&visible).unwrap();
+                assert!(!text.contains("fsfs_complete_cli_expansion"));
+                if format == OutputFormat::Jsonl {
+                    let frames = text
+                        .lines()
+                        .map(|line| serde_json::from_str::<Frame>(line).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(frames.len(), 3);
+                    assert_eq!(frames[2].seq, 2);
+                    assert!(
+                        matches!(&frames[2].event, StreamEvent::Terminal(terminal) if terminal.status == StreamTerminalStatus::Completed)
+                    );
+                } else {
+                    assert_eq!(text.matches('\u{001e}').count(), 3);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn invalid_expansion_order_or_identity_owns_one_failure_terminal_without_regeneration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for fault in [
+                "before_initial",
+                "wrong_id",
+                "duplicate",
+                "missing",
+                "ordinary",
+            ] {
+                let mut request = request();
+                request.search.expand = fault != "ordinary";
+                let mut wire = frames_bytes(&[started(&request)]);
+                if fault != "before_initial" {
+                    wire.extend(frames_bytes(&[initial(&request)]));
+                }
+                if fault != "missing" {
+                    let mut admission = ready(&request);
+                    if fault == "wrong_id" {
+                        let mut value: serde_json::Value =
+                            serde_json::from_slice(&admission).unwrap();
+                        value["request_id"] = serde_json::json!("somebody else");
+                        admission = serde_json::to_vec(&value).unwrap();
+                        admission.push(b'\n');
+                    }
+                    wire.extend(&admission);
+                    if fault == "duplicate" {
+                        wire.extend(admission);
+                    }
+                }
+                wire.extend(frames_bytes(&[Frame {
+                    seq: 2,
+                    ..completed(&request)
+                }]));
+                let (mut peer, mut server) = UnixStream::pair().unwrap();
+                peer.set_nonblocking(true).unwrap();
+                server.write_all(&wire).unwrap();
+                server.shutdown(Shutdown::Write).unwrap();
+                let calls = AtomicUsize::new(0);
+                let mut state = ReceiveState::default();
+                let mut output = Vec::new();
+                let result = receive_with_query_expansion(
+                    &cx,
+                    &mut peer,
+                    &request,
+                    Instant::now(),
+                    Duration::from_secs(1),
+                    OutputFormat::Jsonl,
+                    &mut state,
+                    &mut output,
+                    async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(fallback(&request))
+                    },
+                )
+                .await;
+                let failure = finish_receive(
+                    &mut state,
+                    &request,
+                    OutputFormat::Jsonl,
+                    &mut output,
+                    result,
+                )
+                .unwrap_err();
+                assert!(
+                    FsfsRuntime::forwarded_search_error_was_emitted(&failure),
+                    "{fault}"
+                );
+                assert!(!FsfsRuntime::is_stale_daemon_refusal(&failure), "{fault}");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    usize::from(fault == "duplicate"),
+                    "{fault}"
+                );
+                let frames = output
+                    .split(|&byte| byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice::<Frame>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    frames
+                        .iter()
+                        .filter(|frame| matches!(frame.event, StreamEvent::Terminal(_)))
+                        .count(),
+                    1,
+                    "{fault}"
+                );
+                assert!(
+                    matches!(&frames.last().unwrap().event, StreamEvent::Terminal(terminal) if terminal.status == StreamTerminalStatus::Failed)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn cancellation_or_daemon_loss_during_client_expansion_drops_generator_and_owns_one_terminal() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll, Waker};
+
+        struct Released(Arc<AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for cancel in [true, false] {
+                let mut request = request();
+                request.search.expand = true;
+                let (mut peer, mut server) = UnixStream::pair().unwrap();
+                peer.set_nonblocking(true).unwrap();
+                let mut wire = frames_bytes(&[started(&request), initial(&request)]);
+                wire.extend(ready(&request));
+                server.write_all(&wire).unwrap();
+                let released = Arc::new(AtomicBool::new(false));
+                let owned = Released(Arc::clone(&released));
+                let mut state = ReceiveState::default();
+                let mut output = Vec::new();
+                let mut operation = Box::pin(receive_with_query_expansion(
+                    &cx,
+                    &mut peer,
+                    &request,
+                    Instant::now(),
+                    Duration::from_secs(1),
+                    OutputFormat::Jsonl,
+                    &mut state,
+                    &mut output,
+                    async move {
+                        let _owned = owned;
+                        std::future::pending().await
+                    },
+                ));
+                let mut task = Context::from_waker(Waker::noop());
+                assert!(operation.as_mut().poll(&mut task).is_pending());
+                if !cancel {
+                    drop(server);
+                }
+                cx.set_cancel_requested(cancel);
+                let Poll::Ready(result) = operation.as_mut().poll(&mut task) else {
+                    panic!("cancellation or peer loss must release the expansion immediately"); // ubs:ignore — cfg(test) failure.
+                };
+                drop(operation);
+                cx.set_cancel_requested(false);
+                assert!(released.load(Ordering::SeqCst));
+                if cancel {
+                    assert!(matches!(&result, Err(SearchError::Cancelled { .. })));
+                } else {
+                    assert!(
+                        matches!(&result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::BrokenPipe)
+                    );
+                }
+                let error = finish_receive(
+                    &mut state,
+                    &request,
+                    OutputFormat::Jsonl,
+                    &mut output,
+                    result,
+                )
+                .unwrap_err();
+                assert!(FsfsRuntime::forwarded_search_error_was_emitted(&error));
+                let frames = output
+                    .split(|&byte| byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice::<Frame>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(frames.len(), 3);
+                let expected = if cancel {
+                    StreamTerminalStatus::Cancelled
+                } else {
+                    StreamTerminalStatus::Failed
+                };
+                assert!(
+                    matches!(&frames[2].event, StreamEvent::Terminal(terminal) if terminal.status == expected)
+                );
+                retained_search_checkpoint(&cx).unwrap();
+            }
+        });
     }
 
     async fn read(
@@ -1004,6 +1434,95 @@ mod tests {
             let output = String::from_utf8(output).unwrap();
             assert_eq!(output.matches('\u{001e}').count(), 2);
             assert!(!root.join("generations").exists());
+        });
+    }
+
+    #[test]
+    fn expanded_cli_uses_the_named_daemon_and_preserves_its_preadmission_refusal() {
+        use crate::CliInput;
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for stream in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = std::fs::canonicalize(directory.path()).unwrap();
+                let socket = root.join("expand.sock");
+                let listener = UnixListener::bind(&socket).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                    command: CliCommand::Search,
+                    query: Some("query".to_owned()),
+                    daemon: true,
+                    daemon_socket: Some(socket),
+                    index_dir: Some(root.clone()),
+                    expand: true,
+                    stream,
+                    format: if stream {
+                        OutputFormat::Toon
+                    } else {
+                        OutputFormat::Json
+                    },
+                    ..CliInput::default()
+                });
+                let server = std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let mut peer = loop {
+                        match listener.accept() {
+                            Ok((peer, _)) => break peer,
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                                assert!(started.elapsed() < Duration::from_secs(3));
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("accept: {error}"), // ubs:ignore — cfg(test) failure.
+                        }
+                    };
+                    peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    peer.set_write_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    std::io::BufReader::new(&mut peer)
+                        .take(FSFS_DAEMON_REQUEST_MAX_BYTES as u64 + 1)
+                        .read_until(b'\n', &mut bytes)
+                        .unwrap();
+                    let request = if stream {
+                        parse_request(&bytes).unwrap().request
+                    } else {
+                        decode_request(&bytes).unwrap()
+                    };
+                    assert!(request.search.expand, "the request must preserve --expand");
+                    let refusal =
+                        complete_cli_error("expansion_frontdoor", "fixture admission refusal");
+                    let reply = Reply {
+                        fsfs_complete_cli: VERSION,
+                        request_id: request.request_id,
+                        query: request.search.query,
+                        result: error_envelope(&refusal),
+                    };
+                    peer.write_all(&encode_response(&reply).unwrap()).unwrap();
+                });
+                let mut output = Vec::new();
+                let result = Box::pin(runtime.run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output,
+                ))
+                .await;
+                server.join().unwrap();
+                let error = result.unwrap_err();
+                assert_eq!(
+                    FsfsRuntime::forwarded_search_error(&error)
+                        .unwrap()
+                        .field
+                        .as_deref(),
+                    Some("complete_generation.expansion_frontdoor")
+                );
+                assert!(output.is_empty());
+                assert!(
+                    !root.join("generations").exists(),
+                    "no direct client retrieval before or after refusal"
+                );
+            }
         });
     }
 

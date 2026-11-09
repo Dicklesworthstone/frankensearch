@@ -51,11 +51,15 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 15: explicit quality-only retrieval travels with each request.
 // 16: explicit ranking-prior policy travels with every request and cache key.
 // 17: exact JSON score parsing, including replies loaded from a cache.
-const VERSION: u32 = 17;
+// 18: client-owned expansion exchange over one retained daemon request.
+const VERSION: u32 = 18;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
 mod progressive;
+
+#[path = "complete_daemon_expansion.rs"]
+mod expansion;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +77,7 @@ struct SearchRequest {
     quality_only: bool,
     filter: Option<String>,
     explain: bool,
+    expand: bool,
     store_root: PathBuf,
     configuration: serde_json::Value,
     policy: SearchPolicy,
@@ -87,7 +92,27 @@ impl SearchRequest {
         } else {
             SearchExecutionMode::Full
         };
-        (self.policy.delivery_budget(), mode)
+        (self.delivery_budget(), mode)
+    }
+
+    fn delivery_budget(&self) -> Duration {
+        let ordinary = self.policy.delivery_budget();
+        if !self.expand {
+            return ordinary;
+        }
+        let per_query = self
+            .policy
+            .quality_timeout_ms
+            .saturating_add(if self.policy.rerank {
+                self.policy.rerank_timeout_ms
+            } else {
+                0
+            });
+        ordinary
+            .saturating_add(Duration::from_millis(per_query.saturating_mul(
+                u64::try_from(crate::query_expansion::MAX_EXPANDED_QUERIES - 1).unwrap_or(u64::MAX),
+            )))
+            .saturating_add(crate::query_expansion::LLM_REQUEST_TIMEOUT)
     }
 
     /// The policy is already installed on the per-request runtime. Omitted
@@ -329,6 +354,7 @@ fn make_request(
             quality_only: runtime.cli_input.quality_only,
             filter: runtime.cli_input.filter.clone(),
             explain: runtime.config.search.explain,
+            expand: runtime.cli_input.expand,
             store_root: std::fs::canonicalize(root)?,
             configuration: configuration_contract(runtime.config())?,
             policy: SearchPolicy::of(runtime.config()),
@@ -378,10 +404,14 @@ fn decode_reply(bytes: &[u8], request: &ForwardedSearch) -> SearchResult<SearchP
 impl FsfsRuntime {
     /// Recover a validated forwarding reply's structured error so callers
     /// can preserve its exit status, error code and recovery guidance.
-    /// Transport failures and unrelated subsystem errors return `None`.
+    /// Admitted expansion failures retain their original diagnostic too;
+    /// unrelated errors and failures before admission return `None`.
     #[must_use]
     pub fn forwarded_search_error(error: &SearchError) -> Option<&OutputError> {
         if let Some(error) = progressive::reported_error(error) {
+            return Some(error);
+        }
+        if let Some(error) = expansion::reported_error(error) {
             return Some(error);
         }
         match error {
@@ -439,11 +469,32 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<SearchPayload> {
+        self.query_complete_generation_daemon_with_query_expansion(
+            cx,
+            root,
+            query,
+            limit,
+            Self::expand_search_query(cx, query),
+        )
+        .await
+    }
+
+    async fn query_complete_generation_daemon_with_query_expansion<F>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        query: &str,
+        limit: usize,
+        expansion_future: F,
+    ) -> SearchResult<SearchPayload>
+    where
+        F: Future<Output = SearchResult<crate::query_expansion::ExpansionResult>> + Send,
+    {
         retained_search_checkpoint(cx)?;
-        if self.cli_input.stream || self.cli_input.expand {
+        if self.cli_input.stream {
             return Err(complete_cli_error(
                 "daemon_options",
-                "CLI forwarding currently supports buffered search without expansion; use --no-daemon for --stream",
+                "buffered forwarding cannot satisfy a streaming search",
             ));
         }
         let request = make_request(self, root, query, limit)?;
@@ -463,9 +514,44 @@ impl FsfsRuntime {
             cx,
             &mut peer,
             FSFS_DAEMON_RESPONSE_MAX_BYTES,
-            control::remaining(started, request.search.policy.delivery_budget())?,
+            control::remaining(started, request.search.delivery_budget())?,
         )
         .await?;
+        if request.search.expand {
+            if !expansion::is_ready(&response) {
+                return match decode_reply(&response, &request) {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(complete_cli_error(
+                        "daemon_expansion",
+                        "expanded search completed without the client variants",
+                    )),
+                };
+            }
+            expansion::validate_ready(&response, &request)?;
+            return async {
+                expansion::send_variants(
+                    cx,
+                    &mut peer,
+                    &request,
+                    started,
+                    request.search.delivery_budget(),
+                    expansion_future,
+                )
+                .await?;
+                let response = control::read_response(
+                    cx,
+                    &mut peer,
+                    FSFS_DAEMON_RESPONSE_MAX_BYTES,
+                    control::remaining(started, request.search.delivery_budget())?,
+                )
+                .await?;
+                let payload = decode_reply(&response, &request)?;
+                retained_search_checkpoint(cx)?;
+                Ok(payload)
+            }
+            .await
+            .map_err(expansion::after_started);
+        }
         let payload = decode_reply(&response, &request)?;
         retained_search_checkpoint(cx)?;
         Ok(payload)
@@ -495,7 +581,7 @@ fn query_runtime(
     if stream {
         query_runtime.cli_input.format = OutputFormat::Jsonl;
     }
-    query_runtime.cli_input.expand = false;
+    query_runtime.cli_input.expand = request.expand;
     query_runtime.cli_input.overrides.limit = Some(request.limit);
     request.policy.apply_to(&mut query_runtime)?;
     query_runtime.config.search.explain = request.explain;
@@ -510,6 +596,12 @@ async fn execute(
     request: &ForwardedSearch,
     cache: Option<&mut HashMap<SearchCacheKey, Vec<SearchPayload>>>,
 ) -> SearchResult<SearchPayload> {
+    if request.search.expand {
+        return Err(complete_cli_error(
+            "daemon_expansion",
+            "expanded search requires its client exchange",
+        ));
+    }
     validate_request(runtime, session.store.root(), request)?;
     let cache_enabled = cache.is_some();
     let mut disabled_cache = HashMap::new();
@@ -579,6 +671,42 @@ async fn execute(
     Ok(last.payload)
 }
 
+async fn execute_expanded(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    session: &mut LiveRetainedSearchReader,
+    request: &ForwardedSearch,
+    cache: Option<&mut HashMap<SearchCacheKey, Vec<SearchPayload>>>,
+    peer: &mut UnixStream,
+    output: streaming::PhaseWriter,
+) -> SearchResult<SearchPayload> {
+    validate_request(runtime, session.store.root(), request)?;
+    if session.refresh(cx).await?
+        && let Some(cache) = cache
+    {
+        cache.clear();
+    }
+    let query_runtime = query_runtime(session, &request.search, false)?;
+    // Pinning/admission precedes the client handshake. Neither the LLM wait
+    // nor any later query variant can refresh this request onto a successor.
+    let expanded = expansion::receive_variants(cx, request, peer, output).await?;
+    let payload = query_runtime
+        .execute_retained_expanded_queries(
+            cx,
+            &mut session.reader.resources,
+            &request.search.query,
+            request.search.limit,
+            &expanded.queries,
+        )
+        .await?;
+    if expanded.queries.len() > 1 {
+        query_runtime.invalidate_complete_generation_explanation(&request.search.query)?;
+    }
+    // The fused ranking depends on client variants, which are not an ordinary
+    // query-cache key. It neither reads nor populates the plain result cache.
+    Ok(payload)
+}
+
 pub(super) async fn serve(
     cx: &Cx,
     runtime: &FsfsRuntime,
@@ -594,8 +722,22 @@ pub(super) async fn serve(
         ))
         .await;
     }
-    serve_buffered(cx, peer, bytes, timeout, |request| async move {
-        Box::pin(execute(cx, runtime, session, &request, cache)).await
+    let mut expansion_peer = peer.try_clone()?;
+    serve_buffered(cx, peer, bytes, timeout, |request, output| async move {
+        if request.search.expand {
+            Box::pin(execute_expanded(
+                cx,
+                runtime,
+                session,
+                &request,
+                cache,
+                &mut expansion_peer,
+                output,
+            ))
+            .await
+        } else {
+            Box::pin(execute(cx, runtime, session, &request, cache)).await
+        }
     })
     .await
 }
@@ -620,14 +762,14 @@ pub(super) async fn refuse_admission(
     if progressive::is_streamed(bytes) {
         progressive::refuse_admission(cx, peer, bytes, timeout, error).await
     } else {
-        serve_buffered(cx, peer, bytes, timeout, |_| async { Err(error) }).await
+        serve_buffered(cx, peer, bytes, timeout, |_, _| async { Err(error) }).await
     }
 }
 
 /// The ordinary buffered transport, with one caller-owned execution future.
 /// Use the same connection driver as progressive delivery but never expose a
-/// writer to the executor: no stream frame or probe can enter the buffered
-/// response. Peer loss releases the execution borrow before the next client;
+/// writer to ordinary search. Expanded requests use the shared output queue
+/// only for their correlated internal handshake. Peer loss releases the execution borrow before the next client;
 /// its own delivery budget still owns deadlines and caller cancellation.
 async fn serve_buffered<F, Fut>(
     cx: &Cx,
@@ -637,7 +779,7 @@ async fn serve_buffered<F, Fut>(
     execute: F,
 ) -> SearchResult<PeerOutcome>
 where
-    F: FnOnce(ForwardedSearch) -> Fut,
+    F: FnOnce(ForwardedSearch, streaming::PhaseWriter) -> Fut,
     Fut: Future<Output = SearchResult<SearchPayload>>,
 {
     let request = decode_request(bytes);
@@ -650,14 +792,27 @@ where
     let result = match request {
         Ok(request) => {
             let connection = streaming::PhaseWriter::new(peer)?;
-            run_request(
+            let output = connection.clone();
+            let result = run_request(
                 cx,
-                request.search.policy.delivery_budget(),
+                request.search.delivery_budget(),
                 // Keep even synchronous closure setup behind the first peer
                 // check. Constructing a request after disconnect starts no work.
-                streaming::drive(cx, &connection, async move { execute(request).await }),
+                streaming::drive(
+                    cx,
+                    &connection,
+                    async move { execute(request, output).await },
+                ),
             )
-            .await
+            .await;
+            if connection.failed() || connection.has_pending() {
+                // A timeout or failed write may have exposed only part of an
+                // internal handshake. Never append a fresh envelope to it.
+                return Err(result.err().unwrap_or_else(|| {
+                    complete_cli_error("daemon_response", "buffered output did not finish draining")
+                }));
+            }
+            result
         }
         Err(error) => Err(error),
     };
@@ -1346,6 +1501,239 @@ mod generation_tests {
     }
 
     #[test]
+    fn warm_expansion_keeps_one_generation_while_sibling_searches_and_publication_progress() {
+        use crate::config::DegradationOverrideMode;
+        use crate::generation_store::CompleteGenerationStore;
+        use crate::query_expansion::{ExpandedQuery, ExpansionResult, ExpansionStrategy};
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicUsize;
+
+        fn inventory(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            let mut files = BTreeMap::new();
+            let mut pending = vec![root.to_owned()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else {
+                        files.insert(
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            std::fs::read(path).unwrap(),
+                        );
+                    }
+                }
+            }
+            files
+        }
+
+        run_test_with_cx(|cx| async move {
+            for streamed in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let source = directory.path().join("source");
+                let root = directory.path().join("store");
+                std::fs::create_dir(&source).unwrap();
+                std::fs::write(source.join("alpha.md"), "originaltoken alpha document").unwrap();
+                std::fs::write(source.join("beta.md"), "varianttoken beta document").unwrap();
+                let mut config = FsfsConfig::default();
+                "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+                config.indexing.offline = true;
+                config.indexing.quality_model.clear();
+                config.search.fast_only = true;
+                config.search.rerank = false;
+                config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+                let runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                    command: CliCommand::Daemon,
+                    target_path: Some(source.clone()),
+                    index_dir: Some(root.clone()),
+                    quiet: true,
+                    ..CliInput::default()
+                });
+                assert!(matches!(
+                    runtime
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                    GenerationPublication::Durable(_)
+                ));
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let predecessor = store.active(&cx).unwrap().unwrap();
+                let pointer = root.join(COMPLETE_GENERATION_POINTER);
+                let old_selection = std::fs::read(&pointer).unwrap();
+                let queries = vec![
+                    ExpandedQuery {
+                        text: "originaltoken".to_owned(),
+                        strategy: ExpansionStrategy::Original,
+                    },
+                    ExpandedQuery {
+                        text: "varianttoken".to_owned(),
+                        strategy: ExpansionStrategy::Keyword,
+                    },
+                ];
+                let mut retained = runtime.open_retained_search(&cx, &root).await.unwrap();
+                let expected = retained
+                    .runtime
+                    .execute_retained_expanded_queries(
+                        &cx,
+                        &mut retained.resources,
+                        "originaltoken",
+                        10,
+                        &queries,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(expected.hits.len(), 2);
+                std::fs::write(source.join("gamma.md"), "varianttoken gamma successor").unwrap();
+                assert!(matches!(
+                    runtime
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                    GenerationPublication::Durable(_)
+                ));
+                let successor = store.active(&cx).unwrap().unwrap();
+                let new_selection = std::fs::read(&pointer).unwrap();
+                let predecessor_before = inventory(predecessor.path());
+                let successor_before = inventory(successor.path());
+                // Prepare both sealed generations, then advance selection only
+                // inside the actual client-owned expansion future below.
+                std::fs::write(&pointer, &old_selection).unwrap();
+                let endpoint = runtime.complete_generation_socket_path(&root).unwrap();
+                let ordinary = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command: CliCommand::Search,
+                    index_dir: Some(root.clone()),
+                    daemon: true,
+                    format: OutputFormat::Json,
+                    ..CliInput::default()
+                });
+                let mut expanded = ordinary.clone();
+                expanded.cli_input.expand = true;
+                expanded.cli_input.stream = streamed;
+                expanded.cli_input.format = if streamed {
+                    OutputFormat::Jsonl
+                } else {
+                    OutputFormat::Json
+                };
+                let calls = AtomicUsize::new(0);
+                let client_work = async {
+                    for _ in 0..1_000 {
+                        if endpoint.exists() {
+                            break;
+                        }
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                    assert!(endpoint.exists());
+                    // Seed the ordinary cache. Expansion must neither replay
+                    // this one-query answer nor replace it with its fused one.
+                    let original = ordinary
+                        .query_complete_generation_daemon(&cx, &root, "originaltoken", 10)
+                        .await?;
+                    assert_eq!(original.hits.len(), 1);
+                    let generated = async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // The expanded request is admitted and owns its reader.
+                        // Await a sibling before returning variants: a daemon
+                        // holding its shared session lock across LLM work would
+                        // deadlock here instead of serving this ordinary query.
+                        let sibling = ordinary
+                            .query_complete_generation_daemon(&cx, &root, "originaltoken", 10)
+                            .await?;
+                        assert_eq!(sibling.hits.len(), 1);
+                        std::fs::write(&pointer, &new_selection)?;
+                        let sibling = ordinary
+                            .query_complete_generation_daemon(&cx, &root, "varianttoken", 10)
+                            .await?;
+                        assert_eq!(
+                            sibling.hits.len(),
+                            2,
+                            "new requests observe the successor during expansion"
+                        );
+                        Ok(ExpansionResult {
+                            queries: queries.clone(),
+                            backend_used: None,
+                            elapsed_ms: 0,
+                        })
+                    };
+                    let hits = if streamed {
+                        let mut output = Vec::new();
+                        expanded
+                            .stream_complete_generation_daemon_with_query_expansion(
+                                &cx,
+                                &root,
+                                "originaltoken",
+                                10,
+                                &mut output,
+                                generated,
+                            )
+                            .await?;
+                        let frames = output
+                            .split(|&byte| byte == b'\n')
+                            .filter(|line| !line.is_empty())
+                            .map(|line| {
+                                serde_json::from_slice::<StreamFrame<SearchHitPayload>>(line)
+                                    .unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        let expanded_at = frames.iter().position(|frame| matches!(&frame.event,
+                            StreamEvent::Progress(progress) if progress.reason_code == "query.stream.expanded_ready"
+                        )).unwrap();
+                        assert_eq!(frames.iter().filter(|frame| matches!(&frame.event,
+                            StreamEvent::Progress(progress) if progress.reason_code == "query.stream.initial_ready"
+                        )).count(), 1);
+                        assert!(!frames.iter().any(|frame| matches!(&frame.event,
+                            StreamEvent::Progress(progress) if progress.reason_code == "daemon_cache_hit"
+                        )));
+                        for (sequence, frame) in frames.iter().enumerate() {
+                            assert!(validate_stream_frame(frame).valid);
+                            assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
+                        }
+                        assert!(
+                            matches!(&frames.last().unwrap().event, StreamEvent::Terminal(terminal) if terminal.status == StreamTerminalStatus::Completed)
+                        );
+                        frames[expanded_at..]
+                            .iter()
+                            .filter_map(|frame| match &frame.event {
+                                StreamEvent::Result(result) => Some(result.item.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        expanded
+                            .query_complete_generation_daemon_with_query_expansion(
+                                &cx,
+                                &root,
+                                "originaltoken",
+                                10,
+                                generated,
+                            )
+                            .await?
+                            .hits
+                    };
+                    assert_eq!(
+                        hits, expected.hits,
+                        "every expansion variant stays on the admitted generation"
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    let original = ordinary
+                        .query_complete_generation_daemon(&cx, &root, "originaltoken", 10)
+                        .await?;
+                    assert_eq!(
+                        original.hits.len(),
+                        1,
+                        "fused expansion must not fill the ordinary cache key"
+                    );
+                    assert_eq!(store.active(&cx)?, Some(successor.clone()));
+                    assert_eq!(inventory(predecessor.path()), predecessor_before);
+                    assert_eq!(inventory(successor.path()), successor_before);
+                    Ok::<(), SearchError>(())
+                };
+                Box::pin(drive_with_daemon(&cx, &runtime, &root, client_work)).await;
+                assert!(!endpoint.exists());
+            }
+        });
+    }
+
+    #[test]
     fn forwarded_searches_fill_the_serve_cache_and_replace_it_with_the_generation() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
@@ -1763,6 +2151,7 @@ mod buffered_transport_tests {
                 quality_only: false,
                 filter: Some("ext:rs".to_owned()),
                 explain: false,
+                expand: false,
                 store_root: PathBuf::from("/transport-fixture"),
                 configuration: serde_json::Value::Null,
                 policy: SearchPolicy::of(&FsfsConfig::default()),
@@ -1791,7 +2180,7 @@ mod buffered_transport_tests {
                 &mut server,
                 &bytes,
                 Duration::from_secs(1),
-                |request| {
+                |request, _| {
                     // This is outside the returned future: even closure setup must
                     // be behind peer admission, not just model polling.
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1819,7 +2208,7 @@ mod buffered_transport_tests {
                 &mut server,
                 &bytes,
                 Duration::from_secs(1),
-                |_| async move {
+                |_, _| async move {
                     let _owned = owned;
                     std::future::pending().await
                 },
@@ -1848,7 +2237,7 @@ mod buffered_transport_tests {
                     &mut server,
                     &bytes,
                     Duration::from_secs(1),
-                    |request| async move { Ok(payload(request.search.query)) },
+                    |request, _| async move { Ok(payload(request.search.query)) },
                 )
                 .await
                 .unwrap(),
@@ -1875,7 +2264,7 @@ mod buffered_transport_tests {
                     &mut server,
                     &bytes,
                     Duration::from_secs(1),
-                    |request| async move {
+                    |request, _| async move {
                         assert_eq!(request.search.filter.as_deref(), Some("ext:rs"));
                         assert_eq!(request.search.limit, 3);
                         if fail {
@@ -1911,6 +2300,56 @@ mod buffered_transport_tests {
     }
 
     #[test]
+    fn failed_internal_handshake_is_never_followed_by_a_buffered_envelope() {
+        run_test_with_cx(|cx| async move {
+            for complete_ready in [false, true] {
+                let (mut client, mut server) = UnixStream::pair().unwrap();
+                let mut request = request();
+                request.search.expand = true;
+                let bytes = serde_json::to_vec(&request).unwrap();
+                let result = serve_buffered(
+                    &cx,
+                    &mut server,
+                    &bytes,
+                    Duration::from_secs(1),
+                    |request, mut output| async move {
+                        if complete_ready {
+                            let mut ready = serde_json::to_vec(&serde_json::json!({
+                                "fsfs_complete_cli_expansion": VERSION,
+                                "request_id": request.request_id,
+                                "query": request.search.query,
+                            }))
+                            .unwrap();
+                            ready.push(b'\n');
+                            output.write_all(&ready)?;
+                            output.flush()?;
+                            // An oversized next record is a sticky writer
+                            // failure, even if earlier Ready reached the peer.
+                            output.write_all(&vec![b'x'; FSFS_DAEMON_RESPONSE_MAX_BYTES + 1])?;
+                        } else {
+                            output.write_all(b"{partial readiness")?;
+                            output.flush()?;
+                        }
+                        Ok(payload(request.search.query))
+                    },
+                )
+                .await;
+                assert!(result.is_err());
+                drop(server);
+                let mut delivered = Vec::new();
+                client.read_to_end(&mut delivered).unwrap();
+                if complete_ready {
+                    expansion::validate_ready(&delivered, &request).unwrap();
+                    assert_eq!(delivered.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                } else {
+                    assert!(delivered.is_empty());
+                }
+                retained_search_checkpoint(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn buffered_future_drop_releases_work_without_cancelling_the_daemon() {
         run_test_with_cx(|cx| async move {
             for polled in [false, true] {
@@ -1925,7 +2364,7 @@ mod buffered_transport_tests {
                     &mut server,
                     &bytes,
                     Duration::from_secs(1),
-                    |_| async {
+                    |_, _| async {
                         let _owned = owned;
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::future::pending().await
@@ -1963,7 +2402,7 @@ mod buffered_transport_tests {
                     &mut server,
                     &bytes,
                     Duration::from_secs(1),
-                    |request| async {
+                    |request, _| async {
                         cx.set_cancel_requested(true);
                         if fail {
                             Err(complete_cli_error("fixture", "original refusal"))

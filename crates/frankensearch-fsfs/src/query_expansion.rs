@@ -19,7 +19,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 /// Timeout for LLM API calls.
-const LLM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const LLM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One original plus at most one result from each expansion strategy.
+pub(crate) const MAX_EXPANDED_QUERIES: usize = 4;
+/// Bound generated text independently of the provider's token-budget promise.
+pub(crate) const MAX_VARIANT_BYTES: usize = 16 * 1024;
 
 /// Maximum tokens for expansion responses.
 const MAX_EXPANSION_TOKENS: u32 = 256;
@@ -32,14 +37,15 @@ pub enum LlmBackend {
 }
 
 /// A single expanded query variant with metadata about its origin.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExpandedQuery {
     pub text: String,
     pub strategy: ExpansionStrategy,
 }
 
 /// The expansion strategy that produced a query variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExpansionStrategy {
     /// Original user query (always included).
     Original,
@@ -259,29 +265,28 @@ fn parse_expansion_response(raw: &str) -> Vec<ExpandedQuery> {
     let mut results = Vec::with_capacity(3);
     for line in raw.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("KEYWORD:") {
-            let text = rest.trim();
-            if !text.is_empty() {
-                results.push(ExpandedQuery {
-                    text: text.to_owned(),
-                    strategy: ExpansionStrategy::Keyword,
-                });
-            }
+        let (strategy, rest) = if let Some(rest) = trimmed.strip_prefix("KEYWORD:") {
+            (ExpansionStrategy::Keyword, rest)
         } else if let Some(rest) = trimmed.strip_prefix("SEMANTIC:") {
-            let text = rest.trim();
-            if !text.is_empty() {
-                results.push(ExpandedQuery {
-                    text: text.to_owned(),
-                    strategy: ExpansionStrategy::Semantic,
-                });
-            }
+            (ExpansionStrategy::Semantic, rest)
         } else if let Some(rest) = trimmed.strip_prefix("HYDE:") {
-            let text = rest.trim();
-            if !text.is_empty() {
-                results.push(ExpandedQuery {
-                    text: text.to_owned(),
-                    strategy: ExpansionStrategy::HyDE,
-                });
+            (ExpansionStrategy::HyDE, rest)
+        } else {
+            continue;
+        };
+        let text = rest.trim();
+        if !text.is_empty()
+            && text.len() <= MAX_VARIANT_BYTES
+            && !results
+                .iter()
+                .any(|query: &ExpandedQuery| query.strategy == strategy)
+        {
+            results.push(ExpandedQuery {
+                text: text.to_owned(),
+                strategy,
+            });
+            if results.len() == MAX_EXPANDED_QUERIES - 1 {
+                break;
             }
         }
     }
@@ -360,6 +365,23 @@ combined with a reactor for I/O events. Popular implementations include tokio an
         let expanded = parse_expansion_response(raw);
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].strategy, ExpansionStrategy::HyDE);
+    }
+
+    #[test]
+    fn expansion_response_bounds_work_and_keeps_one_variant_per_strategy() {
+        let oversized = "x".repeat(MAX_VARIANT_BYTES + 1);
+        let raw = format!(
+            "KEYWORD: {oversized}\nKEYWORD: first\nKEYWORD: duplicate\nSEMANTIC: second\nHYDE: third\nHYDE: fourth"
+        );
+        let variants = parse_expansion_response(&raw);
+        assert_eq!(variants.len(), MAX_EXPANDED_QUERIES - 1);
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| variant.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
     }
 
     #[test]

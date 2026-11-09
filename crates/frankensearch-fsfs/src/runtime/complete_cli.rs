@@ -1169,11 +1169,6 @@ impl FsfsRuntime {
             )
             .await;
         }
-        if self.cli_input.expand {
-            return self
-                .run_complete_expanded_search(cx, root, query, limit, started, writer)
-                .await;
-        }
         if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
             #[cfg(unix)]
             {
@@ -1225,6 +1220,11 @@ impl FsfsRuntime {
                 "daemon_transport",
                 "complete-generation daemon forwarding requires Unix sockets",
             ));
+        }
+        if self.cli_input.expand {
+            return self
+                .run_complete_expanded_search(cx, root, query, limit, started, writer)
+                .await;
         }
         let reader = self.open_retained_search(cx, root).await?;
         Box::pin(self.run_retained_search_with_writer(cx, root, reader, started, writer)).await
@@ -1347,21 +1347,18 @@ impl FsfsRuntime {
         reader
             .runtime
             .enable_complete_generation_explanations(root, &reader.generation)?;
-        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
-            tracing::warn!(
-                "--expand executes directly against one retained generation; daemon forwarding is ignored"
-            );
-        }
         if !self.cli_input.stream {
             let expansion = super::with_cancellation(cx, "fsfs.query_expansion", expansion).await?;
-            let payload = Self::execute_retained_expanded_queries(
-                cx,
-                &mut reader,
-                query,
-                limit,
-                &expansion.queries,
-            )
-            .await?;
+            let payload = reader
+                .runtime
+                .execute_retained_expanded_queries(
+                    cx,
+                    &mut reader.resources,
+                    query,
+                    limit,
+                    &expansion.queries,
+                )
+                .await?;
             if expansion.queries.len() > 1 {
                 reader
                     .runtime
@@ -1401,26 +1398,29 @@ impl FsfsRuntime {
     }
 
     async fn execute_retained_expanded_queries(
+        &self,
         cx: &Cx,
-        reader: &mut super::RetainedSearchReader,
+        resources: &mut super::SearchExecutionResources,
         query: &str,
         limit: usize,
         queries: &[crate::query_expansion::ExpandedQuery],
     ) -> SearchResult<crate::output_schema::SearchPayload> {
         retained_search_checkpoint(cx)?;
-        let mode = reader.search_mode()?;
+        let mode = super::degraded_search_mode(
+            self.config.pressure.degradation_override,
+            self.requested_search_mode(),
+        )?;
         if queries.len() <= 1 {
-            let mut artifacts = reader
-                .runtime
+            let mut artifacts = self
                 .execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
                     limit,
                     mode,
-                    &mut reader.resources,
+                    resources,
                     SearchExecutionFlags {
                         include_snippets: true,
-                        persist_explain_session: reader.runtime.complete_explain_target.is_some(),
+                        persist_explain_session: self.complete_explain_target.is_some(),
                     },
                     None,
                 )
@@ -1428,20 +1428,17 @@ impl FsfsRuntime {
             let mut last = artifacts
                 .pop()
                 .ok_or_else(|| complete_cli_error("search", "search returned no phase"))?;
-            reader
-                .runtime
-                .attach_complete_search_explanations(cx, &mut last, &reader.resources)?;
+            self.attach_complete_search_explanations(cx, &mut last, resources)?;
             return Ok(last.payload);
         }
-        let fingerprint = reader.resources.generation_fingerprint.clone();
-        let payloads = reader
-            .runtime
+        let fingerprint = resources.generation_fingerprint.clone();
+        let payloads = self
             .execute_expanded_query_variants(
                 cx,
                 query,
                 queries,
                 limit.saturating_mul(2).max(20),
-                &mut reader.resources,
+                resources,
                 &fingerprint,
                 SearchExecutionFlags {
                     include_snippets: true,
@@ -1450,18 +1447,10 @@ impl FsfsRuntime {
             )
             .await?;
         retained_search_checkpoint(cx)?;
-        Self::validate_search_generation_fingerprint(
-            &reader.resources.index_root,
-            &fingerprint,
-            mode,
-        )?;
-        let mut payload = Self::fuse_expanded_payloads(
-            query,
-            &payloads,
-            limit,
-            reader.runtime.config.search.rrf_k,
-        );
-        if reader.runtime.config.search.explain {
+        Self::validate_search_generation_fingerprint(&resources.index_root, &fingerprint, mode)?;
+        let mut payload =
+            Self::fuse_expanded_payloads(query, &payloads, limit, self.config.search.rrf_k);
+        if self.config.search.explain {
             payload.explanation_warnings.push(crate::output_schema::OutputWarning::new(
                 crate::output_schema::OutputWarningCode::EXPLANATION_UNAVAILABLE,
                 "expanded-query fusion has no complete per-query explanation evidence; run the search without --expand for ranking explanations",
@@ -3513,15 +3502,17 @@ mod tests {
                 },
             ];
             reader.runtime.config.search.explain = true;
-            let old = FsfsRuntime::execute_retained_expanded_queries(
-                &cx,
-                &mut reader,
-                "sharedtoken",
-                10,
-                &queries,
-            )
-            .await
-            .unwrap();
+            let old = reader
+                .runtime
+                .execute_retained_expanded_queries(
+                    &cx,
+                    &mut reader.resources,
+                    "sharedtoken",
+                    10,
+                    &queries,
+                )
+                .await
+                .unwrap();
             assert_eq!(old.hits.len(), 1);
             assert_eq!(old.phase, crate::output_schema::SearchOutputPhase::Initial);
             assert_eq!(old.hits[0].path, "alpha.md");
@@ -3533,15 +3524,17 @@ mod tests {
             );
             assert_eq!(reader.generation(), &predecessor);
             let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
-            let new = FsfsRuntime::execute_retained_expanded_queries(
-                &cx,
-                &mut fresh,
-                "sharedtoken",
-                10,
-                &queries,
-            )
-            .await
-            .unwrap();
+            let new = fresh
+                .runtime
+                .execute_retained_expanded_queries(
+                    &cx,
+                    &mut fresh.resources,
+                    "sharedtoken",
+                    10,
+                    &queries,
+                )
+                .await
+                .unwrap();
             assert_eq!(new.hits.len(), 2);
             assert_eq!(new.phase, crate::output_schema::SearchOutputPhase::Initial);
             assert_eq!(new.query, "sharedtoken");
@@ -3581,28 +3574,32 @@ mod tests {
                 &std::collections::HashMap::new(),
             );
             assert_eq!(expansion.queries.len(), 1);
-            let fallback = FsfsRuntime::execute_retained_expanded_queries(
-                &cx,
-                &mut reader,
-                "sharedtoken",
-                1,
-                &expansion.queries,
-            )
-            .await
-            .unwrap();
+            let fallback = reader
+                .runtime
+                .execute_retained_expanded_queries(
+                    &cx,
+                    &mut reader.resources,
+                    "sharedtoken",
+                    1,
+                    &expansion.queries,
+                )
+                .await
+                .unwrap();
             assert_eq!(fallback.phase, original.phase);
             assert_eq!(fallback.hits, original.hits);
             let selected = reader.generation().clone();
             cx.set_cancel_requested(true);
-            let error = FsfsRuntime::execute_retained_expanded_queries(
-                &cx,
-                &mut reader,
-                "sharedtoken",
-                1,
-                &expansion.queries,
-            )
-            .await
-            .unwrap_err();
+            let error = reader
+                .runtime
+                .execute_retained_expanded_queries(
+                    &cx,
+                    &mut reader.resources,
+                    "sharedtoken",
+                    1,
+                    &expansion.queries,
+                )
+                .await
+                .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             cx.set_cancel_requested(false);
             assert_eq!(

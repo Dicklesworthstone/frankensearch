@@ -35,10 +35,22 @@ struct Output {
     offset: usize,
     staged: Vec<u8>,
     emitted: bool,
+    failed: bool,
 }
 
 impl Output {
     fn drain(&mut self) -> io::Result<DrainState> {
+        if self.failed {
+            return Err(io::Error::other("daemon output previously failed"));
+        }
+        let result = self.drain_inner();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn drain_inner(&mut self) -> io::Result<DrainState> {
         // Check even with an empty queue: quality inference or generation
         // admission can suspend long after Initial was completely delivered.
         check_peer(&self.peer)?;
@@ -69,6 +81,7 @@ impl PhaseWriter {
             offset: 0,
             staged: Vec::new(),
             emitted: false,
+            failed: false,
         }))))
     }
 
@@ -82,13 +95,29 @@ impl PhaseWriter {
         // A poisoned state cannot authorize a buffered fallback after a stream.
         self.0.lock().map_or(true, |output| output.emitted)
     }
+
+    /// A partial internal handshake is just as final as a partial user frame.
+    /// Never append a different response after a transport or writer failure.
+    pub(super) fn failed(&self) -> bool {
+        self.0.lock().map_or(true, |output| output.failed)
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        self.0.lock().map_or(true, |output| {
+            output.offset < output.pending.len() || !output.staged.is_empty()
+        })
+    }
 }
 
 impl Write for PhaseWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let mut output = self.lock()?;
+        if output.failed {
+            return Err(io::Error::other("daemon output previously failed"));
+        }
         let used = output.pending.len() - output.offset + output.staged.len();
         if bytes.len() > FSFS_DAEMON_RESPONSE_MAX_BYTES.saturating_sub(used) {
+            output.failed = true;
             return Err(io::Error::other(
                 "complete-generation stream output exceeds 4 MiB bound",
             ));
@@ -100,8 +129,12 @@ impl Write for PhaseWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         let mut output = self.lock()?;
+        if output.failed {
+            return Err(io::Error::other("daemon output previously failed"));
+        }
         if !output.staged.is_empty() {
             if output.staged.last() != Some(&b'\n') {
+                output.failed = true;
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     "stream flush requires complete JSONL records",
