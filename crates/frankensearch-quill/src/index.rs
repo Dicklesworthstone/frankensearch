@@ -12432,8 +12432,8 @@ impl QuillReader {
     /// Split one document's score for `query` by clause and field.
     ///
     /// Every scoring leaf of the parsed query is evaluated once per field
-    /// under its inherited boosts, restricted to the one document by a
-    /// zero-weight identifier clause. Enclosing Boolean branches must match
+    /// under its inherited boosts, seeking the document in its owning leaf
+    /// without changing the scorer tree. Enclosing Boolean branches must match
     /// before their descendants contribute: a term can occur in the document
     /// while the conjunction or exclusion containing it still fails.
     fn explain_document_on(
@@ -12449,23 +12449,64 @@ impl QuillReader {
         }
         let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
+        validate_query_lowering(&parsed.query, 1.0, self.schema)?;
+        let Some(global_docid) = snapshot.resolve_document_id(document_id)? else {
+            return Ok(None);
+        };
+        let leaf = if let Some(delta) = snapshot.delta_for_docid(global_docid) {
+            QueryLeaf::Delta(delta)
+        } else {
+            snapshot
+                .keeper_snapshot()
+                .segments()
+                .iter()
+                .map(QueryLeaf::Sealed)
+                .find(|leaf| {
+                    let (lo, hi) = leaf.docid_range();
+                    (lo..hi).contains(&u64::from(global_docid))
+                })
+                .ok_or_else(|| invalid_state("explanation document has no owning leaf"))?
+        };
+        if !leaf.is_live_document(global_docid) {
+            return Ok(None);
+        }
+        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
+        let lower_explanation = |clause: &Query, topdocs_root| {
+            validate_query_lowering(clause, 1.0, self.schema)?;
+            let upper_bound = query_work_upper_bound(
+                clause,
+                snapshot,
+                self.schema,
+                self.config.glob_expansion_limit,
+            )?;
+            let checkpoint: QueryCheckpointHandle<'_> =
+                self.query_checkpoint(cx, "explain", self.config.query_fuel_budget, upper_bound);
+            checkpoint.admit(QueryWorkKind::Segment, 1)?;
+            lower_query(
+                cx,
+                &checkpoint,
+                clause,
+                1.0,
+                leaf,
+                snapshot,
+                prepared_doc_freqs.as_ref(),
+                self.schema,
+                self.config.glob_expansion_limit,
+                false,
+                topdocs_root,
+            )
+        };
         let score_of = |clause: Query| -> Result<Option<f32>, QuillIndexError> {
-            let only_this_document = Query::boost(
-                Query::set(ID_FIELD, vec![QueryValue::Str(document_id.to_owned())]),
-                0.0,
-            );
-            let pinned = Query::boolean(
-                vec![
-                    BooleanClause::new(Occur::Must, clause),
-                    BooleanClause::new(Occur::Must, only_this_document),
-                ],
-                None,
-            );
-            Ok(self
-                .search_preparsed_uncached_on(cx, &pinned, 1, 0, false, snapshot)?
-                .hits
-                .first()
-                .map(|hit| hit.score))
+            let mut scorer = lower_explanation(&clause, true)?;
+            let matches = scorer.advance(global_docid)? == Some(global_docid);
+            check_cancel(cx, "explain")?;
+            if matches {
+                let score = scorer.score()?;
+                check_cancel(cx, "explain")?;
+                Ok(Some(score))
+            } else {
+                Ok(None)
+            }
         };
         let Some(score) = score_of(parsed.query.clone())? else {
             return Ok(None);
@@ -12497,15 +12538,55 @@ impl QuillReader {
                     // discard zero-boost branches.
                     let branch_matches = branch_matches
                         && (node == parsed.query.root_id()
-                            || score_of(copy_explanation_subquery(cx, &parsed.query, node)?)?
-                                .is_some());
-                    pending.extend(
-                        clauses
-                            .iter()
-                            .rev()
-                            .filter(|clause| clause.occur != Occur::MustNot)
-                            .map(|clause| (clause.query, boost, branch_matches)),
-                    );
+                            || score_of(Query::boost(
+                                copy_explanation_subquery(cx, &parsed.query, node)?,
+                                boost,
+                            ))?
+                            .is_some());
+                    let mut children = Vec::new();
+                    for clause in clauses
+                        .iter()
+                        .filter(|clause| clause.occur != Occur::MustNot)
+                    {
+                        let raw_all = branch_matches
+                            && lower_explanation(
+                                &Query::boost(
+                                    copy_explanation_subquery(cx, &parsed.query, clause.query)?,
+                                    boost,
+                                ),
+                                false,
+                            )?
+                            .is_raw_unit_all();
+                        children.push((clause.query, clause.occur, raw_all));
+                    }
+                    // Match the scorer's All normalization without changing
+                    // its tree: required non-All clauses make unit Alls neutral;
+                    // otherwise retain only the first All in each eligible role.
+                    let has_must = children.iter().any(|(_, occur, _)| *occur == Occur::Must);
+                    let must_non_all = children
+                        .iter()
+                        .any(|(_, occur, raw_all)| *occur == Occur::Must && !raw_all);
+                    let first_must_all = children
+                        .iter()
+                        .position(|(_, occur, raw_all)| *occur == Occur::Must && *raw_all);
+                    let first_should_all = children
+                        .iter()
+                        .position(|(_, occur, raw_all)| *occur == Occur::Should && *raw_all);
+                    pending.extend(children.into_iter().enumerate().rev().map(
+                        |(position, (child, occur, raw_all))| {
+                            let contributes = !raw_all
+                                || match occur {
+                                    Occur::Must => {
+                                        !must_non_all && first_must_all == Some(position)
+                                    }
+                                    Occur::Should => {
+                                        !has_must && first_should_all == Some(position)
+                                    }
+                                    Occur::MustNot => false,
+                                };
+                            (child, boost, branch_matches && contributes)
+                        },
+                    ));
                 }
                 QueryNode::Boost { query, factor } => {
                     pending.push((*query, boost * factor, branch_matches));
@@ -24327,13 +24408,25 @@ mod tests {
                     .await
                     .expect("index document");
             }
-            for sealed in [false, true] {
-                if sealed {
+            assert!(
+                index
+                    .search_paginated(&cx, "*", 10, 0, false)
+                    .expect("search unpublished fixture")
+                    .hits
+                    .is_empty(),
+                "pending scalar writes must remain invisible"
+            );
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("publish fixture");
+            for recommitted in [false, true] {
+                if recommitted {
                     LexicalWrite::commit(&index, &cx).await.expect("commit");
                 }
                 for query in [
                     "(alpha AND beta) OR gamma",
                     "((alpha AND beta)^3 OR gamma)^2",
+                    "((alpha AND beta)^340282346638528859811704183484516925440 OR gamma)^0",
                     "(alpha AND (beta OR delta)) OR gamma",
                     "(alpha AND beta)^0 OR gamma",
                     "(alpha -blocked) OR gamma",
@@ -24356,7 +24449,7 @@ mod tests {
                         assert_eq!(
                             explanation.score.to_bits(),
                             hit.score.to_bits(),
-                            "{query} {} sealed={sealed}",
+                            "{query} {} recommitted={recommitted}",
                             hit.document_id
                         );
                         let parts = explanation
@@ -24366,7 +24459,7 @@ mod tests {
                             .sum::<f64>();
                         assert!(
                             (parts - f64::from(hit.score)).abs() <= 1e-4 * f64::from(hit.score),
-                            "{query} {} sealed={sealed}: parts {parts} vs {} in {:?}",
+                            "{query} {} recommitted={recommitted}: parts {parts} vs {} in {:?}",
                             hit.document_id,
                             hit.score,
                             explanation.terms
@@ -24391,7 +24484,7 @@ mod tests {
                     assert!(!rejected.is_empty(), "retain rejected positive clauses");
                     assert!(
                         rejected.iter().all(|term| term.score == 0.0),
-                        "{query} {document_id} sealed={sealed}: {rejected:?}"
+                        "{query} {document_id} recommitted={recommitted}: {rejected:?}"
                     );
                     assert!(
                         explanation
@@ -24418,18 +24511,36 @@ mod tests {
                     .await
                     .expect("index document");
             }
-            for sealed in [false, true] {
-                if sealed {
+            assert!(
+                index
+                    .search_paginated(&cx, "*", 10, 0, false)
+                    .expect("search unpublished fixture")
+                    .hits
+                    .is_empty(),
+                "pending scalar writes must remain invisible"
+            );
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("publish fixture");
+            for recommitted in [false, true] {
+                if recommitted {
                     LexicalWrite::commit(&index, &cx).await.expect("commit");
                 }
                 for query in [
                     "*",
                     "*^2",
+                    "* AND alpha",
+                    "alpha AND *",
+                    "* OR alpha",
+                    "* AND *",
+                    "(* AND *) AND alpha",
+                    "(* OR *) OR alpha",
                     "id:[a TO c]",
                     "id:{a TO c}",
                     "id:[* TO b]",
                     "id:IN [a c]",
                     "ord:[0 TO 18446744073709551615]",
+                    "ord:[0 TO 18446744073709551615] AND alpha",
                     "*^2 OR id:[a TO c]^3 OR id:IN [a c]^4",
                     "alpha OR id:[a TO b]^3",
                     "alpha AND id:IN [a c]",
@@ -24450,7 +24561,7 @@ mod tests {
                         assert_eq!(
                             explanation.score.to_bits(),
                             hit.score.to_bits(),
-                            "{query} {} sealed={sealed}",
+                            "{query} {} recommitted={recommitted}",
                             hit.document_id
                         );
                         let parts = explanation
@@ -24460,7 +24571,7 @@ mod tests {
                             .sum::<f64>();
                         assert!(
                             (parts - f64::from(hit.score)).abs() <= 1e-4 * f64::from(hit.score),
-                            "{query} {} sealed={sealed}: parts {parts} vs {} in {:?}",
+                            "{query} {} recommitted={recommitted}: parts {parts} vs {} in {:?}",
                             hit.document_id,
                             hit.score,
                             explanation.terms
@@ -24493,6 +24604,62 @@ mod tests {
                     assert_eq!(part.doc_freq, None);
                     assert_eq!(part.idf, None);
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn explain_document_preserves_delta_scores_and_rejects_deleted_documents() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("create index");
+            let initial = index.snapshot().expect("initial snapshot");
+            let generation = initial.loaded_manifest().manifest.generation;
+            let lease_base = initial.loaded_manifest().manifest.docid_high_watermark;
+            drop(initial);
+            let base = u32::try_from(lease_base).expect("fixture docids fit u32");
+            let mut delta =
+                DeltaSegment::new(DEFAULT_SCHEMA, lease_base, usize::MAX).expect("Delta");
+            apply_tokenized_delta_document(&mut delta, base, "a", "alpha beta");
+            apply_tokenized_delta_document(&mut delta, base.checked_add(1).unwrap(), "b", "gamma");
+            let deleted = base.checked_add(2).unwrap();
+            apply_tokenized_delta_document(&mut delta, deleted, "deleted", "alpha gamma");
+            assert_eq!(delta.delete_delta_id("deleted"), Some(deleted));
+            index
+                .publish_delta_table(vec![Arc::new(delta.freeze(generation))])
+                .expect("publish Delta");
+            let snapshot = index.search_snapshot().expect("published snapshot");
+            assert_eq!(snapshot.delta_count(), 1);
+            assert!(snapshot.keeper_snapshot().segments().is_empty());
+            for query in [
+                "*",
+                "*^2",
+                "* AND alpha",
+                "* OR gamma",
+                "(* OR *) OR alpha",
+                "alpha OR gamma",
+                "alpha -gamma",
+            ] {
+                let hits = index
+                    .search_paginated(&cx, query, 10, 0, false)
+                    .unwrap()
+                    .hits;
+                assert!(!hits.is_empty(), "{query}: fixture must match");
+                for hit in hits.iter() {
+                    let explanation = index
+                        .explain_document(&cx, query, &hit.document_id)
+                        .expect("explain Delta")
+                        .expect("ranked Delta document matches");
+                    assert_eq!(explanation.score.to_bits(), hit.score.to_bits(), "{query}");
+                    let parts = explanation
+                        .terms
+                        .iter()
+                        .map(|term| f64::from(term.score))
+                        .sum::<f64>();
+                    assert!((parts - f64::from(hit.score)).abs() <= 1e-4 * f64::from(hit.score));
+                }
+            }
+            for (query, document) in [("alpha", "b"), ("*", "missing"), ("*", "deleted")] {
+                assert_eq!(index.explain_document(&cx, query, document).unwrap(), None);
             }
         });
     }

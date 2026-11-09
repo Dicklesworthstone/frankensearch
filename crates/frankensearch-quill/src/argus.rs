@@ -4304,7 +4304,8 @@ impl<'a> ReferenceScorer<'a> {
         matches!(self.node, ScorerNode::Empty)
     }
 
-    fn is_raw_unit_all(&self) -> bool {
+    /// Whether Boolean composition treats this scorer as a unit All anchor.
+    pub(crate) fn is_raw_unit_all(&self) -> bool {
         matches!(
             &self.node,
             ScorerNode::All(scorer) if scorer.is_raw_unit_score()
