@@ -165,5 +165,10 @@ name = "seal_full_lease_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "cass_ingest_analyze_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true

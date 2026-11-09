@@ -1044,7 +1044,205 @@ fn cass_cjk_token_end(text: &str, mut cursor: usize) -> usize {
     end
 }
 
+/// Byte-indexed [`cass_ascii_token_end`] for the borrowed ingest path, which
+/// also reports whether the token holds an ASCII uppercase byte.
+///
+/// A byte at or above `0x80` starts or continues a non-ASCII scalar, which is
+/// neither ASCII alphanumeric nor `-`, so it ends the token exactly where the
+/// char walk does.
+fn cass_ascii_token_end_bytes(bytes: &[u8], start: usize) -> (usize, bool) {
+    let mut cursor = start;
+    let mut end = start;
+    let mut last_was_ascii_alphanumeric = false;
+    let mut has_ascii_uppercase = false;
+    while let Some(&byte) = bytes.get(cursor) {
+        if byte.is_ascii_alphanumeric() {
+            has_ascii_uppercase |= byte.is_ascii_uppercase();
+            cursor += 1;
+            end = cursor;
+            last_was_ascii_alphanumeric = true;
+            continue;
+        }
+        if byte == b'-'
+            && last_was_ascii_alphanumeric
+            && bytes.get(cursor + 1).is_some_and(u8::is_ascii_alphanumeric)
+        {
+            cursor += 1;
+            end = cursor;
+            last_was_ascii_alphanumeric = false;
+            continue;
+        }
+        break;
+    }
+    (end, has_ascii_uppercase)
+}
+
+/// Borrowed [`CassAnalyzer::emit_normalized`]: drop a source longer than
+/// [`CASS_MAX_TOKEN_BYTES`], else emit `source` itself when it holds no ASCII
+/// uppercase byte (lowercasing would not change it) and its ASCII-lowercased
+/// copy in `scratch` otherwise. `has_ascii_uppercase` may over-report; it must
+/// never under-report.
+#[inline]
+fn emit_cass_normalized_borrowed(
+    scratch: &mut String,
+    source: &str,
+    has_ascii_uppercase: bool,
+    position: u32,
+    offset_from: usize,
+    offset_to: usize,
+    sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+) {
+    if source.len() > CASS_MAX_TOKEN_BYTES {
+        return;
+    }
+    let text = if has_ascii_uppercase {
+        scratch.clear();
+        scratch.push_str(source);
+        scratch.make_ascii_lowercase();
+        scratch.as_str()
+    } else {
+        source
+    };
+    sink(AnalyzedTokenRef {
+        text,
+        position,
+        offset_from,
+        offset_to,
+        position_length: 1,
+    });
+}
+
 impl CassAnalyzer {
+    /// Borrowed form of [`TokenAnalyzer::analyze`] for ingest: the same token
+    /// stream (text, positions, offsets, drops) with each token borrowed from
+    /// `text` unless ASCII lowercasing changes it. The owned
+    /// [`TokenAnalyzer::analyze`] remains the char-walk reference.
+    fn analyze_cass_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        let bytes = text.as_bytes();
+        let mut cursor = 0;
+        let mut position = 0_u32;
+
+        while let Some(&byte) = bytes.get(cursor) {
+            let offset_to = if byte.is_ascii_alphanumeric() {
+                let (offset_to, has_ascii_uppercase) = cass_ascii_token_end_bytes(bytes, cursor);
+                self.emit_ascii_borrowed(
+                    analyzer,
+                    &text[cursor..offset_to],
+                    has_ascii_uppercase,
+                    position,
+                    cursor,
+                    offset_to,
+                    sink,
+                );
+                offset_to
+            } else if byte.is_ascii() {
+                cursor += 1;
+                continue;
+            } else {
+                let Some((ch, next_cursor)) = tokenizer_next_char(text, cursor) else {
+                    break;
+                };
+                if !is_cass_cjk(ch) {
+                    cursor = next_cursor;
+                    continue;
+                }
+                let offset_to = cass_cjk_token_end(text, next_cursor);
+                self.emit_cjk_borrowed(&text[cursor..offset_to], position, cursor, offset_to, sink);
+                offset_to
+            };
+            position = next_token_position(position);
+            cursor = offset_to;
+        }
+    }
+
+    /// Borrowed [`Self::emit_ascii`]. A part's uppercase flag is the whole
+    /// compound's, which can only over-report.
+    fn emit_ascii_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        source: &str,
+        has_ascii_uppercase: bool,
+        position: u32,
+        offset_from: usize,
+        offset_to: usize,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        emit_cass_normalized_borrowed(
+            &mut self.token.text,
+            source,
+            has_ascii_uppercase,
+            position,
+            offset_from,
+            offset_to,
+            sink,
+        );
+        if analyzer != AnalyzerKind::CassHyphenNormalize || !source.contains('-') {
+            return;
+        }
+        for part in source.split('-').filter(|part| !part.is_empty()) {
+            emit_cass_normalized_borrowed(
+                &mut self.token.text,
+                part,
+                has_ascii_uppercase,
+                position,
+                offset_from,
+                offset_to,
+                sink,
+            );
+        }
+    }
+
+    /// Borrowed [`Self::emit_cjk`]. Adjacent scalars are adjacent in `source`,
+    /// so every bigram is a source slice; a run holds no ASCII byte, so ASCII
+    /// lowercasing never changes it.
+    fn emit_cjk_borrowed(
+        &mut self,
+        source: &str,
+        position: u32,
+        offset_from: usize,
+        offset_to: usize,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        let mut scalars = source.char_indices();
+        let Some((mut left_at, _)) = scalars.next() else {
+            return;
+        };
+        let Some((mut right_at, mut right)) = scalars.next() else {
+            emit_cass_normalized_borrowed(
+                &mut self.token.text,
+                source,
+                false,
+                position,
+                offset_from,
+                offset_to,
+                sink,
+            );
+            return;
+        };
+
+        loop {
+            sink(AnalyzedTokenRef {
+                text: &source[left_at..right_at + right.len_utf8()],
+                position,
+                offset_from,
+                offset_to,
+                position_length: 1,
+            });
+
+            left_at = right_at;
+            let Some((next_at, next)) = scalars.next() else {
+                break;
+            };
+            right_at = next_at;
+            right = next;
+        }
+    }
+
     fn emit_normalized(
         &mut self,
         source: &str,
@@ -1158,6 +1356,16 @@ impl TokenAnalyzer for CassAnalyzer {
         }
     }
 
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        debug_assert!(self.supports(analyzer));
+        self.analyze_cass_borrowed(analyzer, text, sink);
+    }
+
     fn bytes_reserved(&self) -> usize {
         self.token.text.capacity()
     }
@@ -1168,6 +1376,64 @@ impl TokenAnalyzer for CassAnalyzer {
         self.token.offset_from = 0;
         self.token.offset_to = 0;
         self.token.position_length = 0;
+    }
+}
+
+/// The CASS ingest route before [`CassAnalyzer`] overrode
+/// [`TokenAnalyzer::analyze_borrowed`].
+///
+/// CASS kinds run the owned char-walk [`TokenAnalyzer::analyze`] and
+/// re-borrow each token through the trait's owned-token bridge, and every
+/// other kind forwards to [`CompiledAnalyzerFamily`]. Retained as the
+/// same-binary ingest A/B incumbent and as the byte-identity oracle in tests.
+#[cfg(any(test, feature = "bench-internals"))]
+#[derive(Debug, Clone, Default)]
+pub struct OwnedBridgeCassFamily {
+    family: CompiledAnalyzerFamily,
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+impl sealed::Sealed for OwnedBridgeCassFamily {}
+
+#[cfg(any(test, feature = "bench-internals"))]
+impl TokenAnalyzer for OwnedBridgeCassFamily {
+    fn supports(&self, analyzer: AnalyzerKind) -> bool {
+        self.family.supports(analyzer)
+    }
+
+    fn analyze(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        self.family.analyze(analyzer, text, sink);
+    }
+
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        match analyzer {
+            AnalyzerKind::FrankensearchDefault | AnalyzerKind::FrankensearchCjkBigrams => {
+                self.family.analyze_borrowed(analyzer, text, sink);
+            }
+            AnalyzerKind::CassHyphenNormalize | AnalyzerKind::CassPrefixNormalize => {
+                self.family
+                    .cass
+                    .analyze(analyzer, text, &mut |token| sink(token.into()));
+            }
+        }
+    }
+
+    fn bytes_reserved(&self) -> usize {
+        self.family.bytes_reserved()
+    }
+
+    fn reset(&mut self) {
+        self.family.reset();
     }
 }
 
@@ -7102,6 +7368,350 @@ mod tests {
         assert_eq!(analyzer.bytes_reserved(), retained);
         analyzer.analyze(AnalyzerKind::CassPrefixNormalize, "short", &mut |_| {});
         assert_eq!(analyzer.bytes_reserved(), retained);
+    }
+
+    fn owned_analyzed_token(token: AnalyzedTokenRef<'_>) -> AnalyzedToken {
+        AnalyzedToken {
+            text: token.text.to_owned(),
+            position: token.position,
+            offset_from: token.offset_from,
+            offset_to: token.offset_to,
+            position_length: token.position_length,
+        }
+    }
+
+    #[test]
+    fn cass_borrowed_ingest_stream_matches_owned_char_walk() {
+        // The borrowed ingest stream must be the owned char-walk stream token
+        // for token (text, position, offsets, length), for both CASS kinds:
+        // hyphen-join edges, ASCII case, CJK runs (one scalar, BMP, 4-byte
+        // Extension B), non-CJK non-ASCII separators, and the 256-byte
+        // retention edge for whole tokens, compounds and their parts.
+        const SEED: u64 = 0xCA55_B0BB_0012_0001;
+        const ATOMS: [&str; 26] = [
+            "a",
+            "Z",
+            "q7",
+            "Ab",
+            "ID",
+            "x9Y",
+            "-",
+            "--",
+            " ",
+            "_",
+            ".",
+            "/",
+            "\n",
+            "搜",
+            "索",
+            "かな",
+            "한글",
+            "\u{20000}",
+            "\u{3400}",
+            "é",
+            "Größe",
+            "🙂",
+            "—",
+            "123",
+            "x-Y",
+            "Ω",
+        ];
+        let mut inputs: Vec<String> = [
+            "",
+            "-",
+            "a",
+            "A",
+            "a-",
+            "-a",
+            "a-b",
+            "a--b",
+            "A-b-C",
+            "a-b-",
+            "-a-b",
+            "a1-B2-c3 x",
+            "a-é",
+            "é-a",
+            "ab-搜",
+            "搜-ab",
+            "搜",
+            "搜索引擎",
+            "A搜索B",
+            "abc搜索def",
+            "Größe",
+            "ÉCLAIR",
+            "東京かな한글",
+            "\u{20000}\u{20001}\u{2A6DF}",
+            "mix\u{20000}東京\u{2A700}tail",
+            "BD-Q3FY search",
+            "He Hel Hell Hello he",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for len in [
+            CASS_MAX_TOKEN_BYTES - 1,
+            CASS_MAX_TOKEN_BYTES,
+            CASS_MAX_TOKEN_BYTES + 1,
+        ] {
+            inputs.push("x".repeat(len));
+            inputs.push(format!("{} ok", "X".repeat(len)));
+            // An oversized compound whose parts are retained, and a compound
+            // whose own leading part is oversized.
+            inputs.push(format!(
+                "{}-{}",
+                "a".repeat(len / 2 + 1),
+                "B".repeat(len / 2 + 1)
+            ));
+            inputs.push(format!("{}-b c", "A".repeat(len)));
+        }
+        let mut rng = DeterministicRng(SEED);
+        for _ in 0..512 {
+            let mut input = String::new();
+            for _ in 0..rng.choose(64) {
+                input.push_str(ATOMS[rng.choose(ATOMS.len())]);
+            }
+            inputs.push(input);
+        }
+
+        // One analyzer per route across every input, as one accumulator reuses
+        // it, so retained scratch cannot leak from one field into the next.
+        let mut borrowed_analyzer = CassAnalyzer::default();
+        let mut family = CompiledAnalyzerFamily::default();
+        let mut tokens = 0_usize;
+        for input in &inputs {
+            for kind in [
+                AnalyzerKind::CassHyphenNormalize,
+                AnalyzerKind::CassPrefixNormalize,
+            ] {
+                let mut owned = Vec::new();
+                CassAnalyzer::default().analyze(kind, input, &mut |token| {
+                    owned.push(token.clone());
+                });
+                let mut borrowed = Vec::new();
+                borrowed_analyzer.analyze_borrowed(kind, input, &mut |token| {
+                    borrowed.push(owned_analyzed_token(token));
+                });
+                let mut via_family = Vec::new();
+                family.analyze_borrowed(kind, input, &mut |token| {
+                    via_family.push(owned_analyzed_token(token));
+                });
+                assert_eq!(borrowed, owned, "{kind:?} input={input:?}");
+                assert_eq!(via_family, owned, "family {kind:?} input={input:?}");
+                tokens += owned.len();
+            }
+        }
+        assert!(tokens > 10_000, "the corpus must exercise the analyzer");
+    }
+
+    #[test]
+    fn cass_borrowed_ingest_borrows_unchanged_tokens_and_scratches_lowercased_ones() {
+        let text = "lower UPPER low-dash Mixed-Case 搜索 搜";
+        let input = text.as_ptr() as usize..text.as_ptr() as usize + text.len();
+        let mut analyzer = CassAnalyzer::default();
+        let mut observed = Vec::new();
+        analyzer.analyze_borrowed(AnalyzerKind::CassHyphenNormalize, text, &mut |token| {
+            observed.push((
+                token.text.to_owned(),
+                token.position,
+                input.contains(&(token.text.as_ptr() as usize)),
+            ));
+        });
+        assert_eq!(
+            observed,
+            [
+                ("lower", 0, true),
+                ("upper", 1, false),
+                ("low-dash", 2, true),
+                ("low", 2, true),
+                ("dash", 2, true),
+                ("mixed-case", 3, false),
+                ("mixed", 3, false),
+                ("case", 3, false),
+                ("搜索", 4, true),
+                ("搜", 5, true),
+            ]
+            .map(|(text, position, borrowed)| (text.to_owned(), position, borrowed))
+        );
+    }
+
+    #[test]
+    fn cass_borrowed_ingest_seals_the_owned_bridge_bytes() {
+        // A CASS accumulator on the shipping family must intern the same terms
+        // in the same order and fill the same token, position, length and
+        // fieldnorm columns as one on the owned-bridge incumbent, and both
+        // must seal byte-identical segments under both radix modes.
+        use crate::cass::{CassDerivedColumns, CassDocument, CassFieldValues};
+        const WORDS: [&str; 16] = [
+            "search",
+            "Index",
+            "BD-Q3FY",
+            "rust-lang",
+            "x",
+            "ÉCLAIR",
+            "搜索引擎",
+            "搜",
+            "Größe",
+            "a--b",
+            "-lead",
+            "trail-",
+            "README.md",
+            "🙂",
+            "snake_case",
+            "\u{20000}\u{20001}",
+        ];
+        const SEPARATORS: [&str; 5] = [" ", "\n", ", ", "/", "-"];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread flush pool");
+        for seed in 0..3_u64 {
+            let mut rng = DeterministicRng(0xCA55_1A9E_5EED_0001 ^ seed.wrapping_mul(0x9E37_79B9));
+            let documents: Vec<CassDocument> = (0..200_u64)
+                .map(|msg_idx| {
+                    let mut content = String::new();
+                    for word in 0..=rng.choose(120) {
+                        if word != 0 {
+                            content.push_str(SEPARATORS[rng.choose(SEPARATORS.len())]);
+                        }
+                        content.push_str(WORDS[rng.choose(WORDS.len())]);
+                    }
+                    if rng.choose(20) == 0 {
+                        content.push(' ');
+                        content.push_str(&"Q".repeat(CASS_MAX_TOKEN_BYTES - 1 + rng.choose(3)));
+                    }
+                    CassDocument {
+                        agent: "codex".to_owned(),
+                        workspace: Some("/data/projects/demo".to_owned()),
+                        workspace_original: None,
+                        source_path: format!("/tmp/session-{seed}.jsonl"),
+                        msg_idx,
+                        created_at: Some(
+                            1_700_000_000_000 + i64::try_from(msg_idx).expect("small index"),
+                        ),
+                        title: (msg_idx % 7 == 0)
+                            .then(|| format!("Title {}", WORDS[rng.choose(WORDS.len())])),
+                        content,
+                        source_id: "local".to_owned(),
+                        origin_kind: "local".to_owned(),
+                        origin_host: None,
+                        conversation_id: Some(i64::try_from(seed).expect("small seed")),
+                    }
+                })
+                .collect();
+
+            let mut shipping =
+                ColumnarAccumulator::new(CASS_SEMANTIC_SCHEMA).expect("shipping CASS accumulator");
+            let mut incumbent = ColumnarAccumulator::with_analyzer(
+                CASS_SEMANTIC_SCHEMA,
+                OwnedBridgeCassFamily::default(),
+            )
+            .expect("owned-bridge CASS accumulator");
+            let mut ids = Vec::new();
+            for (ordinal, document) in documents.iter().enumerate() {
+                let derived = CassDerivedColumns::derive(document.as_ref());
+                let values = CassFieldValues::build(document.as_ref(), &derived);
+                let doc_ord = u32::try_from(ordinal).expect("small ordinal");
+                let candidate = shipping
+                    .add_document_with_values(
+                        doc_ord,
+                        &values.indexed,
+                        &values.numeric,
+                        &values.stored,
+                    )
+                    .expect("shipping accumulates");
+                let reference = incumbent
+                    .add_document_with_values(
+                        doc_ord,
+                        &values.indexed,
+                        &values.numeric,
+                        &values.stored,
+                    )
+                    .expect("incumbent accumulates");
+                assert_eq!(candidate.admitted_tokens, reference.admitted_tokens);
+                assert_eq!(candidate.oversized_tokens, reference.oversized_tokens);
+                assert_eq!(candidate.bytes_used, reference.bytes_used);
+                // Only analyzer scratch differs: it now grows for lowercased
+                // tokens alone, never past the incumbent's.
+                assert!(candidate.bytes_reserved <= reference.bytes_reserved);
+                ids.push(document.to_schema_document().id);
+            }
+
+            let term_count = u32::try_from(shipping.terms().len()).expect("small term table");
+            assert_eq!(shipping.terms().len(), incumbent.terms().len());
+            for id in 0..term_count {
+                assert_eq!(
+                    shipping.terms().composite_key(id),
+                    incumbent.terms().composite_key(id),
+                    "seed {seed}: term {id}"
+                );
+            }
+            assert_eq!(shipping.fields().len(), incumbent.fields().len());
+            for (candidate, reference) in shipping.fields().iter().zip(incumbent.fields()) {
+                let field = candidate.field_ord();
+                assert_eq!(field, reference.field_ord());
+                assert_eq!(candidate.term_ids(), reference.term_ids(), "field {field}");
+                assert_eq!(candidate.doc_ords(), reference.doc_ords(), "field {field}");
+                assert_eq!(
+                    candidate.positions(),
+                    reference.positions(),
+                    "field {field}"
+                );
+                assert_eq!(
+                    candidate.document_lengths(),
+                    reference.document_lengths(),
+                    "field {field}"
+                );
+                assert_eq!(
+                    candidate.fieldnorm_ids(),
+                    reference.fieldnorm_ids(),
+                    "field {field}"
+                );
+                assert_eq!(candidate.total_tokens(), reference.total_tokens());
+            }
+            for term in [b"bd-q3fy".as_slice(), b"q3fy", "搜索".as_bytes(), b"index"] {
+                assert!(
+                    shipping.terms().find(7, term).is_some(),
+                    "seed {seed}: compounds, parts, CJK bigrams and lowercased words \
+                     must be indexed ({term:?})"
+                );
+            }
+
+            let flush_docs: Vec<FlushDocumentInput<'_>> = ids
+                .iter()
+                .enumerate()
+                .map(|(ordinal, id)| {
+                    FlushDocumentInput::from_canonical_content(
+                        u32::try_from(ordinal).expect("small ordinal"),
+                        id,
+                        id.as_bytes(),
+                    )
+                })
+                .collect();
+            let input = FlushSegmentInput {
+                segment_id: 0x0ca5_5b0b | seed,
+                lease_docid_base: 3 * 65_536,
+                created_unix_s: 1_700_000_000,
+                engine_version: 0x0001_0002,
+                documents: &flush_docs,
+            };
+            for mode in [FlushMode::Scalar, FlushMode::Automatic] {
+                let candidate = pool
+                    .install(|| flush_accumulator_with_mode(&shipping, input, mode))
+                    .expect("shipping seal");
+                let reference = pool
+                    .install(|| flush_accumulator_with_mode(&incumbent, input, mode))
+                    .expect("incumbent seal");
+                assert_eq!(
+                    candidate.as_bytes(),
+                    reference.as_bytes(),
+                    "seed {seed} {mode:?}: borrowed CASS ingest must seal the incumbent bytes"
+                );
+                SegmentReader::from_bytes(candidate.as_bytes(), CASS_SEMANTIC_SCHEMA)
+                    .expect("CASS segment reopens")
+                    .verify()
+                    .expect("CASS segment witnesses verify");
+            }
+        }
     }
 
     #[test]
