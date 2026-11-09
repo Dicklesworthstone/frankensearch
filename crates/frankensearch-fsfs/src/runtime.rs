@@ -10072,6 +10072,10 @@ impl FsfsRuntime {
             {
                 cache.clear();
             }
+            Self::validate_query_exclusions(
+                &ParsedQuery::parse(&Self::normalize_search_query(&request.query)),
+                resources.lexical_index.is_some(),
+            )?;
             // Resolve the fast producer once before snapshotting it. Quality
             // remains lazy so its cold load cannot delay INITIAL delivery.
             let fast_admission: SearchResult<()> = async {
@@ -10282,6 +10286,10 @@ impl FsfsRuntime {
         {
             hot_cache.clear();
         }
+        Self::validate_query_exclusions(
+            &ParsedQuery::parse(&Self::normalize_search_query(&request.query)),
+            resources.lexical_index.is_some(),
+        )?;
         let requested_limit = request.limit.unwrap_or_else(|| {
             self.cli_input
                 .overrides
@@ -12594,9 +12602,21 @@ impl FsfsRuntime {
         let lookup_fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
         Self::validate_search_generation_fingerprint(&index_root, &lookup_fingerprint, mode)?;
         let mut prepared = self.clone();
+        let parsed_query = ParsedQuery::parse(&Self::normalize_search_query(query));
+        // A cached answer cannot stand in for the lexical evidence needed to
+        // enforce exclusions. Open that evidence before loading any model,
+        // including the reranker, and reuse it for either replay or retrieval.
+        let mut admitted_resources = if parsed_query.has_negations() {
+            let resources = prepared
+                .prepare_search_execution_resources_at_root_with_modes(cx, &index_root, mode, mode)
+                .await?;
+            Self::validate_query_exclusions(&parsed_query, resources.lexical_index.is_some())?;
+            Some(resources)
+        } else {
+            None
+        };
         prepared.prepare_search_reranker(cx).await?;
         let key = prepared.search_cache_key(query, limit, mode)?;
-        let mut admitted_resources = None;
         match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
                 // A persisted semantic answer does not establish that its
@@ -12611,14 +12631,18 @@ impl FsfsRuntime {
                             .any(|hit| hit.semantic_rank.is_some() || hit.hash_rank.is_some())
                     }) && !Self::cached_search_requires_quality(mode, &payloads)
                 } else {
-                    let mut resources = prepared
-                        .prepare_search_execution_resources_at_root_with_modes(
-                            cx,
-                            &index_root,
-                            mode,
-                            mode,
-                        )
-                        .await?;
+                    let mut resources = if let Some(resources) = admitted_resources.take() {
+                        resources
+                    } else {
+                        prepared
+                            .prepare_search_execution_resources_at_root_with_modes(
+                                cx,
+                                &index_root,
+                                mode,
+                                mode,
+                            )
+                            .await?
+                    };
                     let replay = Box::pin(prepared.admit_cached_search_producers(
                         cx,
                         &mut resources,
@@ -13449,6 +13473,7 @@ impl FsfsRuntime {
         payloads: &[SearchPayload],
     ) -> SearchResult<bool> {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
+        Self::validate_cached_query_exclusions(resources, payloads)?;
         if matches!(mode, SearchExecutionMode::LexicalOnly)
             && payloads.iter().any(|payload| {
                 payload
@@ -13586,6 +13611,7 @@ impl FsfsRuntime {
         payloads: &[SearchPayload],
     ) -> SearchResult<()> {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
+        Self::validate_cached_query_exclusions(resources, payloads)?;
         Self::validate_bound_search_resources(resources, mode)?;
         if Self::cached_search_requires_fast(resources, mode, payloads) {
             Self::validate_cached_fast_producer(resources)?;
@@ -14600,6 +14626,9 @@ impl FsfsRuntime {
         self.validate_semantic_model_selection(mode)?;
         self.rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
+        let normalized_query = Self::normalize_search_query(query);
+        let parsed_query = ParsedQuery::parse(&normalized_query);
+        Self::validate_query_exclusions(&parsed_query, resources.lexical_index.is_some())?;
         if matches!(mode, SearchExecutionMode::QualityOnly) {
             return self
                 .execute_quality_only_search(cx, query, limit, resources, flags, phase_sink)
@@ -14611,7 +14640,6 @@ impl FsfsRuntime {
             .map(SegmentStatsProvider::segment_stats)
             .transpose()?;
         let index_freshness = lexical_stats.map(Self::index_freshness_payload);
-        let normalized_query = Self::normalize_search_query(query);
         let filter_expr = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
         if normalized_query.is_empty() {
             let artifact = SearchPhaseArtifact {
@@ -15011,7 +15039,6 @@ impl FsfsRuntime {
         // lane through its own parser. The vector lanes embed the rest of the
         // query and skip every document the lexical engine matches for them;
         // otherwise an excluded file returned through its vectors (bd-ekop5).
-        let parsed_query = ParsedQuery::parse(&normalized_query);
         let semantic_query = if parsed_query.has_negations() && !parsed_query.is_positive_empty() {
             parsed_query.positive.clone()
         } else {
@@ -24875,14 +24902,7 @@ impl FsfsRuntime {
         let normalized_query = Self::normalize_search_query(query);
         let filter = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
         let parsed = ParsedQuery::parse(&normalized_query);
-        if parsed.has_negations() && resources.lexical_index.is_none() {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.search_query".to_owned(),
-                value: "quality_only_exclusions".to_owned(),
-                reason: "query exclusions require the lexical index to identify excluded documents; quality-only search will not ignore them"
-                    .to_owned(),
-            });
-        }
+        Self::validate_query_exclusions(&parsed, resources.lexical_index.is_some())?;
         let lexical_stats = resources
             .lexical_index
             .as_ref()
@@ -25122,15 +25142,45 @@ impl FsfsRuntime {
         ))
     }
 
+    /// Exclusion clauses need document-text evidence even when retrieval uses
+    /// only vectors. A missing lexical index must not silently broaden a query.
+    fn validate_query_exclusions(
+        parsed: &ParsedQuery,
+        lexical_available: bool,
+    ) -> SearchResult<()> {
+        if parsed.has_negations() && !lexical_available {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.search_query".to_owned(),
+                value: "exclusions_without_lexical_index".to_owned(),
+                reason: "query exclusions require the lexical index to identify excluded documents; rebuild the lexical index before searching with exclusions"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_cached_query_exclusions(
+        resources: &SearchExecutionResources,
+        payloads: &[SearchPayload],
+    ) -> SearchResult<()> {
+        if resources.lexical_index.is_none() {
+            for payload in payloads {
+                Self::validate_query_exclusions(&ParsedQuery::parse(&payload.query), false)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Every live document the lexical engine matches for the query's
-    /// exclusions, which the vector lanes then skip. `None` when the query has
-    /// no exclusions or no lexical index can evaluate them.
+    /// exclusions, which the vector lanes then skip. `None` only when the
+    /// query has no exclusions; missing lexical evidence is an error.
     fn query_exclusions(
         cx: &Cx,
         lexical: Option<&QuillSearchIndex>,
         parsed: &ParsedQuery,
         live_docs: usize,
     ) -> SearchResult<Option<Arc<HashSet<String>>>> {
+        Self::validate_query_exclusions(parsed, lexical.is_some())?;
         let Some(lexical) = lexical.filter(|_| parsed.has_negations()) else {
             return Ok(None);
         };
@@ -51387,6 +51437,25 @@ mod tests {
                     .unwrap();
                 assert_eq!(initial_a.semantic_rank, Some(0), "{query}");
 
+                let fast = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        &cx,
+                        &query,
+                        10,
+                        SearchExecutionMode::FastOnly,
+                        &mut resources,
+                        flags,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!fast[0].hits.is_empty(), "{query}");
+                assert!(
+                    fast.iter()
+                        .flat_map(|phase| &phase.hits)
+                        .all(|hit| hit.path != "b.rs"),
+                    "{query}",
+                );
+
                 // Generated variants deliberately omit the negative clauses.
                 // In the quality tier the excluded b.rs is the best match;
                 // a limit of one proves exclusions run before top-k selection.
@@ -51491,6 +51560,210 @@ mod tests {
                 .expect_err("missing exclusion evidence must not broaden expanded retrieval");
             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                     if field == "query_expansion.exclusions"));
+        });
+    }
+
+    fn assert_exclusions_refused_before_work<T>(operation: impl Future<Output = SearchResult<T>>) {
+        let mut operation = Box::pin(operation);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(
+                operation.as_mut().poll(&mut context),
+                Poll::Ready(Err(SearchError::InvalidConfig { field, value, .. }))
+                    if field == "cli.search_query"
+                        && value == "exclusions_without_lexical_index"
+            ),
+            "missing exclusion evidence must fail before model or reranker work",
+        );
+    }
+
+    #[test]
+    fn negated_queries_without_lexical_evidence_fail_before_model_or_reranker_work() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut positive_resources = disagreeing_blend_resources(temp.path());
+            let mut resources = positive_resources.clone();
+            let fast = Arc::new(PendingSemanticEmbedder::new("blend-fast-2", 2));
+            let quality = Arc::new(PendingSemanticEmbedder::new("blend-quality-2", 2));
+            resources.fast_embedder = Some(admitted_shared(&fast));
+            resources.quality_embedder = Some(admitted_shared(&quality));
+            let mut config = FsfsConfig::default();
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config.clone());
+            // Holding the load gate makes even an attempted reranker load
+            // observable as Pending rather than a synchronous exclusion error.
+            let permit = asupersync::sync::OwnedMutexGuard::lock(
+                Arc::clone(&runtime.reranker_load_gate),
+                &cx,
+            )
+            .await
+            .unwrap();
+            let flags = SearchExecutionFlags {
+                include_snippets: false,
+                persist_explain_session: false,
+            };
+            let mut emitted = 0;
+            for mode in [
+                SearchExecutionMode::Full,
+                SearchExecutionMode::FastOnly,
+                SearchExecutionMode::QualityOnly,
+                SearchExecutionMode::LexicalOnly,
+            ] {
+                for query in [
+                    "how do alpha documents rank -banned",
+                    "how do alpha documents rank -\"internal secret\"",
+                    "how do alpha documents rank NOT \"internal secret\"",
+                    "-banned",
+                ] {
+                    assert_exclusions_refused_before_work(
+                        runtime.execute_search_phase_artifacts_with_mode_using_resources(
+                            &cx,
+                            query,
+                            10,
+                            mode,
+                            &mut resources,
+                            flags,
+                            Some(&mut |_| {
+                                emitted += 1;
+                                Ok(())
+                            }),
+                        ),
+                    );
+                }
+            }
+            assert_eq!(emitted, 0);
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            assert!(runtime.reranker.get().is_none());
+            drop(permit);
+
+            // The missing lexical index still permits ordinary vector-only
+            // queries; the refusal is specific to unprovable exclusions.
+            config.search.rerank = false;
+            let runtime = FsfsRuntime::new(config);
+            for mode in [SearchExecutionMode::Full, SearchExecutionMode::FastOnly] {
+                let phases = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        &cx,
+                        "how do alpha documents rank",
+                        10,
+                        mode,
+                        &mut positive_resources,
+                        flags,
+                    )
+                    .await
+                    .unwrap();
+                assert!(phases.iter().any(|phase| !phase.hits.is_empty()));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn negated_queries_without_lexical_evidence_cannot_replay_cached_results() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = published_blend_resources(temp.path());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let permit = asupersync::sync::OwnedMutexGuard::lock(
+                Arc::clone(&runtime.reranker_load_gate),
+                &cx,
+            )
+            .await
+            .unwrap();
+            let query = "how do alpha documents rank -banned";
+            let payloads = vec![SearchPayload::new(
+                query.to_owned(),
+                SearchOutputPhase::Initial,
+                0,
+                Vec::new(),
+            )];
+            let fingerprint = resources.generation_fingerprint.clone();
+            let key = runtime
+                .search_cache_key(query, 10, SearchExecutionMode::Full)
+                .unwrap();
+            runtime
+                .write_search_payload_cache(&key, &payloads, &fingerprint)
+                .unwrap();
+            let mut cache = HashMap::from([(key, payloads.clone())]);
+            let mut emitted = 0;
+            assert_exclusions_refused_before_work(runtime.admit_cached_search_producers(
+                &cx,
+                &mut resources,
+                SearchExecutionMode::Full,
+                &payloads,
+            ));
+            assert_exclusions_refused_before_work(runtime.replay_cached_search_payloads(
+                &cx,
+                &mut resources,
+                SearchExecutionMode::Full,
+                &fingerprint,
+                &payloads,
+                Some(&mut |_| {
+                    emitted += 1;
+                    Ok(())
+                }),
+            ));
+            assert_exclusions_refused_before_work(
+                runtime.execute_search_payloads_cached_for_cli_with_phase_sink(
+                    &cx,
+                    query,
+                    10,
+                    &mut |_| {
+                        emitted += 1;
+                        Ok(())
+                    },
+                ),
+            );
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": query, "limit": 10, "mode": "full", "rerank": true,
+            }))
+            .unwrap();
+            let options = super::SearchServeOptions {
+                hot_cache_enabled: true,
+                persist_explain_session: false,
+            };
+            assert_exclusions_refused_before_work(runtime.execute_search_serve_request_with_sink(
+                &cx,
+                request.clone(),
+                &mut resources,
+                &mut cache,
+                options,
+                Some(&mut |_| {
+                    emitted += 1;
+                    Ok(())
+                }),
+            ));
+            // The shared daemon must reject before its eager fast admission.
+            resources.fast_embedder = None;
+            resources.fast_embedder_attempted = false;
+            let shared = Arc::new(asupersync::sync::Mutex::new((resources, cache)));
+            assert_exclusions_refused_before_work(
+                runtime.execute_shared_search_serve_request_with_sink(
+                    &cx,
+                    request,
+                    Arc::clone(&shared),
+                    options,
+                    Some(&mut |_| {
+                        emitted += 1;
+                        Ok(())
+                    }),
+                ),
+            );
+            let guard = asupersync::sync::OwnedMutexGuard::lock(shared, &cx)
+                .await
+                .unwrap();
+            assert!(guard.0.fast_embedder.is_none());
+            assert!(!guard.0.fast_embedder_attempted);
+            assert_eq!(emitted, 0);
+            assert!(runtime.reranker.get().is_none());
+            drop(permit);
         });
     }
 
