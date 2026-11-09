@@ -24325,7 +24325,7 @@ mod tests {
                         hits.iter().any(|hit| hit.document_id == "partial"),
                         "{query}: fixture must match through its gamma branch"
                     );
-                    for hit in &hits {
+                    for hit in hits.iter() {
                         let explanation = index
                             .explain_document(&cx, query, &hit.document_id)
                             .expect("explain")
@@ -24419,7 +24419,7 @@ mod tests {
                         .expect("search")
                         .hits;
                     assert!(!hits.is_empty(), "{query}: fixture must match");
-                    for hit in &hits {
+                    for hit in hits.iter() {
                         let explanation = index
                             .explain_document(&cx, query, &hit.document_id)
                             .expect("explain")
