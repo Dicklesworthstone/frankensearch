@@ -890,6 +890,80 @@ mod tests {
         });
     }
 
+    /// A word with an accented Latin letter must find the document it came from.
+    ///
+    /// The CASS tokenizer keeps only ASCII alphanumeric and CJK runs, so it
+    /// indexes `kérlek` as `k` + `rlek`. The query parser keeps the whole
+    /// word, so before the fix such a query matched nothing. The query side
+    /// must split like the tokenizer, before lowercasing (`İ`) and at hyphen
+    /// runs. A word with no indexable fragment at all (`привет`) must still
+    /// match nothing rather than everything.
+    #[test]
+    fn cass_accented_latin_words_match_the_indexed_fragments() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+            let documents = [
+                sample_document(
+                    "hu",
+                    0,
+                    "claude",
+                    "Mentés",
+                    "Kérlek ellenőrizd a mentést İstanbulban",
+                ),
+                sample_document("en", 1, "codex", "Backup", "please check the backup"),
+            ]
+            .iter()
+            .map(CassDocument::to_schema_document)
+            .collect::<Vec<_>>();
+            index
+                .index_schema_documents(&cx, &documents)
+                .await
+                .expect("ingest CASS documents");
+            index.commit(&cx).await.expect("publish CASS documents");
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open a CASS-schema reader");
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS query parser");
+            let filters = crate::query::CassQueryFilters::default();
+
+            for (query, expected) in [
+                ("kérlek", 1),
+                ("Kérlek", 1),
+                ("ellenőrizd", 1),
+                ("mentést", 1),
+                ("İstanbulban", 1),
+                ("kérlek--mentést", 1),
+                ("\"kérlek ellenőrizd\"", 1),
+                ("\"ellenőrizd kérlek\"", 0),
+                ("kér*", 1),
+                ("kérlek AND backup", 0),
+                ("kérlek OR backup", 2),
+                ("please", 1),
+                ("привет", 0),
+            ] {
+                let parsed = parser.parse(query, &filters);
+                let hit = reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                    .expect("search the CASS index");
+                assert_eq!(hit.total_count, Some(expected), "query {query:?}");
+            }
+        });
+    }
+
     /// A date-filtered query must keep working once a sealed segment holds a
     /// tombstone (frankensearch#49, cass GH #499).
     ///

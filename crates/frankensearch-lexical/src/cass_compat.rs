@@ -2572,11 +2572,16 @@ fn cass_normalize_term_parts(raw: &str) -> Vec<String> {
 /// Normalize phrase text into tokenizer-aligned terms (lowercased, no wildcards).
 #[must_use]
 fn cass_normalize_phrase_terms(raw: &str) -> Vec<String> {
-    cass_sanitize_query(raw)
-        .split_whitespace()
-        .map(|s| s.trim_matches('*').to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect()
+    let mut terms = Vec::new();
+    for term in cass_sanitize_query(raw).split_whitespace() {
+        let term = term.trim_matches('*');
+        match cass_indexed_fragments(term) {
+            Some(fragments) => terms.extend(fragments),
+            None if !term.is_empty() => terms.push(term.to_lowercase()),
+            None => {}
+        }
+    }
+    terms
 }
 
 /// The complement of `query`: Tantivy reads a query of `MustNot` clauses
@@ -2911,6 +2916,18 @@ fn cass_build_compound_term_query(
     let mut subqueries: Vec<Box<dyn Query>> = Vec::new();
     for part in parts {
         let pattern = CassWildcardPattern::parse(part);
+        if matches!(
+            pattern,
+            CassWildcardPattern::Exact(_) | CassWildcardPattern::Prefix(_)
+        ) && let Some(fragments) = cass_indexed_fragments(part.trim_matches('*'))
+        {
+            if let Some(query) =
+                cass_build_compound_term_query(&fragments, fields, regex_query_factory)?
+            {
+                subqueries.push(query);
+            }
+            continue;
+        }
         let term_shoulds = cass_build_term_query_clauses(&pattern, fields, regex_query_factory)?;
         if !term_shoulds.is_empty() {
             subqueries.push(Box::new(BooleanQuery::new(term_shoulds)));
@@ -2955,6 +2972,35 @@ fn cass_build_phrase_query(
         shoulds.push((Occur::Should, Box::new(PhraseQuery::new(phrase_terms))));
     }
     Ok(Some(Box::new(BooleanQuery::new(shoulds))))
+}
+
+/// The terms `CassTokenizer` indexes for `raw`, when `raw` holds a character
+/// outside ASCII and the CJK ranges.
+///
+/// The tokenizer treats such characters as separators, so it indexes `kérlek`
+/// as `k` + `rlek`, while query terms keep every Unicode letter. Running the
+/// tokenizer itself on the unlowercased text keeps both sides aligned, including
+/// hyphen runs (`a--b`) and case mappings that change length (`İ`). Returns
+/// `None` when no such character occurs or no term remains (`привет`), so those
+/// terms build exactly the query they built before. Like the parts of a
+/// punctuated term, the fragments are required with AND, so short fragments
+/// widen the match (`mentés` needs `ment` and `s`). Suffix, substring and
+/// complex wildcards keep the accented text and still match nothing. Quill's
+/// `cass_indexed_fragments` is the native twin of this function.
+fn cass_indexed_fragments(raw: &str) -> Option<Vec<String>> {
+    if raw
+        .chars()
+        .all(|ch| ch.is_ascii() || is_cass_tokenizer_cjk(ch))
+    {
+        return None;
+    }
+    let mut tokenizer = CassTokenizer::default();
+    let mut stream = tokenizer.token_stream(raw);
+    let mut fragments = Vec::new();
+    while stream.advance() {
+        fragments.push(stream.token().text.to_ascii_lowercase());
+    }
+    (!fragments.is_empty()).then_some(fragments)
 }
 
 /// Build Tantivy query clauses from boolean tokens.
@@ -4685,6 +4731,62 @@ mod cass_query_tests {
             !results.is_empty(),
             "CJK search for 'テスト' should find the indexed Japanese document"
         );
+    }
+
+    /// `CassTokenizer` indexes `kérlek` as `k` + `rlek`; a query for the whole
+    /// word must reach those terms, split like the tokenizer splits, before
+    /// lowercasing (`İ`) and at hyphen runs. A word with no indexable fragment
+    /// (`привет`) must still match nothing.
+    #[test]
+    fn accented_latin_index_and_search_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+        let doc = |msg_idx: u64, title: &str, content: &str| CassDocument {
+            agent: "claude".to_string(),
+            workspace: None,
+            workspace_original: None,
+            source_path: format!("/tmp/test-{msg_idx}"),
+            msg_idx,
+            created_at: Some(1_700_000_000_000),
+            title: Some(title.to_string()),
+            content: content.to_string(),
+            conversation_id: None,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+        idx.add_cass_documents(&[
+            doc(0, "Mentés", "Kérlek ellenőrizd a mentést İstanbulban"),
+            doc(1, "Backup", "please check the backup"),
+        ])
+        .expect("add");
+        idx.commit().expect("commit");
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+        let fields = idx.fields();
+
+        for (raw, expected) in [
+            ("kérlek", 1),
+            ("Kérlek", 1),
+            ("ellenőrizd", 1),
+            ("mentést", 1),
+            ("İstanbulban", 1),
+            ("kérlek--mentést", 1),
+            ("\"kérlek ellenőrizd\"", 1),
+            ("\"ellenőrizd kérlek\"", 0),
+            ("kér*", 1),
+            ("kérlek AND backup", 0),
+            ("kérlek OR backup", 2),
+            ("please", 1),
+            ("привет", 0),
+        ] {
+            let query = cass_build_tantivy_query(raw, &CassQueryFilters::default(), &fields);
+            let hits = searcher
+                .search(&query, &tantivy::collector::Count)
+                .expect("search");
+            assert_eq!(hits, expected, "query {raw:?}");
+        }
     }
 
     #[test]
