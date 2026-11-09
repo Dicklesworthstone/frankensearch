@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use asupersync::Cx;
 use frankensearch_core::generation::QuantizationFormat;
-use frankensearch_core::{EmbeddingIdentityBundleV1, SearchError, SearchResult};
+use frankensearch_core::{Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult};
 use frankensearch_embed::RegisteredQualityModel;
 use frankensearch_storage::{
     BuildTrigger, ClaimOutcome, ContentHasher, DocumentRecord, JobQueueConfig, PersistentJobQueue,
@@ -64,6 +64,50 @@ pub(super) enum DeferredQualityAttempt {
     Completed(DeferredQualityCompletion),
     MissingBacklog,
     ProducerChanged,
+    /// Only a retryable failure at model loading, before inference or admission.
+    ProducerUnavailable(SearchError),
+}
+
+/// Only typed availability failures can keep a watch's validated backlog pending.
+/// Generic I/O may describe the source, catalog, or publication authority instead.
+pub(super) fn retryable_quality_producer_error(error: &SearchError) -> bool {
+    match error {
+        SearchError::EmbedderUnavailable { .. } | SearchError::ModelNotFound { .. } => true,
+        SearchError::ModelLoadFailed { source, .. } => {
+            let mut cause: &(dyn std::error::Error + 'static) = source.as_ref();
+            // Error implementations can expose arbitrary chains. Keep diagnosis bounded.
+            for _ in 0..8 {
+                if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+                    return matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    );
+                }
+                let Some(source) = cause.source() else {
+                    return false;
+                };
+                cause = source;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+#[cfg(all(test, feature = "semantic-loaders"))]
+thread_local! {
+    static QUALITY_COMPLETION_LOAD_FAILURE: std::cell::Cell<Option<fn() -> SearchError>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, feature = "semantic-loaders"))]
+pub(super) fn set_quality_completion_load_failure(
+    failure: Option<fn() -> SearchError>,
+) -> Option<fn() -> SearchError> {
+    QUALITY_COMPLETION_LOAD_FAILURE.with(|slot| slot.replace(failure))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -874,6 +918,78 @@ impl FsfsRuntime {
             DeferredQualityAttempt::ProducerChanged => Err(invalid(
                 "deferred quality producer changed; run a full source reindex to establish new work",
             )),
+            DeferredQualityAttempt::ProducerUnavailable(error) => Err(error),
+        }
+    }
+
+    /// A retry probes the same success-only model slot without allocating another
+    /// candidate. Producer identity and source authority are admitted by completion.
+    #[allow(clippy::future_not_send)]
+    pub(super) async fn prepare_retained_quality_producer(
+        &self,
+        cx: &Cx,
+    ) -> SearchResult<Arc<dyn Embedder>> {
+        let request = self.search_blocking_pool.as_ref().map_or_else(
+            || cx.clone(),
+            |pool| cx.clone().with_blocking_pool_handle(Some(pool.clone())),
+        );
+        let cx = &request;
+        retained_search_checkpoint(cx)?;
+        // Watch retry probes also enter the ordinary memory/CPU/I/O gate; they
+        // have no surrounding completion batch to provide that admission.
+        let mut control = IndexRunControl::new(&self.config)?;
+        control
+            .admit_work(cx, "complete_quality.model_load")
+            .await?;
+        #[cfg(all(test, feature = "semantic-loaders"))]
+        if let Some(error) =
+            QUALITY_COMPLETION_LOAD_FAILURE.with(|slot| slot.get().map(|failure| failure()))
+        {
+            return Err(error);
+        }
+        let permit =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.quality_load_gate), cx)
+                .await
+                .map_err(|error| SearchError::Cancelled {
+                    phase: "complete_quality.model_load".to_owned(),
+                    reason: error.to_string(),
+                })?;
+        let embedder = if let Some(embedder) = permit.0.as_ref().map(Arc::clone) {
+            drop(permit);
+            Some(embedder)
+        } else {
+            let initialization = self.start_quality_initialization(cx, permit)?;
+            Self::join_search_worker(cx, initialization).await??
+        };
+        retained_search_checkpoint(cx)?;
+        embedder.ok_or_else(|| SearchError::EmbedderUnavailable {
+            model: self.config.indexing.quality_model.clone(),
+            reason: "the selected deferred quality producer is unavailable".to_owned(),
+        })
+    }
+
+    pub(super) fn quality_completion_loader_can_retry(&self) -> bool {
+        match RegisteredQualityModel::from_name(&self.config.indexing.quality_model) {
+            Some(
+                RegisteredQualityModel::MiniLmOnnx
+                | RegisteredQualityModel::SnowflakeOnnx
+                | RegisteredQualityModel::NomicOnnx,
+            ) => cfg!(any(test, feature = "semantic-loaders")),
+            Some(
+                RegisteredQualityModel::MiniLmNative | RegisteredQualityModel::MultilingualNative,
+            ) => {
+                #[cfg(feature = "rerank")]
+                {
+                    self.native_blocking_pool
+                        .as_ref()
+                        .is_some_and(|pool| !pool.is_shutdown())
+                }
+                #[cfg(not(feature = "rerank"))]
+                {
+                    false
+                }
+            }
+            None => false,
         }
     }
 
@@ -1009,21 +1125,17 @@ impl FsfsRuntime {
         control
             .admit_work(cx, "complete_quality.model_load")
             .await?;
-        let permit =
-            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&candidate.quality_load_gate), cx)
-                .await
-                .map_err(|error| SearchError::Cancelled {
-                    phase: "complete_quality.model_load".to_owned(),
-                    reason: error.to_string(),
-                })?;
-        let embedder = if let Some(embedder) = permit.0.as_ref().map(Arc::clone) {
-            drop(permit);
-            Some(embedder)
-        } else {
-            let initialization = candidate.start_quality_initialization(cx, permit)?;
-            Self::join_search_worker(cx, initialization).await??
-        }
-        .ok_or_else(|| invalid("the deferred quality producer is unavailable"))?;
+        let embedder = match candidate.prepare_retained_quality_producer(cx).await {
+            Ok(embedder) => embedder,
+            Err(error)
+                if candidate.quality_completion_loader_can_retry()
+                    && retryable_quality_producer_error(&error) =>
+            {
+                retained_search_checkpoint(cx)?;
+                return Ok(DeferredQualityAttempt::ProducerUnavailable(error));
+            }
+            Err(error) => return Err(error),
+        };
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
         let admitted =
             candidate.admit_workload_embedder(cx, embedder, super::WorkloadClass::Embed)?;

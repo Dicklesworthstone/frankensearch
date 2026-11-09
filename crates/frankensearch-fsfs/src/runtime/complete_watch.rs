@@ -18,7 +18,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
-use super::deferred_quality::DeferredQualityAttempt;
+use super::deferred_quality::{DeferredQualityAttempt, retryable_quality_producer_error};
 use super::{
     FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsRuntime, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE,
     STORE_OVERLAP_REASON, SourceStamp, canonical_store_root, index_discovery_walker,
@@ -521,6 +521,19 @@ struct SettleWindow {
     observation: Option<SourceObservation>,
 }
 
+#[derive(Debug)]
+enum WatchAttempt {
+    NoChange,
+    Published {
+        observation: Option<SourceObservation>,
+        publication: GenerationPublication,
+    },
+    QualityUnavailable {
+        generation: PublishedGeneration,
+        error: SearchError,
+    },
+}
+
 struct CompleteWatchSession {
     runtime: FsfsRuntime,
     pressure: IndexPressureMonitor,
@@ -533,6 +546,7 @@ struct CompleteWatchSession {
     baseline: Option<SourceObservation>,
     publication: Option<PublishedGeneration>,
     settling: Option<SettleWindow>,
+    quality_retry_at: Option<Instant>,
     last_reconcile: Instant,
     unstable_builds: usize,
 }
@@ -591,6 +605,7 @@ impl CompleteWatchSession {
             baseline: None,
             publication: None,
             settling: None,
+            quality_retry_at: None,
             last_reconcile: Instant::now(),
             unstable_builds: 0,
         })
@@ -774,13 +789,13 @@ impl CompleteWatchSession {
         cx: &Cx,
         force_rebuild: bool,
         pending: Option<&DirtyWindow>,
-    ) -> SearchResult<Option<(Option<SourceObservation>, GenerationPublication)>> {
+    ) -> SearchResult<WatchAttempt> {
         let observed = self.source.observe(cx, &self.runtime.config.discovery)?;
         let touched = pending
             .is_some_and(|hint| touches_observed_files(hint, &observed, self.baseline.as_ref()));
         if !force_rebuild && !touched && self.baseline.as_ref() == Some(&observed) {
             // Excluded-file notifications do not force re-embedding the corpus.
-            return Ok(None);
+            return Ok(WatchAttempt::NoChange);
         }
         // Capture only the read-only authority inputs, not the native watcher
         // handle, whose cross-platform Sync guarantees are not part of this API.
@@ -819,10 +834,20 @@ impl CompleteWatchSession {
                     check_watch_publication(cx, store_root, Some(&generation))
                 })
                 .await?;
-            if let DeferredQualityAttempt::Completed(completed) = completed {
-                // The next tick still owes initial source reconciliation. Do not
-                // attach the observed current tree to older retained source text.
-                return Ok(Some((None, completed.publication)));
+            match completed {
+                DeferredQualityAttempt::Completed(completed) => {
+                    // The next tick still owes initial source reconciliation. Do not
+                    // attach the observed current tree to older retained source text.
+                    return Ok(WatchAttempt::Published {
+                        observation: None,
+                        publication: completed.publication,
+                    });
+                }
+                DeferredQualityAttempt::ProducerUnavailable(error) => {
+                    return Ok(WatchAttempt::QualityUnavailable { generation, error });
+                }
+                DeferredQualityAttempt::MissingBacklog
+                | DeferredQualityAttempt::ProducerChanged => {}
             }
         }
         if !force_rebuild
@@ -842,7 +867,10 @@ impl CompleteWatchSession {
                 )
                 .await?;
             if let Some(publication) = outcome.publication {
-                return Ok(Some((Some(observed), publication)));
+                return Ok(WatchAttempt::Published {
+                    observation: Some(observed),
+                    publication,
+                });
             }
             // Only absent deletions can reach this no-op outcome. Reconcile
             // through the ordinary builder before advancing source authority.
@@ -864,7 +892,20 @@ impl CompleteWatchSession {
             .rebuild_retained_generation_with_precommit(cx, &self.store_root, precommit)
             .await?
             .0;
-        Ok(Some((Some(observed), publication)))
+        Ok(WatchAttempt::Published {
+            observation: Some(observed),
+            publication,
+        })
+    }
+
+    fn postpone_quality_retry(&mut self, now: Instant, error: &SearchError) {
+        self.quality_retry_at = Some(now.max(Instant::now()) + RECONCILE_INTERVAL);
+        tracing::warn!(
+            reason_code = "watch.quality_producer_pending",
+            error_code = error.diagnostic_code(),
+            retry_after_secs = RECONCILE_INTERVAL.as_secs(),
+            "retained quality producer unavailable; preserving pending generation and source reconciliation"
+        );
     }
 
     #[allow(clippy::future_not_send)]
@@ -886,6 +927,27 @@ impl CompleteWatchSession {
             self.probe_settling_source(cx, now)?;
             return Ok(None);
         }
+        if let Some(retry_at) = self.quality_retry_at {
+            if now < retry_at {
+                return Ok(None);
+            }
+            // The first attempt already validated its immutable catalog. Probe
+            // only the model until it can load, rather than copying the whole
+            // generation again on every missing-model retry. Completion still
+            // revalidates all source, queue and producer authority afterward.
+            match self.runtime.prepare_retained_quality_producer(cx).await {
+                Ok(_) => self.quality_retry_at = None,
+                Err(error)
+                    if self.runtime.quality_completion_loader_can_retry()
+                        && retryable_quality_producer_error(&error) =>
+                {
+                    retained_search_checkpoint(cx)?;
+                    self.postpone_quality_retry(now, &error);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let initial = self.baseline.is_none() && self.unstable_builds == 0;
         let periodic = now.saturating_duration_since(self.last_reconcile) >= RECONCILE_INTERVAL;
         let pending = {
@@ -902,7 +964,10 @@ impl CompleteWatchSession {
         self.last_reconcile = now;
         let force_rebuild = initial || pending.as_ref().is_some_and(|window| window.force_rebuild);
         match self.attempt(cx, force_rebuild, pending.as_ref()).await {
-            Ok(Some((observation, publication))) => {
+            Ok(WatchAttempt::Published {
+                observation,
+                publication,
+            }) => {
                 self.baseline = observation;
                 self.publication = Some(match &publication {
                     GenerationPublication::Durable(generation)
@@ -910,10 +975,32 @@ impl CompleteWatchSession {
                         generation.clone()
                     }
                 });
+                self.quality_retry_at = None;
                 self.unstable_builds = 0;
                 Ok(Some(publication))
             }
-            Ok(None) => {
+            Ok(WatchAttempt::QualityUnavailable { generation, error }) => {
+                retained_search_checkpoint(cx)?;
+                check_backend(&self.changes)?;
+                self.source.check()?;
+                check_watch_publication(cx, &self.store_root, Some(&generation))?;
+                // Bind the waiting session to the same selected generation.
+                // A different publisher must not retarget this pending work.
+                self.publication = Some(generation);
+                if let Some(pending) = pending {
+                    let mut changes = lock_changes(&self.changes)?;
+                    changes.record(now.max(Instant::now()), pending.force_rebuild);
+                    for path in &pending.paths {
+                        changes.record_path(path);
+                    }
+                    if let Some(window) = &mut changes.dirty {
+                        window.first = window.first.min(pending.first);
+                    }
+                }
+                self.postpone_quality_retry(now, &error);
+                Ok(None)
+            }
+            Ok(WatchAttempt::NoChange) => {
                 self.unstable_builds = 0;
                 Ok(None)
             }
@@ -938,6 +1025,10 @@ impl FsfsRuntime {
     ///
     /// On restart, an eligible selected quality backlog is completed from its
     /// retained inputs before rebuilding sources, once pressure permits work.
+    /// A missing producer or transient loader I/O leaves that same generation
+    /// pending and probes again on the reconciliation interval. These probes
+    /// allocate no replacement generation until the producer can load. Source
+    /// notifications, cancellation and publication ownership remain observed.
     /// Explicit quality deferral, fast-only policy and `--full-reindex` retain
     /// their normal behavior. Completion leaves the initial source reconciliation
     /// owed; it never claims that older retained text represents the current tree.
@@ -1015,6 +1106,61 @@ mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
     use notify::event::{AccessKind, DataChange, Flag, ModifyKind};
+
+    #[test]
+    fn quality_retry_requires_a_typed_producer_availability_failure() {
+        assert!(retryable_quality_producer_error(
+            &SearchError::ModelNotFound {
+                name: "selected-quality".to_owned(),
+            }
+        ));
+        assert!(retryable_quality_producer_error(
+            &SearchError::EmbedderUnavailable {
+                model: "selected-quality".to_owned(),
+                reason: "not installed".to_owned(),
+            }
+        ));
+        for (kind, retryable) in [
+            (std::io::ErrorKind::NotFound, true),
+            (std::io::ErrorKind::Interrupted, true),
+            (std::io::ErrorKind::WouldBlock, true),
+            (std::io::ErrorKind::TimedOut, true),
+            (std::io::ErrorKind::InvalidData, false),
+            (std::io::ErrorKind::PermissionDenied, false),
+        ] {
+            let error = SearchError::ModelLoadFailed {
+                path: PathBuf::from("quality-model"),
+                source: std::io::Error::from(kind).into(),
+            };
+            assert_eq!(retryable_quality_producer_error(&error), retryable);
+        }
+        for error in [
+            SearchError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            SearchError::EmbeddingFailed {
+                model: "selected-quality".to_owned(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound).into(),
+            },
+            SearchError::ModelLoadFailed {
+                path: PathBuf::from("quality-model"),
+                source: "invalid model execution contract".into(),
+            },
+            SearchError::Cancelled {
+                phase: "quality-initialization".to_owned(),
+                reason: "requested".to_owned(),
+            },
+            SearchError::IndexCorrupted {
+                path: PathBuf::from("retained-generation"),
+                detail: "invalid source catalog".to_owned(),
+            },
+            SearchError::InvalidConfig {
+                field: "embedding.identity".to_owned(),
+                value: String::new(),
+                reason: "producer differs from the retained generation".to_owned(),
+            },
+        ] {
+            assert!(!retryable_quality_producer_error(&error), "{error:?}");
+        }
+    }
 
     #[test]
     fn public_retained_watch_enforces_background_policy_before_registering_or_building() {
@@ -2557,6 +2703,7 @@ mod lifecycle_tests {
         use super::*;
         use crate::config::DegradationOverrideMode;
         use crate::pressure_sensing::PressureSample;
+        use crate::runtime::deferred_quality::set_quality_completion_load_failure;
         use crate::runtime::{
             FSFS_VECTOR_INDEX_FILE, SearchExecutionMode, retained_reuse, set_test_fast_embedder,
             set_test_quality_embedder, test_fast_embedder_override, test_quality_embedder_override,
@@ -2568,6 +2715,7 @@ mod lifecycle_tests {
         // model-quality claim and never substitute a worker/publication path.
         struct Producer {
             identity: EmbeddingIdentityBundleV1,
+            semantic: bool,
             inputs: Mutex<Vec<String>>,
             during_embedding: Mutex<Option<DuringEmbedding>>,
         }
@@ -2576,6 +2724,7 @@ mod lifecycle_tests {
             fn new(id: &str) -> Self {
                 Self {
                     identity: EmbeddingIdentityBundleV1::explicit_test_model(id, 3),
+                    semantic: true,
                     inputs: Mutex::new(Vec::new()),
                     during_embedding: Mutex::new(None),
                 }
@@ -2645,7 +2794,7 @@ mod lifecycle_tests {
             }
 
             fn is_semantic(&self) -> bool {
-                true
+                self.semantic
             }
 
             fn category(&self) -> ModelCategory {
@@ -2656,6 +2805,35 @@ mod lifecycle_tests {
         struct RestoreProviders {
             fast: Option<Arc<dyn Embedder>>,
             quality: Option<Arc<dyn Embedder>>,
+        }
+
+        struct RestoreQualityLoadFailure(Option<fn() -> SearchError>);
+
+        impl Drop for RestoreQualityLoadFailure {
+            fn drop(&mut self) {
+                let _ = set_quality_completion_load_failure(self.0);
+            }
+        }
+
+        fn unavailable_quality_producer() -> SearchError {
+            SearchError::EmbedderUnavailable {
+                model: "watch-resume-quality".to_owned(),
+                reason: "selected producer has not been provisioned".to_owned(),
+            }
+        }
+
+        fn corrupt_quality_producer() -> SearchError {
+            SearchError::ModelLoadFailed {
+                path: PathBuf::from("selected-quality-model"),
+                source: std::io::Error::from(std::io::ErrorKind::InvalidData).into(),
+            }
+        }
+
+        fn busy_quality_producer() -> SearchError {
+            SearchError::ModelLoadFailed {
+                path: PathBuf::from("selected-quality-model"),
+                source: std::io::Error::from(std::io::ErrorKind::WouldBlock).into(),
+            }
         }
 
         impl Drop for RestoreProviders {
@@ -2671,6 +2849,8 @@ mod lifecycle_tests {
                 .build()
                 .unwrap();
             scheduler.block_on(async move {
+                let _restore_load_failure =
+                    RestoreQualityLoadFailure(set_quality_completion_load_failure(None));
                 let _restore = RestoreProviders {
                     fast: test_fast_embedder_override(),
                     quality: test_quality_embedder_override(),
@@ -2729,6 +2909,260 @@ mod lifecycle_tests {
             controlled_notifications(&mut session);
             pressure(&mut session, 0.0);
             session
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn watch_retries_unavailable_quality_without_new_candidates_then_reconciles_sources() {
+            run(|cx, fast, quality| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (runtime, source, root, before) =
+                    pending_generation(&cx, directory.path()).await;
+                let path = source.join("alpha.md");
+                let input = DefaultCanonicalizer::default()
+                    .canonicalize(&fs::read_to_string(&path).unwrap());
+                let catalog = fs::read(before.path().join("catalog.sqlite")).unwrap();
+                fs::write(
+                    &path,
+                    "provisionedlatertoken source changed during downtime",
+                )
+                .unwrap();
+                fast.inputs.lock().unwrap().clear();
+                let mut watching = session(&runtime, &cx, &root);
+                let now = Instant::now();
+                {
+                    let mut changes = lock_changes(&watching.changes).unwrap();
+                    changes.record(now, false);
+                    changes.record_path(&path);
+                }
+                let _ = set_quality_completion_load_failure(Some(unavailable_quality_producer));
+                assert!(matches!(
+                    runtime.complete_retained_quality(&cx, &root, &before).await,
+                    Err(SearchError::EmbedderUnavailable { .. })
+                ));
+                let allocated = candidate_count(&root);
+                assert!(watching.advance(&cx, now).await.unwrap().is_none());
+                let after_first_failure = candidate_count(&root);
+                assert_eq!(after_first_failure, allocated + 1);
+                assert_eq!(watching.publication.as_ref(), Some(&before));
+                assert!(watching.baseline.is_none());
+                assert!(lock_changes(&watching.changes).unwrap().dirty.is_some());
+                let first_retry = watching.quality_retry_at.unwrap();
+                for tick in [now + IDLE_POLL, first_retry - IDLE_POLL] {
+                    assert!(watching.advance(&cx, tick).await.unwrap().is_none());
+                    assert_eq!(watching.quality_retry_at, Some(first_retry));
+                    assert_eq!(candidate_count(&root), after_first_failure);
+                }
+                // A later loader probe can still be transiently unavailable. It
+                // must not copy another catalog or acknowledge source work.
+                let _ = set_quality_completion_load_failure(Some(busy_quality_producer));
+                assert!(watching.advance(&cx, first_retry).await.unwrap().is_none());
+                assert_eq!(candidate_count(&root), after_first_failure);
+                let next_retry = watching.quality_retry_at.unwrap();
+                assert!(next_retry >= first_retry + RECONCILE_INTERVAL);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                assert_eq!(
+                    fs::read(before.path().join("catalog.sqlite")).unwrap(),
+                    catalog
+                );
+                assert_eq!(
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap(),
+                    Some(before.clone())
+                );
+
+                let _ = set_quality_completion_load_failure(None);
+                pressure(&mut watching, 200.0);
+                assert!(watching.advance(&cx, next_retry).await.unwrap().is_none());
+                assert_eq!(candidate_count(&root), after_first_failure);
+                assert_eq!(watching.quality_retry_at, Some(next_retry));
+                pressure(&mut watching, 0.0);
+                let completed = require_durable_publication(
+                    watching.advance(&cx, next_retry).await.unwrap().unwrap(),
+                )
+                .unwrap();
+                assert_ne!(completed, before);
+                assert!(watching.quality_retry_at.is_none());
+                assert!(watching.baseline.is_none());
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                assert_eq!(*quality.inputs.lock().unwrap(), vec![input]);
+                assert_eq!(
+                    FsfsRuntime::read_index_sentinel(completed.path())
+                        .unwrap()
+                        .unwrap()
+                        .command,
+                    "complete-quality"
+                );
+                assert_eq!(
+                    fs::read(before.path().join("catalog.sqlite")).unwrap(),
+                    catalog
+                );
+
+                // No new notification is needed after provisioning. Completion
+                // used old retained text, so source reconciliation is still owed.
+                let current = require_durable_publication(
+                    watching
+                        .advance(&cx, next_retry + IDLE_POLL)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_ne!(current, completed);
+                assert!(watching.baseline.is_some());
+                let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+                assert_eq!(
+                    reader
+                        .search(&cx, "provisionedlatertoken", 5)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
+                    1
+                );
+            });
+        }
+
+        #[test]
+        fn watch_quality_retry_observes_cancellation_and_external_publication() {
+            for cancel in [true, false] {
+                run(|cx, _, _| async move {
+                    let directory = tempfile::tempdir().unwrap();
+                    let (runtime, _, root, before) =
+                        pending_generation(&cx, directory.path()).await;
+                    let mut watching = session(&runtime, &cx, &root);
+                    let _ = set_quality_completion_load_failure(Some(unavailable_quality_producer));
+                    assert!(
+                        watching
+                            .advance(&cx, Instant::now())
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    let tick = watching.quality_retry_at.unwrap() - IDLE_POLL;
+                    let expected = if cancel {
+                        cx.set_cancel_requested(true);
+                        before.clone()
+                    } else {
+                        let mut publisher = runtime.clone();
+                        publisher.config.pressure.degradation_override =
+                            DegradationOverrideMode::ForceEmbedDeferred;
+                        require_durable_publication(
+                            publisher
+                                .rebuild_retained_generation(&cx, &root)
+                                .await
+                                .unwrap(),
+                        )
+                        .unwrap()
+                    };
+                    let allocated = candidate_count(&root);
+                    let error = watching.advance(&cx, tick).await.unwrap_err();
+                    cx.set_cancel_requested(false);
+                    if cancel {
+                        assert!(matches!(error, SearchError::Cancelled { .. }));
+                    } else {
+                        assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                            if field == "complete_generation.watch_selection_changed"));
+                    }
+                    assert_eq!(candidate_count(&root), allocated);
+                    assert_eq!(watching.publication.as_ref(), Some(&before));
+                    assert!(watching.baseline.is_none());
+                    assert_eq!(
+                        CompleteGenerationStore::open(&cx, &root)
+                            .unwrap()
+                            .active(&cx)
+                            .unwrap(),
+                        Some(expected)
+                    );
+                });
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "rerank")]
+        fn watch_quality_retry_stops_when_its_native_pool_shuts_down() {
+            run(|cx, _, _| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut runtime, _, root, before) =
+                    pending_generation(&cx, directory.path()).await;
+                "all-minilm-l6-v2-native".clone_into(&mut runtime.config.indexing.quality_model);
+                let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+                let runtime = runtime.with_native_blocking_pool(pool.handle());
+                let mut watching = session(&runtime, &cx, &root);
+                assert!(watching.runtime.quality_completion_loader_can_retry());
+                let _ = set_quality_completion_load_failure(Some(unavailable_quality_producer));
+                assert!(
+                    watching
+                        .advance(&cx, Instant::now())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let retry_at = watching.quality_retry_at.unwrap();
+                let allocated = candidate_count(&root);
+
+                assert!(pool.shutdown_and_wait(Duration::from_secs(2)));
+                assert!(!watching.runtime.quality_completion_loader_can_retry());
+                assert!(matches!(
+                    watching.advance(&cx, retry_at).await,
+                    Err(SearchError::EmbedderUnavailable { .. })
+                ));
+                assert_eq!(candidate_count(&root), allocated);
+                assert_eq!(watching.quality_retry_at, Some(retry_at));
+                assert_eq!(watching.publication.as_ref(), Some(&before));
+                assert!(watching.baseline.is_none());
+                assert_eq!(
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap(),
+                    Some(before)
+                );
+            });
+        }
+
+        #[test]
+        fn watch_quality_retry_does_not_hide_corrupt_models_or_nonsemantic_admission() {
+            for corrupt_model in [true, false] {
+                run(|cx, _, quality| async move {
+                    let directory = tempfile::tempdir().unwrap();
+                    let (runtime, _, root, before) =
+                        pending_generation(&cx, directory.path()).await;
+                    if corrupt_model {
+                        let _ = set_quality_completion_load_failure(Some(corrupt_quality_producer));
+                    } else {
+                        let rejected = Producer {
+                            identity: quality.identity.clone(),
+                            semantic: false,
+                            inputs: Mutex::new(Vec::new()),
+                            during_embedding: Mutex::new(None),
+                        };
+                        set_test_quality_embedder(Some(Arc::new(rejected)));
+                    }
+                    let mut watching = session(&runtime, &cx, &root);
+                    let error = watching.advance(&cx, Instant::now()).await.unwrap_err();
+                    if corrupt_model {
+                        assert!(matches!(error, SearchError::ModelLoadFailed { .. }));
+                    } else {
+                        assert!(matches!(error, SearchError::EmbedderUnavailable { .. }));
+                    }
+                    assert!(watching.quality_retry_at.is_none());
+                    assert!(watching.publication.is_none());
+                    assert!(watching.baseline.is_none());
+                    assert_eq!(
+                        CompleteGenerationStore::open(&cx, &root)
+                            .unwrap()
+                            .active(&cx)
+                            .unwrap(),
+                        Some(before)
+                    );
+                });
+            }
         }
 
         #[test]
