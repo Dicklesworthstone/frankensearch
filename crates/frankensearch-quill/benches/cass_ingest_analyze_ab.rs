@@ -33,9 +33,26 @@
 //! `QUILL_INGEST_PROFILE_SECS=n` instead records `perf` (Linux, `sudo -n`)
 //! over the full shipping `index_schema_documents` route on a one-thread pool.
 //!
+//! `QUILL_REBUILD_DOCS=n` instead runs a production-cadence CASS rebuild: `n`
+//! documents generated on their own threads and streamed into a durable
+//! CASS-config index under `QUILL_REBUILD_DIR` (put it on a normal disk),
+//! committing every `QUILL_REBUILD_COMMIT_EVERY` documents, then the fold:
+//! CASS's capped run plan (`QUILL_REBUILD_FOLD_CAP` output bytes) folded by
+//! serial `concat_merge`. Before the fold, the term merge of the first
+//! `QUILL_FOLD_TERM_AB_RUNS` runs is A/B'd (`fold-term-ab`: the incumbent vs
+//! the shipping `merge_concat_terms` over the same opened sources, output
+//! digests equal on every timed merge, `QUILL_FOLD_TERM_AB_ROUNDS` paired
+//! rounds per cell). `QUILL_REBUILD_PERF_DIR` records `perf` per phase.
+//!
 //! ```bash
 //! CARGO_PROFILE_RELEASE_LTO=false \
 //!   CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 QUILL_INGEST_ROUNDS=15 QUILL_INGEST_FANOUT=8 \
+//!   RCH_REQUIRE_REMOTE=1 rch exec -- \
+//!   cargo bench --locked -p frankensearch-quill --features bench-internals \
+//!     --profile release --bench cass_ingest_analyze_ab
+//!
+//! QUILL_REBUILD_DOCS=1048576 QUILL_REBUILD_COMMIT_EVERY=262144 \
+//!   QUILL_REBUILD_WRITER_THREADS=8 QUILL_REBUILD_GEN_THREADS=4 QUILL_REBUILD_DIR=/data/tmp/quill \
 //!   RCH_REQUIRE_REMOTE=1 rch exec -- \
 //!   cargo bench --locked -p frankensearch-quill --features bench-internals \
 //!     --profile release --bench cass_ingest_analyze_ab
@@ -50,6 +67,7 @@ use asupersync::Cx;
 use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio, print_bench_elf_sha256};
 use frankensearch_quill::cass::CassDocument;
 use frankensearch_quill::config::DEFAULT_SCRIBE_SHARD_BUDGET_BYTES;
+use frankensearch_quill::keeper::BenchConcatTermMerge;
 use frankensearch_quill::schema::CASS_SEMANTIC_SCHEMA;
 use frankensearch_quill::scribe::{
     ColumnarAccumulator, DOC_ORDS_PER_LEASE, FlushDocumentInput, FlushMode, FlushSegmentInput,
@@ -58,7 +76,7 @@ use frankensearch_quill::scribe::{
 };
 use frankensearch_quill::segment::SegmentReader;
 use frankensearch_quill::{
-    CURRENT_ENGINE_VERSION, EncodedSegment, QuillConfig, QuillIndex, SchemaDocument,
+    CURRENT_ENGINE_VERSION, EncodedSegment, KeeperSnapshot, QuillConfig, QuillIndex, SchemaDocument,
 };
 use rayon::prelude::*;
 use xxhash_rust::xxh3::xxh3_64;
@@ -904,8 +922,410 @@ fn profile(label: &str, seconds: f64, mut work: impl FnMut()) {
     }
 }
 
+/// Start `perf record` (Linux, `sudo -n`) over this process for rebuild
+/// phase `label`, when `dir` is set and `QUILL_REBUILD_PERF_PHASES` (default
+/// `ingest,fold`) names the phase.
+fn rebuild_perf_start(dir: &str, label: &str) -> Option<(std::process::Child, String)> {
+    let phases =
+        std::env::var("QUILL_REBUILD_PERF_PHASES").unwrap_or_else(|_| "ingest,fold".into());
+    if dir.is_empty() || !phases.split(',').any(|phase| phase == label) {
+        return None;
+    }
+    let path = format!("{dir}/rebuild-{label}.perf");
+    let pid = std::process::id().to_string();
+    let child = std::process::Command::new("sudo")
+        .args(["-n", "perf", "record", "-F", "999", "-p", &pid, "-o", &path])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn perf record");
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    Some((child, path))
+}
+
+fn rebuild_perf_report(path: &str, extra: &[&str], title: &str) {
+    let mut args = vec![
+        "-n",
+        "perf",
+        "report",
+        "-i",
+        path,
+        "--stdio",
+        "--no-children",
+    ];
+    args.extend_from_slice(extra);
+    let report = std::process::Command::new("sudo")
+        .args(&args)
+        .output()
+        .expect("perf report");
+    let text = String::from_utf8_lossy(&report.stdout);
+    eprintln!("=== perf report {title}");
+    for line in text
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .take(70)
+    {
+        let trimmed = line.trim_end();
+        eprintln!("{}", &trimmed[..trimmed.len().min(230)]);
+    }
+}
+
+/// Stop `perf` and print self time by thread name, by symbol over every
+/// thread, and by symbol on the driving (async writer) thread alone.
+fn rebuild_perf_finish(perf: Option<(std::process::Child, String)>, label: &str) {
+    let Some((mut child, path)) = perf else {
+        return;
+    };
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "kill", "-INT", &child.id().to_string()])
+        .status();
+    let _ = child.wait();
+    let pid = std::process::id().to_string();
+    rebuild_perf_report(
+        &path,
+        &["--sort", "comm", "--percent-limit", "0.5"],
+        &format!("{label} by comm"),
+    );
+    rebuild_perf_report(
+        &path,
+        &["--sort", "symbol", "--percent-limit", "0.4"],
+        &format!("{label} all threads"),
+    );
+    rebuild_perf_report(
+        &path,
+        &[
+            "--tid",
+            &pid,
+            "--percentage",
+            "relative",
+            "--sort",
+            "symbol",
+            "--percent-limit",
+            "0.4",
+        ],
+        &format!("{label} writer thread"),
+    );
+}
+
+/// The fold's term-merge A/B on one planned run of the live index: the
+/// incumbent and the shipping `merge_concat_terms` over the same opened
+/// sources (opening is not timed), output digests asserted equal on every
+/// timed merge, as an A/A incumbent null and the lever ratio
+/// `candidate / incumbent` from paired rounds whose order alternates.
+fn fold_term_merge_ab(snapshot: &KeeperSnapshot, run: &[u64], position: usize, rounds: usize) {
+    let opened = BenchConcatTermMerge::open(snapshot, run).expect("open the run's sources");
+    let expected = opened.merge(true).expect("incumbent term merge");
+    assert_eq!(
+        opened.merge(false).expect("candidate term merge"),
+        expected,
+        "term merge parity (merged terms, xxh3 of sections and rows)"
+    );
+    let wall = RefCell::new(Vec::new());
+    let timed = |incumbent: bool| {
+        let started = Instant::now();
+        let output = opened.merge(black_box(incumbent)).expect("term merge");
+        wall.borrow_mut()
+            .push((incumbent, started.elapsed().as_secs_f64()));
+        assert_eq!(output, expected, "incumbent={incumbent} term merge output");
+    };
+    let null = paired_median_ratio(rounds, 1, || timed(true), || timed(true));
+    let lever = paired_median_ratio(rounds, 1, || timed(true), || timed(false));
+    let seconds = |incumbent: bool| {
+        let mut values: Vec<f64> = wall
+            .borrow()
+            .iter()
+            .filter(|(which, _)| *which == incumbent)
+            .map(|(_, s)| *s)
+            .collect();
+        values.sort_unstable_by(f64::total_cmp);
+        values
+    };
+    let (incumbent_s, candidate_s) = (seconds(true), seconds(false));
+    let source_terms = opened.source_terms();
+    let per_term = |values: &[f64]| values[values.len() / 2] * 1e9 / source_terms as f64;
+    let (rss, hwm) = rss_kib();
+    eprintln!(
+        "[fold-term-ab] run={position} sources={} source_terms={source_terms} merged_terms={} \
+         digest={:016x} rounds={rounds} {} {} decidable={} \
+         incumbent_s p50={:.4} [{:.4}, {:.4}] n={} ({:.1} ns/source term) \
+         candidate_s p50={:.4} [{:.4}, {:.4}] n={} ({:.1} ns/source term) \
+         rss_kib={rss} hwm_kib={hwm}",
+        run.len(),
+        expected.0,
+        expected.1,
+        describe("null", &null),
+        describe("lever(candidate/incumbent)", &lever),
+        lever.decidable_against(&null),
+        incumbent_s[incumbent_s.len() / 2],
+        incumbent_s[0],
+        incumbent_s[incumbent_s.len() - 1],
+        incumbent_s.len(),
+        per_term(&incumbent_s),
+        candidate_s[candidate_s.len() / 2],
+        candidate_s[0],
+        candidate_s[candidate_s.len() - 1],
+        candidate_s.len(),
+        per_term(&candidate_s),
+    );
+}
+
+/// Production-cadence rebuild: stream `total` CASS documents through a
+/// durable CASS-config index in `batch`-document `index_schema_documents`
+/// calls, commit every `QUILL_REBUILD_COMMIT_EVERY` documents, then fold the
+/// published segments with CASS's capped serial concat-merge plan. Before
+/// each of the first `QUILL_FOLD_TERM_AB_RUNS` runs is folded, its term merge
+/// is A/B'd (`QUILL_FOLD_TERM_AB_ROUNDS` paired rounds).
+#[allow(clippy::too_many_lines)]
+fn rebuild(total: usize, shards: usize, batch: usize) {
+    let commit_every: usize = env_or("QUILL_REBUILD_COMMIT_EVERY", 500_000);
+    let chunk_docs: usize = env_or("QUILL_REBUILD_CHUNK", 65_536);
+    let gen_threads: usize = env_or("QUILL_REBUILD_GEN_THREADS", 8);
+    let writer_threads: usize = env_or("QUILL_REBUILD_WRITER_THREADS", 16);
+    let fold_cap: u64 = env_or("QUILL_REBUILD_FOLD_CAP", 1_u64 << 30);
+    let do_fold: usize = env_or("QUILL_REBUILD_FOLD", 1);
+    let ab_runs: usize = env_or("QUILL_FOLD_TERM_AB_RUNS", 1);
+    let ab_rounds: usize = env_or("QUILL_FOLD_TERM_AB_ROUNDS", 10);
+    let budget: usize = env_or("QUILL_REBUILD_BUDGET", DEFAULT_SCRIBE_SHARD_BUDGET_BYTES);
+    let perf_dir = std::env::var("QUILL_REBUILD_PERF_DIR").unwrap_or_default();
+    if !perf_dir.is_empty() {
+        std::fs::create_dir_all(&perf_dir).expect("perf dir");
+    }
+    let root = std::env::var("QUILL_REBUILD_DIR")
+        .map_or_else(
+            |_| tempfile::tempdir(),
+            |parent| {
+                std::fs::create_dir_all(&parent).expect("rebuild parent");
+                tempfile::tempdir_in(parent)
+            },
+        )
+        .expect("rebuild root");
+    eprintln!(
+        "[rebuild] total={total} batch={batch} shards={shards} commit_every={commit_every} \
+         writer_threads={writer_threads} gen_threads={gen_threads} budget={budget} \
+         fold_cap={fold_cap} root={}",
+        root.path().display()
+    );
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(writer_threads)
+        .thread_name(|index| format!("qw-{index}"))
+        .build_global()
+        .expect("global writer pool");
+    let chunks = total.div_ceil(chunk_docs);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<SchemaDocument>>(3);
+    let generator = std::thread::Builder::new()
+        .name("gen-main".to_owned())
+        .spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(gen_threads)
+                .thread_name(|index| format!("gen-{index}"))
+                .build()
+                .expect("generator pool");
+            for chunk in 0..chunks {
+                let docs = (total - chunk * chunk_docs).min(chunk_docs);
+                let part_docs = 4_096;
+                let projected: Vec<SchemaDocument> = pool.install(|| {
+                    (0..docs.div_ceil(part_docs))
+                        .into_par_iter()
+                        .flat_map_iter(|part| {
+                            let count = (docs - part * part_docs).min(part_docs);
+                            let seed = 0x5ea1_ca55_0019_u64
+                                ^ (u64::try_from(chunk).expect("chunk") << 24)
+                                ^ u64::try_from(part).expect("part").wrapping_mul(0x9e37_79b9);
+                            corpus(count, seed)
+                                .iter()
+                                .map(CassDocument::to_schema_document)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect()
+                });
+                if sender.send(projected).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("generator thread");
+    let cx = Cx::for_testing();
+    let config = QuillConfig {
+        scribe_shard_budget_bytes: budget,
+        ..config(shards)
+    };
+    drive(async {
+        let index = QuillIndex::create_with_schema(
+            &cx,
+            root.path().join("index"),
+            CASS_SEMANTIC_SCHEMA,
+            config,
+        )
+        .await
+        .expect("durable CASS index");
+        let perf = rebuild_perf_start(&perf_dir, "ingest");
+        let wall = Instant::now();
+        let (mut ingest_s, mut commit_s, mut wait_s) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut since_commit = 0_usize;
+        let mut ingested = 0_usize;
+        let mut commit_count = 0_usize;
+        loop {
+            let waited = Instant::now();
+            let Ok(chunk) = receiver.recv() else {
+                break;
+            };
+            wait_s += waited.elapsed().as_secs_f64();
+            for slice in chunk.chunks(batch) {
+                let started = Instant::now();
+                index
+                    .index_schema_documents(&cx, slice)
+                    .await
+                    .expect("ingest");
+                ingest_s += started.elapsed().as_secs_f64();
+                since_commit += slice.len();
+                ingested += slice.len();
+                if since_commit >= commit_every {
+                    let started = Instant::now();
+                    let snapshot = index.commit(&cx).await.expect("commit");
+                    let took = started.elapsed().as_secs_f64();
+                    commit_s += took;
+                    commit_count += 1;
+                    since_commit = 0;
+                    let (rss, hwm) = rss_kib();
+                    eprintln!(
+                        "[commit] n={commit_count} docs={ingested} segments={} commit_ms={:.1} \
+                         ingest_s={ingest_s:.2} commit_s={commit_s:.2} wait_s={wait_s:.2} \
+                         wall_s={:.2} rss_kib={rss} hwm_kib={hwm}",
+                        snapshot.segments().len(),
+                        took * 1e3,
+                        wall.elapsed().as_secs_f64(),
+                    );
+                }
+            }
+        }
+        let started = Instant::now();
+        let snapshot = index.commit(&cx).await.expect("final commit");
+        let took = started.elapsed().as_secs_f64();
+        commit_s += took;
+        commit_count += 1;
+        let segments = snapshot.segments().len();
+        let bytes: u64 = snapshot
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().file_len)
+            .sum();
+        let (rss, hwm) = rss_kib();
+        eprintln!(
+            "[ingest-done] docs={ingested} commits={commit_count} segments={segments} \
+             index_bytes={bytes} final_commit_ms={:.1} ingest_s={ingest_s:.2} \
+             commit_s={commit_s:.2} wait_s={wait_s:.2} wall_s={:.2} docs_per_s={:.0} \
+             rss_kib={rss} hwm_kib={hwm}",
+            took * 1e3,
+            wall.elapsed().as_secs_f64(),
+            ingested as f64 / wall.elapsed().as_secs_f64(),
+        );
+        rebuild_perf_finish(perf, "ingest");
+        generator.join().expect("generator");
+        if do_fold == 0 {
+            return;
+        }
+        // CASS's capped fold plan (quill_bridge::plan_capped_merge_runs).
+        let max_docs = 1_u64 << 22;
+        let hull = 128_u64;
+        let mut runs: Vec<Vec<u64>> = Vec::new();
+        let mut current: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
+        let (mut cur_bytes, mut cur_docs, mut cur_lo, mut cur_hi) = (0_u64, 0_u64, 0_u64, 0_u64);
+        let fits = |bytes: u64, docs: u64, lo: u64, hi: u64| {
+            bytes.saturating_add(hi.saturating_sub(lo).saturating_mul(hull)) <= fold_cap
+                && docs <= max_docs
+        };
+        for segment in snapshot.segments() {
+            let m = segment.manifest();
+            let s = (
+                m.segment_id,
+                m.file_len,
+                m.docid_lo,
+                m.docid_hi,
+                u64::from(m.doc_count),
+            );
+            if !current.is_empty() {
+                let nb = cur_bytes + s.1;
+                let nd = cur_docs + s.4;
+                let nlo = cur_lo.min(s.2);
+                let nhi = cur_hi.max(s.3);
+                if fits(nb, nd, nlo, nhi) {
+                    current.push(s);
+                    (cur_bytes, cur_docs, cur_lo, cur_hi) = (nb, nd, nlo, nhi);
+                    continue;
+                }
+                if current.len() >= 2 {
+                    runs.push(current.iter().map(|s| s.0).collect());
+                }
+                current.clear();
+            }
+            if !fits(s.1, s.4, s.2, s.3) {
+                continue;
+            }
+            current.push(s);
+            (cur_bytes, cur_docs, cur_lo, cur_hi) = (s.1, s.4, s.2, s.3);
+        }
+        if current.len() >= 2 {
+            runs.push(current.iter().map(|s| s.0).collect());
+        }
+        let mut used: std::collections::BTreeSet<u64> = snapshot
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().segment_id)
+            .collect();
+        eprintln!(
+            "[fold-plan] runs={} sources={}",
+            runs.len(),
+            runs.iter().map(Vec::len).sum::<usize>()
+        );
+        // The runs are disjoint, so each one's term merge is measured on the
+        // published leaves before any fold.
+        if ab_rounds > 0 {
+            for (position, run) in runs.iter().enumerate().take(ab_runs) {
+                fold_term_merge_ab(&snapshot, run, position, ab_rounds);
+            }
+        }
+        let perf = rebuild_perf_start(&perf_dir, "fold");
+        let fold_started = Instant::now();
+        for (position, run) in runs.iter().enumerate() {
+            let mut output = 0x1900_0000_0000_0000_u64 + u64::try_from(position).expect("pos");
+            while used.contains(&output) {
+                output += 1 << 32;
+            }
+            used.insert(output);
+            let started = Instant::now();
+            let after = index
+                .concat_merge(&cx, run, output, 1_800_000_000)
+                .await
+                .expect("concat merge");
+            let (rss, hwm) = rss_kib();
+            eprintln!(
+                "[fold-run] k={position} sources={} took_s={:.2} segments_after={} rss_kib={rss} \
+                 hwm_kib={hwm}",
+                run.len(),
+                started.elapsed().as_secs_f64(),
+                after.segments().len()
+            );
+        }
+        eprintln!(
+            "[fold-done] runs={} fold_s={:.2}",
+            runs.len(),
+            fold_started.elapsed().as_secs_f64()
+        );
+        rebuild_perf_finish(perf, "fold");
+    });
+}
+
 fn main() {
     let _ = print_bench_elf_sha256();
+    let rebuild_docs: usize = env_or("QUILL_REBUILD_DOCS", 0);
+    if rebuild_docs > 0 {
+        eprintln!("[harness] {}", host_line());
+        rebuild(
+            rebuild_docs,
+            env_or("QUILL_INGEST_SHARDS", 32),
+            env_or("QUILL_INGEST_BATCH", 6_400),
+        );
+        return;
+    }
     let docs: usize = env_or("QUILL_INGEST_DOCS", 65_536);
     let rounds: usize = env_or("QUILL_INGEST_ROUNDS", 15);
     let fanout: usize = env_or("QUILL_INGEST_FANOUT", 8);

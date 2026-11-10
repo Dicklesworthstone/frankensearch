@@ -7462,6 +7462,8 @@ fn compaction_source_validation(error: &ConcatMergeError) -> CompactionError {
     }
 }
 
+/// The incumbent term merge's heap entry, kept for the same-binary A/B.
+#[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug, Eq, PartialEq)]
 struct ConcatTermHeapItem {
     field_ord: u16,
@@ -7470,6 +7472,7 @@ struct ConcatTermHeapItem {
     term_index: usize,
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 impl Ord for ConcatTermHeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
         other
@@ -7481,6 +7484,7 @@ impl Ord for ConcatTermHeapItem {
     }
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 impl PartialOrd for ConcatTermHeapItem {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -7494,7 +7498,70 @@ struct MergedTermRow {
     metadata: TermMetadata,
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 type MergedTermSections = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<MergedTermRow>);
+
+/// One source's next term in [`merge_concat_terms`]'s heap. The term bytes
+/// are borrowed from the source's decoded dictionary, so a heap entry costs
+/// no allocation or copy.
+#[derive(Debug, Eq, PartialEq)]
+struct ConcatTermCursor<'s> {
+    /// [`concat_term_prefix`] of `(field_ord, term)`.
+    prefix: u64,
+    field_ord: u16,
+    term: &'s [u8],
+    source_index: usize,
+    term_index: usize,
+}
+
+impl Ord for ConcatTermCursor<'_> {
+    /// Reversed, so the max-heap pops the least `(field_ord, term,
+    /// source_index, term_index)` first. Comparing `prefix` first keeps that
+    /// order (see [`concat_term_prefix`]) and settles most comparisons with
+    /// one integer compare.
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .prefix
+            .cmp(&self.prefix)
+            .then_with(|| other.field_ord.cmp(&self.field_ord))
+            .then_with(|| other.term.cmp(self.term))
+            .then_with(|| other.source_index.cmp(&self.source_index))
+            .then_with(|| other.term_index.cmp(&self.term_index))
+    }
+}
+
+impl PartialOrd for ConcatTermCursor<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The first eight bytes of the composite key `field_ord` (big-endian) `++
+/// term`, zero padded, as a big-endian integer.
+///
+/// The composite key orders exactly as `(field_ord, term)`, and this prefix
+/// never orders two keys against it: if `a < b` then either `a` is a prefix
+/// of `b` (its padding zeros sort at or below `b`'s bytes) or they first
+/// differ at some byte, which this prefix either holds or truncates away. So
+/// `prefix(a) <= prefix(b)`, and only equal prefixes need the full key.
+fn concat_term_prefix(field_ord: u16, term: &[u8]) -> u64 {
+    let mut key = [0_u8; 8];
+    key[..2].copy_from_slice(&field_ord.to_be_bytes());
+    let take = term.len().min(key.len() - 2);
+    key[2..2 + take].copy_from_slice(&term[..take]);
+    u64::from_be_bytes(key)
+}
+
+/// One merged term of [`merge_concat_terms`]; the term bytes are borrowed
+/// from the first source dictionary that holds the term.
+#[derive(Debug)]
+struct ConcatTermRow<'s> {
+    field_ord: u16,
+    term: &'s [u8],
+    metadata: TermMetadata,
+}
+
+type ConcatTermSections<'s> = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<ConcatTermRow<'s>>);
 
 #[derive(Clone, Copy, Debug)]
 struct IdentityRepresentative {
@@ -7923,7 +7990,7 @@ fn encode_concat_merge(
             count: merged_terms.len(),
         })?;
     for term in &merged_terms {
-        term_inputs.push(TermInput::new(term.field_ord, &term.term, term.metadata));
+        term_inputs.push(TermInput::new(term.field_ord, term.term, term.metadata));
     }
     let termdict = EncodedTermDictionary::encode_sorted(
         schema,
@@ -8316,7 +8383,10 @@ fn open_concat_source<'a>(
     })
 }
 
-fn merge_concat_terms(
+/// The term merge before [`merge_concat_terms`], kept for the same-binary
+/// A/B and the parity tests: every merged and source term allocates.
+#[cfg(any(test, feature = "bench-internals"))]
+fn merge_concat_terms_incumbent(
     sources: &[ConcatSource<'_>],
     has_positions: bool,
 ) -> Result<MergedTermSections, ConcatMergeError> {
@@ -8580,6 +8650,7 @@ fn merge_concat_terms(
     ))
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn push_concat_term(
     heap: &mut BinaryHeap<ConcatTermHeapItem>,
     source: &ConcatSource<'_>,
@@ -8603,6 +8674,439 @@ fn push_concat_term(
         term_index,
     });
     Ok(())
+}
+
+/// Merge every source dictionary's terms in `(field_ord, term)` order,
+/// concatenating each term's POSTINGS, BLOCKMAX and POSITIONS streams from
+/// the sources that hold it, in source order.
+///
+/// Every merged term goes through the same source validation and codec
+/// calls, in the same order, as before; what changed is only where the
+/// per-term working storage lives. Heap entries and merged rows borrow their
+/// term bytes from the source dictionaries, the per-term source lists are
+/// reused from term to term, and the reference slices the codecs take are
+/// built on the stack for terms held by few sources (most terms are held by
+/// one), so a term no longer pays a dozen allocations around the work.
+fn merge_concat_terms<'s>(
+    sources: &'s [ConcatSource<'_>],
+    has_positions: bool,
+) -> Result<ConcatTermSections<'s>, ConcatMergeError> {
+    let mut heap = BinaryHeap::new();
+    heap.try_reserve(sources.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "term merge heap",
+            count: sources.len(),
+        })?;
+    for (source_index, source) in sources.iter().enumerate() {
+        push_concat_term_cursor(&mut heap, source, source_index, 0);
+    }
+    let mut postings_output = Vec::new();
+    let mut positions_output = Vec::new();
+    let mut blockmax_output = Vec::new();
+    let total_terms = sources.iter().try_fold(0_usize, |count, source| {
+        count
+            .checked_add(source.terms.len())
+            .ok_or(ConcatMergeError::ArithmeticOverflow {
+                field: "source term count sum",
+            })
+    })?;
+    let mut merged_terms = Vec::new();
+    merged_terms
+        .try_reserve(total_terms)
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "merged term rows",
+            count: total_terms,
+        })?;
+
+    // Cleared and refilled for every merged term; each reservation below is
+    // a no-op once the list has grown to the largest term's source count.
+    let mut parts = Vec::new();
+    let mut posting_slices = Vec::new();
+    let mut posting_lists = Vec::new();
+    let mut blockmax_lists = Vec::new();
+    while let Some(first) = heap.pop() {
+        let ConcatTermCursor {
+            prefix,
+            field_ord,
+            term,
+            ..
+        } = first;
+        parts.clear();
+        parts
+            .try_reserve_exact(sources.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "equal-term source rows",
+                count: sources.len(),
+            })?;
+        parts.push((first.source_index, first.term_index));
+        push_concat_term_cursor(
+            &mut heap,
+            &sources[first.source_index],
+            first.source_index,
+            first.term_index + 1,
+        );
+        while heap.peek().is_some_and(|next| {
+            next.prefix == prefix && next.field_ord == field_ord && next.term == term
+        }) {
+            let next = heap.pop().expect("peeked concat term remains present");
+            parts.push((next.source_index, next.term_index));
+            push_concat_term_cursor(
+                &mut heap,
+                &sources[next.source_index],
+                next.source_index,
+                next.term_index + 1,
+            );
+        }
+        parts.sort_unstable_by_key(|(source_index, _)| *source_index);
+
+        posting_slices.clear();
+        posting_slices.try_reserve_exact(parts.len()).map_err(|_| {
+            ConcatMergeError::Allocation {
+                resource: "term POSTINGS slices",
+                count: parts.len(),
+            }
+        })?;
+        for &(source_index, term_index) in &parts {
+            let source = &sources[source_index];
+            let metadata = source.terms[term_index].metadata;
+            posting_slices.push(concat_span(
+                source.postings,
+                metadata.postings,
+                SectionKind::POSTINGS,
+            )?);
+        }
+        posting_lists.clear();
+        posting_lists
+            .try_reserve_exact(parts.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "source POSTINGS views",
+                count: parts.len(),
+            })?;
+        for (&bytes, &(source_index, term_index)) in posting_slices.iter().zip(&parts) {
+            posting_lists.push(
+                PostingList::parse(
+                    bytes,
+                    sources[source_index].terms[term_index].metadata.doc_freq,
+                )
+                .map_err(|error| concat_codec(SectionKind::POSTINGS, error))?,
+            );
+        }
+        let merged_postings = with_concat_refs(&posting_lists, "POSTINGS references", |refs| {
+            EncodedPostingList::concatenate(refs)
+                .map_err(|error| concat_codec(SectionKind::POSTINGS, error))
+        })?;
+        let doc_freq = merged_postings.doc_freq();
+
+        blockmax_lists.clear();
+        blockmax_lists.try_reserve_exact(parts.len()).map_err(|_| {
+            ConcatMergeError::Allocation {
+                resource: "source BLOCKMAX views",
+                count: parts.len(),
+            }
+        })?;
+        for ((source_index, term_index), postings) in parts.iter().copied().zip(&posting_lists) {
+            let source = &sources[source_index];
+            let bytes = concat_span(
+                source.blockmax,
+                source.terms[term_index].metadata.blockmax,
+                SectionKind::BLOCKMAX,
+            )?;
+            blockmax_lists.push(
+                BlockMaxConcatList::parse(bytes, postings)
+                    .map_err(|error| concat_codec(SectionKind::BLOCKMAX, error))?,
+            );
+        }
+        let merged_blockmax = with_concat_refs(&blockmax_lists, "BLOCKMAX references", |refs| {
+            EncodedBlockMax::concatenate(refs)
+                .map_err(|error| concat_codec(SectionKind::BLOCKMAX, error))
+        })?;
+
+        let has_term_positions = sources[parts[0].0].terms[parts[0].1]
+            .metadata
+            .positions
+            .is_some();
+        let merged_positions = if has_term_positions {
+            // The `index`th source's POSITIONS view of this term.
+            let parse_positions = |index: usize| {
+                let (source_index, term_index) = parts[index];
+                let source = &sources[source_index];
+                let span = source.terms[term_index].metadata.positions.ok_or_else(|| {
+                    ConcatMergeError::SectionCodec {
+                        section: SectionKind::POSITIONS,
+                        detail: format!(
+                            "field {field_ord} term {:?} has inconsistent positional metadata",
+                            String::from_utf8_lossy(term)
+                        ),
+                    }
+                })?;
+                let bytes = concat_span(
+                    source.positions.ok_or_else(|| {
+                        concat_missing_section(source.segment, SectionKind::POSITIONS)
+                    })?,
+                    span,
+                    SectionKind::POSITIONS,
+                )?;
+                PositionList::parse(bytes, &posting_lists[index])
+                    .map_err(|error| concat_codec(SectionKind::POSITIONS, error))
+            };
+            let merged = if parts.len() == 1 {
+                EncodedPositionList::concatenate(&[&parse_positions(0)?])
+            } else {
+                let mut position_lists = Vec::new();
+                position_lists.try_reserve_exact(parts.len()).map_err(|_| {
+                    ConcatMergeError::Allocation {
+                        resource: "source POSITIONS views",
+                        count: parts.len(),
+                    }
+                })?;
+                for index in 0..parts.len() {
+                    position_lists.push(parse_positions(index)?);
+                }
+                with_concat_refs(&position_lists, "POSITIONS references", |refs| {
+                    Ok(EncodedPositionList::concatenate(refs))
+                })?
+            };
+            Some(merged.map_err(|error| concat_codec(SectionKind::POSITIONS, error))?)
+        } else {
+            for &(source_index, term_index) in &parts {
+                if sources[source_index].terms[term_index]
+                    .metadata
+                    .positions
+                    .is_some()
+                {
+                    return Err(ConcatMergeError::SectionCodec {
+                        section: SectionKind::POSITIONS,
+                        detail: "equal term has inconsistent positional metadata".to_owned(),
+                    });
+                }
+            }
+            None
+        };
+        if has_term_positions && !has_positions {
+            return Err(ConcatMergeError::SectionCodec {
+                section: SectionKind::POSITIONS,
+                detail: "term carries positions but schema has no POSITIONS section".to_owned(),
+            });
+        }
+
+        let postings_offset = durable_concat_len(&postings_output, "POSTINGS offset")?;
+        append_concat_bytes(
+            &mut postings_output,
+            merged_postings.as_bytes(),
+            "POSTINGS output",
+        )?;
+        let blockmax_offset = durable_concat_len(&blockmax_output, "BLOCKMAX offset")?;
+        append_concat_bytes(
+            &mut blockmax_output,
+            merged_blockmax.as_bytes(),
+            "BLOCKMAX output",
+        )?;
+        let positions_span = if let Some(merged_positions) = merged_positions {
+            let offset = durable_concat_len(&positions_output, "POSITIONS offset")?;
+            let len = durable_concat_len(merged_positions.as_bytes(), "term POSITIONS length")?;
+            append_concat_bytes(
+                &mut positions_output,
+                merged_positions.as_bytes(),
+                "POSITIONS output",
+            )?;
+            Some(ByteSpan::new(offset, len))
+        } else {
+            None
+        };
+        let postings_len = durable_concat_len(merged_postings.as_bytes(), "term POSTINGS length")?;
+        let blockmax_len = durable_concat_len(merged_blockmax.as_bytes(), "term BLOCKMAX length")?;
+        let metadata = positions_span.map_or_else(
+            || {
+                TermMetadata::without_positions(
+                    doc_freq,
+                    ByteSpan::new(postings_offset, postings_len),
+                    ByteSpan::new(blockmax_offset, blockmax_len),
+                )
+            },
+            |positions_span| {
+                TermMetadata::with_positions(
+                    doc_freq,
+                    ByteSpan::new(postings_offset, postings_len),
+                    positions_span,
+                    ByteSpan::new(blockmax_offset, blockmax_len),
+                )
+            },
+        );
+        merged_terms.push(ConcatTermRow {
+            field_ord,
+            term,
+            metadata,
+        });
+    }
+    Ok((
+        postings_output,
+        positions_output,
+        blockmax_output,
+        merged_terms,
+    ))
+}
+
+/// Push `source`'s term `term_index`, if it has one, as a heap cursor.
+fn push_concat_term_cursor<'s>(
+    heap: &mut BinaryHeap<ConcatTermCursor<'s>>,
+    source: &'s ConcatSource<'_>,
+    source_index: usize,
+    term_index: usize,
+) {
+    if let Some(term) = source.terms.get(term_index) {
+        heap.push(ConcatTermCursor {
+            prefix: concat_term_prefix(term.field_ord, &term.term),
+            field_ord: term.field_ord,
+            term: &term.term,
+            source_index,
+            term_index,
+        });
+    }
+}
+
+/// Most source terms a merged term's codec reference slice holds on the
+/// stack before [`with_concat_refs`] reserves a vector for it.
+const CONCAT_STACK_REFS: usize = 8;
+
+/// Call `concatenate` with a slice of references to every item of `items`,
+/// in order. Up to [`CONCAT_STACK_REFS`] items the slice lives on the stack;
+/// beyond that it is a vector reserved as `resource`, as it always was.
+fn with_concat_refs<T, R>(
+    items: &[T],
+    resource: &'static str,
+    concatenate: impl FnOnce(&[&T]) -> Result<R, ConcatMergeError>,
+) -> Result<R, ConcatMergeError> {
+    match items {
+        [first, ..] if items.len() <= CONCAT_STACK_REFS => {
+            let mut refs = [first; CONCAT_STACK_REFS];
+            for (slot, item) in refs.iter_mut().zip(items) {
+                *slot = item;
+            }
+            concatenate(&refs[..items.len()])
+        }
+        _ => {
+            let mut refs = Vec::new();
+            refs.try_reserve_exact(items.len())
+                .map_err(|_| ConcatMergeError::Allocation {
+                    resource,
+                    count: items.len(),
+                })?;
+            refs.extend(items.iter());
+            concatenate(&refs)
+        }
+    }
+}
+
+/// An xxh3 digest of a term merge's output: the three merged sections and
+/// every merged row (field, term bytes, document frequency and spans).
+#[cfg(any(test, feature = "bench-internals"))]
+fn concat_term_merge_digest<'r>(
+    sections: [&[u8]; 3],
+    rows: impl Iterator<Item = (u16, &'r [u8], TermMetadata)>,
+) -> u64 {
+    let len_bytes = |len: usize| u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes();
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for section in sections {
+        hasher.update(&len_bytes(section.len()));
+        hasher.update(section);
+    }
+    for (field_ord, term, metadata) in rows {
+        hasher.update(&field_ord.to_le_bytes());
+        hasher.update(&len_bytes(term.len()));
+        hasher.update(term);
+        hasher.update(&metadata.doc_freq.to_le_bytes());
+        for span in [
+            Some(metadata.postings),
+            metadata.positions,
+            Some(metadata.blockmax),
+        ] {
+            let (offset, len) = span.map_or((u64::MAX, u64::MAX), |span| (span.offset, span.len));
+            hasher.update(&offset.to_le_bytes());
+            hasher.update(&len.to_le_bytes());
+        }
+    }
+    hasher.digest()
+}
+
+/// Same-binary A/B for the concat term merge: one run's sources, opened
+/// exactly as a concat merge opens them, ready for repeated term merges.
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+pub struct BenchConcatTermMerge<'a> {
+    sources: Vec<ConcatSource<'a>>,
+    has_positions: bool,
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+impl<'a> BenchConcatTermMerge<'a> {
+    /// Locate and open `source_segment_ids` as a concat merge of them would.
+    ///
+    /// # Errors
+    ///
+    /// As [`KeeperSnapshot::concat_merge_owned`] for the same run.
+    pub fn open(
+        snapshot: &'a KeeperSnapshot,
+        source_segment_ids: &[u64],
+    ) -> Result<Self, ConcatMergeError> {
+        let (start, end) = locate_concat_sources(snapshot, source_segment_ids, u64::MAX)?;
+        let schema = snapshot.schema();
+        let term_fields = concat_term_field_ords(schema)?;
+        let stored_fields = concat_stored_field_ords(schema)?;
+        let has_positions = concat_schema_has_positions(schema);
+        let has_numeric = concat_schema_has_numeric(schema);
+        let sources = snapshot.segments()[start..end]
+            .iter()
+            .map(|segment| {
+                open_concat_source(
+                    segment,
+                    schema,
+                    &term_fields,
+                    &stored_fields,
+                    has_positions,
+                    has_numeric,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            sources,
+            has_positions,
+        })
+    }
+
+    /// Dictionary terms across the run's sources.
+    #[must_use]
+    pub fn source_terms(&self) -> usize {
+        self.sources.iter().map(|source| source.terms.len()).sum()
+    }
+
+    /// One term merge, the incumbent when `incumbent` and else the shipping
+    /// one, including the drop of its output. Returns the merged term count
+    /// and the output's digest, which both arms must share.
+    ///
+    /// # Errors
+    ///
+    /// As the term merge of a concat merge over the same run.
+    pub fn merge(&self, incumbent: bool) -> Result<(usize, u64), ConcatMergeError> {
+        if incumbent {
+            let (postings, positions, blockmax, rows) =
+                merge_concat_terms_incumbent(&self.sources, self.has_positions)?;
+            let digest = concat_term_merge_digest(
+                [&postings, &positions, &blockmax],
+                rows.iter()
+                    .map(|row| (row.field_ord, row.term.as_slice(), row.metadata)),
+            );
+            Ok((rows.len(), digest))
+        } else {
+            let (postings, positions, blockmax, rows) =
+                merge_concat_terms(&self.sources, self.has_positions)?;
+            let digest = concat_term_merge_digest(
+                [&postings, &positions, &blockmax],
+                rows.iter()
+                    .map(|row| (row.field_ord, row.term, row.metadata)),
+            );
+            Ok((rows.len(), digest))
+        }
+    }
 }
 
 fn collect_concat_tombstones(sources: &[ConcatSource<'_>]) -> Result<Vec<u32>, ConcatMergeError> {
@@ -30224,6 +30728,326 @@ mod tests {
             },
         )?;
         assert!(second.removed.is_empty(), "second sweep is empty");
+        Ok(())
+    }
+
+    /// `sources` CASS-shaped leaves, published in MANIFEST order. Every leaf
+    /// holds `common` and an `agent` keyword (more sources than the stack
+    /// reference slices hold), group and pair terms held by a few sources,
+    /// terms unique to one document, terms that share their first six bytes
+    /// (`prefixalpha`, `prefixalphb`), and terms that are prefixes of each
+    /// other (`p`, `pre`, `prefix`, `prefixal`). Leaf 3 is long enough that
+    /// the common terms span several posting blocks.
+    fn concat_term_merge_fixture(
+        sources: u32,
+    ) -> Result<KeeperSnapshot, Box<dyn std::error::Error>> {
+        use crate::schema::CASS_SEMANTIC_SCHEMA;
+        use crate::scribe::{
+            ColumnarAccumulator, FlushDocumentInput, FlushSegmentInput, IndexedFieldValue,
+            flush_accumulator,
+        };
+
+        fn letters(mut value: u32) -> String {
+            let mut out = String::from("q");
+            loop {
+                out.push(char::from(b'a' + u8::try_from(value % 26).unwrap_or(0)));
+                value /= 26;
+                if value == 0 {
+                    return out;
+                }
+            }
+        }
+
+        let schema = CASS_SEMANTIC_SCHEMA;
+        let stat_fields = concat_term_field_ords(schema)?;
+        let genesis = KeeperSnapshot::in_memory(schema)?;
+        let mut manifest = genesis.next_manifest()?;
+        let mut encoded_segments = Vec::new();
+        let mut source_stats = Vec::new();
+        let mut next_ord = 0_u32;
+        for source in 0..sources {
+            let documents = if source == 3 { 300 } else { 20 + source };
+            let mut rows = Vec::new();
+            for local in 0..documents {
+                let doc_ord = next_ord + local;
+                let family = if (source + local) % 2 == 0 {
+                    "prefixalpha"
+                } else {
+                    "prefixalphb"
+                };
+                let parity = if source % 2 == 0 { "even" } else { "odd" };
+                let content = format!(
+                    "common {family} p pre prefix prefixal group{} pair{} uniq{}x{} {parity}",
+                    letters(source % 4),
+                    letters(source / 2),
+                    letters(source),
+                    letters(local),
+                );
+                let title = format!("session {} common", letters(source % 3));
+                let agent = ["claude_code", "codex", "gemini"][usize::try_from(local % 3)?];
+                rows.push((doc_ord, format!("doc-{doc_ord}"), agent, title, content));
+            }
+            let mut accumulator = ColumnarAccumulator::new(schema)?;
+            for (doc_ord, _, agent, title, content) in &rows {
+                accumulator.add_document(
+                    *doc_ord,
+                    &[
+                        IndexedFieldValue::new(0, agent),
+                        IndexedFieldValue::new(6, title),
+                        IndexedFieldValue::new(7, content),
+                        IndexedFieldValue::new(8, title),
+                        IndexedFieldValue::new(9, content),
+                    ],
+                )?;
+            }
+            let documents_input = rows
+                .iter()
+                .map(|(doc_ord, id, _, _, content)| {
+                    FlushDocumentInput::from_canonical_content(*doc_ord, id, content.as_bytes())
+                })
+                .collect::<Vec<_>>();
+            let encoded = flush_accumulator(
+                &accumulator,
+                FlushSegmentInput {
+                    segment_id: 0x7e00 + u64::from(source),
+                    lease_docid_base: 0,
+                    created_unix_s: 1_700_000_000,
+                    engine_version: CURRENT_ENGINE_VERSION,
+                    documents: &documents_input,
+                },
+            )?;
+            let reader = SegmentReader::from_bytes(encoded.as_bytes(), schema)?;
+            source_stats.push(StatsSection::parse(
+                reader
+                    .section(SectionKind::STATS)?
+                    .ok_or_else(|| io::Error::other("fixture leaf is missing STATS"))?,
+                &stat_fields,
+                documents,
+            )?);
+            manifest
+                .segments
+                .push(manifest_segment(&encoded, u64::from(source) + 1));
+            encoded_segments.push(encoded);
+            next_ord += documents;
+        }
+        manifest.docid_high_watermark = u64::from(next_ord);
+        for stats in aggregate_field_stats(source_stats.iter())? {
+            manifest.field_stats.push(ManifestFieldStats {
+                field_ord: stats.field_ord,
+                total_tokens: stats.total_tokens,
+                doc_count: u32::try_from(stats.doc_count)?,
+            });
+        }
+        Ok(genesis.publish_owned_segments(&manifest, encoded_segments)?)
+    }
+
+    /// The term merge emits exactly the incumbent's sections and rows over
+    /// runs whose terms are held by one source, by a few, and by more sources
+    /// than the stack reference slices hold, on keyword, positional and
+    /// position-free text fields, including terms the abbreviated heap key
+    /// cannot tell apart.
+    #[test]
+    fn concat_term_merge_matches_the_incumbent_sections_and_rows() -> TestResult {
+        let snapshot = concat_term_merge_fixture(12)?;
+        let ids = snapshot
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest.segment_id)
+            .collect::<Vec<_>>();
+        let holders = |sources: &[ConcatSource<'_>], field_ord: u16, term: &[u8]| {
+            sources
+                .iter()
+                .filter(|source| {
+                    source
+                        .terms
+                        .iter()
+                        .any(|row| row.field_ord == field_ord && row.term == term)
+                })
+                .count()
+        };
+        for run in [&ids[..], &ids[..2], &ids[3..11], &ids[4..6]] {
+            let opened = BenchConcatTermMerge::open(&snapshot, run)?;
+            let incumbent = merge_concat_terms_incumbent(&opened.sources, opened.has_positions)?;
+            let candidate = merge_concat_terms(&opened.sources, opened.has_positions)?;
+            assert_eq!(candidate.0, incumbent.0, "merged POSTINGS");
+            assert_eq!(candidate.1, incumbent.1, "merged POSITIONS");
+            assert_eq!(candidate.2, incumbent.2, "merged BLOCKMAX");
+            assert_eq!(candidate.3.len(), incumbent.3.len(), "merged term count");
+            for (row, expected) in candidate.3.iter().zip(&incumbent.3) {
+                assert_eq!(
+                    (row.field_ord, row.term, row.metadata),
+                    (
+                        expected.field_ord,
+                        expected.term.as_slice(),
+                        expected.metadata
+                    )
+                );
+            }
+            assert!(
+                candidate.3.len() < opened.source_terms(),
+                "the run merges shared terms"
+            );
+            assert_eq!(opened.merge(false)?, opened.merge(true)?);
+        }
+
+        let opened = BenchConcatTermMerge::open(&snapshot, &ids)?;
+        assert!(holders(&opened.sources, 7, b"common") > CONCAT_STACK_REFS);
+        assert!(holders(&opened.sources, 0, b"codex") > CONCAT_STACK_REFS);
+        assert_eq!(holders(&opened.sources, 7, b"prefixalpha"), 12);
+        assert_eq!(holders(&opened.sources, 7, b"prefixalphb"), 12);
+        assert_eq!(
+            concat_term_prefix(7, b"prefixalpha"),
+            concat_term_prefix(7, b"prefixalphb"),
+            "the fixture holds terms only the full key orders"
+        );
+        let posting_blocks = |source: &ConcatSource<'_>| -> Result<usize, ConcatMergeError> {
+            let row = source
+                .terms
+                .iter()
+                .find(|row| row.field_ord == 7 && row.term == b"common")
+                .ok_or(ConcatMergeError::TooFewSources { count: 0 })?;
+            let bytes = concat_span(
+                source.postings,
+                row.metadata.postings,
+                SectionKind::POSTINGS,
+            )?;
+            let list = PostingList::parse(bytes, row.metadata.doc_freq)
+                .map_err(|error| concat_codec(SectionKind::POSTINGS, error))?;
+            Ok(list.block_count())
+        };
+        assert!(posting_blocks(&opened.sources[3])? > 1);
+        Ok(())
+    }
+
+    /// The abbreviated heap key never orders two `(field_ord, term)` keys
+    /// against their full order, including empty terms, terms shorter than
+    /// the prefix, prefixes of each other, and terms that differ only past
+    /// the prefix or in a high byte.
+    #[test]
+    fn concat_term_prefix_is_monotone_in_the_composite_key() {
+        let mut keys = Vec::new();
+        for field_ord in [0_u16, 1, 7, 0x00ff, 0x0100, u16::MAX] {
+            for term in [
+                &b""[..],
+                b"\0",
+                b"\0\0\0\0\0\0\0",
+                b"a",
+                b"a\0",
+                b"ab",
+                b"abcdef",
+                b"abcdef\0",
+                b"abcdefg",
+                b"abcdeg",
+                b"abcdf",
+                b"prefixalpha",
+                b"prefixalphb",
+                b"\x7f",
+                b"\x80",
+                b"\xff\xff\xff\xff\xff\xff\xff",
+            ] {
+                keys.push((field_ord, term));
+            }
+        }
+        keys.sort_unstable();
+        for pair in keys.windows(2) {
+            let (low, high) = (pair[0], pair[1]);
+            assert!(
+                concat_term_prefix(low.0, low.1) <= concat_term_prefix(high.0, high.1),
+                "{low:?} sorts before {high:?}"
+            );
+        }
+        assert!(concat_term_prefix(0, b"abcdef") < concat_term_prefix(0, b"abcdeg"));
+        assert!(concat_term_prefix(0, b"\xff") < concat_term_prefix(1, b""));
+    }
+
+    /// Every corruption the incumbent refuses, the term merge refuses with the
+    /// same error, in the same order of checks.
+    #[test]
+    fn concat_term_merge_refuses_corrupt_sources_like_the_incumbent() -> TestResult {
+        fn metadata<'s>(
+            sources: &'s mut [ConcatSource<'_>],
+            source: usize,
+            field_ord: u16,
+            term: &[u8],
+        ) -> &'s mut TermMetadata {
+            &mut sources[source]
+                .terms
+                .iter_mut()
+                .find(|row| row.field_ord == field_ord && row.term == term)
+                .expect("the fixture holds the term")
+                .metadata
+        }
+
+        let snapshot = concat_term_merge_fixture(12)?;
+        let ids = snapshot
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest.segment_id)
+            .collect::<Vec<_>>();
+        let refuse = |corrupt: &dyn Fn(&mut [ConcatSource<'_>]),
+                      has_positions: bool|
+         -> Result<String, Box<dyn std::error::Error>> {
+            let mut opened = BenchConcatTermMerge::open(&snapshot, &ids)?;
+            corrupt(&mut opened.sources);
+            let incumbent = merge_concat_terms_incumbent(&opened.sources, has_positions)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"));
+            let candidate = merge_concat_terms(&opened.sources, has_positions)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"));
+            assert_eq!(candidate, incumbent);
+            Ok(incumbent.expect_err("the corruption is refused"))
+        };
+        let unique = b"uniqqhxqa";
+        let far = ByteSpan::new(u64::MAX, 1);
+
+        let error = refuse(
+            &|sources| metadata(sources, 5, 7, b"common").positions = None,
+            true,
+        )?;
+        assert!(error.contains("term \\\"common\\\" has inconsistent positional metadata"));
+        let error = refuse(
+            &|sources| metadata(sources, 0, 7, b"common").positions = None,
+            true,
+        )?;
+        assert!(error.contains("equal term has inconsistent positional metadata"));
+        let error = refuse(&|_| {}, false)?;
+        assert!(error.contains("schema has no POSITIONS section"));
+        // A span past the end of the address space, in each section, for a
+        // term held by one source and by many.
+        for (source, field_ord, term) in [(4, 7, &b"even"[..]), (7, 7, unique), (2, 0, b"codex")] {
+            let error = refuse(
+                &|sources| metadata(sources, source, field_ord, term).postings = far,
+                true,
+            )?;
+            assert!(error.contains("section span end"), "{error}");
+            let error = refuse(
+                &|sources| metadata(sources, source, field_ord, term).blockmax = far,
+                true,
+            )?;
+            assert!(error.contains("section span end"), "{error}");
+        }
+        for (source, term) in [(6, &b"common"[..]), (7, unique)] {
+            let error = refuse(
+                &|sources| metadata(sources, source, 7, term).positions = Some(far),
+                true,
+            )?;
+            assert!(error.contains("section span end"), "{error}");
+        }
+        // Streams the codecs themselves refuse.
+        let error = refuse(
+            &|sources| {
+                let row = metadata(sources, 1, 7, b"common");
+                row.postings = ByteSpan::new(row.postings.offset, row.postings.len - 1);
+            },
+            true,
+        )?;
+        assert!(error.contains("SectionCodec"), "{error}");
+        let error = refuse(
+            &|sources| metadata(sources, 3, 0, b"codex").doc_freq += 1,
+            true,
+        )?;
+        assert!(error.contains("SectionCodec"), "{error}");
         Ok(())
     }
 }
