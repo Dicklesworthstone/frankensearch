@@ -244,25 +244,61 @@ where
         let mut state = self.lock_state();
         let max_small = self.config.max_small_bytes();
 
-        // Update existing entry in-place.
+        // Keep updates in place when the replacement fits its current
+        // partition, preserving FIFO position and access frequency.
         if let Some(entry) = state.entries.get_mut(&key) {
             let old_size = entry.size_bytes;
+            let location = entry.location;
             entry.value = value;
             entry.size_bytes = size_bytes;
-            match entry.location {
+            let (other_bytes, budget) = match location {
+                EntryLocation::Small => (state.small_bytes.saturating_sub(old_size), max_small),
+                EntryLocation::Main => (
+                    state.main_bytes.saturating_sub(old_size),
+                    self.config.max_main_bytes(),
+                ),
+            };
+            if fits_partition(other_bytes, size_bytes, budget) {
+                match location {
+                    EntryLocation::Small => state.small_bytes = other_bytes + size_bytes,
+                    EntryLocation::Main => state.main_bytes = other_bytes + size_bytes,
+                }
+                return;
+            }
+
+            // Growth requiring eviction is a new allocation. Detach the old
+            // queue position before making room so eviction cannot remove the
+            // replacement through a stale key or leave duplicate queue entries.
+            let mut replacement = state.entries.remove(&key).expect("existing cache entry");
+            match location {
                 EntryLocation::Small => {
-                    state.small_bytes = state
-                        .small_bytes
-                        .saturating_sub(old_size)
-                        .saturating_add(size_bytes);
+                    state.small_order.retain(|queued| queued != &key);
+                    state.small_bytes = other_bytes;
+                    if size_bytes > max_small {
+                        replacement.location = EntryLocation::Main;
+                        replacement.freq = 0; // Match ordinary Small-to-Main promotion.
+                    }
                 }
                 EntryLocation::Main => {
-                    state.main_bytes = state
-                        .main_bytes
-                        .saturating_sub(old_size)
-                        .saturating_add(size_bytes);
+                    state.main_order.retain(|queued| queued != &key);
+                    state.main_bytes = other_bytes;
                 }
             }
+            // A reallocated value re-enters at the tail. Same-partition
+            // replacements retain their frequency; shrinking never demotes Main.
+            match replacement.location {
+                EntryLocation::Small => {
+                    evict_small(&mut state, size_bytes, &self.config);
+                    state.small_order.push_back(key.clone());
+                    state.small_bytes += size_bytes;
+                }
+                EntryLocation::Main => {
+                    evict_main(&mut state, size_bytes, &self.config);
+                    state.main_order.push_back(key.clone());
+                    state.main_bytes += size_bytes;
+                }
+            }
+            state.entries.insert(key, replacement);
             return;
         }
 
@@ -313,6 +349,11 @@ where
 
 // ─── Eviction helpers ────────────────────────────────────────────────────────
 
+/// Check room without overflowing when byte estimates approach `usize::MAX`.
+const fn fits_partition(used: usize, needed: usize, budget: usize) -> bool {
+    used <= budget && needed <= budget - used
+}
+
 /// Evict entries from Small until `needed_bytes` fits within the Small budget.
 fn evict_small<K, V>(state: &mut CacheState<K, V>, needed_bytes: usize, config: &S3FifoConfig)
 where
@@ -320,7 +361,7 @@ where
     V: Clone,
 {
     let max_small = config.max_small_bytes();
-    while state.small_bytes + needed_bytes > max_small {
+    while !fits_partition(state.small_bytes, needed_bytes, max_small) {
         let Some(evict_key) = state.small_order.pop_front() else {
             break;
         };
@@ -360,7 +401,7 @@ where
     // Note: We might cycle through the entire queue if everything is hot.
     // The queue length is finite, and we reset freq to 0, so we are guaranteed
     // to eventually find a victim or exhaust the queue (worst case 2 passes).
-    while state.main_bytes + needed_bytes > max_main {
+    while !fits_partition(state.main_bytes, needed_bytes, max_main) {
         let Some(evict_key) = state.main_order.pop_front() else {
             break;
         };
@@ -513,6 +554,184 @@ mod tests {
         cache.insert("key", "new", 20);
         assert_eq!(cache.get(&"key"), Some("new"));
         assert_eq!(cache.memory_used(), 20);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn small_replacement_outgrowing_partition_moves_to_main_and_evicts() {
+        let cache = S3FifoCache::new(small_config(100));
+        cache.insert("growing", 1, 10);
+        assert_eq!(cache.get(&"growing"), Some(1));
+        cache.insert("resident", 2, 80);
+
+        cache.insert("growing", 3, 90);
+        {
+            let state = cache.state.lock().expect("cache lock poisoned");
+            assert!(state.small_order.is_empty());
+            assert_eq!(state.small_bytes, 0);
+            assert_eq!(state.main_bytes, 90);
+            assert_eq!(state.main_order, VecDeque::from(["growing"]));
+            let entry = state.entries.get("growing").expect("replacement retained");
+            assert_eq!(entry.location, EntryLocation::Main);
+            assert_eq!(entry.freq, 0);
+        }
+        assert_eq!(cache.get(&"growing"), Some(3));
+        assert!(cache.get(&"resident").is_none());
+        cache.insert("small", 4, 10);
+        assert_eq!(cache.memory_used(), 100);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn small_replacement_growth_makes_room_and_preserves_hot_peers() {
+        let cache = S3FifoCache::new(small_config(1000));
+        cache.insert("hot", 1, 40);
+        cache.insert("growing", 2, 40);
+        assert_eq!(cache.get(&"hot"), Some(1));
+        cache.insert("older-main", 3, 450);
+        cache.insert("newer-main", 4, 450);
+
+        // The replacement fits Small by itself but not alongside "hot".
+        // Promoting the hot peer must also make room in a full Main partition.
+        cache.insert("growing", 5, 80);
+        assert_eq!(cache.get(&"growing"), Some(5));
+        assert_eq!(cache.get(&"hot"), Some(1));
+        assert!(cache.get(&"older-main").is_none());
+        assert_eq!(cache.get(&"newer-main"), Some(4));
+        assert_eq!(cache.memory_used(), 570);
+        let state = cache.state.lock().expect("cache lock poisoned");
+        assert_eq!(state.small_order, VecDeque::from(["growing"]));
+        assert_eq!(state.small_bytes, 80);
+        assert_eq!(state.main_bytes, 490);
+        assert_eq!(state.entries["hot"].location, EntryLocation::Main);
+    }
+
+    #[test]
+    fn main_replacement_growth_evicts_peers_without_losing_frequency() {
+        let cache = S3FifoCache::new(small_config(100));
+        cache.insert("growing", 1, 45);
+        cache.insert("victim", 2, 45);
+        assert_eq!(cache.get(&"growing"), Some(1));
+        assert_eq!(cache.get(&"growing"), Some(1));
+
+        cache.insert("growing", 3, 70);
+        {
+            let state = cache.state.lock().expect("cache lock poisoned");
+            assert_eq!(state.main_order, VecDeque::from(["growing"]));
+            assert_eq!(state.main_bytes, 70);
+            assert_eq!(state.entries["growing"].freq, 2);
+        }
+        assert_eq!(cache.get(&"growing"), Some(3));
+        assert!(cache.get(&"victim").is_none());
+
+        cache.insert("growing", 4, 5);
+        assert_eq!(cache.get(&"growing"), Some(4));
+        assert_eq!(cache.memory_used(), 5);
+        let state = cache.state.lock().expect("cache lock poisoned");
+        assert_eq!(state.entries["growing"].location, EntryLocation::Main);
+        assert_eq!(state.main_order, VecDeque::from(["growing"]));
+    }
+
+    #[test]
+    fn fitting_replacements_preserve_fifo_position_and_frequency() {
+        for (initial, replacement) in [(3, 4), (20, 30)] {
+            let cache = S3FifoCache::new(small_config(100));
+            cache.insert("first", 1, initial);
+            cache.insert("second", 2, initial);
+            assert_eq!(cache.get(&"first"), Some(1));
+            assert_eq!(cache.get(&"first"), Some(1));
+            cache.insert("first", 3, replacement);
+
+            let state = cache.state.lock().expect("cache lock poisoned");
+            let entry = &state.entries["first"];
+            assert_eq!(entry.value, 3);
+            assert_eq!(entry.freq, 2);
+            let order = match entry.location {
+                EntryLocation::Small => &state.small_order,
+                EntryLocation::Main => &state.main_order,
+            };
+            assert_eq!(order, &VecDeque::from(["first", "second"]));
+            assert_eq!(state.small_bytes + state.main_bytes, initial + replacement);
+        }
+    }
+
+    #[test]
+    fn oversized_replacements_preserve_the_previous_value_and_budget() {
+        let cache = S3FifoCache::new(small_config(100));
+        cache.insert("retained", 1, 8);
+        cache.insert("other", 2, 80);
+
+        for size in [91, 101, usize::MAX] {
+            cache.insert("retained", 3, size);
+            assert_eq!(cache.get(&"retained"), Some(1));
+            assert_eq!(cache.get(&"other"), Some(2));
+            assert_eq!(cache.memory_used(), 88);
+            assert_eq!(cache.len(), 2);
+        }
+    }
+
+    #[test]
+    fn mixed_replacement_churn_keeps_queue_and_byte_accounting_consistent() {
+        let cache = S3FifoCache::new(small_config(100));
+        let sizes = [0, 1, 4, 8, 10, 20, 45, 80, 90, 91, 101];
+        for step in 0..1500 {
+            let key = (step * 7) % 17;
+            let size = sizes[step % sizes.len()];
+            let expected = if size > 90 {
+                cache.get(&key)
+            } else {
+                Some(step)
+            };
+            cache.insert(key, step, size);
+            assert_eq!(cache.get(&key), expected);
+
+            let state = cache.state.lock().expect("cache lock poisoned");
+            let small: HashSet<_> = state.small_order.iter().copied().collect();
+            let main: HashSet<_> = state.main_order.iter().copied().collect();
+            assert_eq!(small.len(), state.small_order.len());
+            assert_eq!(main.len(), state.main_order.len());
+            assert!(small.is_disjoint(&main));
+            assert_eq!(small.len() + main.len(), state.entries.len());
+
+            let mut small_bytes = 0;
+            let mut main_bytes = 0;
+            for (key, entry) in &state.entries {
+                match entry.location {
+                    EntryLocation::Small => {
+                        assert!(small.contains(key));
+                        small_bytes += entry.size_bytes;
+                    }
+                    EntryLocation::Main => {
+                        assert!(main.contains(key));
+                        main_bytes += entry.size_bytes;
+                    }
+                }
+            }
+            assert_eq!(state.small_bytes, small_bytes);
+            assert_eq!(state.main_bytes, main_bytes);
+            assert!(small_bytes <= 10);
+            assert!(main_bytes <= 90);
+            assert!(small_bytes + main_bytes <= 100);
+        }
+    }
+
+    #[test]
+    fn large_estimated_sizes_evict_without_arithmetic_overflow() {
+        let cache = S3FifoCache::new(S3FifoConfig {
+            max_bytes: usize::MAX,
+            small_ratio: 0.0,
+            ..S3FifoConfig::default()
+        });
+        cache.insert("large", 1, usize::MAX - 1);
+        cache.insert("growing", 2, 2);
+        assert!(cache.get(&"large").is_none());
+        assert_eq!(cache.memory_used(), 2);
+        cache.insert("peer", 3, usize::MAX - 2);
+
+        cache.insert("growing", 4, 3);
+        assert_eq!(cache.get(&"growing"), Some(4));
+        assert!(cache.get(&"peer").is_none());
+        assert_eq!(cache.memory_used(), 3);
         assert_eq!(cache.len(), 1);
     }
 
