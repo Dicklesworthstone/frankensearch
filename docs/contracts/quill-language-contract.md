@@ -178,88 +178,88 @@ These rules are pinned independently of the parser because query planners also c
 - `created_at` filters use inclusive i64 lower and upper bounds; either side may be unbounded. Shipping inserts the FAST-field range as a `Must` query, whose matched `ConstScorer` contributes `1.0`; “filter” describes its selection role, not a scoreless implementation.
 - `CassWildcardPattern` classifies terms as `Exact`, `Prefix`, `Suffix`, `Substring`, or `Complex`. Exact and prefix terms issue exact `TermQuery` clauses over `title`, `content`, `title_prefix`, and `content_prefix`; the prefix fields contain only prefixes of 2 through 20 Unicode scalar values. Consequently `a*` does not generally prefix-match longer words, a prefix longer than 20 is not accelerated, and an `Exact` term of length 2 through 20 can match a longer indexed word through a prefix field. Suffix, substring, and complex `*` patterns issue anchor-free `RegexQuery` clauses over `content` and `title`: Tantivy FST regexes already match the complete term and reject explicit `^`/`$` assertions. If either field's regex construction fails, the complete CASS query fails closed to match-none instead of dropping the operand. Regex expansion is unbounded in the shipping path and each matching field uses Tantivy's constant scorer; introducing a bound requires a `GlobExpansionLimit` divergence. The sanitizer does not preserve `?`, so `?` is not a shipping wildcard operator.
 - A term containing any CJK character drops its non-CJK characters for query bigram generation. The remaining CJK characters expand into overlapping bigrams; every bigram is `Must` and may match any searchable field (`title`, `content`, `title_prefix`, `content_prefix`). A single CJK character remains a unigram, but it cannot match inside a multi-character indexed run because that run is represented only by bigrams.
-- Empty/whitespace CASS input produces `All`, after which any supplied filters still apply. A nonempty operand that sanitizes to nothing (for example an emoji or punctuation alone), or a nonempty input with no lexical operand such as `""`, matches nothing. Existing explicit star-only input retains its behavior.
+- Empty/whitespace CASS input produces `All`, after which any supplied filters still apply. Nonempty input without a searchable operand refuses the complete query, including under negation. Star-only and operator-only inputs are not browse requests; see §4.6.
 
 ### 4.6 CASS queries over existing accented-Latin indexes (cass #548)
 
-This is a query correction derived from materemias' illustrative
+This query correction builds on materemias' illustrative
 [frankensearch #74](https://github.com/Dicklesworthstone/frankensearch/pull/74).
 It does not change the analyzer, term bytes, positions, prefix generation,
-schema hash or on-disk format. It can read an index written before the query
-correction without reindexing, within that index's existing schema generation.
+schema hash or on-disk format. It reads existing indexes within their current
+schema generation without rebuilding them.
 
-An exact or trailing-prefix operand containing a non-ASCII character outside
-the CASS CJK ranges is analyzed with the actual CASS tokenizer **before** case
-conversion. Thus `kérlek` becomes `k` and `rlek`, and `İstanbul` becomes
-`stanbul`; Unicode lowercasing must not manufacture an `i` that indexing did
-not store. An operand containing CJK retains the existing CJK path in §4.5.
+An affected operand contains a non-ASCII character outside the CASS CJK
+ranges. Analyze its original spelling with the complete CASS indexing
+pipeline before Unicode case conversion or canonicalization. In particular,
+kérlek emits k and rlek, İstanbul emits stanbul, and the Kelvin sign is not
+turned into an indexed ASCII k. Preserve combining marks through operand
+parsing so decomposed Latin words use their actual indexed fragment sequence.
 No normalization is applied to exact agent/workspace/source filter values.
-Textual `field:value` restrictions are not part of this CASS grammar.
 
-The correction requires all fragments in the same `title` or `content` field,
-using exact terms. It does not combine one fragment in a title with another
-in content, or match every fragment through unrelated word prefixes. An
-explicit trailing `*` may additionally look up the final fragment in that
-same logical field's precomputed prefix column, provided the raw operand
-ends in a token character. `kérl*` can therefore find `kérlek`; `café*`
-requires the exact `caf` fragment instead of broadening it to `caf*`.
-The existing 2–20-character prefix generation and bounded content-prefix
-coverage still limit prefix recall. This correction adds no dictionary
-wildcard expansion.
+Bare affected words and affected quoted phrases require the analyzed
+fragments at their original positions in one title or content field. This
+excludes reversed, separated and cross-field fragment false positives. ASCII
+punctuation still separates unquoted operand groups; repeated hyphens also
+separate affected groups, while a single compound hyphen is retained.
+Generated fragments are typed query leaves and are never reparsed as Boolean
+syntax, even when a fragment spells an operator.
 
-Within quoted phrases, fragments occupy consecutive positions in one title
-or content field: `"kérlek nézd"` searches for `k rlek n zd` in that order.
-One-fragment affected phrases use an exact term, and a required phrase word
-with no indexed fragments makes the phrase unmatchable. The pre-existing
-CJK phrase fallback remains as specified in §4.5.
-That fallback lowers each original operand separately so an affected Latin
-word retains its exact same-field conjunction even beside CJK text. Interior
-`*` characters in quoted operands retain their previous literal/wildcard
-behavior; tokenizer normalization must not erase them into searchable fragments.
+For affected operands containing CJK, use the actual analyzer output, including
+its separate runs. Never concatenate CJK characters across discarded accents:
+東é京 emits the single-character terms 東 and 京, not the bigram 東京.
+Same-position CJK bigrams are all required in one field, rather than treated as
+phrase alternatives. This mixed-script route remains a same-field conjunction,
+so it does not enforce distances between runs. The existing pure CJK route in
+§4.5 remains unchanged.
 
-An explicitly quoted empty operand also remains present in its Boolean
-context: `a AND ""` matches nothing and `a OR ""` retains only `a`. The
-Tantivy adapter wraps CASS phrase scorers with exact monotone seeking because
-the pinned scorer's approximate seek rejects valid exclusion candidates before
-its current document (bd-nqeb4). The wrapper retains native phrase weights,
-positions, scores and explanations; it does not catch scorer panics or replace
-phrases with weaker term conjunctions.
+An explicit trailing star retains the existing prefix-column implementation:
+only the final ASCII fragment may use the corresponding prefix field, and
+only when its source token reaches the end of the operand. Thus café followed
+by a star still requires exact caf; a discarded trailing accent does not move
+the wildcard backward. The 2–20-character prefix-generation limit and bounded
+content-prefix coverage still apply. Explicit prefix fragments remain a
+same-field conjunction. This patch does not introduce complete dictionary
+prefix expansion or restore implicit prefixes for recovered bare words.
 
-Plain affected operands remain conjunctions, as in the contributor's patch:
-order, distance and multiplicity are not enforced unless the user quotes the
-phrase. They can match separated or reversed fragments in one field. Even
-quoted adjacency cannot distinguish `kérlek` from literal `k rlek`, or two
-accents that split identical ASCII runs. NFC/NFD equivalence, `ß`/`ss`
-folding, transliteration and accent-insensitive matching are not supplied
-by this correction. Suffix, substring and complex accented wildcards remain
-untransformed and generally unmatchable. These are consequences of the
-existing index's lost character information.
+Reject the complete expression when a required operand has no indexed terms,
+contains an unsupported affected suffix/substring/interior wildcard, or contains
+an interior wildcard in a quoted phrase. Quoted edge stars retain their legacy
+stripping behavior: a quoted *kérlek* is the exact recovered phrase, while an
+unquoted *kérlek* is unsupported. ASCII punctuation separates groups; other
+non-ASCII separators inside an affected group retain analyzer positions. This applies under OR, NOT and repeated
+negation: an invalid operand is a refusal, not an empty set whose complement
+could become every document. Empty quotes, punctuation-only, emoji-only,
+unsupported-script-only, star-only and operator-only inputs cannot browse.
+Only genuinely blank/whitespace input remains an intentional browse request,
+with the caller's structured filters still applied. Valid negative ASCII or
+accented operands retain ordinary complement semantics.
 
-Normalization admits at most 256 fragments per affected operand or expanded
-phrase and retains the analyzer's inclusive 256-byte token boundary. A
-required token that the analyzer would discard, excessive expansion, or an
-affected nonempty query exceeding 10,000 Unicode scalar values rejects the
-**complete query**, including under `OR` and `NOT`; no partial prefix or
-surviving fragment is substituted. Quill reports the refusal in its parser
-diagnostics and the compatibility builder logs its construction failure.
-An ordinary unindexable word is instead an explicit match-none operand, so
-its deliberate Boolean complement retains standard semantics.
+The Tantivy adapter wraps CASS phrase scorers with exact monotone seeking
+because the pinned scorer's approximate seek rejects valid exclusion
+candidates before its current document (bd-nqeb4). Retain native phrase weights,
+positions, scores and explanations; do not catch scorer panics or substitute
+weaker term conjunctions.
 
-Before entering the recursive compatibility grammar, both CASS parsers admit
-at most 128 nested group tokens. This applies to ASCII queries too; parentheses
-inside quoted phrases or code words are not group tokens. Exceeding the bound
-rejects the complete query with no recoverable partial branch.
+Normalization admits at most 256 analyzed fragments per operand or expanded
+phrase and retains the analyzer's inclusive 256-byte token boundary. Reject
+filtered required tokens and excessive expansion instead of compacting a
+phrase or retaining only part of a conjunction. An affected nonempty query
+exceeding 10,000 Unicode scalar values also refuses the complete expression.
+Quill reports refusal through parser diagnostics; the compatibility builder
+logs construction failure. Before recursive parsing, both adapters enforce a
+128-group nesting limit, including for ASCII queries.
 
-A full Unicode-tokenization correction needs a separately versioned analyzer
-contract covering letters, combining marks, case folding and accent policy,
-new analyzer identity tags and schema/version admission, and rebuilt terms
-and prefix columns from canonical content. Changing only the analyzer code
-or schema's display name would admit incompatible old indexes. In particular,
-upgrading released CASS `v9-quill` to current main's `v10-quill` is an unrelated
-document-identity migration. A no-reindex CASS hotfix must retain its compatible
-dependency line, either through a query-only engine backport or through the
-consumer's existing typed-query API, instead of adopting that schema change
-as a side effect.
+Token-level precision has an unavoidable limit: adjacent literal k rlek and
+different accents producing those same fragments remain indistinguishable
+from kérlek. NFC/NFD equivalence, sharp-s/ss folding, transliteration and
+accent-insensitive matching require a separately versioned analyzer contract
+and rebuilt terms from canonical content.
+
+Upgrading released CASS v9-quill to current main's v10-quill is an unrelated
+document-identity migration. A no-reindex CASS correction must retain its
+compatible dependency line through a query-only backport or the existing
+typed-query API. It must not accept the old sentinel with a new identity
+writer or silently make that migration part of a lexical-query fix.
 
 ## 5. Scoring and statistics contract
 

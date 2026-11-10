@@ -890,6 +890,488 @@ mod tests {
         });
     }
 
+    fn assert_multilingual_matches(
+        cx: &asupersync::Cx,
+        reader: &crate::QuillSearchIndex,
+        labels: &std::collections::BTreeMap<String, String>,
+        raw: &str,
+        expected: &[&str],
+    ) {
+        use std::collections::BTreeSet;
+
+        let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+            .expect("CASS parser");
+        let parsed = parser.parse(raw, &crate::query::CassQueryFilters::default());
+        let expected: BTreeSet<_> = expected.iter().map(|label| (*label).to_owned()).collect();
+        for exact_count in [false, true] {
+            let result = reader
+                .search_preparsed_paginated(cx, &parsed.query, labels.len() + 1, 0, exact_count)
+                .unwrap_or_else(|error| panic!("query {raw:?}, exact={exact_count}: {error}"));
+            let actual: BTreeSet<_> = result
+                .hits
+                .iter()
+                .map(|hit| {
+                    labels
+                        .get(&hit.document_id)
+                        .expect("every hit has a fixture identity")
+                        .clone()
+                })
+                .collect();
+            assert_eq!(actual, expected, "query {raw:?}, exact={exact_count}");
+            assert_eq!(result.hits.len(), expected.len(), "no duplicate hits");
+            if exact_count {
+                assert_eq!(
+                    result.total_count,
+                    Some(u64::try_from(expected.len()).expect("fixture count")),
+                    "query {raw:?}: exact count"
+                );
+            }
+        }
+    }
+
+    /// Expected identities are source labels, independent of the analyzer.
+    /// The legacy index cannot distinguish identical token sequences, but
+    /// disconnected, reversed, cross-field and NFD fragments must not match.
+    #[test]
+    fn cass_multilingual_retrieval_uses_original_analyzer_positions() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let deep = format!(
+                "{} kérlek segits markerkeep",
+                "filler ".repeat(CONTENT_PREFIX_MAX_BYTES / 7 + 2)
+            );
+            let fixtures = [
+                ("hungarian", "review", "kérlek segits markerkeep"),
+                ("uppercase", "review", "KÉRLEK segits markerkeep"),
+                ("accent_collision", "review", "körlek segits markerkeep"),
+                ("space_collision", "review", "k rlek segits markerkeep"),
+                ("longer_word", "review", "kérlekkel segits markerkeep"),
+                ("separated", "review", "k elsewhere rlek segits markerkeep"),
+                ("reversed", "review", "rlek k segits markerkeep"),
+                ("different_fields", "k", "rlek segits markerkeep"),
+                ("decomposed", "review", "ke\u{301}rlek segits markernfd"),
+                ("decomposed_gap", "review", "ke elsewhere rlek"),
+                ("decomposed_fields", "ke", "rlek"),
+                ("french", "review", "élève déjà naïve façade"),
+                ("german", "review", "über Straße schön"),
+                ("punctuation", "review", "pré-commit l'été"),
+                ("dotted_i", "review", "İSTANBUL"),
+                ("ascii_i", "review", "istanbul"),
+                ("kelvin_sign", "review", "Kelvin"),
+                ("ascii_kelvin", "review", "kelvin"),
+                ("cafe", "review", "café"),
+                ("cafe_compound", "review", "caféteria"),
+                ("cafeteria", "review", "cafeteria"),
+                ("cjk", "review", "東京 大阪 中文测试"),
+                ("cjk_long", "review", "東京都"),
+                ("cjk_split", "review", "東é京"),
+                ("cjk_decoy", "review", "東西 京北"),
+                ("cjk_fields", "東", "京"),
+                ("code", "review", "async-runtime foo_bar alpha"),
+                ("literal_or", "review", "or markeroperator"),
+                ("literal_not", "review", "not markeroperator"),
+                ("unrelated", "review", "plain unrelated text"),
+                ("deep_content", "review", deep.as_str()),
+            ];
+            let directory = tempfile::tempdir().expect("multilingual CASS index");
+            let config = crate::QuillConfig {
+                deterministic_ingest: true,
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let writer = crate::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create legacy-analyzer index");
+            let documents: Vec<_> = fixtures
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (label, title, content))| {
+                    sample_document(
+                        label,
+                        u64::try_from(ordinal).expect("fixture ordinal"),
+                        "codex",
+                        title,
+                        content,
+                    )
+                    .to_schema_document()
+                })
+                .collect();
+            let labels: std::collections::BTreeMap<_, _> = documents
+                .iter()
+                .zip(fixtures.iter())
+                .map(|(document, (label, _, _))| (document.id.clone(), (*label).to_owned()))
+                .collect();
+            for batch in documents.chunks(7) {
+                writer
+                    .index_schema_documents(&cx, batch)
+                    .await
+                    .expect("index original source text");
+                writer.commit(&cx).await.expect("seal fixture batch");
+            }
+            drop(writer);
+            let reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config,
+            )
+            .await
+            .expect("reopen without changing the index format");
+
+            let exact = [
+                "hungarian",
+                "uppercase",
+                "accent_collision",
+                "space_collision",
+                "deep_content",
+            ];
+            for raw in [
+                "kérlek",
+                "KÉRLEK",
+                "kérlek AND markerkeep",
+                "\"kérlek\"",
+                "\"kérlek segits\"",
+                "\"KÉRLEK, segits\"",
+            ] {
+                assert_multilingual_matches(&cx, &reader, &labels, raw, &exact);
+            }
+            for (raw, expected) in [
+                ("ke\u{301}rlek", &["decomposed"][..]),
+                ("\"ke\u{301}rlek\"", &["decomposed"][..]),
+                ("élève", &["french"][..]),
+                ("\"élève déjà\"", &["french"][..]),
+                ("façade", &["french"][..]),
+                ("über", &["german"][..]),
+                ("STRAẞE", &["german"][..]),
+                ("schön", &["german"][..]),
+                ("\"pré-commit\"", &["punctuation"][..]),
+                ("İSTANBUL", &["dotted_i"][..]),
+                ("istanbul", &["ascii_i"][..]),
+                ("Kelvin", &["kelvin_sign"][..]),
+                ("kelvin", &["ascii_kelvin"][..]),
+                ("café*", &["cafe", "cafe_compound"][..]),
+                ("\"café\"", &["cafe", "cafe_compound"][..]),
+                ("東京", &["cjk", "cjk_long"][..]),
+                ("\"東京\"", &["cjk", "cjk_long"][..]),
+                ("中文测试", &["cjk"][..]),
+                ("東é京", &["cjk_split"][..]),
+                ("\"東é京\"", &["cjk_split"][..]),
+                ("async", &["code"][..]),
+                ("foo_bar", &["code"][..]),
+                ("éOR", &["literal_or"][..]),
+                ("\"éOR\"", &["literal_or"][..]),
+                ("éNOT", &["literal_not"][..]),
+                ("\"éNOT\"", &["literal_not"][..]),
+                ("kérlek AND NOT markerkeep", &[][..]),
+                ("(kérlek OR Straße) AND NOT markerkeep", &["german"][..]),
+            ] {
+                assert_multilingual_matches(&cx, &reader, &labels, raw, expected);
+            }
+
+            let complement: Vec<_> = fixtures
+                .iter()
+                .map(|(label, _, _)| *label)
+                .filter(|label| !exact.contains(label))
+                .collect();
+            assert_multilingual_matches(&cx, &reader, &labels, "NOT kérlek", &complement);
+            let all: Vec<_> = fixtures.iter().map(|(label, _, _)| *label).collect();
+            for raw in ["", " \t\n", "NOT absentasciiword"] {
+                assert_multilingual_matches(&cx, &reader, &labels, raw, &all);
+            }
+        });
+    }
+
+    #[test]
+    fn cass_multilingual_unrepresentable_input_cannot_browse_or_invert_to_all() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fail-closed CASS index");
+            let writer = crate::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create CASS writer");
+            let documents = [
+                sample_document("matching", 0, "codex", "review", "alpha kérlek")
+                    .to_schema_document(),
+                sample_document("other", 1, "claude", "review", "unrelated document")
+                    .to_schema_document(),
+            ];
+            writer
+                .index_schema_documents(&cx, &documents)
+                .await
+                .expect("index fail-closed fixture");
+            writer.commit(&cx).await.expect("publish fixture");
+            let reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open fail-closed reader");
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("CASS parser");
+            let default_filters = crate::query::CassQueryFilters::default();
+            let scoped = crate::query::CassQueryFilters {
+                agents: vec!["codex".to_owned()],
+                ..Default::default()
+            };
+            for raw in [
+                "é",
+                "\"é\"",
+                "é*",
+                "\u{301}",
+                "привет",
+                "مرحبا",
+                "😀",
+                "!!!",
+                "\"!!!\"",
+                "\"\"",
+                "*",
+                "***",
+                "AND",
+                "OR",
+                "NOT",
+                "()",
+                "NOT é",
+                "NOT привет",
+                "NOT !!!",
+                "NOT \"\"",
+                "alpha OR NOT é",
+                "alpha AND привет",
+                "alpha OR привет",
+                "NOT (alpha OR é)",
+                "*kérlek",
+                "*kérlek*",
+                "ké*rlek",
+                "NOT *kérlek",
+            ] {
+                for filters in [&default_filters, &scoped] {
+                    let parsed = parser.parse(raw, filters);
+                    assert!(
+                        !parsed.diagnostics.is_empty(),
+                        "{raw:?}: unsupported or empty operands require an explanation"
+                    );
+                    let result = reader
+                        .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                        .unwrap_or_else(|error| panic!("fail-closed query {raw:?}: {error}"));
+                    assert!(result.hits.is_empty(), "{raw:?}: must not return documents");
+                    assert_eq!(result.total_count, Some(0), "{raw:?}: count must be zero");
+                }
+            }
+        });
+    }
+
+    /// Opt-in large-index measurement. The live control is the existing quoted
+    /// ASCII-fragment query; this reports normalization overhead, not a speedup
+    /// against an older binary. Corpus construction is streamed in small batches.
+    ///
+    /// CASS_MULTILINGUAL_PERF_DOCS=100000 (default) or 1000000; run with:
+    /// cargo test -p frankensearch-quill --release cass_multilingual_query_scaling -- --ignored --nocapture
+    #[test]
+    #[ignore = "large-index measurement; run explicitly under --release --ignored"]
+    fn cass_multilingual_query_scaling() {
+        use std::collections::BTreeSet;
+        use std::time::Instant;
+
+        let parse_count = |name: &str, default: usize| {
+            std::env::var(name)
+                .map_or(Ok(default), |raw| raw.parse::<usize>())
+                .unwrap_or_else(|error| panic!("{name} must be an integer: {error}"))
+        };
+        let document_count = parse_count("CASS_MULTILINGUAL_PERF_DOCS", 100_000);
+        let rounds = parse_count("CASS_MULTILINGUAL_PERF_ROUNDS", 31);
+        assert!((100..=1_000_000).contains(&document_count));
+        assert!((5..=10_000).contains(&rounds));
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("large multilingual index");
+            let config = crate::QuillConfig {
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let writer = crate::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create scalable CASS index");
+            let ingest_started = Instant::now();
+            let mut expected_ids = BTreeSet::new();
+            for start in (0..document_count).step_by(500) {
+                let end = (start + 500).min(document_count);
+                let mut batch = Vec::with_capacity(end - start);
+                for ordinal in start..end {
+                    let words = match ordinal % 100 {
+                        0 => "kérlek markerselected",
+                        1..=10 => "k unrelated rlek markerseparated",
+                        11..=20 => "rlek k markerreversed",
+                        21..=25 => "東京 中文测试",
+                        26..=30 => "café Straße façade",
+                        _ => "normal conversation source code content",
+                    };
+                    let content = format!(
+                        "session token{:04} revision{:03} {words}",
+                        ordinal % 4_096,
+                        (ordinal * 7) % 251
+                    );
+                    let document = sample_document(
+                        "multilingual-perf",
+                        u64::try_from(ordinal).expect("benchmark ordinal"),
+                        if ordinal % 2 == 0 { "codex" } else { "claude" },
+                        "measurement session",
+                        &content,
+                    )
+                    .to_schema_document();
+                    if ordinal % 100 == 0 {
+                        expected_ids.insert(document.id.clone());
+                    }
+                    batch.push(document);
+                }
+                writer
+                    .index_schema_documents(&cx, &batch)
+                    .await
+                    .expect("ingest streamed multilingual batch");
+                if end % 10_000 == 0 || end == document_count {
+                    writer.commit(&cx).await.expect("seal streamed corpus");
+                }
+            }
+            let ingest_elapsed = ingest_started.elapsed();
+            let segments = writer.snapshot().expect("published benchmark").segments().len();
+            drop(writer);
+
+            let reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config,
+            )
+            .await
+            .expect("reopen scalable CASS index");
+            assert_eq!(
+                reader.doc_count().expect("benchmark document count"),
+                u64::try_from(document_count).expect("benchmark count")
+            );
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            let queries = [
+                ("aligned_phrase", "\"k rlek\""),
+                ("aligned_phrase_repeat", "\"k rlek\""),
+                ("accented_phrase", "\"kérlek\""),
+                ("accented_word", "kérlek"),
+                ("ascii_control", "markerselected"),
+            ];
+
+            // Check the whole independent identity set before measuring a small
+            // ranked page. Equal counts alone could hide offset or false-positive
+            // errors, especially in the frequent one-letter-fragment decoys.
+            let mut first_full_count_ms = Vec::with_capacity(queries.len());
+            let mut aligned_hits = None;
+            for (name, raw) in queries {
+                let started = Instant::now();
+                let parsed = parser.parse(raw, &filters);
+                let result = reader
+                    .search_preparsed_paginated(
+                        &cx,
+                        &parsed.query,
+                        expected_ids.len() + 1,
+                        0,
+                        true,
+                    )
+                    .expect("validate complete benchmark result set");
+                first_full_count_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                let actual: BTreeSet<_> = result
+                    .hits
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
+                    .collect();
+                assert_eq!(actual, expected_ids, "benchmark query {name}");
+                assert_eq!(
+                    result.total_count,
+                    Some(u64::try_from(expected_ids.len()).expect("match count")),
+                    "benchmark exact count {name}"
+                );
+                if name == "aligned_phrase" {
+                    aligned_hits = Some(result.hits.clone());
+                } else if name == "accented_phrase" {
+                    assert_eq!(
+                        Some(&result.hits),
+                        aligned_hits.as_ref(),
+                        "equivalent quoted queries must retain order and scores"
+                    );
+                }
+            }
+
+            let mut samples: Vec<Vec<std::time::Duration>> = queries
+                .iter()
+                .map(|_| Vec::with_capacity(rounds))
+                .collect();
+            for round in 0..rounds {
+                // Rotate the first query to avoid always favoring one arm's
+                // cache warmth. Both A/A controls use the live parser and index.
+                for turn in 0..queries.len() {
+                    let query_index = (round + turn) % queries.len();
+                    let started = Instant::now();
+                    let parsed = parser.parse(queries[query_index].1, &filters);
+                    let result = reader
+                        .search_preparsed_paginated(&cx, &parsed.query, 20, 0, false)
+                        .expect("measure multilingual query");
+                    samples[query_index].push(started.elapsed());
+                    assert_eq!(result.hits.len(), expected_ids.len().min(20));
+                    let _ = std::hint::black_box(result);
+                }
+            }
+            for sample in &mut samples {
+                sample.sort_unstable();
+            }
+            let measurements: Vec<_> = queries
+                .iter()
+                .enumerate()
+                .map(|(index, (name, raw))| {
+                    let sample = &samples[index];
+                    serde_json::json!({
+                        "name": name,
+                        "query": raw,
+                        "first_full_count_ms": first_full_count_ms[index],
+                        "warm_p50_us": sample[rounds / 2].as_secs_f64() * 1_000_000.0,
+                        "warm_p95_us": sample[rounds * 95 / 100].as_secs_f64() * 1_000_000.0,
+                        "warm_max_us": sample[rounds - 1].as_secs_f64() * 1_000_000.0,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "probe": "cass_multilingual_query_scaling",
+                    "documents": document_count,
+                    "segments": segments,
+                    "expected_matches": expected_ids.len(),
+                    "rounds": rounds,
+                    "ingest_ms": ingest_elapsed.as_secs_f64() * 1_000.0,
+                    "aligned_repeat_over_aligned_p50": samples[1][rounds / 2].as_secs_f64()
+                        / samples[0][rounds / 2].as_secs_f64(),
+                    "accented_phrase_over_aligned_p50": samples[2][rounds / 2].as_secs_f64()
+                        / samples[0][rounds / 2].as_secs_f64(),
+                    "measurements": measurements,
+                })
+            );
+        });
+    }
+
     /// A word with an accented Latin letter must find the document it came from.
     ///
     /// The CASS tokenizer keeps only ASCII alphanumeric and CJK runs, so it
@@ -1053,8 +1535,10 @@ mod tests {
                     );
                 };
             for (raw, expected) in [
-                ("kérlek", &[0, 2, 5, 12][..]),
-                ("KÉRLEK", &[0, 2, 5, 12]),
+                // A recovered word requires adjacent fragments; row 2 has
+                // intervening words and therefore is no longer a match.
+                ("kérlek", &[0, 5, 12][..]),
+                ("KÉRLEK", &[0, 5, 12]),
                 ("\"kérlek\"", &[0, 5, 12]),
                 ("\"kérlek nézd\"", &[0, 12]),
                 ("\"nézd kérlek\"", &[5]),
@@ -1074,8 +1558,8 @@ mod tests {
                 ("backup AND NOT \"kérlek nézd\"", &[1]),
                 ("kér*", &[0, 5, 12]),
                 ("kérl*", &[0, 2, 4, 5, 12]),
-                ("(kérlek OR backup) NOT mentés", &[1, 2, 5, 12]),
-                ("NOT NOT kérlek", &[0, 2, 5, 12]),
+                ("(kérlek OR backup) NOT mentés", &[1, 5, 12]),
+                ("NOT NOT kérlek", &[0, 5, 12]),
                 ("backup AND NOT kérlek", &[1]),
                 ("backup OR kérlek AND mentés", &[0, 1]),
                 ("Straße", &[6]),
@@ -1107,10 +1591,10 @@ mod tests {
                 ("backup AND \"\"", &[]),
                 ("kérlek AND \"\"", &[]),
                 ("kérlek AND \" \"", &[]),
-                ("backup OR \"\"", &[1]),
-                ("backup AND NOT \"\"", &[1]),
+                ("backup OR \"\"", &[]),
+                ("backup AND NOT \"\"", &[]),
                 ("backup AND 🚀", &[]),
-                ("backup OR 🚀", &[1]),
+                ("backup OR 🚀", &[]),
                 ("\"backup éß\"", &[]),
                 ("please", &[1]),
                 ("caf*", &[10, 11]),
@@ -1125,7 +1609,7 @@ mod tests {
             check("🚀", &scoped, &[]);
             check("", &scoped, &[0]);
             check(" \t\u{2003}", &scoped, &[0]);
-            check("*", &scoped, &[0]);
+            check("*", &scoped, &[]);
 
             let nested = |depth| format!("{}kérlek{}", "(".repeat(depth), ")".repeat(depth));
             check(&nested(128), &scoped, &[0]);
