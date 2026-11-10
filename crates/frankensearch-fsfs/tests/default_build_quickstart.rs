@@ -345,7 +345,11 @@ mod loader_only {
         }
     }
 
-    #[cfg(any(feature = "semantic-loaders", feature = "rerank"))]
+    #[cfg(any(
+        feature = "semantic-loaders",
+        feature = "rerank",
+        all(unix, feature = "semantic-support")
+    ))]
     fn active_generation_root(index: &Path) -> PathBuf {
         let Ok(pointer) = fs::read_to_string(index.join("FSFS-CURRENT")) else {
             return index.to_path_buf();
@@ -1379,6 +1383,299 @@ mod loader_only {
         verify_real_fast_model_cache_isolation(&fsfs, temp.path(), &index);
         verify_fast_empty_answer_cache(&fsfs, temp.path(), &index);
         verify_fast_answer_cache_generation_changes(&fsfs, temp.path(), &index);
+    }
+
+    #[cfg(all(unix, feature = "semantic-support"))]
+    #[test]
+    #[ignore = "real Model2Vec complete-generation cache replay; provision Potion and run with --ignored --nocapture"]
+    #[allow(clippy::too_many_lines)]
+    fn default_build_replays_complete_generation_fast_answers_without_loading_weights() {
+        use sha2::Digest as _;
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        log_binary_profile("complete-generation-fast-answer-cache");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let models = root.join("models");
+        let install = models.join("potion-multilingual-128M");
+        copy_verified_potion_install(
+            &configured_model_root().join("potion-multilingual-128M"),
+            &install,
+        );
+        let fsfs = IsolatedFsfs::new(root, models);
+        let corpus = root.join("corpus");
+        let index = root.join("index");
+        write_quickstart_corpus(&corpus);
+        let index_corpus = |label: &str, source: &Path| {
+            // Exercise the shipped Linux default, not an opt-in-only route.
+            // Other Unix hosts still require the explicit complete-store flag.
+            let env = if cfg!(target_os = "linux") {
+                Vec::new()
+            } else {
+                vec![("FSFS_COMPLETE_GENERATIONS", "1")]
+            };
+            let outcome = fsfs.run_with_env(
+                root,
+                label,
+                [
+                    "index",
+                    source.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--full",
+                    "--fast-only",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &env,
+            );
+            parse_success_envelope(label, &outcome);
+            assert!(is_complete_store(&index));
+        };
+        index_corpus("complete-cache-index", &corpus);
+        let selected = active_generation_root(&index);
+        let selection = fs::read(index.join("FSFS-CURRENT")).unwrap();
+        let snapshot = |path: &Path| {
+            let mut files = std::collections::BTreeMap::new();
+            let mut directories = vec![path.to_path_buf()];
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        directories.push(entry.path());
+                    } else {
+                        files.insert(
+                            entry.path().strip_prefix(path).unwrap().to_path_buf(),
+                            fs::read(entry.path()).unwrap(),
+                        );
+                    }
+                }
+            }
+            files
+        };
+        let bundle = snapshot(&selected);
+        assert!(!bundle.is_empty());
+        let query = "staggered reconnects after brief outages";
+        let formatted_search = |label: &str, uncached: bool, format: &str, filter: Option<&str>| {
+            let mut env = vec![("FRANKENSEARCH_LOG", "info")];
+            if uncached {
+                env.push(("FSFS_DISABLE_QUERY_CACHE", "1"));
+            }
+            let mut args = vec![
+                "search",
+                query,
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--no-daemon",
+                "--fast-only",
+                "--limit",
+                "3",
+                "--format",
+                format,
+            ];
+            if let Some(filter) = filter {
+                args.extend(["--filter", filter]);
+            }
+            fsfs.run_with_env(root, label, args, QUICKSTART_TIMEOUT, &env)
+        };
+        let search = |label: &str, uncached: bool| formatted_search(label, uncached, "json", None);
+        let cold = search("complete-cache-cold", false);
+        let original = parse_success_envelope("complete cache cold answer", &cold);
+        assert_eq!(cold.stderr.matches("Model2Vec model loaded").count(), 1);
+        assert!(
+            original["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| { hit["path"] == "retry.md" && hit["semantic_rank"].is_number() })
+        );
+        let cache_root = index.join("query_cache");
+        let matching_records = |filter: Option<&str>| {
+            snapshot(&cache_root)
+                .into_iter()
+                .filter_map(|(relative, bytes)| {
+                    let record: Value = serde_json::from_slice(&bytes).ok()?;
+                    (record["key"]["query"] == query && record["key"]["filter"].as_str() == filter)
+                        .then_some((cache_root.join(relative), bytes, record))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut records = matching_records(None);
+        assert_eq!(records.len(), 1, "persist one store-owned answer");
+        let (cache_path, cache_bytes, original_record) = records.pop().unwrap();
+        let assert_generation_binding = |record: &Value, generation: &Path| {
+            assert_eq!(
+                record["complete_generation"]["id"],
+                generation.file_name().unwrap().to_str().unwrap()
+            );
+            assert_eq!(
+                record["complete_generation"]["manifest_sha256"],
+                format!(
+                    "{:x}",
+                    sha2::Sha256::digest(fs::read(generation.join("FSFS-BUNDLE.json")).unwrap())
+                )
+            );
+        };
+        assert_generation_binding(&original_record, &selected);
+        let cache_modified = fs::metadata(&cache_path).unwrap().modified().unwrap();
+        let assert_preserved = || {
+            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            assert_eq!(
+                fs::metadata(&cache_path).unwrap().modified().unwrap(),
+                cache_modified
+            );
+            assert_eq!(fs::read(index.join("FSFS-CURRENT")).unwrap(), selection);
+            assert_eq!(snapshot(&selected), bundle);
+            assert!(!selected.join("query_cache").exists());
+        };
+        let mut warm_elapsed = Vec::new();
+        for ordinal in 0..3 {
+            let warm = search(&format!("complete-cache-warm-{ordinal}"), false);
+            let replayed = parse_success_envelope("complete cache warm answer", &warm);
+            assert_eq!(replayed["data"], original["data"]);
+            assert_eq!(warm.stderr.matches("Model2Vec model loaded").count(), 0);
+            assert!(warm.stderr.contains("model verification receipt accepted"));
+            assert_preserved();
+            warm_elapsed.push(warm.elapsed);
+        }
+        warm_elapsed.sort_unstable();
+        assert!(
+            warm_elapsed[1] * 2 < cold.elapsed,
+            "complete-generation replay must avoid model initialization: cold={:?} warm={warm_elapsed:?}",
+            cold.elapsed
+        );
+        let table = formatted_search("complete-cache-warm-table", false, "table", None);
+        assert!(!table.timed_out && table.status.success(), "{table:?}");
+        assert!(table.stdout.contains("retry.md"), "{table:?}");
+        assert_eq!(table.stderr.matches("Model2Vec model loaded").count(), 0);
+        assert!(table.stderr.contains("model verification receipt accepted"));
+        assert_preserved();
+
+        // A nonempty semantic request whose filter removes every hit still
+        // has a valid producer and must use the same replay path in both formats.
+        let empty_filter = "ext:fsfs-cache-no-match";
+        let empty_cold = formatted_search(
+            "complete-cache-empty-cold",
+            false,
+            "json",
+            Some(empty_filter),
+        );
+        let empty_payload = parse_success_envelope("complete cache empty answer", &empty_cold);
+        assert_eq!(
+            empty_cold.stderr.matches("Model2Vec model loaded").count(),
+            1
+        );
+        assert_eq!(empty_payload["data"]["returned_hits"], 0);
+        assert!(empty_payload["data"]["hits"].as_array().unwrap().is_empty());
+        let mut empty_records = matching_records(Some(empty_filter));
+        assert_eq!(empty_records.len(), 1);
+        let (empty_path, empty_bytes, empty_record) = empty_records.pop().unwrap();
+        let empty_modified = fs::metadata(&empty_path).unwrap().modified().unwrap();
+        assert_generation_binding(&empty_record, &selected);
+        for format in ["json", "table"] {
+            let warm = formatted_search(
+                &format!("complete-cache-empty-warm-{format}"),
+                false,
+                format,
+                Some(empty_filter),
+            );
+            assert!(!warm.timed_out && warm.status.success(), "{warm:?}");
+            if format == "json" {
+                let replayed = parse_success_envelope("complete cache empty replay", &warm);
+                assert_eq!(replayed["data"], empty_payload["data"]);
+            }
+            assert_eq!(warm.stderr.matches("Model2Vec model loaded").count(), 0);
+            assert!(warm.stderr.contains("model verification receipt accepted"));
+            assert_eq!(fs::read(&empty_path).unwrap(), empty_bytes);
+            assert_eq!(
+                fs::metadata(&empty_path).unwrap().modified().unwrap(),
+                empty_modified
+            );
+            assert_preserved();
+        }
+        let assert_refused = |label: &str| {
+            let cached = search(&format!("complete-cache-{label}"), false);
+            let uncached = search(&format!("complete-uncached-{label}"), true);
+            assert_same_fast_producer_refusal(label, &cached, &uncached);
+            assert_preserved();
+        };
+        let retained_install = root.join("retained-model-install");
+        fs::rename(&install, &retained_install).unwrap();
+        assert_refused("missing-producer");
+        fs::rename(&retained_install, &install).unwrap();
+
+        let weights_path = install.join("model.safetensors");
+        let mut weights = File::options()
+            .read(true)
+            .write(true)
+            .open(&weights_path)
+            .unwrap();
+        let original_mtime = weights.metadata().unwrap().modified().unwrap();
+        weights.seek(SeekFrom::End(-1)).unwrap();
+        let mut original_byte = [0];
+        weights.read_exact(&mut original_byte).unwrap();
+        weights.seek(SeekFrom::End(-1)).unwrap();
+        weights.write_all(&[original_byte[0] ^ 1]).unwrap();
+        weights.sync_all().unwrap();
+        weights.set_modified(original_mtime).unwrap();
+        assert_refused("changed-producer-restored-mtime");
+        weights.seek(SeekFrom::End(-1)).unwrap();
+        weights.write_all(&original_byte).unwrap();
+        weights.sync_all().unwrap();
+        drop(weights);
+        frankensearch_embed::model_manifest::verify_dir_and_record(
+            &ModelManifest::potion_128m(),
+            &install,
+        )
+        .unwrap();
+        let restored = search("complete-cache-restored-producer", false);
+        let restored_payload =
+            parse_success_envelope("restored complete-cache producer", &restored);
+        assert_eq!(restored_payload["data"], original["data"]);
+        assert_eq!(restored.stderr.matches("Model2Vec model loaded").count(), 0);
+        assert_preserved();
+
+        // A successor must not reuse the predecessor's answer even when the
+        // query and exact producer remain unchanged. Keep that old answer on
+        // disk as a delayed writer could, and preserve every predecessor byte.
+        let successor_source = root.join("successor-corpus");
+        fs::create_dir(&successor_source).unwrap();
+        fs::write(successor_source.join("successor.md"), RETRY_DOCUMENT).unwrap();
+        index_corpus("complete-cache-successor-index", &successor_source);
+        let successor = active_generation_root(&index);
+        assert_ne!(successor, selected);
+        assert_eq!(snapshot(&selected), bundle);
+        let successor_bundle = snapshot(&successor);
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, &cache_bytes).unwrap();
+        let fresh = search("complete-cache-successor-cold", false);
+        let fresh_payload = parse_success_envelope("complete cache successor answer", &fresh);
+        assert_eq!(fresh.stderr.matches("Model2Vec model loaded").count(), 1);
+        let hits = fresh_payload["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{fresh_payload}");
+        assert_eq!(hits[0]["path"], "successor.md", "{fresh_payload}");
+        assert!(hits[0]["semantic_rank"].is_number(), "{fresh_payload}");
+        let mut successor_records = matching_records(None);
+        assert_eq!(successor_records.len(), 1);
+        let (successor_cache_path, _, successor_record) = successor_records.pop().unwrap();
+        assert_eq!(successor_cache_path, cache_path);
+        assert_ne!(
+            successor_record["index_fingerprint"],
+            original_record["index_fingerprint"]
+        );
+        assert_generation_binding(&successor_record, &successor);
+        assert_eq!(successor_record["key"], original_record["key"]);
+        let successor_cache = snapshot(&cache_root);
+        let warm = search("complete-cache-successor-warm", false);
+        let warm_payload = parse_success_envelope("complete cache successor replay", &warm);
+        assert_eq!(warm_payload["data"], fresh_payload["data"]);
+        assert_eq!(warm.stderr.matches("Model2Vec model loaded").count(), 0);
+        assert!(warm.stderr.contains("model verification receipt accepted"));
+        assert_eq!(snapshot(&cache_root), successor_cache);
+        assert_eq!(snapshot(&selected), bundle);
+        assert_eq!(snapshot(&successor), successor_bundle);
+        assert!(!successor.join("query_cache").exists());
     }
 
     #[cfg(all(unix, feature = "semantic-support"))]

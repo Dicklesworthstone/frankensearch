@@ -57,6 +57,61 @@ type SessionState = (
 );
 type SharedSession = Arc<asupersync::sync::Mutex<SessionState>>;
 
+/// The values a request observed, before its private cache can reject or
+/// replace them. Generation and resource-mode changes invalidate this evidence.
+struct CompleteDaemonCacheSnapshot {
+    generation: crate::generation_store::PublishedGeneration,
+    resource_mode: SearchExecutionMode,
+    entries: HashMap<super::super::SearchCacheKey, Vec<crate::output_schema::SearchPayload>>,
+}
+
+impl CompleteDaemonCacheSnapshot {
+    fn reconcile(
+        &self,
+        shared: &mut SessionState,
+        session: &LiveRetainedSearchReader,
+        completed: HashMap<super::super::SearchCacheKey, Vec<crate::output_schema::SearchPayload>>,
+        successful: bool,
+    ) {
+        if shared.0.generation() != session.generation()
+            || shared.0.reader.resources.resource_mode != session.reader.resources.resource_mode
+        {
+            return;
+        }
+        let original = (&self.generation == session.generation()
+            && self.resource_mode == session.reader.resources.resource_mode)
+            .then_some(&self.entries);
+        if let Some(original) = original {
+            for (key, expected) in original {
+                // Rejection is request-local until it reaches this shared
+                // cache. Never erase a different answer a concurrent request
+                // installed after our snapshot, including on a failed reply.
+                if !completed.contains_key(key) && shared.1.get(key) == Some(expected) {
+                    shared.1.remove(key);
+                }
+            }
+        }
+        if !successful {
+            return;
+        }
+        for (key, value) in completed {
+            let expected = original.and_then(|entries| entries.get(&key));
+            if expected == Some(&value) || shared.1.get(&key) != expected {
+                continue;
+            }
+            // A rejected answer may have been recomputed under the same key.
+            // Install that replacement as well as new keys, without clearing
+            // unrelated answers merely because an existing entry changed.
+            if !shared.1.contains_key(&key)
+                && shared.1.len() >= super::super::FSFS_DAEMON_MAX_CACHE_ENTRIES
+            {
+                shared.1.clear();
+            }
+            shared.1.insert(key, value);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerOutcome {
     Search,
@@ -547,10 +602,11 @@ impl FsfsRuntime {
                         .await;
                     }
                 };
-                let original_keys = cache
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::HashSet<_>>();
+                let original_cache = CompleteDaemonCacheSnapshot {
+                    generation: session.generation().clone(),
+                    resource_mode: session.reader.resources.resource_mode,
+                    entries: cache.clone(),
+                };
                 let result = if forwarding::is_forwarded(&bytes) {
                     // Forwarded and raw requests retain the same generation,
                     // cache, configuration admission and no-replay contracts.
@@ -609,44 +665,51 @@ impl FsfsRuntime {
                     ))
                     .await
                 };
-                retained_search_checkpoint(cx)?;
-                if result.is_ok() {
-                    let mut state =
-                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), cx)
-                            .await
-                            .map_err(|error| {
-                                complete_cli_error("daemon_completion", &error.to_string())
-                            })?;
-                    if state.0.generation() == session.generation() {
-                        let current = &mut state.0.reader.resources;
-                        let completed = &mut session.reader.resources;
-                        if current.resource_mode == completed.resource_mode {
-                            if current.fast_embedder.is_none() && completed.fast_embedder.is_some()
-                            {
-                                current.fast_embedder = completed.fast_embedder.take();
-                                current.fast_embedder_attempted = true;
-                            }
-                            if current.quality_embedder.is_none()
-                                && completed.quality_embedder.is_some()
-                            {
-                                current.quality_embedder = completed.quality_embedder.take();
-                                current.quality_embedder_attempted = true;
-                            }
-                        }
-                        if cache_enabled {
-                            for (key, value) in cache {
-                                if !original_keys.contains(&key) {
-                                    if state.1.len() >= super::super::FSFS_DAEMON_MAX_CACHE_ENTRIES
-                                    {
-                                        state.1.clear();
-                                    }
-                                    state.1.insert(key, value);
+                let mut state = if let Ok(state) = shared.try_lock_owned() {
+                    state
+                } else {
+                    match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), cx).await {
+                        Ok(state) => state,
+                        Err(error) => {
+                            return match result {
+                                Err(original) => Err(original),
+                                Ok(_) => {
+                                    Err(complete_cli_error("daemon_completion", &error.to_string()))
                                 }
-                            }
+                            };
+                        }
+                    }
+                };
+                // Rejected local entries still need eviction when this peer
+                // was cancelled. Do not admit new results after cancellation.
+                let checkpoint = retained_search_checkpoint(cx);
+                if cache_enabled {
+                    original_cache.reconcile(
+                        &mut state,
+                        &session,
+                        cache,
+                        result.is_ok() && checkpoint.is_ok(),
+                    );
+                }
+                let outcome = result?;
+                checkpoint?;
+                if state.0.generation() == session.generation() {
+                    let current = &mut state.0.reader.resources;
+                    let completed = &mut session.reader.resources;
+                    if current.resource_mode == completed.resource_mode {
+                        if current.fast_embedder.is_none() && completed.fast_embedder.is_some() {
+                            current.fast_embedder = completed.fast_embedder.take();
+                            current.fast_embedder_attempted = true;
+                        }
+                        if current.quality_embedder.is_none()
+                            && completed.quality_embedder.is_some()
+                        {
+                            current.quality_embedder = completed.quality_embedder.take();
+                            current.quality_embedder_attempted = true;
                         }
                     }
                 }
-                result
+                Ok(outcome)
             }),
         ))
         .await
@@ -685,7 +748,8 @@ impl FsfsRuntime {
             }
         }
         // The existing cache has at most eight entries. Each request owns its
-        // working set; only newly completed keys are merged after generation fencing.
+        // working set; completed changes are merged after generation fencing
+        // only while their originally observed shared values still match.
         Ok((
             LiveRetainedSearchReader {
                 store: state.0.store.clone(),
@@ -2402,6 +2466,363 @@ mod generation_tests {
             );
             cx.set_cancel_requested(false);
         });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    struct CacheAdmissionEmbedder {
+        inner: Arc<dyn frankensearch_core::Embedder>,
+        refuse: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+        before_identity: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        before_embed: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[cfg(feature = "semantic-support")]
+    impl frankensearch_core::Embedder for CacheAdmissionEmbedder {
+        fn embed<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> frankensearch_core::SearchFuture<'a, Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let hook = self.before_embed.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.embed(cx, text)
+        }
+
+        fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+            let hook = self.before_identity.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(SearchError::UnverifiableRemoteSpace {
+                    producer: self.inner.id().to_owned(),
+                    reason: "test producer no longer verifies".to_owned(),
+                });
+            }
+            self.inner.identity()
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn is_semantic(&self) -> bool {
+            self.inner.is_semantic()
+        }
+
+        fn category(&self) -> frankensearch_core::ModelCategory {
+            self.inner.category()
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    async fn complete_cache_fixture(
+        cx: &Cx,
+        parent: &Path,
+    ) -> (
+        FsfsRuntime,
+        SharedSession,
+        Arc<CacheAdmissionEmbedder>,
+        BoundCompleteSocket,
+    ) {
+        let (base, root) = published_daemon_fixture(cx, parent).await;
+        let mut session = base.open_live_retained_search(cx, &root).await.unwrap();
+        let vectors = parent.join("unit-vectors");
+        fs::create_dir(&vectors).unwrap();
+        // Real FSVI readers and analytically defined query vectors exercise
+        // cache admission; this fixture makes no real-model performance claim.
+        let mut resources = crate::runtime::tests::published_blend_resources(&vectors);
+        let producer = Arc::new(CacheAdmissionEmbedder {
+            inner: resources.quality_embedder.take().unwrap().embedder,
+            refuse: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            before_identity: std::sync::Mutex::new(None),
+            before_embed: std::sync::Mutex::new(None),
+        });
+        resources.quality_embedder = Some(crate::runtime::tests::admitted_shared(&producer));
+        let mut config = FsfsConfig::default();
+        config.search.rerank = false;
+        config.search.quality_timeout_ms = 5_000;
+        let runtime = FsfsRuntime::new(config)
+            .with_daemon_coalescers()
+            .with_cli_input(CliInput {
+                index_dir: Some(vectors),
+                ..CliInput::default()
+            });
+        session.reader.runtime = runtime.clone();
+        session.reader.resources = resources;
+        let shared = Arc::new(asupersync::sync::Mutex::new((session, HashMap::new())));
+        let bound = BoundCompleteSocket::bind(root.join("cache-propagation.sock")).unwrap();
+        (runtime, shared, producer, bound)
+    }
+
+    #[cfg(feature = "semantic-support")]
+    async fn complete_cache_exchange(
+        cx: &Cx,
+        runtime: &FsfsRuntime,
+        shared: &SharedSession,
+        bound: &BoundCompleteSocket,
+    ) -> serde_json::Value {
+        let mut client = UnixStream::connect(&bound.path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client
+            .write_all(b"{\"query\":\"how to recover network requests\",\"mode\":\"quality_only\",\"limit\":10,\"rerank\":false}\n")
+            .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let timeout = Duration::from_secs(10);
+        let mut intake = admission::Intake::new(timeout);
+        let peer = intake
+            .next(cx, &bound.listener, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = runtime
+            .execute_complete_daemon_peer(cx, Arc::clone(shared), peer, timeout, true)
+            .await
+            .unwrap();
+        assert_eq!(outcome, PeerOutcome::Search);
+        let mut line = String::new();
+        std::io::BufReader::new(client)
+            .read_line(&mut line)
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_daemon_evicts_rejected_answers_and_preserves_concurrent_replacements() {
+        for concurrent_replacement in [false, true] {
+            let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 2)
+                .build()
+                .unwrap();
+            scheduler.block_on(async {
+                let cx = Cx::current().unwrap();
+                let directory = tempfile::tempdir_in("/tmp").unwrap();
+                let (runtime, shared, producer, bound) =
+                    complete_cache_fixture(&cx, directory.path()).await;
+                let cold = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(cold["ok"], true, "{cold}");
+                assert_eq!(cold["cached"], false);
+                let (key, original) = shared
+                    .try_lock_owned()
+                    .unwrap()
+                    .1
+                    .iter()
+                    .next()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .unwrap();
+                let warm = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(warm["cached"], true, "{warm}");
+                let calls = producer.calls.load(Ordering::SeqCst);
+                let mut replacement = original.clone();
+                replacement[0].hits[0].path = "concurrent-answer.rs".to_owned();
+                if concurrent_replacement {
+                    let state = Arc::downgrade(&shared);
+                    let key = key.clone();
+                    let value = replacement.clone();
+                    *producer.before_identity.lock().unwrap() = Some(Box::new(move || {
+                        state
+                            .upgrade()
+                            .unwrap()
+                            .try_lock_owned()
+                            .unwrap()
+                            .1
+                            .insert(key, value);
+                    }));
+                }
+                producer.refuse.store(true, Ordering::SeqCst);
+                let refused = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(refused["ok"], false, "{refused}");
+                assert!(refused["payloads"].as_array().unwrap().is_empty());
+                assert_eq!(producer.calls.load(Ordering::SeqCst), calls);
+                {
+                    let state = shared.try_lock_owned().unwrap();
+                    if concurrent_replacement {
+                        assert_eq!(state.1.get(&key), Some(&replacement));
+                    } else {
+                        assert!(
+                            !state.1.contains_key(&key),
+                            "a rejected answer survived in the shared daemon cache"
+                        );
+                    }
+                }
+                if !concurrent_replacement {
+                    producer.refuse.store(false, Ordering::SeqCst);
+                    let recovered = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                    assert_eq!(recovered["ok"], true, "{recovered}");
+                    assert_eq!(recovered["cached"], false);
+                    assert_eq!(recovered["payloads"], cold["payloads"]);
+                    assert_eq!(producer.calls.load(Ordering::SeqCst), calls + 1);
+                    let replayed = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                    assert_eq!(replayed["cached"], true, "{replayed}");
+                    assert_eq!(producer.calls.load(Ordering::SeqCst), calls + 1);
+                }
+            });
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_daemon_publishes_recomputed_existing_cache_entries() {
+        for concurrent_replacement in [false, true] {
+            let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 2)
+                .build()
+                .unwrap();
+            scheduler.block_on(async {
+                let cx = Cx::current().unwrap();
+                let directory = tempfile::tempdir_in("/tmp").unwrap();
+                let (runtime, shared, producer, bound) =
+                    complete_cache_fixture(&cx, directory.path()).await;
+                let cold = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(cold["ok"], true, "{cold}");
+                let (key, mut original) = shared
+                    .try_lock_owned()
+                    .unwrap()
+                    .1
+                    .iter()
+                    .next()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .unwrap();
+                // A retained transient failure must be recomputed. It cannot
+                // keep poisoning this key after the real retrieval succeeds.
+                original[0].phase = crate::output_schema::SearchOutputPhase::RefinementFailed;
+                shared
+                    .try_lock_owned()
+                    .unwrap()
+                    .1
+                    .insert(key.clone(), original.clone());
+                let mut replacement = original;
+                replacement[0].hits[0].path = "concurrent-answer.rs".to_owned();
+                if concurrent_replacement {
+                    let state = Arc::downgrade(&shared);
+                    let key = key.clone();
+                    let value = replacement.clone();
+                    *producer.before_embed.lock().unwrap() = Some(Box::new(move || {
+                        state
+                            .upgrade()
+                            .unwrap()
+                            .try_lock_owned()
+                            .unwrap()
+                            .1
+                            .insert(key, value);
+                    }));
+                }
+                let calls = producer.calls.load(Ordering::SeqCst);
+                let recomputed = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(recomputed["ok"], true, "{recomputed}");
+                assert_eq!(recomputed["cached"], false);
+                assert_eq!(recomputed["payloads"], cold["payloads"]);
+                assert_eq!(producer.calls.load(Ordering::SeqCst), calls + 1);
+                if concurrent_replacement {
+                    assert_eq!(
+                        shared.try_lock_owned().unwrap().1.get(&key),
+                        Some(&replacement)
+                    );
+                } else {
+                    let replayed = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                    assert_eq!(replayed["cached"], true, "{replayed}");
+                    assert_eq!(replayed["payloads"], cold["payloads"]);
+                    assert_eq!(producer.calls.load(Ordering::SeqCst), calls + 1);
+                }
+            });
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_daemon_rejected_completion_preserves_new_generation_or_mode() {
+        for publish_generation in [false, true] {
+            let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 2)
+                .build()
+                .unwrap();
+            scheduler.block_on(async {
+                let cx = Cx::current().unwrap();
+                let directory = tempfile::tempdir_in("/tmp").unwrap();
+                let (runtime, shared, producer, bound) =
+                    complete_cache_fixture(&cx, directory.path()).await;
+                let cold = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(cold["ok"], true, "{cold}");
+                let (mut replacement, expected_cache) = runtime
+                    .snapshot_complete_daemon(&cx, &shared, false)
+                    .await
+                    .unwrap();
+                assert_eq!(expected_cache.len(), 1);
+                let next_pointer = if publish_generation {
+                    let root = replacement.store.root().to_path_buf();
+                    let pointer = root.join(COMPLETE_GENERATION_POINTER);
+                    let previous = fs::read(&pointer).unwrap();
+                    let mut config = FsfsConfig::default();
+                    "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+                    config.indexing.offline = true;
+                    config.indexing.quality_model.clear();
+                    config.search.fast_only = true;
+                    config.search.rerank = false;
+                    let source = directory.path().join("source");
+                    fs::write(source.join("beta.md"), "sharedtoken beta document").unwrap();
+                    let builder = FsfsRuntime::new(config).with_cli_input(CliInput {
+                        target_path: Some(source),
+                        index_dir: Some(root.clone()),
+                        quiet: true,
+                        ..CliInput::default()
+                    });
+                    builder
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap();
+                    let mut successor =
+                        builder.open_live_retained_search(&cx, &root).await.unwrap();
+                    assert_ne!(successor.generation(), replacement.generation());
+                    // Keep the analytical producers identical so payload equality
+                    // alone cannot protect the newly admitted generation.
+                    successor.reader.runtime = runtime.clone();
+                    successor.reader.resources = replacement.reader.resources;
+                    replacement = successor;
+                    let next = fs::read(&pointer).unwrap();
+                    fs::write(&pointer, previous).unwrap();
+                    Some((pointer, next))
+                } else {
+                    replacement.reader.resources.resource_mode = SearchExecutionMode::LexicalOnly;
+                    None
+                };
+                let expected_generation = replacement.generation().clone();
+                let expected_mode = replacement.reader.resources.resource_mode;
+                let state = Arc::downgrade(&shared);
+                *producer.before_identity.lock().unwrap() = Some(Box::new(move || {
+                    if let Some((pointer, next)) = next_pointer {
+                        fs::write(pointer, next).unwrap();
+                    }
+                    state.upgrade().unwrap().try_lock_owned().unwrap().0 = replacement;
+                }));
+                producer.refuse.store(true, Ordering::SeqCst);
+                let refused = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(refused["ok"], false, "{refused}");
+                assert!(refused["payloads"].as_array().unwrap().is_empty());
+                let state = shared.try_lock_owned().unwrap();
+                assert_eq!(state.0.generation(), &expected_generation);
+                assert_eq!(state.0.reader.resources.resource_mode, expected_mode);
+                assert_eq!(
+                    state.1, expected_cache,
+                    "a rejected older request must not evict a newer generation or mode"
+                );
+            });
+        }
     }
 
     #[cfg(feature = "semantic-support")]

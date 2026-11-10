@@ -56,12 +56,30 @@ def metadata_fixture():
     }
 
 
+def complete_generation_fixture(index, version=2):
+    """Only pointer framing/tree inventory; not a valid fsfs generation or evidence."""
+    generation_id = "g-" + "a" * 32 + "-" + "b" * 8 + "-" + "c" * 16
+    bundle = index / "generations" / generation_id
+    bundle.mkdir(parents=True)
+    manifest = bundle / "FSFS-BUNDLE.json"
+    manifest.write_bytes(b'{"fixture_only": true}\n')
+    (bundle / "vectors.fixture").write_bytes(b"fixture-only sealed artifact")
+    generation = {"id": generation_id, "manifest_sha256": bench.sha256_file(manifest)}
+    pointer = (f"FSFS-COMPLETE-GENERATION-v{version}\n{generation_id}\n"
+               f'{generation["manifest_sha256"]}\n')
+    if version == 2:
+        pointer += "d" * 64 + "\n"
+    (index / "FSFS-CURRENT").write_text(pointer, encoding="utf-8")
+    return generation
+
+
 class FixtureRunner:
     """In-memory protocol stand-in, intentionally incapable of writing a result receipt."""
 
-    def __init__(self, output, mode):
+    def __init__(self, output, mode, layout="legacy"):
         self.output = output
         self.mode = mode
+        self.layout = layout
         self.calls = []
 
     def invoke(self, binary, label, command):
@@ -76,14 +94,23 @@ class FixtureRunner:
                 "models": [{"id": bench.MODEL_ID, "state": "verified", "verified": True}],
             }}
         elif label == "setup-index":
-            Path(command[command.index("--index-dir") + 1]).mkdir()
-        elif label.endswith("-cold"):
+            index = Path(command[command.index("--index-dir") + 1])
+            index.mkdir()
+            if self.layout == "complete":
+                complete_generation_fixture(index)
+        elif (label.endswith("-cold") and self.layout == "legacy"
+              or self.layout == "complete" and label.startswith("candidate-")
+              and label.endswith(("-cold", "-semantic-control"))):
             index = Path(command[command.index("--index-dir") + 1])
             (index / "query_cache").mkdir()
-            (index / "query_cache" / "fixture-only.json").write_bytes(b'{"fixture_only": true}')
+            record = {"fixture_only": True}
+            if self.layout == "complete":
+                record["complete_generation"] = bench.complete_generation_snapshot(index)["generation"]
+            bench.write_json(index / "query_cache" / "fixture-only.json", record)
         if "--filter" in command:
             response["data"].update(hits=[], returned_hits=0)
-            if label.startswith("baseline-") and label.endswith("-warm"):
+            if (self.layout == "legacy" and label.startswith("baseline-")
+                    and label.endswith("-warm")):
                 index = Path(command[command.index("--index-dir") + 1])
                 path = index / "query_cache" / "fixture-only.json"
                 stamp = path.stat()
@@ -129,11 +156,32 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(getattr(args, name).parent, self.root)
         self.assertEqual(args.receipt_mode, "valid")
         self.assertEqual(args.scenario, "semantic-hits")
+        self.assertEqual(args.layout, "legacy")
+        self.assertEqual(bench.parse_args(self.arguments(layout="complete")).layout, "complete")
         for option in (["--rounds", "0"], ["--timeout-seconds", "nan"],
-                       ["--receipt-mode", "unknown"], ["--scenario", "unknown"]):
+                       ["--receipt-mode", "unknown"], ["--scenario", "unknown"],
+                       ["--layout", "unknown"]):
             with self.subTest(option=option), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     bench.parse_args(self.arguments() + option)
+
+    def test_selected_layout_replaces_inherited_runtime_overrides(self):
+        for layout in bench.LAYOUTS:
+            output = self.root / layout
+            output.mkdir()
+            with mock.patch.dict(os.environ, {
+                "FSFS_COMPLETE_GENERATIONS": "inherited", "FSFS_TEST_ONLY": "inherited",
+                "FRANKENSEARCH_MODEL_DIR": "inherited", "FRANKENSEARCH_OFFLINE": "0",
+                "HF_HOME": "inherited", "HUGGINGFACE_HUB_CACHE": "inherited",
+            }):
+                environment = bench.runtime_environment(output, layout)
+            self.assertEqual(environment["FSFS_COMPLETE_GENERATIONS"],
+                             str(int(layout == "complete")))
+            self.assertEqual(environment["FRANKENSEARCH_OFFLINE"], "1")
+            self.assertEqual(environment["FRANKENSEARCH_ALLOW_DOWNLOAD"], "0")
+            self.assertEqual(environment["FRANKENSEARCH_MODEL_DIR"], str(output / "models"))
+            for key in ("FSFS_TEST_ONLY", "HF_HOME", "HUGGINGFACE_HUB_CACHE"):
+                self.assertNotIn(key, environment)
 
     def test_output_cannot_overlap_inputs_or_reuse_previous_evidence(self):
         with chdir(self.root):
@@ -480,6 +528,178 @@ class HarnessTests(unittest.TestCase):
         (index / "query_cache" / "two.json").write_bytes(b"fixture-only")
         with self.assertRaisesRegex(bench.BenchmarkError, "found 2"):
             bench.cache_snapshot(index)
+
+    def test_complete_layout_keeps_baseline_uncached_and_candidate_bound_to_sealed_bundle(self):
+        for scenario in bench.SCENARIOS:
+            for mode in ("valid", "absent", "malformed"):
+                with self.subTest(scenario=scenario, mode=mode):
+                    output = self.root / f"{scenario}-{mode}"
+                    (output / "models" / bench.MODEL_DIRECTORY).mkdir(parents=True)
+                    runner = FixtureRunner(output, mode, "complete")
+                    binaries = {arm: self.root / (arm + "-fixture-only") for arm in bench.ARMS}
+                    template, config, state = bench.setup_fixture(
+                        runner, binaries, output, mode, "complete")
+                    original = bench.complete_generation_snapshot(template)
+                    controls = bench.run_semantic_controls(
+                        runner, binaries, output, template, config, state, "complete"
+                    ) if scenario == "filtered-empty" else None
+                    rows = bench.run_rounds(
+                        runner, binaries, output, template, config, 2, state,
+                        scenario, controls, "complete")
+                    self.assertEqual(len(rows), 8)
+                    self.assertEqual(bench.complete_generation_snapshot(template), original)
+                    self.assertFalse((template / "query_cache").exists())
+                    expected_order = [
+                        "baseline-0-cold", "baseline-0-warm", "candidate-0-cold", "candidate-0-warm",
+                        "candidate-1-cold", "candidate-1-warm", "baseline-1-cold", "baseline-1-warm",
+                    ]
+                    self.assertEqual([label for _, label, _ in runner.calls[-8:]], expected_order)
+                    for row in rows:
+                        cached = row["arm"] == "candidate"
+                        self.assertEqual(row["layout"], "complete")
+                        self.assertEqual(row["scenario"], scenario)
+                        self.assertEqual(row["cache_record_count"], int(cached))
+                        self.assertEqual(row["cache_sha256"] is not None, cached)
+                        self.assertEqual(row["model_loads"],
+                                         int(row["phase"] == "cold" or not cached))
+                        self.assertEqual(row["complete_generation"], original["generation"])
+                        self.assertEqual(row["sealed_bundle_inventory"], original["inventory"])
+                        self.assertEqual(row["selection_pointer_sha256"], original["pointer_sha256"])
+                        for field in ("warm_payload_identical", "cache_bytes_unchanged",
+                                      "cache_mtime_unchanged", "sealed_bundle_unchanged"):
+                            self.assertTrue(row[field])
+                    if controls is not None:
+                        for arm in bench.ARMS:
+                            self.assertTrue(controls[arm]["response"]["data"]["hits"])
+                            self.assertEqual(controls[arm]["model_loads"], 1)
+                            self.assertEqual(controls[arm]["complete_generation"], original["generation"])
+                            control_index = output / f"{arm}-semantic-control-index"
+                            self.assertEqual(len(list((control_index / "query_cache").glob("*.json"))),
+                                             int(arm == "candidate"))
+                    bench.summarize(rows, 2)
+
+    def test_complete_snapshot_requires_valid_pointer_framing_and_manifest_digest(self):
+        for version in (1, 2):
+            index = self.root / f"version-{version}"
+            generation = complete_generation_fixture(index, version)
+            self.assertEqual(bench.complete_generation_snapshot(index)["generation"], generation)
+        malformed = [
+            b"not-a-pointer", b"\xff", b"x" * 257,
+            b"FSFS-COMPLETE-GENERATION-v1\n../escape\n" + b"a" * 64 + b"\n",
+        ]
+        for ordinal, contents in enumerate(malformed):
+            index = self.root / f"malformed-{ordinal}"
+            complete_generation_fixture(index)
+            (index / "FSFS-CURRENT").write_bytes(contents)
+            with self.subTest(case=ordinal), self.assertRaises(bench.BenchmarkError):
+                bench.complete_generation_snapshot(index)
+        index = self.root / "changed-manifest"
+        generation = complete_generation_fixture(index)
+        (index / "generations" / generation["id"] / "FSFS-BUNDLE.json").write_bytes(b"changed")
+        with self.assertRaisesRegex(bench.BenchmarkError, "manifest digest differs"):
+            bench.complete_generation_snapshot(index)
+        index = self.root / "missing-generation"
+        generation = complete_generation_fixture(index)
+        bundle = index / "generations" / generation["id"]
+        bundle.rename(bundle.with_name("moved-aside"))
+        with self.assertRaisesRegex(bench.BenchmarkError, "missing or indirect"):
+            bench.complete_generation_snapshot(index)
+
+    def test_complete_layout_refuses_cache_and_bundle_drift_during_either_request(self):
+        cases = [
+            ("baseline-cache", "baseline-0-cold", "expected 0 persisted"),
+            ("missing-cache", "candidate-0-cold", "expected 1 persisted"),
+            ("extra-cache", "candidate-0-warm", "expected 1 persisted"),
+            ("missing-stamp", "candidate-0-cold", "exact selected complete generation"),
+            ("wrong-id", "candidate-0-warm", "exact selected complete generation"),
+            ("wrong-digest", "candidate-0-cold", "exact selected complete generation"),
+            ("invalid-cache", "candidate-0-warm", "invalid complete-generation cache"),
+            ("bundle-bytes", "baseline-0-cold", "sealed bundle changed"),
+            ("bundle-rewrite", "candidate-0-warm", "sealed bundle changed"),
+            ("pointer-change", "baseline-0-warm", "sealed bundle changed"),
+            ("bundled-cache", "candidate-0-cold", "outside the sealed"),
+            ("cache-rewrite", "candidate-0-warm", "warm cache was rewritten"),
+        ]
+        for case, trigger, error in cases:
+            output = self.root / case
+            (output / "models" / bench.MODEL_DIRECTORY).mkdir(parents=True)
+            runner = FixtureRunner(output, "valid", "complete")
+            binaries = {arm: self.root / (arm + "-fixture-only") for arm in bench.ARMS}
+            template, config, state = bench.setup_fixture(
+                runner, binaries, output, "valid", "complete")
+            invoke = runner.invoke
+
+            def corrupt_search(binary, label, command):
+                result = invoke(binary, label, command)
+                if label != trigger:
+                    return result
+                index = Path(command[command.index("--index-dir") + 1])
+                generation = bench.complete_generation_snapshot(index)["generation"]
+                bundle = index / "generations" / generation["id"]
+                cache = index / "query_cache" / "fixture-only.json"
+                if case == "baseline-cache":
+                    cache.parent.mkdir()
+                    cache.write_bytes(b"unexpected baseline answer")
+                elif case == "missing-cache":
+                    cache.rename(index / "moved-answer.json")
+                elif case == "extra-cache":
+                    (cache.parent / "extra.json").write_bytes(cache.read_bytes())
+                elif case in ("missing-stamp", "wrong-id", "wrong-digest"):
+                    record = json.loads(cache.read_bytes())
+                    if case == "missing-stamp":
+                        record.pop("complete_generation")
+                    else:
+                        field = "id" if case == "wrong-id" else "manifest_sha256"
+                        record["complete_generation"][field] = "foreign-generation"
+                    bench.write_json(cache, record)
+                elif case == "invalid-cache":
+                    cache.write_bytes(b"not-json")
+                elif case == "bundle-bytes":
+                    (bundle / "vectors.fixture").write_bytes(b"changed sealed artifact")
+                elif case == "bundle-rewrite":
+                    path = bundle / "vectors.fixture"
+                    stamp = path.stat()
+                    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1))
+                elif case == "pointer-change":
+                    path = index / "FSFS-CURRENT"
+                    path.write_bytes(path.read_bytes().replace(b"d" * 64, b"e" * 64))
+                elif case == "bundled-cache":
+                    (bundle / "query_cache").mkdir()
+                elif case == "cache-rewrite":
+                    stamp = cache.stat()
+                    os.utime(cache, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1))
+                return result
+
+            with mock.patch.object(runner, "invoke", side_effect=corrupt_search):
+                with self.subTest(case=case), self.assertRaisesRegex(bench.BenchmarkError, error):
+                    bench.run_rounds(runner, binaries, output, template, config, 1, state,
+                                     layout="complete")
+
+    def test_complete_semantic_control_enforces_generation_integrity_before_empty_measurement(self):
+        for target in bench.ARMS:
+            output = self.root / target
+            (output / "models" / bench.MODEL_DIRECTORY).mkdir(parents=True)
+            runner = FixtureRunner(output, "valid", "complete")
+            binaries = {arm: self.root / (arm + "-fixture-only") for arm in bench.ARMS}
+            template, config, state = bench.setup_fixture(
+                runner, binaries, output, "valid", "complete")
+            invoke = runner.invoke
+
+            def corrupt_control(binary, label, command):
+                result = invoke(binary, label, command)
+                if label == f"{target}-semantic-control":
+                    index = Path(command[command.index("--index-dir") + 1])
+                    generation = bench.complete_generation_snapshot(index)["generation"]
+                    (index / "generations" / generation["id"] / "new.fixture").write_bytes(b"changed")
+                return result
+
+            with mock.patch.object(runner, "invoke", side_effect=corrupt_control):
+                with self.subTest(target=target), self.assertRaisesRegex(
+                        bench.BenchmarkError, "sealed bundle changed"):
+                    bench.run_semantic_controls(
+                        runner, binaries, output, template, config, state, "complete")
+            self.assertFalse(any(label.endswith(("-cold", "-warm"))
+                                 for _, label, _ in runner.calls))
 
     def test_verify_precedes_index_and_paired_order_alternates_in_every_receipt_mode(self):
         for mode in ("valid", "absent", "malformed"):

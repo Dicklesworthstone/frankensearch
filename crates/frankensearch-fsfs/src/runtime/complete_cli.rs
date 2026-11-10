@@ -1287,28 +1287,127 @@ impl FsfsRuntime {
                 });
         }
         let mode = reader.search_mode()?;
-        let mut artifacts = reader
-            .runtime
-            .execute_search_phase_artifacts_with_mode_using_resources(
-                cx,
-                query,
-                limit,
-                mode,
-                &mut reader.resources,
-                SearchExecutionFlags {
-                    include_snippets: true,
-                    persist_explain_session: true,
-                },
-                None,
-            )
-            .await?;
-        let last = artifacts.last_mut().ok_or_else(|| {
+        let payloads = Box::pin(reader.runtime.execute_retained_cli_search(
+            cx,
+            query,
+            limit,
+            mode,
+            &mut reader.resources,
+            SearchExecutionFlags {
+                include_snippets: true,
+                persist_explain_session: true,
+            },
+            None,
+        ))
+        .await?;
+        let last = payloads.last().ok_or_else(|| {
             complete_cli_error("search", "search completed without an Initial phase")
         })?;
-        reader
-            .runtime
-            .attach_complete_search_explanations(cx, last, &reader.resources)?;
-        self.emit_complete_search_payload(last.payload.clone(), started, writer)
+        self.emit_complete_search_payload(last.clone(), started, writer)
+    }
+
+    /// Persist CLI answers beside the store, retaining the admitted reader for
+    /// every replay check and phase. Publication may advance while this query
+    /// runs; neither its resources nor its cache stamp may follow that change.
+    #[allow(clippy::too_many_lines)]
+    pub(super) async fn execute_retained_cli_search(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mode: super::SearchExecutionMode,
+        resources: &mut super::SearchExecutionResources,
+        flags: SearchExecutionFlags,
+        mut phase_sink: Option<super::SearchPhaseSink<'_>>,
+    ) -> SearchResult<Vec<crate::output_schema::SearchPayload>> {
+        let target = self.complete_explain_target.as_ref().ok_or_else(|| {
+            complete_cli_error(
+                "cache_generation",
+                "search requires an admitted complete generation",
+            )
+        })?;
+        if target.generation.path() != resources.index_root {
+            return Err(complete_cli_error(
+                "cache_generation",
+                "answer cache resources differ from the searched complete generation",
+            ));
+        }
+        self.validate_semantic_model_selection(mode)?;
+        Self::validate_bound_search_resources(resources, mode)?;
+        Self::validate_query_exclusions(
+            &super::ParsedQuery::parse(&Self::normalize_search_query(query)),
+            resources.lexical_index.is_some(),
+        )?;
+        // Inline explanations need live fused-candidate evidence, just as on
+        // the complete daemon. Never store presentation-specific explanations
+        // in the ordinary answer cache. Expansion has its own retained route.
+        let cache_enabled =
+            std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none() && !self.config.search.explain;
+        let fingerprint = resources.generation_fingerprint.clone();
+        let mut prepared = self.clone();
+        prepared.prepare_search_reranker(cx).await?;
+        let key = cache_enabled
+            .then(|| prepared.search_cache_key(query, limit, mode))
+            .transpose()?;
+        if let Some(key) = &key {
+            match prepared.try_load_search_payload_cache(key, &fingerprint) {
+                Ok(Some(payloads)) => {
+                    if Box::pin(
+                        prepared.admit_cached_search_producers(
+                            cx, resources, mode, &key.query, &payloads,
+                        ),
+                    )
+                    .await?
+                    {
+                        let payloads = Box::pin(prepared.replay_cached_search_payloads(
+                            cx,
+                            resources,
+                            mode,
+                            &fingerprint,
+                            &payloads,
+                            phase_sink.take(),
+                        ))
+                        .await?;
+                        Self::validate_cached_search_producers(cx, resources, mode, &payloads)?;
+                        retained_search_checkpoint(cx)?;
+                        if flags.persist_explain_session
+                            && let Err(error) = prepared
+                                .persist_explain_session_for_cached_payloads(query, &payloads)
+                        {
+                            tracing::warn!(%error, "failed to persist cached complete search explanation context");
+                        }
+                        return Ok(payloads);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "complete search cache read failed; continuing with uncached execution");
+                }
+            }
+        }
+        let mut artifacts = prepared
+            .execute_search_phase_artifacts_with_mode_using_resources(
+                cx, query, limit, mode, resources, flags, phase_sink,
+            )
+            .await?;
+        Self::validate_search_generation_fingerprint(&resources.index_root, &fingerprint, mode)?;
+        retained_search_checkpoint(cx)?;
+        if let Some(key) = &key {
+            let payloads = artifacts
+                .iter()
+                .map(|artifact| artifact.payload.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = prepared.write_search_payload_cache(key, &payloads, &fingerprint) {
+                tracing::warn!(%error, "complete search cache write failed; continuing without cache persistence");
+            }
+        }
+        if let Some(last) = artifacts.last_mut() {
+            prepared.attach_complete_search_explanations(cx, last, resources)?;
+        }
+        Ok(artifacts
+            .into_iter()
+            .map(|artifact| artifact.payload)
+            .collect())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4374,9 +4473,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, _, root) = fixture(directory.path());
         fs::create_dir(&root).unwrap();
-        let authority = root.join(
-            frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME,
-        );
+        let authority =
+            root.join(frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME);
         fs::write(&authority, b"fixed authority").unwrap();
         let nested = root.join("existing");
         fs::create_dir(&nested).unwrap();
@@ -4430,9 +4528,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         std::os::unix::fs::symlink(
             "absent-authority",
-            root.join(
-                frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME,
-            ),
+            root.join(frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME),
         )
         .unwrap();
         let selection = root.join(COMPLETE_GENERATION_POINTER);
@@ -4551,6 +4647,179 @@ mod tests {
                 second_receipt["data"]["generation_id"].as_str().unwrap()
             );
             assert!(!current.path().join(FSFS_EXPLAIN_SESSION_FILE).exists());
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_cli_cache_requires_exact_bundle_stamp_and_streams_without_retrieval() {
+        run_test_with_cx(|cx| async move {
+            let _embedders = RestoreDashboardEmbedders::install();
+            let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+            set_test_fast_embedder(Some(Arc::new(DashboardEmbedder {
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("dashboard-fast", 3),
+                category: ModelCategory::StaticEmbedder,
+                recorded_texts: Some(Arc::clone(&recorded)),
+            })));
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut search = search_runtime(&runtime);
+            search.cli_input.query = Some("how to find sharedtoken document content".to_owned());
+            let mut reader = search.open_retained_search(&cx, &root).await.unwrap();
+            reader
+                .runtime
+                .enable_complete_generation_explanations(&root, &reader.generation)
+                .unwrap();
+            let sealed = sealed_inventory(reader.generation.path());
+            recorded.lock().unwrap().clear();
+            let mut cold = Vec::new();
+            Box::pin(search.run_retained_search_with_writer(
+                &cx,
+                &root,
+                reader,
+                Instant::now(),
+                &mut cold,
+            ))
+            .await
+            .unwrap();
+            assert!(
+                !recorded.lock().unwrap().is_empty(),
+                "cold query must execute its producer"
+            );
+            let cold: serde_json::Value = serde_json::from_slice(&cold).unwrap();
+
+            let mut reader = search.open_retained_search(&cx, &root).await.unwrap();
+            reader
+                .runtime
+                .enable_complete_generation_explanations(&root, &reader.generation)
+                .unwrap();
+            let query = search.cli_input.query.as_deref().unwrap();
+            let mode = reader.search_mode().unwrap();
+            let key = reader
+                .runtime
+                .search_cache_key(query, search.config.search.default_limit, mode)
+                .unwrap();
+            let fingerprint = reader.resources.generation_fingerprint.clone();
+            let path = reader.runtime.search_cache_path(&key).unwrap();
+            assert_eq!(
+                path.parent().unwrap(),
+                fs::canonicalize(&root).unwrap().join("query_cache")
+            );
+            let bytes = fs::read(&path).unwrap();
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            let record: super::super::SearchCacheRecord = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                reader
+                    .runtime
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap()
+                    .is_some()
+            );
+            // Keep the key and index fingerprint exact so only the complete
+            // bundle binding can reject a legacy, foreign or revised record.
+            let stamp = record.complete_generation.as_ref().unwrap();
+            for replacement in [
+                None,
+                Some(super::super::CompleteExplainGeneration {
+                    id: "another-generation".to_owned(),
+                    manifest_sha256: stamp.manifest_sha256.clone(),
+                }),
+                Some(super::super::CompleteExplainGeneration {
+                    id: stamp.id.clone(),
+                    manifest_sha256: "0".repeat(64),
+                }),
+            ] {
+                let mut changed = record.clone();
+                changed.complete_generation = replacement;
+                fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+                assert!(
+                    reader
+                        .runtime
+                        .try_load_search_payload_cache(&key, &fingerprint)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            fs::write(&path, &bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            recorded.lock().unwrap().clear();
+            search.cli_input.stream = true;
+            search.cli_input.format = OutputFormat::Jsonl;
+            let mut streamed = Vec::new();
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut streamed))
+                .await
+                .unwrap();
+            assert!(
+                recorded.lock().unwrap().is_empty(),
+                "warm stream must replay without new embeddings"
+            );
+            let frames: Vec<StreamFrame<SearchHitPayload>> = streamed
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| crate::stream_protocol::validate_stream_frame(frame).valid)
+            );
+            assert!(frames.iter().any(|frame| matches!(&frame.event,
+                crate::stream_protocol::StreamEvent::Result(result)
+                    if result.item.path == cold["data"]["hits"][0]["path"])));
+            assert!(matches!(frames.last().unwrap().event,
+                crate::stream_protocol::StreamEvent::Terminal(ref terminal)
+                    if terminal.status == crate::stream_protocol::StreamTerminalStatus::Completed));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            assert_eq!(sealed_inventory(reader.generation.path()), sealed);
+            assert!(!reader.generation.path().join("query_cache").exists());
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_cli_cache_refuses_symlink_redirect_into_a_sealed_bundle() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let search = search_runtime(&runtime);
+            let mut reader = search.open_retained_search(&cx, &root).await.unwrap();
+            reader
+                .runtime
+                .enable_complete_generation_explanations(&root, &reader.generation)
+                .unwrap();
+            let before = sealed_inventory(reader.generation.path());
+            std::os::unix::fs::symlink(reader.generation.path(), root.join("query_cache")).unwrap();
+            let mode = reader.search_mode().unwrap();
+            let key = reader
+                .runtime
+                .search_cache_key("sharedtoken", search.config.search.default_limit, mode)
+                .unwrap();
+            assert!(
+                reader
+                    .runtime
+                    .try_load_search_payload_cache(&key, &reader.resources.generation_fingerprint)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symlink")
+            );
+            let mut output = Vec::new();
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut output))
+                .await
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(result["data"]["hits"].as_array().unwrap().len(), 1);
+            assert_eq!(sealed_inventory(reader.generation.path()), before);
+            assert!(!reader.runtime.search_cache_path(&key).unwrap().exists());
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_eq!(store.active(&cx).unwrap().unwrap(), reader.generation);
         });
     }
 

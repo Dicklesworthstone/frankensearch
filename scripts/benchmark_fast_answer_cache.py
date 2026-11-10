@@ -63,24 +63,31 @@ with planned commands after an unsuccessful build.
 The runner verifies the supplied evidence's source and binary bindings; it cannot
 reconstruct an unrecorded build.
 
-This measures the persisted answer cache in the legacy index layout, explicitly
-setting FSFS_COMPLETE_GENERATIONS=0. Complete-generation stores are the default
-for new roots on Linux and macOS; their one-shot searches deliberately do not
-persist answer caches and are outside this measurement's scope.
+The default --layout legacy measures the original regression, explicitly setting
+FSFS_COMPLETE_GENERATIONS=0. --layout complete sets FSFS_COMPLETE_GENERATIONS=1
+and measures the store-owned answer cache for immutable complete generations.
+Use a complete-generation baseline before that cache was added (for example
+448af4c): it must leave no persisted answer after either request. The candidate
+must write exactly one record under the store's query_cache directory, bound to
+the selected generation ID and the actual FSFS-BUNDLE.json digest. The selected
+pointer and every sealed bundle file must remain unchanged after each request.
 Cold/warm here means the persisted ANSWER cache, not the OS page cache. Each arm
-and round receives a copy of one legacy index. The baseline must load Model2Vec once on
-both requests; the candidate must load once cold and zero times warm. Payloads,
-ordered hits/scores, and cache bytes, mtime, and record count are checked.
+and round receives a copy of one index in the selected layout. The baseline must
+load Model2Vec once on both requests; the candidate must load once cold and zero
+times warm. Payloads, ordered hits/scores, and cache bytes, mtime, and record count
+are checked. Both binaries must support the selected layout.
 The default --scenario semantic-hits measures the original positive-answer
 regression. --scenario filtered-empty instead uses an excluding extension filter
 and verifies an unfiltered semantic positive control for EACH arm on separate
-indexes before timing. Use a baseline before e700da7 (for example 6e6d771) to
-isolate that zero-result correction: its warm request recomputes and rewrites the
-answer, while the candidate must replay it without loading weights or rewriting
-the cache. Complete filtered-empty payloads must agree across arms and rounds.
-Both arms must retain identical cold/warm answer/cache bytes; only that explicit
-scenario requires the baseline's cache mtime to change. The original scenario's
-unchanged-mtime gate remains in force for both arms.
+indexes before timing. With legacy layout, use a baseline before e700da7 (for
+example 6e6d771) to isolate that zero-result correction: its warm request recomputes
+and rewrites the answer, while the candidate must replay it without loading
+weights or rewriting the cache. Complete filtered-empty payloads must agree
+across arms and rounds. Both arms must retain identical cold/warm answer/cache
+bytes; only that explicit legacy scenario requires the baseline's cache mtime to
+change. The original scenario's unchanged-mtime gate remains in force for both
+arms. Complete layout always requires the baseline cache to remain absent and
+the candidate cache bytes and mtime to remain unchanged.
 Registered model verification remains mandatory in every receipt mode. Timing is
 reported, not assumed to improve: paired candidate/baseline warm ratios are
 descriptive and do not qualify a promotion or competitive result.
@@ -121,6 +128,7 @@ MODEL_ARTIFACTS = {
 }
 QUERY = "staggered reconnects after brief outages"
 SCENARIOS = ("semantic-hits", "filtered-empty")
+LAYOUTS = ("legacy", "complete")
 EMPTY_FILTER = "ext:fsfs-cache-no-match"
 DOCUMENTS = {
     "retry.md": "Recover transient network failures with exponential backoff, bounded retries, and random jitter.",
@@ -166,6 +174,7 @@ def parse_args(argv=None):
     parser.add_argument("--receipt-mode", choices=("valid", "absent", "malformed"),
                         default="valid")
     parser.add_argument("--scenario", choices=SCENARIOS, default="semantic-hits")
+    parser.add_argument("--layout", choices=LAYOUTS, default="legacy")
     args = parser.parse_args(argv)
     if args.rounds < 1:
         parser.error("--rounds must be positive")
@@ -331,7 +340,8 @@ def private_inputs(args, metadata):
     return binaries
 
 
-def runtime_environment(output):
+def runtime_environment(output, layout="legacy"):
+    require(layout in LAYOUTS, "unknown index layout")
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith(("FSFS_", "FRANKENSEARCH_"))}
     for name in ("HF_HOME", "HUGGINGFACE_HUB_CACHE"):
@@ -344,7 +354,8 @@ def runtime_environment(output):
     environment.update(
         FRANKENSEARCH_MODEL_DIR=str(output / "models"),
         FRANKENSEARCH_OFFLINE="1", FRANKENSEARCH_ALLOW_DOWNLOAD="0",
-        FSFS_COMPLETE_GENERATIONS="0", RUST_LOG="info", FRANKENSEARCH_LOG="info",
+        FSFS_COMPLETE_GENERATIONS=str(int(layout == "complete")),
+        RUST_LOG="info", FRANKENSEARCH_LOG="info",
         NO_COLOR="1", RAYON_NUM_THREADS="1",
     )
     return environment
@@ -435,7 +446,8 @@ def validate_receipt_state(output, state):
                 "indexing/search changed or repaired the model receipt")
 
 
-def setup_fixture(runner, binaries, output, receipt_mode):
+def setup_fixture(runner, binaries, output, receipt_mode, layout="legacy"):
+    require(layout in LAYOUTS, "unknown index layout")
     corpus = output / "corpus"
     corpus.mkdir()
     for name, contents in DOCUMENTS.items():
@@ -467,15 +479,86 @@ def setup_fixture(runner, binaries, output, receipt_mode):
          "--fast-only", "--format", "json"],
     )
     require(template.is_dir(), "baseline indexing did not create the template index")
+    if layout == "complete":
+        complete_generation_snapshot(template)
+    else:
+        require(not (template / "FSFS-CURRENT").exists(),
+                "legacy indexing unexpectedly selected a complete generation")
     validate_receipt_state(output, receipt_state)
     return template, config, receipt_state
 
 
-def cache_snapshot(index):
+def complete_generation_snapshot(index):
+    """Bind measurement to the selected bundle without trusting cache contents."""
+    pointer = index / "FSFS-CURRENT"
+    require(pointer.is_file() and not pointer.is_symlink() and pointer.stat().st_size <= 256,
+            f"complete layout requires a bounded regular FSFS-CURRENT: {index}")
+    pointer_bytes = pointer.read_bytes()
+    try:
+        fields = pointer_bytes.decode("utf-8").split("\n")
+    except UnicodeError as error:
+        raise BenchmarkError(f"invalid complete-generation pointer: {index}") from error
+    framing_valid = (
+        len(fields) == 4 and fields[0] == "FSFS-COMPLETE-GENERATION-v1"
+        or len(fields) == 5 and fields[0] == "FSFS-COMPLETE-GENERATION-v2"
+        and re.fullmatch(r"[0-9a-f]{64}", fields[3]) is not None
+    )
+    require(framing_valid and fields[-1] == ""
+            and re.fullmatch(r"g-[0-9a-f]{32}-[0-9a-f]{8}-[0-9a-f]{16}", fields[1])
+            and re.fullmatch(r"[0-9a-f]{64}", fields[2]),
+            f"invalid complete-generation pointer: {index}")
+    generation = {"id": fields[1], "manifest_sha256": fields[2]}
+    generations = index / "generations"
+    bundle = generations / generation["id"]
+    require(generations.is_dir() and not generations.is_symlink()
+            and bundle.is_dir() and not bundle.is_symlink(),
+            f"selected complete-generation bundle is missing or indirect: {index}")
+    require(not (bundle / "query_cache").exists() and not (bundle / "query_cache").is_symlink(),
+            "answer caches must remain outside the sealed complete-generation bundle")
+    inventory = {}
+    for path in sorted(bundle.rglob("*")):
+        require(not path.is_symlink(), f"sealed bundle contains a symlink: {path}")
+        relative = path.relative_to(bundle).as_posix()
+        if path.is_dir():
+            inventory[relative] = {"kind": "directory"}
+        else:
+            require(path.is_file(), f"sealed bundle contains a non-regular artifact: {path}")
+            stamp = path.stat()
+            inventory[relative] = {
+                "kind": "file", "sha256": sha256_file(path), "size": stamp.st_size,
+                "mtime_ns": stamp.st_mtime_ns,
+            }
+    manifest = inventory.get("FSFS-BUNDLE.json", {})
+    require(manifest.get("sha256") == generation["manifest_sha256"],
+            f"selected complete-generation manifest digest differs: {index}")
+    return {"generation": generation, "inventory": inventory,
+            "pointer_sha256": hashlib.sha256(pointer_bytes).hexdigest(),
+            "pointer_mtime_ns": pointer.stat().st_mtime_ns}
+
+
+def validate_unchanged_generation(index, before):
+    require(complete_generation_snapshot(index) == before,
+            f"selected complete-generation pointer or sealed bundle changed during search: {index}")
+
+
+def cache_snapshot(index, expected_records=1, complete_generation=None):
+    require(expected_records in (0, 1), "unsupported expected cache record count")
     records = sorted((index / "query_cache").glob("*.json"))
-    require(len(records) == 1, f"expected one persisted answer, found {len(records)}: {index}")
+    require(len(records) == expected_records,
+            f"expected {expected_records} persisted answer(s), found {len(records)}: {index}")
+    if not records:
+        return {"names": [], "bytes": None, "mtime_ns": None}
     path = records[0]
-    return {"names": [path.name], "bytes": path.read_bytes(), "mtime_ns": path.stat().st_mtime_ns}
+    contents = path.read_bytes()
+    if complete_generation is not None:
+        try:
+            record = json.loads(contents)
+        except (ValueError, UnicodeError) as error:
+            raise BenchmarkError(f"invalid complete-generation cache record: {path}") from error
+        require(isinstance(record, dict)
+                and record.get("complete_generation") == complete_generation,
+                f"cached answer does not name the exact selected complete generation: {path}")
+    return {"names": [path.name], "bytes": contents, "mtime_ns": path.stat().st_mtime_ns}
 
 
 def semantic_hits(data, label):
@@ -499,7 +582,9 @@ def search_command(config, index, scenario):
     return command
 
 
-def run_semantic_controls(runner, binaries, output, template, config, receipt_state):
+def run_semantic_controls(runner, binaries, output, template, config, receipt_state,
+                          layout="legacy"):
+    require(layout in LAYOUTS, "unknown index layout")
     controls = {}
     reference_hits = None
     reference_generation = None
@@ -508,12 +593,16 @@ def run_semantic_controls(runner, binaries, output, template, config, receipt_st
         shutil.copytree(template, index)
         require(not list((index / "query_cache").glob("*.json")),
                 "semantic control must start without a persisted answer")
+        sealed = complete_generation_snapshot(index) if layout == "complete" else None
         validate_receipt_state(output, receipt_state)
         result = runner.invoke(
             binaries[arm], f"{arm}-semantic-control",
             search_command(config, index, "semantic-hits"),
         )
         validate_receipt_state(output, receipt_state)
+        if sealed is not None:
+            validate_unchanged_generation(index, sealed)
+            cache_snapshot(index, int(arm == "candidate"), sealed["generation"])
         require(result["model_loads"] == 1,
                 f"{arm}: semantic control must load Model2Vec exactly once")
         data = result["response"].get("data")
@@ -529,19 +618,28 @@ def run_semantic_controls(runner, binaries, output, template, config, receipt_st
         require(reference_generation is None or generation == reference_generation,
                 "semantic control producer identities differ across arms")
         reference_hits, reference_generation = hits, generation
-        controls[arm] = {**result, "vector_generation_id": generation}
+        controls[arm] = {**result, "vector_generation_id": generation,
+                        "layout": layout,
+                        "complete_generation": sealed["generation"] if sealed else None}
     return controls
 
 
 def validate_pair(arm, cold, warm, before, after, reference_hits, receipt_mode,
-                  scenario="semantic-hits", expected_generation_id=None):
+                  scenario="semantic-hits", expected_generation_id=None, layout="legacy"):
     require(scenario in SCENARIOS, "unknown benchmark scenario")
+    require(layout in LAYOUTS, "unknown index layout")
     cold_data, warm_data = cold["response"].get("data"), warm["response"].get("data")
     require(isinstance(cold_data, dict) and cold_data == warm_data,
             f"{arm}: warm cached payload differs from cold retrieval")
     require(before["names"] == after["names"], f"{arm}: warm cache record count/name changed")
     require(before["bytes"] == after["bytes"], f"{arm}: warm cache bytes changed")
-    if scenario == "filtered-empty" and arm == "baseline":
+    if layout == "complete":
+        expected = int(arm == "candidate")
+        require(len(before["names"]) == expected
+                and (before["bytes"] is not None) == bool(expected)
+                and (before["mtime_ns"] is not None) == bool(expected),
+                f"{arm}: complete layout requires {expected} persisted answer(s)")
+    if layout == "legacy" and scenario == "filtered-empty" and arm == "baseline":
         require(before["mtime_ns"] != after["mtime_ns"],
                 "baseline: filtered-empty regression must recompute and rewrite the warm answer")
     else:
@@ -574,8 +672,9 @@ def validate_pair(arm, cold, warm, before, after, reference_hits, receipt_mode,
 
 
 def run_rounds(runner, binaries, output, template, config, rounds, receipt_state,
-               scenario="semantic-hits", semantic_controls=None):
+               scenario="semantic-hits", semantic_controls=None, layout="legacy"):
     require(scenario in SCENARIOS, "unknown benchmark scenario")
+    require(layout in LAYOUTS, "unknown index layout")
     if scenario == "filtered-empty":
         require(isinstance(semantic_controls, dict) and set(semantic_controls) == set(ARMS),
                 "filtered-empty measurement requires both semantic controls")
@@ -588,17 +687,25 @@ def run_rounds(runner, binaries, output, template, config, rounds, receipt_state
             shutil.copytree(template, index)
             require(not list((index / "query_cache").glob("*.json")),
                     f"{arm}: cold request already has a persisted answer")
+            sealed = complete_generation_snapshot(index) if layout == "complete" else None
+            expected_records = int(layout == "legacy" or arm == "candidate")
+            generation = sealed["generation"] if sealed else None
             command = search_command(config, index, scenario)
             validate_receipt_state(output, receipt_state)
             cold = runner.invoke(binaries[arm], f"{arm}-{ordinal}-cold", command)
             validate_receipt_state(output, receipt_state)
-            before = cache_snapshot(index)
+            if sealed is not None:
+                validate_unchanged_generation(index, sealed)
+            before = cache_snapshot(index, expected_records, generation)
             warm = runner.invoke(binaries[arm], f"{arm}-{ordinal}-warm", command)
             validate_receipt_state(output, receipt_state)
-            after = cache_snapshot(index)
+            if sealed is not None:
+                validate_unchanged_generation(index, sealed)
+            after = cache_snapshot(index, expected_records, generation)
             reference_hits = validate_pair(
                 arm, cold, warm, before, after, reference_hits, receipt_state["mode"], scenario,
-                semantic_controls[arm]["vector_generation_id"] if semantic_controls else None)
+                semantic_controls[arm]["vector_generation_id"] if semantic_controls else None,
+                layout)
             if scenario == "filtered-empty":
                 payload = cold["response"]["data"]
                 require(reference_payload is None or payload == reference_payload,
@@ -608,11 +715,16 @@ def run_rounds(runner, binaries, output, template, config, rounds, receipt_state
                 rows.append({
                     **{key: value for key, value in result.items() if key != "response"},
                     "arm": arm, "round": ordinal, "phase": phase,
-                    "receipt_mode": receipt_state["mode"], "scenario": scenario,
-                    "cache_sha256": hashlib.sha256(before["bytes"]).hexdigest(),
+                    "receipt_mode": receipt_state["mode"], "scenario": scenario, "layout": layout,
+                    "cache_sha256": (hashlib.sha256(before["bytes"]).hexdigest()
+                                     if before["bytes"] is not None else None),
                     "warm_payload_identical": True, "cache_bytes_unchanged": True,
                     "cache_mtime_unchanged": before["mtime_ns"] == after["mtime_ns"],
-                    "cache_record_count": 1,
+                    "cache_record_count": len(before["names"]),
+                    "complete_generation": generation,
+                    "sealed_bundle_unchanged": True if sealed else None,
+                    "sealed_bundle_inventory": sealed["inventory"] if sealed else None,
+                    "selection_pointer_sha256": sealed["pointer_sha256"] if sealed else None,
                 })
     return rows
 
@@ -658,16 +770,16 @@ def run_benchmark(args):
         for name, expected in MODEL_ARTIFACTS.items():
             verify_file(args.models / MODEL_DIRECTORY / name, expected)
         binaries = private_inputs(args, metadata)
-        environment = runtime_environment(args.output)
+        environment = runtime_environment(args.output, args.layout)
         runner = CommandRunner(args.output, environment, args.timeout_seconds)
         template, config, receipt_state = setup_fixture(
-            runner, binaries, args.output, args.receipt_mode)
+            runner, binaries, args.output, args.receipt_mode, args.layout)
         semantic_controls = run_semantic_controls(
-            runner, binaries, args.output, template, config, receipt_state
+            runner, binaries, args.output, template, config, receipt_state, args.layout
         ) if args.scenario == "filtered-empty" else None
         rows = run_rounds(
             runner, binaries, args.output, template, config, args.rounds, receipt_state,
-            args.scenario, semantic_controls)
+            args.scenario, semantic_controls, args.layout)
         summary = summarize(rows, args.rounds)
         for arm in ARMS:
             require(validate_source(getattr(args, arm + "_source"), metadata["arms"][arm])
@@ -683,7 +795,7 @@ def run_benchmark(args):
             "evidence_class": "diagnostic-maintenance",
             "qualifies_promotion": False, "qualifies_competitive_win": False,
             "feature_profile": metadata["feature_profile"],
-            "receipt_mode": args.receipt_mode, "scenario": args.scenario,
+            "receipt_mode": args.receipt_mode, "scenario": args.scenario, "layout": args.layout,
             "filter": EMPTY_FILTER if args.scenario == "filtered-empty" else None,
             "semantic_controls": semantic_controls,
             "cross_arm_equivalence": ("complete-search-payloads"
@@ -691,6 +803,10 @@ def run_benchmark(args):
                                       else "ordered-hits-and-scores"),
             "cache_scope": (
                 "persisted legacy-layout answer cache (FSFS_COMPLETE_GENERATIONS=0); "
+                "fresh --no-daemon processes; no OS page cache eviction"
+                if args.layout == "legacy" else
+                "store-owned complete-generation answer cache (FSFS_COMPLETE_GENERATIONS=1); "
+                "baseline has no persisted answers; candidate bound to the exact sealed bundle; "
                 "fresh --no-daemon processes; no OS page cache eviction"
             ),
             "build_metadata": metadata, "source_provenance": sources,
@@ -714,7 +830,7 @@ def run_benchmark(args):
             "evidence_class": "diagnostic-maintenance",
             "qualifies_promotion": False, "qualifies_competitive_win": False,
             "feature_profile": metadata["feature_profile"], "receipt_mode": args.receipt_mode,
-            "scenario": args.scenario,
+            "scenario": args.scenario, "layout": args.layout,
             "source_heads": {arm: sources[arm]["head"] for arm in ARMS}, "summary": summary,
         }, indent=2, sort_keys=True), flush=True)
         return receipt
@@ -723,7 +839,7 @@ def run_benchmark(args):
             write_json(args.output / "failure.json", {
                 "status": "failed", "evidence_class": "diagnostic-maintenance",
                 "qualifies_measurement_result": False, "receipt_mode": args.receipt_mode,
-                "scenario": args.scenario,
+                "scenario": args.scenario, "layout": args.layout,
                 "build_metadata": metadata, "source_provenance": sources,
                 "error_type": type(error).__name__, "error": str(error),
                 "completed_commands": runner.events if runner else [],

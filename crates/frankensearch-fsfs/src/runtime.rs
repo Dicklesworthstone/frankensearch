@@ -1825,6 +1825,10 @@ type SharedSearchServeState = Arc<
 struct SearchCacheRecord {
     schema_version: String,
     index_fingerprint: String,
+    /// Store-owned answers must name the exact admitted immutable bundle.
+    /// A legacy record (or a predecessor's record) cannot authorize replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    complete_generation: Option<CompleteExplainGeneration>,
     key: SearchCacheKey,
     payloads: Vec<SearchPayload>,
 }
@@ -9455,6 +9459,18 @@ impl FsfsRuntime {
                 self.emit_search_stream_payload(stage_payload, stream_id, &mut seq, writer)
             };
             if let Some(execution) = resources_override.as_mut() {
+                if self.complete_explain_target.is_some() {
+                    return Box::pin(self.execute_retained_cli_search(
+                        cx,
+                        query,
+                        limit,
+                        mode,
+                        execution.resources,
+                        execution.flags,
+                        Some(&mut phase_sink),
+                    ))
+                    .await;
+                }
                 self.execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
@@ -9465,16 +9481,11 @@ impl FsfsRuntime {
                     Some(&mut phase_sink),
                 )
                 .await
-                .and_then(|mut artifacts| {
-                    if self.complete_explain_target.is_some()
-                        && let Some(last) = artifacts.last_mut()
-                    {
-                        self.attach_complete_search_explanations(cx, last, execution.resources)?;
-                    }
-                    Ok(artifacts
+                .map(|artifacts| {
+                    artifacts
                         .into_iter()
                         .map(|artifact| artifact.payload)
-                        .collect::<Vec<_>>())
+                        .collect::<Vec<_>>()
                 })
             } else if self.cli_input.daemon {
                 let mut daemon_sink = |payload: &SearchPayload, cached: bool| {
@@ -10450,143 +10461,153 @@ impl FsfsRuntime {
         runtime.prepare_search_reranker(cx).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
-        let cached = if options.hot_cache_enabled
-            && let Some(payloads) = hot_cache.get(&cache_key)
-        {
-            match Box::pin(runtime.admit_cached_search_producers(
-                cx,
-                resources,
-                mode,
-                &cache_key.query,
-                payloads,
-            ))
-            .await
+        // Every failed replay must invalidate the request-local entry, including
+        // failures in attestation or a phase sink. Shared complete-generation
+        // servers merge these removals with an expected-value comparison.
+        let response = async {
+            let cached = if options.hot_cache_enabled
+                && let Some(payloads) = hot_cache.get(&cache_key)
             {
-                Ok(true) => true,
-                Ok(false) => {
-                    hot_cache.remove(&cache_key);
-                    false
+                match Box::pin(runtime.admit_cached_search_producers(
+                    cx,
+                    resources,
+                    mode,
+                    &cache_key.query,
+                    payloads,
+                ))
+                .await
+                {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        hot_cache.remove(&cache_key);
+                        false
+                    }
+                    Err(error) => {
+                        hot_cache.remove(&cache_key);
+                        return Err(error);
+                    }
                 }
-                Err(error) => {
-                    hot_cache.remove(&cache_key);
-                    return Err(error);
-                }
-            }
-        } else {
-            false
-        };
-        let cached_payloads = cached.then(|| hot_cache.get(&cache_key)).flatten();
-        Self::validate_bound_search_resources(resources, mode)?;
-        let policy = runtime.search_serve_policy_for_mode(mode)?;
-        if let Some(sink) = frame_sink.as_mut() {
-            sink(SearchServeFrame::Attested {
-                schema_version: FSFS_SEARCH_SERVE_STREAM_VERSION.to_owned(),
-                policy: Box::new(policy.clone()),
-                generation_fingerprint: resources.generation_fingerprint.clone(),
-                vector_generation_id: if matches!(mode, SearchExecutionMode::QualityOnly) {
-                    resources
-                        .quality_vector_index
-                        .as_ref()
-                        .map(|index| index.embedder_id().to_owned())
-                } else {
-                    resources
-                        .vector_index
-                        .as_ref()
-                        .map(|index| index.embedder_id().to_owned())
-                },
-                query: request.query.clone(),
-                mode: mode.label().to_owned(),
-                limit: requested_limit,
-                filter: request.filter.clone(),
-                rerank: runtime.reranking_enabled_by_policy(),
-                cached,
-            })?;
-        }
-        let index_root = resources.index_root.clone();
-        let fingerprint = resources.generation_fingerprint.clone();
-        let mut publish = |payload: &SearchPayload| {
-            Self::search_daemon_checkpoint(cx)?;
-            Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+            } else {
+                false
+            };
+            let cached_payloads = cached.then(|| hot_cache.get(&cache_key)).flatten();
+            Self::validate_bound_search_resources(resources, mode)?;
+            let policy = runtime.search_serve_policy_for_mode(mode)?;
             if let Some(sink) = frame_sink.as_mut() {
-                sink(SearchServeFrame::Phase {
-                    payload: Box::new(payload.clone()),
+                sink(SearchServeFrame::Attested {
+                    schema_version: FSFS_SEARCH_SERVE_STREAM_VERSION.to_owned(),
+                    policy: Box::new(policy.clone()),
+                    generation_fingerprint: resources.generation_fingerprint.clone(),
+                    vector_generation_id: if matches!(mode, SearchExecutionMode::QualityOnly) {
+                        resources
+                            .quality_vector_index
+                            .as_ref()
+                            .map(|index| index.embedder_id().to_owned())
+                    } else {
+                        resources
+                            .vector_index
+                            .as_ref()
+                            .map(|index| index.embedder_id().to_owned())
+                    },
+                    query: request.query.clone(),
+                    mode: mode.label().to_owned(),
+                    limit: requested_limit,
+                    filter: request.filter.clone(),
+                    rerank: runtime.reranking_enabled_by_policy(),
+                    cached,
                 })?;
             }
-            Ok(())
-        };
-        let payloads = if let Some(payloads) = cached_payloads {
-            Box::pin(runtime.replay_cached_search_payloads(
-                cx,
-                resources,
-                mode,
-                &fingerprint,
-                payloads,
-                Some(&mut publish),
-            ))
-            .await?
-        } else {
-            runtime
-                .execute_search_phase_artifacts_with_mode_using_resources(
+            let index_root = resources.index_root.clone();
+            let fingerprint = resources.generation_fingerprint.clone();
+            let mut publish = |payload: &SearchPayload| {
+                Self::search_daemon_checkpoint(cx)?;
+                Self::validate_search_generation_fingerprint(&index_root, &fingerprint, mode)?;
+                if let Some(sink) = frame_sink.as_mut() {
+                    sink(SearchServeFrame::Phase {
+                        payload: Box::new(payload.clone()),
+                    })?;
+                }
+                Ok(())
+            };
+            let payloads = if let Some(payloads) = cached_payloads {
+                Box::pin(runtime.replay_cached_search_payloads(
                     cx,
-                    &request.query,
-                    requested_limit,
-                    mode,
                     resources,
-                    SearchExecutionFlags {
-                        include_snippets: true,
-                        persist_explain_session: options.persist_explain_session,
-                    },
+                    mode,
+                    &fingerprint,
+                    payloads,
                     Some(&mut publish),
-                )
+                ))
                 .await?
-                .into_iter()
-                .map(|artifact| artifact.payload)
-                .collect::<Vec<_>>()
-        };
-        if cached && !Self::search_payloads_cacheable(&payloads) {
+            } else {
+                runtime
+                    .execute_search_phase_artifacts_with_mode_using_resources(
+                        cx,
+                        &request.query,
+                        requested_limit,
+                        mode,
+                        resources,
+                        SearchExecutionFlags {
+                            include_snippets: true,
+                            persist_explain_session: options.persist_explain_session,
+                        },
+                        Some(&mut publish),
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|artifact| artifact.payload)
+                    .collect::<Vec<_>>()
+            };
+            if cached && !Self::search_payloads_cacheable(&payloads) {
+                hot_cache.remove(&cache_key);
+            }
+            Self::validate_bound_search_resources(resources, mode)?;
+            if cached {
+                Self::validate_cached_search_producers(cx, resources, mode, &payloads)?;
+            }
+            if matches!(mode, SearchExecutionMode::QualityOnly) {
+                Self::validate_required_quality_resources(resources)?;
+            }
+            Self::search_daemon_checkpoint(cx)?;
+            // Misses retain the full fused-candidate evidence saved by the search
+            // above. Only a cache hit needs to reconstruct the latest CLI context
+            // from its payloads, matching the ordinary persisted-cache path.
+            if cached
+                && options.persist_explain_session
+                && let Err(error) =
+                    runtime.persist_explain_session_for_cached_payloads(&request.query, &payloads)
+            {
+                warn!(%error, "failed to persist cached daemon search explanation context");
+            }
+            if options.hot_cache_enabled
+                && !cached
+                && Self::search_payloads_cacheable(&payloads)
+                && serde_json::to_writer(&mut SearchServeFrameBuffer::default(), &payloads).is_ok()
+            {
+                // Bound persistent query retention independently of transport
+                // buffers. Large successful streams remain deliverable uncached.
+                if hot_cache.len() >= FSFS_DAEMON_MAX_CACHE_ENTRIES {
+                    hot_cache.clear();
+                }
+                hot_cache.insert(cache_key.clone(), payloads.clone());
+            }
+
+            Ok(SearchServeResponse {
+                schema_version: FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
+                policy: Some(policy),
+                ok: true,
+                query: request.query,
+                mode: mode.label().to_owned(),
+                cached,
+                payloads,
+                error: None,
+            })
+        }
+        .await;
+        if response.is_err() {
             hot_cache.remove(&cache_key);
         }
-        Self::validate_bound_search_resources(resources, mode)?;
-        if cached {
-            Self::validate_cached_search_producers(cx, resources, mode, &payloads)?;
-        }
-        if matches!(mode, SearchExecutionMode::QualityOnly) {
-            Self::validate_required_quality_resources(resources)?;
-        }
-        Self::search_daemon_checkpoint(cx)?;
-        // Misses retain the full fused-candidate evidence saved by the search
-        // above. Only a cache hit needs to reconstruct the latest CLI context
-        // from its payloads, matching the ordinary persisted-cache path.
-        if cached
-            && options.persist_explain_session
-            && let Err(error) =
-                runtime.persist_explain_session_for_cached_payloads(&request.query, &payloads)
-        {
-            warn!(%error, "failed to persist cached daemon search explanation context");
-        }
-        if options.hot_cache_enabled
-            && !cached
-            && Self::search_payloads_cacheable(&payloads)
-            && serde_json::to_writer(&mut SearchServeFrameBuffer::default(), &payloads).is_ok()
-        {
-            // Bound persistent query retention independently of transport
-            // buffers. Large successful streams remain deliverable uncached.
-            if hot_cache.len() >= FSFS_DAEMON_MAX_CACHE_ENTRIES {
-                hot_cache.clear();
-            }
-            hot_cache.insert(cache_key, payloads.clone());
-        }
-
-        Ok(SearchServeResponse {
-            schema_version: FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
-            policy: Some(policy),
-            ok: true,
-            query: request.query,
-            mode: mode.label().to_owned(),
-            cached,
-            payloads,
-            error: None,
-        })
+        response
     }
 
     fn search_serve_ready_event(
@@ -13849,8 +13870,44 @@ impl FsfsRuntime {
 
     fn search_cache_path(&self, key: &SearchCacheKey) -> SearchResult<PathBuf> {
         let index_root = self.resolve_status_index_root()?;
+        let cache_root = if let Some(target) = &self.complete_explain_target {
+            if target.generation.path() != index_root {
+                return Err(complete_cli::complete_cli_error(
+                    "cache_generation",
+                    "answer cache destination does not own the searched complete generation",
+                ));
+            }
+            &target.store_root
+        } else {
+            &index_root
+        };
         let file_name = format!("{}.json", Self::search_cache_key_hash(key));
-        Ok(index_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
+        Ok(cache_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
+    }
+
+    /// A store-owned cache must not be redirected into its sealed generation.
+    /// Match explanation-directory admission without changing legacy layouts.
+    fn admit_complete_search_cache_directory(&self, create: bool) -> SearchResult<bool> {
+        let Some(target) = &self.complete_explain_target else {
+            return Ok(true);
+        };
+        let directory = target.store_root.join(FSFS_SEARCH_CACHE_DIR_NAME);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+            Ok(_) => Err(complete_cli::complete_cli_error(
+                "cache_directory",
+                "answer cache must be a real directory, not a symlink or other file",
+            )),
+            Err(error) if error.kind() == ErrorKind::NotFound && !create => Ok(false),
+            Err(error) if error.kind() == ErrorKind::NotFound => match fs::create_dir(&directory) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    self.admit_complete_search_cache_directory(false)
+                }
+                Err(error) => Err(error.into()),
+            },
+            Err(error) => Err(error.into()),
+        }
     }
 
     #[cfg(test)]
@@ -14343,6 +14400,9 @@ impl FsfsRuntime {
         expected_fingerprint: &str,
     ) -> SearchResult<Option<Vec<SearchPayload>>> {
         let cache_path = self.search_cache_path(key)?;
+        if !self.admit_complete_search_cache_directory(false)? {
+            return Ok(None);
+        }
         let raw = match fs::read_to_string(&cache_path) {
             Ok(raw) => raw,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -14361,6 +14421,13 @@ impl FsfsRuntime {
         if record.index_fingerprint != expected_fingerprint {
             return Ok(None);
         }
+        let complete_generation = self
+            .complete_explain_target
+            .as_ref()
+            .map(|target| CompleteExplainGeneration::from_generation(&target.generation));
+        if record.complete_generation != complete_generation {
+            return Ok(None);
+        }
         if !Self::search_payloads_cacheable(&record.payloads) {
             return Ok(None);
         }
@@ -14377,6 +14444,12 @@ impl FsfsRuntime {
             return Ok(());
         }
         let cache_path = self.search_cache_path(key)?;
+        if !self.admit_complete_search_cache_directory(true)? {
+            return Err(complete_cli::complete_cli_error(
+                "cache_directory",
+                "answer cache directory disappeared during admission",
+            ));
+        }
         if let Some(parent) = cache_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -14384,6 +14457,10 @@ impl FsfsRuntime {
         let record = SearchCacheRecord {
             schema_version: FSFS_SEARCH_CACHE_SCHEMA_VERSION.to_owned(),
             index_fingerprint: index_fingerprint.to_owned(),
+            complete_generation: self
+                .complete_explain_target
+                .as_ref()
+                .map(|target| CompleteExplainGeneration::from_generation(&target.generation)),
             key: key.clone(),
             payloads: payloads.to_vec(),
         };
@@ -43874,6 +43951,7 @@ mod tests {
             let old_record = super::SearchCacheRecord {
                 schema_version: super::FSFS_SEARCH_CACHE_SCHEMA_VERSION.to_owned(),
                 index_fingerprint: fingerprint.clone(),
+                complete_generation: None,
                 key: key.clone(),
                 payloads: failed.payloads.clone(),
             };
