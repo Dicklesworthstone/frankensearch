@@ -19,7 +19,11 @@ mod loader_only {
     #[cfg(any(feature = "semantic-loaders", all(unix, feature = "semantic-support")))]
     use frankensearch_embed::model_manifest::is_verification_cached;
     use frankensearch_embed::model_manifest::{ModelManifest, ModelTier};
-    #[cfg(any(feature = "semantic-loaders", feature = "rerank"))]
+    #[cfg(any(
+        feature = "semantic-loaders",
+        feature = "rerank",
+        all(unix, feature = "semantic-support")
+    ))]
     use frankensearch_index::VectorIndex;
     use serde_json::Value;
 
@@ -1065,6 +1069,43 @@ mod loader_only {
         fs::write(&receipt, intact_receipt).unwrap();
         assert_replayed("restored-well-formed-receipt", 0);
 
+        // A well-formed receipt for another manifest is not evidence for
+        // this producer. Intact artifacts may pass the ordinary full hash
+        // check, but changed bytes cannot borrow that receipt's authority.
+        let intact_receipt = fs::read(&receipt).unwrap();
+        let mut foreign_receipt: Value = serde_json::from_slice(&intact_receipt).unwrap();
+        let fingerprint = foreign_receipt["manifest_fingerprint"].as_str().unwrap();
+        let changed_fingerprint = if fingerprint.starts_with('a') {
+            'b'
+        } else {
+            'a'
+        };
+        foreign_receipt["manifest_fingerprint"] =
+            format!("{changed_fingerprint}{}", &fingerprint[1..]).into();
+        let foreign_bytes = serde_json::to_vec(&foreign_receipt).unwrap();
+        fs::write(&receipt, &foreign_bytes).unwrap();
+        assert!(!is_verification_cached(&manifest, &install));
+        assert_replayed("verified-with-foreign-manifest-receipt", 2);
+        assert_eq!(fs::read(&receipt).unwrap(), foreign_bytes);
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(install.join(&weights.name))
+            .unwrap();
+        let mut original_byte = [0];
+        file.read_exact(&mut original_byte).unwrap();
+        file.rewind().unwrap();
+        file.write_all(&[original_byte[0] ^ 1]).unwrap();
+        assert_refused("foreign-receipt-with-changed-weights");
+        assert_eq!(fs::read(&receipt).unwrap(), foreign_bytes);
+        file.rewind().unwrap();
+        file.write_all(&original_byte).unwrap();
+        drop(file);
+        // Restoring the bytes changes their metadata. Only an explicit
+        // verification operation may replace the stale receipt.
+        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install).unwrap();
+        assert_replayed("restored-foreign-receipt-and-weights", 0);
+
         // Valid model files cannot authorize an answer from a different
         // embedding contract. Keep the cache filename so key admission must
         // reject the record before a fresh search with the intact producer.
@@ -1336,6 +1377,159 @@ mod loader_only {
         );
         parse_success_envelope("fast answer-cache index", &indexed);
         verify_real_fast_model_cache_isolation(&fsfs, temp.path(), &index);
+        verify_fast_answer_cache_generation_changes(&fsfs, temp.path(), &index);
+    }
+
+    #[cfg(all(unix, feature = "semantic-support"))]
+    #[allow(clippy::too_many_lines)]
+    fn verify_fast_answer_cache_generation_changes(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
+        let query = "producer policy controls retained network retries";
+        let config = root.join("cached-fast-model.toml");
+        let run_search = |label: &str, uncached: bool| {
+            let mut env = vec![("FRANKENSEARCH_LOG", "info")];
+            if uncached {
+                env.push(("FSFS_DISABLE_QUERY_CACHE", "1"));
+            }
+            fsfs.run_with_env(
+                root,
+                label,
+                [
+                    "search",
+                    query,
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--no-daemon",
+                    "--fast-only",
+                    "--limit",
+                    "3",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &env,
+            )
+        };
+        let (cache_path, original_answer) = fs::read_dir(index.join("query_cache"))
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).ok()?;
+                let record: Value = serde_json::from_slice(&bytes).ok()?;
+                (record["key"]["query"] == query).then_some((path, bytes))
+            })
+            .expect("generation control requires a real persisted answer");
+        let original_record: Value = serde_json::from_slice(&original_answer).unwrap();
+        let source = index.join("vector/index.fsvi");
+        let original_vectors = fs::read(&source).unwrap();
+        let reader = VectorIndex::open_read_only(&source).unwrap();
+        assert!(
+            reader.record_count() > 0,
+            "the control must retain real vectors"
+        );
+        let revision = reader.embedder_revision();
+        assert_eq!(revision.len(), 64);
+        let changed = if revision.starts_with('a') { 'b' } else { 'a' };
+        let incompatible_revision = format!("{changed}{}", &revision[1..]);
+        let replacement = root.join("incompatible-fast-producer.fsvi");
+        let mut writer = VectorIndex::create_with_revision(
+            &replacement,
+            reader.embedder_id(),
+            &incompatible_revision,
+            reader.dimension(),
+            reader.quantization(),
+        )
+        .unwrap()
+        .with_publication_nonce(reader.publication_nonce());
+        for row in 0..reader.record_count() {
+            writer
+                .write_record(
+                    reader.doc_id_at(row).unwrap(),
+                    &reader.vector_at_f32(row).unwrap(),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let incompatible = VectorIndex::open_read_only(&replacement).unwrap();
+        assert_eq!(incompatible.embedder_id(), reader.embedder_id());
+        assert_eq!(incompatible.dimension(), reader.dimension());
+        assert_eq!(incompatible.record_count(), reader.record_count());
+        assert_eq!(incompatible.embedder_revision(), incompatible_revision);
+        drop(incompatible);
+        drop(reader);
+        // Preserve valid FSVI framing, dimensions and genuine vectors. Only
+        // the complete producer revision is incompatible with the model.
+        let incompatible_bytes = fs::read(replacement).unwrap();
+        fs::write(&source, &incompatible_bytes).unwrap();
+        let cached = run_search("incompatible-vector-cached", false);
+        let uncached = run_search("incompatible-vector-uncached", true);
+        for outcome in [&cached, &uncached] {
+            assert!(!outcome.timed_out, "{outcome:?}");
+            assert!(!outcome.status.success(), "{outcome:?}");
+            let error: Value = serde_json::from_str(&outcome.stdout).unwrap();
+            assert_eq!(error["ok"], false);
+            assert!(error["data"].is_null());
+            assert_eq!(error["error"]["code"], "unverifiable_remote_space");
+        }
+        let cached_error: Value = serde_json::from_str(&cached.stdout).unwrap();
+        let uncached_error: Value = serde_json::from_str(&uncached.stdout).unwrap();
+        assert_eq!(cached.status.code(), uncached.status.code());
+        assert_eq!(cached_error["error"], uncached_error["error"]);
+        assert_eq!(fs::read(&cache_path).unwrap(), original_answer);
+        assert_eq!(fs::read(&source).unwrap(), incompatible_bytes);
+        fs::write(&source, original_vectors).unwrap();
+
+        // Publish a genuinely different corpus through the CLI, using the
+        // same registered producer. Retain a delayed old answer publication
+        // after the new generation so the cache reader must detect the drift.
+        let successor_corpus = root.join("successor-corpus");
+        fs::create_dir_all(&successor_corpus).unwrap();
+        fs::write(
+            successor_corpus.join("successor.md"),
+            "Applications reconnect after temporary outages using exponential backoff and randomized jitter, pausing between attempts to recover connections.",
+        )
+        .unwrap();
+        let indexed = fsfs.run_with_env(
+            root,
+            "fast-answer-cache-successor-index",
+            [
+                "index",
+                successor_corpus.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--full",
+                "--fast-only",
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FSFS_COMPLETE_GENERATIONS", "0")],
+        );
+        parse_success_envelope("publish same-producer successor", &indexed);
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, &original_answer).unwrap();
+        let fresh = run_search("changed-generation-fresh", false);
+        let fresh_payload = parse_success_envelope("changed-generation fresh answer", &fresh);
+        assert_eq!(fresh.stderr.matches("Model2Vec model loaded").count(), 1);
+        let hits = fresh_payload["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{fresh_payload}");
+        assert_eq!(hits[0]["path"], "successor.md", "{fresh_payload}");
+        assert!(hits[0]["semantic_rank"].is_number(), "{fresh_payload}");
+        assert!(hits[0]["lexical_rank"].is_null(), "{fresh_payload}");
+        let fresh_answer = fs::read(&cache_path).unwrap();
+        let fresh_record: Value = serde_json::from_slice(&fresh_answer).unwrap();
+        assert_eq!(fresh_record["key"], original_record["key"]);
+        assert_ne!(
+            fresh_record["index_fingerprint"],
+            original_record["index_fingerprint"]
+        );
+        let warm = run_search("changed-generation-warm", false);
+        let warm_payload = parse_success_envelope("changed-generation warm answer", &warm);
+        assert_eq!(warm_payload["data"], fresh_payload["data"]);
+        assert_eq!(warm.stderr.matches("Model2Vec model loaded").count(), 0);
+        assert!(warm.stderr.contains("model verification receipt accepted"));
+        assert_eq!(fs::read(&cache_path).unwrap(), fresh_answer);
     }
 
     #[cfg(all(unix, feature = "semantic-support"))]
