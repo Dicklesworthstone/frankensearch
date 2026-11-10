@@ -571,9 +571,14 @@ mod tests {
             assert_eq!(state.small_bytes, 0);
             assert_eq!(state.main_bytes, 90);
             assert_eq!(state.main_order, VecDeque::from(["growing"]));
-            let entry = state.entries.get("growing").expect("replacement retained");
-            assert_eq!(entry.location, EntryLocation::Main);
-            assert_eq!(entry.freq, 0);
+            let (location, frequency) = state
+                .entries
+                .get("growing")
+                .map(|entry| (entry.location, entry.freq))
+                .expect("replacement retained");
+            drop(state);
+            assert_eq!(location, EntryLocation::Main);
+            assert_eq!(frequency, 0);
         }
         assert_eq!(cache.get(&"growing"), Some(3));
         assert!(cache.get(&"resident").is_none());
