@@ -1481,7 +1481,7 @@ where
 }
 
 struct AcquisitionLock {
-    _file: File,
+    file: File,
 }
 
 impl AcquisitionLock {
@@ -1512,13 +1512,24 @@ impl AcquisitionLock {
             .open(lock_path)
             .map_err(SearchError::from)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file }),
             Err(TryLockError::WouldBlock) => Err(SearchError::InvalidConfig {
                 field: "model_acquisition.lock".to_owned(),
                 value: "busy".to_owned(),
                 reason: "another process is acquiring this model generation".to_owned(),
             }),
             Err(TryLockError::Error(error)) => Err(SearchError::from(error)),
+        }
+    }
+}
+
+impl Drop for AcquisitionLock {
+    fn drop(&mut self) {
+        // Closing this handle alone can leave the lock held by descriptors
+        // inherited during a concurrent process spawn. Its lifetime is the
+        // acquisition transaction, even if a duplicate handle survives it.
+        if let Err(error) = self.file.unlock() {
+            warn!(error_kind = ?error.kind(), "failed to release model acquisition lock");
         }
     }
 }
@@ -2984,6 +2995,43 @@ mod tests {
             ));
             assert!(!destination_dir.exists());
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquisition_lock_release_does_not_wait_for_inherited_handles() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("model");
+        let lock_path = temp.path().join(".model.acquisition.lock");
+        let first = AcquisitionLock::acquire(&destination).unwrap();
+        // A forked child can retain this open-file description until exec/exit.
+        let inherited = first.file.try_clone().unwrap();
+        let original = inherited.metadata().unwrap();
+        assert!(matches!(
+            AcquisitionLock::acquire(&destination),
+            Err(SearchError::InvalidConfig { ref field, ref value, .. })
+                if field == "model_acquisition.lock" && value == "busy"
+        ));
+
+        drop(first);
+        let successor = AcquisitionLock::acquire(&destination)
+            .expect("completed acquisition must release its lock despite inherited handles");
+        let current = std::fs::metadata(&lock_path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (original.dev(), original.ino())
+        );
+
+        drop(inherited);
+        assert!(matches!(
+            AcquisitionLock::acquire(&destination),
+            Err(SearchError::InvalidConfig { ref field, ref value, .. })
+                if field == "model_acquisition.lock" && value == "busy"
+        ));
+        drop(successor);
+        let _next = AcquisitionLock::acquire(&destination).unwrap();
     }
 
     #[test]
