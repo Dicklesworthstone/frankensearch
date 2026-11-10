@@ -318,6 +318,10 @@ pub(super) fn finish_index(
     };
     producer.validate()?;
     let storage = Arc::new(open_catalog(runtime, true)?);
+    let previous_key = storage
+        .get_index_metadata(BACKLOG_NAME)?
+        .map(|metadata| backlog_from_metadata(&metadata).map(|backlog| backlog.queue_key()))
+        .transpose()?;
     let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
     let mut backlog = Backlog {
         schema_version: 1,
@@ -362,6 +366,21 @@ pub(super) fn finish_index(
             "deferred quality coverage disagrees with source membership",
         ));
     }
+    if let Some(previous_key) = previous_key.filter(|previous| previous != &key) {
+        // Source reuse copied the predecessor's catalog, including its jobs.
+        // Only this new generation's key can complete against the new source
+        // fence. Retire the exact old queue after accounting for all replacement
+        // work, or unchanged rebuilds accumulate duplicate claimable jobs.
+        // This catalog belongs to the unpublished candidate: predecessor work
+        // and unrelated producer queues remain untouched on success or failure.
+        storage
+            .connection()
+            .execute_with_params_sync(
+                "DELETE FROM embedding_jobs WHERE embedder_id = ?1;",
+                &[SqliteValue::Text(previous_key.into())],
+            )
+            .map_err(storage_error)?;
+    }
     record_backlog(&storage, &backlog, 0)?;
     tracing::info!(
         queued = backlog.queued_documents,
@@ -383,6 +402,19 @@ fn read_optional_backlog(storage: &Storage) -> SearchResult<Option<Backlog>> {
     let Some(metadata) = storage.get_index_metadata(BACKLOG_NAME)? else {
         return Ok(None);
     };
+    let backlog = backlog_from_metadata(&metadata)?;
+    if metadata.record_count != 0 {
+        return Err(invalid(
+            "deferred quality catalog descriptor is inconsistent",
+        ));
+    }
+    Ok(Some(backlog))
+}
+
+/// Validate both pending and completed descriptors before using their exact
+/// producer key to retire copied work. Completion readers separately require
+/// a still-pending descriptor; a completed one cannot authorize more inference.
+fn backlog_from_metadata(metadata: &frankensearch_storage::IndexMetadata) -> SearchResult<Backlog> {
     let backlog: Backlog =
         serde_json::from_str(metadata.config_json.as_deref().ok_or_else(|| {
             invalid("the deferred quality catalog has no source and producer descriptor")
@@ -401,13 +433,15 @@ fn read_optional_backlog(storage: &Storage) -> SearchResult<Option<Backlog>> {
         || metadata.schema_version != Some(i64::from(backlog.schema_version))
         || metadata.dimension != i64::from(backlog.producer.space.dimension)
         || usize::try_from(metadata.source_doc_count).ok() != Some(backlog.requested_documents)
-        || metadata.record_count != 0
+        || (metadata.record_count != 0
+            && (metadata.record_count != metadata.source_doc_count
+                || backlog.unavailable_documents != 0))
     {
         return Err(invalid(
             "deferred quality catalog descriptor is inconsistent",
         ));
     }
-    Ok(Some(backlog))
+    Ok(backlog)
 }
 
 fn validate_pending_jobs(
@@ -1546,6 +1580,202 @@ mod tests {
         result
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn assert_only_current_quality_work(
+        cx: &Cx,
+        runtime: &FsfsRuntime,
+        root: &Path,
+        selected: &PublishedGeneration,
+    ) {
+        // Inspect and claim only an independently copied private candidate.
+        // Opening the selected catalog for writing would invalidate the very
+        // predecessor-preservation assertions this lifecycle test exercises.
+        let store = CompleteGenerationStore::open(cx, root).unwrap();
+        let build = store.begin(cx).unwrap();
+        let mut input = runtime.cli_input.clone();
+        input.index_dir = Some(build.path().to_path_buf());
+        let candidate = runtime.clone().with_cli_input(input);
+        assert_eq!(
+            retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path()).unwrap(),
+            *selected,
+        );
+        let storage = Arc::new(open_catalog(&candidate, false).unwrap());
+        let backlog = read_backlog(&storage).unwrap();
+        let rows = storage
+            .connection()
+            .query_sync("SELECT job_id FROM embedding_jobs;")
+            .unwrap();
+        let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
+        let claimed = queue
+            .claim_batch("queue-lifecycle-probe", JOB_BATCH_SIZE)
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            backlog.queued_documents,
+            "superseded generations must not leave duplicate claimable quality work",
+        );
+        assert!(
+            claimed
+                .iter()
+                .all(|job| job.embedder_id == backlog.queue_key())
+        );
+        assert_eq!(
+            rows.len(),
+            backlog.queued_documents,
+            "the candidate must not accumulate obsolete generation queues",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn source_reindex_retires_only_replaced_quality_work_after_coverage_validation() {
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("queue-reindex-fast"));
+            let quality = Arc::new(Producer::new("queue-reindex-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let deferred = runtime(directory.path(), true);
+            let root = directory.path().join("store");
+            let (publication, mut payload) = deferred
+                .rebuild_retained_generation_with_summary(&cx, &root)
+                .await
+                .unwrap();
+            let selected = durable(publication);
+            let before = files(selected.path());
+
+            for case in ["pending", "completed", "invalid-coverage", "cancelled"] {
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let build = store.begin(&cx).unwrap();
+                let mut input = deferred.cli_input.clone();
+                input.index_dir = Some(build.path().to_path_buf());
+                let mut candidate = deferred.clone().with_cli_input(input);
+                candidate.discovery_excluded_root = Some(root.clone());
+                assert_eq!(
+                    retained_reuse::copy_selected_generation(
+                        &cx,
+                        &candidate,
+                        &store,
+                        build.path(),
+                    )
+                    .unwrap(),
+                    selected,
+                );
+                let storage = Arc::new(open_catalog(&candidate, false).unwrap());
+                let previous = read_backlog(&storage).unwrap();
+                let previous_key = previous.queue_key();
+                let unrelated_key = format!("{previous_key}.unrelated-owner");
+                let queue =
+                    PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
+                queue
+                    .enqueue(
+                        "alpha.md",
+                        &unrelated_key,
+                        &ContentHasher::hash(&expected["alpha.md"]),
+                        0,
+                    )
+                    .unwrap();
+                if case == "completed" {
+                    let jobs = queue
+                        .claim_batch_for_embedder("previous-owner", JOB_BATCH_SIZE, &previous_key)
+                        .unwrap();
+                    assert_eq!(jobs.len(), expected.len());
+                    for job in jobs {
+                        assert_eq!(
+                            queue
+                                .complete(&job, job.content_hash.as_ref().unwrap())
+                                .unwrap(),
+                            ClaimOutcome::Applied(()),
+                        );
+                    }
+                    record_backlog(&storage, &previous, expected.len()).unwrap();
+                    assert!(read_backlog(&storage).is_err());
+                }
+                drop(queue);
+                drop(storage);
+                payload.generation.index_root = build.path().display().to_string();
+                payload.quality_deferred_files =
+                    expected.len() + usize::from(case == "invalid-coverage");
+                if case == "cancelled" {
+                    cx.set_cancel_requested(true);
+                }
+                let result = finish_index(&cx, &candidate, &payload);
+                cx.set_cancel_requested(false);
+                let storage = Arc::new(open_catalog(&candidate, false).unwrap());
+                let queue =
+                    PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
+                let current = read_backlog(&storage).unwrap();
+                if matches!(case, "invalid-coverage" | "cancelled") {
+                    assert!(result.is_err(), "{case}");
+                    assert_eq!(current.queue_key(), previous_key);
+                    assert_eq!(
+                        queue
+                            .claim_batch_for_embedder(
+                                "preserved-owner",
+                                JOB_BATCH_SIZE,
+                                &previous_key
+                            )
+                            .unwrap()
+                            .len(),
+                        expected.len(),
+                    );
+                } else {
+                    result.unwrap();
+                    assert_ne!(current.queue_key(), previous_key);
+                    assert!(
+                        queue
+                            .claim_batch_for_embedder(
+                                "obsolete-owner",
+                                JOB_BATCH_SIZE,
+                                &previous_key
+                            )
+                            .unwrap()
+                            .is_empty(),
+                    );
+                    let rows = storage
+                        .connection()
+                        .query_sync("SELECT job_id FROM embedding_jobs;")
+                        .unwrap();
+                    assert_eq!(rows.len(), expected.len() + 1, "{case}");
+                    let jobs = queue
+                        .claim_batch_for_embedder(
+                            "current-owner",
+                            JOB_BATCH_SIZE,
+                            &current.queue_key(),
+                        )
+                        .unwrap();
+                    assert_eq!(jobs.len(), expected.len());
+                    for job in jobs {
+                        let ClaimOutcome::Applied(document) =
+                            queue.check_claim(&job, None).unwrap()
+                        else {
+                            panic!("the replacement work must retain its exact document revision");
+                        };
+                        assert_eq!(
+                            document.content_hash,
+                            ContentHasher::hash(&expected[&job.doc_id])
+                        );
+                        assert_eq!(
+                            storage.get_document_content(&job.doc_id).unwrap().as_ref(),
+                            expected.get(&job.doc_id)
+                        );
+                    }
+                }
+                assert_eq!(
+                    queue
+                        .claim_batch_for_embedder("unrelated-owner", JOB_BATCH_SIZE, &unrelated_key)
+                        .unwrap()
+                        .len(),
+                    1,
+                    "a similar producer-key prefix is not retirement authority",
+                );
+                assert_eq!(store.active(&cx).unwrap(), Some(selected.clone()));
+                assert_eq!(files(selected.path()), before);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+            }
+        });
+    }
+
     #[test]
     fn restart_finishes_exact_quality_input_without_sources_or_fast_reembedding() {
         run(|cx| async move {
@@ -2227,6 +2457,7 @@ mod tests {
                     .unwrap(),
             );
             let mut predecessors = vec![(first.clone(), files(first.path()))];
+            assert_only_current_quality_work(&cx, &deferred, &root, &first);
             let latest_raw = "sharedtoken updated alpha body\r\n\r\nlatest source revision";
             let latest_canonical = DefaultCanonicalizer::default().canonicalize(latest_raw);
             fs::write(directory.path().join("source/alpha.md"), latest_raw).unwrap();
@@ -2265,6 +2496,7 @@ mod tests {
                         .await
                         .unwrap(),
                 );
+                assert_only_current_quality_work(&cx, &deferred, &root, &selected);
                 let wanted = if pass == 0 {
                     vec![latest_canonical.clone()]
                 } else {

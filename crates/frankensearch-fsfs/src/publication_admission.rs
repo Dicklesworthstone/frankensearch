@@ -173,11 +173,15 @@ mod tests {
             assert!(!root.path().join(PUBLICATION_LOCK_FILE_NAME).exists());
             assert!(!nested.join("missing").exists());
             assert_eq!(
-                std::fs::read_dir(root.path()).expect("root inventory").count(),
+                std::fs::read_dir(root.path())
+                    .expect("root inventory")
+                    .count(),
                 2
             );
             assert_eq!(
-                std::fs::read_dir(&nested).expect("nested inventory").count(),
+                std::fs::read_dir(&nested)
+                    .expect("nested inventory")
+                    .count(),
                 1
             );
         }
