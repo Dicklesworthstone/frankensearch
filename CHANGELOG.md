@@ -1,5 +1,26 @@
 # Changelog
 
+### Unreleased — Search accented Latin words in existing CASS indexes (#548)
+
+- Adapt materemias' illustrative frankensearch #74 patch to normalize affected
+  exact/prefix operands and quoted phrases through the indexing tokenizer before
+  case conversion in both lexical adapters. Indexed words such as `kérlek`
+  become searchable without changing durable tokenization or schema identity.
+- Require exact fragments in one title/content field, restrict prefix assistance
+  to the last fragment of an explicit prefix query, preserve Boolean/filter
+  semantics, and refuse token/expansion overflow as a complete query. Nonempty
+  unindexable operands no longer disappear into match-all recovery.
+- Keep empty quoted operands in Boolean expressions and wrap CASS phrase
+  scorers with an exact, monotone seek adapter so negated phrases cannot violate
+  the pinned Tantivy scorer's forward-seek assumptions. Native phrase positions,
+  scores, counts and explanations are retained.
+- Add multilingual, phrase, field/filter, case-mapping, empty-input, wildcard
+  and adversarial regressions. Plain fragments remain unordered conjunctions;
+  unsupported accented wildcard forms and Unicode normalization/folding limits
+  are documented in the language contract. Applying the correction to released
+  CASS v9 indexes must retain that compatible schema; adopting main's v10 schema
+  is a separate migration.
+
 ### Unreleased — Recover watcher changes after notification overflow
 
 - Honor filesystem backend rescan flags even when the notification has no paths

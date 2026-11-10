@@ -17,7 +17,8 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use tantivy::SegmentMeta;
 use tantivy::indexer::{LogMergePolicy, MergeCandidate, MergePolicy, NoMergePolicy, UserOperation};
 use tantivy::query::{
-    AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, EnableScoring, Explanation, Occur, PhraseQuery, Query, RangeQuery,
+    RegexQuery, Scorer, TermQuery, Weight,
 };
 use tantivy::schema::IndexRecordOption;
 use tantivy::schema::{
@@ -26,7 +27,10 @@ use tantivy::schema::{
 #[cfg(test)]
 use tantivy::tokenizer::RegexTokenizer;
 use tantivy::tokenizer::{TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
+use tantivy::{
+    DocId, DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, Score, SegmentReader, TERMINATED,
+    TantivyError, Term, doc,
+};
 use tracing::{debug, info, warn};
 
 /// Adapter that re-wraps an `Arc<dyn MergePolicy>` as a `Box<dyn MergePolicy>`,
@@ -1143,6 +1147,7 @@ impl CassTantivyIndex {
         let query = cass_fail_closed_tantivy_query(
             raw_query,
             cass_try_build_tantivy_query_from_tokens(
+                raw_query,
                 tokens,
                 has_boolean_operators,
                 filters,
@@ -1199,6 +1204,7 @@ impl CassTantivyIndex {
         let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
         let fields = self.fields();
         let outcome = cass_try_build_tantivy_query_from_tokens(
+            raw_query,
             tokens.clone(),
             has_boolean_operators,
             filters,
@@ -2471,9 +2477,9 @@ where
                         phrase.push(c);
                     }
                 }
-                if !phrase.is_empty() {
-                    push_token(&mut tokens, CassQueryToken::Phrase(phrase))?;
-                }
+                // A present quoted operand must survive even when empty.
+                // Otherwise required AND "" silently loses a requirement.
+                push_token(&mut tokens, CassQueryToken::Phrase(phrase))?;
             }
             '&' if chars.peek() == Some(&'&') => {
                 chars.next();
@@ -2570,13 +2576,45 @@ fn cass_normalize_term_parts(raw: &str) -> Vec<String> {
 }
 
 /// Normalize phrase text into tokenizer-aligned terms (lowercased, no wildcards).
-#[must_use]
-fn cass_normalize_phrase_terms(raw: &str) -> Vec<String> {
-    cass_sanitize_query(raw)
-        .split_whitespace()
-        .map(|s| s.trim_matches('*').to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect()
+fn cass_normalize_phrase_terms(raw: &str) -> SearchResult<(Vec<String>, bool, bool)> {
+    let mut terms = Vec::new();
+    let mut normalized = false;
+    let mut unindexable = false;
+    for term in cass_sanitize_query(raw).split_whitespace() {
+        let term = term.trim_matches('*');
+        // Edge stars retain the existing phrase behavior. An interior star
+        // remains literal/complex: tokenizing it would invent new matches.
+        let fragments = if term.contains('*') {
+            None
+        } else {
+            cass_indexed_fragments(term)?
+        };
+        match fragments {
+            Some(fragments) => {
+                normalized = true;
+                unindexable |= fragments.is_empty();
+                terms.extend(fragments);
+            }
+            None if !term.is_empty() => terms.push(term.to_lowercase()),
+            None => {}
+        }
+        if normalized && terms.len() > CASS_MAX_QUERY_FRAGMENTS {
+            return Err(cass_normalization_error(
+                "phrase has too many indexed fragments",
+            ));
+        }
+        if normalized && terms.iter().any(|term| term.is_ascii() && term.len() > 256) {
+            return Err(cass_normalization_error(
+                "an indexed phrase term exceeds 256 bytes",
+            ));
+        }
+    }
+    Ok((terms, normalized, unindexable))
+}
+
+/// Only an omitted operand or an explicit all-wildcard operand may disappear.
+fn cass_ignorable_operand(raw: &str) -> bool {
+    raw.chars().all(|ch| ch.is_whitespace() || ch == '*')
 }
 
 /// The complement of `query`: Tantivy reads a query of `MustNot` clauses
@@ -2763,12 +2801,23 @@ impl CassOracleGrammar<'_> {
                 &cass_normalize_term_parts(term),
                 self.fields,
                 self.regex_query_factory,
-            )?,
-            CassQueryToken::Phrase(phrase) => cass_build_phrase_query(
-                &cass_normalize_phrase_terms(phrase),
-                self.fields,
-                self.regex_query_factory,
-            )?,
+            )?
+            .or_else(|| (!cass_ignorable_operand(term)).then(cass_match_none_query)),
+            CassQueryToken::Phrase(phrase) => {
+                let (terms, normalized, unindexable) = cass_normalize_phrase_terms(phrase)?;
+                if unindexable || (terms.is_empty() && !phrase.contains('*')) {
+                    Some(cass_match_none_query())
+                } else if terms.len() == 1 && normalized {
+                    Some(cass_build_indexed_fragments_query(
+                        &terms,
+                        false,
+                        self.fields,
+                    ))
+                } else {
+                    cass_build_phrase_query(phrase, &terms, self.fields, self.regex_query_factory)?
+                        .or_else(|| (!cass_ignorable_operand(phrase)).then(cass_match_none_query))
+                }
+            }
             CassQueryToken::LParen => {
                 self.open_groups += 1;
                 let inner = self.parse_or()?;
@@ -2911,6 +2960,22 @@ fn cass_build_compound_term_query(
     let mut subqueries: Vec<Box<dyn Query>> = Vec::new();
     for part in parts {
         let pattern = CassWildcardPattern::parse(part);
+        if matches!(
+            pattern,
+            CassWildcardPattern::Exact(_) | CassWildcardPattern::Prefix(_)
+        ) && let Some(fragments) = cass_indexed_fragments(part.trim_matches('*'))?
+        {
+            let core = part.trim_matches('*');
+            let prefix = matches!(pattern, CassWildcardPattern::Prefix(_))
+                && core
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric());
+            subqueries.push(cass_build_indexed_fragments_query(
+                &fragments, prefix, fields,
+            ));
+            continue;
+        }
         let term_shoulds = cass_build_term_query_clauses(&pattern, fields, regex_query_factory)?;
         if !term_shoulds.is_empty() {
             subqueries.push(Box::new(BooleanQuery::new(term_shoulds)));
@@ -2927,8 +2992,138 @@ fn cass_build_compound_term_query(
     })
 }
 
+/// Keep one affected word within one logical field. Only its final fragment
+/// may consult that field's bounded edge-prefix column, and only for an
+/// explicit trailing wildcard. An AND of field-wide ORs would let one-letter
+/// fragments match unrelated words or split a word across title and content.
+fn cass_build_indexed_fragments_query(
+    fragments: &[String],
+    prefix: bool,
+    fields: &CassFields,
+) -> Box<dyn Query> {
+    if fragments.is_empty() {
+        return cass_match_none_query();
+    }
+    let mut field_queries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(2);
+    for (field, prefix_field) in [
+        (fields.title, fields.title_prefix),
+        (fields.content, fields.content_prefix),
+    ] {
+        let mut musts: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fragments.len());
+        for (index, fragment) in fragments.iter().enumerate() {
+            let exact: Box<dyn Query> = Box::new(TermQuery::new(
+                Term::from_field_text(field, fragment),
+                IndexRecordOption::WithFreqsAndPositions,
+            ));
+            let query = if prefix && index + 1 == fragments.len() {
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Should, exact),
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(prefix_field, fragment),
+                            IndexRecordOption::Basic,
+                        )),
+                    ),
+                ])) as Box<dyn Query>
+            } else {
+                exact
+            };
+            musts.push((Occur::Must, query));
+        }
+        field_queries.push((Occur::Should, Box::new(BooleanQuery::new(musts))));
+    }
+    Box::new(BooleanQuery::new(field_queries))
+}
+
+/// Keep CASS phrase scorers within the ordinary `DocSet` seek contract.
+///
+/// Tantivy 0.26.2's `Exclude` calls `seek_danger` with increasing candidates that
+/// can precede the phrase's current document. That is valid for `seek_danger`,
+/// but `PhraseScorer` forwards them to a forward-only intersection and asserts
+/// that the candidate is at least its current document (bd-nqeb4). Use the
+/// exact, valid-state default `seek_danger` instead; no panic is caught and no
+/// phrase is dropped. Weight, positions, scores and term visitors stay native.
+#[derive(Clone, Debug)]
+struct CassPhraseQuery(PhraseQuery);
+
+impl Query for CassPhraseQuery {
+    fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(CassPhraseWeight(self.0.weight(scoring)?)))
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.0.query_terms(visitor);
+    }
+}
+
+struct CassPhraseWeight(Box<dyn Weight>);
+
+impl Weight for CassPhraseWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        // Keep the wrapper for empty scorers too. Otherwise BooleanWeight
+        // can collapse the title/content union to EmptyScorer, whose default
+        // seek rejects an earlier document while explaining an OR operand.
+        Ok(Box::new(CassPhraseScorer(self.0.scorer(reader, boost)?)))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if doc >= reader.max_doc() || scorer.doc() > doc || scorer.seek(doc) != doc {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Document #({doc}) does not match"
+            )));
+        }
+        // The matching document cannot precede the original scorer's first
+        // match, so its native explanation can now seek forward safely.
+        self.0.explain(reader, doc)
+    }
+}
+
+struct CassPhraseScorer(Box<dyn Scorer>);
+
+impl DocSet for CassPhraseScorer {
+    fn advance(&mut self) -> DocId {
+        if self.0.doc() == TERMINATED {
+            TERMINATED
+        } else {
+            self.0.advance()
+        }
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        let current = self.0.doc();
+        if current >= target {
+            current
+        } else {
+            self.0.seek(target)
+        }
+    }
+
+    // Deliberately inherit DocSet::seek_danger: it uses this exact seek and
+    // never leaves the inner phrase scorer in an invalid approximate state.
+    fn doc(&self) -> DocId {
+        self.0.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.0.size_hint()
+    }
+
+    fn cost(&self) -> u64 {
+        self.0.cost()
+    }
+}
+
+impl Scorer for CassPhraseScorer {
+    fn score(&mut self) -> Score {
+        self.0.score()
+    }
+}
+
 /// Build a phrase query (exact order) across title/content fields.
 fn cass_build_phrase_query(
+    raw: &str,
     terms: &[String],
     fields: &CassFields,
     regex_query_factory: CassRegexQueryFactory,
@@ -2940,10 +3135,16 @@ fn cass_build_phrase_query(
         return cass_build_compound_term_query(terms, fields, regex_query_factory);
     }
 
-    // If any term contains CJK, fall back to compound term query (AND of bigrams)
-    // because PhraseQuery expects exact indexed tokens and CJK is bigram-indexed.
+    // CJK phrases retain the legacy non-positional AND of bigrams. Lower the
+    // original operands so an affected word stays one exact, same-field group:
+    // passing flattened fragments would restore prefix/cross-field matches.
     if terms.iter().any(|t| contains_cjk(t)) {
-        return cass_build_compound_term_query(terms, fields, regex_query_factory);
+        let parts = cass_normalize_term_parts(raw)
+            .into_iter()
+            .map(|part| part.trim_matches('*').to_owned())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        return cass_build_compound_term_query(&parts, fields, regex_query_factory);
     }
 
     let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -2952,9 +3153,97 @@ fn cass_build_phrase_query(
             .iter()
             .map(|t| Term::from_field_text(field, t))
             .collect::<Vec<_>>();
-        shoulds.push((Occur::Should, Box::new(PhraseQuery::new(phrase_terms))));
+        shoulds.push((
+            Occur::Should,
+            Box::new(CassPhraseQuery(PhraseQuery::new(phrase_terms))),
+        ));
     }
     Ok(Some(Box::new(BooleanQuery::new(shoulds))))
+}
+
+/// The terms `CassTokenizer` indexes for `raw`, when `raw` holds a character
+/// outside ASCII and the CJK ranges.
+///
+/// The tokenizer treats such characters as separators, so it indexes `kérlek`
+/// as `k` + `rlek`, while query terms keep every Unicode letter. Running the
+/// tokenizer itself on the unlowercased text keeps both sides aligned, including
+/// hyphen runs (`a--b`) and case mappings that change length (`İ`). Returns
+/// `None` when no such character occurs or the operand contains CJK, whose
+/// historical bigram handling remains unchanged. `Some(empty)` is explicitly
+/// unmatchable, including Unicode characters whose lowercase form is ASCII.
+/// Oversized or excessive fragments reject the whole query: dropping a required
+/// fragment could broaden a positive query or invert a rejected negation.
+/// Suffix, substring and complex wildcards are intentionally not normalized.
+/// Quill's `cass_indexed_fragments` is the native twin of this function.
+fn cass_indexed_fragments(raw: &str) -> SearchResult<Option<Vec<String>>> {
+    if !cass_needs_indexed_fragments(raw) || raw.chars().any(is_cass_tokenizer_cjk) {
+        return Ok(None);
+    }
+    let mut tokenizer = CassTokenizer::default();
+    let mut stream = tokenizer.token_stream(raw);
+    let mut fragments = Vec::new();
+    while stream.advance() {
+        if stream.token().text.len() > 256 {
+            return Err(cass_normalization_error(
+                "an indexed fragment exceeds 256 bytes",
+            ));
+        }
+        if fragments.len() == CASS_MAX_QUERY_FRAGMENTS {
+            return Err(cass_normalization_error(
+                "operand has too many indexed fragments",
+            ));
+        }
+        fragments.push(stream.token().text.to_ascii_lowercase());
+    }
+    Ok(Some(fragments))
+}
+
+const CASS_MAX_QUERY_FRAGMENTS: usize = 256;
+const CASS_MAX_QUERY_LENGTH: usize = 10_000;
+const CASS_MAX_QUERY_NESTING: usize = 128;
+
+fn cass_needs_indexed_fragments(raw: &str) -> bool {
+    raw.chars()
+        .any(|ch| !ch.is_ascii() && !is_cass_tokenizer_cjk(ch))
+}
+
+fn cass_normalization_error(reason: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "cass_query.normalization".to_owned(),
+        value: "query rejected".to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn cass_query_normalization_preflight(raw: &str) -> SearchResult<()> {
+    if !raw.trim().is_empty()
+        && cass_needs_indexed_fragments(raw)
+        && raw.chars().take(CASS_MAX_QUERY_LENGTH + 1).count() > CASS_MAX_QUERY_LENGTH
+    {
+        return Err(cass_normalization_error(
+            "query exceeds 10000 Unicode scalar values",
+        ));
+    }
+    Ok(())
+}
+
+/// Count lexer groups, excluding parentheses inside phrases and code terms,
+/// before the recursive grammar can consume adversarially deep input.
+fn cass_query_nesting_preflight(tokens: &[CassQueryToken]) -> SearchResult<()> {
+    let mut depth = 0_usize;
+    for token in tokens {
+        match token {
+            CassQueryToken::LParen => {
+                depth += 1;
+                if depth > CASS_MAX_QUERY_NESTING {
+                    return Err(cass_normalization_error("query exceeds 128 nested groups"));
+                }
+            }
+            CassQueryToken::RParen => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Build Tantivy query clauses from boolean tokens.
@@ -3031,11 +3320,15 @@ pub fn cass_build_tantivy_query(
     filters: &CassQueryFilters,
     fields: &CassFields,
 ) -> Box<dyn Query> {
+    if let Err(error) = cass_query_normalization_preflight(raw_query) {
+        return cass_fail_closed_tantivy_query(raw_query, Err(error));
+    }
     let tokens = cass_parse_boolean_query(raw_query);
     let has_boolean_operators = !tokens.is_empty() && cass_has_boolean_operators(raw_query);
     cass_fail_closed_tantivy_query(
         raw_query,
         cass_try_build_tantivy_query_from_tokens(
+            raw_query,
             tokens,
             has_boolean_operators,
             filters,
@@ -3056,11 +3349,15 @@ pub fn cass_build_tantivy_query_single_parse(
     filters: &CassQueryFilters,
     fields: &CassFields,
 ) -> Box<dyn Query> {
+    if let Err(error) = cass_query_normalization_preflight(raw_query) {
+        return cass_fail_closed_tantivy_query(raw_query, Err(error));
+    }
     let tokens = cass_parse_boolean_query(raw_query);
     let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
     cass_fail_closed_tantivy_query(
         raw_query,
         cass_try_build_tantivy_query_from_tokens(
+            raw_query,
             tokens,
             has_boolean_operators,
             filters,
@@ -3071,16 +3368,24 @@ pub fn cass_build_tantivy_query_single_parse(
 }
 
 fn cass_try_build_tantivy_query_from_tokens(
+    raw_query: &str,
     tokens: Vec<CassQueryToken>,
     has_boolean_operators: bool,
     filters: &CassQueryFilters,
     fields: &CassFields,
     regex_query_factory: CassRegexQueryFactory,
 ) -> SearchResult<Box<dyn Query>> {
+    cass_query_normalization_preflight(raw_query)?;
+    cass_query_nesting_preflight(&tokens)?;
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     if tokens.is_empty() {
-        clauses.push((Occur::Must, Box::new(AllQuery)));
+        let query: Box<dyn Query> = if raw_query.trim().is_empty() {
+            Box::new(AllQuery)
+        } else {
+            cass_match_none_query()
+        };
+        clauses.push((Occur::Must, query));
     } else if has_boolean_operators {
         clauses.extend(cass_build_boolean_query_clauses(
             &tokens,
@@ -3095,6 +3400,8 @@ fn cass_try_build_tantivy_query_from_tokens(
                     cass_build_compound_term_query(&parts, fields, regex_query_factory)?
                 {
                     clauses.push((Occur::Must, term_query));
+                } else if !cass_ignorable_operand(&term_str) {
+                    clauses.push((Occur::Must, cass_match_none_query()));
                 }
             }
         }
@@ -4242,6 +4549,7 @@ mod cass_query_tests {
 
         let raw_query = "NOT *legacy";
         let failed_build = cass_try_build_tantivy_query_from_tokens(
+            raw_query,
             cass_parse_boolean_query(raw_query),
             true,
             &CassQueryFilters::default(),
@@ -4684,6 +4992,581 @@ mod cass_query_tests {
         assert!(
             !results.is_empty(),
             "CJK search for 'テスト' should find the indexed Japanese document"
+        );
+    }
+
+    /// `CassTokenizer` indexes `kérlek` as `k` + `rlek`; a query for the whole
+    /// word must reach those terms, split like the tokenizer splits, before
+    /// lowercasing (`İ`) and at hyphen runs. A word with no indexable fragment
+    /// (`привет`) must still match nothing.
+    #[test]
+    fn accented_latin_index_and_search_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+        let doc = |msg_idx: u64, title: &str, content: &str| CassDocument {
+            agent: "claude".to_string(),
+            workspace: None,
+            workspace_original: None,
+            source_path: format!("/tmp/test-{msg_idx}"),
+            msg_idx,
+            created_at: Some(1_700_000_000_000),
+            title: Some(title.to_string()),
+            content: content.to_string(),
+            conversation_id: None,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+        idx.add_cass_documents(&[
+            doc(0, "Mentés", "Kérlek ellenőrizd a mentést İstanbulban"),
+            doc(1, "Backup", "please check the backup"),
+        ])
+        .expect("add");
+        idx.commit().expect("commit");
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+        let fields = idx.fields();
+
+        for (raw, expected) in [
+            ("kérlek", 1),
+            ("Kérlek", 1),
+            ("ellenőrizd", 1),
+            ("mentést", 1),
+            ("İstanbulban", 1),
+            ("kérlek--mentést", 1),
+            ("\"kérlek ellenőrizd\"", 1),
+            ("\"ellenőrizd kérlek\"", 0),
+            ("kér*", 1),
+            ("kérlek AND backup", 0),
+            ("kérlek OR backup", 2),
+            ("please", 1),
+            ("привет", 0),
+        ] {
+            let query = cass_build_tantivy_query(raw, &CassQueryFilters::default(), &fields);
+            let hits = searcher
+                .search(&query, &tantivy::collector::Count)
+                .expect("search");
+            assert_eq!(hits, expected, "query {raw:?}");
+        }
+    }
+
+    #[test]
+    fn accented_latin_queries_preserve_fields_operators_and_phrase_order() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut index = CassTantivyIndex::open_or_create_with_writer_parallelism(dir.path(), 1)
+            .expect("create accented fixture");
+        let documents = [
+            ("Hungarian", "Kérlek nézd ellenőrizd a mentést İstanbulban"),
+            ("k", "rlek"),
+            ("Prefix traps", "king rlekin menthol seconds"),
+            ("French", "café déjà vérifiez"),
+            ("German", "Straße"),
+            ("Polish", "zażółć gęślą jaźń"),
+            ("Czech", "příliš žluťoučký"),
+            ("Case maps", "İstanbul K"),
+            ("Decomposed", "ke\u{301}rlek"),
+            ("Separated", "k intervening rlek"),
+            ("Reverse", "rlek k"),
+            ("Terminal prefix", "k rlekin"),
+            ("ASCII control", "backup"),
+            ("Another prefix trap", "cafeteria"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(position, (title, content))| CassDocument {
+            agent: if position == 0 { "claude" } else { "codex" }.to_owned(),
+            workspace: Some(if position == 0 { "/café" } else { "/other" }.to_owned()),
+            workspace_original: None,
+            source_path: format!("/fixture/accented-{position}.jsonl"),
+            msg_idx: u64::try_from(position).expect("fixture position fits"),
+            created_at: Some(100 + i64::try_from(position).expect("fixture position fits")),
+            title: Some(title.to_owned()),
+            content: content.to_owned(),
+            conversation_id: None,
+            source_id: if position == 0 { "source-é" } else { "local" }.to_owned(),
+            origin_kind: if position == 0 { "ssh" } else { "local" }.to_owned(),
+            origin_host: None,
+        })
+        .collect::<Vec<_>>();
+        index.add_cass_documents(&documents).expect("index fixture");
+        index.commit().expect("commit fixture");
+        let reader = index.reader().expect("fixture reader");
+        reader.reload().expect("reload fixture");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+
+        for (query, expected) in [
+            ("kérlek", vec![0, 9, 10]),
+            ("KÉRLEK", vec![0, 9, 10]),
+            ("kérl*", vec![0, 9, 10, 11]),
+            ("kér*", vec![0]),
+            ("kérlek--mentést", vec![0]),
+            ("\"kérlek\"", vec![0]),
+            ("\"kérlek nézd\"", vec![0]),
+            ("\"nézd kérlek\"", vec![]),
+            ("\"kérlek kérlek\"", vec![]),
+            ("\"ké*rlek\"", vec![]),
+            ("\"ké*rlek nézd\"", vec![]),
+            ("\"*kérlek*\"", vec![0]),
+            ("\"kérl*\"", vec![]),
+            ("mentést", vec![0]),
+            ("café", vec![3]),
+            ("café*", vec![3]),
+            ("\"café\"", vec![3]),
+            ("\"café*\"", vec![3]),
+            ("déjà", vec![3]),
+            ("Straße", vec![4]),
+            ("STRAẞE", vec![4]),
+            ("STRASSE", vec![]),
+            ("ZAŻÓŁĆ", vec![5]),
+            ("příliš", vec![6]),
+            ("İstanbul", vec![7]),
+            ("\"İstanbul\"", vec![7]),
+            ("İstanbul*", vec![0, 7]),
+            ("istanbul", vec![]),
+            ("K", vec![]),
+            ("İ", vec![]),
+            ("ke\u{301}rlek", vec![8]),
+            ("\"ke\u{301}rlek\"", vec![8]),
+            ("kérlek AND backup", vec![]),
+            ("kérlek OR backup", vec![0, 9, 10, 12]),
+            ("kérlek -mentést", vec![9, 10]),
+            ("NOT NOT kérlek", vec![0, 9, 10]),
+            ("(kérlek OR backup) AND -mentést", vec![9, 10, 12]),
+            ("backup NOT kérlek", vec![12]),
+            ("backup AND 🚀", vec![]),
+            ("🚀 OR backup", vec![12]),
+            ("привет", vec![]),
+            ("éß", vec![]),
+            ("\"kérlek привет\"", vec![]),
+            ("🚀", vec![]),
+            ("🚀*", vec![]),
+            ("!***", vec![]),
+            ("...", vec![]),
+            ("\"🚀\"", vec![]),
+            ("\"🚀*\"", vec![]),
+            ("\"*++*\"", vec![]),
+            ("\"\"", vec![]),
+            ("\" \u{2003}\"", vec![]),
+            ("backup \u{2003}", vec![12]),
+            ("*érlek", vec![]),
+            ("*kérlek*", vec![]),
+            ("kér*lek", vec![]),
+            ("backup", vec![12]),
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, query, &CassQueryFilters::default()),
+                expected,
+                "query {query:?}"
+            );
+        }
+
+        for filters in [
+            CassQueryFilters {
+                agents: vec!["claude".to_owned()],
+                ..CassQueryFilters::default()
+            },
+            CassQueryFilters {
+                workspaces: vec!["/café".to_owned()],
+                ..CassQueryFilters::default()
+            },
+            CassQueryFilters {
+                created_from: Some(100),
+                created_to: Some(100),
+                ..CassQueryFilters::default()
+            },
+            CassQueryFilters {
+                source_filter: CassSourceFilter::SourceId("source-é".to_owned()),
+                ..CassQueryFilters::default()
+            },
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, "kérlek", &filters),
+                vec![0]
+            );
+            assert!(cass_result_ids(&searcher, &fields, "🚀", &filters).is_empty());
+        }
+
+        let oversized = format!("{}ébackup", "x".repeat(257));
+        let terminal_oversized = format!("backupé{}", "x".repeat(257));
+        let too_many = "ké".repeat(CASS_MAX_QUERY_FRAGMENTS + 1);
+        let too_long = format!("kérlek{}", " ".repeat(CASS_MAX_QUERY_LENGTH));
+        for invalid in [oversized, terminal_oversized, too_many, too_long] {
+            for query in [
+                invalid.clone(),
+                format!("backup OR {invalid}"),
+                format!("NOT {invalid}"),
+                format!("NOT \"{invalid}\""),
+                format!("NOT \"привет {invalid}\""),
+            ] {
+                assert!(
+                    cass_result_ids(&searcher, &fields, &query, &CassQueryFilters::default())
+                        .is_empty(),
+                    "normalization rejection must fail the whole query: {query:?}"
+                );
+            }
+        }
+        for phrase in [
+            format!("{} café", "x".repeat(257)),
+            format!("café {}", "x".repeat(257)),
+        ] {
+            for raw in [
+                format!("\"{phrase}\""),
+                format!("backup OR \"{phrase}\""),
+                format!("NOT \"{phrase}\""),
+            ] {
+                assert!(
+                    cass_result_ids(&searcher, &fields, &raw, &CassQueryFilters::default())
+                        .is_empty(),
+                    "a rejected mixed phrase must fail the whole query: {raw:?}"
+                );
+            }
+        }
+        for (term, expected) in [("kérlek", vec![0, 9, 10]), ("backup", vec![12])] {
+            let allowed = format!(
+                "{}{term}{} AND {term}",
+                "(".repeat(CASS_MAX_QUERY_NESTING),
+                ")".repeat(CASS_MAX_QUERY_NESTING)
+            );
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, &allowed, &CassQueryFilters::default()),
+                expected,
+                "the depth boundary remains searchable"
+            );
+            let excessive = format!(
+                "{}{term}{}",
+                "(".repeat(CASS_MAX_QUERY_NESTING + 1),
+                ")".repeat(CASS_MAX_QUERY_NESTING + 1)
+            );
+            for raw in [
+                excessive.clone(),
+                format!("backup OR {excessive}"),
+                format!("NOT {excessive}"),
+            ] {
+                assert!(
+                    cass_result_ids(&searcher, &fields, &raw, &CassQueryFilters::default())
+                        .is_empty(),
+                    "excessive grouping must fail the whole query: {raw:?}"
+                );
+            }
+        }
+        for (raw, expected) in [
+            (format!("kérlek{}", "(".repeat(200)), vec![0, 9, 10]),
+            (format!("\"kérlek {} nézd\"", "(".repeat(200)), vec![0]),
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, &raw, &CassQueryFilters::default()),
+                expected,
+                "opaque parentheses are not grammar groups: {raw:?}"
+            );
+        }
+        for all_query in ["", " \t\n", "\u{a0}", "*", "***"] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, all_query, &CassQueryFilters::default()),
+                (0..14).collect::<Vec<_>>(),
+                "explicit all-documents query {all_query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accented_words_stay_grouped_in_legacy_cjk_phrase_fallback() {
+        let directory = tempfile::tempdir().expect("mixed script directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create mixed script index");
+        let documents = [
+            ("", "kérlek 日本語 café"),
+            ("k", "rlektor 日本語 cafeteria"),
+            ("k", "rlek 日本語"),
+            ("", "k rlektor 日本語 cafeteria"),
+            ("", "日本語 rlek k caf"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(position, (title, content))| CassDocument {
+            agent: "claude".to_owned(),
+            workspace: None,
+            workspace_original: None,
+            source_path: format!("/fixture/mixed-script-{position}.jsonl"),
+            msg_idx: u64::try_from(position).expect("fixture ordinal"),
+            created_at: None,
+            title: Some(title.to_owned()),
+            content: content.to_owned(),
+            conversation_id: None,
+            source_id: "local".to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: None,
+        })
+        .collect::<Vec<_>>();
+        index
+            .add_cass_documents(&documents)
+            .expect("index mixed scripts");
+        index.commit().expect("commit mixed scripts");
+        let reader = index.reader().expect("mixed script reader");
+        reader.reload().expect("reload mixed scripts");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        for (raw, expected) in [
+            ("\"kérlek 日本語\"", vec![0, 4]),
+            ("\"日本語 kérlek\"", vec![0, 4]),
+            ("\"kérlek* 日本語\"", vec![0, 4]),
+            ("kérlek* 日本語", vec![0, 3, 4]),
+            ("\"café 日本語\"", vec![0, 4]),
+            ("\"café* 日本語\"", vec![0, 4]),
+            ("\"ké*rlek 日本語\"", vec![]),
+            ("kérlek日本語", vec![0, 1, 2, 3, 4]),
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, raw, &CassQueryFilters::default()),
+                expected,
+                "mixed-script query {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_quoted_operands_remain_required_in_boolean_queries() {
+        let directory = tempfile::tempdir().expect("empty phrase directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create empty phrase index");
+        let documents = ["backup kérlek", "other kérlek", "other"]
+            .into_iter()
+            .enumerate()
+            .map(|(position, content)| CassDocument {
+                agent: "claude".to_owned(),
+                workspace: None,
+                workspace_original: None,
+                source_path: format!("/fixture/empty-phrase-{position}.jsonl"),
+                msg_idx: u64::try_from(position).expect("fixture ordinal"),
+                created_at: None,
+                title: None,
+                content: content.to_owned(),
+                conversation_id: None,
+                source_id: "local".to_owned(),
+                origin_kind: "local".to_owned(),
+                origin_host: None,
+            })
+            .collect::<Vec<_>>();
+        index
+            .add_cass_documents(&documents)
+            .expect("index operands");
+        index.commit().expect("commit operands");
+        let reader = index.reader().expect("empty phrase reader");
+        reader.reload().expect("reload operands");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let filters = CassQueryFilters::default();
+
+        for empty_operand in ["\"\"", "\" \u{2003}\"", "\"🚀\""] {
+            for (raw, expected) in [
+                (empty_operand.to_owned(), vec![]),
+                (format!("backup AND {empty_operand}"), vec![]),
+                (format!("kérlek AND {empty_operand}"), vec![]),
+                (format!("backup {empty_operand}"), vec![]),
+                (format!("{empty_operand} OR backup"), vec![0]),
+                (format!("backup OR {empty_operand}"), vec![0]),
+                (format!("kérlek OR {empty_operand}"), vec![0, 1]),
+                (format!("NOT {empty_operand}"), vec![0, 1, 2]),
+                (format!("NOT NOT {empty_operand}"), vec![]),
+                (format!("backup NOT {empty_operand}"), vec![0]),
+                (format!("NOT ({empty_operand} OR backup)"), vec![1, 2]),
+            ] {
+                assert_eq!(
+                    cass_result_ids(&searcher, &fields, &raw, &filters),
+                    expected,
+                    "{raw:?}"
+                );
+            }
+        }
+        for omitted in ["", " \u{2003}", "***", "\"*** \u{2003}\""] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, omitted, &filters),
+                vec![0, 1, 2],
+                "{omitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accented_latin_negated_phrases_preserve_exclusions_and_scores() {
+        let directory = tempfile::tempdir().expect("negated phrase directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create negated phrase index");
+        let documents = [
+            "backup kérlek filler nézd",
+            "backup kérlek nézd",
+            "backup nézd kérlek",
+            "other kérlek nézd",
+            "backup complete",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(position, content)| CassDocument {
+            agent: "claude".to_owned(),
+            workspace: None,
+            workspace_original: None,
+            source_path: format!("/fixture/negative-phrase-{position}.jsonl"),
+            msg_idx: u64::try_from(position).expect("fixture ordinal"),
+            created_at: None,
+            title: None,
+            content: content.to_owned(),
+            conversation_id: None,
+            source_id: "local".to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: None,
+        })
+        .collect::<Vec<_>>();
+        index.add_cass_documents(&documents).expect("index phrases");
+        index.commit().expect("commit phrases");
+        let reader = index.reader().expect("phrase reader");
+        reader.reload().expect("reload phrases");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let filters = CassQueryFilters::default();
+        let positive = scored_cass_results(&searcher, &fields, "backup", &filters);
+
+        // The excluded phrase starts after the first positive document, and
+        // later becomes exhausted while positive candidates still remain.
+        // A fully absent phrase whose individual terms exist is a distinct
+        // case from a missing-term query that returns an EmptyScorer directly.
+        for (raw, expected) in [
+            ("backup NOT \"kérlek nézd\"", vec![0, 2, 4]),
+            ("backup NOT \"kérlek kék\"", vec![0, 1, 2, 4]),
+            ("backup -\"nézd kérlek\"", vec![0, 1, 4]),
+            ("backup OR \"kérlek kék\"", vec![0, 1, 2, 4]),
+            (
+                "backup NOT (\"kérlek nézd\" OR \"nézd kérlek\")",
+                vec![0, 4],
+            ),
+        ] {
+            let actual = scored_cass_results(&searcher, &fields, raw, &filters);
+            assert_eq!(
+                actual.keys().copied().collect::<Vec<_>>(),
+                expected,
+                "{raw:?}"
+            );
+            for (id, score) in &actual {
+                assert_eq!(score.to_bits(), positive[id].to_bits(), "score for {raw:?}");
+            }
+            let query = cass_build_tantivy_query(raw, &filters, &fields);
+            assert_eq!(
+                searcher
+                    .search(&*query, &tantivy::collector::Count)
+                    .expect("count negatives"),
+                actual.len(),
+                "count for {raw:?}"
+            );
+            for (score, address) in searcher
+                .search(&*query, &tantivy::collector::TopDocs::with_limit(5))
+                .expect("search explained exclusions")
+            {
+                let explanation = query
+                    .explain(&searcher, address)
+                    .expect("explain retained document");
+                assert_eq!(explanation.value().to_bits(), score.to_bits());
+            }
+        }
+        assert_eq!(
+            cass_result_ids(&searcher, &fields, "\"kérlek nézd\"", &filters),
+            vec![1, 3]
+        );
+        assert_eq!(
+            cass_result_ids(&searcher, &fields, "backup", &filters),
+            vec![0, 1, 2, 4]
+        );
+
+        let phrase = cass_build_tantivy_query("\"kérlek nézd\"", &filters, &fields);
+        let absent_phrase = cass_build_tantivy_query("\"kérlek kék\"", &filters, &fields);
+        let excluded = cass_build_tantivy_query("backup NOT \"kérlek nézd\"", &filters, &fields);
+        // Nonmatches lie before, between and after the phrase's matches.
+        // Native PhraseWeight::explain otherwise seeks backwards for the
+        // first of these; the adapter must return an ordinary nonmatch error.
+        for (_, address) in searcher
+            .search(&*excluded, &tantivy::collector::TopDocs::with_limit(5))
+            .expect("find phrase nonmatches")
+        {
+            assert!(phrase.explain(&searcher, address).is_err());
+            assert!(absent_phrase.explain(&searcher, address).is_err());
+        }
+        for (score, address) in searcher
+            .search(&*phrase, &tantivy::collector::TopDocs::with_limit(5))
+            .expect("find phrase matches")
+        {
+            let explanation = phrase.explain(&searcher, address).expect("explain phrase");
+            assert_eq!(explanation.value().to_bits(), score.to_bits());
+        }
+        let protected_phrase = CassPhraseQuery(PhraseQuery::new(
+            ["k", "rlek", "n", "zd"]
+                .map(|term| Term::from_field_text(fields.content, term))
+                .to_vec(),
+        ));
+        assert!(
+            protected_phrase
+                .explain(
+                    &searcher,
+                    tantivy::DocAddress {
+                        segment_ord: 0,
+                        doc_id: TERMINATED,
+                    },
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn accented_latin_fragment_limits_and_unlowercased_token_boundaries() {
+        for (raw, expected) in [
+            ("KÉRLEK", vec!["k", "rlek"]),
+            ("İstanbul", vec!["stanbul"]),
+            ("kérlek--mentést", vec!["k", "rlek", "ment", "st"]),
+            ("Straße", vec!["stra", "e"]),
+            ("K", vec![]),
+            ("привет", vec![]),
+        ] {
+            assert_eq!(
+                cass_indexed_fragments(raw).expect("bounded fragments"),
+                Some(expected.into_iter().map(str::to_owned).collect()),
+                "raw operand {raw:?}"
+            );
+        }
+        for unchanged in ["ASCII", "foo-bar", "搜索", "kérlek搜索"] {
+            assert_eq!(cass_indexed_fragments(unchanged).expect("unchanged"), None);
+        }
+        let at_limit = format!("{}ébackup", "A".repeat(256));
+        assert_eq!(
+            cass_indexed_fragments(&at_limit).expect("256-byte token remains valid"),
+            Some(vec!["a".repeat(256), "backup".to_owned()])
+        );
+        for over_limit in [
+            format!("{}ébackup", "A".repeat(257)),
+            format!("backupé{}", "A".repeat(257)),
+            "ké".repeat(CASS_MAX_QUERY_FRAGMENTS + 1),
+        ] {
+            assert!(cass_indexed_fragments(&over_limit).is_err());
+        }
+        let fragment_limit = "ké".repeat(CASS_MAX_QUERY_FRAGMENTS);
+        assert_eq!(
+            cass_indexed_fragments(&fragment_limit)
+                .expect("exact fragment limit")
+                .expect("affected operand")
+                .len(),
+            CASS_MAX_QUERY_FRAGMENTS
+        );
+        assert!(cass_normalize_phrase_terms(&format!("{fragment_limit} café")).is_err());
+        for mixed in [
+            format!("{} café", "a".repeat(257)),
+            format!("café {}", "a".repeat(257)),
+        ] {
+            assert!(cass_normalize_phrase_terms(&mixed).is_err());
+        }
+        assert!(cass_normalize_phrase_terms(&format!("{} café", "日本語".repeat(40))).is_ok());
+        assert_eq!(
+            cass_normalize_phrase_terms("ké*rlek").expect("literal interior wildcard"),
+            (vec!["ké*rlek".to_owned()], false, false)
         );
     }
 

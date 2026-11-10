@@ -890,6 +890,277 @@ mod tests {
         });
     }
 
+    /// A word with an accented Latin letter must find the document it came from.
+    ///
+    /// The CASS tokenizer keeps only ASCII alphanumeric and CJK runs, so it
+    /// indexes `kérlek` as `k` + `rlek`. The query parser keeps the whole
+    /// word, so before the fix such a query matched nothing. The query side
+    /// must split like the tokenizer, before lowercasing (`İ`) and at hyphen
+    /// runs. A word with no indexable fragment at all (`привет`) must still
+    /// match nothing rather than everything.
+    #[test]
+    fn cass_accented_latin_words_match_the_indexed_fragments() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+            let documents = [
+                sample_document(
+                    "hu",
+                    0,
+                    "claude",
+                    "Mentés",
+                    "Kérlek ellenőrizd a mentést İstanbulban",
+                ),
+                sample_document("en", 1, "codex", "Backup", "please check the backup"),
+            ]
+            .iter()
+            .map(CassDocument::to_schema_document)
+            .collect::<Vec<_>>();
+            index
+                .index_schema_documents(&cx, &documents)
+                .await
+                .expect("ingest CASS documents");
+            index.commit(&cx).await.expect("publish CASS documents");
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open a CASS-schema reader");
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS query parser");
+            let filters = crate::query::CassQueryFilters::default();
+
+            for (query, expected) in [
+                ("kérlek", 1),
+                ("Kérlek", 1),
+                ("ellenőrizd", 1),
+                ("mentést", 1),
+                ("İstanbulban", 1),
+                ("kérlek--mentést", 1),
+                ("\"kérlek ellenőrizd\"", 1),
+                ("\"ellenőrizd kérlek\"", 0),
+                ("kér*", 1),
+                ("kérlek AND backup", 0),
+                ("kérlek OR backup", 2),
+                ("please", 1),
+                ("привет", 0),
+            ] {
+                let parsed = parser.parse(query, &filters);
+                let hit = reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                    .expect("search the CASS index");
+                assert_eq!(hit.total_count, Some(expected), "query {query:?}");
+            }
+        });
+    }
+
+    /// Exercise the real positional and Boolean scorers, including documents
+    /// that the illustrative all-fields/prefix-fragment conjunction admitted.
+    #[test]
+    fn cass_unicode_queries_keep_field_scope_phrases_and_boolean_semantics() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("CASS fixture directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create CASS index");
+            let rows = [
+                (
+                    "Mentés",
+                    "Kérlek nézd ellenőrizd a mentést İstanbulban 日本語",
+                ),
+                ("Backup", "please check backup"),
+                ("", "k unrelated rlek n intervening zd"),
+                ("k", "rlek 日本語"),
+                ("", "k rleking 日本語"),
+                ("", "nézd kérlek"),
+                ("", "Straße déjà zażółć příliš"),
+                ("", "STRASSE istanbul"),
+                ("", "İstanbul"),
+                ("", "ke\u{301}rlek"),
+                ("", "café"),
+                ("", "cafeteria"),
+                ("kérlek nézd", "other content"),
+                ("", "unrelated"),
+            ];
+            let documents = rows
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (title, content))| {
+                    sample_document(
+                        &format!("source-{ordinal}"),
+                        u64::try_from(ordinal).expect("fixture ordinal"),
+                        if ordinal == 0 { "cláude" } else { "codex" },
+                        title,
+                        content,
+                    )
+                    .to_schema_document()
+                })
+                .collect::<Vec<_>>();
+            let ids = documents
+                .iter()
+                .enumerate()
+                .map(|(ordinal, document)| (document.id.clone(), ordinal))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            index
+                .index_schema_documents(&cx, &documents)
+                .await
+                .expect("index fixture");
+            index.commit(&cx).await.expect("seal fixture");
+            drop(index);
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("reopen unchanged durable index");
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            let check =
+                |raw: &str, filters: &crate::query::CassQueryFilters, expected: &[usize]| {
+                    let parsed = parser.parse(raw, filters);
+                    let result = reader
+                        .search_preparsed_paginated(&cx, &parsed.query, rows.len(), 0, true)
+                        .expect("query must execute without a scorer error");
+                    let mut actual = result
+                        .hits
+                        .iter()
+                        .map(|hit| *ids.get(&hit.document_id).expect("known fixture identity"))
+                        .collect::<Vec<_>>();
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected, "query {raw:?}");
+                    assert_eq!(result.total_count, Some(expected.len()), "count {raw:?}");
+                };
+            for (raw, expected) in [
+                ("kérlek", &[0, 2, 5, 12][..]),
+                ("KÉRLEK", &[0, 2, 5, 12]),
+                ("\"kérlek\"", &[0, 5, 12]),
+                ("\"kérlek nézd\"", &[0, 12]),
+                ("\"nézd kérlek\"", &[5]),
+                ("\"kérlek 日本語\"", &[0]),
+                (
+                    "NOT \"kérlek nézd\"",
+                    &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13],
+                ),
+                (
+                    "NOT \"nézd kérlek\"",
+                    &[0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13],
+                ),
+                (
+                    "NOT \"kérlek backup\"",
+                    &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+                ),
+                ("backup AND NOT \"kérlek nézd\"", &[1]),
+                ("kér*", &[0, 5, 12]),
+                ("kérl*", &[0, 2, 4, 5, 12]),
+                ("(kérlek OR backup) NOT mentés", &[1, 2, 5, 12]),
+                ("NOT NOT kérlek", &[0, 2, 5, 12]),
+                ("backup AND NOT kérlek", &[1]),
+                ("backup OR kérlek AND mentés", &[0, 1]),
+                ("Straße", &[6]),
+                ("STRAẞE", &[6]),
+                ("STRASSE", &[7]),
+                ("DÉJÀ", &[6]),
+                ("ZAŻÓŁĆ", &[6]),
+                ("PŘÍLIŠ", &[6]),
+                ("İstanbul", &[8]),
+                ("İstan*", &[0, 8]),
+                ("istanbul", &[7]),
+                ("ke\u{301}rlek", &[9]),
+                ("café", &[10]),
+                ("café*", &[10]),
+                ("\"café\"", &[10]),
+                ("*érlek", &[]),
+                ("kér*lek", &[]),
+                ("*kérlek*", &[]),
+                ("\"ké*rlek\"", &[]),
+                ("\"ké*rlek nézd\"", &[]),
+                ("привет", &[]),
+                ("éß", &[]),
+                ("🚀", &[]),
+                ("🚀*", &[]),
+                ("!***", &[]),
+                ("\"🚀*\"", &[]),
+                ("...", &[]),
+                ("\"\"", &[]),
+                ("backup AND \"\"", &[]),
+                ("kérlek AND \"\"", &[]),
+                ("kérlek AND \" \"", &[]),
+                ("backup OR \"\"", &[1]),
+                ("backup AND NOT \"\"", &[1]),
+                ("backup AND 🚀", &[]),
+                ("backup OR 🚀", &[1]),
+                ("\"backup éß\"", &[]),
+                ("please", &[1]),
+                ("caf*", &[10, 11]),
+            ] {
+                check(raw, &filters, expected);
+            }
+            let scoped = crate::query::CassQueryFilters {
+                agents: vec!["cláude".to_owned()],
+                ..Default::default()
+            };
+            check("kérlek", &scoped, &[0]);
+            check("🚀", &scoped, &[]);
+            check("", &scoped, &[0]);
+            check(" \t\u{2003}", &scoped, &[0]);
+            check("*", &scoped, &[0]);
+
+            let nested = |depth| format!("{}kérlek{}", "(".repeat(depth), ")".repeat(depth));
+            check(&nested(128), &scoped, &[0]);
+            check(&nested(129), &scoped, &[]);
+            check(&format!("backup OR {}", nested(129)), &filters, &[]);
+            check(&format!("NOT {}", nested(129)), &filters, &[]);
+
+            // Reject the entire expression on resource/length refusal: OR
+            // cannot hide it and NOT must not turn refusal into match-all.
+            let oversized = format!("{}ébackup", "a".repeat(257));
+            let trailing_oversized = format!("backupé{}", "a".repeat(257));
+            let expansion = "aé".repeat(257);
+            let overlong = format!("backup{}é", " ".repeat(10_000));
+            for hostile in [&oversized, &trailing_oversized, &expansion, &overlong] {
+                for raw in [
+                    hostile.to_string(),
+                    format!("NOT {hostile}"),
+                    format!("backup OR {hostile}"),
+                    format!("\"{hostile}\""),
+                ] {
+                    check(&raw, &filters, &[]);
+                }
+            }
+            for phrase in [
+                format!("\"{} café\"", "x".repeat(257)),
+                format!("\"café {}\"", "x".repeat(257)),
+                format!("\"é {}\"", "x".repeat(257)),
+            ] {
+                for raw in [
+                    phrase.clone(),
+                    format!("backup OR {phrase}"),
+                    format!("NOT {phrase}"),
+                ] {
+                    check(&raw, &filters, &[]);
+                }
+            }
+        });
+    }
+
     /// A date-filtered query must keep working once a sealed segment holds a
     /// tombstone (frankensearch#49, cass GH #499).
     ///
