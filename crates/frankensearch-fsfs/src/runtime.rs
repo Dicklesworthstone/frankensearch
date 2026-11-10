@@ -10392,8 +10392,14 @@ impl FsfsRuntime {
         let cached = if options.hot_cache_enabled
             && let Some(payloads) = hot_cache.get(&cache_key)
         {
-            match Box::pin(runtime.admit_cached_search_producers(cx, resources, mode, payloads))
-                .await
+            match Box::pin(runtime.admit_cached_search_producers(
+                cx,
+                resources,
+                mode,
+                &cache_key.query,
+                payloads,
+            ))
+            .await
             {
                 Ok(true) => true,
                 Ok(false) => {
@@ -12752,6 +12758,7 @@ impl FsfsRuntime {
                         cx,
                         &mut resources,
                         mode,
+                        &key.query,
                         &payloads,
                     ))
                     .await?;
@@ -13880,6 +13887,7 @@ impl FsfsRuntime {
         cx: &Cx,
         resources: &mut SearchExecutionResources,
         mode: SearchExecutionMode,
+        normalized_query: &str,
         payloads: &[SearchPayload],
     ) -> SearchResult<bool> {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
@@ -13924,13 +13932,15 @@ impl FsfsRuntime {
             return Ok(false);
         }
         if Self::cached_search_requires_fast(resources, mode, payloads) {
-            if !payloads.iter().any(|payload| {
-                payload.phase == SearchOutputPhase::Initial
-                    && payload_has_admitted_semantic_hits(payload)
-            }) {
-                // A lexical-only or empty Initial does not establish whether
-                // the live planner would use this semantic generation. Run
-                // that planner before loading a model or publishing a hit.
+            // Every nonempty Full/FastOnly request requires primary readiness,
+            // even if inference is skipped or returns no hits. Only the actual
+            // request's normalized cache key can establish the empty exception.
+            if normalized_query.is_empty()
+                || !payloads
+                    .iter()
+                    .any(|payload| payload.phase == SearchOutputPhase::Initial)
+            {
+                // Empty requests and incomplete phase layouts use the live path.
                 return Ok(false);
             }
             if resources.vector_index.is_none() {
@@ -43793,7 +43803,8 @@ mod tests {
                         &cx,
                         &mut resources,
                         SearchExecutionMode::Full,
-                        &failed.payloads
+                        &key.query,
+                        &failed.payloads,
                     )
                     .await
                     .unwrap()
@@ -52967,12 +52978,13 @@ mod tests {
             runtime
                 .write_search_payload_cache(&key, &payloads, &fingerprint)
                 .unwrap();
-            let mut cache = HashMap::from([(key, payloads.clone())]);
+            let mut cache = HashMap::from([(key.clone(), payloads.clone())]);
             let mut emitted = 0;
             assert_exclusions_refused_before_work(runtime.admit_cached_search_producers(
                 &cx,
                 &mut resources,
                 SearchExecutionMode::Full,
+                &key.query,
                 &payloads,
             ));
             assert_exclusions_refused_before_work(runtime.replay_cached_search_payloads(
@@ -63977,7 +63989,12 @@ mod tests {
     #[test]
     fn daemon_cache_refuses_missing_and_changed_fast_producers() {
         run_on_runtime_task(|cx| async move {
-            for mode in ["full", "fast_only"] {
+            for (mode, filter) in [
+                ("full", None),
+                ("fast_only", None),
+                ("full", Some("ext:md")),
+                ("fast_only", Some("ext:md")),
+            ] {
                 let temp = tempfile::tempdir().unwrap();
                 let mut resources = disagreeing_blend_resources(temp.path());
                 let mut config = FsfsConfig::default();
@@ -63989,7 +64006,7 @@ mod tests {
                 });
                 let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
                     "query": "why does semantic ranking find these files", "mode": mode,
-                    "limit": 10, "rerank": false,
+                    "limit": 10, "rerank": false, "filter": filter,
                 }))
                 .unwrap();
                 let mut cache = HashMap::new();
@@ -64004,6 +64021,15 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(!original.cached);
+                assert!(!original.payloads.is_empty());
+                if filter.is_some() {
+                    assert!(
+                        original
+                            .payloads
+                            .iter()
+                            .all(|payload| payload.hits.is_empty())
+                    );
+                }
                 let warm = runtime
                     .execute_search_serve_request(
                         &cx,
@@ -64772,14 +64798,19 @@ mod tests {
                 index_dir: Some(temp.path().to_path_buf()),
                 ..CliInput::default()
             });
-            for query in ["", "cache_lookup"] {
+            for (query, cached_query) in [
+                ("", ""),
+                (" \u{7}\t\n", "cache_lookup"),
+                ("cache_lookup", ""),
+            ] {
                 let key = runtime
                     .search_cache_key(query, 10, SearchExecutionMode::Full)
                     .unwrap();
+                let empty_query = key.query.is_empty();
                 let mut cache = HashMap::from([(
                     key,
                     vec![SearchPayload::new(
-                        query,
+                        cached_query,
                         SearchOutputPhase::Initial,
                         0,
                         Vec::new(),
@@ -64808,7 +64839,7 @@ mod tests {
                         }),
                     )
                     .await;
-                if query.is_empty() {
+                if empty_query {
                     let response = result.unwrap();
                     assert!(!response.cached);
                     assert!(response.payloads[0].hits.is_empty());
@@ -64822,13 +64853,43 @@ mod tests {
                         result,
                         Err(SearchError::UnverifiableRemoteSpace { .. })
                     ));
-                    assert!(resources.fast_embedder_attempted);
+                    assert!(resources.fast_embedder.is_none());
+                    assert!(!resources.fast_embedder_attempted);
                     assert_eq!(
                         published, 0,
                         "ambiguous cached metadata cannot bypass primary admission"
                     );
                     assert!(cache.is_empty());
                 }
+            }
+
+            let key = runtime
+                .search_cache_key("cache_lookup", 10, SearchExecutionMode::Full)
+                .unwrap();
+            for payloads in [
+                Vec::new(),
+                vec![SearchPayload::new(
+                    "cache_lookup",
+                    SearchOutputPhase::Refined,
+                    0,
+                    Vec::new(),
+                )],
+            ] {
+                assert!(
+                    !runtime
+                        .admit_cached_search_producers(
+                            &cx,
+                            &mut resources,
+                            SearchExecutionMode::Full,
+                            &key.query,
+                            &payloads,
+                        )
+                        .await
+                        .unwrap(),
+                    "cached answers without Initial must run the live planner"
+                );
+                assert!(resources.fast_embedder.is_none());
+                assert!(!resources.fast_embedder_attempted);
             }
         });
     }

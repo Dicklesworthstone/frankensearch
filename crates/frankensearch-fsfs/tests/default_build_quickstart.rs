@@ -1377,7 +1377,130 @@ mod loader_only {
         );
         parse_success_envelope("fast answer-cache index", &indexed);
         verify_real_fast_model_cache_isolation(&fsfs, temp.path(), &index);
+        verify_fast_empty_answer_cache(&fsfs, temp.path(), &index);
         verify_fast_answer_cache_generation_changes(&fsfs, temp.path(), &index);
+    }
+
+    #[cfg(all(unix, feature = "semantic-support"))]
+    #[allow(clippy::too_many_lines)]
+    fn verify_fast_empty_answer_cache(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let query = "how should clients recover from temporary connection failures";
+        let config = root.join("cached-fast-model.toml");
+        let run_search = |label: &str, uncached: bool| {
+            let mut env = vec![("FRANKENSEARCH_LOG", "info")];
+            if uncached {
+                env.push(("FSFS_DISABLE_QUERY_CACHE", "1"));
+            }
+            fsfs.run_with_env(
+                root,
+                label,
+                [
+                    "search",
+                    query,
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--no-daemon",
+                    "--fast-only",
+                    "--limit",
+                    "3",
+                    "--filter",
+                    "ext:fsfs-cache-no-match",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &env,
+            )
+        };
+        // The corpus and semantic request are nonempty. Only the filter
+        // removes every hit; readiness still admits the real producer.
+        let cold = run_search("empty-fast-cache-cold", false);
+        let original = parse_success_envelope("empty fast cache seed", &cold);
+        assert_eq!(cold.stderr.matches("Model2Vec model loaded").count(), 1);
+        assert_eq!(original["data"]["phase"], "initial");
+        assert_eq!(original["data"]["returned_hits"], 0);
+        assert!(original["data"]["hits"].as_array().unwrap().is_empty());
+        assert!(
+            original["data"]["vector_generation_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_ne!(original["data"]["vector_generation_is_hash"], true);
+        let mut records = fs::read_dir(index.join("query_cache"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).ok()?;
+                let record: Value = serde_json::from_slice(&bytes).ok()?;
+                (record["key"]["query"] == query).then_some((path, bytes))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "the empty answer must be persisted");
+        let (cache_path, cache_bytes) = records.pop().unwrap();
+        let assert_replayed = |label: &str| {
+            let warm = run_search(label, false);
+            let replayed = parse_success_envelope(label, &warm);
+            assert_eq!(replayed["data"], original["data"], "{label}");
+            assert_eq!(
+                warm.stderr.matches("Model2Vec model loaded").count(),
+                0,
+                "{label}: {warm:?}"
+            );
+            assert!(
+                warm.stderr.contains("model verification receipt accepted"),
+                "{label}: {warm:?}"
+            );
+            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            warm.elapsed
+        };
+        let warm_elapsed = assert_replayed("empty-fast-cache-warm");
+        let assert_refused = |label: &str| {
+            let cached = run_search(&format!("empty-cached-{label}"), false);
+            let uncached = run_search(&format!("empty-uncached-{label}"), true);
+            assert_same_fast_producer_refusal(label, &cached, &uncached);
+            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+        };
+
+        // This helper runs only with the standalone test's independent
+        // installation. An empty answer must not hide producer failures.
+        let install = fsfs.model_root.join("potion-multilingual-128M");
+        let retained_install = root.join("empty-cache-retained-install");
+        let receipt_bytes = fs::read(install.join(".verified")).unwrap();
+        fs::rename(&install, &retained_install).unwrap();
+        assert_refused("missing-producer");
+        assert_eq!(
+            fs::read(retained_install.join(".verified")).unwrap(),
+            receipt_bytes
+        );
+        fs::rename(&retained_install, &install).unwrap();
+
+        let manifest = ModelManifest::potion_128m();
+        let mut tokenizer = File::options()
+            .read(true)
+            .write(true)
+            .open(install.join("tokenizer.json"))
+            .unwrap();
+        let mut original_byte = [0];
+        tokenizer.read_exact(&mut original_byte).unwrap();
+        tokenizer.rewind().unwrap();
+        tokenizer.write_all(&[original_byte[0] ^ 1]).unwrap();
+        assert!(!is_verification_cached(&manifest, &install));
+        assert_refused("changed-tokenizer");
+        assert_eq!(fs::read(install.join(".verified")).unwrap(), receipt_bytes);
+        tokenizer.rewind().unwrap();
+        tokenizer.write_all(&original_byte).unwrap();
+        drop(tokenizer);
+        frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install).unwrap();
+        assert_replayed("empty-fast-cache-restored-producer");
+        eprintln!(
+            "[default-build-e2e] stage=fast-empty-answer-cache real_potion=true cold_ms={} warm_ms={} cold_weight_loads=1 warm_weight_loads=0 empty_answer_equal=true missing_changed_producer_same_error_as_uncached=true cache_bytes_unchanged=true",
+            cold.elapsed.as_millis(),
+            warm_elapsed.as_millis()
+        );
     }
 
     #[cfg(all(unix, feature = "semantic-support"))]
