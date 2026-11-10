@@ -75,6 +75,10 @@ pub(super) fn admission_policy(
     Ok(parse_request(bytes)?.request.search.admission_policy())
 }
 
+pub(super) fn cache_request(bytes: &[u8]) -> SearchResult<ForwardedSearch> {
+    Ok(parse_request(bytes)?.request)
+}
+
 pub(super) async fn refuse_admission(
     cx: &Cx,
     peer: &mut UnixStream,

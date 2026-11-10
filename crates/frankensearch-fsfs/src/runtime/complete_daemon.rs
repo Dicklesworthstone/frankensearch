@@ -572,7 +572,13 @@ impl FsfsRuntime {
                     return Ok(PeerOutcome::Search);
                 }
                 let (mut session, mut cache) = match self
-                    .snapshot_complete_daemon(cx, &shared, prepare_fast)
+                    .snapshot_complete_daemon_request(
+                        cx,
+                        &shared,
+                        &bytes,
+                        prepare_fast,
+                        cache_enabled,
+                    )
                     .await
                 {
                     Ok(snapshot) => snapshot,
@@ -720,7 +726,7 @@ impl FsfsRuntime {
         cx: &Cx,
         shared: &SharedSession,
         prepare_fast: bool,
-    ) -> SearchResult<SessionState> {
+    ) -> SearchResult<LiveRetainedSearchReader> {
         let mut state = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(shared), cx)
             .await
             .map_err(|error| complete_cli_error("daemon_admission", &error.to_string()))?;
@@ -747,20 +753,83 @@ impl FsfsRuntime {
                 admitted.enable_daemon_dispatch(cx, services).await?;
             }
         }
-        // The existing cache has at most eight entries. Each request owns its
-        // working set; completed changes are merged after generation fencing
-        // only while their originally observed shared values still match.
-        Ok((
-            LiveRetainedSearchReader {
-                store: state.0.store.clone(),
-                reader: RetainedSearchReader {
-                    runtime,
-                    generation: state.0.reader.generation.clone(),
-                    resources: state.0.reader.resources.clone(),
-                },
+        Ok(LiveRetainedSearchReader {
+            store: state.0.store.clone(),
+            reader: RetainedSearchReader {
+                runtime,
+                generation: state.0.reader.generation.clone(),
+                resources: state.0.reader.resources.clone(),
             },
-            state.1.clone(),
-        ))
+        })
+    }
+
+    /// Retain the reader independently of cache use, then copy only this
+    /// request's exact answer. Large unrelated answers stay in shared storage.
+    async fn snapshot_complete_daemon_request(
+        &self,
+        cx: &Cx,
+        shared: &SharedSession,
+        bytes: &[u8],
+        prepare_fast: bool,
+        cache_enabled: bool,
+    ) -> SearchResult<SessionState> {
+        let mut session = self
+            .snapshot_complete_daemon(cx, shared, prepare_fast)
+            .await?;
+        let mut cache = HashMap::new();
+        if !cache_enabled {
+            return Ok((session, cache));
+        }
+        let prepared = async {
+            let request = if forwarding::is_forwarded(bytes) {
+                forwarding::cache_request(self, &session, bytes)?
+            } else {
+                let (request, streamed) = parse_request(bytes)?;
+                (!streamed).then(|| (session.reader.runtime.clone(), request))
+            };
+            let Some((runtime, request)) = request else {
+                return Ok(None);
+            };
+            let mode = degraded_search_mode(
+                runtime.config.pressure.degradation_override,
+                parse_search_execution_mode(request.mode.as_deref())?,
+            )?;
+            let limit = request.limit.unwrap_or_else(|| {
+                runtime
+                    .cli_input
+                    .overrides
+                    .limit
+                    .unwrap_or(runtime.config.search.default_limit)
+            });
+            let mut runtime = runtime.with_search_serve_request_policy(&request)?;
+            // Reranker initialization may await work. Never hold the shared
+            // reader lock while preparing this request's exact model key.
+            runtime.prepare_search_reranker(cx).await?;
+            let key = runtime.search_cache_key(&request.query, limit, mode)?;
+            Ok::<_, SearchError>(Some((runtime, key)))
+        }
+        .await;
+        retained_search_checkpoint(cx)?;
+        // Request execution owns the canonical error/framing contract. A
+        // failed key projection cannot authorize an answer; let the ordinary
+        // handler report that failure through its existing transport path.
+        let Ok(Some((prepared, key))) = prepared else {
+            return Ok((session, cache));
+        };
+        // Freeze even an unavailable reranker for this request, matching the
+        // key selected above. A concurrent successful load remains available
+        // to future requests through the shared runtime's original slot.
+        session.reader.runtime.reranker = prepared.reranker;
+        let state = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(shared), cx)
+            .await
+            .map_err(|error| complete_cli_error("daemon_admission", &error.to_string()))?;
+        if state.0.generation() == session.generation()
+            && state.0.reader.resources.resource_mode == session.reader.resources.resource_mode
+            && let Some(payloads) = state.1.get(&key)
+        {
+            cache.insert(key, payloads.clone());
+        }
+        Ok((session, cache))
     }
 
     /// Raw streams use the same typed request mode as buffered searches. Admit
@@ -2569,6 +2638,9 @@ mod generation_tests {
     }
 
     #[cfg(feature = "semantic-support")]
+    const CACHE_TEST_REQUEST: &[u8] = b"{\"query\":\"how to recover network requests\",\"mode\":\"quality_only\",\"limit\":10,\"rerank\":false}\n";
+
+    #[cfg(feature = "semantic-support")]
     async fn complete_cache_exchange(
         cx: &Cx,
         runtime: &FsfsRuntime,
@@ -2579,9 +2651,7 @@ mod generation_tests {
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        client
-            .write_all(b"{\"query\":\"how to recover network requests\",\"mode\":\"quality_only\",\"limit\":10,\"rerank\":false}\n")
-            .unwrap();
+        client.write_all(CACHE_TEST_REQUEST).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
         let timeout = Duration::from_secs(10);
         let mut intake = admission::Intake::new(timeout);
@@ -2600,6 +2670,176 @@ mod generation_tests {
             .read_line(&mut line)
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_daemon_snapshots_only_the_requested_answer_and_skips_raw_streams() {
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        scheduler.block_on(async {
+            let cx = Cx::current().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let (runtime, shared, producer, bound) =
+                complete_cache_fixture(&cx, directory.path()).await;
+            let cold = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+            assert_eq!(cold["ok"], true, "{cold}");
+            assert_eq!(cold["cached"], false);
+            let (key, payloads) = {
+                let mut state = shared.try_lock_owned().unwrap();
+                let (key, payloads) = state
+                    .1
+                    .iter()
+                    .next()
+                    .map(|(key, payloads)| (key.clone(), payloads.clone()))
+                    .unwrap();
+                for ordinal in 1..super::super::super::FSFS_DAEMON_MAX_CACHE_ENTRIES {
+                    // Same query/limit, different policy: filtering only by
+                    // query text would still clone all these large answers.
+                    let mut unrelated = key.clone();
+                    unrelated.quality_timeout_ms += u64::try_from(ordinal).unwrap();
+                    let mut large = payloads.clone();
+                    large[0].hits[0].snippet = Some("unrelated ".repeat(32 << 10));
+                    state.1.insert(unrelated, large);
+                }
+                (key, payloads)
+            };
+            let (_, snapshot) = runtime
+                .snapshot_complete_daemon_request(&cx, &shared, CACHE_TEST_REQUEST, false, true)
+                .await
+                .unwrap();
+            assert_eq!(snapshot, HashMap::from([(key.clone(), payloads)]));
+            let calls = producer.calls.load(Ordering::SeqCst);
+            let warm = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+            assert_eq!(warm["cached"], true, "{warm}");
+            assert_eq!(warm["payloads"], cold["payloads"]);
+            assert_eq!(producer.calls.load(Ordering::SeqCst), calls);
+            let mut streamed: serde_json::Value =
+                serde_json::from_slice(CACHE_TEST_REQUEST).unwrap();
+            streamed["stream"] = true.into();
+            for (bytes, enabled) in [
+                (serde_json::to_vec(&streamed).unwrap(), true),
+                (CACHE_TEST_REQUEST.to_vec(), false),
+            ] {
+                let (_, snapshot) = runtime
+                    .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, enabled)
+                    .await
+                    .unwrap();
+                assert!(
+                    snapshot.is_empty(),
+                    "this route never uses the answer cache"
+                );
+            }
+            let state = shared.try_lock_owned().unwrap();
+            assert_eq!(
+                state.1.len(),
+                super::super::super::FSFS_DAEMON_MAX_CACHE_ENTRIES
+            );
+            assert!(state.1.contains_key(&key));
+        });
+    }
+
+    #[test]
+    fn complete_daemon_prepares_the_exact_reranker_key_before_fenced_cache_copy() {
+        struct KeyProbe(std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+        impl frankensearch_core::SyncRerank for KeyProbe {
+            fn rerank_sync(
+                &self,
+                _: &str,
+                _: &[frankensearch_core::RerankDocument],
+            ) -> SearchResult<Vec<frankensearch_core::RerankScore>> {
+                panic!("snapshot preparation must not run reranking inference");
+            }
+
+            fn id(&self) -> &str {
+                if let Some(hook) = self.0.lock().unwrap().take() {
+                    hook();
+                }
+                "snapshot-reranker"
+            }
+
+            fn model_name(&self) -> &str {
+                "Snapshot key probe"
+            }
+        }
+
+        struct ResetReranker;
+        impl Drop for ResetReranker {
+            fn drop(&mut self) {
+                crate::runtime::set_test_reranker(None);
+            }
+        }
+
+        for change_mode in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
+                let runtime = runtime.with_daemon_coalescers();
+                let session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+                let bytes =
+                    b"{\"query\":\"sharedtoken\",\"mode\":\"full\",\"limit\":10,\"rerank\":true}";
+                let (request, _) = parse_request(bytes).unwrap();
+                let mut prepared = session
+                    .reader
+                    .runtime
+                    .with_search_serve_request_policy(&request)
+                    .unwrap();
+                let unavailable = prepared
+                    .search_cache_key("sharedtoken", 10, SearchExecutionMode::Full)
+                    .unwrap();
+                let probe = Arc::new(frankensearch_core::SyncRerankerAdapter(KeyProbe(
+                    std::sync::Mutex::new(None),
+                )));
+                let provider: Arc<dyn frankensearch_core::Reranker> = probe.clone();
+                prepared.reranker = Arc::new(std::sync::OnceLock::from(
+                    crate::runtime::RerankerSlot(Some(provider.clone())),
+                ));
+                let key = prepared
+                    .search_cache_key("sharedtoken", 10, SearchExecutionMode::Full)
+                    .unwrap();
+                assert_ne!(unavailable, key);
+                let cache = HashMap::from([(unavailable, Vec::new()), (key.clone(), Vec::new())]);
+                let shared = Arc::new(asupersync::sync::Mutex::new((session, cache)));
+                let weak = Arc::downgrade(&shared);
+                *probe.0.0.lock().unwrap() = Some(Box::new(move || {
+                    let shared = weak.upgrade().unwrap();
+                    let mut state = shared
+                        .try_lock_owned()
+                        .expect("reranker key preparation must release the shared reader lock");
+                    if change_mode {
+                        let mode = &mut state.0.reader.resources.resource_mode;
+                        *mode = if *mode == SearchExecutionMode::LexicalOnly {
+                            SearchExecutionMode::Full
+                        } else {
+                            SearchExecutionMode::LexicalOnly
+                        };
+                    }
+                }));
+                assert!(runtime.reranker.get().is_none());
+                crate::runtime::set_test_reranker(Some(provider));
+                let _reset = ResetReranker;
+                let (snapshot, cache) = runtime
+                    .snapshot_complete_daemon_request(&cx, &shared, bytes, false, true)
+                    .await
+                    .unwrap();
+                assert!(!Arc::ptr_eq(
+                    &snapshot.reader.runtime.reranker,
+                    &runtime.reranker
+                ));
+                if change_mode {
+                    assert!(
+                        cache.is_empty(),
+                        "a changed resource mode fences the snapshot"
+                    );
+                } else {
+                    assert_eq!(cache, HashMap::from([(key, Vec::new())]));
+                }
+                assert_eq!(shared.try_lock_owned().unwrap().1.len(), 2);
+            });
+        }
     }
 
     #[cfg(feature = "semantic-support")]
@@ -2760,7 +3000,7 @@ mod generation_tests {
                 let cold = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
                 assert_eq!(cold["ok"], true, "{cold}");
                 let (mut replacement, expected_cache) = runtime
-                    .snapshot_complete_daemon(&cx, &shared, false)
+                    .snapshot_complete_daemon_request(&cx, &shared, CACHE_TEST_REQUEST, false, true)
                     .await
                     .unwrap();
                 assert_eq!(expected_cache.len(), 1);

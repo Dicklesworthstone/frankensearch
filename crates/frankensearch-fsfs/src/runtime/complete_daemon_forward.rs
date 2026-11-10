@@ -752,6 +752,31 @@ pub(super) fn admission_policy(bytes: &[u8]) -> SearchResult<(Duration, SearchEx
     }
 }
 
+/// Project only requests which use the ordinary answer cache, after the same
+/// strict protocol and configuration checks as their transport execution.
+pub(super) fn cache_request(
+    runtime: &FsfsRuntime,
+    session: &LiveRetainedSearchReader,
+    bytes: &[u8],
+) -> SearchResult<Option<(FsfsRuntime, SearchServeRequest)>> {
+    let streamed = progressive::is_streamed(bytes);
+    let request = if streamed {
+        progressive::cache_request(bytes)?
+    } else {
+        decode_request(bytes)?
+    };
+    validate_request(runtime, session.store.root(), &request)?;
+    if request.search.expand || request.search.explain {
+        return Ok(None);
+    }
+    let query_runtime = query_runtime(session, &request.search, streamed)?;
+    let mode = degraded_search_mode(
+        query_runtime.config.pressure.degradation_override,
+        query_runtime.requested_search_mode(),
+    )?;
+    Ok(Some((query_runtime, request.search.as_serve_request(mode))))
+}
+
 pub(super) async fn refuse_admission(
     cx: &Cx,
     peer: &mut UnixStream,
@@ -1856,13 +1881,15 @@ mod generation_tests {
             config.indexing.quality_model.clear();
             config.search.fast_only = true;
             config.search.rerank = false;
-            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-                command: CliCommand::Daemon,
-                target_path: Some(source.clone()),
-                index_dir: Some(root.clone()),
-                quiet: true,
-                ..CliInput::default()
-            });
+            let runtime = FsfsRuntime::new(config)
+                .with_daemon_coalescers()
+                .with_cli_input(CliInput {
+                    command: CliCommand::Daemon,
+                    target_path: Some(source.clone()),
+                    index_dir: Some(root.clone()),
+                    quiet: true,
+                    ..CliInput::default()
+                });
             assert!(matches!(
                 runtime
                     .rebuild_retained_generation(&cx, &root)
@@ -1871,7 +1898,9 @@ mod generation_tests {
                 GenerationPublication::Durable(_)
             ));
             let mut session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
-            let request = make_request(&runtime, &root, "sharedtoken", 10).unwrap();
+            let mut client = runtime.clone();
+            client.config.search.quality_timeout_ms += 1;
+            let request = make_request(&client, &root, "sharedtoken", 10).unwrap();
             let mut cache = HashMap::new();
             let first = Box::pin(execute(
                 &cx,
@@ -1920,6 +1949,59 @@ mod generation_tests {
                 .await
                 .unwrap();
             assert_eq!(uncached.hits.len(), 1, "a disabled cache is not read");
+
+            let (key, payloads) = cache
+                .iter()
+                .next()
+                .map(|(key, payloads)| (key.clone(), payloads.clone()))
+                .unwrap();
+            let mut unrelated = key.clone();
+            unrelated.quality_timeout_ms = runtime.config.search.quality_timeout_ms;
+            let mut large = first;
+            large.hits[0].snippet = Some("unrelated ".repeat(32 << 10));
+            cache.insert(unrelated, vec![large]);
+            let shared = std::sync::Arc::new(asupersync::sync::Mutex::new((session, cache)));
+            let wire_requests = |request: &ForwardedSearch| {
+                [
+                    serde_json::to_vec(request).unwrap(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "fsfs_complete_cli_stream": VERSION,
+                        "request": request,
+                    }))
+                    .unwrap(),
+                ]
+            };
+            for bytes in wire_requests(&request) {
+                // Forwarded fast-only admission is distinct from the common
+                // executor's Full mode plus fast_only policy. Projecting the
+                // admission mode or daemon's original policy misses this key.
+                let (_, snapshot) = runtime
+                    .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, true)
+                    .await
+                    .unwrap();
+                assert_eq!(snapshot, HashMap::from([(key.clone(), payloads.clone())]));
+                let (_, disabled) = runtime
+                    .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, false)
+                    .await
+                    .unwrap();
+                assert!(disabled.is_empty());
+            }
+            let mut expanding = client.clone();
+            expanding.cli_input.expand = true;
+            let expanded = make_request(&expanding, &root, "sharedtoken", 10).unwrap();
+            for request in [&explained, &expanded] {
+                for bytes in wire_requests(request) {
+                    let (_, snapshot) = runtime
+                        .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, true)
+                        .await
+                        .unwrap();
+                    assert!(
+                        snapshot.is_empty(),
+                        "this route never uses the answer cache"
+                    );
+                }
+            }
+            assert_eq!(shared.try_lock_owned().unwrap().1.len(), 2);
         });
     }
 
