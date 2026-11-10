@@ -479,6 +479,24 @@ impl IndexBuilder {
             return Err(error);
         }
 
+        // Resolve foreign layouts, incompatible schemas, and live writer
+        // conflicts before invoking embedders or replacing either vector
+        // tier. Keep an admitted existing writer for the whole build: a
+        // successful probe followed by a later reopen would race another
+        // publisher. Empty paths are created only after embedding succeeds.
+        #[cfg(feature = "quill")]
+        let quill_lexical = if matches!(self.lexical_backend, Some(IndexLexicalBackend::Quill)) {
+            Box::pin(prepare_quill_lexical_index(
+                cx,
+                &self.data_dir.join("lexical"),
+                false,
+            ))
+            .await
+            .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?
+        } else {
+            None
+        };
+
         #[cfg(feature = "lexical-tantivy")]
         let tantivy_lexical = if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy))
         {
@@ -815,6 +833,20 @@ impl IndexBuilder {
         // Admit a new writer only after embedding/cancellation succeeds, but
         // still before replacing vector generations. Recheck an initially
         // empty path in case another builder populated it while we embedded.
+        #[cfg(feature = "quill")]
+        let quill_lexical = if matches!(self.lexical_backend, Some(IndexLexicalBackend::Quill))
+            && quill_lexical.is_none()
+        {
+            Box::pin(prepare_quill_lexical_index(
+                cx,
+                &self.data_dir.join("lexical"),
+                true,
+            ))
+            .await
+            .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?
+        } else {
+            quill_lexical
+        };
         #[cfg(feature = "lexical-tantivy")]
         let tantivy_lexical = if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy))
             && tantivy_lexical.is_none()
@@ -881,7 +913,13 @@ impl IndexBuilder {
             let result = match backend {
                 #[cfg(feature = "quill")]
                 IndexLexicalBackend::Quill => {
-                    Box::pin(build_lexical_index(cx, &lexical_path, lexical_docs)).await
+                    Box::pin(build_lexical_index(
+                        cx,
+                        &lexical_path,
+                        lexical_docs,
+                        quill_lexical.expect("Quill writer admitted before vector publication"),
+                    ))
+                    .await
                 }
                 #[cfg(feature = "lexical-tantivy")]
                 IndexLexicalBackend::Tantivy => {
@@ -1755,33 +1793,36 @@ async fn open_lexical_reader(
 }
 
 #[cfg(feature = "quill")]
-async fn build_lexical_index(
+async fn prepare_quill_lexical_index(
     cx: &Cx,
     data_dir: &Path,
-    documents: &[IndexableDocument],
-) -> SearchResult<LexicalArmReceipt> {
+    create_if_empty: bool,
+) -> SearchResult<Option<QuillIndex>> {
     build_checkpoint(cx, "Quill lexical index initialization")?;
     // bd-8nqz.2: never initialize Quill on top of a foreign, damaged,
     // blue-green, or ambiguous layout — MANIFEST absence is NOT emptiness.
-    // Empty proceeds; DirectQuill preserves the existing create-over-own
-    // behavior; everything else is a typed refusal.
-    match inspect_lexical_layout(data_dir).map_err(|source| SearchError::SubsystemError {
-        subsystem: "facade.lexical.layout",
-        source: Box::new(source),
-    })? {
-        LexicalLayout::Empty | LexicalLayout::DirectQuill => {}
-        layout => {
-            return Err(SearchError::InvalidConfig {
-                field: "data_dir/lexical".to_owned(),
-                value: data_dir.display().to_string(),
-                reason: format!(
-                    "refusing to initialize Quill over a {} lexical layout; \
+    // Existing indexes are opened, never recreated if they disappear between
+    // layout inspection and writer admission.
+    let existing =
+        match inspect_lexical_layout(data_dir).map_err(|source| SearchError::SubsystemError {
+            subsystem: "facade.lexical.layout",
+            source: Box::new(source),
+        })? {
+            LexicalLayout::Empty if !create_if_empty => return Ok(None),
+            LexicalLayout::Empty => false,
+            LexicalLayout::DirectQuill => true,
+            layout => {
+                return Err(SearchError::InvalidConfig {
+                    field: "data_dir/lexical".to_owned(),
+                    value: data_dir.display().to_string(),
+                    reason: format!(
+                        "refusing to initialize Quill over a {} lexical layout; \
                      inspect or repair the directory first",
-                    layout.label()
-                ),
-            });
-        }
-    }
+                        layout.label()
+                    ),
+                });
+            }
+        };
 
     let config = QuillConfig {
         bulk_load_mode: true,
@@ -1792,10 +1833,29 @@ async fn build_lexical_index(
     let lexical = {
         let protector =
             FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())?;
-        QuillIndex::create_durable(cx, data_dir, config, protector).await?
+        if existing {
+            QuillIndex::open_durable(cx, data_dir, config, protector).await?
+        } else {
+            QuillIndex::create_durable(cx, data_dir, config, protector).await?
+        }
     };
     #[cfg(not(feature = "durability"))]
-    let lexical = QuillIndex::create(cx, data_dir, config).await?;
+    let lexical = if existing {
+        QuillIndex::open(cx, data_dir, config).await?
+    } else {
+        QuillIndex::create(cx, data_dir, config).await?
+    };
+    build_checkpoint(cx, "Quill lexical writer admission")?;
+    Ok(Some(lexical))
+}
+
+#[cfg(feature = "quill")]
+async fn build_lexical_index(
+    cx: &Cx,
+    data_dir: &Path,
+    documents: &[IndexableDocument],
+    lexical: QuillIndex,
+) -> SearchResult<LexicalArmReceipt> {
     build_checkpoint(cx, "Quill lexical document indexing")?;
 
     // Per-document indexing so one rejected document (duplicate id, oversized
@@ -4912,12 +4972,23 @@ mod tests {
     fn build_refuses_quill_init_over_foreign_lexical_layout() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
+            let mut vectors = TwoTierIndex::create(dir.path(), TwoTierConfig::default()).unwrap();
+            vectors
+                .add_record("doc-retained", &[1.0, 0.0], Some(&[0.0, 1.0]))
+                .unwrap();
+            drop(vectors.finish().unwrap());
+            let vector_paths = [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME]
+                .map(|name| dir.path().join(name));
+            let before_vectors = vector_paths
+                .each_ref()
+                .map(|path| std::fs::read(path).unwrap());
             let lexical_dir = dir.path().join("lexical");
             std::fs::create_dir_all(&lexical_dir).unwrap();
             std::fs::write(lexical_dir.join("meta.json"), b"{}").unwrap();
 
             let error = IndexBuilder::new(dir.path())
                 .with_embedder_stack(stub_stack())
+                .with_progress(|_| panic!("foreign layout must refuse before embedding"))
                 .add_document("doc-1", "content")
                 .build(&cx)
                 .await
@@ -4931,6 +5002,159 @@ mod tests {
                 !lexical_dir.join("MANIFEST").exists(),
                 "no Quill artifacts may appear beside the foreign index"
             );
+            for (path, before) in vector_paths.iter().zip(before_vectors) {
+                assert_eq!(std::fs::read(path).unwrap(), before);
+            }
+            assert_eq!(std::fs::read(lexical_dir.join("meta.json")).unwrap(), b"{}");
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_builder_writer_conflict_preserves_existing_vectors_and_documents() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-retained", "retainedwritersentinel")
+                .build(&cx)
+                .await
+                .expect("publish the original hybrid generation");
+            let lexical_path = dir.path().join("lexical");
+            let existing = QuillIndex::open(&cx, &lexical_path, QuillConfig::default())
+                .await
+                .expect("hold the existing Quill writer");
+            let vector_paths = [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME]
+                .map(|name| dir.path().join(name));
+            let before_vectors = vector_paths
+                .each_ref()
+                .map(|path| std::fs::read(path).unwrap());
+            let before_manifest = std::fs::read(lexical_path.join("MANIFEST")).unwrap();
+            let exporter = Arc::new(RecordingExporter::default());
+
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .with_config(TwoTierConfig::default().with_metrics_exporter(exporter.clone()))
+                .add_document("doc-refused", "refusedwritersentinel")
+                .build(&cx)
+                .await
+                .expect_err("writer contention must refuse before replacing vector generations");
+
+            assert!(
+                exporter.embedding.lock().unwrap().is_empty(),
+                "writer contention must refuse before either embedder runs",
+            );
+            for (path, before) in vector_paths.iter().zip(before_vectors) {
+                assert_eq!(std::fs::read(path).unwrap(), before);
+            }
+            assert_eq!(
+                std::fs::read(lexical_path.join("MANIFEST")).unwrap(),
+                before_manifest,
+            );
+            let hits = existing
+                .search_doc_ids(&cx, "retainedwritersentinel", 10)
+                .expect("the retained generation remains searchable");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].document_id, "doc-retained");
+            assert!(
+                existing
+                    .search_doc_ids(&cx, "refusedwritersentinel", 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_builder_late_writer_creation_failure_preserves_existing_vectors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let mut vectors = TwoTierIndex::create(dir.path(), TwoTierConfig::default()).unwrap();
+            vectors
+                .add_record("doc-retained", &[1.0, 0.0], Some(&[0.0, 1.0]))
+                .unwrap();
+            drop(vectors.finish().unwrap());
+            let vector_paths = [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME]
+                .map(|name| dir.path().join(name));
+            let before_vectors = vector_paths
+                .each_ref()
+                .map(|path| std::fs::read(path).unwrap());
+            let lexical_path = dir.path().join("lexical");
+            let obstruction = lexical_path.clone();
+
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .with_progress(move |_| {
+                    std::fs::write(&obstruction, b"retained late obstruction").unwrap();
+                })
+                .add_document("doc-refused", "latewriterfailure")
+                .build(&cx)
+                .await
+                .expect_err("late writer admission failure must precede vector publication");
+
+            for (path, before) in vector_paths.iter().zip(before_vectors) {
+                assert_eq!(std::fs::read(path).unwrap(), before);
+            }
+            assert_eq!(
+                std::fs::read(&lexical_path).unwrap(),
+                b"retained late obstruction",
+            );
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_builder_retains_writer_admission_through_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-retained", "retainedadmissionsentinel")
+                .build(&cx)
+                .await
+                .unwrap();
+            let lexical_path = dir.path().join("lexical");
+            let probe_path = lexical_path.clone();
+            let probes = Arc::new(AtomicUsize::new(0));
+            let callback_probes = Arc::clone(&probes);
+
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .with_progress(move |_| {
+                    let probe_path = probe_path.clone();
+                    std::thread::spawn(move || {
+                        asupersync::test_utils::run_test_with_cx(|probe_cx| async move {
+                            assert!(
+                                QuillIndex::open(&probe_cx, probe_path, QuillConfig::default())
+                                    .await
+                                    .is_err(),
+                                "the builder must retain its admitted writer",
+                            );
+                        });
+                    })
+                    .join()
+                    .expect("joined writer admission probe");
+                    callback_probes.fetch_add(1, Ordering::SeqCst);
+                })
+                .add_document("doc-new", "newadmissionsentinel")
+                .build(&cx)
+                .await
+                .expect("the admitted writer survives vector construction");
+
+            assert_eq!(probes.load(Ordering::SeqCst), 1);
+            assert_eq!(stats.lexical.unwrap().indexed, 1);
+            let lexical = QuillIndex::open(&cx, &lexical_path, QuillConfig::default())
+                .await
+                .expect("the successful build releases its writer");
+            for (query, id) in [
+                ("retainedadmissionsentinel", "doc-retained"),
+                ("newadmissionsentinel", "doc-new"),
+            ] {
+                let hits = lexical.search_doc_ids(&cx, query, 10).unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].document_id, id);
+            }
         });
     }
 
