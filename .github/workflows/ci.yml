@@ -378,8 +378,15 @@ jobs:
           cargo test --locked -p frankensearch-fsfs --test default_build_quickstart \
             loader_only::default_build_indexes_and_returns_a_real_hybrid_result \
             -- --ignored --exact --nocapture 2>&1 | tee "${artifact_dir}/real-model.log"
+          cargo test --locked -p frankensearch-fsfs --test default_build_quickstart \
+            loader_only::default_build_replays_fast_answers_without_loading_weights \
+            -- --ignored --exact --nocapture 2>&1 | tee "${artifact_dir}/legacy-answer-cache.log"
+          cargo test --locked -p frankensearch-fsfs --test default_build_quickstart \
+            loader_only::default_build_replays_complete_generation_fast_answers_without_loading_weights \
+            -- --ignored --exact --nocapture 2>&1 | tee "${artifact_dir}/complete-answer-cache.log"
 
           sha256sum "${artifact_dir}/missing-corrupt.log" "${artifact_dir}/real-model.log" \
+            "${artifact_dir}/legacy-answer-cache.log" "${artifact_dir}/complete-answer-cache.log" \
             >"${artifact_dir}/SHA256SUMS"
           python3 - "${artifact_dir}/receipt.json" <<'PY'
           import json
@@ -396,6 +403,8 @@ jobs:
                   "missing-corrupt",
                   "real-model-semantic-only",
                   "real-model-hybrid",
+                  "legacy-fast-answer-cache",
+                  "complete-generation-fast-answer-cache",
               ],
               "status": "pass",
           }
