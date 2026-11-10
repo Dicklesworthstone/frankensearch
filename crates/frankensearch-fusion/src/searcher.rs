@@ -1820,9 +1820,10 @@ impl TwoTierSearcher {
                         }
                     }
                     Err(SearchError::Cancelled { phase, reason }) => {
-                        if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
-                            let _ = circuit_breaker.record_outcome(&QualityOutcome::Error);
-                        }
+                        // Cancellation describes this request, not the quality
+                        // provider's health. Preserve both a prior failure
+                        // streak and any successful half-open probes; the next
+                        // request must remain eligible to establish an outcome.
                         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                             self.emit_session_stop_telemetry(
                                 root_request_id,
@@ -7055,6 +7056,153 @@ mod tests {
         searcher.maybe_record_quality_completion(Duration::from_millis(11), None);
         assert!(breaker.is_open());
         assert_eq!(breaker.metrics().trips, 1);
+    }
+
+    #[test]
+    fn quality_cancellation_preserves_shared_circuit_failure_evidence() {
+        let (_index_dir, index) = build_test_index_with_quality(4);
+        let breaker = Arc::new(CircuitBreaker::new(
+            crate::circuit_breaker::CircuitBreakerConfig {
+                failure_threshold: 2,
+                latency_threshold_ms: u64::MAX,
+                ..crate::circuit_breaker::CircuitBreakerConfig::default()
+            },
+        ));
+        let failing = TwoTierSearcher::new(
+            index.clone(),
+            Arc::new(StubEmbedder::new("fast", 4)),
+            TwoTierConfig::default(),
+        )
+        .with_quality_embedder(Arc::new(FailingEmbedder))
+        .with_circuit_breaker(breaker.clone());
+        let failing = &failing;
+
+        // A real provider failure establishes a streak that cancellation must
+        // neither advance nor reset. Another real failure must still trip it.
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_, metrics) = failing.search_collect(&cx, "query", 5).await.unwrap();
+            assert_eq!(metrics.skip_reason.as_deref(), Some("embedding_failed"));
+        });
+        assert!(breaker.is_closed());
+
+        for request_cancellation in [false, true] {
+            let quality: Arc<dyn Embedder> = if request_cancellation {
+                Arc::new(CancellingEmbedder::new(
+                    "quality",
+                    4,
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                ))
+            } else {
+                Arc::new(CancelledEmbedder)
+            };
+            let cancelled = TwoTierSearcher::new(
+                index.clone(),
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(quality)
+            .with_circuit_breaker(breaker.clone());
+            let cancelled = &cancelled;
+            for _ in 0..breaker.config().failure_threshold + 1 {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let mut phases = Vec::new();
+                    let error = cancelled
+                        .search(
+                            &cx,
+                            "query",
+                            5,
+                            |_| None,
+                            |phase| match phase {
+                                SearchPhase::Initial { .. } => phases.push("initial"),
+                                phase => panic!("cancelled quality published {phase:?}"),
+                            },
+                        )
+                        .await
+                        .expect_err("cancelled refinement stays request-local");
+                    assert!(matches!(error, SearchError::Cancelled { .. }));
+                    assert_eq!(phases, ["initial"]);
+                });
+                assert!(breaker.is_closed(), "cancellation is not a health failure");
+                assert_eq!(breaker.metrics().trips, 0);
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_, metrics) = failing.search_collect(&cx, "query", 5).await.unwrap();
+            assert_eq!(metrics.skip_reason.as_deref(), Some("embedding_failed"));
+        });
+        assert!(breaker.is_open(), "the real failure streak must survive");
+        assert_eq!(breaker.metrics().trips, 1);
+    }
+
+    #[test]
+    fn quality_cancellation_preserves_half_open_recovery() {
+        let (_index_dir, index) = build_test_index_with_quality(4);
+        let breaker = Arc::new(CircuitBreaker::new(
+            crate::circuit_breaker::CircuitBreakerConfig {
+                latency_threshold_ms: u64::MAX,
+                improvement_threshold: 0.0,
+                half_open_interval_ms: 0,
+                reset_threshold: 2,
+                ..crate::circuit_breaker::CircuitBreakerConfig::default()
+            },
+        ));
+        breaker.force_open();
+        let healthy = TwoTierSearcher::new(
+            index.clone(),
+            Arc::new(StubEmbedder::new("fast", 4)),
+            TwoTierConfig::default(),
+        )
+        .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+        .with_circuit_breaker(breaker.clone());
+        let cancelled = TwoTierSearcher::new(
+            index,
+            Arc::new(StubEmbedder::new("fast", 4)),
+            TwoTierConfig::default(),
+        )
+        .with_quality_embedder(Arc::new(CancellingEmbedder::new(
+            "quality",
+            4,
+            vec![1.0, 0.0, 0.0, 0.0],
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )))
+        .with_circuit_breaker(breaker.clone());
+        let healthy = &healthy;
+        let cancelled = &cancelled;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_, metrics) = healthy.search_collect(&cx, "query", 5).await.unwrap();
+            assert!(metrics.skip_reason.is_none());
+            assert!(metrics.kendall_tau.is_some());
+        });
+        assert!(breaker.is_half_open());
+        assert_eq!(breaker.metrics().probes_succeeded, 1);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = cancelled
+                .search_collect(&cx, "query", 5)
+                .await
+                .expect_err("real request cancellation must propagate");
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+        });
+        assert!(breaker.is_half_open(), "cancelled probe must not reopen");
+        assert_eq!(breaker.metrics().probes_succeeded, 1);
+        assert_eq!(breaker.metrics().resets, 0);
+        assert!(
+            !breaker.should_skip_quality().0,
+            "next probe stays admitted"
+        );
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_, metrics) = healthy.search_collect(&cx, "query", 5).await.unwrap();
+            assert!(metrics.skip_reason.is_none());
+            assert!(metrics.kendall_tau.is_some());
+        });
+        assert!(breaker.is_closed(), "recovery keeps its prior success");
+        assert_eq!(breaker.metrics().probes_succeeded, 2);
+        assert_eq!(breaker.metrics().resets, 1);
+        assert_eq!(breaker.metrics().queries_skipped, 0);
     }
 
     #[test]
