@@ -510,6 +510,8 @@ const REASON_VECTOR_QUALITY_TIER_BUILT: &str = "vector.quality_tier.built";
 const REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY: &str = "vector.quality_tier.skipped.fast_only";
 const REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE: &str =
     "vector.quality_tier.deferred.pressure_override";
+const REASON_VECTOR_QUALITY_TIER_DEFERRED_MODEL_UNAVAILABLE: &str =
+    "vector.quality_tier.deferred.model_unavailable";
 const REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE: &str =
     "vector.quality_tier.skipped.model_unavailable";
 const REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED: &str =
@@ -519,6 +521,34 @@ const REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED: &str =
 const REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY: &str =
     "vector.quality_tier.skipped.lexical_only";
 const REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY: &str = "vector.fast_tier.skipped.lexical_only";
+
+/// Why a retained source build owes exact quality work to a later completion.
+/// Producer backoff is local to indexing; it must not change query policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexingQualityDeferral {
+    PressureOverride,
+    ProducerUnavailable,
+}
+
+impl IndexingQualityDeferral {
+    const fn reason_code(self) -> &'static str {
+        match self {
+            Self::PressureOverride => REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE,
+            Self::ProducerUnavailable => REASON_VECTOR_QUALITY_TIER_DEFERRED_MODEL_UNAVAILABLE,
+        }
+    }
+
+    fn from_reason_code(reason: &str) -> Option<Self> {
+        match reason {
+            REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE => Some(Self::PressureOverride),
+            REASON_VECTOR_QUALITY_TIER_DEFERRED_MODEL_UNAVAILABLE => {
+                Some(Self::ProducerUnavailable)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Checkpoint embedder identity of a lexical-only generation, which embeds
 /// nothing. No embedder reports this id, so no vector reuse can match it.
 const LEXICAL_ONLY_GENERATION_EMBEDDER_ID: &str = "fsfs-lexical-only";
@@ -7040,6 +7070,10 @@ pub struct FsfsRuntime {
     /// tiers. Selected by `force_lexical_only` or `force_metadata_only`, and
     /// always set in a build without semantic loaders (bd-636yz).
     lexical_only_indexing: bool,
+    /// A watcher with an unavailable optional producer continues source work
+    /// while preserving exact quality inputs for its bounded acquisition retry.
+    /// This applies only to private source-build clones, never serving policy.
+    indexing_quality_deferral: Option<IndexingQualityDeferral>,
     /// Source files a complete-generation watch observed unchanged since the
     /// generation it extends: same inode, length, and modification and change
     /// times to the nanosecond, and no notification naming them. A seeded
@@ -7073,6 +7107,14 @@ impl FsfsRuntime {
             self.config.pressure.degradation_override,
             DegradationOverrideMode::ForceEmbedDeferred
         )
+    }
+
+    const fn indexing_quality_deferral(&self) -> Option<IndexingQualityDeferral> {
+        if self.quality_work_deferred() {
+            Some(IndexingQualityDeferral::PressureOverride)
+        } else {
+            self.indexing_quality_deferral
+        }
     }
 
     /// Effective query/indexing quality policy, including runtimes constructed
@@ -7130,6 +7172,7 @@ impl FsfsRuntime {
             generation_retention: crate::generation_store::GenerationRetention::default(),
             complete_generations_for_new_roots: false,
             lexical_only_indexing,
+            indexing_quality_deferral: None,
             unchanged_sources: None,
             seeded_from_receipt: false,
             source_policy: IndexSourcePolicy::BestEffort,
@@ -16319,11 +16362,12 @@ impl FsfsRuntime {
     /// The bare download command retains its separate bulk catalog semantics.
     fn configured_model_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
         self.validate_registered_local_model_intent()?;
-        let quality = if self.quality_disabled_by_policy() {
-            None
-        } else {
-            select_quality_model(&self.config.indexing.quality_model)?
-        };
+        let quality =
+            if self.quality_disabled_by_policy() || self.indexing_quality_deferral().is_some() {
+                None
+            } else {
+                select_quality_model(&self.config.indexing.quality_model)?
+            };
         #[cfg(not(feature = "semantic-support"))]
         {
             let _ = quality;
@@ -20097,7 +20141,7 @@ impl FsfsRuntime {
                 value
                     .reason_codes
                     .iter()
-                    .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+                    .any(|reason| IndexingQualityDeferral::from_reason_code(reason).is_some())
             }) {
             Self::read_index_manifest(&index_root)?
                 .into_iter()
@@ -20430,7 +20474,7 @@ impl FsfsRuntime {
         )?];
         // Banner/progress/status collection must not inspect or hash an expensive
         // quality cache merely to report an explicitly deferred operation.
-        if !self.quality_work_deferred() {
+        if self.indexing_quality_deferral().is_none() {
             statuses.push(Self::collect_model_status(
                 "quality",
                 &self.config.indexing.quality_model,
@@ -22538,8 +22582,10 @@ impl FsfsRuntime {
                 .filter(|entry| entry.semantic_indexed)
                 .count(),
             semantic_deferred_files,
-            quality_deferred_files: if quality_tier_reason
-                == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE
+            quality_deferred_files: if IndexingQualityDeferral::from_reason_code(
+                quality_tier_reason,
+            )
+            .is_some()
             {
                 semantic_doc_count
             } else {
@@ -24204,8 +24250,8 @@ impl FsfsRuntime {
         if self.config.indexing.quality_model.trim().is_empty() {
             return (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);
         }
-        if self.quality_work_deferred() {
-            return (None, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+        if let Some(deferral) = self.indexing_quality_deferral() {
+            return (None, deferral.reason_code());
         }
         if self.config.search.fast_only {
             return (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);

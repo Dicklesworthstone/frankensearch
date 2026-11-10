@@ -24,13 +24,14 @@ use frankensearch_storage::{
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(test, feature = "semantic-loaders"))]
+use super::REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE;
 use super::{
     CheckpointFileEntry, FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsIndexPayload, FsfsRuntime,
-    IndexManifestEntry, IndexRunControl, IndexSentinel, IngestionClass, PendingIndexDocument,
-    REASON_VECTOR_QUALITY_TIER_BUILT, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE,
-    SearchExecutionMode, VectorIndex, content_sha256_hex, ingestion_class_label,
-    pressure_timestamp_ms, protect_vector_generations, retained_reuse, retained_search_checkpoint,
-    validate_retained_catalog_path,
+    IndexManifestEntry, IndexRunControl, IndexSentinel, IndexingQualityDeferral, IngestionClass,
+    PendingIndexDocument, REASON_VECTOR_QUALITY_TIER_BUILT, SearchExecutionMode, VectorIndex,
+    content_sha256_hex, ingestion_class_label, pressure_timestamp_ms, protect_vector_generations,
+    retained_reuse, retained_search_checkpoint, validate_retained_catalog_path,
 };
 use crate::generation_store::{
     CompleteGenerationStore, GenerationPublication, PublishedGeneration,
@@ -97,13 +98,13 @@ pub(super) fn retryable_quality_producer_error(error: &SearchError) -> bool {
     }
 }
 
-#[cfg(all(test, feature = "semantic-loaders"))]
+#[cfg(all(test, feature = "semantic-support"))]
 thread_local! {
     static QUALITY_COMPLETION_LOAD_FAILURE: std::cell::Cell<Option<fn() -> SearchError>> =
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(all(test, feature = "semantic-loaders"))]
+#[cfg(all(test, feature = "semantic-support"))]
 pub(super) fn set_quality_completion_load_failure(
     failure: Option<fn() -> SearchError>,
 ) -> Option<fn() -> SearchError> {
@@ -181,7 +182,7 @@ fn captures_quality(runtime: &FsfsRuntime) -> bool {
     // an unrestricted queue runner in its mutable catalog; do not put jobs
     // requiring generation-scoped completion into that runner's work stream.
     runtime.discovery_excluded_root.is_some()
-        && runtime.quality_work_deferred()
+        && runtime.indexing_quality_deferral().is_some()
         && !runtime.lexical_only_indexing
         && !runtime.config.indexing.quality_model.trim().is_empty()
         && RegisteredQualityModel::from_name(&runtime.config.indexing.quality_model).is_some()
@@ -499,7 +500,7 @@ fn open_carried_backlog(
     let deferred = previous
         .reason_codes
         .iter()
-        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+        .any(|reason| IndexingQualityDeferral::from_reason_code(reason).is_some());
     if (!deferred
         && predecessor
             .path()
@@ -778,17 +779,26 @@ pub(super) fn finish_content_upserts(
     if backlog.requested_documents == 0 {
         sentinel
             .reason_codes
-            .retain(|reason| reason != REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+            .retain(|reason| IndexingQualityDeferral::from_reason_code(reason).is_none());
         candidate.write_index_sentinel(destination, &sentinel)?;
-    } else if !sentinel
-        .reason_codes
-        .iter()
-        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
-    {
-        sentinel
+    } else {
+        let previous = sentinel
             .reason_codes
-            .push(REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE.to_owned());
-        candidate.write_index_sentinel(destination, &sentinel)?;
+            .iter()
+            .find_map(|reason| IndexingQualityDeferral::from_reason_code(reason));
+        let deferral = candidate
+            .indexing_quality_deferral()
+            .or(previous)
+            .unwrap_or(IndexingQualityDeferral::PressureOverride);
+        if previous != Some(deferral) {
+            sentinel
+                .reason_codes
+                .retain(|reason| IndexingQualityDeferral::from_reason_code(reason).is_none());
+            sentinel
+                .reason_codes
+                .push(deferral.reason_code().to_owned());
+            candidate.write_index_sentinel(destination, &sentinel)?;
+        }
     }
     retained_search_checkpoint(cx)
 }
@@ -876,7 +886,7 @@ where
     if requested == 0 {
         sentinel
             .reason_codes
-            .retain(|reason| reason != REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+            .retain(|reason| IndexingQualityDeferral::from_reason_code(reason).is_none());
         runtime.write_index_sentinel(destination, &sentinel)?;
     }
     tracing::info!(
@@ -941,7 +951,7 @@ impl FsfsRuntime {
         control
             .admit_work(cx, "complete_quality.model_load")
             .await?;
-        #[cfg(all(test, feature = "semantic-loaders"))]
+        #[cfg(all(test, feature = "semantic-support"))]
         if let Some(error) =
             QUALITY_COMPLETION_LOAD_FAILURE.with(|slot| slot.get().map(|failure| failure()))
         {
@@ -1056,7 +1066,7 @@ impl FsfsRuntime {
         if !sentinel
             .reason_codes
             .iter()
-            .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+            .any(|reason| IndexingQualityDeferral::from_reason_code(reason).is_some())
             || predecessor
                 .path()
                 .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
