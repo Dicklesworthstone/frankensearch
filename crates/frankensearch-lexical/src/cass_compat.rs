@@ -2735,10 +2735,10 @@ fn cass_combine_and(mut operands: Vec<CassOracleNode>) -> Option<CassOracleNode>
 /// primary := TERM | PHRASE | '(' or ')'
 /// ```
 ///
-/// Malformed input is recovered the way Quill recovers it: an unclosed `(`
-/// closes at the end, and an empty group, a dangling operator, a NOT with no
-/// operand and an operand that lowers to nothing are skipped. This adapter
-/// has no diagnostic channel, so the recovery is silent.
+/// Malformed input is recovered the way Quill recovers it: an unclosed
+/// nonempty group closes at the end, and a dangling operator or NOT with no
+/// operand is skipped. Empty groups and unsearchable operands refuse the
+/// complete query. This adapter has no diagnostic channel for recovery.
 struct CassOracleGrammar<'a> {
     tokens: &'a [CassQueryToken],
     position: usize,
@@ -2852,6 +2852,11 @@ impl CassOracleGrammar<'_> {
                 self.open_groups -= 1;
                 if matches!(self.peek(), Some(CassQueryToken::RParen)) {
                     self.position += 1;
+                }
+                if inner.is_none() {
+                    return Err(cass_normalization_error(
+                        "query group has no searchable operands",
+                    ));
                 }
                 return Ok(inner);
             }
@@ -3308,18 +3313,35 @@ fn cass_query_normalization_preflight(raw: &str) -> SearchResult<()> {
 /// Count lexer groups, excluding parentheses inside phrases and code terms,
 /// before the recursive grammar can consume adversarially deep input.
 fn cass_query_nesting_preflight(tokens: &[CassQueryToken]) -> SearchResult<()> {
-    let mut depth = 0_usize;
+    let mut group_starts = Vec::new();
+    let mut operand_count = 0_usize;
     for token in tokens {
         match token {
             CassQueryToken::LParen => {
-                depth += 1;
-                if depth > CASS_MAX_QUERY_NESTING {
+                group_starts.push(operand_count);
+                if group_starts.len() > CASS_MAX_QUERY_NESTING {
                     return Err(cass_normalization_error("query exceeds 128 nested groups"));
                 }
             }
-            CassQueryToken::RParen => depth = depth.saturating_sub(1),
+            CassQueryToken::RParen => {
+                if group_starts.pop() == Some(operand_count) {
+                    return Err(cass_normalization_error(
+                        "query group has no searchable operands",
+                    ));
+                }
+            }
+            CassQueryToken::Term(term) if !term.trim().is_empty() => operand_count += 1,
+            CassQueryToken::Phrase(_) => operand_count += 1,
             _ => {}
         }
+    }
+    // The no-operator fast path does not lower groups through the grammar.
+    // Refuse empty groups here too, including unclosed groups at the end;
+    // an unclosed group with an operand retains the existing recovery.
+    if group_starts.contains(&operand_count) {
+        return Err(cass_normalization_error(
+            "query group has no searchable operands",
+        ));
     }
     Ok(())
 }
@@ -4441,10 +4463,10 @@ mod cass_query_tests {
             ("alpha -(active OR deprecated)", vec![5]),
             ("deprecated OR -(alpha OR active)", vec![1, 4]),
             ("((gamma))", vec![3]),
-            // Recovery: an unclosed group closes at the end; an empty group
-            // and a dangling operator are skipped.
+            // Recovery closes a nonempty group at the end and skips dangling
+            // operators, while an empty group refuses the complete query.
             ("(deprecated OR gamma", vec![1, 3]),
-            ("gamma ()", vec![3]),
+            ("gamma ()", vec![]),
             ("gamma AND", vec![3]),
             ("OR gamma", vec![3]),
         ] {
@@ -5453,6 +5475,13 @@ mod cass_query_tests {
             "*",
             "***",
             "\"*** \u{2003}\"",
+            "()",
+            "( )",
+            "(\u{2003})",
+            "(AND OR NOT)",
+            "(( ))",
+            "(NOT ())",
+            "((AND) OR)",
         ] {
             for raw in [
                 empty_operand.to_owned(),
@@ -5466,6 +5495,7 @@ mod cass_query_tests {
                 format!("NOT NOT {empty_operand}"),
                 format!("backup NOT {empty_operand}"),
                 format!("NOT ({empty_operand} OR backup)"),
+                format!("NOT (backup AND {empty_operand})"),
             ] {
                 assert!(
                     cass_result_ids(&searcher, &fields, &raw, &filters).is_empty(),
@@ -5473,8 +5503,37 @@ mod cass_query_tests {
                 );
             }
         }
-        for rejected in ["AND", "OR NOT", "()", "---", "!!!"] {
+        for rejected in [
+            "AND",
+            "OR NOT",
+            "()",
+            "---",
+            "!!!",
+            "backup AND (",
+            "backup OR (NOT",
+            "NOT (backup AND ((",
+            "backup ((OR",
+        ] {
             assert!(cass_result_ids(&searcher, &fields, rejected, &filters).is_empty());
+        }
+        // Empty syntax must not be confused with a valid negative query or
+        // the existing recovery of incomplete, nonempty expressions.
+        for (raw, expected) in [
+            ("NOT backup", vec![1, 2]),
+            ("backup", vec![0]),
+            ("(backup", vec![0]),
+            ("backup AND", vec![0]),
+            ("backup OR", vec![0]),
+            ("backup NOT", vec![0]),
+            ("OR backup", vec![0]),
+            ("backup()", vec![0]),
+            ("\"backup ()\"", vec![0]),
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, raw, &filters),
+                expected,
+                "{raw:?}"
+            );
         }
         for omitted in ["", " \u{2003}"] {
             assert_eq!(

@@ -156,7 +156,7 @@ unary      := (NOT | '-')* primary
 primary    := term | quoted_phrase | '(' or_expr ')'
 ```
 
-For example, `auth OR token AND cache` means `auth OR (token AND cache)`, and `(auth OR token) AND cache` groups explicitly. A `(` opens a group only at the start of a word, and a `)` closes one only while a group is open, so code such as `foo(bar)` remains one term. An unclosed group is closed at the end of the query, and an empty group is skipped; both carry a `SyntaxRecovery` diagnostic. Negation is parity-based: an odd number of adjacent negators negates and `NOT NOT a` is `a`.
+For example, `auth OR token AND cache` means `auth OR (token AND cache)`, and `(auth OR token) AND cache` groups explicitly. A `(` opens a group only at the start of a word, and a `)` closes one only while a group is open, so code such as `foo(bar)` remains one term. An unclosed nonempty group is closed at the end of the query with a `SyntaxRecovery` diagnostic. An empty or operator-only group rejects the complete CASS expression, including under `AND`, `OR`, or `NOT`; it is never dropped from its parent. Negation is parity-based: an odd number of adjacent negators negates and `NOT NOT a` is `a`.
 
 **Historical divergence (cass #52, resolved on main by frankensearch #56).** The older Tantivy CASS builder and native parser before 0.3.3 made OR bind tighter than AND, treated parentheses as term characters, and made repeated negators idempotent. Both current adapters implement the standard grammar above. The result-set differential includes mixed precedence, grouping and negation parity; `cass_parser_precedence_matches_set_algebra_over_the_oracle` pins those semantics.
 
@@ -228,8 +228,9 @@ stripping behavior: a quoted *kérlek* is the exact recovered phrase, while an
 unquoted *kérlek* is unsupported. ASCII punctuation separates groups; other
 non-ASCII separators inside an affected group retain analyzer positions. This applies under OR, NOT and repeated
 negation: an invalid operand is a refusal, not an empty set whose complement
-could become every document. Empty quotes, punctuation-only, emoji-only,
-unsupported-script-only, star-only and operator-only inputs cannot browse.
+could become every document. Empty quotes, empty or operator-only groups,
+punctuation-only, emoji-only, unsupported-script-only, star-only and
+operator-only inputs cannot browse.
 Only genuinely blank/whitespace input remains an intentional browse request,
 with the caller's structured filters still applied. Valid negative ASCII or
 accented operands retain ordinary complement semantics.

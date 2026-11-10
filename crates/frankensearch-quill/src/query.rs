@@ -6108,8 +6108,18 @@ impl CassGrammar {
                 } else {
                     self.syntax_diagnostic("unclosed '(' was closed at the end", offset);
                 }
-                if inner.is_none() {
-                    self.syntax_diagnostic("empty group was skipped", offset);
+                if inner.is_none() && !self.normalization_failed {
+                    self.normalization_failed = true;
+                    emit_diagnostic(
+                        &mut self.diagnostics,
+                        QueryDiagnostic {
+                            kind: QueryDiagnosticKind::DroppedFragment,
+                            message: "CASS empty group has no searchable operand; refusing the complete query"
+                                .to_owned(),
+                            byte_offset: Some(offset),
+                            fragment: None,
+                        },
+                    );
                 }
                 inner
             }
@@ -7298,13 +7308,23 @@ mod tests {
             "*érlek",
             "ké*rlek",
             "\"ké*rlek\"",
+            "()",
+            "( )",
+            "(\u{2003})",
+            "(AND OR NOT)",
+            "(( ))",
+            "(NOT ())",
+            "((AND) OR)",
         ] {
             for raw in [
                 operand.to_owned(),
                 format!("NOT {operand}"),
                 format!("NOT NOT {operand}"),
                 format!("backup OR {operand}"),
+                format!("backup {operand}"),
+                format!("backup AND {operand}"),
                 format!("backup AND NOT {operand}"),
+                format!("NOT (backup AND {operand})"),
             ] {
                 let parsed = parser.parse(&raw, &filters);
                 assert!(parsed.query.is_empty(), "{raw:?} must refuse the entire query");
@@ -7316,7 +7336,18 @@ mod tests {
                 );
             }
         }
-        for raw in ["AND", "OR", "NOT", "-", "()", "NOT ()"] {
+        for raw in [
+            "AND",
+            "OR",
+            "NOT",
+            "-",
+            "()",
+            "NOT ()",
+            "backup AND (",
+            "backup OR (NOT",
+            "NOT (backup AND ((",
+            "backup ((OR",
+        ] {
             let parsed = parser.parse(raw, &filters);
             assert!(parsed.query.is_empty(), "{raw:?} is not a browse request");
             assert!(!parsed.diagnostics.is_empty(), "{raw:?}");
@@ -8320,7 +8351,8 @@ mod tests {
 
     /// cass#52 grammar, feature-independent: equivalent spellings lower to
     /// the same tree, the two groupings of a mixed query differ, code
-    /// parentheses stay inside terms, and malformed groups are recovered.
+    /// parentheses stay inside terms, unclosed nonempty groups recover, and
+    /// empty groups refuse the complete query.
     #[test]
     fn cass_parser_groups_with_parentheses_and_standard_precedence() {
         let parser = cass_parser();
@@ -8392,12 +8424,13 @@ mod tests {
             unclosed.diagnostics
         );
         let empty = parser.parse("auth ()", &filters);
-        assert_eq!(empty.query, tree("auth"));
+        assert!(empty.query.is_empty());
         assert!(
-            empty
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("empty group")),
+            empty.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == QueryDiagnosticKind::DroppedFragment
+                    && diagnostic.message.contains("empty group")
+                    && diagnostic.byte_offset == Some("auth ".len())
+            }),
             "{:?}",
             empty.diagnostics
         );
