@@ -313,8 +313,26 @@ impl StorageBackedJobRunner {
         self.metrics.as_ref()
     }
 
+    /// Canonicalize source text once, then retain and enqueue that exact input.
+    /// Call [`Self::ingest_canonical`] when the caller has already prepared the
+    /// embedding text with its indexing canonicalizer.
+    pub fn ingest(&self, mut request: IngestRequest) -> SearchResult<IngestResult> {
+        ensure_non_empty(&request.doc_id, "doc_id")?;
+        request.text = self.canonicalizer.canonicalize(&request.text);
+        self.ingest_canonical(request)
+    }
+
+    /// Retain and enqueue caller-prepared canonical embedding text unchanged.
+    ///
+    /// The caller owns source decoding and must use the canonicalization profile
+    /// associated with its index and producer. Canonicalization is not idempotent:
+    /// a second pass can strip operators and link syntax
+    /// preserved inside fenced code. The supplied text therefore supplies both
+    /// the persisted input and its deduplication hash without another transform.
+    /// All document, queue, backpressure, and empty-input rules are shared with
+    /// [`Self::ingest`]; workers read the retained input without canonicalizing it.
     #[allow(clippy::too_many_lines)]
-    pub fn ingest(&self, request: IngestRequest) -> SearchResult<IngestResult> {
+    pub fn ingest_canonical(&self, request: IngestRequest) -> SearchResult<IngestResult> {
         ensure_non_empty(&request.doc_id, "doc_id")?;
         let correlation_id = resolve_correlation_id(&request.doc_id, request.correlation_id);
 
@@ -322,7 +340,7 @@ impl StorageBackedJobRunner {
             .total_ingest_calls
             .fetch_add(1, Ordering::Relaxed);
 
-        let canonical_text = self.canonicalizer.canonicalize(&request.text);
+        let canonical_text = request.text;
         if canonical_text.trim().is_empty() {
             self.metrics
                 .total_ingest_skipped
@@ -2439,6 +2457,106 @@ mod tests {
             runner = runner.with_quality_embedder(quality_embedder);
         }
         runner
+    }
+
+    #[test]
+    fn prepared_ingest_preserves_code_input_and_requeues_operator_only_edits() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let (runner, probe) = make_claim_probe_runner(false, false, sink.clone());
+            let raw = "# Example\n```rust\nlet result = left * right;\nlet reference = \"[label](destination)\";\n```";
+            let first = "Example [code: rust] let result = left * right; let reference = \"[label](destination)\";";
+            let second = "Example [code: rust] let result = left ** right; let reference = \"[label](destination)\";";
+            let canonicalizer = DefaultCanonicalizer::default();
+            assert_eq!(canonicalizer.canonicalize(raw), first);
+            assert_ne!(canonicalizer.canonicalize(first), first);
+            assert_eq!(
+                canonicalizer.canonicalize(first),
+                canonicalizer.canonicalize(second),
+                "a second pass would erase the edit before queue deduplication"
+            );
+
+            let inserted = runner.ingest(IngestRequest::new("code", raw)).unwrap();
+            assert_eq!(inserted.action, IngestAction::New);
+            assert_eq!(
+                runner
+                    .process_batch(&cx, "first")
+                    .await
+                    .unwrap()
+                    .jobs_completed,
+                1
+            );
+            assert_eq!(probe.inputs.lock().unwrap().as_slice(), [first]);
+
+            let unchanged = runner
+                .ingest_canonical(IngestRequest::new("code", first))
+                .unwrap();
+            assert_eq!(unchanged.action, IngestAction::Unchanged);
+            assert!(!unchanged.fast_job_enqueued);
+            assert_eq!(
+                runner
+                    .process_batch(&cx, "unchanged")
+                    .await
+                    .unwrap()
+                    .jobs_claimed,
+                0
+            );
+
+            let changed = runner
+                .ingest_canonical(IngestRequest::new("code", second))
+                .unwrap();
+            assert_eq!(changed.action, IngestAction::Updated);
+            assert!(changed.fast_job_enqueued);
+            let document = runner.storage.get_document("code").unwrap().unwrap();
+            assert_eq!(document.content_hash, ContentHasher::hash(second));
+            assert_eq!(
+                runner
+                    .storage
+                    .get_document_content("code")
+                    .unwrap()
+                    .as_deref(),
+                Some(second)
+            );
+            assert_eq!(
+                runner
+                    .process_batch(&cx, "changed")
+                    .await
+                    .unwrap()
+                    .jobs_completed,
+                1
+            );
+            assert_eq!(probe.inputs.lock().unwrap().as_slice(), [first, second]);
+            assert_eq!(
+                sink.entries().len(),
+                2,
+                "the changed input must reach persistence"
+            );
+
+            let raw_changed = raw.replace("left * right", "left ** right");
+            let same_raw = runner
+                .ingest(IngestRequest::new("code", raw_changed))
+                .unwrap();
+            assert_eq!(same_raw.action, IngestAction::Unchanged);
+            assert!(!same_raw.fast_job_enqueued);
+            let plain = runner
+                .ingest(IngestRequest::new("plain", "caf\u{e9} **notes**"))
+                .unwrap();
+            assert_eq!(plain.action, IngestAction::New);
+            assert_eq!(
+                runner
+                    .storage
+                    .get_document_content("plain")
+                    .unwrap()
+                    .as_deref(),
+                Some("caf\u{e9} notes"),
+                "ordinary callers still receive exactly one canonicalization pass"
+            );
+            let empty = runner
+                .ingest_canonical(IngestRequest::new("empty", " \t "))
+                .unwrap();
+            assert!(matches!(empty.action, IngestAction::Skipped { .. }));
+            assert!(runner.storage.get_document("empty").unwrap().is_none());
+        });
     }
 
     #[derive(Debug)]

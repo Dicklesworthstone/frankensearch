@@ -4003,9 +4003,10 @@ fn prefetch_watch_source(
         file.take(observed_len + 1).read_to_end(&mut bytes)?;
         Ok(bytes)
     });
-    if bytes.as_ref().is_ok_and(|bytes| {
-        u64::try_from(bytes.len()).unwrap_or(u64::MAX) > observed_len
-    }) {
+    if bytes
+        .as_ref()
+        .is_ok_and(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX) > observed_len)
+    {
         return None;
     }
     *budget -= observed_len;
@@ -4860,7 +4861,7 @@ impl LiveIngestPipeline {
         let mut request = IngestRequest::new(rel_key.to_owned(), canonical.to_owned());
         request.source_path = Some(abs_path.display().to_string());
         request.enqueue_quality = false;
-        storage_ctx.runner.ingest(request)
+        storage_ctx.runner.ingest_canonical(request)
     }
 
     #[allow(clippy::future_not_send)]
@@ -45163,18 +45164,17 @@ mod tests {
                     }
                     Ok(stream_expansion_fixture("alpha", Some("beta")))
                 };
-                let error = Box::pin(runtime
-                    .run_search_stream_with_query_expansion(
-                        &cx,
-                        "alpha",
-                        2,
-                        "expanded-refusal",
-                        &mut transport,
-                        None,
-                        expansion,
-                    ))
-                    .await
-                    .unwrap_err();
+                let error = Box::pin(runtime.run_search_stream_with_query_expansion(
+                    &cx,
+                    "alpha",
+                    2,
+                    "expanded-refusal",
+                    &mut transport,
+                    None,
+                    expansion,
+                ))
+                .await
+                .unwrap_err();
                 cx.set_cancel_requested(false);
                 if cancel {
                     assert!(matches!(error, SearchError::Cancelled { .. }));
@@ -48525,6 +48525,75 @@ mod tests {
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].doc_id, "doc.md");
             assert!(hits[0].score > 0.99);
+        });
+    }
+
+    #[test]
+    fn live_ingest_storage_uses_prepared_input_without_recanonicalizing() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let vector_path = temp.path().join("fast.fsvi");
+            VectorIndex::create(&vector_path, "retry-fast", 2)
+                .unwrap()
+                .finish()
+                .unwrap();
+            let pipeline = LiveIngestPipeline::new(
+                temp.path().to_path_buf(),
+                create_test_quill(&cx, &temp.path().join("lexical")).await,
+                VectorIndex::open(&vector_path).unwrap(),
+                admitted(StorageRetryEmbedder::new("retry-fast")),
+            )
+            .with_storage_db_path(temp.path().join("catalog.db"));
+            let context = pipeline.build_storage_batch_context().unwrap().unwrap();
+            for (text, action) in [
+                (
+                    "Example [code: rust] let value = left * right;",
+                    frankensearch_storage::IngestAction::New,
+                ),
+                (
+                    "Example [code: rust] let value = left ** right;",
+                    frankensearch_storage::IngestAction::Updated,
+                ),
+            ] {
+                let result = LiveIngestPipeline::enqueue_storage_upsert(
+                    &context,
+                    "doc.md",
+                    text,
+                    &temp.path().join("doc.md"),
+                )
+                .unwrap();
+                assert_eq!(result.action, action);
+                assert!(result.fast_job_enqueued);
+                assert!(!result.quality_job_enqueued);
+                assert_eq!(
+                    context
+                        .storage
+                        .get_document_content("doc.md")
+                        .unwrap()
+                        .as_deref(),
+                    Some(text)
+                );
+                assert_eq!(
+                    context
+                        .storage
+                        .get_document("doc.md")
+                        .unwrap()
+                        .unwrap()
+                        .content_hash,
+                    frankensearch_storage::ContentHasher::hash(text)
+                );
+                pipeline.drain_storage_jobs(&cx, &context).await.unwrap();
+            }
+            assert_eq!(context.runner.metrics().snapshot().total_jobs_completed, 2);
+            assert_eq!(
+                pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap(),
+                vec!["doc.md".to_owned()]
+            );
         });
     }
 
@@ -57988,7 +58057,8 @@ mod tests {
         );
         let remaining = super::WATCH_PREFETCH_MAX_BATCH_BYTES - observed_len;
         assert_eq!(budget, remaining);
-        file.set_len(super::WATCH_PREFETCH_MAX_FILE_BYTES + 1).unwrap();
+        file.set_len(super::WATCH_PREFETCH_MAX_FILE_BYTES + 1)
+            .unwrap();
         let observed_len = file.metadata().unwrap().len();
         assert!(super::prefetch_watch_source(&oversized, observed_len, &mut budget).is_none());
         assert_eq!(budget, remaining);
@@ -64502,8 +64572,7 @@ mod tests {
                     .degradation_advice
                     .values()
                     .any(|advice| {
-                        advice.failure
-                            == super::DegradationFailureKind::UnverifiableEmbeddingSpace
+                        advice.failure == super::DegradationFailureKind::UnverifiableEmbeddingSpace
                     }),
                 "the planted foreign producer must cause the refinement failure"
             );
