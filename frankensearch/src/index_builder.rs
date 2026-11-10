@@ -363,9 +363,10 @@ impl IndexBuilder {
     /// and otherwise omit the lexical arm. This method overrides that choice
     /// for this build only; it is never an automatic fallback from Quill.
     ///
-    /// Open the resulting `lexical` directory with [`TantivyIndex::open_read_only`]
-    /// or [`TantivyIndex::open`]. This does not change [`open_hybrid`]'s feature
-    /// requirements or migrate an existing lexical directory to a new format.
+    /// [`open_hybrid`] attaches the resulting direct Tantivy index as a
+    /// read-only lexical arm with `lexical-tantivy` (including `cass-compat`).
+    /// The directory also supports [`TantivyIndex::open_read_only`] and
+    /// [`TantivyIndex::open`]. This selection does not migrate existing indexes.
     /// A nonempty lexical directory must already be readable as Tantivy; the
     /// build checks this and acquires its writer before creating vector files
     /// or embedding documents. Conflicting Quill or blue-green markers refuse.
@@ -1621,7 +1622,9 @@ fn is_hash_generation_id(embedder_id: &str) -> bool {
 /// yields `lexical: None` and `lexical_backend: None`, as does a build without
 /// a lexical backend compiled in. When the arm is present,
 /// `lexical_backend` records whether it is the default Quill reader or an
-/// explicit Tantivy oracle/rollback reader.
+/// explicit Tantivy oracle/rollback reader. Direct Tantivy indexes require
+/// `lexical-tantivy` (also enabled by `cass-compat`); blue-green lexical roots
+/// require `quill` for layout selection. Readers acquire no lexical writer lock.
 pub async fn open_hybrid(
     cx: &Cx,
     data_dir: impl AsRef<Path>,
@@ -1745,7 +1748,7 @@ async fn open_lexical_reader(
         }
         #[cfg(feature = "lexical-tantivy")]
         LexicalLayout::DirectTantivy => {
-            let index = TantivyIndex::open(dir)?;
+            let index = TantivyIndex::open_read_only(dir)?;
             Ok((
                 Some(Arc::new(index)),
                 Some(LexicalReaderBackend::TantivyOracle),
@@ -1755,7 +1758,7 @@ async fn open_lexical_reader(
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Tantivy =>
         {
-            let index = TantivyIndex::open(&pointer.engine_dir(dir))?;
+            let index = TantivyIndex::open_read_only(&pointer.engine_dir(dir))?;
             Ok((
                 Some(Arc::new(index)),
                 Some(LexicalReaderBackend::TantivyOracle),
@@ -1772,19 +1775,19 @@ async fn open_lexical_reader(
     }
 }
 
-#[cfg(all(feature = "lexical", not(feature = "quill")))]
+#[cfg(all(feature = "lexical-tantivy", not(feature = "quill")))]
 async fn open_lexical_reader(
     _cx: &Cx,
     dir: &Path,
 ) -> SearchResult<(Option<Arc<dyn LexicalRead>>, Option<LexicalReaderBackend>)> {
-    let index = TantivyIndex::open(dir)?;
+    let index = TantivyIndex::open_read_only(dir)?;
     Ok((
         Some(Arc::new(index)),
         Some(LexicalReaderBackend::TantivyOracle),
     ))
 }
 
-#[cfg(not(any(feature = "lexical", feature = "quill")))]
+#[cfg(not(any(feature = "quill", feature = "lexical-tantivy")))]
 async fn open_lexical_reader(
     _cx: &Cx,
     _dir: &Path,
@@ -2111,10 +2114,7 @@ mod tests {
     use frankensearch_durability::FsviProtector;
     #[cfg(all(feature = "durability", feature = "quill"))]
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviVerifyResult};
-    #[cfg(any(
-        all(feature = "quill", feature = "lexical-tantivy"),
-        all(feature = "lexical", not(feature = "quill"))
-    ))]
+    #[cfg(feature = "lexical-tantivy")]
     use frankensearch_lexical::TantivyIndex;
     #[cfg(feature = "quill")]
     use frankensearch_quill::{
@@ -5183,6 +5183,55 @@ mod tests {
         });
     }
 
+    /// The facade must open a direct Tantivy generation while its writer is
+    /// active, and its retained reader must leave later writers admissible.
+    /// This also exercises the Tantivy-only `cass-compat` feature lane.
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn open_hybrid_opens_direct_tantivy_without_writer_ownership() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            IndexBuilder::new(root.path())
+                .with_embedder_stack(stub_stack())
+                .with_tantivy_lexical()
+                .add_document("direct-doc", "directreadersentinel searchable content")
+                .add_document("other-doc", "other lexical content")
+                .build(&cx)
+                .await
+                .unwrap();
+            let lexical_path = root.path().join("lexical");
+            let writer = TantivyIndex::open(&lexical_path).unwrap();
+
+            let parts = open_hybrid(&cx, root.path(), TwoTierConfig::default())
+                .await
+                .expect("hybrid readers must coexist with an active Tantivy writer");
+            assert_eq!(parts.vectors.doc_count(), 2);
+            assert_eq!(
+                parts.lexical_backend,
+                Some(LexicalReaderBackend::TantivyOracle)
+            );
+            let lexical = parts
+                .lexical
+                .expect("the Tantivy lexical arm must be attached");
+            let hits = lexical
+                .search(&cx, "directreadersentinel", 5)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "direct-doc");
+
+            drop(writer);
+            let _next_writer = TantivyIndex::open(&lexical_path)
+                .expect("the retained facade reader must not own the writer lock");
+            let hits = lexical
+                .search(&cx, "directreadersentinel", 5)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "direct-doc");
+        });
+    }
+
     /// bd-8nqz.2: when both backends are compiled, a published Tantivy
     /// generation is a supported rollback target. The root inspector decides
     /// the engine; no Quill open is attempted against Tantivy's `meta.json`.
@@ -5204,15 +5253,6 @@ mod tests {
             .await
             .unwrap();
             LexicalWrite::commit(&tantivy, &cx).await.unwrap();
-            // Tantivy's IndexWriter holds an exclusive directory lock, so the
-            // rollback generation has to be CLOSED before a reader may open
-            // it. Without this the open below fails LockBusy — which is what
-            // it did, undetected, from the day this test was written: it is
-            // gated on all(quill, lexical-tantivy) and no lane ever enabled
-            // both, so `-p frankensearch --lib open_lexical_reader` reported a
-            // vacuous "ok. 0 passed" in every single-feature selection
-            // (bd-8nqz.2, bd-jt7b2's defect class one layer up).
-            drop(tantivy);
             publish_current(
                 &lexical_root,
                 &CurrentPointer::new(BlueGreenEngine::Tantivy, "tantivy-v1", 0).unwrap(),
@@ -5222,6 +5262,13 @@ mod tests {
             let (lexical, backend) = open_lexical_reader(&cx, &lexical_root).await.unwrap();
             assert_eq!(backend, Some(LexicalReaderBackend::TantivyOracle));
             let lexical = lexical.expect("published Tantivy generation must open");
+            let hits = lexical.search(&cx, "rollback", 5).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "tantivy-doc");
+
+            drop(tantivy);
+            let _next_writer = TantivyIndex::open(&tantivy_dir)
+                .expect("the rollback reader must not retain a writer lock");
             let hits = lexical.search(&cx, "rollback", 5).await.unwrap();
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].doc_id, "tantivy-doc");
@@ -5353,7 +5400,7 @@ mod tests {
 
     /// Without a lexical backend compiled in, `open_hybrid` still opens the
     /// vector arms and reports the lexical arm as absent rather than erroring.
-    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    #[cfg(not(any(feature = "quill", feature = "lexical-tantivy")))]
     #[test]
     fn open_hybrid_without_lexical_backend_reports_absent_arm() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
