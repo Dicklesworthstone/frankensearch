@@ -1046,7 +1046,11 @@ mod tests {
                         .collect::<Vec<_>>();
                     actual.sort_unstable();
                     assert_eq!(actual, expected, "query {raw:?}");
-                    assert_eq!(result.total_count, Some(expected.len()), "count {raw:?}");
+                    assert_eq!(
+                        result.total_count,
+                        Some(u64::try_from(expected.len()).expect("fixture count")),
+                        "count {raw:?}"
+                    );
                 };
             for (raw, expected) in [
                 ("kérlek", &[0, 2, 5, 12][..]),
