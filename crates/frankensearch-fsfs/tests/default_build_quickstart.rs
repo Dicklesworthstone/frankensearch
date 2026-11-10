@@ -1386,10 +1386,14 @@ mod loader_only {
     fn verify_fast_empty_answer_cache(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
         use std::io::{Read as _, Seek as _, Write as _};
 
+        let manifest = ModelManifest::potion_128m();
         let query = "how should clients recover from temporary connection failures";
         let config = root.join("cached-fast-model.toml");
-        let run_search = |label: &str, uncached: bool| {
-            let mut env = vec![("FRANKENSEARCH_LOG", "info")];
+        let run_formatted_search = |label: &str, uncached: bool, format: &str| {
+            let mut env = vec![(
+                "FRANKENSEARCH_LOG",
+                "info,frankensearch_embed::model_manifest=debug",
+            )];
             if uncached {
                 env.push(("FSFS_DISABLE_QUERY_CACHE", "1"));
             }
@@ -1410,12 +1414,14 @@ mod loader_only {
                     "--filter",
                     "ext:fsfs-cache-no-match",
                     "--format",
-                    "json",
+                    format,
                 ],
                 QUICKSTART_TIMEOUT,
                 &env,
             )
         };
+        let run_search =
+            |label: &str, uncached: bool| run_formatted_search(label, uncached, "json");
         // The corpus and semantic request are nonempty. Only the filter
         // removes every hit; readiness still admits the real producer.
         let cold = run_search("empty-fast-cache-cold", false);
@@ -1441,35 +1447,136 @@ mod loader_only {
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 1, "the empty answer must be persisted");
         let (cache_path, cache_bytes) = records.pop().unwrap();
-        let assert_replayed = |label: &str| {
-            let warm = run_search(label, false);
-            let replayed = parse_success_envelope(label, &warm);
-            assert_eq!(replayed["data"], original["data"], "{label}");
+        let cache_modified = fs::metadata(&cache_path).unwrap().modified().unwrap();
+        let assert_preserved = || {
+            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            assert_eq!(
+                fs::metadata(&cache_path).unwrap().modified().unwrap(),
+                cache_modified
+            );
+        };
+        let assert_replayed = |label: &str, format: &str, expected_hashes: usize| {
+            let warm = run_formatted_search(label, false, format);
+            if format == "json" {
+                let replayed = parse_success_envelope(label, &warm);
+                assert_eq!(replayed["data"], original["data"], "{label}");
+            } else {
+                assert_finished_successfully(label, &warm);
+                assert!(warm.stdout.contains("PHASE INITIAL: 0 hit(s)"), "{warm:?}");
+                assert!(
+                    warm.stdout
+                        .contains(&format!("No results for \"{query}\".")),
+                    "{warm:?}"
+                );
+                assert!(!warm.stdout.contains("Search readiness:"), "{warm:?}");
+            }
             assert_eq!(
                 warm.stderr.matches("Model2Vec model loaded").count(),
                 0,
                 "{label}: {warm:?}"
             );
-            assert!(
+            assert_eq!(
                 warm.stderr.contains("model verification receipt accepted"),
+                expected_hashes == 0,
                 "{label}: {warm:?}"
             );
-            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            let hashes = warm
+                .stderr
+                .lines()
+                .filter(|line| line.contains("verifying model artifact bytes"))
+                .collect::<Vec<_>>();
+            assert_eq!(hashes.len(), expected_hashes, "{label}: {warm:?}");
+            for artifact in &manifest.files {
+                let size_field = format!("expected_size={}", artifact.size);
+                assert_eq!(
+                    hashes
+                        .iter()
+                        .filter(|line| {
+                            line.contains(&artifact.name) && line.contains(&size_field)
+                        })
+                        .count(),
+                    usize::from(expected_hashes != 0),
+                    "each intact artifact must be hashed once or reuse its receipt: {label}: {warm:?}"
+                );
+            }
+            assert_preserved();
             warm.elapsed
         };
-        let warm_elapsed = assert_replayed("empty-fast-cache-warm");
+        let install = fsfs.model_root.join("potion-multilingual-128M");
+        let receipt = install.join(".verified");
+        let receipt_bytes = fs::read(&receipt).unwrap();
+        let receipt_modified = fs::metadata(&receipt).unwrap().modified().unwrap();
+        let warm_elapsed = assert_replayed("empty-fast-cache-warm", "json", 0);
+        assert_replayed("empty-fast-cache-table-warm", "table", 0);
+        assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
+        assert_eq!(
+            fs::metadata(&receipt).unwrap().modified().unwrap(),
+            receipt_modified
+        );
+
+        // Without a reusable receipt, admission hashes each artifact once.
+        // Rendering the admitted empty answer must not repeat that full pass.
+        let retained_receipt = root.join("empty-cache-retained-receipt");
+        fs::rename(&receipt, &retained_receipt).unwrap();
+        for format in ["json", "table"] {
+            assert_replayed(&format!("empty-cache-no-receipt-{format}"), format, 2);
+            assert!(!receipt.exists(), "read admission must not mint a receipt");
+        }
+        let malformed_receipt = b"{malformed-empty-cache-verification-receipt";
+        fs::write(&receipt, malformed_receipt).unwrap();
+        let malformed_modified = fs::metadata(&receipt).unwrap().modified().unwrap();
+        for format in ["json", "table"] {
+            assert_replayed(
+                &format!("empty-cache-malformed-receipt-{format}"),
+                format,
+                2,
+            );
+            assert_eq!(fs::read(&receipt).unwrap(), malformed_receipt);
+            assert_eq!(
+                fs::metadata(&receipt).unwrap().modified().unwrap(),
+                malformed_modified
+            );
+        }
+        fs::rename(&receipt, root.join("empty-cache-malformed-receipt")).unwrap();
+        fs::rename(&retained_receipt, &receipt).unwrap();
+        assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
+        assert_eq!(
+            fs::metadata(&receipt).unwrap().modified().unwrap(),
+            receipt_modified
+        );
+
         let assert_refused = |label: &str| {
             let cached = run_search(&format!("empty-cached-{label}"), false);
             let uncached = run_search(&format!("empty-uncached-{label}"), true);
             assert_same_fast_producer_refusal(label, &cached, &uncached);
-            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            let error: Value = serde_json::from_str(&cached.stdout).unwrap();
+            for uncached in [false, true] {
+                let table = run_formatted_search(
+                    &format!("empty-table-{label}-uncached-{uncached}"),
+                    uncached,
+                    "table",
+                );
+                assert!(!table.timed_out, "{label}: {table:?}");
+                assert!(!table.status.success(), "{label}: {table:?}");
+                assert_eq!(table.status.code(), cached.status.code(), "{label}");
+                assert!(
+                    table
+                        .stderr
+                        .contains(error["error"]["code"].as_str().unwrap()),
+                    "{label}: {table:?}"
+                );
+                assert!(table.stdout.is_empty(), "{label}: {table:?}");
+                assert!(
+                    !table.stderr.contains("Model2Vec model loaded"),
+                    "{label}: {table:?}"
+                );
+            }
+            assert_preserved();
         };
 
         // This helper runs only with the standalone test's independent
         // installation. An empty answer must not hide producer failures.
-        let install = fsfs.model_root.join("potion-multilingual-128M");
         let retained_install = root.join("empty-cache-retained-install");
-        let receipt_bytes = fs::read(install.join(".verified")).unwrap();
         fs::rename(&install, &retained_install).unwrap();
         assert_refused("missing-producer");
         assert_eq!(
@@ -1478,7 +1585,6 @@ mod loader_only {
         );
         fs::rename(&retained_install, &install).unwrap();
 
-        let manifest = ModelManifest::potion_128m();
         let mut tokenizer = File::options()
             .read(true)
             .write(true)
@@ -1495,9 +1601,15 @@ mod loader_only {
         tokenizer.write_all(&original_byte).unwrap();
         drop(tokenizer);
         frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &install).unwrap();
-        assert_replayed("empty-fast-cache-restored-producer");
+        for format in ["json", "table"] {
+            assert_replayed(
+                &format!("empty-cache-restored-producer-{format}"),
+                format,
+                0,
+            );
+        }
         eprintln!(
-            "[default-build-e2e] stage=fast-empty-answer-cache real_potion=true cold_ms={} warm_ms={} cold_weight_loads=1 warm_weight_loads=0 empty_answer_equal=true missing_changed_producer_same_error_as_uncached=true cache_bytes_unchanged=true",
+            "[default-build-e2e] stage=fast-empty-answer-cache real_potion=true cold_ms={} warm_ms={} cold_weight_loads=1 warm_weight_loads=0 empty_answer_equal=true missing_changed_producer_same_error_as_uncached=true cache_bytes_mtime_unchanged=true warm_json_table_hashes=valid:0,absent:2,malformed:2 table_missing_changed_refused=true",
             cold.elapsed.as_millis(),
             warm_elapsed.as_millis()
         );

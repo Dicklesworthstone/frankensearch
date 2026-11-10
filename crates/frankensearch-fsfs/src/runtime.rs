@@ -9036,8 +9036,12 @@ impl FsfsRuntime {
             .collect();
 
         if self.cli_input.format == OutputFormat::Table {
+            let mode = degraded_search_mode(
+                search_runtime.config.pressure.degradation_override,
+                search_runtime.requested_search_mode(),
+            )?;
             if let Some(mode_hint) =
-                search_runtime.search_readiness_warning_for_payload(&payload)?
+                search_runtime.search_readiness_warning_for_payload(query, mode, &payload)?
             {
                 // Same color rule as the table below: NO_COLOR and a piped
                 // stdout both mean plain text.
@@ -9146,18 +9150,31 @@ impl FsfsRuntime {
         Ok(self.search_readiness()?.map(|(hint, _)| hint))
     }
 
-    /// Rendering follows successful search or cache admission. A fast-only
-    /// semantic Initial already proves the primary producer was available;
-    /// inspecting its model directory again adds no readiness information and
-    /// can rehash the entire model when its verification receipt is absent.
-    /// Other results retain the usual actionable installation/index guidance.
+    /// Call only after successful search or cache admission. Every nonempty
+    /// Full/FastOnly request admits its primary producer, including when no
+    /// semantic hits survive. Re-inspecting its directory adds no readiness
+    /// information and can rehash the model when its receipt is absent.
+    /// Use the actual request and effective mode, not payload metadata alone:
+    /// daemon completion also requires an attestation for that exact mode.
+    /// Empty queries, lexical modes, and quality work retain actionable guidance.
     fn search_readiness_warning_for_payload(
         &self,
+        query: &str,
+        mode: SearchExecutionMode,
         payload: &SearchPayload,
     ) -> SearchResult<Option<String>> {
         if self.quality_disabled_by_policy()
+            && matches!(
+                mode,
+                SearchExecutionMode::Full | SearchExecutionMode::FastOnly
+            )
+            && !Self::normalize_search_query(query).is_empty()
             && payload.phase == SearchOutputPhase::Initial
-            && payload_has_admitted_semantic_hits(payload)
+            && !payload.vector_generation_is_hash
+            && payload
+                .vector_generation_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty() && !Self::is_legacy_hash_vector_generation(id))
         {
             return Ok(None);
         }
@@ -39180,6 +39197,24 @@ mod tests {
             );
             assert!(!state.attested, "{version} cannot admit any phase");
         }
+        let mut downgraded = header();
+        if let SearchServeFrame::Attested { policy, mode, .. } = &mut downgraded {
+            *policy = Box::new(
+                runtime
+                    .search_serve_policy_for_mode(SearchExecutionMode::LexicalOnly)
+                    .unwrap(),
+            );
+            "lexical_only".clone_into(mode);
+        }
+        let error = accept(downgraded, &mut state).unwrap_err();
+        assert!(error.to_string().contains("search policy"));
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon")
+        );
+        assert!(
+            !state.attested,
+            "a server-side lexical downgrade cannot attest semantic readiness"
+        );
         let mut bad = header();
         if let SearchServeFrame::Attested { policy, .. } = &mut bad {
             policy.ranking_priors = true;
@@ -62935,54 +62970,47 @@ mod tests {
             }],
         )
         .with_vector_generation("potion-multilingual-128M", false);
-        assert!(
-            runtime
-                .search_readiness_warning_for_payload(&semantic)
-                .unwrap()
-                .is_none()
-        );
-
         let mut lexical = semantic.clone();
         lexical.hits[0].semantic_rank = None;
         lexical.hits[0].lexical_rank = Some(0);
         let hash = semantic.clone().with_vector_generation("fnv1a-256", true);
         let empty = SearchPayload::new("readiness", SearchOutputPhase::Initial, 0, Vec::new());
+        let zero_hits = empty
+            .clone()
+            .with_vector_generation("potion-multilingual-128M", false);
+        for mode in [SearchExecutionMode::Full, SearchExecutionMode::FastOnly] {
+            for payload in [&semantic, &lexical, &zero_hits] {
+                assert!(
+                    runtime
+                        .search_readiness_warning_for_payload("readiness", mode, payload)
+                        .unwrap()
+                        .is_none(),
+                    "successful nonempty fast requests already admitted their producer"
+                );
+            }
+        }
         let mut refined = semantic.clone();
         refined.phase = SearchOutputPhase::Refined;
         let mut failed = semantic.clone();
         failed.phase = SearchOutputPhase::RefinementFailed;
         for (label, payload) in [
-            ("lexical", &lexical),
             ("hash control", &hash),
-            ("empty", &empty),
+            ("missing generation", &empty),
             ("refined or expanded", &refined),
             ("failed refinement", &failed),
         ] {
             assert_eq!(
                 runtime
-                    .search_readiness_warning_for_payload(payload)
+                    .search_readiness_warning_for_payload(
+                        "readiness",
+                        SearchExecutionMode::Full,
+                        payload,
+                    )
                     .unwrap(),
                 fallback,
                 "{label} must retain its actionable warning"
             );
         }
-
-        let mut full = runtime.clone();
-        full.config.search.fast_only = false;
-        assert_eq!(
-            full.search_readiness_warning_for_payload(&semantic)
-                .unwrap(),
-            full.search_readiness_warning().unwrap(),
-            "an Initial alone does not establish optional quality readiness"
-        );
-        full.config.pressure.degradation_override = DegradationOverrideMode::ForceEmbedDeferred;
-        assert!(
-            full.search_readiness_warning_for_payload(&semantic)
-                .unwrap()
-                .is_none(),
-            "explicit quality deferral retains the admitted fast result"
-        );
-
         fs::create_dir_all(&index_root).unwrap();
         fs::write(index_root.join(super::FSFS_VECTOR_MANIFEST_FILE), b"[]").unwrap();
         let missing_vector = runtime.search_readiness_warning().unwrap();
@@ -62993,9 +63021,93 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .search_readiness_warning_for_payload(&empty)
+                .search_readiness_warning_for_payload(
+                    "readiness",
+                    SearchExecutionMode::Full,
+                    &empty,
+                )
                 .unwrap(),
             missing_vector
+        );
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn fast_table_readiness_requires_semantic_request_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = FsfsConfig::default();
+        config.indexing.model_dir = temp.path().join("models").display().to_string();
+        config.storage.index_dir = temp.path().join("index").display().to_string();
+        config.indexing.offline = true;
+        config.search.fast_only = true;
+        let runtime = FsfsRuntime::new(config);
+        let fallback = runtime.search_readiness_warning().unwrap();
+        assert!(fallback.is_some());
+        let payload = SearchPayload::new("cached query", SearchOutputPhase::Initial, 0, Vec::new())
+            .with_vector_generation("potion-multilingual-128M", false);
+
+        for query in ["", " \u{7}\t\n"] {
+            assert_eq!(
+                runtime
+                    .search_readiness_warning_for_payload(
+                        query,
+                        SearchExecutionMode::Full,
+                        &payload,
+                    )
+                    .unwrap(),
+                fallback,
+                "payload metadata cannot admit a normalized-empty request"
+            );
+        }
+        assert_eq!(
+            runtime
+                .search_readiness_warning_for_payload(
+                    "readiness",
+                    SearchExecutionMode::LexicalOnly,
+                    &payload,
+                )
+                .unwrap(),
+            fallback,
+            "explicit lexical results retain readiness guidance"
+        );
+        let mut lexical_only = runtime.clone();
+        lexical_only.config.pressure.degradation_override =
+            DegradationOverrideMode::ForceLexicalOnly;
+        let lexical_mode = super::degraded_search_mode(
+            lexical_only.config.pressure.degradation_override,
+            lexical_only.requested_search_mode(),
+        )
+        .unwrap();
+        assert_eq!(lexical_mode, SearchExecutionMode::LexicalOnly);
+        assert_eq!(
+            lexical_only
+                .search_readiness_warning_for_payload("readiness", lexical_mode, &payload)
+                .unwrap(),
+            lexical_only.search_readiness_warning().unwrap(),
+            "effective lexical mode cannot inherit the fast-only flag's admission"
+        );
+
+        let mut full = runtime.clone();
+        full.config.search.fast_only = false;
+        for mode in [SearchExecutionMode::Full, SearchExecutionMode::QualityOnly] {
+            assert_eq!(
+                full.search_readiness_warning_for_payload("readiness", mode, &payload)
+                    .unwrap(),
+                full.search_readiness_warning().unwrap(),
+                "an Initial alone does not establish quality readiness"
+            );
+        }
+        full.config.pressure.degradation_override = DegradationOverrideMode::ForceEmbedDeferred;
+        let fast_mode = super::degraded_search_mode(
+            full.config.pressure.degradation_override,
+            full.requested_search_mode(),
+        )
+        .unwrap();
+        assert!(
+            full.search_readiness_warning_for_payload("readiness", fast_mode, &payload)
+                .unwrap()
+                .is_none(),
+            "explicit quality deferral retains the admitted fast result"
         );
     }
 
