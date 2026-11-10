@@ -1,9 +1,10 @@
 //! Lifecycle management with complete-generation-aware write admission.
 //!
 //! Keep the native kernel-lock implementation in its existing source module.
-//! Every public publication lease additionally refuses a sealed bundle or any
-//! of its descendants before touching directories or lock files and at each
-//! publication fence. Filesystem aliases cannot hide a sealed ancestor.
+//! Every public publication lease additionally refuses a sealed bundle or a
+//! fixed-authority generation root and their descendants before touching
+//! directories or lock files and at each publication fence. Filesystem aliases
+//! cannot hide either protocol boundary.
 
 #[path = "lifecycle.rs"]
 mod kernel;
@@ -16,7 +17,8 @@ pub use kernel::*;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use frankensearch_core::SearchResult;
+use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME;
 
 /// Exclusive publication authority for a mutable fsfs index root.
 ///
@@ -30,10 +32,10 @@ pub struct PublicationLease {
 }
 
 impl PublicationLease {
-    /// Acquire native exclusion after refusing a sealed generation subtree.
+    /// Acquire native exclusion after refusing sealed or fixed-authority subtrees.
     ///
     /// # Errors
-    /// Returns the native contention/I/O error or a sealed-generation refusal.
+    /// Returns the native contention/I/O error or a generation-protocol refusal.
     pub fn acquire(index_root: &Path) -> SearchResult<Self> {
         let root = std::path::absolute(index_root)?;
         reject_sealed_ancestry(&root)?;
@@ -45,8 +47,8 @@ impl PublicationLease {
     /// Revalidate both mutable-generation admission and native lock authority.
     ///
     /// # Errors
-    /// Returns an error if the root or an ancestor was sealed, or native
-    /// authority was lost.
+    /// Returns an error if the root or an ancestor was sealed, acquired fixed
+    /// generation authority, or lost native publication authority.
     pub fn fence(&self, boundary: &'static str) -> SearchResult<()> {
         reject_sealed_ancestry(&self.root)?;
         self.inner.fence(boundary)
@@ -62,7 +64,10 @@ impl PublicationLease {
 // The native lease creates missing directories and rewrites its owner record.
 // Inspect the nearest existing ancestor without creating anything first. Its
 // canonical ancestry catches both a nested index root and a symlink pointing
-// into a sealed generation; lexical parents alone cannot catch the latter.
+// into a sealed or fixed-authority generation; lexical parents alone cannot
+// catch the latter. AUTHORITY presence selects that protocol even if its bytes
+// are corrupt or it is a dangling symlink; fsfs must never establish a competing
+// FSFS-CURRENT selection or initialize its legacy writer lock there.
 // Keep the original absolute root on the lease so the native inode fence still
 // detects a pathname retargeted after acquisition.
 pub(crate) fn reject_sealed_ancestry(root: &Path) -> SearchResult<()> {
@@ -72,6 +77,20 @@ pub(crate) fn reject_sealed_ancestry(root: &Path) -> SearchResult<()> {
             Ok(existing) => {
                 for directory in existing.ancestors() {
                     crate::generation_store::reject_published_write(directory)?;
+                    match std::fs::symlink_metadata(
+                        directory.join(GENERATION_ROOT_AUTHORITY_FILE_NAME),
+                    ) {
+                        Ok(_) => {
+                            return Err(SearchError::InvalidConfig {
+                                field: "fsfs.index_root".to_owned(),
+                                value: root.display().to_string(),
+                                reason: "a fixed-authority generation root and its descendants cannot be opened by the fsfs mutable or cooperative-store protocol; use the native generation API instead"
+                                    .to_owned(),
+                            });
+                        }
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 return Ok(());
             }
@@ -119,6 +138,141 @@ mod tests {
             std::fs::read(lock).expect("retained record"),
             b"preserve this record"
         );
+    }
+
+    #[test]
+    fn fixed_authority_admission_preserves_root_descendants_and_aliases() {
+        let root = tempfile::tempdir().expect("root");
+        let authority = root.path().join(GENERATION_ROOT_AUTHORITY_FILE_NAME);
+        std::fs::write(&authority, b"fixed authority").expect("authority marker");
+        let nested = root.path().join("existing");
+        std::fs::create_dir(&nested).expect("existing descendant");
+        let lock = nested.join(PUBLICATION_LOCK_FILE_NAME);
+        std::fs::write(&lock, b"retained owner record").expect("lock record");
+        let alias_parent = tempfile::tempdir().expect("alias parent");
+        let alias = alias_parent.path().join("alias");
+        std::os::unix::fs::symlink(&nested, &alias).expect("alias");
+
+        for attempted in [
+            root.path().to_path_buf(),
+            nested.clone(),
+            nested.join("missing/child"),
+            alias.clone(),
+            alias.join("missing/child"),
+        ] {
+            let error = PublicationLease::acquire(&attempted).expect_err("fixed authority");
+            assert!(error.to_string().contains("fixed-authority"), "{error}");
+            assert_eq!(
+                std::fs::read(&authority).expect("authority unchanged"),
+                b"fixed authority"
+            );
+            assert_eq!(
+                std::fs::read(&lock).expect("owner unchanged"),
+                b"retained owner record"
+            );
+            assert!(!root.path().join(PUBLICATION_LOCK_FILE_NAME).exists());
+            assert!(!nested.join("missing").exists());
+            assert_eq!(
+                std::fs::read_dir(root.path()).expect("root inventory").count(),
+                2
+            );
+            assert_eq!(
+                std::fs::read_dir(&nested).expect("nested inventory").count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn complete_store_admission_refuses_every_authority_marker_before_writing() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for marker in ["regular", "dangling", "directory"] {
+                let root = tempfile::tempdir().expect("root");
+                let authority = root.path().join(GENERATION_ROOT_AUTHORITY_FILE_NAME);
+                match marker {
+                    "regular" => std::fs::write(&authority, b"fixed authority").unwrap(),
+                    "dangling" => {
+                        std::os::unix::fs::symlink("absent-authority", &authority).unwrap();
+                    }
+                    _ => std::fs::create_dir(&authority).unwrap(),
+                }
+                for profile in [
+                    frankensearch_core::GenerationRootSecurityProfileV1::CooperativeLocal,
+                    frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+                ] {
+                    crate::generation_store::CompleteGenerationStore::create_with_profile(
+                        &cx,
+                        root.path(),
+                        profile,
+                    )
+                    .expect_err("foreign authority cannot create a cooperative store");
+                    crate::generation_store::CompleteGenerationStore::open_with_profile(
+                        &cx,
+                        root.path(),
+                        profile,
+                    )
+                    .expect_err("foreign authority cannot open as a cooperative store");
+                }
+                crate::generation_store::CompleteGenerationStore::create(
+                    &cx,
+                    &root.path().join("missing-store"),
+                )
+                .expect_err("foreign authority cannot contain a cooperative store");
+                PublicationLease::acquire(root.path())
+                    .expect_err("foreign authority cannot acquire a legacy lease");
+                assert!(std::fs::symlink_metadata(&authority).is_ok());
+                assert_eq!(
+                    std::fs::read_dir(root.path())
+                        .expect("unchanged inventory")
+                        .count(),
+                    1,
+                    "{marker}: no directories, pins or writer lock may be created",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn held_lease_refuses_new_fixed_authority_without_rewriting_its_owner() {
+        let root = tempfile::tempdir().expect("root");
+        let nested = root.path().join("mutable");
+        let lease = PublicationLease::acquire(&nested).expect("mutable admission");
+        let owner = std::fs::read(lease.lock_path()).expect("owner before fence");
+        lease.fence("before authority").expect("mutable fence");
+        std::fs::write(
+            root.path().join(GENERATION_ROOT_AUTHORITY_FILE_NAME),
+            b"fixed authority",
+        )
+        .expect("authority marker");
+
+        let error = lease.fence("after authority").expect_err("new protocol");
+        assert!(error.to_string().contains("fixed-authority"));
+        assert_eq!(std::fs::read(lease.lock_path()).unwrap(), owner);
+    }
+
+    #[test]
+    fn fixed_authority_sibling_does_not_block_mutable_roots_or_aliases() {
+        let root = tempfile::tempdir().expect("root");
+        let fixed = root.path().join("fixed");
+        std::fs::create_dir(&fixed).expect("fixed directory");
+        std::fs::write(
+            fixed.join(GENERATION_ROOT_AUTHORITY_FILE_NAME),
+            b"fixed authority",
+        )
+        .expect("authority marker");
+        let mutable = root.path().join("fixed-other");
+        let nested = mutable.join("new/nested");
+        let lease = PublicationLease::acquire(&nested).expect("mutable sibling");
+        lease.fence("mutable sibling").expect("mutable fence");
+        let alias = root.path().join("mutable-alias");
+        std::os::unix::fs::symlink(&mutable, &alias).expect("alias");
+        let aliased = alias.join("new/nested");
+        PublicationLease::acquire(&aliased).expect_err("native exclusion remains");
+        drop(lease);
+        PublicationLease::acquire(&aliased)
+            .expect("mutable alias after release")
+            .fence("alias publication")
+            .expect("mutable alias fence");
     }
 
     #[test]

@@ -550,6 +550,11 @@ impl FsfsRuntime {
             }
         }
 
+        // Fixed AUTHORITY roots use a different publication protocol. Apply
+        // the lease's alias-aware admission before either complete-store routing
+        // or a legacy fallback can initialize locks, pins, or artifact directories.
+        crate::lifecycle::reject_sealed_ancestry(&root)?;
+
         // Explicit source recovery chooses a fresh complete-store build even
         // when no selection exists. A malformed incumbent remains expected-old
         // evidence for the existing guarded recovery publisher, never fallback
@@ -4362,6 +4367,92 @@ mod tests {
             runtime.complete_generation_command_root(false).unwrap(),
             Some(root)
         );
+    }
+
+    #[test]
+    fn complete_cli_rejects_fixed_authority_before_complete_or_legacy_routing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, _, root) = fixture(directory.path());
+        fs::create_dir(&root).unwrap();
+        let authority = root.join(
+            frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME,
+        );
+        fs::write(&authority, b"fixed authority").unwrap();
+        let nested = root.join("existing");
+        fs::create_dir(&nested).unwrap();
+        let alias = directory.path().join("authority-alias");
+        std::os::unix::fs::symlink(&nested, &alias).unwrap();
+
+        for attempted in [
+            root.clone(),
+            nested.clone(),
+            nested.join("missing-index"),
+            alias.clone(),
+            alias.join("missing-index"),
+        ] {
+            for command in [
+                CliCommand::Index,
+                CliCommand::Watch,
+                CliCommand::Search,
+                CliCommand::Status,
+                CliCommand::Doctor,
+                CliCommand::Serve,
+                CliCommand::Daemon,
+            ] {
+                let mut input = runtime.cli_input.clone();
+                input.command = command;
+                input.index_dir = Some(attempted.clone());
+                input.query = Some("sharedtoken".to_owned());
+                let attempted_runtime = runtime.clone().with_cli_input(input);
+                for initialize in [false, true] {
+                    let error = attempted_runtime
+                        .complete_generation_command_root(initialize)
+                        .expect_err("foreign authority cannot select either fsfs route");
+                    assert!(
+                        matches!(
+                            &error,
+                            SearchError::InvalidConfig { field, .. } if field == "fsfs.index_root"
+                        ),
+                        "{command:?}: {error}",
+                    );
+                }
+            }
+        }
+        assert_eq!(fs::read(&authority).unwrap(), b"fixed authority");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(&nested).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn complete_cli_rejects_foreign_authority_even_with_a_complete_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, _, root) = fixture(directory.path());
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(
+            "absent-authority",
+            root.join(
+                frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME,
+            ),
+        )
+        .unwrap();
+        let selection = root.join(COMPLETE_GENERATION_POINTER);
+        fs::write(&selection, b"must not be adopted or repaired").unwrap();
+        fs::create_dir(root.join("generations")).unwrap();
+
+        for attempted in [&runtime, &search_runtime(&runtime)] {
+            for initialize in [false, true] {
+                let error = attempted
+                    .complete_generation_command_root(initialize)
+                    .expect_err("a complete selection cannot override fixed authority");
+                assert!(error.to_string().contains("fixed-authority"), "{error}");
+            }
+        }
+        assert_eq!(
+            fs::read(&selection).unwrap(),
+            b"must not be adopted or repaired"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 0);
     }
 
     #[test]
