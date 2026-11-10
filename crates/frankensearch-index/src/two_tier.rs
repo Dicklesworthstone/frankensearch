@@ -2551,24 +2551,15 @@ impl TwoTierIndexBuilder {
         doc_id: impl Into<String>,
         embedding: &[f32],
     ) -> SearchResult<()> {
-        let dimension = embedding.len();
-        let expected = self.fast_dimension.get_or_insert(dimension);
-        if *expected != dimension {
-            return Err(SearchError::DimensionMismatch {
-                expected: *expected,
-                found: dimension,
-            });
-        }
         let doc_id = doc_id.into();
-        if !self.fast_ids.insert(doc_id.clone()) {
-            return Err(SearchError::InvalidConfig {
-                field: "doc_id".to_owned(),
-                value: doc_id,
-                reason: "duplicate doc_id in fast tier; each document must have a unique id"
-                    .to_owned(),
-            });
-        }
-        self.fast_records.push((doc_id, embedding.to_vec()));
+        validate_record_admission(
+            &doc_id,
+            embedding.len(),
+            self.fast_dimension,
+            &self.fast_ids,
+            "fast",
+        )?;
+        self.push_fast_record(doc_id, embedding.to_vec());
         Ok(())
     }
 
@@ -2585,24 +2576,15 @@ impl TwoTierIndexBuilder {
         doc_id: impl Into<String>,
         embedding: Vec<f32>,
     ) -> SearchResult<()> {
-        let dimension = embedding.len();
-        let expected = self.fast_dimension.get_or_insert(dimension);
-        if *expected != dimension {
-            return Err(SearchError::DimensionMismatch {
-                expected: *expected,
-                found: dimension,
-            });
-        }
         let doc_id = doc_id.into();
-        if !self.fast_ids.insert(doc_id.clone()) {
-            return Err(SearchError::InvalidConfig {
-                field: "doc_id".to_owned(),
-                value: doc_id,
-                reason: "duplicate doc_id in fast tier; each document must have a unique id"
-                    .to_owned(),
-            });
-        }
-        self.fast_records.push((doc_id, embedding));
+        validate_record_admission(
+            &doc_id,
+            embedding.len(),
+            self.fast_dimension,
+            &self.fast_ids,
+            "fast",
+        )?;
+        self.push_fast_record(doc_id, embedding);
         Ok(())
     }
 
@@ -2617,32 +2599,28 @@ impl TwoTierIndexBuilder {
         doc_id: impl Into<String>,
         embedding: &[f32],
     ) -> SearchResult<()> {
-        let dimension = embedding.len();
-        let expected = self.quality_dimension.get_or_insert(dimension);
-        if *expected != dimension {
-            return Err(SearchError::DimensionMismatch {
-                expected: *expected,
-                found: dimension,
-            });
-        }
         let doc_id = doc_id.into();
-        if !self.quality_ids.insert(doc_id.clone()) {
-            return Err(SearchError::InvalidConfig {
-                field: "doc_id".to_owned(),
-                value: doc_id,
-                reason: "duplicate doc_id in quality tier; each document must have a unique id"
-                    .to_owned(),
-            });
-        }
-        self.quality_records.push((doc_id, embedding.to_vec()));
+        validate_record_admission(
+            &doc_id,
+            embedding.len(),
+            self.quality_dimension,
+            &self.quality_ids,
+            "quality",
+        )?;
+        self.push_quality_record(doc_id, embedding.to_vec());
         Ok(())
     }
 
     /// Add a fast record and optionally a matching quality record.
     ///
+    /// Both tiers are admitted before either buffer changes. A rejected pair
+    /// leaves its document identifier available for a corrected retry.
+    ///
     /// # Errors
     ///
-    /// Returns `SearchError::DimensionMismatch` if either tier dimension is inconsistent.
+    /// Returns `SearchError::DimensionMismatch` if either tier dimension is
+    /// inconsistent, or `SearchError::InvalidConfig` for a duplicate identifier
+    /// in either supplied tier. Every returned error leaves both tiers unchanged.
     pub fn add_record(
         &mut self,
         doc_id: impl Into<String>,
@@ -2650,11 +2628,39 @@ impl TwoTierIndexBuilder {
         quality_embedding: Option<&[f32]>,
     ) -> SearchResult<()> {
         let doc_id = doc_id.into();
-        self.add_fast_record(doc_id.clone(), fast_embedding)?;
+        validate_record_admission(
+            &doc_id,
+            fast_embedding.len(),
+            self.fast_dimension,
+            &self.fast_ids,
+            "fast",
+        )?;
         if let Some(quality_embedding) = quality_embedding {
-            self.add_quality_record(doc_id, quality_embedding)?;
+            validate_record_admission(
+                &doc_id,
+                quality_embedding.len(),
+                self.quality_dimension,
+                &self.quality_ids,
+                "quality",
+            )?;
+        }
+        self.push_fast_record(doc_id.clone(), fast_embedding.to_vec());
+        if let Some(quality_embedding) = quality_embedding {
+            self.push_quality_record(doc_id, quality_embedding.to_vec());
         }
         Ok(())
+    }
+
+    fn push_fast_record(&mut self, doc_id: String, embedding: Vec<f32>) {
+        self.fast_dimension = Some(embedding.len());
+        self.fast_ids.insert(doc_id.clone());
+        self.fast_records.push((doc_id, embedding));
+    }
+
+    fn push_quality_record(&mut self, doc_id: String, embedding: Vec<f32>) {
+        self.quality_dimension = Some(embedding.len());
+        self.quality_ids.insert(doc_id.clone());
+        self.quality_records.push((doc_id, embedding));
     }
 
     /// Write all buffered records and open the resulting `TwoTierIndex`.
@@ -2675,6 +2681,10 @@ impl TwoTierIndexBuilder {
     /// Returns `SearchError::InvalidConfig` if no fast-tier records were
     /// added or a declared identity does not describe the written vectors,
     /// and propagates writer/open errors from `VectorIndex`.
+    /// Both tiers are fully prepared before either is published, so record,
+    /// header or staging-I/O failures preserve the existing generation. The
+    /// final two-file installation is still sequential; its shared publication
+    /// nonce detects an interruption between installations.
     pub fn finish(self) -> SearchResult<TwoTierIndex> {
         let fast_dimension = self
             .fast_dimension
@@ -2706,18 +2716,18 @@ impl TwoTierIndexBuilder {
         // F16)`, so the written bytes are identical to the former `create`
         // call for builders that declared no identity (empty default
         // revision). Each tier is written at a sibling staging path and
-        // installed over the canonical name through `publish_tier`, which
+        // installed over the canonical name through `StagedTier::install`, which
         // carries the successor compaction generation and the shared
         // publication nonce so `install_replacement`'s generation authority
         // atomically invalidates any surviving destination sidecar
         // (bd-zhjv8, bd-miio8; supersedes the r3 retire-before-publish
-        // ordering — see `publish_tier`).
+        // ordering — see `stage_tier`).
         let publication_nonce = crate::next_publication_nonce(if fast_path.exists() {
             VectorIndex::peek_publication_nonce(&fast_path)?
         } else {
             0
         });
-        publish_tier(
+        let staged_fast = stage_tier(
             &fast_path,
             &self.fast_embedder_id,
             &self.fast_embedder_revision,
@@ -2726,16 +2736,27 @@ impl TwoTierIndexBuilder {
             &self.fast_records,
         )?;
 
-        if let Some(quality_dimension) = self.quality_dimension {
+        let staged_quality = if let Some(quality_dimension) = self.quality_dimension {
             let quality_path = self.dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-            publish_tier(
+            Some(stage_tier(
                 &quality_path,
                 &self.quality_embedder_id,
                 &self.quality_embedder_revision,
                 quality_dimension,
                 publication_nonce,
                 &self.quality_records,
-            )?;
+            )?)
+        } else {
+            None
+        };
+
+        // No canonical artifact changes until every selected tier has passed
+        // its real writer's validation and durable staging. In particular, a
+        // malformed quality vector cannot leave a newly installed fast tier
+        // paired with the previous generation's quality file.
+        staged_fast.install()?;
+        if let Some(staged_quality) = staged_quality {
+            staged_quality.install()?;
         }
 
         let mut index = TwoTierIndex::open(&self.dir, self.config)?;
@@ -2768,16 +2789,55 @@ impl TwoTierIndexBuilder {
     }
 }
 
-/// Stage one tier's records and durably install them over `canonical_path`
-/// with the generation discipline [`VectorIndex::install_replacement`]
-/// requires (bd-zhjv8) and the shared cross-tier publication nonce
-/// (bd-miio8).
+fn validate_record_admission(
+    doc_id: &str,
+    dimension: usize,
+    expected_dimension: Option<usize>,
+    doc_ids: &std::collections::HashSet<String>,
+    tier: &str,
+) -> SearchResult<()> {
+    if let Some(expected) = expected_dimension
+        && expected != dimension
+    {
+        return Err(SearchError::DimensionMismatch {
+            expected,
+            found: dimension,
+        });
+    }
+    if doc_ids.contains(doc_id) {
+        return Err(SearchError::InvalidConfig {
+            field: "doc_id".to_owned(),
+            value: doc_id.to_owned(),
+            reason: format!("duplicate doc_id in {tier} tier; each document must have a unique id"),
+        });
+    }
+    Ok(())
+}
+
+/// A completely written tier whose unique temporary name is owned until
+/// installation. Dropping it can remove only that staging file, never a
+/// canonical index or its WAL, including after a rename followed by an error.
+#[derive(Debug)]
+struct StagedTier {
+    canonical_path: PathBuf,
+    staging_path: tempfile::TempPath,
+}
+
+impl StagedTier {
+    fn install(self) -> SearchResult<()> {
+        VectorIndex::install_replacement(&self.canonical_path, &self.staging_path).map(drop)
+    }
+}
+
+/// Prepare one tier with the generation discipline required by
+/// [`VectorIndex::install_replacement`] and the shared cross-tier publication
+/// nonce (bd-zhjv8, bd-miio8). Preparation never replaces the canonical file.
 ///
 /// Protocol:
-/// 1. The replacement is FULLY written at a sibling staging path
-///    (`temporary_output_path`), never at the canonical name, carrying
+/// 1. Reserve a unique sibling staging file and retain its cleanup ownership.
+/// 2. FULLY write the replacement there, never at the canonical name, carrying
 ///    `next_generation(destination)` and the caller's publication nonce.
-/// 2. [`VectorIndex::install_replacement`] validates the staged artifact
+/// 3. After all tiers are prepared, [`VectorIndex::install_replacement`] validates
 ///    and atomically renames it over the canonical main. The generation
 ///    byte is the authority: the rename installs the new data AND
 ///    invalidates any surviving destination WAL (whose records bind to the
@@ -2789,55 +2849,49 @@ impl TwoTierIndexBuilder {
 /// audits #8366/#8367): durably retiring the sidecar BEFORE the rename
 /// opens a crash window in which the SURVIVING old generation loses its
 /// acknowledged appends — the two-resource-commit finding that closed
-/// bd-zhjv8 (authority, not ordering). A failed publication cleans up its
-/// own staged artifact and leaves the old generation, main AND sidecar,
-/// intact; a crash may leave a stray staging file, which lives under a
-/// `.tmp.<pid>.<nanos>` name that no open or discovery path resolves.
-fn publish_tier(
+/// bd-zhjv8 (authority, not ordering). Preparation failures clean up their
+/// owned staging files and preserve every canonical artifact. Installation
+/// failures can follow a successful rename; shared nonces still detect a
+/// split pair. A crash may leave a hidden staging file that no index opener
+/// resolves.
+fn stage_tier(
     canonical_path: &Path,
     embedder_id: &str,
     embedder_revision: &str,
     dimension: usize,
     publication_nonce: u16,
     records: &[(String, Vec<f32>)],
-) -> SearchResult<()> {
+) -> SearchResult<StagedTier> {
     let generation = if canonical_path.exists() {
         crate::next_generation(VectorIndex::peek_compaction_gen(canonical_path)?)
     } else {
         1
     };
-    let staging_path = crate::temporary_output_path(canonical_path);
-    let result = (|| {
-        let mut writer = VectorIndex::create_with_revision(
-            &staging_path,
-            embedder_id,
-            embedder_revision,
-            dimension,
-            Quantization::F16,
-        )?
-        .with_generation(generation)
-        .with_publication_nonce(publication_nonce);
-        for (doc_id, embedding) in records {
-            writer.write_record(doc_id, embedding)?;
-        }
-        writer.finish()?;
-        VectorIndex::install_replacement(canonical_path, &staging_path).map(drop)
-    })();
-    if result.is_err()
-        && staging_path.exists()
-        && let Err(cleanup_err) = fs::remove_file(&staging_path)
-    {
-        // Best-effort cleanup of the staged artifact only — the staging file
-        // is this function's own product under a name no open path resolves,
-        // never the canonical main or its WAL (mirrors the error path of
-        // `VectorIndexWriter::finish`).
-        warn!(
-            staging_path = %staging_path.display(),
-            ?cleanup_err,
-            "failed to clean up staged tier replacement after error"
-        );
+    let parent = canonical_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging_path = tempfile::Builder::new()
+        .prefix(".tmp-fsvi-tier-")
+        .tempfile_in(parent)?
+        .into_temp_path();
+    let mut writer = VectorIndex::create_with_revision(
+        &staging_path,
+        embedder_id,
+        embedder_revision,
+        dimension,
+        Quantization::F16,
+    )?
+    .with_generation(generation)
+    .with_publication_nonce(publication_nonce);
+    for (doc_id, embedding) in records {
+        writer.write_record(doc_id, embedding)?;
     }
-    result
+    writer.finish()?;
+    Ok(StagedTier {
+        canonical_path: canonical_path.to_path_buf(),
+        staging_path,
+    })
 }
 
 /// Reject a declared producing identity whose space dimension does not
@@ -3329,7 +3383,7 @@ fn admission_error_to_search_error(
 /// pre-r3 crash: fresh legacy mains start at compaction generation 1, so a
 /// leftover generation-2 sidecar collides exactly.
 /// `TwoTierIndexBuilder::finish` now publishes each tier as an
-/// authority-carrying successor generation (`publish_tier`, bd-zhjv8), so
+/// authority-carrying successor generation (`StagedTier::install`, bd-zhjv8), so
 /// the rename itself invalidates the destination's sidecar and finish can
 /// no longer manufacture that state; this warning keeps
 /// any residual legacy state (pre-r3 crash artifacts, external
@@ -4190,6 +4244,101 @@ mod tests {
                 found: 2
             }
         ));
+    }
+
+    #[test]
+    fn builder_rejected_pair_does_not_publish_a_fast_only_ghost() {
+        let dir = temp_index_dir("record-quality-rejection-ghost");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_record("accepted", &[1.0, 0.0], Some(&[1.0, 0.0, 0.0]))
+            .expect("accepted pair");
+        builder
+            .add_record("rejected", &[0.0, 1.0], Some(&[0.0, 1.0]))
+            .expect_err("reject inconsistent quality dimension");
+        let index = builder.finish().expect("finish after rejecting a document");
+        drop(index);
+
+        let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
+        assert_eq!(reopened.doc_count(), 1);
+        assert!(reopened.has_quality_for_index(0));
+        let hits = reopened
+            .search_fast(&[0.0, 1.0], 10)
+            .expect("search the persisted accepted corpus");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "accepted");
+    }
+
+    #[test]
+    fn builder_duplicate_quality_pair_preserves_independent_tier_admission() {
+        let dir = temp_index_dir("record-duplicate-quality-atomic");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_fast_record("original", &[1.0, 0.0])
+            .expect("original fast record");
+        builder
+            .add_quality_record("reserved", &[0.0, 1.0, 0.0])
+            .expect("independently supplied quality record");
+        let error = builder
+            .add_record("reserved", &[0.0, 1.0], Some(&[1.0, 0.0, 0.0]))
+            .expect_err("the paired write cannot replace an existing quality record");
+        assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "doc_id"));
+
+        builder
+            .add_fast_record("reserved", &[0.0, 1.0])
+            .expect("a rejected pair must leave the fast identifier available");
+        let index = builder.finish().expect("finish independent tier records");
+        let hits = index.search_fast(&[0.0, 1.0], 1).expect("search reserved");
+        assert_eq!(hits[0].doc_id, "reserved");
+        let quality = index
+            .quality_scores_for_hits(&[0.0, 1.0, 0.0], &hits)
+            .expect("retain the original quality vector");
+        assert_eq!(quality, vec![Some(1.0)]);
+    }
+
+    #[test]
+    fn builder_invalid_quality_records_preserve_existing_generation() {
+        let malformed: [(&str, &[f32]); 4] = [
+            ("zero", &[0.0, 0.0]),
+            ("nan", &[f32::NAN, 1.0]),
+            ("infinite", &[f32::INFINITY, 1.0]),
+            ("empty", &[]),
+        ];
+        for (case, quality) in malformed {
+            let dir = temp_index_dir(&format!("invalid-quality-preserves-generation-{case}"));
+            let mut original = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+            original
+                .add_record("retained", &[1.0, 0.0], Some(&[0.0, 1.0]))
+                .unwrap();
+            drop(original.finish().unwrap());
+            let paths = [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME]
+                .map(|name| dir.join(name));
+            let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+
+            let mut replacement = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+            replacement
+                .add_record("refused", &[0.0, 1.0], Some(quality))
+                .expect("buffer the pair before FSVI writer validation");
+            replacement
+                .finish()
+                .expect_err("invalid quality data cannot publish a replacement");
+
+            for (path, bytes) in paths.iter().zip(before) {
+                assert_eq!(
+                    fs::read(path).unwrap(),
+                    bytes,
+                    "{case}: failure preparing quality must preserve both published tiers",
+                );
+            }
+            let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+            assert!(
+                index.has_quality_index(),
+                "{case}: preserve quality admission"
+            );
+            let hits = index.search_fast(&[1.0, 0.0], 10).unwrap();
+            assert_eq!(hits.len(), 1, "{case}");
+            assert_eq!(hits[0].doc_id, "retained", "{case}");
+        }
     }
 
     #[cfg(feature = "ann")]
@@ -6513,6 +6662,22 @@ mod tests {
                 found: 2
             }
         ));
+
+        // A rejected pair is not a partial fast-tier success. The caller can
+        // correct the quality vector and retry the same document identifier.
+        builder
+            .add_record("doc-b", &[0.0, 1.0], Some(&[0.0, 1.0, 0.0]))
+            .expect("retry the corrected pair without a duplicate fast record");
+        let index = builder.finish().expect("publish only accepted pairs");
+        assert_eq!(index.doc_count(), 2);
+        assert!(index.has_quality_for_index(0));
+        assert!(index.has_quality_for_index(1));
+        let hits = index.search_fast(&[0.0, 1.0], 1).expect("search retry");
+        assert_eq!(hits[0].doc_id, "doc-b");
+        let quality = index
+            .quality_scores_for_hits(&[0.0, 1.0, 0.0], &hits)
+            .expect("score the corrected quality vector");
+        assert_eq!(quality, vec![Some(1.0)]);
     }
 
     #[test]
@@ -10255,7 +10420,7 @@ mod tests {
     ///   the state unconstructable, and the two-tier open path now surfaces
     ///   the replay with a warning rather than silence;
     /// - `finish()` over ANY WAL-bearing directory exits with
-    ///   {new main, no WAL}: `publish_tier` installs an authority-carrying
+    ///   {new main, no WAL}: `StagedTier::install` installs an authority-carrying
     ///   successor generation (bd-zhjv8) whose rename atomically invalidates
     ///   the destination's sidecar, so the hazard state {new main + ADOPTABLE
     ///   old WAL} is unreachable through `finish()` at every interruption
