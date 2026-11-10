@@ -306,7 +306,7 @@ fn sharded_live_quality_completion_refines_after_repartition_and_refuses_stale_i
         .unwrap();
         let current = live.install(&cx, &update).await.unwrap();
         assert!(
-            matches!(live.install(&cx, &stale).await, Err(SearchError::InvalidConfig { field, .. }) if field == "sharded_live.expected_current")
+            matches!(live.install(&cx, &stale).await, Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.sharded_live.expected_current")
         );
         assert!(Arc::ptr_eq(
             &live.snapshot(&cx).await.unwrap().index,

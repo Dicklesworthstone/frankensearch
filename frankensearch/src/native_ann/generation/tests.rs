@@ -1020,7 +1020,25 @@ fn pooled_retained_preview_yields_and_abandons_queued_work_without_starting_qual
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        // spawn_blocking first schedules an executor child, which then
+        // dispatches to the pool. Service that child before waiting for its
+        // real admission; blocking this current-thread executor deadlocks it.
+        let admission_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        std::future::poll_fn(|task| match entered.try_recv() {
+            Ok(()) => std::task::Poll::Ready(()),
+            Err(mpsc::TryRecvError::Empty) => {
+                assert!(
+                    std::time::Instant::now() < admission_deadline,
+                    "blocking worker never entered the pool"
+                );
+                task.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("blocking worker exited before entering the pool")
+            }
+        })
+        .await;
         let mut stream = scope
             .search_progressive_with_quality_and_pool(
                 &cx,
@@ -1278,10 +1296,9 @@ fn retained_reranking_reads_only_its_window_and_enforces_aggregate_source_bytes(
                 1,
             )
             .unwrap();
-        assert_source_refused(
-            unbound.with_retained_reranker(&model, 1, BUDGET),
-            "retained-generation-required",
-        );
+        assert!(matches!(unbound.with_retained_reranker(&model, 1, BUDGET),
+                Err(SearchError::InvalidConfig { field, value, .. })
+                    if field == "native_ann.rerank.source" && value == "retained-generation-required"));
     });
 }
 

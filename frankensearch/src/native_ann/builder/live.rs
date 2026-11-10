@@ -715,8 +715,9 @@ mod tests {
 
     fn assert_refusal(error: SearchError, field: &str) {
         assert!(
-            matches!(error, SearchError::InvalidConfig { field: actual, .. }
-            if actual == field)
+            matches!(&error, SearchError::InvalidConfig { field: actual, .. }
+            if actual == field),
+            "expected {field}, got {error:?}"
         );
     }
 
@@ -833,7 +834,7 @@ mod tests {
             let current = live.install(&cx, &update).await.unwrap();
             assert_refusal(
                 live.install(&cx, &stale).await.unwrap_err(),
-                "live.expected_current",
+                "native_ann.live.expected_current",
             );
             assert!(Arc::ptr_eq(
                 &live.snapshot(&cx).await.unwrap().index,

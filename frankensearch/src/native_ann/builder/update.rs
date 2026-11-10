@@ -2881,10 +2881,16 @@ mod tests {
                 // the explicit completion constructor may disable quality reuse.
                 let mut ordinary = old.begin_update(&cx, &rejected, generation(2)).unwrap();
                 ordinary.builder.quality = Some(TierPlan::new(quality.clone()).unwrap());
-                assert!(matches!(
-                    Box::pin(ordinary.build(&cx)).await,
-                    Err(SearchError::InvalidConfig { field, .. }) if field == "update.source_join"
-                ));
+                let outcome = Box::pin(ordinary.build(&cx)).await;
+                assert!(
+                    matches!(
+                        &outcome,
+                        Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.update.source_join"
+                    ),
+                    "ordinary update must reject missing quality reuse: success={} error={:?}",
+                    outcome.is_ok(),
+                    outcome.as_ref().err()
+                );
                 assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
             });
         }
