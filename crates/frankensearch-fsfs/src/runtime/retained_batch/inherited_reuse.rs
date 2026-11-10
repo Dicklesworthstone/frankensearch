@@ -7,6 +7,9 @@
 //! ordinary retained indexer still decides compatibility, checks source hashes
 //! and admits producers before actually reusing anything. In particular, this
 //! does not hash canonical document text and call it a source-byte witness.
+//! Quality completion additionally projects the exact deferred-to-completed
+//! configuration contract after admission, while retaining those same source
+//! witnesses and historical execution scope.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -303,6 +306,7 @@ pub(super) fn retain_inputs(
     destination: &Path,
     changed: &HashSet<String>,
     source_inputs: &BTreeMap<String, SourceInput>,
+    quality_completed: bool,
 ) -> SearchResult<Option<IndexingCheckpoint>> {
     let Some(mut receipt) = read_receipt(cx, predecessor)? else {
         return Ok(None);
@@ -365,6 +369,24 @@ pub(super) fn retain_inputs(
             "ordinary checkpoint admission refused inherited evidence; next indexing starts cold"
         );
         return Ok(None);
+    }
+    if quality_completed {
+        if let Some((configuration, contract)) =
+            crate::runtime::retained_reuse::completed_quality_reuse_digests(
+                runtime,
+                &receipt.session,
+                receipt.executable_sha256.as_deref(),
+                &receipt.configuration_sha256,
+                receipt.indexing_contract_sha256.as_deref(),
+            )?
+        {
+            receipt.configuration_sha256 = configuration;
+            receipt.indexing_contract_sha256 = Some(contract);
+        }
+        receipt
+            .checkpoint
+            .reason_codes
+            .clone_from(&sentinel.reason_codes);
     }
     retained_search_checkpoint(cx)?;
     let mut encoded = BoundedBytes(Vec::new());

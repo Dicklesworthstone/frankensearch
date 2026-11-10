@@ -51,7 +51,28 @@ pub(super) fn retain_unchanged_inputs(
         destination,
         &HashSet::new(),
         &BTreeMap::new(),
+        false,
     )
+}
+
+/// Quality completion preserves membership and source proofs. Its authenticated
+/// receipt may project only the exact deferred-to-completed policy transition.
+pub(super) fn retain_completed_quality_inputs(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    predecessor: &PublishedGeneration,
+    destination: &Path,
+) -> SearchResult<()> {
+    inherited_reuse::retain_inputs(
+        cx,
+        runtime,
+        predecessor,
+        destination,
+        &HashSet::new(),
+        &BTreeMap::new(),
+        true,
+    )?;
+    Ok(())
 }
 
 /// One ordered document mutation. The last operation for an ID wins.
@@ -937,6 +958,7 @@ impl FsfsRuntime {
             build.path(),
             &changed_ids,
             &source_inputs,
+            false,
         )?;
         if deferred_upserts {
             super::deferred_quality::finish_content_upserts(cx, &candidate, build.path())?;

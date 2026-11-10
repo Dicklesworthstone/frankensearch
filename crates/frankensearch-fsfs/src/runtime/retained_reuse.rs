@@ -315,6 +315,74 @@ fn compatible_receipt(runtime: &FsfsRuntime, receipt: &ReuseReceipt) -> SearchRe
         && receipt.checkpoint.target_root == runtime.resolve_target_root()?.display().to_string())
 }
 
+/// A completed quality tier changes only the deferred-work policy and its
+/// resolved fast-only clamp. The historical source contract must equal the
+/// current one with that policy restored before its receipt can describe the
+/// completed state.
+/// Completion never certifies a new source body, executable, or window plan.
+pub(super) fn completed_quality_reuse_digests(
+    runtime: &FsfsRuntime,
+    session: &str,
+    executable: Option<&str>,
+    configuration: &str,
+    indexing_contract: Option<&str>,
+) -> SearchResult<Option<(String, String)>> {
+    use crate::config::DegradationOverrideMode;
+
+    if !matches!(
+        runtime.config.pressure.degradation_override,
+        DegradationOverrideMode::Auto | DegradationOverrideMode::ForceFull
+    ) || runtime.quality_disabled_by_policy()
+        || runtime.lexical_only_indexing
+    {
+        return Ok(None);
+    }
+    // Preserve the same fail-closed execution rule as ordinary reuse. An
+    // executable upgrade may complete the retained producer-bound work, but
+    // cannot re-attest its historical source pipeline under a new policy.
+    let same_execution = match (executable, execution::fingerprint()) {
+        (Some(expected), Some(actual)) => hex_digest(expected) && expected == actual,
+        (None, None) => session == session_id()?,
+        _ => false,
+    };
+    if !same_execution {
+        return Ok(None);
+    }
+    let mut deferred = runtime.config.clone();
+    deferred.pressure.degradation_override = DegradationOverrideMode::ForceEmbedDeferred;
+    // Directly constructed runtimes defer through the override itself. CLI
+    // resolution additionally clamps search.fast_only=true. Both forms can
+    // own exact deferred inputs; require one whole historical digest pair,
+    // never ignore the field in general or accept an explicit current clamp.
+    for fast_only in [runtime.config.search.fast_only, true] {
+        deferred.search.fast_only = fast_only;
+        if configuration == configuration::digest(&deferred)?
+            && indexing_contract == Some(configuration::contract_digest(&deferred)?.as_str())
+        {
+            return Ok(Some((
+                configuration_digest(runtime)?,
+                indexing_contract_digest(runtime)?,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Carry authenticated source evidence through quality completion without
+/// reading source files. Only the exact deferred-to-completed contract
+/// transition above can change its configuration scope; all source witnesses
+/// and historical execution identity remain unchanged.
+pub(super) async fn retain_completed_quality_inputs(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    predecessor: &PublishedGeneration,
+    destination: &Path,
+) -> SearchResult<()> {
+    execution::prepare(cx).await?;
+    super::retained_batch::retain_completed_quality_inputs(cx, runtime, predecessor, destination)?;
+    Ok(())
+}
+
 impl FsfsRuntime {
     /// Execute the original indexer with an optional independently copied seed.
     /// The outer retained builder still owns model admission, source precommit,

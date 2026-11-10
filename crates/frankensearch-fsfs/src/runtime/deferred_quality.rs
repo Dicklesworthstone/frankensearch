@@ -1294,6 +1294,8 @@ impl FsfsRuntime {
             ));
         }
         drop(resources);
+        retained_reuse::retain_completed_quality_inputs(cx, &candidate, &predecessor, build.path())
+            .await?;
         control.admit_work(cx, "complete_quality.publish").await?;
         admitted.check_current_identity()?;
         let publication = build.publish_with_precommit(
@@ -1624,6 +1626,352 @@ mod tests {
             assert_eq!(phases.last().unwrap().phase, SearchOutputPhase::Refined);
             assert!(!phases.last().unwrap().hits.is_empty());
             assert_eq!(files(next.path()), successor_before);
+        });
+    }
+
+    #[test]
+    fn completed_quality_preserves_source_reuse_across_index_and_watch_startup() {
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("completion-reuse-fast"));
+            let quality = Arc::new(Producer::new("completion-reuse-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let root = directory.path().join("store");
+            let first = durable(
+                runtime(directory.path(), true)
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let before = files(first.path());
+            let original_receipt: serde_json::Value =
+                serde_json::from_slice(&before[Path::new("FSFS-REUSE.json")]).unwrap();
+            let mut resumed = runtime(directory.path(), false);
+            resumed.cli_input.target_path = Some(directory.path().join("source"));
+            let session = original_receipt["session"].as_str().unwrap();
+            let executable = original_receipt["executable_sha256"].as_str();
+            let configuration = original_receipt["configuration_sha256"].as_str().unwrap();
+            let contract = original_receipt["indexing_contract_sha256"].as_str();
+            for (session, executable, configuration, contract) in [
+                ("foreign-session", None, configuration, contract),
+                (
+                    session,
+                    Some("unproven-executable"),
+                    configuration,
+                    contract,
+                ),
+                (session, executable, "foreign-configuration", contract),
+                (session, executable, configuration, None),
+                (session, executable, configuration, Some("foreign-contract")),
+            ] {
+                assert!(
+                    retained_reuse::completed_quality_reuse_digests(
+                        &resumed,
+                        session,
+                        executable,
+                        configuration,
+                        contract,
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            }
+            fast.inputs.lock().unwrap().clear();
+            let completed = resumed
+                .complete_retained_quality(&cx, &root, &first)
+                .await
+                .unwrap();
+            assert_eq!(completed.completed_documents, expected.len());
+            let mut selected = durable(completed.publication);
+            let completed_receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(selected.path().join("FSFS-REUSE.json")).unwrap())
+                    .unwrap();
+            for key in ["session", "executable_sha256"] {
+                assert_eq!(completed_receipt[key], original_receipt[key], "{key}");
+            }
+            assert_eq!(
+                completed_receipt["checkpoint"]["files"], original_receipt["checkpoint"]["files"],
+                "completion must carry exact source witnesses without inventing new ones"
+            );
+            assert_ne!(
+                completed_receipt["configuration_sha256"],
+                original_receipt["configuration_sha256"]
+            );
+            assert_eq!(files(first.path()), before);
+            assert!(fast.inputs.lock().unwrap().is_empty());
+
+            // Both ordinary indexing and watch startup use this retained
+            // rebuild path. Watch mode does not change the indexing contract.
+            for watch in [false, true] {
+                resumed.config.indexing.watch_mode = watch;
+                fast.inputs.lock().unwrap().clear();
+                quality.inputs.lock().unwrap().clear();
+                let preserved = files(selected.path());
+                let previous = selected;
+                selected = durable(
+                    resumed
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                );
+                assert!(fast.inputs.lock().unwrap().is_empty(), "watch={watch}");
+                assert!(quality.inputs.lock().unwrap().is_empty(), "watch={watch}");
+                assert_eq!(files(previous.path()), preserved);
+                for (name, producer) in [
+                    (FSFS_VECTOR_INDEX_FILE, &fast),
+                    (FSFS_VECTOR_QUALITY_INDEX_FILE, &quality),
+                ] {
+                    let index = VectorIndex::open_read_only(&selected.path().join(name)).unwrap();
+                    assert_eq!(index.embedder_revision(), producer.identity.fingerprint());
+                    assert_eq!(
+                        index.live_doc_ids().unwrap(),
+                        expected.keys().cloned().collect()
+                    );
+                    for row in 0..index.record_count() {
+                        assert_eq!(index.vector_at_f32(row).unwrap(), vec![1.0, 0.0, 0.0]);
+                    }
+                }
+            }
+
+            // The preserved receipt remains an admission input, not a bypass
+            // of source checks. Only the edited row must be embedded again.
+            let changed = "sharedtoken changed alpha after quality completion";
+            fs::write(directory.path().join("source/alpha.md"), changed).unwrap();
+            fast.inputs.lock().unwrap().clear();
+            quality.inputs.lock().unwrap().clear();
+            let preserved = files(selected.path());
+            let previous = selected;
+            selected = durable(
+                resumed
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(fast.inputs.lock().unwrap().as_slice(), &[changed]);
+            assert_eq!(quality.inputs.lock().unwrap().as_slice(), &[changed]);
+            assert_eq!(files(previous.path()), preserved);
+
+            // A different indexing window plan must still rebuild both rows.
+            resumed.config.indexing.fast_window_max_per_file += 1;
+            fast.inputs.lock().unwrap().clear();
+            quality.inputs.lock().unwrap().clear();
+            let preserved = files(selected.path());
+            resumed
+                .rebuild_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(fast.inputs.lock().unwrap().len(), expected.len());
+            assert_eq!(quality.inputs.lock().unwrap().len(), expected.len());
+            assert_eq!(files(selected.path()), preserved);
+        });
+    }
+
+    #[test]
+    fn completed_quality_does_not_certify_opaque_upserts_or_configuration_drift() {
+        use super::super::retained_batch::RetainedMutation;
+
+        run(|cx| async move {
+            for changed_configuration in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let expected = source_fixture(directory.path());
+                let fast = Arc::new(Producer::new("completion-scope-fast"));
+                let quality = Arc::new(Producer::new("completion-scope-quality"));
+                let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+                let deferred = runtime(directory.path(), true);
+                let root = directory.path().join("store");
+                let first = durable(
+                    deferred
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                );
+                let first_bytes = files(first.path());
+                let pending = if changed_configuration {
+                    first.clone()
+                } else {
+                    durable(
+                        deferred
+                            .apply_retained_batch(
+                                &cx,
+                                &root,
+                                &first,
+                                &[RetainedMutation::Upsert {
+                                    id: "alpha.md".to_owned(),
+                                    text: "opaque replacement is not the source file".to_owned(),
+                                }],
+                            )
+                            .await
+                            .unwrap()
+                            .publication
+                            .unwrap(),
+                    )
+                };
+                let pending_bytes = files(pending.path());
+                let mut resumed = runtime(directory.path(), false);
+                resumed.cli_input.target_path = Some(directory.path().join("source"));
+                if changed_configuration {
+                    resumed.config.indexing.fast_window_max_per_file += 1;
+                }
+                let completed = durable(
+                    resumed
+                        .complete_retained_quality(&cx, &root, &pending)
+                        .await
+                        .unwrap()
+                        .publication,
+                );
+                let completed_bytes = files(completed.path());
+                let inherited: serde_json::Value =
+                    serde_json::from_slice(&completed_bytes[Path::new("FSFS-REUSE.json")]).unwrap();
+                let historical: serde_json::Value =
+                    serde_json::from_slice(&pending_bytes[Path::new("FSFS-REUSE.json")]).unwrap();
+                assert_eq!(
+                    inherited["checkpoint"]["files"],
+                    historical["checkpoint"]["files"]
+                );
+                if changed_configuration {
+                    assert_eq!(
+                        inherited["configuration_sha256"],
+                        historical["configuration_sha256"]
+                    );
+                    assert_eq!(
+                        inherited["indexing_contract_sha256"],
+                        historical["indexing_contract_sha256"]
+                    );
+                } else {
+                    assert_eq!(
+                        inherited["checkpoint"]["files"]["alpha.md"]["content_hash_hex"],
+                        ""
+                    );
+                    assert_eq!(
+                        inherited["checkpoint"]["files"]["alpha.md"]["semantic_indexed"],
+                        false
+                    );
+                }
+                fast.inputs.lock().unwrap().clear();
+                quality.inputs.lock().unwrap().clear();
+                resumed
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                let expected_inputs = if changed_configuration {
+                    expected.values().cloned().collect::<BTreeSet<_>>()
+                } else {
+                    BTreeSet::from([expected["alpha.md"].clone()])
+                };
+                for producer in [&fast, &quality] {
+                    assert_eq!(
+                        producer
+                            .inputs
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>(),
+                        expected_inputs,
+                    );
+                    assert_eq!(producer.inputs.lock().unwrap().len(), expected_inputs.len());
+                }
+                assert_eq!(files(first.path()), first_bytes);
+                assert_eq!(files(pending.path()), pending_bytes);
+                assert_eq!(files(completed.path()), completed_bytes);
+            }
+        });
+    }
+
+    #[test]
+    fn resolved_deferred_policy_completes_with_reuse_but_explicit_fast_only_refuses() {
+        use std::collections::HashMap;
+
+        use crate::config::{CliOverrides, PressureProfile, load_from_str};
+
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("resolved-completion-fast"));
+            let quality = Arc::new(Producer::new("resolved-completion-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let root = directory.path().join("store");
+            let resolved = |deferred, fast_only| {
+                let requested = runtime(directory.path(), deferred);
+                let mut config = requested.config().clone();
+                config.pressure.profile = PressureProfile::Performance;
+                let text = config.to_toml().unwrap();
+                let loaded = load_from_str(
+                    Some(&text),
+                    None,
+                    &HashMap::<String, String>::new(),
+                    &CliOverrides {
+                        fast_only,
+                        ..CliOverrides::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap();
+                let mut input = requested.cli_input.clone();
+                input.target_path = Some(directory.path().join("source"));
+                FsfsRuntime::new(loaded.config).with_cli_input(input)
+            };
+            let deferred = resolved(true, None);
+            assert!(deferred.config.search.fast_only);
+            assert!(deferred.quality_work_deferred());
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let before = files(first.path());
+            fast.inputs.lock().unwrap().clear();
+            quality.inputs.lock().unwrap().clear();
+
+            // Clearing deferral alone does not authorize quality while an
+            // explicit current fast-only request remains effective.
+            let fast_only = resolved(false, Some(true));
+            assert!(!fast_only.quality_work_deferred());
+            assert!(fast_only.config.search.fast_only);
+            let error = fast_only
+                .complete_retained_quality(&cx, &root, &first)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, .. } if field == "index.complete_quality"
+            ));
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            assert_eq!(files(first.path()), before);
+
+            let resumed = resolved(false, None);
+            assert!(!resumed.config.search.fast_only);
+            let completion = resumed
+                .complete_retained_quality(&cx, &root, &first)
+                .await
+                .unwrap();
+            assert_eq!(completion.completed_documents, expected.len());
+            let completed = durable(completion.publication);
+            let completed_bytes = files(completed.path());
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert_eq!(quality.inputs.lock().unwrap().len(), expected.len());
+            fast.inputs.lock().unwrap().clear();
+            quality.inputs.lock().unwrap().clear();
+            let next = durable(
+                resumed
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            assert_eq!(files(first.path()), before);
+            assert_eq!(files(completed.path()), completed_bytes);
+            assert_eq!(
+                VectorIndex::open_read_only(&next.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE))
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap(),
+                expected.keys().cloned().collect()
+            );
         });
     }
 
