@@ -351,6 +351,7 @@ impl IndexOpenSpec {
 #[derive(Debug, Clone, Copy)]
 struct TierCacheIdentity<'a> {
     tier: &'static str,
+    dimension: Option<usize>,
     embedder: Option<&'a str>,
     revision: Option<&'a str>,
     space: Option<&'a str>,
@@ -361,6 +362,7 @@ impl<'a> TierCacheIdentity<'a> {
     fn fast(index: &'a TwoTierIndex) -> Self {
         Self {
             tier: "fast",
+            dimension: Some(index.fast_dimension()),
             embedder: Some(index.fast_embedder_id()),
             revision: Some(index.fast_embedder_revision()),
             space: index.fast_space_fingerprint_hex(),
@@ -371,6 +373,7 @@ impl<'a> TierCacheIdentity<'a> {
     fn quality(index: &'a TwoTierIndex) -> Self {
         Self {
             tier: "quality",
+            dimension: index.quality_dimension(),
             embedder: index.quality_embedder_id(),
             revision: index.quality_embedder_revision(),
             space: index.quality_space_fingerprint_hex(),
@@ -379,6 +382,19 @@ impl<'a> TierCacheIdentity<'a> {
     }
 
     fn validate_replacement(self, candidate: Self) -> SearchResult<()> {
+        // A cache refresh keeps the caller's query providers. Even an
+        // unidentified legacy tier must preserve the shape they can search;
+        // adding a declared identity does not authorize dimensionality drift.
+        if self.dimension != candidate.dimension {
+            return Err(SearchError::InvalidConfig {
+                field: "index_cache.replace".to_owned(),
+                value: self.tier.to_owned(),
+                reason: format!(
+                    "replacement {} tier dimensionality differs from the retained index",
+                    self.tier
+                ),
+            });
+        }
         if let Some(expected) = self.space
             && candidate.space != Some(expected)
         {
@@ -569,7 +585,8 @@ impl IndexCache {
     /// # Errors
     ///
     /// Rejects changes to retained artifact paths, tier topology, embedding
-    /// spaces, or identity attestation with [`SearchError::InvalidConfig`].
+    /// spaces, per-tier dimensions, or identity attestation with
+    /// [`SearchError::InvalidConfig`].
     /// When both versions of a tier lack a space fingerprint, their model
     /// identifiers and revisions must match, including for the quality tier.
     /// These legacy checks reject obvious drift; they do not attest the old
@@ -1031,6 +1048,8 @@ mod tests {
 
         let index = cache.current();
         assert_eq!(index.doc_count(), 3);
+        assert_eq!(index.fast_dimension(), 4);
+        assert_eq!(index.quality_dimension(), None);
     }
 
     #[test]
@@ -1559,10 +1578,128 @@ mod tests {
     }
 
     #[test]
+    fn legacy_replacements_bind_each_retained_tier_dimension() {
+        for tier in ["fast", "quality"] {
+            let dir = temp_dir("cache-tier-dimensions");
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            write_index(&fast_path, &[("retained", vec![1.0; 3])]);
+            write_index(&quality_path, &[("retained", vec![1.0; 5])]);
+            let cache = IndexCache::open(
+                &dir,
+                TwoTierConfig::default(),
+                Box::new(SentinelFileDetector::new()),
+            )
+            .expect("open differently sized tiers");
+            let retained = cache.current();
+            assert_eq!(retained.fast_dimension(), 3);
+            assert_eq!(retained.quality_dimension(), Some(5));
+            assert!(retained.fast_space_fingerprint_hex().is_none());
+            assert!(retained.quality_space_fingerprint_hex().is_none());
+
+            let (target, changed_dimension) = if tier == "fast" {
+                (&fast_path, 4)
+            } else {
+                (&quality_path, 6)
+            };
+            let staged = dir.join("changed-dimension.fsvi");
+            write_index(&staged, &[("retained", vec![1.0; changed_dimension])]);
+            std::fs::rename(&staged, target).expect("install changed-dimension candidate");
+            let candidate_bytes = std::fs::read(target).expect("candidate bytes");
+            let reopen = || {
+                TwoTierIndex::open(&dir, TwoTierConfig::default())
+                    .expect("open same-label candidate with a changed dimension")
+            };
+            let assert_refused = |error: SearchError| {
+                assert!(is_replace_rejection(&error), "{tier}: {error:?}");
+                assert!(error.to_string().contains("dimensionality"), "{error}");
+                assert!(Arc::ptr_eq(&retained, &cache.current()));
+            };
+            assert_refused(
+                cache
+                    .replace(reopen())
+                    .expect_err("replacement must preserve each tier's dimension"),
+            );
+            assert_refused(
+                cache
+                    .replace_if_current(&retained, reopen())
+                    .expect_err("conditional replacement must preserve each tier's dimension"),
+            );
+            assert_refused(
+                cache
+                    .reload()
+                    .expect_err("reload must preserve each tier's dimension"),
+            );
+
+            // Refusal leaves both retained tiers searchable and does not rewrite
+            // the caller's on-disk candidate to manufacture compatibility.
+            let hits = retained.search_fast(&[1.0; 3], 10).expect("retained fast query");
+            assert_eq!(hits.len(), 1);
+            let scores = retained
+                .quality_scores_for_hits(&[1.0; 5], &hits)
+                .expect("retained quality query");
+            assert_eq!(scores.len(), 1);
+            assert!(scores[0].is_some());
+            assert_eq!(std::fs::read(target).expect("candidate retained"), candidate_bytes);
+        }
+    }
+
+    #[test]
+    fn same_dimension_successors_keep_distinct_fast_and_quality_shapes() {
+        let dir = temp_dir("cache-stable-tier-dimensions");
+        for (name, dimension) in [
+            (VECTOR_INDEX_FAST_FILENAME, 3),
+            (VECTOR_INDEX_QUALITY_FILENAME, 5),
+        ] {
+            write_index(&dir.join(name), &[("retained", vec![1.0; dimension])]);
+        }
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new()),
+        )
+        .expect("open differently sized tiers");
+        let retained = cache.current();
+
+        for (name, dimension) in [
+            (VECTOR_INDEX_FAST_FILENAME, 3),
+            (VECTOR_INDEX_QUALITY_FILENAME, 5),
+        ] {
+            let staged = dir.join(format!("next-{name}"));
+            write_index(
+                &staged,
+                &[
+                    ("retained", vec![1.0; dimension]),
+                    ("new", vec![0.5; dimension]),
+                ],
+            );
+            std::fs::rename(&staged, dir.join(name)).expect("publish same-shape successor");
+        }
+        let candidate =
+            TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open valid successor");
+        assert!(
+            cache
+                .replace_if_current(&retained, candidate)
+                .expect("compatible successor")
+        );
+        assert!(!Arc::ptr_eq(&retained, &cache.current()));
+        assert_eq!(cache.current().doc_count(), 2);
+        cache.reload().expect("reload compatible distinct tier shapes");
+        let reloaded = cache.current();
+        assert_eq!(reloaded.fast_dimension(), 3);
+        assert_eq!(reloaded.quality_dimension(), Some(5));
+        assert_eq!(reloaded.doc_count(), 2);
+        assert_eq!(retained.doc_count(), 1);
+        let old_hits = retained.search_fast(&[1.0; 3], 10).expect("old reader works");
+        assert_eq!(old_hits.len(), 1);
+    }
+
+    #[test]
     fn legacy_identity_enrichment_preserves_the_existing_bootstrap_contract() {
         for tier in ["fast", "quality"] {
             let seed = TierCacheIdentity {
                 tier,
+                dimension: Some(4),
                 embedder: Some("stub-model"),
                 revision: Some(""),
                 space: None,
@@ -1575,6 +1712,15 @@ mod tests {
             };
             seed.validate_replacement(declared)
                 .expect("initial declaration is not legacy revision drift");
+            let changed_dimension = TierCacheIdentity {
+                dimension: Some(8),
+                ..declared
+            };
+            assert!(is_replace_rejection(
+                &seed
+                    .validate_replacement(changed_dimension)
+                    .expect_err("declaring identity cannot change the retained dimension")
+            ));
             let lost_identity = TierCacheIdentity {
                 space: None,
                 ..declared

@@ -2066,6 +2066,21 @@ impl TwoTierIndex {
         self.fast_tier().record_count()
     }
 
+    /// Dimension of the retained fast-tier vectors.
+    #[must_use]
+    pub fn fast_dimension(&self) -> usize {
+        self.fast_tier().dimension()
+    }
+
+    /// Dimension of the retained quality-tier vectors, when loaded.
+    ///
+    /// Each tier has its own embedding space; this need not match
+    /// [`Self::fast_dimension`].
+    #[must_use]
+    pub fn quality_dimension(&self) -> Option<usize> {
+        self.quality_tier().map(VectorIndex::dimension)
+    }
+
     /// Embedder identity recorded in the fast-tier index header.
     #[must_use]
     pub fn fast_embedder_id(&self) -> &str {
