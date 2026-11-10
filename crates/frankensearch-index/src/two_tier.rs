@@ -2066,6 +2066,28 @@ impl TwoTierIndex {
         self.fast_tier().record_count()
     }
 
+    /// Whether the retained fast tier contains main-file rows or active WAL rows.
+    ///
+    /// Tombstoned main-file rows still count. This is a conservative content
+    /// observation from the retained object, not a live-document count or a
+    /// fresh pathname inspection. A tier is an empty bootstrap seed only when
+    /// both its main file and its admitted WAL contain no records.
+    #[must_use]
+    pub fn fast_retains_content(&self) -> bool {
+        let index = self.fast_tier();
+        index.record_count() != 0 || index.wal_record_count() != 0
+    }
+
+    /// Quality-tier counterpart of [`Self::fast_retains_content`].
+    ///
+    /// `None` means that no quality tier is loaded; `Some(false)` means that
+    /// the loaded quality tier retains neither main-file nor active WAL rows.
+    #[must_use]
+    pub fn quality_retains_content(&self) -> Option<bool> {
+        self.quality_tier()
+            .map(|index| index.record_count() != 0 || index.wal_record_count() != 0)
+    }
+
     /// Dimension of the retained fast-tier vectors.
     #[must_use]
     pub fn fast_dimension(&self) -> usize {

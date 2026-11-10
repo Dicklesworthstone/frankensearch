@@ -351,6 +351,7 @@ impl IndexOpenSpec {
 #[derive(Debug, Clone, Copy)]
 struct TierCacheIdentity<'a> {
     tier: &'static str,
+    retains_content: bool,
     dimension: Option<usize>,
     embedder: Option<&'a str>,
     revision: Option<&'a str>,
@@ -362,6 +363,7 @@ impl<'a> TierCacheIdentity<'a> {
     fn fast(index: &'a TwoTierIndex) -> Self {
         Self {
             tier: "fast",
+            retains_content: index.fast_retains_content(),
             dimension: Some(index.fast_dimension()),
             embedder: Some(index.fast_embedder_id()),
             revision: Some(index.fast_embedder_revision()),
@@ -373,6 +375,7 @@ impl<'a> TierCacheIdentity<'a> {
     fn quality(index: &'a TwoTierIndex) -> Self {
         Self {
             tier: "quality",
+            retains_content: index.quality_retains_content().unwrap_or(false),
             dimension: index.quality_dimension(),
             embedder: index.quality_embedder_id(),
             revision: index.quality_embedder_revision(),
@@ -415,8 +418,20 @@ impl<'a> TierCacheIdentity<'a> {
                     .to_owned(),
             });
         }
-        // Preserve the existing identity-enrichment bootstrap contract: an
-        // empty legacy seed can be replaced by its first declared generation.
+        // Only an empty legacy seed may acquire its first space identity. A
+        // fingerprint on a replacement cannot establish which producer wrote
+        // retained unidentified rows, including tombstones and active WAL rows.
+        // Keep the query provider's model label even for the empty bootstrap.
+        if self.space.is_none()
+            && candidate.space.is_some()
+            && (self.retains_content || self.embedder != candidate.embedder)
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "index_cache.replace".to_owned(),
+                value: self.tier.to_owned(),
+                reason: "initial identity declaration requires an empty retained tier and an unchanged model identifier; open a new cache for an explicitly migrated generation".to_owned(),
+            });
+        }
         // When neither object has a space fingerprint, compare BOTH labels on
         // BOTH tiers. Equal labels reject obvious drift but never attest space.
         if self.space.is_none()
@@ -590,7 +605,9 @@ impl IndexCache {
     /// When both versions of a tier lack a space fingerprint, their model
     /// identifiers and revisions must match, including for the quality tier.
     /// These legacy checks reject obvious drift; they do not attest the old
-    /// vectors. Existing identity-enrichment bootstrap behavior is retained.
+    /// vectors. An initial identity declaration is allowed only for an empty
+    /// retained tier with the same model identifier; main-file tombstones and
+    /// active WAL records prevent treating a legacy tier as an empty seed.
     /// Rejection preserves the installed index and in-flight reader snapshots.
     /// Native caches require a cache-owned reload; an arbitrary prebuilt index
     /// does not establish that the retained graph recipe was followed.
@@ -1633,14 +1650,19 @@ mod tests {
 
             // Refusal leaves both retained tiers searchable and does not rewrite
             // the caller's on-disk candidate to manufacture compatibility.
-            let hits = retained.search_fast(&[1.0; 3], 10).expect("retained fast query");
+            let hits = retained
+                .search_fast(&[1.0; 3], 10)
+                .expect("retained fast query");
             assert_eq!(hits.len(), 1);
             let scores = retained
                 .quality_scores_for_hits(&[1.0; 5], &hits)
                 .expect("retained quality query");
             assert_eq!(scores.len(), 1);
             assert!(scores[0].is_some());
-            assert_eq!(std::fs::read(target).expect("candidate retained"), candidate_bytes);
+            assert_eq!(
+                std::fs::read(target).expect("candidate retained"),
+                candidate_bytes
+            );
         }
     }
 
@@ -1684,13 +1706,17 @@ mod tests {
         );
         assert!(!Arc::ptr_eq(&retained, &cache.current()));
         assert_eq!(cache.current().doc_count(), 2);
-        cache.reload().expect("reload compatible distinct tier shapes");
+        cache
+            .reload()
+            .expect("reload compatible distinct tier shapes");
         let reloaded = cache.current();
         assert_eq!(reloaded.fast_dimension(), 3);
         assert_eq!(reloaded.quality_dimension(), Some(5));
         assert_eq!(reloaded.doc_count(), 2);
         assert_eq!(retained.doc_count(), 1);
-        let old_hits = retained.search_fast(&[1.0; 3], 10).expect("old reader works");
+        let old_hits = retained
+            .search_fast(&[1.0; 3], 10)
+            .expect("old reader works");
         assert_eq!(old_hits.len(), 1);
     }
 
@@ -1699,6 +1725,7 @@ mod tests {
         for tier in ["fast", "quality"] {
             let seed = TierCacheIdentity {
                 tier,
+                retains_content: false,
                 dimension: Some(4),
                 embedder: Some("stub-model"),
                 revision: Some(""),

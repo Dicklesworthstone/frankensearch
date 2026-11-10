@@ -70,6 +70,219 @@ fn open(
     .unwrap()
 }
 
+#[derive(Clone, Copy, Debug)]
+enum LegacyContent {
+    Empty,
+    Main,
+    Tombstoned,
+    Wal,
+}
+
+fn legacy_cache(directory: &Path, quality: bool, content: LegacyContent) -> IndexCache {
+    for (is_quality, filename, name, dimension) in [
+        (false, "fast.fsvi", "fast", 2),
+        (true, "quality.fsvi", "quality", 3),
+    ] {
+        let path = directory.join(filename);
+        let mut writer = VectorIndex::create_with_revision(
+            &path,
+            name,
+            "legacy-revision",
+            dimension,
+            Quantization::F32,
+        )
+        .unwrap();
+        let mut vector = vec![0.0; dimension];
+        vector[0] = 1.0;
+        if is_quality == quality
+            && matches!(content, LegacyContent::Main | LegacyContent::Tombstoned)
+        {
+            writer.write_record("legacy", &vector).unwrap();
+        }
+        writer.finish().unwrap();
+        if is_quality == quality {
+            match content {
+                LegacyContent::Tombstoned => {
+                    let mut index = VectorIndex::open(&path).unwrap();
+                    assert!(index.soft_delete("legacy").unwrap());
+                    assert_eq!(index.record_count(), 1);
+                    assert_eq!(index.live_count(), 0);
+                }
+                LegacyContent::Wal => {
+                    let mut index = VectorIndex::open(&path).unwrap();
+                    index.append("legacy", &vector).unwrap();
+                    assert_eq!(index.record_count(), 0);
+                    assert_eq!(index.wal_record_count(), 1);
+                }
+                LegacyContent::Empty | LegacyContent::Main => {}
+            }
+        }
+    }
+    IndexCache::open_with_paths(
+        TwoTierIndexPaths::new(directory.join("fast.fsvi"))
+            .with_quality_index(directory.join("quality.fsvi")),
+        directory,
+        TwoTierConfig::default(),
+        Box::new(SentinelFileDetector::new()),
+    )
+    .unwrap()
+}
+
+/// Preserve this fixture's old vector and WAL bytes at distinct names while
+/// staging the caller's proposed successor at the cache's retained paths.
+fn stage_first_identity(
+    directory: &Path,
+    fast: &FsviV2IdentityBinding,
+    quality: &FsviV2IdentityBinding,
+    ids: &[&str],
+) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut preserved = Vec::new();
+    for (name, binding) in [("fast.fsvi", fast), ("quality.fsvi", quality)] {
+        let path = directory.join(name);
+        let predecessor = path.with_extension("legacy");
+        fs::rename(&path, &predecessor).unwrap();
+        preserved.push((predecessor.clone(), fs::read(&predecessor).unwrap()));
+        let wal = frankensearch_index::wal::wal_path_for(&path);
+        if wal.exists() {
+            let predecessor_wal = wal.with_extension("retained-wal");
+            fs::rename(&wal, &predecessor_wal).unwrap();
+            preserved.push((predecessor_wal.clone(), fs::read(&predecessor_wal).unwrap()));
+        }
+        write(&path, binding, ids, 1);
+        preserved.push((path.clone(), fs::read(&path).unwrap()));
+    }
+    preserved
+}
+
+#[test]
+fn initial_identity_cannot_launder_populated_tombstoned_or_wal_legacy_tiers() {
+    for quality_populated in [false, true] {
+        for content in [
+            LegacyContent::Main,
+            LegacyContent::Tombstoned,
+            LegacyContent::Wal,
+        ] {
+            for empty_candidate in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let cache = legacy_cache(directory.path(), quality_populated, content);
+                let retained = cache.current();
+                assert_eq!(retained.fast_retains_content(), !quality_populated);
+                assert_eq!(retained.quality_retains_content(), Some(quality_populated));
+                let fast = binding("fast", 2, 5, 7);
+                let quality = binding("quality", 3, 5, 7);
+                let ids = if empty_candidate {
+                    &[][..]
+                } else {
+                    &["new"][..]
+                };
+                let preserved = stage_first_identity(directory.path(), &fast, &quality, ids);
+                for conditional in [false, true] {
+                    let candidate = open(&cache, &fast, Some(&quality));
+                    let result = if conditional {
+                        cache.replace_if_current(&retained, candidate).map(|_| ())
+                    } else {
+                        cache.replace(candidate)
+                    };
+                    let error = result.expect_err("unidentified content cannot gain an identity");
+                    let expected_tier = if quality_populated { "quality" } else { "fast" };
+                    assert!(
+                        matches!(error, SearchError::InvalidConfig { ref field, ref value, ref reason }
+                            if field == "index_cache.replace" && value == expected_tier
+                                && reason.contains("initial identity declaration")),
+                        "{content:?}, {expected_tier}, empty={empty_candidate}: {error:?}"
+                    );
+                    assert!(Arc::ptr_eq(&retained, &cache.current()));
+                }
+                for (path, bytes) in preserved {
+                    assert_eq!(fs::read(path).unwrap(), bytes);
+                }
+                // Neither moving the path nor presenting an empty successor can
+                // hide content already retained by the installed snapshot.
+                assert_eq!(retained.fast_retains_content(), !quality_populated);
+                assert_eq!(retained.quality_retains_content(), Some(quality_populated));
+                if !matches!(content, LegacyContent::Tombstoned) {
+                    let vector = if quality_populated {
+                        retained.quality_vector_for_doc_id("legacy").unwrap()
+                    } else {
+                        retained.fast_vector_for_doc_id("legacy").unwrap()
+                    };
+                    assert_eq!(vector.unwrap()[0], 1.0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_legacy_bootstrap_preserves_model_identity_and_remains_reloadable() {
+    for changed_tier in [None, Some("fast"), Some("quality")] {
+        for conditional in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let cache = legacy_cache(directory.path(), false, LegacyContent::Empty);
+            let retained = cache.current();
+            assert!(!retained.fast_retains_content());
+            assert_eq!(retained.quality_retains_content(), Some(false));
+            let fast = binding(
+                if changed_tier == Some("fast") {
+                    "foreign"
+                } else {
+                    "fast"
+                },
+                2,
+                5,
+                7,
+            );
+            let quality = binding(
+                if changed_tier == Some("quality") {
+                    "foreign"
+                } else {
+                    "quality"
+                },
+                3,
+                5,
+                7,
+            );
+            let preserved = stage_first_identity(directory.path(), &fast, &quality, &["new"]);
+            let candidate = open(&cache, &fast, Some(&quality));
+            let result = if conditional {
+                cache.replace_if_current(&retained, candidate).map(|_| ())
+            } else {
+                cache.replace(candidate)
+            };
+            if let Some(tier) = changed_tier {
+                let error = result.expect_err("empty seed cannot change its query provider");
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { ref field, ref value, .. }
+                        if field == "index_cache.replace" && value == tier)
+                );
+                assert!(Arc::ptr_eq(&retained, &cache.current()));
+            } else {
+                result.expect("matching empty seeds may acquire their first identities");
+                assert!(!Arc::ptr_eq(&retained, &cache.current()));
+                cache
+                    .reload()
+                    .expect("retain installed exact bindings on reload");
+                let installed = cache.current();
+                assert_eq!(installed.fast_admitted_binding(), Some(&fast));
+                assert_eq!(installed.quality_admitted_binding(), Some(&quality));
+                assert_eq!(
+                    installed.fast_vector_for_doc_id("new").unwrap(),
+                    Some(vec![0.0, 1.0])
+                );
+                assert_eq!(
+                    installed.quality_vector_for_doc_id("new").unwrap(),
+                    Some(vec![0.0, 1.0, 0.0])
+                );
+                assert!(!retained.fast_retains_content());
+                assert_eq!(retained.quality_retains_content(), Some(false));
+            }
+            for (path, bytes) in preserved {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+}
+
 #[test]
 fn exact_cache_opens_both_tiers_and_reloads_the_retained_bindings() {
     run_test_with_cx(|cx| async move {
