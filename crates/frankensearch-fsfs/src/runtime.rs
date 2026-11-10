@@ -14062,6 +14062,11 @@ impl FsfsRuntime {
         if matches!(mode, SearchExecutionMode::QualityOnly) {
             Self::validate_required_quality_resources(resources)?;
         }
+        // A verified producer can remain unchanged while another writer
+        // publishes a new corpus during artifact revalidation. Recheck after
+        // that potentially expensive work, before a cached phase can escape.
+        Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
+        Self::validate_bound_search_resources(resources, mode)?;
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")
     }
 
@@ -64094,6 +64099,179 @@ mod tests {
                 published, 0,
                 "valid G2 resources must not authorize G1 cached scores"
             );
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    struct CacheGenerationPublishingEmbedder {
+        target: PathBuf,
+        successor: PathBuf,
+        publish: AtomicBool,
+        cancel: Option<Cx>,
+        inference_calls: AtomicUsize,
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    impl CacheGenerationPublishingEmbedder {
+        fn new(root: &Path, cancel: Option<Cx>) -> Self {
+            let successor = root.join("successor.fsvi");
+            let mut writer = VectorIndex::create_with_revision(
+                &successor,
+                "blend-fast-2",
+                &test_identity("blend-fast-2", 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer.write_record("successor.rs", &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            Self {
+                target: root.join(super::FSFS_VECTOR_INDEX_FILE),
+                successor,
+                publish: AtomicBool::new(false),
+                cancel,
+                inference_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    impl Embedder for CacheGenerationPublishingEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.inference_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![1.0, 0.0]) })
+        }
+
+        fn identity(&self) -> super::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+            if self.publish.swap(false, Ordering::SeqCst) {
+                fs::rename(&self.successor, &self.target)?;
+                if let Some(cx) = &self.cancel {
+                    cx.set_cancel_requested(true);
+                }
+            }
+            Ok(test_identity("blend-fast-2", 2))
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn id(&self) -> &'static str {
+            "blend-fast-2"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Cache Generation Publication Fixture"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn persistent_cache_rechecks_generation_after_producer_verification() {
+        run_on_runtime_task(|cx| async move {
+            for mode in [SearchExecutionMode::FastOnly, SearchExecutionMode::Full] {
+                for (after_sink, cancel) in [(false, false), (true, false), (false, true)] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let mut resources = published_blend_resources(temp.path());
+                    let producer = Arc::new(CacheGenerationPublishingEmbedder::new(
+                        temp.path(),
+                        cancel.then(|| cx.clone()),
+                    ));
+                    resources.vector_index = Some(Arc::new(
+                        VectorIndex::open_read_only(&producer.target).unwrap(),
+                    ));
+                    resources.fast_embedder = Some(admitted_shared(&producer));
+                    let runtime = FsfsRuntime::new(FsfsConfig::default());
+                    let payloads = vec![
+                        SearchPayload::new(
+                            "cached generation",
+                            SearchOutputPhase::Initial,
+                            1,
+                            vec![SearchHitPayload {
+                                rank: 1,
+                                path: "a.rs".to_owned(),
+                                line: None,
+                                score: 1.0,
+                                snippet: None,
+                                lexical_rank: None,
+                                semantic_rank: Some(0),
+                                hash_rank: None,
+                                in_both_sources: false,
+                            }],
+                        )
+                        .with_vector_generation("blend-fast-2", false),
+                    ];
+                    let generation = resources.generation_fingerprint.clone();
+                    assert_eq!(
+                        runtime
+                            .replay_cached_search_payloads(
+                                &cx,
+                                &mut resources,
+                                mode,
+                                &generation,
+                                &payloads,
+                                None,
+                            )
+                            .await
+                            .unwrap(),
+                        payloads
+                    );
+
+                    // Publish a compatible successor from the producer check,
+                    // after the early generation fence. Arming in the sink
+                    // instead targets the final check after an admitted phase.
+                    producer.publish.store(!after_sink, Ordering::SeqCst);
+                    let mut published = 0;
+                    let result = runtime
+                        .replay_cached_search_payloads(
+                            &cx,
+                            &mut resources,
+                            mode,
+                            &generation,
+                            &payloads,
+                            Some(&mut |phase| {
+                                assert_eq!(phase, &payloads[0]);
+                                published += 1;
+                                producer.publish.store(after_sink, Ordering::SeqCst);
+                                Ok(())
+                            }),
+                        )
+                        .await;
+                    cx.set_cancel_requested(false);
+                    let error = result.unwrap_err();
+                    if cancel {
+                        assert!(matches!(error, SearchError::Cancelled { .. }));
+                    } else {
+                        assert!(matches!(error,
+                            SearchError::InvalidConfig { field, .. } if field == "index.generation"
+                        ));
+                    }
+                    assert_eq!(published, usize::from(after_sink));
+                    assert_ne!(
+                        FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap(),
+                        generation
+                    );
+                    let successor = VectorIndex::open_read_only(&producer.target).unwrap();
+                    assert_eq!(successor.record_count(), 1);
+                    assert_eq!(successor.doc_id_at(0).unwrap(), "successor.rs");
+                    assert_eq!(
+                        successor.embedder_revision(),
+                        producer.identity().unwrap().fingerprint()
+                    );
+                    let retained = resources.vector_index.as_ref().unwrap();
+                    assert_eq!(retained.doc_id_at(0).unwrap(), "a.rs");
+                    assert_eq!(retained.vector_at_f32(0).unwrap(), [1.0, 0.0]);
+                    assert_eq!(producer.inference_calls.load(Ordering::SeqCst), 0);
+                }
+            }
         });
     }
 
