@@ -652,7 +652,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v19: checked canonical quality selection; disabled tiers have no producer.
 // v20: explicit ranking-prior policy separates cached result orders.
 // v21: exact JSON number parsing; older cache hops could change score bits.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v21";
+// v22: registered reranker inputs and execution policy bind reranked answers.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v22";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -670,8 +671,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v16 / stream v14: require and attest the independent quality-only primary.
 // v17 / stream v15: carry and attest explicit code-navigation ranking priors.
 // v18 / stream v16: exact JSON score transport and cache parsing.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v18";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v16";
+// v19 / stream v17: registered reranking cannot load unverified shadow weights.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v19";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v17";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -1783,6 +1785,10 @@ struct SearchCacheKey {
     /// be served to a request that finds a different one, or none.
     #[serde(default)]
     rerank_model: Option<String>,
+    /// Exact registered artifacts and native execution policy. A same-name
+    /// reranker revision cannot reuse another producer's scores.
+    #[serde(default)]
+    rerank_contract: Option<String>,
 }
 
 /// Check the response consumer without reading request bytes or writing a
@@ -13841,7 +13847,23 @@ impl FsfsRuntime {
             } else {
                 None
             },
+            rerank_contract: self.registered_reranker_cache_contract()?,
         })
+    }
+
+    #[cfg_attr(not(feature = "rerank"), allow(clippy::unnecessary_wraps))]
+    fn registered_reranker_cache_contract(&self) -> SearchResult<Option<String>> {
+        if !self.reranking_enabled_by_policy() {
+            return Ok(None);
+        }
+        #[cfg(feature = "rerank")]
+        {
+            frankensearch_rerank::NativeReranker::registered_cache_contract().map(Some)
+        }
+        #[cfg(not(feature = "rerank"))]
+        {
+            Ok(None)
+        }
     }
 
     #[must_use]
@@ -13865,6 +13887,8 @@ impl FsfsRuntime {
         hasher.update(key.rerank_timeout_ms.to_le_bytes());
         hasher.update([u8::from(key.rerank)]);
         hasher.update(key.rerank_model.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+        hasher.update(key.rerank_contract.as_deref().unwrap_or("").as_bytes());
         sha256_digest_hex(hasher.finalize())
     }
 
@@ -23993,8 +24017,8 @@ impl FsfsRuntime {
                 source: "native reranking requires a caller-owned blocking pool; use FsfsRuntime::with_native_blocking_pool".into(),
             }
         })?;
-        let reranker =
-            frankensearch_rerank::NativeReranker::load(&inspection.path)?.with_blocking_pool(pool);
+        let reranker = frankensearch_rerank::NativeReranker::load_registered(&inspection.path)?
+            .with_blocking_pool(pool);
         Ok(Some(Arc::new(reranker)))
     }
 
@@ -42949,7 +42973,10 @@ mod tests {
     #[test]
     #[cfg(feature = "rerank")]
     #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    #[allow(clippy::too_many_lines)]
     fn cold_reranker_fixture_retry_preserves_each_query_model_and_cache_key() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
         let scheduler = RuntimeBuilder::current_thread()
             .blocking_threads(0, 1)
             .build()
@@ -42975,13 +43002,16 @@ mod tests {
 
             // Provision actual registered bytes into this test's private cache.
             let source = PathBuf::from(std::env::var("FRANKENSEARCH_RERANK_MODEL_DIR").unwrap());
-            let installed = private_cache.join(source.file_name().unwrap());
+            let manifest = ModelManifest::ms_marco_reranker();
+            let installed = private_cache.join(FsfsRuntime::manifest_install_dir_name(&manifest));
             fs::create_dir_all(&installed).unwrap();
-            for file in ModelManifest::ms_marco_reranker().files {
+            for file in &manifest.files {
                 let destination = installed.join(&file.name);
                 fs::create_dir_all(destination.parent().unwrap()).unwrap();
                 fs::copy(source.join(&file.name), destination).unwrap();
             }
+            frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &installed)
+                .unwrap();
             let mut available = runtime.clone();
             available.prepare_search_reranker(&cx).await.unwrap();
             let retained = runtime.reranker.get().unwrap().0.as_ref().unwrap();
@@ -43003,6 +43033,174 @@ mod tests {
                     .search_cache_key("recover network", 10, SearchExecutionMode::Full)
                     .unwrap(),
                 absent_key
+            );
+
+            // Cache actual native cross-encoder evidence. A fresh request must
+            // not replay those scores after its installation becomes ambiguous,
+            // missing, or changed, even if the old model ID and receipt remain.
+            let stage = super::StageDirective {
+                enabled: true,
+                candidate_budget: 2,
+                timeout_ms: 30_000,
+                reason_code: "query.stage.rerank.enabled",
+            };
+            let scored = available
+                .apply_rerank_stage(
+                    &cx,
+                    Some(retained.as_ref()),
+                    &stage,
+                    temp.path(),
+                    "recover network",
+                    rerank_deadline_documents(temp.path()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(scored.payload.status, RerankStageStatus::Applied);
+            assert_eq!(scored.payload.reranked_hits, 2);
+            let mut answer = FsfsRuntime::build_limited_payload(
+                super::QueryExecutionOrchestrator::new(super::QueryFusionPolicy {
+                    rrf_k: runtime.config.search.rrf_k,
+                }),
+                "recover network",
+                SearchOutputPhase::Refined,
+                &scored.fused,
+                &scored.fused,
+                &HashMap::new(),
+                10,
+                false,
+            );
+            assert_eq!(answer.returned_hits, 2);
+            answer.rerank = Some(scored.payload);
+            let fingerprint = "registered-reranker-fixture";
+            available
+                .write_search_payload_cache(&available_key, &[answer.clone()], fingerprint)
+                .unwrap();
+            let cache_path = available.search_cache_path(&available_key).unwrap();
+            let cache_bytes = fs::read(&cache_path).unwrap();
+            let tokenizer = installed.join("tokenizer.json");
+            let tokenizer_bytes = fs::read(&tokenizer).unwrap();
+            let tokenizer_mtime = fs::metadata(&tokenizer).unwrap().modified().unwrap();
+            let shadow = installed.join("model_f32.safetensors");
+            let retained_install = temp.path().join("retained-reranker-install");
+            for mutation in ["shadow", "missing", "tokenizer"] {
+                match mutation {
+                    "shadow" => {
+                        fs::copy(installed.join("model.safetensors"), &shadow).unwrap();
+                        let mut weights = fs::File::options()
+                            .read(true)
+                            .write(true)
+                            .open(&shadow)
+                            .unwrap();
+                        let mut header_size = [0; 8];
+                        weights.read_exact(&mut header_size).unwrap();
+                        let header_size = u64::from_le_bytes(header_size);
+                        let mut header = vec![0; usize::try_from(header_size).unwrap()];
+                        weights.read_exact(&mut header).unwrap();
+                        let header: serde_json::Value = serde_json::from_slice(&header).unwrap();
+                        let bias = &header["classifier.bias"];
+                        assert_eq!(bias["dtype"], "F32");
+                        let offset = 8 + header_size + bias["data_offsets"][0].as_u64().unwrap();
+                        weights.seek(SeekFrom::Start(offset)).unwrap();
+                        let mut original_bias = [0; 4];
+                        weights.read_exact(&mut original_bias).unwrap();
+                        let changed_bias = f32::from_le_bytes(original_bias) + 1.0;
+                        assert!(changed_bias.is_finite());
+                        weights.seek(SeekFrom::Start(offset)).unwrap();
+                        weights.write_all(&changed_bias.to_le_bytes()).unwrap();
+                        weights.sync_all().unwrap();
+                        drop(weights);
+                        assert!(frankensearch_embed::model_manifest::is_verification_cached(
+                            &manifest, &installed
+                        ));
+                        // This is a valid alternative producer, not corrupt
+                        // bytes the old generic loader would also reject.
+                        let custom = frankensearch_rerank::NativeReranker::load(&installed)
+                            .unwrap()
+                            .with_blocking_pool(scheduler.blocking_handle().unwrap());
+                        let documents = available
+                            .rerank_documents(&cx, temp.path(), "recover network", &scored.fused)
+                            .await
+                            .unwrap();
+                        let changed = frankensearch_core::Reranker::rerank(
+                            &custom,
+                            &cx,
+                            "recover network",
+                            &documents,
+                        )
+                        .await
+                        .unwrap();
+                        assert!(changed.iter().any(|score| {
+                            answer
+                                .rerank
+                                .as_ref()
+                                .unwrap()
+                                .scores
+                                .iter()
+                                .any(|original| {
+                                    original.path == score.doc_id
+                                        && original.logit.map(f32::to_bits)
+                                            != score.raw_logit.map(f32::to_bits)
+                                })
+                        }));
+                    }
+                    "missing" => fs::rename(&installed, &retained_install).unwrap(),
+                    "tokenizer" => {
+                        let mut changed = tokenizer_bytes.clone();
+                        *changed.last_mut().unwrap() ^= 1;
+                        fs::write(&tokenizer, changed).unwrap();
+                        fs::File::open(&tokenizer)
+                            .unwrap()
+                            .set_modified(tokenizer_mtime)
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    frankensearch_rerank::NativeReranker::load_registered(&installed).is_err(),
+                    "registered producer must refuse {mutation}"
+                );
+                let mut fresh = FsfsRuntime::new(runtime.config.clone())
+                    .with_native_blocking_pool(scheduler.blocking_handle().unwrap());
+                fresh.prepare_search_reranker(&cx).await.unwrap();
+                let unavailable_key = fresh
+                    .search_cache_key("recover network", 10, SearchExecutionMode::Full)
+                    .unwrap();
+                assert!(unavailable_key.rerank_model.is_none(), "{mutation}");
+                assert_eq!(
+                    unavailable_key.rerank_contract,
+                    available_key.rerank_contract
+                );
+                assert!(
+                    fresh
+                        .try_load_search_payload_cache(&unavailable_key, fingerprint)
+                        .unwrap()
+                        .is_none(),
+                    "{mutation} must not replay the previously reranked answer"
+                );
+                assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+                match mutation {
+                    "shadow" => {
+                        fs::rename(&shadow, temp.path().join("rejected-shadow-weights")).unwrap();
+                    }
+                    "missing" => fs::rename(&retained_install, &installed).unwrap(),
+                    "tokenizer" => fs::write(&tokenizer, &tokenizer_bytes).unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &installed)
+                .unwrap();
+            let mut restored = FsfsRuntime::new(runtime.config.clone())
+                .with_native_blocking_pool(scheduler.blocking_handle().unwrap());
+            restored.prepare_search_reranker(&cx).await.unwrap();
+            let restored_key = restored
+                .search_cache_key("recover network", 10, SearchExecutionMode::Full)
+                .unwrap();
+            assert_eq!(restored_key, available_key);
+            assert_eq!(
+                restored
+                    .try_load_search_payload_cache(&restored_key, fingerprint)
+                    .unwrap(),
+                Some(vec![answer])
             );
         });
         assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
@@ -43692,6 +43890,64 @@ mod tests {
     #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
     fn rerank_deadline_fixture_cancelled_file_read_drains_and_retries() {
         rerank_deadline_blocked_file(true);
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    fn reranker_contract_is_request_scoped_and_invalidates_prior_cached_scores() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = temp.path().display().to_string();
+        let plain = FsfsRuntime::new(config.clone());
+        let mode = SearchExecutionMode::Full;
+        let plain_key = plain.search_cache_key("recover network", 2, mode).unwrap();
+        assert!(plain_key.rerank_contract.is_none());
+        config.search.rerank = true;
+        let runtime = FsfsRuntime::new(config);
+        let key = runtime
+            .search_cache_key("recover network", 2, mode)
+            .unwrap();
+        assert_eq!(
+            key.rerank_contract,
+            Some(frankensearch_rerank::NativeReranker::registered_cache_contract().unwrap())
+        );
+        assert_eq!(key.embedding_contracts, plain_key.embedding_contracts);
+        let payloads = vec![SearchPayload::new(
+            "recover network",
+            SearchOutputPhase::Refined,
+            0,
+            Vec::new(),
+        )];
+        let fingerprint = "same-retained-generation";
+        runtime
+            .write_search_payload_cache(&key, &payloads, fingerprint)
+            .unwrap();
+        let hot = HashMap::from([(key.clone(), payloads.clone())]);
+        let mut changed = key.clone();
+        changed.rerank_contract = Some("changed-same-id-reranker-contract".to_owned());
+        assert_eq!(changed.rerank_model, key.rerank_model);
+        assert!(!hot.contains_key(&changed));
+        assert_ne!(
+            runtime.search_cache_path(&changed).unwrap(),
+            runtime.search_cache_path(&key).unwrap()
+        );
+        assert!(
+            runtime
+                .try_load_search_payload_cache(&changed, fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        let path = runtime.search_cache_path(&key).unwrap();
+        let mut old: SearchCacheRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        old.schema_version = "fsfs.search.cache.v21".to_owned();
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(
+            runtime
+                .try_load_search_payload_cache(&key, fingerprint)
+                .unwrap()
+                .is_none(),
+            "old answers may have been scored by unverified preferred weights"
+        );
     }
 
     #[test]

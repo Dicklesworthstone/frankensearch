@@ -52,7 +52,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 16: explicit ranking-prior policy travels with every request and cache key.
 // 17: exact JSON score parsing, including replies loaded from a cache.
 // 18: client-owned expansion exchange over one retained daemon request.
-const VERSION: u32 = 18;
+// 19: registered reranking cannot load unverified shadow weights.
+const VERSION: u32 = 19;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]

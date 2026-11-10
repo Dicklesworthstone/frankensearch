@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -206,6 +207,9 @@ const MAX_BATCH_TOKENS: usize = 2048;
 /// bmm — obsolete since the raw attention became a gemm.)
 const FUSED_ATTN_MAX_SEQ: usize = DEFAULT_MAX_LENGTH;
 const MODEL_NAME: &str = "ms-marco-minilm-l-6-v2";
+/// Bump when the registered tokenizer, numerical, or scoring policy changes.
+const REGISTERED_RERANKER_EXECUTION_REVISION: &str =
+    "frankentorch-ms-marco-minilm-int8-f32-longest-first-cls-sigmoid-v1";
 pub(crate) const SAFETENSORS_PRIMARY: &str = "model_f32.safetensors";
 pub(crate) const SAFETENSORS_FALLBACK: &str = "model.safetensors";
 pub(crate) const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -215,6 +219,114 @@ fn rerank_err(ctx: &str, e: impl std::fmt::Display) -> SearchError {
         model: MODEL_NAME.to_owned(),
         source: format!("{ctx}: {e}").into(),
     }
+}
+
+fn reject_unregistered_reranker_weights(model_dir: &Path) -> SearchResult<()> {
+    let shadow = model_dir.join(SAFETENSORS_PRIMARY);
+    match fs::symlink_metadata(&shadow) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SearchError::ModelLoadFailed {
+            path: shadow,
+            source: error.into(),
+        }),
+        Ok(_) => Err(SearchError::ModelLoadFailed {
+            path: shadow,
+            source: "unregistered preferred weights cannot replace the pinned MS MARCO producer"
+                .into(),
+        }),
+    }
+}
+
+fn read_registered_reranker_artifact(
+    model_dir: &Path,
+    artifact: &frankensearch_embed::model_manifest::ModelFile,
+) -> SearchResult<Vec<u8>> {
+    let path = model_dir.join(&artifact.name);
+    let failure = |error: std::io::Error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SearchError::ModelNotFound {
+                name: format!("missing registered reranker artifact: {}", artifact.name),
+            }
+        } else {
+            SearchError::ModelLoadFailed {
+                path: path.clone(),
+                source: error.into(),
+            }
+        }
+    };
+    let metadata = fs::symlink_metadata(&path).map_err(failure)?;
+    if !metadata.file_type().is_file() {
+        return Err(SearchError::ModelLoadFailed {
+            path,
+            source:
+                "registered reranker artifact must be a regular file, not a symlink or special node"
+                    .into(),
+        });
+    }
+    if metadata.len() != artifact.size {
+        return Err(SearchError::HashMismatch {
+            path,
+            expected: format!("{} bytes", artifact.size),
+            actual: format!("{} bytes", metadata.len()),
+        });
+    }
+    let read_limit = artifact
+        .size
+        .checked_add(1)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "reranker.artifact_size".to_owned(),
+            value: artifact.name.clone(),
+            reason: "registered artifact size exceeds the bounded reader".to_owned(),
+        })?;
+    let capacity = usize::try_from(read_limit).map_err(|_| SearchError::InvalidConfig {
+        field: "reranker.artifact_size".to_owned(),
+        value: artifact.name.clone(),
+        reason: "registered artifact size exceeds the addressable buffer".to_owned(),
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    fs::File::open(&path)
+        .map_err(failure)?
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(failure)?;
+    let actual = frankensearch_core::sha256_checksum(&bytes);
+    let expected = format!("sha256:{}", artifact.sha256);
+    if u64::try_from(bytes.len()).ok() != Some(artifact.size) || actual != expected {
+        return Err(SearchError::HashMismatch {
+            path,
+            expected: format!("{} bytes / {expected}", artifact.size),
+            actual: format!("{} bytes / {actual}", bytes.len()),
+        });
+    }
+    Ok(bytes)
+}
+
+fn registered_reranker_cache_contract(
+    manifest: &frankensearch_embed::model_manifest::ModelManifest,
+    execution_revision: &str,
+) -> SearchResult<String> {
+    manifest.validate()?;
+    if !manifest.is_production_ready() || execution_revision.is_empty() {
+        return Err(SearchError::InvalidConfig {
+            field: "reranker.manifest".to_owned(),
+            value: manifest.id.clone(),
+            reason: "registered reranker cache identity requires pinned artifact checksums and an execution revision"
+                .to_owned(),
+        });
+    }
+    let bytes = serde_json::to_vec(&(
+        manifest,
+        execution_revision,
+        env!("CARGO_PKG_VERSION"),
+        DEFAULT_MAX_LENGTH,
+        RERANKER_LAYERS,
+    ))
+    .map_err(|error| SearchError::InvalidConfig {
+        field: "reranker.cache_contract".to_owned(),
+        value: manifest.id.clone(),
+        reason: format!("cannot encode registered reranker contract: {error}"),
+    })?;
+    Ok(frankensearch_core::sha256_checksum(&bytes))
 }
 
 fn index_to_i64(index: usize, ctx: &str) -> SearchResult<i64> {
@@ -1814,8 +1926,12 @@ impl std::fmt::Debug for NativeReranker {
 }
 
 impl NativeReranker {
-    /// Load the reranker from a model directory containing a safetensors weight file
+    /// Load an explicitly chosen custom model directory containing a safetensors weight file
     /// (`model_f32.safetensors` preferred, else `model.safetensors`) and `tokenizer.json`.
+    ///
+    /// This generic loader does not establish registered artifact provenance.
+    /// Applications selecting the pinned MS MARCO producer must use
+    /// [`Self::load_registered`], which verifies the exact bytes it consumes.
     ///
     /// # Errors
     /// `SearchError::ModelNotFound` when required files are missing;
@@ -1832,21 +1948,11 @@ impl NativeReranker {
                 ),
             });
         }
-        let mut tokenizer =
+        let tokenizer =
             Tokenizer::from_file(&tok_path).map_err(|e| SearchError::ModelLoadFailed {
                 path: tok_path.clone(),
                 source: format!("tokenizer load failed: {e}").into(),
             })?;
-        tokenizer
-            .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: DEFAULT_MAX_LENGTH,
-                ..Default::default()
-            }))
-            .map_err(|e| SearchError::ModelLoadFailed {
-                path: tok_path.clone(),
-                source: format!("failed to enable truncation: {e}").into(),
-            })?;
-
         let weights_path = {
             let primary = dir.join(SAFETENSORS_PRIMARY);
             if primary.is_file() {
@@ -1869,9 +1975,89 @@ impl NativeReranker {
         // cores. No pool is needed (and one session keeps the f32 embedding table
         // resident only once, ~47 MB instead of per-slot copies).
         let shared = parse_weights(&weights_path, LinearPrecision::Int8)?;
+        Self::from_artifacts(dir, &weights_path, tokenizer, shared)
+    }
+
+    /// Load the pinned MS MARCO producer from its registered installation.
+    ///
+    /// The tokenizer and `model.safetensors` are read once into owned buffers,
+    /// checked against the registered size and SHA-256, and parsed from those
+    /// same bytes. A receipt for another path or a later file replacement cannot
+    /// authorize different inference inputs. An unregistered preferred weight
+    /// file is an ambiguous installation and is rejected, even with a valid receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registered verifier's typed error for unavailable or changed
+    /// artifacts, or `ModelLoadFailed` for ambiguous layouts or invalid model data.
+    pub fn load_registered(model_dir: impl AsRef<Path>) -> SearchResult<Self> {
+        use frankensearch_embed::model_manifest::{ModelManifest, verify_dir_cached};
+
+        let dir = model_dir.as_ref();
+        reject_unregistered_reranker_weights(dir)?;
+        let manifest = ModelManifest::ms_marco_reranker();
+        verify_dir_cached(&manifest, dir)?;
+        let read_artifact = |name: &str| {
+            let file = manifest
+                .files
+                .iter()
+                .find(|file| file.name == name)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "reranker.manifest".to_owned(),
+                    value: name.to_owned(),
+                    reason: "registered reranker input is missing from its manifest".to_owned(),
+                })?;
+            read_registered_reranker_artifact(dir, file)
+        };
+        let tokenizer_bytes = read_artifact(TOKENIZER_JSON)?;
+        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes).map_err(|error| {
+            SearchError::ModelLoadFailed {
+                path: dir.join(TOKENIZER_JSON),
+                source: format!("registered tokenizer load failed: {error}").into(),
+            }
+        })?;
+        drop(tokenizer_bytes);
+        let weights = read_artifact(SAFETENSORS_FALLBACK)?;
+        let weights_path = dir.join(SAFETENSORS_FALLBACK);
+        let shared = parse_weight_bytes(&weights_path, weights, LinearPrecision::Int8)?;
+        reject_unregistered_reranker_weights(dir)?;
+        Self::from_artifacts(dir, &weights_path, tokenizer, shared)
+    }
+
+    /// Fingerprint of the registered artifacts and the native scoring policy.
+    ///
+    /// Answer caches use this alongside the selected model ID. The operation
+    /// performs no model I/O or initialization and does not attest availability.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the registered manifest cannot be validated
+    /// or serialized.
+    pub fn registered_cache_contract() -> SearchResult<String> {
+        registered_reranker_cache_contract(
+            &frankensearch_embed::model_manifest::ModelManifest::ms_marco_reranker(),
+            REGISTERED_RERANKER_EXECUTION_REVISION,
+        )
+    }
+
+    fn from_artifacts(
+        dir: &Path,
+        weights_path: &Path,
+        mut tokenizer: Tokenizer,
+        shared: SharedWeights,
+    ) -> SearchResult<Self> {
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: DEFAULT_MAX_LENGTH,
+                ..Default::default()
+            }))
+            .map_err(|error| SearchError::ModelLoadFailed {
+                path: dir.join(TOKENIZER_JSON),
+                source: format!("failed to enable truncation: {error}").into(),
+            })?;
         if shared.encoder_layers != RERANKER_LAYERS {
             return Err(SearchError::ModelLoadFailed {
-                path: weights_path,
+                path: weights_path.to_path_buf(),
                 source: format!(
                     "reranker weights contain {} encoder layers, expected {RERANKER_LAYERS}",
                     shared.encoder_layers
@@ -2036,6 +2222,14 @@ pub(crate) fn parse_weights(
         path: path.to_path_buf(),
         source: format!("read safetensors: {e}").into(),
     })?;
+    parse_weight_bytes(path, bytes, precision)
+}
+
+fn parse_weight_bytes(
+    path: &Path,
+    bytes: Vec<u8>,
+    precision: LinearPrecision,
+) -> SearchResult<SharedWeights> {
     if bytes.len() < 8 {
         return Err(SearchError::ModelLoadFailed {
             path: path.to_path_buf(),
@@ -2482,6 +2676,158 @@ impl frankensearch_core::traits::Reranker for NativeReranker {
 mod tests {
     use super::*;
 
+    #[test]
+    fn registered_artifact_reader_rejects_changed_bytes_even_with_restored_mtime() {
+        use frankensearch_embed::model_manifest::ModelFile;
+
+        for name in [TOKENIZER_JSON, SAFETENSORS_FALLBACK] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(name);
+            let original = b"registered artifact bytes";
+            fs::write(&path, original).unwrap();
+            let original_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+            let artifact = ModelFile {
+                name: name.to_owned(),
+                sha256: frankensearch_core::sha256_checksum(original)
+                    .strip_prefix("sha256:")
+                    .unwrap()
+                    .to_owned(),
+                size: u64::try_from(original.len()).unwrap(),
+                url: None,
+            };
+            assert_eq!(
+                read_registered_reranker_artifact(temp.path(), &artifact).unwrap(),
+                original
+            );
+            let mut changed = original.to_vec();
+            changed[0] ^= 1;
+            for bytes in [changed, original[..original.len() - 1].to_vec(), {
+                let mut longer = original.to_vec();
+                longer.push(0);
+                longer
+            }] {
+                fs::write(&path, bytes).unwrap();
+                fs::File::open(&path)
+                    .unwrap()
+                    .set_modified(original_mtime)
+                    .unwrap();
+                assert!(matches!(
+                    read_registered_reranker_artifact(temp.path(), &artifact),
+                    Err(SearchError::HashMismatch { .. })
+                ));
+            }
+            fs::write(&path, original).unwrap();
+            assert_eq!(
+                read_registered_reranker_artifact(temp.path(), &artifact).unwrap(),
+                original
+            );
+            fs::rename(&path, temp.path().join("retained-original")).unwrap();
+            assert!(matches!(
+                read_registered_reranker_artifact(temp.path(), &artifact),
+                Err(SearchError::ModelNotFound { .. })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_artifact_reader_rejects_symlinks_to_matching_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = b"registered artifact bytes";
+        let retained = temp.path().join("retained-original");
+        fs::write(&retained, original).unwrap();
+        for name in [TOKENIZER_JSON, SAFETENSORS_FALLBACK] {
+            std::os::unix::fs::symlink(&retained, temp.path().join(name)).unwrap();
+            let artifact = frankensearch_embed::model_manifest::ModelFile {
+                name: name.to_owned(),
+                sha256: frankensearch_core::sha256_checksum(original)[7..].to_owned(),
+                size: u64::try_from(original.len()).unwrap(),
+                url: None,
+            };
+            assert!(matches!(
+                read_registered_reranker_artifact(temp.path(), &artifact),
+                Err(SearchError::ModelLoadFailed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn registered_loader_rejects_preferred_shadow_weights_before_construction() {
+        for directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let shadow = temp.path().join(SAFETENSORS_PRIMARY);
+            if directory {
+                fs::create_dir(&shadow).unwrap();
+            } else {
+                fs::write(&shadow, b"unregistered preferred weights").unwrap();
+            }
+            let error = NativeReranker::load_registered(temp.path()).unwrap_err();
+            assert!(
+                matches!(error, SearchError::ModelLoadFailed { ref path, .. }
+                if path == &shadow)
+            );
+            assert!(error.to_string().contains("unregistered preferred weights"));
+        }
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let shadow = temp.path().join(SAFETENSORS_PRIMARY);
+            std::os::unix::fs::symlink("missing-shadow-target", &shadow).unwrap();
+            let error = NativeReranker::load_registered(temp.path()).unwrap_err();
+            assert!(
+                matches!(error, SearchError::ModelLoadFailed { ref path, .. }
+                if path == &shadow)
+            );
+        }
+    }
+
+    #[test]
+    fn registered_cache_contract_invalidates_same_id_artifact_and_execution_changes() {
+        let manifest = frankensearch_embed::model_manifest::ModelManifest::ms_marco_reranker();
+        let fingerprint = NativeReranker::registered_cache_contract().unwrap();
+        assert_eq!(
+            fingerprint,
+            registered_reranker_cache_contract(&manifest, REGISTERED_RERANKER_EXECUTION_REVISION)
+                .unwrap()
+        );
+        let mut revisions = Vec::new();
+        let mut changed = manifest.clone();
+        changed.revision = "a".repeat(40);
+        revisions.push(changed);
+        for name in [SAFETENSORS_FALLBACK, TOKENIZER_JSON] {
+            let mut changed = manifest.clone();
+            changed
+                .files
+                .iter_mut()
+                .find(|file| file.name == name)
+                .unwrap()
+                .sha256 = "a".repeat(64);
+            revisions.push(changed);
+        }
+        for changed in revisions {
+            assert_eq!(changed.id, manifest.id);
+            assert_ne!(
+                fingerprint,
+                registered_reranker_cache_contract(
+                    &changed,
+                    REGISTERED_RERANKER_EXECUTION_REVISION
+                )
+                .unwrap()
+            );
+        }
+        assert_ne!(
+            fingerprint,
+            registered_reranker_cache_contract(&manifest, "different-numerical-policy").unwrap()
+        );
+        assert!(registered_reranker_cache_contract(&manifest, "").is_err());
+        let mut unpinned = manifest;
+        unpinned.revision = "main".to_owned();
+        assert!(
+            registered_reranker_cache_contract(&unpinned, REGISTERED_RERANKER_EXECUTION_REVISION)
+                .is_err()
+        );
+    }
+
     // Explicit producer qualification, not a promise about every GNU libc or
     // x86 CPU. Run on the retained GNU x86 producer with its resolved expf
     // implementation and executable provenance recorded by the RCH driver.
@@ -2672,14 +3018,7 @@ mod tests {
 
     fn verified_async_fixture() -> NativeReranker {
         let dir = model_dir().expect("reranker fixture required");
-        frankensearch_embed::model_manifest::ModelManifest::ms_marco_reranker()
-            .verify_dir(&dir)
-            .expect("registered cross-encoder artifacts");
-        assert!(
-            !dir.join(SAFETENSORS_PRIMARY).exists(),
-            "unregistered preferred weights must not replace the verified fixture"
-        );
-        NativeReranker::load(dir).expect("actual native reranker")
+        NativeReranker::load_registered(dir).expect("actual registered native reranker")
     }
 
     #[test]

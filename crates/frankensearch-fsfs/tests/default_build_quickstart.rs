@@ -770,7 +770,7 @@ mod loader_only {
         let mut records = matching_records();
         assert_eq!(records.len(), 1, "the real query must persist one answer");
         let (cache_path, cache_bytes, record) = records.pop().unwrap();
-        assert_eq!(record["schema_version"], "fsfs.search.cache.v21");
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v22");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
 
         // Multiple fresh processes keep an isolated scheduling delay from
@@ -1391,6 +1391,7 @@ mod loader_only {
     #[allow(clippy::too_many_lines)]
     fn default_build_replays_complete_generation_fast_answers_without_loading_weights() {
         use sha2::Digest as _;
+        use std::fmt::Write as _;
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
         log_binary_profile("complete-generation-fast-answer-cache");
@@ -1505,16 +1506,18 @@ mod loader_only {
         assert_eq!(records.len(), 1, "persist one store-owned answer");
         let (cache_path, cache_bytes, original_record) = records.pop().unwrap();
         let assert_generation_binding = |record: &Value, generation: &Path| {
+            let mut manifest_sha256 = String::with_capacity(64);
+            for byte in sha2::Sha256::digest(fs::read(generation.join("FSFS-BUNDLE.json")).unwrap())
+            {
+                write!(manifest_sha256, "{byte:02x}").unwrap();
+            }
             assert_eq!(
                 record["complete_generation"]["id"],
                 generation.file_name().unwrap().to_str().unwrap()
             );
             assert_eq!(
                 record["complete_generation"]["manifest_sha256"],
-                format!(
-                    "{:x}",
-                    sha2::Sha256::digest(fs::read(generation.join("FSFS-BUNDLE.json")).unwrap())
-                )
+                manifest_sha256
             );
         };
         assert_generation_binding(&original_record, &selected);
@@ -2955,7 +2958,7 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v18");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v19");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
                     let mut contracts = sha2::Sha256::new();
                     for manifest in [
