@@ -4684,11 +4684,6 @@ fn collect_snapshot_for_root(
             continue;
         }
 
-        // An empty directory can still carry a broken policy (including a
-        // global one). Validate before listing so absence never grants deletion
-        // authority under rules we could not read completely.
-        ignore_rules.validate_directory(&dir_path)?;
-
         // Every skip below leaves part of the tree unobserved, so each one
         // records the path it could not resolve. Skipping silently is what
         // turns an unreadable directory into a subtree of phantom deletes.
@@ -4700,6 +4695,12 @@ fn collect_snapshot_for_root(
             }
             Err(error) => return Err(error.into()),
         };
+
+        // Opening an unreadable directory above records an incomplete scan
+        // before probing ignore files beneath it. For a readable directory,
+        // validate policy before consuming even an empty listing: absence
+        // never grants deletion authority under rules we could not read.
+        ignore_rules.validate_directory(&dir_path)?;
 
         for entry in dir_entries {
             // `ReadDir` yields lazily. Check before advancing it and again
@@ -11427,13 +11428,12 @@ mod tests {
         // than pass without ever hiding anything.
         let denial_is_enforced = fs::read_dir(&closed_dir).is_err();
 
-        let (short, short_completeness) =
-            collect_snapshot_from_roots(&roots, &discovery, &|| false)
-                .expect("hostile scan still succeeds");
+        let hostile = collect_snapshot_from_roots(&roots, &discovery, &|| false);
 
         // Restore before asserting so a failure cannot leave the temp tree
         // undeletable for the harness.
         fs::set_permissions(&closed_dir, original).expect("restore subtree permissions");
+        let (short, short_completeness) = hostile.expect("hostile scan still succeeds");
 
         assert!(
             denial_is_enforced,

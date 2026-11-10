@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn stopping_absent_or_non_socket_endpoints_never_creates_or_removes_files() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let path = directory.path().join("search.sock");
             assert!(stop(&cx, &path, Duration::from_secs(1)).await.is_err());
             assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -381,7 +381,8 @@ mod tests {
     #[test]
     fn cancelled_and_expired_client_never_connects_to_listener() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            // Keep the real endpoint within AF_UNIX's path limit even when TMPDIR is deep.
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let path = directory.path().join("search.sock");
             let listener = UnixListener::bind(&path).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -450,7 +451,7 @@ mod tests {
         run_test_with_cx(|cx| async move {
             use super::super::BoundCompleteSocket;
             use crate::{CliCommand, CliInput, FsfsConfig, FsfsRuntime};
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let root = directory.path().to_path_buf();
             let path = root.join("controlled.sock");
             let pointer = root.join(crate::generation_store::COMPLETE_GENERATION_POINTER);

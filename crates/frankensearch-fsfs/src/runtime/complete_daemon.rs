@@ -1331,7 +1331,7 @@ mod tests {
 
     #[test]
     fn socket_owner_excludes_duplicates_and_releases_endpoint_not_lock_inode() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let path = directory.path().join("search.sock");
         let first = BoundCompleteSocket::bind(path.clone()).unwrap();
         assert_eq!(
@@ -1353,7 +1353,7 @@ mod tests {
 
     #[test]
     fn socket_startup_does_not_remove_existing_files_or_noncooperating_listeners() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let file = directory.path().join("file.sock");
         fs::write(&file, b"unrelated data").unwrap();
         assert!(BoundCompleteSocket::bind(file.clone()).is_err());
@@ -1374,7 +1374,7 @@ mod tests {
         use std::rc::Rc;
 
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let runtime = FsfsRuntime::new(crate::FsfsConfig::default());
             let socket = directory.path().join("fsfs-query.sock");
 
@@ -1453,7 +1453,7 @@ mod tests {
     /// it. Live listeners and other files stay untouched (test above).
     #[test]
     fn socket_startup_replaces_only_a_verified_stale_endpoint() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let path = directory.path().join("search.sock");
         drop(UnixListener::bind(&path).unwrap());
         assert!(path.exists(), "the endpoint outlives its listener");
@@ -1469,7 +1469,7 @@ mod tests {
 
     #[test]
     fn socket_cleanup_preserves_replaced_endpoint() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let path = directory.path().join("search.sock");
         let owner = BoundCompleteSocket::bind(path.clone()).unwrap();
         fs::remove_file(&path).unwrap();
@@ -1480,7 +1480,7 @@ mod tests {
 
     #[test]
     fn socket_lock_symlink_is_not_followed() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let path = directory.path().join("search.sock");
         let outside = directory.path().join("outside");
         fs::write(&outside, b"sentinel").unwrap();
@@ -2115,7 +2115,7 @@ mod generation_tests {
     #[test]
     fn complete_daemon_refreshes_real_search_and_cache_after_publication_and_repair() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let source = directory.path().join("source");
             let root = directory.path().join("store");
             fs::create_dir(&source).unwrap();
@@ -2293,7 +2293,7 @@ mod generation_tests {
     #[test]
     fn stop_without_a_listening_daemon_reports_nothing_to_stop() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let runtime = FsfsRuntime::new(FsfsConfig::default());
             let missing = directory.path().join("absent.sock");
             // A socket file whose daemon died refuses connections.
@@ -2366,7 +2366,7 @@ mod generation_tests {
     #[test]
     fn complete_daemon_answers_the_readiness_probe_without_searching() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
             let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);
             let cancel = CancelOnDrop(cx.clone());
@@ -2421,7 +2421,7 @@ mod generation_tests {
                 let owner = crate::runtime::SearchBlockingPool::default();
                 scheduler.block_on(async {
                     let cx = owner.context(Cx::current().unwrap());
-                    let directory = tempfile::tempdir().unwrap();
+                    let directory = tempfile::tempdir_in("/tmp").unwrap();
                     let (base, root) = published_daemon_fixture(&cx, directory.path()).await;
                     let mut session = base.open_live_retained_search(&cx, &root).await.unwrap();
                     let vectors = directory.path().join("unit-vectors");
@@ -2868,7 +2868,7 @@ mod generation_tests {
         use crate::config::DegradationOverrideMode;
 
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let source = directory.path().join("source");
             let root = directory.path().join("store");
             fs::create_dir(&source).unwrap();
@@ -2959,7 +2959,7 @@ mod generation_tests {
     #[test]
     fn complete_daemon_streams_apply_the_requests_search_policy() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
             let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);
             let cancel = CancelOnDrop(cx.clone());
@@ -3029,7 +3029,7 @@ mod generation_tests {
     #[test]
     fn complete_daemon_serves_around_an_incomplete_sender_then_accepts_its_request() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
             let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
             let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);

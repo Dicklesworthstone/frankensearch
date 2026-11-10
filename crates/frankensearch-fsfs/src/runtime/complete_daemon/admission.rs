@@ -384,7 +384,8 @@ mod tests {
     use std::task::Waker;
 
     fn listener() -> (tempfile::TempDir, UnixListener) {
-        let directory = tempfile::tempdir().unwrap();
+        // These intake probes must bind before testing admission and shutdown.
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let listener = UnixListener::bind(directory.path().join("intake.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
         (directory, listener)

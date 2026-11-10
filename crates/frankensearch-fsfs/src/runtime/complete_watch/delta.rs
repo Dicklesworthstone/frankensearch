@@ -705,7 +705,8 @@ mod metadata_tests {
         use std::os::unix::net::UnixListener;
 
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            // The special-file case creates a real Unix socket.
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let path = directory.path().join("source.md");
             fs::write(&path, b"\xff\0not decoded").unwrap();
             let expected = SourceStamp::from_metadata(&fs::symlink_metadata(&path).unwrap());

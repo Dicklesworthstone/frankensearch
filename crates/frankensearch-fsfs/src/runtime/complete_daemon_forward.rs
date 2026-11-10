@@ -1327,7 +1327,8 @@ mod tests {
     #[test]
     fn malformed_peer_response_is_not_retried_or_followed_by_local_retrieval() {
         run_test_with_cx(|cx| async move {
-            let root = tempfile::tempdir().unwrap();
+            // The malformed-response probe needs a bindable endpoint before it can run.
+            let root = tempfile::tempdir_in("/tmp").unwrap();
             let runtime = FsfsRuntime::new(FsfsConfig::default());
             let path = runtime
                 .complete_generation_socket_path(root.path())
@@ -1529,7 +1530,7 @@ mod generation_tests {
 
         run_test_with_cx(|cx| async move {
             for streamed in [false, true] {
-                let directory = tempfile::tempdir().unwrap();
+                let directory = tempfile::tempdir_in("/tmp").unwrap();
                 let source = directory.path().join("source");
                 let root = directory.path().join("store");
                 std::fs::create_dir(&source).unwrap();
@@ -1738,7 +1739,7 @@ mod generation_tests {
     #[test]
     fn forwarded_searches_fill_the_serve_cache_and_replace_it_with_the_generation() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let source = directory.path().join("source");
             let root = directory.path().join("store");
             std::fs::create_dir(&source).unwrap();
@@ -1925,7 +1926,7 @@ mod generation_tests {
     #[test]
     fn cli_forwarding_follows_publication_isolates_filters_and_recovers_after_refusal() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let source = directory.path().join("source");
             let root = directory.path().join("store");
             std::fs::create_dir(&source).unwrap();

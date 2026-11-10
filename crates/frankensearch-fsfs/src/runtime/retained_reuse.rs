@@ -2431,7 +2431,7 @@ mod generation_tests {
             use std::os::unix::net::{UnixListener, UnixStream};
 
             run_test_with_cx(|cx| async move {
-                let parent = tempfile::tempdir().unwrap();
+                let parent = tempfile::tempdir_in("/tmp").unwrap();
                 let (_, _, root) = fixture(parent.path(), 2);
                 assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
 
