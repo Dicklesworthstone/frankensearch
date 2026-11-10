@@ -17,8 +17,8 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use tantivy::SegmentMeta;
 use tantivy::indexer::{LogMergePolicy, MergeCandidate, MergePolicy, NoMergePolicy, UserOperation};
 use tantivy::query::{
-    AllQuery, BooleanQuery, EnableScoring, Explanation, Occur, PhraseQuery, Query, RangeQuery,
-    RegexQuery, Scorer, TermQuery, Weight,
+    AllQuery, BooleanQuery, EnableScoring, Explanation, Occur, PhrasePrefixQuery, PhraseQuery, Query,
+    RangeQuery, RegexQuery, Scorer, TermQuery, Weight,
 };
 use tantivy::schema::IndexRecordOption;
 use tantivy::schema::{
@@ -3006,11 +3006,8 @@ fn cass_build_compound_term_query(
         }
         if cass_needs_indexed_fragments(part) {
             let prefix = match pattern {
-                CassWildcardPattern::Exact(_) => false,
-                CassWildcardPattern::Prefix(_) => {
-                    fragments.ends_with_token
-                        && fragments.terms.last().is_some_and(|term| term.is_ascii())
-                }
+                CassWildcardPattern::Exact(_) => (2..=20).contains(&core.chars().take(21).count()),
+                CassWildcardPattern::Prefix(_) => true,
                 CassWildcardPattern::Suffix(_)
                 | CassWildcardPattern::Substring(_)
                 | CassWildcardPattern::Complex(_) => {
@@ -3018,7 +3015,8 @@ fn cass_build_compound_term_query(
                         "affected operands support only exact or trailing-prefix queries",
                     ));
                 }
-            };
+            } && fragments.ends_with_token
+                && fragments.terms.last().is_some_and(|term| term.is_ascii());
             subqueries.push(cass_build_indexed_fragments_query(
                 &fragments, prefix, fields,
             ));
@@ -3043,8 +3041,8 @@ fn cass_build_compound_term_query(
 
 /// Keep an affected word adjacent, ordered and inside one logical field.
 /// CJK bigrams share positions but are all required, so they retain same-field
-/// conjunction. Explicit prefixes retain the existing edge-prefix columns;
-/// those columns have no positions and their historic length bound remains.
+/// conjunction. Prefixes use the complete positional fields, including text
+/// beyond the stored edge-prefix window, with a checked vocabulary budget.
 fn cass_build_indexed_fragments_query(
     fragments: &CassIndexedFragments,
     prefix: bool,
@@ -3053,50 +3051,103 @@ fn cass_build_indexed_fragments_query(
     if fragments.terms.is_empty() {
         return cass_match_none_query();
     }
-    let positional = !prefix && !fragments.terms.iter().any(|term| contains_cjk(term));
+    let positional = !fragments.terms.iter().any(|term| contains_cjk(term));
     let mut field_queries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(2);
-    for (field, prefix_field) in [
-        (fields.title, fields.title_prefix),
-        (fields.content, fields.content_prefix),
-    ] {
-        if positional && fragments.terms.len() > 1 {
+    for field in [fields.title, fields.content] {
+        if positional && (prefix || fragments.terms.len() > 1) {
             let terms = fragments
                 .terms
                 .iter()
                 .zip(&fragments.positions)
                 .map(|(term, position)| (*position, Term::from_field_text(field, term)))
                 .collect();
-            field_queries.push((
-                Occur::Should,
-                Box::new(CassPhraseQuery(PhraseQuery::new_with_offset(terms))),
-            ));
+            let query: Box<dyn Query> = if prefix {
+                Box::new(CassBoundedPhrasePrefixQuery::new(terms))
+            } else {
+                Box::new(CassPhraseQuery(PhraseQuery::new_with_offset(terms)))
+            };
+            field_queries.push((Occur::Should, query));
             continue;
         }
         let mut musts: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fragments.terms.len());
         for (index, fragment) in fragments.terms.iter().enumerate() {
-            let exact: Box<dyn Query> = Box::new(TermQuery::new(
-                Term::from_field_text(field, fragment),
-                IndexRecordOption::WithFreqsAndPositions,
-            ));
             let query = if prefix && index + 1 == fragments.terms.len() {
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Should, exact),
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(prefix_field, fragment),
-                            IndexRecordOption::Basic,
-                        )),
-                    ),
-                ])) as Box<dyn Query>
+                Box::new(CassBoundedPhrasePrefixQuery::new(vec![(
+                    fragments.positions[index],
+                    Term::from_field_text(field, fragment),
+                )])) as Box<dyn Query>
             } else {
-                exact
+                Box::new(TermQuery::new(
+                    Term::from_field_text(field, fragment),
+                    IndexRecordOption::WithFreqsAndPositions,
+                )) as Box<dyn Query>
             };
             musts.push((Occur::Must, query));
         }
         field_queries.push((Occur::Should, Box::new(BooleanQuery::new(musts))));
     }
     Box::new(BooleanQuery::new(field_queries))
+}
+
+/// Complete CASS prefix expansion is bounded per field and segment. Overflow
+/// rejects the entire query before any scorer can return a partial result.
+const CASS_PREFIX_EXPANSION_LIMIT: u32 = 1_024;
+
+#[derive(Clone, Debug)]
+struct CassBoundedPhrasePrefixQuery {
+    query: PhrasePrefixQuery,
+    prefix: Term,
+}
+
+impl CassBoundedPhrasePrefixQuery {
+    fn new(terms: Vec<(usize, Term)>) -> Self {
+        let prefix = terms
+            .last()
+            .expect("an admitted CASS prefix has at least one term")
+            .1
+            .clone();
+        Self {
+            query: PhrasePrefixQuery::new_with_offset(terms),
+            prefix,
+        }
+    }
+}
+
+impl Query for CassBoundedPhrasePrefixQuery {
+    fn weight(&self, scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        let searcher = scoring.searcher().ok_or_else(|| {
+            TantivyError::InvalidArgument("CASS prefix validation requires a searcher".to_owned())
+        })?;
+        let prefix = self.prefix.serialized_value_bytes();
+        let mut max_expansions = 1_u32;
+        // Native PhrasePrefixQuery silently truncates at its configured limit.
+        // Validate all segments while the enclosing query is weighted, even
+        // for a negated operand or one whose other anchors do not match.
+        for reader in searcher.segment_readers() {
+            let inverted = reader.inverted_index(self.prefix.field())?;
+            let mut terms = inverted.terms().range().ge(prefix).into_stream()?;
+            let mut expansions = 0_u32;
+            while terms.advance() && terms.key().starts_with(prefix) {
+                expansions += 1;
+                if expansions > CASS_PREFIX_EXPANSION_LIMIT {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "CASS prefix expansion exceeds {CASS_PREFIX_EXPANSION_LIMIT} \
+                         terms in one field/segment"
+                    )));
+                }
+            }
+            max_expansions = max_expansions.max(expansions);
+        }
+        // Keep allocation proportional to this snapshot's actual vocabulary,
+        // rather than reserving 1024 postings for every short prefix.
+        let mut query = self.query.clone();
+        query.set_max_expansions(max_expansions);
+        Ok(Box::new(CassPhraseWeight(query.weight(scoring)?)))
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.query.query_terms(visitor);
+    }
 }
 
 /// Keep CASS phrase scorers within the ordinary `DocSet` seek contract.
@@ -5201,10 +5252,10 @@ mod cass_query_tests {
         let fields = index.fields();
 
         for (query, expected) in [
-            ("kérlek", vec![0]),
-            ("KÉRLEK", vec![0]),
-            ("kérl*", vec![0, 9, 10, 11]),
-            ("kér*", vec![0]),
+            ("kérlek", vec![0, 11]),
+            ("KÉRLEK", vec![0, 11]),
+            ("kérl*", vec![0, 11]),
+            ("kér*", vec![0, 11]),
             ("kérlek--mentést", vec![0]),
             ("\"kérlek\"", vec![0]),
             ("\"kérlek nézd\"", vec![0]),
@@ -5225,7 +5276,7 @@ mod cass_query_tests {
             ("STRASSE", vec![]),
             ("ZAŻÓŁĆ", vec![5]),
             ("příliš", vec![6]),
-            ("İstanbul", vec![7]),
+            ("İstanbul", vec![0, 7]),
             ("\"İstanbul\"", vec![7]),
             ("İstanbul*", vec![0, 7]),
             ("istanbul", vec![]),
@@ -5234,10 +5285,10 @@ mod cass_query_tests {
             ("ke\u{301}rlek", vec![8]),
             ("\"ke\u{301}rlek\"", vec![8]),
             ("kérlek AND backup", vec![]),
-            ("kérlek OR backup", vec![0, 12]),
-            ("kérlek -mentést", vec![]),
-            ("NOT NOT kérlek", vec![0]),
-            ("(kérlek OR backup) AND -mentést", vec![12]),
+            ("kérlek OR backup", vec![0, 11, 12]),
+            ("kérlek -mentést", vec![11]),
+            ("NOT NOT kérlek", vec![0, 11]),
+            ("(kérlek OR backup) AND -mentést", vec![11, 12]),
             ("backup NOT kérlek", vec![12]),
             ("backup AND 🚀", vec![]),
             ("🚀 OR backup", vec![]),
@@ -5327,7 +5378,7 @@ mod cass_query_tests {
                 );
             }
         }
-        for (term, expected) in [("kérlek", vec![0]), ("backup", vec![12])] {
+        for (term, expected) in [("kérlek", vec![0, 11]), ("backup", vec![12])] {
             let allowed = format!(
                 "{}{term}{} AND {term}",
                 "(".repeat(CASS_MAX_QUERY_NESTING),
@@ -5356,7 +5407,7 @@ mod cass_query_tests {
             }
         }
         for (raw, expected) in [
-            (format!("kérlek{}", "(".repeat(200)), vec![0]),
+            (format!("kérlek{}", "(".repeat(200)), vec![0, 11]),
             (format!("\"kérlek {} nézd\"", "(".repeat(200)), vec![0]),
         ] {
             assert_eq!(
@@ -5416,7 +5467,7 @@ mod cass_query_tests {
             ("\"kérlek 日本語\"", vec![0, 4]),
             ("\"日本語 kérlek\"", vec![0, 4]),
             ("\"kérlek* 日本語\"", vec![0, 4]),
-            ("kérlek* 日本語", vec![0, 3, 4]),
+            ("kérlek* 日本語", vec![0, 3]),
             ("\"café 日本語\"", vec![0, 4]),
             ("\"café* 日本語\"", vec![0, 4]),
             ("\"ké*rlek 日本語\"", vec![]),
@@ -5482,6 +5533,9 @@ mod cass_query_tests {
             "(( ))",
             "(NOT ())",
             "((AND) OR)",
+            "(\r)",
+            "(AND OR)",
+            "(NOT)",
         ] {
             for raw in [
                 empty_operand.to_owned(),
@@ -5513,8 +5567,19 @@ mod cass_query_tests {
             "backup OR (NOT",
             "NOT (backup AND ((",
             "backup ((OR",
+            "(",
+            "NOT (",
+            "NOT (backup AND (",
         ] {
             assert!(cass_result_ids(&searcher, &fields, rejected, &filters).is_empty());
+            let query = cass_build_tantivy_query_single_parse(rejected, &filters, &fields);
+            assert_eq!(
+                searcher
+                    .search(&*query, &tantivy::collector::Count)
+                    .expect("count rejected groups"),
+                0,
+                "{rejected:?}"
+            );
         }
         // Empty syntax must not be confused with a valid negative query or
         // the existing recovery of incomplete, nonempty expressions.
@@ -5522,6 +5587,9 @@ mod cass_query_tests {
             ("NOT backup", vec![1, 2]),
             ("backup", vec![0]),
             ("(backup", vec![0]),
+            ("NOT (backup", vec![1, 2]),
+            ("NOT NOT (backup", vec![0]),
+            ("(backup AND (kérlek", vec![0]),
             ("backup AND", vec![0]),
             ("backup OR", vec![0]),
             ("backup NOT", vec![0]),
@@ -5540,6 +5608,318 @@ mod cass_query_tests {
                 cass_result_ids(&searcher, &fields, omitted, &filters),
                 vec![0, 1, 2],
                 "{omitted:?}"
+            );
+        }
+    }
+
+    fn cass_prefix_fixture_document(id: u64, title: &str, content: &str) -> CassDocument {
+        CassDocument {
+            agent: "claude".to_owned(),
+            workspace: None,
+            workspace_original: None,
+            source_path: format!("/fixture/accented-prefix-{id}.jsonl"),
+            msg_idx: id,
+            created_at: None,
+            title: Some(title.to_owned()),
+            content: content.to_owned(),
+            conversation_id: None,
+            source_id: "local".to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: None,
+        }
+    }
+
+    #[test]
+    fn accented_prefixes_preserve_positions_and_original_terminal_boundaries() {
+        let directory = tempfile::tempdir().expect("positional prefix directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create positional prefix index");
+        let deep = format!("{} kérleks", "padding ".repeat(700));
+        assert!(
+            !cass_build_content_prefix_and_preview(&deep).0.contains("rlek"),
+            "the deep occurrence must be outside the old edge-prefix window"
+        );
+        let at_twenty = "ézyxwvutsrqponmlkjih";
+        let over_twenty = "é01234567890123456789";
+        assert_eq!(at_twenty.chars().count(), 20);
+        assert_eq!(over_twenty.chars().count(), 21);
+        let documents = [
+            ("", "kérlek".to_owned()),
+            ("", "kérleks".to_owned()),
+            ("", "k unrelated rleks".to_owned()),
+            ("", "rleks k".to_owned()),
+            ("k", "rleks".to_owned()),
+            ("", "kilo rleks".to_owned()),
+            ("", "caféteria".to_owned()),
+            ("", "cafeteria".to_owned()),
+            ("", "caféine".to_owned()),
+            ("", "échoes".to_owned()),
+            ("", deep),
+            ("", format!("{at_twenty}tails")),
+            ("", format!("{over_twenty}tails")),
+            ("", "éxylophone".to_owned()),
+            ("", "東京échoes".to_owned()),
+            ("東京", "choes".to_owned()),
+            ("", "東京 chatter".to_owned()),
+            ("", "東京éabcdefghijklmnopqrstuvXYZ".to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(position, (title, content))| {
+            cass_prefix_fixture_document(
+                u64::try_from(position).expect("fixture ordinal"),
+                title,
+                &format!("backup {content}"),
+            )
+        })
+        .collect::<Vec<_>>();
+        index
+            .add_cass_documents(&documents)
+            .expect("index prefix corpus");
+        index.commit().expect("commit prefix corpus");
+        let reader = index.reader().expect("prefix reader");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let filters = CassQueryFilters::default();
+        for (raw, expected) in [
+            ("kérlek", vec![0, 1, 10]),
+            ("kérl*", vec![0, 1, 10]),
+            ("kér*", vec![0, 1, 10]),
+            ("\"kérlek\"", vec![0]),
+            ("\"kérleks\"", vec![1, 10]),
+            ("kérlé*", vec![]),
+            ("café", vec![6, 8]),
+            ("café*", vec![6, 8]),
+            ("\"café*\"", vec![6, 8]),
+            ("caf*", vec![6, 7, 8]),
+            ("écho", vec![9, 14, 15]),
+            ("écho*", vec![9, 14, 15]),
+            ("\"écho\"", vec![]),
+            ("éx", vec![13]),
+            ("éx*", vec![13]),
+            ("\"éx\"", vec![]),
+            (at_twenty, vec![11]),
+            (over_twenty, vec![]),
+            ("東京écho*", vec![14]),
+            ("東京écho", vec![14]),
+            ("\"東京écho\"", vec![]),
+            ("éabcdefghijklmnopqrstuv*", vec![17]),
+            ("éabcdefghijklmnopqrstuv", vec![]),
+            ("東京éabcdefghijklmnopqrstuv*", vec![17]),
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, raw, &filters),
+                expected,
+                "positional prefix {raw:?}"
+            );
+        }
+        for (raw, expected) in [
+            (format!("{at_twenty}*"), vec![11]),
+            (format!("{over_twenty}*"), vec![12]),
+            (format!("\"{at_twenty}\""), vec![]),
+            (format!("\"{over_twenty}\""), vec![]),
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, &raw, &filters),
+                expected,
+                "prefix length boundary {raw:?}"
+            );
+        }
+
+        let positive = scored_cass_results(&searcher, &fields, "backup", &filters);
+        let negative = scored_cass_results(&searcher, &fields, "backup NOT kérl*", &filters);
+        let expected = (0..18)
+            .filter(|id| ![0, 1, 10].contains(id))
+            .collect::<Vec<_>>();
+        assert_eq!(negative.keys().copied().collect::<Vec<_>>(), expected);
+        for (id, score) in &negative {
+            assert_eq!(score.to_bits(), positive[id].to_bits());
+        }
+        let query = cass_build_tantivy_query("backup NOT kérl*", &filters, &fields);
+        assert_eq!(
+            searcher
+                .search(&*query, &tantivy::collector::Count)
+                .expect("count negated prefix"),
+            negative.len()
+        );
+        for (score, address) in searcher
+            .search(&*query, &tantivy::collector::TopDocs::with_limit(18))
+            .expect("search explained prefix exclusion")
+        {
+            let explanation = query
+                .explain(&searcher, address)
+                .expect("explain retained prefix document");
+            assert_eq!(explanation.value().to_bits(), score.to_bits());
+        }
+    }
+
+    #[test]
+    fn accented_prefix_expansion_is_complete_beyond_the_native_default() {
+        let directory = tempfile::tempdir().expect("complete prefix directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create complete prefix index");
+        let documents = (0..80)
+            .map(|id| cass_prefix_fixture_document(id, "", &format!("kér{id:04}word")))
+            .collect::<Vec<_>>();
+        index
+            .add_cass_documents(&documents)
+            .expect("index 80 prefix terms");
+        index.commit().expect("commit 80 prefix terms");
+        let reader = index.reader().expect("complete prefix reader");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let filters = CassQueryFilters::default();
+        // Cover both PhrasePrefixWeight and the singleton range-weight path.
+        // Tantivy's unconfigured 50-expansion default truncates both.
+        for raw in ["kér*", "kér", "ér*", "ér"] {
+            let query = cass_build_tantivy_query(raw, &filters, &fields);
+            assert_eq!(
+                searcher
+                    .search(&*query, &tantivy::collector::Count)
+                    .expect("complete prefix count"),
+                80,
+                "{raw:?}"
+            );
+            let page = searcher
+                .search(&*query, &tantivy::collector::TopDocs::with_limit(80))
+                .expect("complete prefix page");
+            assert_eq!(page.len(), 80, "{raw:?}");
+            if raw.starts_with('é') {
+                assert!(
+                    page.iter()
+                        .all(|(score, _)| score.to_bits() == 1.0_f32.to_bits()),
+                    "a singleton prefix retains native constant scoring"
+                );
+            }
+            assert_eq!(
+                searcher
+                    .search(
+                        &*query,
+                        &tantivy::collector::TopDocs::with_limit(10).and_offset(70),
+                    )
+                    .expect("prefix page past the old expansion limit")
+                    .len(),
+                10,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accented_prefix_budget_is_complete_or_errors_before_search() {
+        let directory = tempfile::tempdir().expect("prefix budget directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create prefix budget index");
+        index.writer.set_merge_policy(Box::new(NoMergePolicy));
+        let within_budget = (0..CASS_PREFIX_EXPANSION_LIMIT - 1)
+            .map(|id| format!("kéallow{id:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let over_budget = (0..=CASS_PREFIX_EXPANSION_LIMIT)
+            .map(|id| format!("kéoverflow{id:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let title_terms = (0..600)
+            .map(|id| format!("éfield{id:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let content_terms = (600..1200)
+            .map(|id| format!("éfield{id:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        index
+            .add_cass_documents(&[
+                cass_prefix_fixture_document(0, "keep", &within_budget),
+                cass_prefix_fixture_document(1, "", &over_budget),
+                // Isolate the last admitted term so truncated expansion
+                // cannot still pass by finding an earlier term in this row.
+                cass_prefix_fixture_document(
+                    4,
+                    "",
+                    &format!("kéallow{:04}", CASS_PREFIX_EXPANSION_LIMIT - 1),
+                ),
+                cass_prefix_fixture_document(5, &title_terms, &content_terms),
+            ])
+            .expect("index prefix budget boundaries");
+        index.commit().expect("commit prefix budget boundaries");
+        let reader = index.reader().expect("prefix budget reader");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let filters = CassQueryFilters::default();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        for raw in ["éallow", "éallow*", "kéallow", "kéallow*"] {
+            let query = cass_build_tantivy_query(raw, &filters, &fields);
+            assert_eq!(
+                searcher
+                    .search(&*query, &tantivy::collector::Count)
+                    .expect("exactly 1024 expansions remain complete"),
+                2,
+                "{raw:?}"
+            );
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, raw, &filters),
+                vec![0, 4]
+            );
+        }
+        for raw in [
+            "éoverflow*",
+            "éoverflow",
+            "kéoverflow*",
+            "kéoverflow",
+            "NOT éoverflow*",
+            "NOT kéoverflow*",
+            "keep OR éoverflow*",
+            "keep OR kéoverflow*",
+            "keep AND NOT éoverflow*",
+            "missing AND éoverflow*",
+            "missing AND kéoverflow*",
+        ] {
+            let query = cass_build_tantivy_query(raw, &filters, &fields);
+            let count_error = searcher
+                .search(&*query, &tantivy::collector::Count)
+                .expect_err("overflow must reject count before scoring");
+            assert!(count_error.to_string().contains("1024"), "{raw:?}");
+            let page_error = searcher
+                .search(&*query, &tantivy::collector::TopDocs::with_limit(1))
+                .expect_err("overflow must not return a partial page");
+            assert!(page_error.to_string().contains("1024"), "{raw:?}");
+        }
+        assert_eq!(
+            cass_result_ids(&searcher, &fields, "éfield*", &filters),
+            vec![5],
+            "two fields may each expand to 600 different terms"
+        );
+
+        // The budget belongs to each field/segment, not the whole index.
+        // Two disjoint vocabularies of 600 terms must both be searched.
+        for (id, first) in [(2, 0), (3, 600)] {
+            let content = (first..first + 600)
+                .map(|term| format!("éshared{term:04}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            index
+                .add_cass_documents(&[cass_prefix_fixture_document(id, "", &content)])
+                .expect("index independent prefix segment");
+            index.commit().expect("commit independent prefix segment");
+        }
+        reader.reload().expect("reload prefix budget segments");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 3);
+        for raw in ["éshared", "éshared*"] {
+            let query = cass_build_tantivy_query(raw, &filters, &fields);
+            assert_eq!(
+                searcher
+                    .search(&*query, &tantivy::collector::Count)
+                    .expect("independent segments remain within budget"),
+                2,
+                "{raw:?}"
+            );
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, raw, &filters),
+                vec![2, 3]
             );
         }
     }

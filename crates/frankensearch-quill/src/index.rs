@@ -4940,6 +4940,32 @@ struct QueryWorkShape {
 /// oracle's public query parser.
 const TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS: usize = 50;
 
+/// CASS opts into complete bounded expansion through its existing analyzer;
+/// the default parser retains the pinned Tantivy 50-term truncation contract.
+fn cass_phrase_prefix_field(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+) -> Result<bool, QuillIndexError> {
+    Ok(matches!(
+        query_field_kind(schema, field_ord)?,
+        FieldKind::Text {
+            analyzer: Analyzer::CassHyphenNormalize,
+            ..
+        }
+    ))
+}
+
+fn phrase_prefix_expansion_limit(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+) -> Result<usize, QuillIndexError> {
+    Ok(if cass_phrase_prefix_field(schema, field_ord)? {
+        crate::query::CASS_PREFIX_EXPANSION_LIMIT
+    } else {
+        TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS
+    })
+}
+
 impl QueryWorkShape {
     fn visit(
         &mut self,
@@ -4976,15 +5002,18 @@ impl QueryWorkShape {
                     prefix,
                     ..
                 } => {
-                    let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
                     let terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
-                    let expansions = if *prefix {
-                        self.dictionary_scans = self.dictionary_scans.saturating_add(fields);
-                        u64::try_from(TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS).unwrap_or(u64::MAX)
-                    } else {
-                        1
-                    };
-                    let phrase_fields = fields.saturating_mul(expansions);
+                    let mut phrase_fields = 0_u64;
+                    for field in fields {
+                        let expansions = if *prefix {
+                            self.dictionary_scans = self.dictionary_scans.saturating_add(1);
+                            u64::try_from(phrase_prefix_expansion_limit(schema, field.field_id)?)
+                                .unwrap_or(u64::MAX)
+                        } else {
+                            1
+                        };
+                        phrase_fields = phrase_fields.saturating_add(expansions);
+                    }
                     let streams = phrase_fields.saturating_mul(terms);
                     self.posting_streams = self.posting_streams.saturating_add(streams);
                     self.phrase_streams = self.phrase_streams.saturating_add(streams);
@@ -16481,9 +16510,20 @@ fn validate_query_lowering(
                     }
                 }
                 if *prefix && terms.len() == 1 {
-                    return Err(QuillIndexError::UnsupportedQuery {
-                        detail: "phrase prefix requires at least two positioned terms".to_owned(),
-                    });
+                    if fields.is_empty() {
+                        return Err(QuillIndexError::UnsupportedQuery {
+                            detail: "phrase prefix requires at least two positioned terms"
+                                .to_owned(),
+                        });
+                    }
+                    for field in fields {
+                        if !cass_phrase_prefix_field(schema, field.field_id)? {
+                            return Err(QuillIndexError::UnsupportedQuery {
+                                detail: "phrase prefix requires at least two positioned terms"
+                                    .to_owned(),
+                            });
+                        }
+                    }
                 }
                 for term in terms {
                     for field in fields {
@@ -17416,11 +17456,6 @@ fn lower_query_with_mode<'a>(
                 slop,
                 prefix,
             } => {
-                if *prefix && terms.len() == 1 {
-                    return Err(QuillIndexError::UnsupportedQuery {
-                        detail: "phrase prefix requires at least two positioned terms".to_owned(),
-                    });
-                }
                 if terms.len() == 1 {
                     let term = &terms[0];
                     let mut clauses = Vec::new();
@@ -17428,17 +17463,45 @@ fn lower_query_with_mode<'a>(
                         .try_reserve_exact(fields.len())
                         .map_err(|_| invalid_state("could not allocate phrase field clauses"))?;
                     for field in fields {
-                        clauses.push(ScorerClause::should(lower_leaf_term(
-                            leaf,
-                            snapshot,
-                            schema,
-                            field.field_id,
-                            term.text.as_bytes(),
-                            prepared_doc_freqs,
-                            inherited_boost * field.boost,
-                            false,
-                            checkpoint,
-                        )?));
+                        let scorer = if *prefix {
+                            if !cass_phrase_prefix_field(schema, field.field_id)? {
+                                return Err(QuillIndexError::UnsupportedQuery {
+                                    detail: "phrase prefix requires at least two positioned terms"
+                                        .to_owned(),
+                                });
+                            }
+                            let expansions = leaf_phrase_prefix_terms(
+                                checkpoint,
+                                leaf,
+                                schema,
+                                field.field_id,
+                                term.text.as_bytes(),
+                            )?;
+                            lower_leaf_string_predicate(
+                                checkpoint,
+                                leaf,
+                                snapshot,
+                                prepared_doc_freqs,
+                                schema,
+                                field.field_id,
+                                expansions,
+                                inherited_boost * field.boost,
+                                mode,
+                            )?
+                        } else {
+                            lower_leaf_term(
+                                leaf,
+                                snapshot,
+                                schema,
+                                field.field_id,
+                                term.text.as_bytes(),
+                                prepared_doc_freqs,
+                                inherited_boost * field.boost,
+                                false,
+                                checkpoint,
+                            )?
+                        };
+                        clauses.push(ScorerClause::should(scorer));
                     }
                     lower_boolean(
                         clauses,
@@ -18349,9 +18412,11 @@ fn leaf_phrase_prefix_terms(
     prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, QuillIndexError> {
     validate_string_query_field(schema, field_ord, "phrase prefix")?;
+    let complete = cass_phrase_prefix_field(schema, field_ord)?;
+    let expansion_limit = phrase_prefix_expansion_limit(schema, field_ord)?;
     let mut terms = Vec::new();
     terms
-        .try_reserve_exact(TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS)
+        .try_reserve_exact(expansion_limit)
         .map_err(|_| invalid_state("could not allocate leaf-local phrase-prefix expansions"))?;
 
     match leaf {
@@ -18359,7 +18424,10 @@ fn leaf_phrase_prefix_terms(
             let dictionary = open_dictionary(segment, schema)?;
             let mut cursor = dictionary.prefix_cursor(field_ord, prefix)?;
             let mut admitted_block = None;
-            while terms.len() < TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS {
+            loop {
+                if !complete && terms.len() == expansion_limit {
+                    break;
+                }
                 let Some(current) = cursor.current() else {
                     break;
                 };
@@ -18367,6 +18435,14 @@ fn leaf_phrase_prefix_terms(
                 if block != admitted_block {
                     checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
                     admitted_block = block;
+                }
+                if terms.len() == expansion_limit {
+                    return Err(TermDictionaryError::GlobExpansionLimitExceeded {
+                        field_ord,
+                        limit: expansion_limit,
+                        actual: expansion_limit + 1,
+                    }
+                    .into());
                 }
                 let mut owned = Vec::new();
                 owned
@@ -18380,8 +18456,8 @@ fn leaf_phrase_prefix_terms(
         QueryLeaf::Delta(delta) => {
             // The ordered view is materialized and radix-sorted as one unit on
             // first use, so admission must precede construction just as it does
-            // for ordinary glob expansion. The 50-term semantic cap remains
-            // leaf-local after that unavoidable generation-level work.
+            // for ordinary glob expansion. The prefix policy remains leaf-local
+            // after that unavoidable generation-level work.
             checkpoint.admit(
                 QueryWorkKind::DictionaryBlock,
                 delta_ordered_view_blocks(delta.segment().term_count()),
@@ -18395,13 +18471,21 @@ fn leaf_phrase_prefix_terms(
                     checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
                 }
                 if term.term().starts_with(prefix) {
+                    if terms.len() == expansion_limit {
+                        return Err(TermDictionaryError::GlobExpansionLimitExceeded {
+                            field_ord,
+                            limit: expansion_limit,
+                            actual: expansion_limit + 1,
+                        }
+                        .into());
+                    }
                     let mut owned = Vec::new();
                     owned.try_reserve_exact(term.term().len()).map_err(|_| {
                         invalid_state("could not copy Delta phrase-prefix expansion")
                     })?;
                     owned.extend_from_slice(term.term());
                     terms.push(owned);
-                    if terms.len() == TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS {
+                    if !complete && terms.len() == expansion_limit {
                         break;
                     }
                 }
@@ -19323,6 +19407,47 @@ fn owned_fieldnorm_bridge_calls() -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cass_prefix_work_admission_uses_complete_expansion_bound() {
+        use crate::query::{CASS_PREFIX_EXPANSION_LIMIT, PositionedTerm, QueryField};
+
+        for (schema, limit) in [
+            (
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                CASS_PREFIX_EXPANSION_LIMIT,
+            ),
+            (DEFAULT_SCHEMA, TANTIVY_PHRASE_PREFIX_MAX_EXPANSIONS),
+        ] {
+            let fields = schema
+                .fields
+                .iter()
+                .filter(|field| matches!(field.name, "title" | "content"))
+                .map(|field| QueryField::new(field.id, 1.0))
+                .collect::<Vec<_>>();
+            let field_count = u64::try_from(fields.len()).expect("field count");
+            let query = Query::phrase(
+                fields.clone(),
+                vec![PositionedTerm::new(0, "k"), PositionedTerm::new(1, "r")],
+                0,
+                true,
+            );
+            let mut shape = QueryWorkShape::default();
+            shape.visit(&query, schema, 1).expect("work admission");
+            let expanded_fields = field_count * u64::try_from(limit).expect("limit");
+            assert_eq!(shape.dictionary_scans, field_count);
+            assert_eq!(shape.phrase_fields, expanded_fields);
+            assert_eq!(shape.posting_streams, expanded_fields * 2);
+            assert_eq!(shape.phrase_streams, expanded_fields * 2);
+
+            let singleton = Query::phrase(fields, vec![PositionedTerm::new(0, "r")], 0, true);
+            assert_eq!(
+                validate_query_lowering(&singleton, 1.0, schema).is_ok(),
+                schema == crate::schema::CASS_SEMANTIC_SCHEMA,
+                "only the CASS analyzer opts into single-token prefix queries"
+            );
+        }
+    }
+
     /// Test-rendezvous bound: catches a hang, never races the scheduler.
     /// 2s flaked when the full parallel suite saturated the blocking pool
     /// (bd-zam2i).

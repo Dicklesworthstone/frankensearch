@@ -19,6 +19,10 @@ use crate::scribe::{
 /// Maximum number of Unicode scalar values admitted to either native parser.
 pub const MAX_QUERY_LENGTH: usize = 10_000;
 
+/// Maximum complete prefix expansion per CASS text field and index leaf.
+/// Queries that need more terms fail instead of silently omitting matches.
+pub const CASS_PREFIX_EXPANSION_LIMIT: usize = 1024;
+
 /// Bound tokenizer-driven CASS expansion independently of the input length.
 const CASS_MAX_QUERY_FRAGMENTS: usize = 256;
 
@@ -5436,9 +5440,10 @@ impl CassQueryParser {
                 }
                 if cass_needs_indexed_fragments(raw) {
                     let ascii_tail = fragments.terms.last().is_some_and(|term| term.is_ascii());
+                    let implicit_prefix = (2..=20).contains(&raw.chars().take(21).count());
                     return Ok(Some(self.lower_indexed_fragments(
                         &fragments,
-                        prefix && fragments.ends_with_token && ascii_tail,
+                        (prefix || implicit_prefix) && fragments.ends_with_token && ascii_tail,
                     )));
                 }
                 if term.chars().any(is_cass_cjk) {
@@ -5479,8 +5484,8 @@ impl CassQueryParser {
             QueryField::new(self.fields.title, 1.0),
             QueryField::new(self.fields.content, 1.0),
         ]);
-        if !prefix && !terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
-            if terms.len() == 1 {
+        if !terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
+            if terms.len() == 1 && !prefix {
                 return Query::term(fields, terms[0].clone());
             }
             // Fragments of one source word must be adjacent, ordered, and in
@@ -5493,32 +5498,39 @@ impl CassQueryParser {
                     .map(|(text, position)| PositionedTerm::new(*position, text.clone()))
                     .collect(),
                 0,
-                false,
+                prefix,
             );
         }
         // CJK bigrams share an analyzer position but are all required: treating
         // them as phrase alternatives would admit only one of the bigrams.
-        // Explicit prefixes retain the existing bounded prefix-column route.
-        let clauses = [
-            (self.fields.title, self.fields.title_prefix),
-            (self.fields.content, self.fields.content_prefix),
-        ]
-        .into_iter()
-        .map(|(field, prefix_field)| {
-            let required = terms
-                .iter()
-                .enumerate()
-                .map(|(index, term)| {
-                    let mut fields = vec![QueryField::new(field, 1.0)];
-                    if prefix && index + 1 == terms.len() {
-                        fields.push(QueryField::new(prefix_field, 1.0));
-                    }
-                    Query::term(fields, term.clone())
-                })
-                .collect();
-            BooleanClause::new(Occur::Should, cass_required_query(required))
-        })
-        .collect();
+        // A final ASCII prefix expands in the same full-text field as the
+        // required bigrams, independently of the legacy prefix-column caps.
+        let clauses = [self.fields.title, self.fields.content]
+            .into_iter()
+            .map(|field| {
+                let required = terms
+                    .iter()
+                    .enumerate()
+                    .map(|(index, term)| {
+                        let fields = vec![QueryField::new(field, 1.0)];
+                        if prefix && index + 1 == terms.len() {
+                            Query::phrase(
+                                fields,
+                                vec![PositionedTerm::new(
+                                    fragments.positions[index],
+                                    term.clone(),
+                                )],
+                                0,
+                                true,
+                            )
+                        } else {
+                            Query::term(fields, term.clone())
+                        }
+                    })
+                    .collect();
+                BooleanClause::new(Occur::Should, cass_required_query(required))
+            })
+            .collect();
         Query::boolean(clauses, Some(BooleanOperator::Or))
     }
 
@@ -6557,20 +6569,31 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
-    fn cass_phrase_matches(doc: CassEvalDoc, field: QueryField, phrase: &[PositionedTerm]) -> bool {
+    fn cass_phrase_matches(
+        doc: CassEvalDoc,
+        field: QueryField,
+        phrase: &[PositionedTerm],
+        prefix: bool,
+    ) -> bool {
         let haystack = cass_field_terms(doc, field.field_id);
         let Some(first) = phrase.first() else {
             return false;
         };
         haystack.iter().any(|candidate| {
-            candidate.text == first.text
-                && phrase.iter().all(|needle| {
+            (candidate.text == first.text
+                || (prefix && phrase.len() == 1 && candidate.text.starts_with(&first.text)))
+                && phrase.iter().enumerate().all(|(index, needle)| {
                     let position = candidate
                         .position
                         .saturating_add(needle.position.saturating_sub(first.position));
-                    haystack
-                        .iter()
-                        .any(|term| term.position == position && term.text == needle.text)
+                    haystack.iter().any(|term| {
+                        term.position == position
+                            && if prefix && index + 1 == phrase.len() {
+                                term.text.starts_with(&needle.text)
+                            } else {
+                                term.text == needle.text
+                            }
+                    })
                 })
         })
     }
@@ -6696,10 +6719,15 @@ mod tests {
                 .iter()
                 .copied()
                 .any(|field| cass_term_matches(doc, field, text)),
-            QueryNode::Phrase { fields, terms, .. } => fields
+            QueryNode::Phrase {
+                fields,
+                terms,
+                prefix,
+                ..
+            } => fields
                 .iter()
                 .copied()
-                .any(|field| cass_phrase_matches(doc, field, terms)),
+                .any(|field| cass_phrase_matches(doc, field, terms, *prefix)),
             QueryNode::Range {
                 field_id,
                 lower,
@@ -7246,11 +7274,11 @@ mod tests {
     fn cass_recovered_words_keep_analyzer_positions_before_sanitizing() {
         let parser = cass_parser();
         let filters = CassQueryFilters::default();
-        for (raw, expected) in [
-            ("kérlek", vec!["k", "rlek"]),
-            ("KÉRLEK", vec!["k", "rlek"]),
-            ("ke\u{301}rlek", vec!["ke", "rlek"]),
-            ("\"ke\u{301}rlek\"", vec!["ke", "rlek"]),
+        for (raw, expected, expected_prefix) in [
+            ("kérlek", vec!["k", "rlek"], true),
+            ("KÉRLEK", vec!["k", "rlek"], true),
+            ("ke\u{301}rlek", vec!["ke", "rlek"], true),
+            ("\"ke\u{301}rlek\"", vec!["ke", "rlek"], false),
         ] {
             let parsed = parser.parse(raw, &filters);
             assert!(parsed.diagnostics.is_empty(), "{raw:?}");
@@ -7279,7 +7307,7 @@ mod tests {
                 [0, 1]
             );
             assert_eq!(*slop, 0);
-            assert!(!prefix);
+            assert_eq!(*prefix, expected_prefix);
         }
         assert_eq!(
             cass_operand_parts("kérlek--mentést,café ke\u{301}rlek"),
@@ -8000,7 +8028,16 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-        for empty_operand in ["\"\"", "\" \u{2003}\"", "\"🚀\""] {
+        for empty_operand in [
+            "\"\"",
+            "\" \u{2003}\"",
+            "\"🚀\"",
+            "()",
+            "(NOT)",
+            "(AND OR)",
+            "(())",
+            "(",
+        ] {
             queries.extend([
                 format!("backup AND {empty_operand}"),
                 format!("kérlek AND {empty_operand}"),

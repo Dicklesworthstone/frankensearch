@@ -19,6 +19,11 @@
 //! its index and calls [`cass_schema_hash_matches`] on open. A changed
 //! sentinel means "rebuild in a new generation". The older directory remains
 //! intact while the caller builds and validates its replacement.
+//!
+//! Applications retaining an existing `v9-quill` generation can explicitly
+//! select [`legacy_v9`] for its directory, sentinel, and document identities.
+//! The compiled field schema and tokenizer bytes are shared, so query-only
+//! corrections do not require an identity migration or an index rebuild.
 
 use std::path::{Path, PathBuf};
 
@@ -71,6 +76,68 @@ pub fn cass_index_dir(base: &Path) -> std::io::Result<PathBuf> {
     let dir = base.join("index").join(CASS_SCHEMA_VERSION);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Explicit access to an existing `v9-quill` identity generation.
+///
+/// The field schema and analyzers are unchanged between v9 and v10. A caller
+/// can therefore adopt corrected queries while retaining its v9 directory and
+/// primary keys. Every writer, upsert, and deletion must use this same identity
+/// policy; accepting a v9 sentinel while writing v10 identities would duplicate
+/// existing messages instead of revising them.
+///
+/// This policy deliberately retains v9's delimiter-based identities, including
+/// their historical ambiguities. Migration to the default length-prefixed
+/// identities remains a separate, explicit generation rebuild.
+pub mod legacy_v9 {
+    use super::{CassConversationKey, CassDocument, Path, PathBuf, SchemaDocument};
+
+    /// Directory generation used by CASS before the identity migration.
+    pub const CASS_SCHEMA_VERSION: &str = "v9-quill";
+
+    /// Exact sentinel written by the original v9 profile.
+    pub const CASS_SCHEMA_HASH: &str = "quill-fslx-schema-v9-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
+
+    /// Whether `stored` names the retained v9 schema and identity policy.
+    #[must_use]
+    pub fn cass_schema_hash_matches(stored: &str) -> bool {
+        stored == CASS_SCHEMA_HASH
+    }
+
+    /// Resolve and create the retained v9 index directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the directory cannot be created.
+    pub fn cass_index_dir(base: &Path) -> std::io::Result<PathBuf> {
+        let dir = base.join("index").join(CASS_SCHEMA_VERSION);
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// Reproduce a v9 primary key for reads, upserts, and deletions.
+    #[must_use]
+    pub fn cass_document_identity(
+        source_id: &str,
+        conversation: CassConversationKey<'_>,
+        msg_idx: u64,
+    ) -> String {
+        let path = conversation.source_path;
+        conversation.id.map_or_else(
+            || format!("{source_id}#{path}#{msg_idx}"),
+            |id| format!("{source_id}#{path}#{id}#{msg_idx}"),
+        )
+    }
+
+    /// Project unchanged CASS columns using the retained v9 primary key.
+    #[must_use]
+    pub fn to_schema_document(document: &CassDocument) -> SchemaDocument {
+        document.to_schema_document_with_identity(cass_document_identity(
+            &document.source_id,
+            CassConversationKey::for_document(document.as_ref()),
+            document.msg_idx,
+        ))
+    }
 }
 
 /// Segment-count threshold at which a CASS index wants compaction.
@@ -471,14 +538,18 @@ impl CassDocument {
     /// batch can skip the copy by building [`CassFieldValues`] directly.
     #[must_use]
     pub fn to_schema_document(&self) -> SchemaDocument {
+        self.to_schema_document_with_identity(cass_document_identity(
+            &self.source_id,
+            CassConversationKey::for_document(self.as_ref()),
+            self.msg_idx,
+        ))
+    }
+
+    fn to_schema_document_with_identity(&self, id: String) -> SchemaDocument {
         let derived = CassDerivedColumns::derive(self.as_ref());
         let values = CassFieldValues::build(self.as_ref(), &derived);
         SchemaDocument {
-            id: cass_document_identity(
-                &self.source_id,
-                CassConversationKey::for_document(self.as_ref()),
-                self.msg_idx,
-            ),
+            id,
             indexed: values
                 .indexed
                 .iter()
@@ -951,6 +1022,13 @@ mod tests {
                 ("decomposed", "review", "ke\u{301}rlek segits markernfd"),
                 ("decomposed_gap", "review", "ke elsewhere rlek"),
                 ("decomposed_fields", "ke", "rlek"),
+                ("singleton_exact", "review", "éx"),
+                ("singleton_long", "review", "éxray"),
+                ("singleton_interior", "review", "axray"),
+                ("at_prefix_limit", "review", "éabcdefghijklmnopqrs"),
+                ("at_prefix_limit_long", "review", "éabcdefghijklmnopqrssuffix"),
+                ("beyond_prefix_limit", "review", "ézyxwvutsrqponmlkjihg"),
+                ("beyond_prefix_limit_long", "review", "ézyxwvutsrqponmlkjihgsuffix"),
                 ("french", "review", "élève déjà naïve façade"),
                 ("german", "review", "über Straße schön"),
                 ("punctuation", "review", "pré-commit l'été"),
@@ -1030,10 +1108,25 @@ mod tests {
                 "space_collision",
                 "deep_content",
             ];
+            let word = [
+                "hungarian",
+                "uppercase",
+                "accent_collision",
+                "space_collision",
+                "deep_content",
+                "longer_word",
+            ];
             for raw in [
                 "kérlek",
                 "KÉRLEK",
+                "kér*",
+                "kérl*",
+                "kérlek*",
                 "kérlek AND markerkeep",
+            ] {
+                assert_multilingual_matches(&cx, &reader, &labels, raw, &word);
+            }
+            for raw in [
                 "\"kérlek\"",
                 "\"kérlek segits\"",
                 "\"KÉRLEK, segits\"",
@@ -1042,7 +1135,23 @@ mod tests {
             }
             for (raw, expected) in [
                 ("ke\u{301}rlek", &["decomposed"][..]),
+                ("ke\u{301}r*", &["decomposed"][..]),
                 ("\"ke\u{301}rlek\"", &["decomposed"][..]),
+                ("éx", &["singleton_exact", "singleton_long"][..]),
+                ("éx*", &["singleton_exact", "singleton_long"][..]),
+                ("\"éx\"", &["singleton_exact"][..]),
+                ("xé", &["singleton_exact"][..]),
+                ("xé*", &["singleton_exact"][..]),
+                (
+                    "éabcdefghijklmnopqrs",
+                    &["at_prefix_limit", "at_prefix_limit_long"][..],
+                ),
+                ("\"éabcdefghijklmnopqrs\"", &["at_prefix_limit"][..]),
+                ("ézyxwvutsrqponmlkjihg", &["beyond_prefix_limit"][..]),
+                (
+                    "ézyxwvutsrqponmlkjihg*",
+                    &["beyond_prefix_limit", "beyond_prefix_limit_long"][..],
+                ),
                 ("élève", &["french"][..]),
                 ("\"élève déjà\"", &["french"][..]),
                 ("façade", &["french"][..]),
@@ -1051,6 +1160,7 @@ mod tests {
                 ("schön", &["german"][..]),
                 ("\"pré-commit\"", &["punctuation"][..]),
                 ("İSTANBUL", &["dotted_i"][..]),
+                ("İSTAN*", &["dotted_i"][..]),
                 ("istanbul", &["ascii_i"][..]),
                 ("Kelvin", &["kelvin_sign"][..]),
                 ("kelvin", &["ascii_kelvin"][..]),
@@ -1076,13 +1186,348 @@ mod tests {
             let complement: Vec<_> = fixtures
                 .iter()
                 .map(|(label, _, _)| *label)
-                .filter(|label| !exact.contains(label))
+                .filter(|label| !word.contains(label))
                 .collect();
             assert_multilingual_matches(&cx, &reader, &labels, "NOT kérlek", &complement);
             let all: Vec<_> = fixtures.iter().map(|(label, _, _)| *label).collect();
             for raw in ["", " \t\n", "NOT absentasciiword"] {
                 assert_multilingual_matches(&cx, &reader, &labels, raw, &all);
             }
+        });
+    }
+
+    /// Prefix completion must not inherit the generic parser's 50-term cap,
+    /// depend on the bounded prefix column, or lose phrase positions. Merging
+    /// changes dictionary layout but must preserve membership and pagination.
+    #[test]
+    fn cass_multilingual_prefixes_are_complete_and_positional_across_merge() {
+        use std::collections::BTreeSet;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("CASS prefix completeness index");
+            let config = crate::QuillConfig {
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let writer = crate::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create prefix completeness writer");
+            let mut documents: Vec<_> = (0_u64..128)
+                .map(|ordinal| {
+                    let content = if ordinal == 127 {
+                        format!(
+                            "{} kér{ordinal:04} selected",
+                            "filler ".repeat(CONTENT_PREFIX_MAX_BYTES / 7 + 2)
+                        )
+                    } else if ordinal == 0 {
+                        "kér0000 kér0001 selected".to_owned()
+                    } else {
+                        format!("kér{ordinal:04} selected")
+                    };
+                    sample_document(
+                        &format!("prefix-{ordinal:03}"),
+                        ordinal,
+                        "codex",
+                        "fixture",
+                        &content,
+                    )
+                    .to_schema_document()
+                })
+                .collect();
+            let selected: BTreeSet<_> = documents
+                .iter()
+                .map(|document| document.id.clone())
+                .collect();
+            for (label, title, content) in [
+                ("separated-prefix", "fixture", "k elsewhere r0000"),
+                ("reversed-prefix", "fixture", "r0001 k"),
+                ("cross-field-prefix", "k", "r0002"),
+            ] {
+                documents
+                    .push(sample_document(label, 0, "codex", title, content).to_schema_document());
+            }
+            let all: BTreeSet<_> = documents
+                .iter()
+                .map(|document| document.id.clone())
+                .collect();
+            for batch in documents.chunks(64) {
+                writer
+                    .index_schema_documents(&cx, batch)
+                    .await
+                    .expect("index prefix batch");
+                writer.commit(&cx).await.expect("seal prefix batch");
+            }
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("CASS parser");
+            for after_merge in [false, true] {
+                let reader = crate::QuillSearchIndex::open_with_schema(
+                    &cx,
+                    directory.path(),
+                    crate::schema::CASS_SEMANTIC_SCHEMA,
+                    config.clone(),
+                )
+                .await
+                .expect("open prefix snapshot");
+                for (raw, expected) in [
+                    ("kér", &selected),
+                    ("kér*", &selected),
+                    ("KÉR*", &selected),
+                    ("ér*", &all),
+                ] {
+                    let parsed = parser.parse(raw, &crate::query::CassQueryFilters::default());
+                    for exact_count in [false, true] {
+                        let result = reader
+                            .search_preparsed_paginated(
+                                &cx,
+                                &parsed.query,
+                                documents.len(),
+                                0,
+                                exact_count,
+                            )
+                            .expect("complete CASS prefix search");
+                        let actual: BTreeSet<_> = result
+                            .hits
+                            .iter()
+                            .map(|hit| hit.document_id.clone())
+                            .collect();
+                        assert_eq!(actual, *expected, "{raw:?}, merged={after_merge}");
+                        assert_eq!(
+                            result.hits.len(),
+                            expected.len(),
+                            "completion unions must not duplicate rows"
+                        );
+                        if exact_count {
+                            assert_eq!(
+                                result.total_count,
+                                Some(u64::try_from(expected.len()).expect("fixture count"))
+                            );
+                        }
+                        let page = reader
+                            .search_preparsed_paginated(&cx, &parsed.query, 23, 51, exact_count)
+                            .expect("page beyond the old 50-completion limit");
+                        assert_eq!(
+                            page.hits.as_ref(),
+                            &result.hits[51..74],
+                            "stable prefix pagination"
+                        );
+                        if exact_count {
+                            assert_eq!(page.total_count, result.total_count);
+                        }
+                    }
+                }
+                drop(reader);
+                if !after_merge {
+                    let snapshot = writer.snapshot().expect("prefix segment snapshot");
+                    assert!(snapshot.segments().len() >= 2);
+                    let inputs: Vec<_> = snapshot
+                        .segments()
+                        .iter()
+                        .map(|segment| segment.manifest().segment_id)
+                        .collect();
+                    let mut output = 0x0C0A_7100_u64;
+                    while inputs.contains(&output) {
+                        output += 1;
+                    }
+                    drop(snapshot);
+                    writer
+                        .concat_merge(&cx, &inputs, output, 1_700_000_000)
+                        .await
+                        .expect("merge prefix dictionaries");
+                    assert_eq!(
+                        writer.snapshot().expect("merged snapshot").segments().len(),
+                        1
+                    );
+                }
+            }
+        });
+    }
+
+    /// The documented limit is per field and per immutable leaf. At the
+    /// boundary all completions are searchable; the next completion refuses
+    /// the whole query, including complements and otherwise successful ORs.
+    #[test]
+    fn cass_multilingual_prefix_budget_is_complete_or_errors_without_partial_results() {
+        use std::collections::BTreeSet;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("CASS prefix budget index");
+            let config = crate::QuillConfig {
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let writer = crate::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create prefix budget writer");
+            let documents: Vec<_> = (0_u64..1_025)
+                .map(|ordinal| {
+                    sample_document(
+                        "prefix-budget",
+                        ordinal,
+                        "codex",
+                        "fixture",
+                        &format!("kér{ordinal:04} selected"),
+                    )
+                    .to_schema_document()
+                })
+                .collect();
+            // Seed the scalar accumulator, then keep batches below the bulk
+            // parallel route so the boundary is exercised in a single leaf.
+            writer
+                .index_schema_documents(&cx, &documents[..1])
+                .await
+                .expect("seed prefix corpus");
+            for batch in documents[1..1_024].chunks(64) {
+                writer
+                    .index_schema_documents(&cx, batch)
+                    .await
+                    .expect("index bounded prefix batch");
+            }
+            writer
+                .commit(&cx)
+                .await
+                .expect("seal exactly 1024 completions");
+            assert_eq!(
+                writer
+                    .snapshot()
+                    .expect("boundary snapshot")
+                    .segments()
+                    .len(),
+                1
+            );
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("CASS parser");
+            for count in [1_024, 1_025] {
+                if count == 1_025 {
+                    writer
+                        .index_schema_documents(&cx, &documents[1_024..])
+                        .await
+                        .expect("add one distinct completion");
+                    writer
+                        .commit(&cx)
+                        .await
+                        .expect("seal the second prefix leaf");
+                    assert_eq!(
+                        writer
+                            .snapshot()
+                            .expect("two-leaf snapshot")
+                            .segments()
+                            .len(),
+                        2
+                    );
+                }
+                let reader = crate::QuillSearchIndex::open_with_schema(
+                    &cx,
+                    directory.path(),
+                    crate::schema::CASS_SEMANTIC_SCHEMA,
+                    config.clone(),
+                )
+                .await
+                .expect("read per-leaf prefix boundary");
+                let expected: BTreeSet<_> = documents[..count]
+                    .iter()
+                    .map(|document| document.id.clone())
+                    .collect();
+                for raw in ["kér", "kér*", "ér*"] {
+                    let parsed = parser.parse(raw, &crate::query::CassQueryFilters::default());
+                    let result = reader
+                        .search_preparsed_paginated(&cx, &parsed.query, count + 1, 0, true)
+                        .expect("all per-leaf completions within the bound must be returned");
+                    let actual: BTreeSet<_> = result
+                        .hits
+                        .iter()
+                        .map(|hit| hit.document_id.clone())
+                        .collect();
+                    assert_eq!(actual, expected, "{raw:?}, corpus={count}");
+                    assert_eq!(
+                        result.total_count,
+                        Some(u64::try_from(count).expect("fixture count"))
+                    );
+                }
+            }
+
+            let snapshot = writer.snapshot().expect("pre-merge budget snapshot");
+            let inputs: Vec<_> = snapshot
+                .segments()
+                .iter()
+                .map(|segment| segment.manifest().segment_id)
+                .collect();
+            let mut output = 0x0C0A_7200_u64;
+            while inputs.contains(&output) {
+                output += 1;
+            }
+            drop(snapshot);
+            writer
+                .concat_merge(&cx, &inputs, output, 1_700_000_001)
+                .await
+                .expect("merge to 1025 completions in one leaf");
+            assert_eq!(
+                writer
+                    .snapshot()
+                    .expect("over-budget snapshot")
+                    .segments()
+                    .len(),
+                1
+            );
+            let reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config,
+            )
+            .await
+            .expect("open over-budget prefix leaf");
+            for raw in [
+                "kér",
+                "kér*",
+                "ér*",
+                "NOT kér*",
+                "NOT NOT kér*",
+                "selected OR kér*",
+                "selected OR NOT kér*",
+                "absentfixedterm AND kér*",
+            ] {
+                let parsed = parser.parse(raw, &crate::query::CassQueryFilters::default());
+                for exact_count in [false, true] {
+                    let error = reader
+                        .search_preparsed_paginated(&cx, &parsed.query, 10, 0, exact_count)
+                        .expect_err("over-budget prefix must never yield partial results or match-all");
+                    assert!(
+                        matches!(
+                            &error,
+                            crate::QuillIndexError::Dictionary(
+                                crate::TermDictionaryError::GlobExpansionLimitExceeded {
+                                    field_ord: field::CONTENT,
+                                    limit: 1_024,
+                                    actual: 1_025,
+                                }
+                            )
+                        ),
+                        "{raw:?}, exact={exact_count}: {error}"
+                    );
+                }
+            }
+            let quoted = parser.parse("\"kér\"", &crate::query::CassQueryFilters::default());
+            let exact = reader
+                .search_preparsed_paginated(&cx, &quoted.query, 10, 0, true)
+                .expect("exact phrases do not expand prefixes");
+            assert!(exact.hits.is_empty());
+            assert_eq!(exact.total_count, Some(0));
         });
     }
 
@@ -1176,9 +1621,11 @@ mod tests {
         });
     }
 
-    /// Opt-in large-index measurement. The live control is the existing quoted
-    /// ASCII-fragment query; this reports normalization overhead, not a speedup
-    /// against an older binary. Corpus construction is streamed in small batches.
+    /// Opt-in large-index measurement of exact-query normalization. The live
+    /// A/A control is the existing quoted ASCII-fragment query, compared with
+    /// the equivalent quoted accented query. This reports normalization overhead,
+    /// not a speedup against an older binary. Implicit-prefix timing is outside
+    /// this probe. Corpus construction is streamed in small batches.
     ///
     /// CASS_MULTILINGUAL_PERF_DOCS=100000 (default) or 1000000; run with:
     /// cargo test -p frankensearch-quill --release cass_multilingual_query_scaling -- --ignored --nocapture
@@ -1278,7 +1725,6 @@ mod tests {
                 ("aligned_phrase", "\"k rlek\""),
                 ("aligned_phrase_repeat", "\"k rlek\""),
                 ("accented_phrase", "\"kérlek\""),
-                ("accented_word", "kérlek"),
                 ("ascii_control", "markerselected"),
             ];
 
@@ -1543,8 +1989,8 @@ mod tests {
             for (raw, expected) in [
                 // A recovered word requires adjacent fragments; row 2 has
                 // intervening words and therefore is no longer a match.
-                ("kérlek", &[0, 5, 12][..]),
-                ("KÉRLEK", &[0, 5, 12]),
+                ("kérlek", &[0, 4, 5, 12][..]),
+                ("KÉRLEK", &[0, 4, 5, 12]),
                 ("\"kérlek\"", &[0, 5, 12]),
                 ("\"kérlek nézd\"", &[0, 12]),
                 ("\"nézd kérlek\"", &[5]),
@@ -1562,10 +2008,10 @@ mod tests {
                     &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
                 ),
                 ("backup AND NOT \"kérlek nézd\"", &[1]),
-                ("kér*", &[0, 5, 12]),
-                ("kérl*", &[0, 2, 4, 5, 12]),
-                ("(kérlek OR backup) NOT mentés", &[1, 5, 12]),
-                ("NOT NOT kérlek", &[0, 5, 12]),
+                ("kér*", &[0, 4, 5, 12]),
+                ("kérl*", &[0, 4, 5, 12]),
+                ("(kérlek OR backup) NOT mentés", &[1, 4, 5, 12]),
+                ("NOT NOT kérlek", &[0, 4, 5, 12]),
                 ("backup AND NOT kérlek", &[1]),
                 ("backup OR kérlek AND mentés", &[0, 1]),
                 ("Straße", &[6]),
@@ -1574,7 +2020,7 @@ mod tests {
                 ("DÉJÀ", &[6]),
                 ("ZAŻÓŁĆ", &[6]),
                 ("PŘÍLIŠ", &[6]),
-                ("İstanbul", &[8]),
+                ("İstanbul", &[0, 8]),
                 ("İstan*", &[0, 8]),
                 ("istanbul", &[7]),
                 ("ke\u{301}rlek", &[9]),
@@ -2193,6 +2639,210 @@ mod tests {
             "the Tantivy-era sentinel must force a rebuild, never be accepted as current"
         );
         assert!(!cass_schema_hash_matches(""));
+    }
+
+    #[test]
+    fn legacy_v9_preserves_its_exact_sentinel_identity_and_columns() {
+        use CassConversationKey as Key;
+
+        assert_eq!(legacy_v9::CASS_SCHEMA_VERSION, "v9-quill");
+        assert_eq!(
+            legacy_v9::CASS_SCHEMA_HASH,
+            "quill-fslx-schema-v9-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external"
+        );
+        assert!(legacy_v9::cass_schema_hash_matches(
+            legacy_v9::CASS_SCHEMA_HASH
+        ));
+        assert!(!legacy_v9::cass_schema_hash_matches(CASS_SCHEMA_HASH));
+        assert!(!cass_schema_hash_matches(legacy_v9::CASS_SCHEMA_HASH));
+        assert!(!legacy_v9::cass_schema_hash_matches(""));
+        assert!(!legacy_v9::cass_schema_hash_matches(
+            "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external"
+        ));
+        for (source, path, conversation_id, ordinal, expected) in [
+            ("local", "/a.jsonl", None, 0, "local#/a.jsonl#0"),
+            ("local", "/a.jsonl", Some(7), 1, "local#/a.jsonl#7#1"),
+            ("café", "/é.jsonl", Some(-3), 9, "café#/é.jsonl#-3#9"),
+            ("source#part", "/a#7", None, 0, "source#part#/a#7#0"),
+        ] {
+            assert_eq!(
+                legacy_v9::cass_document_identity(source, Key::new(path, conversation_id), ordinal),
+                expected
+            );
+        }
+
+        let document = sample_document("legacy", 4, "codex", "pré-commit", "kérlek café");
+        let current = document.to_schema_document();
+        let retained = legacy_v9::to_schema_document(&document);
+        assert_eq!(retained.id, "legacy#/transcripts/legacy.jsonl#42#4");
+        assert_ne!(retained.id, current.id);
+        assert_eq!(retained.indexed, current.indexed);
+        assert_eq!(retained.numeric, current.numeric);
+        assert_eq!(retained.stored, current.stored);
+    }
+
+    /// Seed independently spelled v9 primary keys, then exercise the new
+    /// query path and the explicit retained-identity writer against those keys.
+    /// A writer that silently adopts v10 would leave duplicate/stale messages.
+    #[test]
+    fn legacy_v9_reopens_upserts_and_deletes_without_changing_generation() {
+        use std::collections::BTreeSet;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("retained CASS generation root");
+            let legacy_path = legacy_v9::cass_index_dir(directory.path()).expect("v9 directory");
+            assert_eq!(legacy_path, directory.path().join("index/v9-quill"));
+            let config = crate::QuillConfig {
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let mut documents = [
+                sample_document("legacy", 0, "codex", "review", "kérlek original markerkeep"),
+                sample_document(
+                    "legacy",
+                    1,
+                    "codex",
+                    "review",
+                    "backup unaffected markerkeep",
+                ),
+            ];
+            documents[0].source_path = "/archive/one.jsonl".to_owned();
+            documents[0].conversation_id = Some(7);
+            documents[1].source_path = "/archive/two.jsonl".to_owned();
+            documents[1].conversation_id = None;
+            let identities = [
+                "legacy#/archive/one.jsonl#7#0",
+                "legacy#/archive/two.jsonl#1",
+            ];
+            let mut persisted: Vec<_> = documents
+                .iter()
+                .map(CassDocument::to_schema_document)
+                .collect();
+            for (document, identity) in persisted.iter_mut().zip(identities) {
+                document.id = identity.to_owned();
+            }
+            let writer = crate::QuillIndex::create_with_schema(
+                &cx,
+                &legacy_path,
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create original v9 generation");
+            writer
+                .index_schema_documents(&cx, &persisted)
+                .await
+                .expect("seed original v9 primary keys");
+            writer.commit(&cx).await.expect("seal original generation");
+            drop(writer);
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("corrected CASS parser");
+            let query_ids = |reader: &crate::QuillSearchIndex, raw: &str| {
+                let parsed = parser.parse(raw, &crate::query::CassQueryFilters::default());
+                let result = reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                    .expect("search retained generation");
+                assert_eq!(
+                    result.total_count,
+                    Some(u64::try_from(result.hits.len()).expect("small result count"))
+                );
+                result
+                    .hits
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
+                    .collect::<BTreeSet<_>>()
+            };
+            let reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                &legacy_path,
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("read existing v9 index without rebuilding");
+            assert_eq!(
+                query_ids(&reader, "kérlek"),
+                BTreeSet::from([identities[0].to_owned()])
+            );
+            assert_eq!(reader.doc_count().expect("original count"), 2);
+            drop(reader);
+
+            let writer = crate::QuillIndex::open_with_schema(
+                &cx,
+                &legacy_path,
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("retain writer generation");
+            documents[0].content = "kérlek revised markerkeep".to_owned();
+            writer
+                .upsert_schema_documents(&cx, &[legacy_v9::to_schema_document(&documents[0])])
+                .await
+                .expect("revise the existing v9 primary key");
+            writer.commit(&cx).await.expect("publish v9 revision");
+            drop(writer);
+
+            let reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                &legacy_path,
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("read revised v9 generation");
+            assert_eq!(reader.doc_count().expect("revision count"), 2);
+            assert_eq!(
+                query_ids(&reader, "revised"),
+                BTreeSet::from([identities[0].to_owned()])
+            );
+            assert!(query_ids(&reader, "original").is_empty());
+            assert_eq!(
+                query_ids(&reader, "unaffected"),
+                BTreeSet::from([identities[1].to_owned()])
+            );
+            drop(reader);
+
+            let writer = crate::QuillIndex::open_with_schema(
+                &cx,
+                &legacy_path,
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("open retained generation for deletion");
+            let identity = legacy_v9::cass_document_identity(
+                &documents[0].source_id,
+                CassConversationKey::for_document(documents[0].as_ref()),
+                documents[0].msg_idx,
+            );
+            assert!(
+                writer
+                    .delete_document(&cx, &identity)
+                    .await
+                    .expect("delete revised v9 key")
+            );
+            drop(writer);
+            let reader = crate::QuillSearchIndex::open_with_schema(
+                &cx,
+                &legacy_path,
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config,
+            )
+            .await
+            .expect("read v9 generation after deletion");
+            assert_eq!(reader.doc_count().expect("deletion count"), 1);
+            assert!(query_ids(&reader, "kérlek").is_empty());
+            assert_eq!(
+                query_ids(&reader, "markerkeep"),
+                BTreeSet::from([identities[1].to_owned()])
+            );
+            assert!(!directory.path().join("index/v10-quill").exists());
+        });
     }
 
     #[test]

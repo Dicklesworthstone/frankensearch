@@ -212,14 +212,29 @@ phrase alternatives. This mixed-script route remains a same-field conjunction,
 so it does not enforce distances between runs. The existing pure CJK route in
 §4.5 remains unchanged.
 
-An explicit trailing star retains the existing prefix-column implementation:
-only the final ASCII fragment may use the corresponding prefix field, and
-only when its source token reaches the end of the operand. Thus café followed
-by a star still requires exact caf; a discarded trailing accent does not move
-the wildcard backward. The 2–20-character prefix-generation limit and bounded
-content-prefix coverage still apply. Explicit prefix fragments remain a
-same-field conjunction. This patch does not introduce complete dictionary
-prefix expansion or restore implicit prefixes for recovered bare words.
+Affected prefixes use the full title/content term dictionaries, retaining
+adjacency and field boundaries for the fixed Latin fragments. Only the final
+ASCII fragment can expand, and only when its source token reaches the end of
+the operand. Thus café followed by a star still requires exact caf; a discarded
+trailing accent does not move the wildcard backward. An explicit trailing star
+works at any admitted operand length. A bare affected operand retains CASS's
+implicit prefix behavior at 2–20 original Unicode scalar values; quoted
+operands remain exact. A single retained fragment also supports prefix matching.
+Mixed CJK operands retain their same-field conjunction, with only a terminal
+ASCII fragment eligible for dictionary expansion. Existing pure ASCII and pure
+CJK query interpretation is unchanged.
+
+Both adapters admit at most 1,024 distinct completions per target field and
+index leaf. They include every completion within this limit, including matches
+beyond the old generated-prefix coverage. Encountering a 1,025th completion
+refuses the complete search, including under OR or NOT; it never returns a
+truncated result set. Quill reports the typed dictionary expansion-limit error,
+and Tantivy rejects query weight construction after checking all segments.
+The limit is deliberately per leaf, so a merge can make a formerly admissible
+query exceed the limit and return an explicit error. Quill's work admission
+includes the larger expansion bound and reuses query-local document-frequency
+statistics. This policy is selected by the CASS text analyzer; default-schema
+phrase prefixes retain their pinned Tantivy 50-completion truncation contract.
 
 Reject the complete expression when a required operand has no indexed terms,
 contains an unsupported affected suffix/substring/interior wildcard, or contains
@@ -257,10 +272,11 @@ accent-insensitive matching require a separately versioned analyzer contract
 and rebuilt terms from canonical content.
 
 Upgrading released CASS v9-quill to current main's v10-quill is an unrelated
-document-identity migration. A no-reindex CASS correction must retain its
-compatible dependency line through a query-only backport or the existing
-typed-query API. It must not accept the old sentinel with a new identity
-writer or silently make that migration part of a lexical-query fix.
+document-identity migration. The explicit `cass::legacy_v9` module retains
+the v9 sentinel, index path, identity function and document projection as one
+opt-in contract. CASS adopts that complete contract when using the new engine
+on existing indexes; v10 defaults remain unchanged. Accepting the old sentinel
+with a v10 identity writer is never a compatible upgrade.
 
 ## 5. Scoring and statistics contract
 

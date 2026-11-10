@@ -12,15 +12,24 @@
   or uses an unsupported affected wildcard. Negation and OR cannot turn
   refusal into broad retrieval. Only blank/whitespace input intentionally
   browses; empty quotes, star-only and operator-only input match nothing.
-- Preserve the CASS Tantivy phrase scorer's monotone seek wrapper, structured
-  filters, grammar resource limits and the existing explicit prefix-column
-  implementation. Complete dictionary prefix expansion remains separate work.
+- Expand affected prefixes in the full title/content term dictionaries with
+  positional matching, including singleton fragments, long explicit prefixes
+  and deep-body matches. Restore bare-word implicit prefixes at 2–20 original
+  Unicode scalar values while keeping quoted operands exact.
+- Include every prefix completion up to 1,024 terms per field and leaf; refuse
+  the whole query at 1,025 instead of silently truncating results. Preserve the
+  default parser's separate 50-term contract, bounded work admission, shared
+  document-frequency statistics and Tantivy's monotone phrase scorer wrapper.
 - Add real-index negative regressions for displaced/reversed/cross-field and
   decomposed fragments, case mappings, CJK, unsupported operands and durable
   reopening. Add an opt-in streamed 100k/1m-document scaling probe; native
   execution and timings still require a working qualification environment.
-- Retain the released CASS v9 dependency generation for compatible adoption.
-  Upstream v10 document identities are an independent migration.
+- Expose an explicit `cass::legacy_v9` schema/identity/projection contract for
+  compatible adoption of the new engine by released CASS indexes. Add durable
+  reopen/upsert/delete regressions; upstream v10 defaults remain unchanged.
+- Add complete-prefix, merge-boundary, pagination/count and overflow-refusal
+  regressions for both backends. Native test qualification remains blocked:
+  the host killed `asupersync` compilation in both test and library checks.
 
 ### Unreleased — Recover watcher changes after notification overflow
 
