@@ -1026,9 +1026,17 @@ mod tests {
                 ("singleton_long", "review", "éxray"),
                 ("singleton_interior", "review", "axray"),
                 ("at_prefix_limit", "review", "éabcdefghijklmnopqrs"),
-                ("at_prefix_limit_long", "review", "éabcdefghijklmnopqrssuffix"),
+                (
+                    "at_prefix_limit_long",
+                    "review",
+                    "éabcdefghijklmnopqrssuffix",
+                ),
                 ("beyond_prefix_limit", "review", "ézyxwvutsrqponmlkjihg"),
-                ("beyond_prefix_limit_long", "review", "ézyxwvutsrqponmlkjihgsuffix"),
+                (
+                    "beyond_prefix_limit_long",
+                    "review",
+                    "ézyxwvutsrqponmlkjihgsuffix",
+                ),
                 ("french", "review", "élève déjà naïve façade"),
                 ("german", "review", "über Straße schön"),
                 ("punctuation", "review", "pré-commit l'été"),
@@ -1126,11 +1134,7 @@ mod tests {
             ] {
                 assert_multilingual_matches(&cx, &reader, &labels, raw, &word);
             }
-            for raw in [
-                "\"kérlek\"",
-                "\"kérlek segits\"",
-                "\"KÉRLEK, segits\"",
-            ] {
+            for raw in ["\"kérlek\"", "\"kérlek segits\"", "\"KÉRLEK, segits\""] {
                 assert_multilingual_matches(&cx, &reader, &labels, raw, &exact);
             }
             for (raw, expected) in [
@@ -1192,6 +1196,181 @@ mod tests {
             let all: Vec<_> = fixtures.iter().map(|(label, _, _)| *label).collect();
             for raw in ["", " \t\n", "NOT absentasciiword"] {
                 assert_multilingual_matches(&cx, &reader, &labels, raw, &all);
+            }
+        });
+    }
+
+    /// An explicit prefix searches the full positional fields, including
+    /// completions outside both historical edge-ngram bounds. The plain term
+    /// keeps its existing exact/edge-ngram behavior.
+    #[test]
+    fn explicit_ascii_prefixes_search_complete_fields_with_filters_and_pagination() {
+        use std::collections::BTreeSet;
+
+        const PREFIX: &str = "authenticationmiddleware";
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            assert!(PREFIX.len() > 20);
+            let directory = tempfile::tempdir().expect("ASCII prefix index");
+            let config = crate::QuillConfig {
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..crate::QuillConfig::default()
+            };
+            let writer = crate::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create ASCII prefix writer");
+            let padding = "padding ".repeat(CONTENT_PREFIX_MAX_BYTES / 8 + 1);
+            let mut documents: Vec<_> = (0_u64..80)
+                .map(|ordinal| {
+                    let content = format!("sharedmarker {padding}{PREFIX}{ordinal:04}");
+                    assert!(
+                        !cass_build_content_prefix_and_preview(&content)
+                            .0
+                            .contains("auth"),
+                        "the required match must lie beyond the prefix column"
+                    );
+                    sample_document(
+                        "ascii-prefix",
+                        ordinal,
+                        if ordinal % 2 == 0 { "codex" } else { "claude" },
+                        "fixture",
+                        &content,
+                    )
+                    .to_schema_document()
+                })
+                .collect();
+            for (ordinal, title, content) in [
+                (80, format!("{PREFIX}-component"), "sharedmarker".to_owned()),
+                (81, "fixture".to_owned(), format!("sharedmarker {PREFIX}")),
+                (
+                    82,
+                    "fixture".to_owned(),
+                    format!("sharedmarker not{PREFIX}"),
+                ),
+                (
+                    83,
+                    "fixture".to_owned(),
+                    "sharedmarker authentication middleware".to_owned(),
+                ),
+            ] {
+                documents.push(
+                    sample_document("ascii-prefix", ordinal, "codex", &title, &content)
+                        .to_schema_document(),
+                );
+            }
+            for batch in documents.chunks(40) {
+                writer
+                    .index_schema_documents(&cx, batch)
+                    .await
+                    .expect("index prefix batch");
+                writer.commit(&cx).await.expect("seal prefix batch");
+            }
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("CASS parser");
+            let defaults = crate::query::CassQueryFilters::default();
+            let scoped = crate::query::CassQueryFilters {
+                agents: vec!["codex".to_owned()],
+                created_from: Some(1_700_000_020),
+                created_to: Some(1_700_000_060),
+                ..Default::default()
+            };
+            let selected: BTreeSet<_> = documents[..82].iter().map(|doc| doc.id.clone()).collect();
+            let filtered: BTreeSet<_> = (20..=60)
+                .step_by(2)
+                .map(|ordinal| documents[ordinal].id.clone())
+                .collect();
+            let excluded: BTreeSet<_> = documents[82..].iter().map(|doc| doc.id.clone()).collect();
+            let exact = BTreeSet::from([documents[80].id.clone(), documents[81].id.clone()]);
+            let compound = BTreeSet::from([documents[80].id.clone()]);
+            let single_character: BTreeSet<_> = selected
+                .iter()
+                .cloned()
+                .chain(std::iter::once(documents[83].id.clone()))
+                .collect();
+            for after_merge in [false, true] {
+                let reader = crate::QuillSearchIndex::open_with_schema(
+                    &cx,
+                    directory.path(),
+                    crate::schema::CASS_SEMANTIC_SCHEMA,
+                    config.clone(),
+                )
+                .await
+                .expect("reopen ASCII prefix index");
+                for (raw, filters, expected) in [
+                    (format!("{PREFIX}*"), &defaults, &selected),
+                    ("authenticationm*".to_owned(), &defaults, &selected),
+                    ("auth*".to_owned(), &defaults, &single_character),
+                    ("a*".to_owned(), &defaults, &single_character),
+                    (format!("{}*", PREFIX.to_uppercase()), &defaults, &selected),
+                    (format!("{PREFIX}-*"), &defaults, &compound),
+                    (format!("{PREFIX}*"), &scoped, &filtered),
+                    ("auth*".to_owned(), &scoped, &filtered),
+                    ("a*".to_owned(), &scoped, &filtered),
+                    (format!("sharedmarker NOT {PREFIX}*"), &defaults, &excluded),
+                    (PREFIX.to_owned(), &defaults, &exact),
+                    (format!("\"{PREFIX}*\""), &defaults, &exact),
+                ] {
+                    let parsed = parser.parse(&raw, filters);
+                    for exact_count in [false, true] {
+                        let result = reader
+                            .search_preparsed_paginated(
+                                &cx,
+                                &parsed.query,
+                                documents.len(),
+                                0,
+                                exact_count,
+                            )
+                            .expect("complete ASCII prefix result");
+                        let actual: BTreeSet<_> = result
+                            .hits
+                            .iter()
+                            .map(|hit| hit.document_id.clone())
+                            .collect();
+                        assert_eq!(&actual, expected, "{raw:?}, merged={after_merge}");
+                        assert_eq!(
+                            result.hits.len(),
+                            expected.len(),
+                            "prefix union cannot duplicate rows"
+                        );
+                        assert_eq!(
+                            result.total_count,
+                            exact_count.then(|| u64::try_from(expected.len()).expect("count"))
+                        );
+                        let offset = result.hits.len().min(51);
+                        let end = result.hits.len().min(offset + 17);
+                        let page = reader
+                            .search_preparsed_paginated(&cx, &parsed.query, 17, offset, exact_count)
+                            .expect("complete ASCII prefix page");
+                        assert_eq!(page.hits.as_ref(), &result.hits[offset..end]);
+                        assert_eq!(page.total_count, result.total_count);
+                    }
+                }
+                drop(reader);
+                if !after_merge {
+                    let snapshot = writer.snapshot().expect("unmerged prefix snapshot");
+                    assert!(snapshot.segments().len() >= 2);
+                    let inputs: Vec<_> = snapshot
+                        .segments()
+                        .iter()
+                        .map(|segment| segment.manifest().segment_id)
+                        .collect();
+                    let mut output = 0x0C0A_7300_u64;
+                    while inputs.contains(&output) {
+                        output += 1;
+                    }
+                    drop(snapshot);
+                    writer
+                        .concat_merge(&cx, &inputs, output, 1_700_000_000)
+                        .await
+                        .expect("merge ASCII prefix index");
+                }
             }
         });
     }
@@ -1443,7 +1622,7 @@ mod tests {
                     .iter()
                     .map(|document| document.id.clone())
                     .collect();
-                for raw in ["kér", "kér*", "ér*"] {
+                for raw in ["kér", "kér*", "ér*", "r*"] {
                     let parsed = parser.parse(raw, &crate::query::CassQueryFilters::default());
                     let result = reader
                         .search_preparsed_paginated(&cx, &parsed.query, count + 1, 0, true)
@@ -1501,12 +1680,19 @@ mod tests {
                 "selected OR kér*",
                 "selected OR NOT kér*",
                 "absentfixedterm AND kér*",
+                "r*",
+                "NOT r*",
+                "selected OR r*",
+                "selected OR NOT r*",
+                "absentfixedterm AND r*",
             ] {
                 let parsed = parser.parse(raw, &crate::query::CassQueryFilters::default());
                 for exact_count in [false, true] {
                     let error = reader
                         .search_preparsed_paginated(&cx, &parsed.query, 10, 0, exact_count)
-                        .expect_err("over-budget prefix must never yield partial results or match-all");
+                        .expect_err(
+                            "over-budget prefix must never yield partial results or match-all",
+                        );
                     assert!(
                         matches!(
                             &error,
@@ -1703,7 +1889,11 @@ mod tests {
                 }
             }
             let ingest_elapsed = ingest_started.elapsed();
-            let segments = writer.snapshot().expect("published benchmark").segments().len();
+            let segments = writer
+                .snapshot()
+                .expect("published benchmark")
+                .segments()
+                .len();
             drop(writer);
 
             let reader = crate::QuillSearchIndex::open_with_schema(
@@ -1737,13 +1927,7 @@ mod tests {
                 let started = Instant::now();
                 let parsed = parser.parse(raw, &filters);
                 let result = reader
-                    .search_preparsed_paginated(
-                        &cx,
-                        &parsed.query,
-                        expected_ids.len() + 1,
-                        0,
-                        true,
-                    )
+                    .search_preparsed_paginated(&cx, &parsed.query, expected_ids.len() + 1, 0, true)
                     .expect("validate complete benchmark result set");
                 first_full_count_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
                 let actual: BTreeSet<_> = result
@@ -1768,10 +1952,8 @@ mod tests {
                 }
             }
 
-            let mut samples: Vec<Vec<std::time::Duration>> = queries
-                .iter()
-                .map(|_| Vec::with_capacity(rounds))
-                .collect();
+            let mut samples: Vec<Vec<std::time::Duration>> =
+                queries.iter().map(|_| Vec::with_capacity(rounds)).collect();
             for round in 0..rounds {
                 // Rotate the first query to avoid always favoring one arm's
                 // cache warmth. Both A/A controls use the live parser and index.

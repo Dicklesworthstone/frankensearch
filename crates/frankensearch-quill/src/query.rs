@@ -4906,7 +4906,7 @@ pub struct CassQueryFilters {
 pub enum CassWildcardPattern {
     /// No wildcard, lowered through exact term queries.
     Exact(String),
-    /// One trailing wildcard, accelerated through the prefix fields.
+    /// One trailing wildcard, expanded against the complete positional fields.
     Prefix(String),
     /// One leading wildcard, lowered through regex expansion.
     Suffix(String),
@@ -5429,6 +5429,23 @@ impl CassQueryParser {
                     return Err(QueryDiagnosticKind::DroppedFragment);
                 }
                 if cass_short_ascii_operand_is_admitted(raw.trim_matches('*')) {
+                    if prefix {
+                        // Edge-ngram columns cover only the first 4 KiB of a
+                        // body and prefixes through 20 characters. They are
+                        // useful for bare-term completion, but cannot answer
+                        // an explicit wildcard over the complete document.
+                        // The native prefix scorer validates its per-field,
+                        // per-leaf expansion bound before returning any hit.
+                        return Ok(Some(Query::phrase(
+                            Vec::from([
+                                QueryField::new(self.fields.title, 1.0),
+                                QueryField::new(self.fields.content, 1.0),
+                            ]),
+                            vec![PositionedTerm::new(0, term)],
+                            0,
+                            true,
+                        )));
+                    }
                     return Ok(Some(Query::term(self.fields.searchable(), term)));
                 }
                 // Admit the original spelling before any Unicode case mapping.
@@ -5466,7 +5483,9 @@ impl CassQueryParser {
                     return Err(QueryDiagnosticKind::DroppedFragment);
                 }
                 if !cass_short_ascii_operand_is_admitted(raw.trim_matches('*'))
-                    && cass_analyzed_fragments(raw.trim_matches('*'))?.terms.is_empty()
+                    && cass_analyzed_fragments(raw.trim_matches('*'))?
+                        .terms
+                        .is_empty()
                 {
                     return Err(QueryDiagnosticKind::DroppedFragment);
                 }
@@ -5555,7 +5574,10 @@ impl CassQueryParser {
             let fragments = cass_analyzed_fragments(&parts.join(" "))?;
             return Ok(self.lower_indexed_fragments(&fragments, false));
         }
-        let terms = parts.iter().map(|part| part.to_lowercase()).collect::<Vec<_>>();
+        let terms = parts
+            .iter()
+            .map(|part| part.to_lowercase())
+            .collect::<Vec<_>>();
         if terms.len() > CASS_MAX_QUERY_FRAGMENTS {
             return Err(QueryDiagnosticKind::DroppedFragment);
         }
@@ -7299,7 +7321,10 @@ mod tests {
                 ]
             );
             assert_eq!(
-                terms.iter().map(|term| term.text.as_str()).collect::<Vec<_>>(),
+                terms
+                    .iter()
+                    .map(|term| term.text.as_str())
+                    .collect::<Vec<_>>(),
                 expected
             );
             assert_eq!(
@@ -7355,7 +7380,10 @@ mod tests {
                 format!("NOT (backup AND {operand})"),
             ] {
                 let parsed = parser.parse(&raw, &filters);
-                assert!(parsed.query.is_empty(), "{raw:?} must refuse the entire query");
+                assert!(
+                    parsed.query.is_empty(),
+                    "{raw:?} must refuse the entire query"
+                );
                 assert!(
                     parsed.diagnostics.iter().any(|diagnostic| {
                         diagnostic.kind == QueryDiagnosticKind::DroppedFragment
@@ -7381,7 +7409,10 @@ mod tests {
             assert!(!parsed.diagnostics.is_empty(), "{raw:?}");
         }
         for raw in ["", " \t\u{2003}"] {
-            assert!(matches!(parser.parse(raw, &filters).query.root(), QueryNode::All));
+            assert!(matches!(
+                parser.parse(raw, &filters).query.root(),
+                QueryNode::All
+            ));
         }
     }
 
@@ -7592,8 +7623,8 @@ mod tests {
                 "pattern": input,
                 "normalized_term": term,
                 "class": "Prefix",
-                "strategy": "TermQuery",
-                "fields": searchable,
+                "strategy": "BoundedPhrasePrefixQuery",
+                "fields": ["title", "content"],
             }),
             CassWildcardPattern::Suffix(term) => json!({
                 "type": "Glob",
@@ -7657,16 +7688,35 @@ mod tests {
             if case["query_class"] == "glob" {
                 assert_eq!(&cass_wildcard_fixture(input), expected_ast, "fixture {id}");
                 match (CassWildcardPattern::parse(input), parsed.query.root()) {
-                    (
-                        CassWildcardPattern::Exact(expected)
-                        | CassWildcardPattern::Prefix(expected),
-                        QueryNode::Term { fields, text },
-                    ) => {
+                    (CassWildcardPattern::Exact(expected), QueryNode::Term { fields, text }) => {
                         assert_eq!(text, &expected, "native parser glob text for {id}");
                         assert_eq!(
                             fields,
                             &cass_parser().fields.searchable(),
                             "native parser glob fields for {id}"
+                        );
+                    }
+                    (
+                        CassWildcardPattern::Prefix(expected),
+                        QueryNode::Phrase {
+                            fields,
+                            terms,
+                            slop: 0,
+                            prefix: true,
+                        },
+                    ) => {
+                        assert_eq!(
+                            terms,
+                            &[PositionedTerm::new(0, expected)],
+                            "native prefix for {id}"
+                        );
+                        assert_eq!(
+                            fields,
+                            &[
+                                QueryField::new(cass_parser().fields.title, 1.0),
+                                QueryField::new(cass_parser().fields.content, 1.0),
+                            ],
+                            "native complete prefix fields for {id}"
                         );
                     }
                     (

@@ -17,8 +17,8 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use tantivy::SegmentMeta;
 use tantivy::indexer::{LogMergePolicy, MergeCandidate, MergePolicy, NoMergePolicy, UserOperation};
 use tantivy::query::{
-    AllQuery, BooleanQuery, EnableScoring, Explanation, Occur, PhrasePrefixQuery, PhraseQuery, Query,
-    RangeQuery, RegexQuery, Scorer, TermQuery, Weight,
+    AllQuery, BooleanQuery, EnableScoring, Explanation, Occur, PhrasePrefixQuery, PhraseQuery,
+    Query, RangeQuery, RegexQuery, Scorer, TermQuery, Weight,
 };
 use tantivy::schema::IndexRecordOption;
 use tantivy::schema::{
@@ -2601,7 +2601,9 @@ fn cass_normalize_phrase_terms(raw: &str) -> SearchResult<(CassIndexedFragments,
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
     if parts.is_empty() {
-        return Err(cass_normalization_error("phrase has no searchable operands"));
+        return Err(cass_normalization_error(
+            "phrase has no searchable operands",
+        ));
     }
     for part in &parts {
         // Edge stars retain the existing quoted behavior. An interior star
@@ -2623,7 +2625,10 @@ fn cass_normalize_phrase_terms(raw: &str) -> SearchResult<(CassIndexedFragments,
             "phrase has too many indexed fragments",
         ));
     }
-    let terms = parts.iter().map(|part| part.to_lowercase()).collect::<Vec<_>>();
+    let terms = parts
+        .iter()
+        .map(|part| part.to_lowercase())
+        .collect::<Vec<_>>();
     let positions = (0..terms.len()).collect();
     Ok((
         CassIndexedFragments {
@@ -2956,6 +2961,23 @@ fn cass_build_term_query_clauses(
                 let bigrams = cjk_bigrams(term);
                 if let Some(q) = cass_build_cjk_term_query(&bigrams, fields) {
                     shoulds.push((Occur::Should, q));
+                }
+                return Ok(shoulds);
+            }
+            if matches!(pattern, CassWildcardPattern::Prefix(_)) {
+                // An explicit wildcard must search the whole positional
+                // field, not the first 4 KiB / first 20-character prefix
+                // columns used by ordinary bare-term completion. Keep the
+                // existing complete-or-error expansion budget and safe native
+                // phrase scorer, including inside negations and filters.
+                for field in [fields.title, fields.content] {
+                    shoulds.push((
+                        Occur::Should,
+                        Box::new(CassBoundedPhrasePrefixQuery::new(vec![(
+                            0,
+                            Term::from_field_text(field, term),
+                        )])),
+                    ));
                 }
                 return Ok(shoulds);
             }
@@ -3336,9 +3358,7 @@ fn cass_needs_indexed_fragments(raw: &str) -> bool {
 /// A short ASCII operand containing a letter or digit necessarily contributes
 /// an admitted token. Avoid analyzer allocations on the existing ASCII path.
 fn cass_ascii_operand_admitted(raw: &str) -> bool {
-    raw.len() <= 256
-        && raw.is_ascii()
-        && raw.bytes().any(|byte| byte.is_ascii_alphanumeric())
+    raw.len() <= 256 && raw.is_ascii() && raw.bytes().any(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn cass_normalization_error(reason: &str) -> SearchError {
@@ -5630,6 +5650,150 @@ mod cass_query_tests {
     }
 
     #[test]
+    fn explicit_ascii_prefixes_search_complete_fields_with_filters_and_pagination() {
+        const PREFIX: &str = "authenticationmiddleware";
+        let directory = tempfile::tempdir().expect("ASCII prefix directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create ASCII prefix index");
+        index.writer.set_merge_policy(Box::new(NoMergePolicy));
+        let padding = "padding ".repeat(CONTENT_PREFIX_MAX_BYTES / 8 + 1);
+        let mut documents = (0_u64..80)
+            .map(|ordinal| {
+                let content = format!("sharedmarker {padding}{PREFIX}{ordinal:04}");
+                assert!(
+                    !cass_build_content_prefix_and_preview(&content)
+                        .0
+                        .contains("auth"),
+                    "the required match must lie beyond the prefix column"
+                );
+                let mut document = cass_prefix_fixture_document(ordinal, "fixture", &content);
+                document.agent = if ordinal % 2 == 0 { "codex" } else { "claude" }.to_owned();
+                document.created_at =
+                    Some(1_700_000_000 + i64::try_from(ordinal).expect("ordinal"));
+                document
+            })
+            .collect::<Vec<_>>();
+        for (ordinal, title, content) in [
+            (80, format!("{PREFIX}-component"), "sharedmarker".to_owned()),
+            (81, "fixture".to_owned(), format!("sharedmarker {PREFIX}")),
+            (
+                82,
+                "fixture".to_owned(),
+                format!("sharedmarker not{PREFIX}"),
+            ),
+            (
+                83,
+                "fixture".to_owned(),
+                "sharedmarker authentication middleware".to_owned(),
+            ),
+        ] {
+            documents.push(cass_prefix_fixture_document(ordinal, &title, &content));
+        }
+        for batch in documents.chunks(40) {
+            index
+                .add_cass_documents(batch)
+                .expect("index ASCII prefix batch");
+            index.commit().expect("seal ASCII prefix batch");
+        }
+        let reader = index.reader().expect("ASCII prefix reader");
+        let fields = index.fields();
+        let defaults = CassQueryFilters::default();
+        let scoped = CassQueryFilters {
+            agents: vec!["codex".to_owned()],
+            created_from: Some(1_700_000_020),
+            created_to: Some(1_700_000_060),
+            ..Default::default()
+        };
+        for after_merge in [false, true] {
+            reader.reload().expect("reload ASCII prefix index");
+            let searcher = reader.searcher();
+            for (raw, filters, expected) in [
+                (format!("{PREFIX}*"), &defaults, (0..82).collect::<Vec<_>>()),
+                ("authenticationm*".to_owned(), &defaults, (0..82).collect()),
+                ("auth*".to_owned(), &defaults, (0..82).chain([83]).collect()),
+                ("a*".to_owned(), &defaults, (0..82).chain([83]).collect()),
+                (
+                    format!("{}*", PREFIX.to_uppercase()),
+                    &defaults,
+                    (0..82).collect(),
+                ),
+                (format!("{PREFIX}-*"), &defaults, vec![80]),
+                (
+                    format!("{PREFIX}*"),
+                    &scoped,
+                    (20..=60).step_by(2).collect(),
+                ),
+                ("auth*".to_owned(), &scoped, (20..=60).step_by(2).collect()),
+                ("a*".to_owned(), &scoped, (20..=60).step_by(2).collect()),
+                (
+                    format!("sharedmarker NOT {PREFIX}*"),
+                    &defaults,
+                    vec![82, 83],
+                ),
+                (PREFIX.to_owned(), &defaults, vec![80, 81]),
+                (format!("\"{PREFIX}*\""), &defaults, vec![80, 81]),
+            ] {
+                for single_parse in [false, true] {
+                    let query = if single_parse {
+                        cass_build_tantivy_query_single_parse(&raw, filters, &fields)
+                    } else {
+                        cass_build_tantivy_query(&raw, filters, &fields)
+                    };
+                    let (top, count) = searcher
+                        .search(
+                            &*query,
+                            &(
+                                tantivy::collector::TopDocs::with_limit(documents.len()),
+                                tantivy::collector::Count,
+                            ),
+                        )
+                        .expect("complete ASCII prefix result");
+                    let mut actual = top
+                        .iter()
+                        .map(|(_, address)| {
+                            let document: tantivy::TantivyDocument =
+                                searcher.doc(*address).expect("stored prefix match");
+                            document
+                                .get_first(fields.msg_idx)
+                                .and_then(|value| value.as_u64())
+                                .expect("message ordinal")
+                        })
+                        .collect::<Vec<_>>();
+                    actual.sort_unstable();
+                    assert_eq!(
+                        actual, expected,
+                        "{raw:?}, merged={after_merge}, single={single_parse}"
+                    );
+                    assert_eq!(
+                        count,
+                        expected.len(),
+                        "exact count is independent of the page"
+                    );
+                    let offset = top.len().min(51);
+                    let end = top.len().min(offset + 17);
+                    let (page, page_count) = searcher
+                        .search(
+                            &*query,
+                            &(
+                                tantivy::collector::TopDocs::with_limit(17).and_offset(offset),
+                                tantivy::collector::Count,
+                            ),
+                        )
+                        .expect("complete ASCII prefix offset page");
+                    assert_eq!(page, top[offset..end]);
+                    assert_eq!(page_count, count);
+                }
+            }
+            if !after_merge {
+                assert!(searcher.segment_readers().len() >= 2);
+                drop(searcher);
+                index.force_merge().expect("merge ASCII prefix index");
+            }
+        }
+    }
+
+    #[test]
     fn accented_prefixes_preserve_positions_and_original_terminal_boundaries() {
         let directory = tempfile::tempdir().expect("positional prefix directory");
         let mut index =
@@ -5637,7 +5801,9 @@ mod cass_query_tests {
                 .expect("create positional prefix index");
         let deep = format!("{} kérleks", "padding ".repeat(700));
         assert!(
-            !cass_build_content_prefix_and_preview(&deep).0.contains("rlek"),
+            !cass_build_content_prefix_and_preview(&deep)
+                .0
+                .contains("rlek"),
             "the deep occurrence must be outside the old edge-prefix window"
         );
         let at_twenty = "ézyxwvutsrqponmlkjih";
@@ -5850,7 +6016,7 @@ mod cass_query_tests {
         let fields = index.fields();
         let filters = CassQueryFilters::default();
         assert_eq!(searcher.segment_readers().len(), 1);
-        for raw in ["éallow", "éallow*", "kéallow", "kéallow*"] {
+        for raw in ["éallow", "éallow*", "kéallow", "kéallow*", "allow*"] {
             let query = cass_build_tantivy_query(raw, &filters, &fields);
             assert_eq!(
                 searcher
@@ -5876,6 +6042,11 @@ mod cass_query_tests {
             "keep AND NOT éoverflow*",
             "missing AND éoverflow*",
             "missing AND kéoverflow*",
+            "overflow*",
+            "NOT overflow*",
+            "keep OR overflow*",
+            "keep AND NOT overflow*",
+            "missing AND overflow*",
         ] {
             let query = cass_build_tantivy_query(raw, &filters, &fields);
             let count_error = searcher
@@ -5966,7 +6137,9 @@ mod cass_query_tests {
             origin_host: None,
         })
         .collect::<Vec<_>>();
-        index.add_cass_documents(&documents).expect("index raw operands");
+        index
+            .add_cass_documents(&documents)
+            .expect("index raw operands");
         index.commit().expect("commit raw operands");
         drop(index);
         let index = CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
@@ -6001,7 +6174,9 @@ mod cass_query_tests {
                 "count {raw:?}"
             );
         }
-        let expected = (0..15).filter(|id| ![0, 4].contains(id)).collect::<Vec<_>>();
+        let expected = (0..15)
+            .filter(|id| ![0, 4].contains(id))
+            .collect::<Vec<_>>();
         assert_eq!(
             cass_result_ids(&searcher, &fields, "NOT ke\u{301}rlek", &filters),
             expected,
@@ -6153,7 +6328,9 @@ mod cass_query_tests {
             ("東京é大阪", vec!["東京", "大阪"]),
         ] {
             assert_eq!(
-                cass_analyzed_fragments(raw).expect("bounded fragments").terms,
+                cass_analyzed_fragments(raw)
+                    .expect("bounded fragments")
+                    .terms,
                 expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
                 "raw operand {raw:?}"
             );

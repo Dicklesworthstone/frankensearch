@@ -1714,8 +1714,8 @@
         "pattern": "prefix*",
         "normalized_term": "prefix",
         "class": "Prefix",
-        "strategy": "TermQuery",
-        "fields": ["title", "content", "title_prefix", "content_prefix"]
+        "strategy": "BoundedPhrasePrefixQuery",
+        "fields": ["title", "content"]
       }
     },
     {
@@ -3689,7 +3689,8 @@
       "surface": "queries",
       "contracts": [
         "prefix fields contain lengths 2 through 20 only",
-        "a* does not generally match a longer token",
+        "explicit ASCII prefixes search complete title/content fields beyond edge-ngram bounds",
+        "explicit prefix expansion is complete or fails above 1024 terms per field/segment",
         "exact terms of length 2 through 20 may match longer tokens through prefix fields",
         "mixed-script CJK input drops non-CJK characters before bigramming",
         "single CJK unigram does not match inside a multi-character bigram-indexed run"
