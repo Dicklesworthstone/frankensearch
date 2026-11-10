@@ -71,6 +71,16 @@ Cold/warm here means the persisted ANSWER cache, not the OS page cache. Each arm
 and round receives a copy of one legacy index. The baseline must load Model2Vec once on
 both requests; the candidate must load once cold and zero times warm. Payloads,
 ordered hits/scores, and cache bytes, mtime, and record count are checked.
+The default --scenario semantic-hits measures the original positive-answer
+regression. --scenario filtered-empty instead uses an excluding extension filter
+and verifies an unfiltered semantic positive control for EACH arm on separate
+indexes before timing. Use a baseline before e700da7 (for example 6e6d771) to
+isolate that zero-result correction: its warm request recomputes and rewrites the
+answer, while the candidate must replay it without loading weights or rewriting
+the cache. Complete filtered-empty payloads must agree across arms and rounds.
+Both arms must retain identical cold/warm answer/cache bytes; only that explicit
+scenario requires the baseline's cache mtime to change. The original scenario's
+unchanged-mtime gate remains in force for both arms.
 Registered model verification remains mandatory in every receipt mode. Timing is
 reported, not assumed to improve: paired candidate/baseline warm ratios are
 descriptive and do not qualify a promotion or competitive result.
@@ -110,6 +120,8 @@ MODEL_ARTIFACTS = {
     },
 }
 QUERY = "staggered reconnects after brief outages"
+SCENARIOS = ("semantic-hits", "filtered-empty")
+EMPTY_FILTER = "ext:fsfs-cache-no-match"
 DOCUMENTS = {
     "retry.md": "Recover transient network failures with exponential backoff, bounded retries, and random jitter.",
     "gardening.md": "Tomato seedlings need warm soil, steady sunlight, compost, and careful watering.",
@@ -153,6 +165,7 @@ def parse_args(argv=None):
     parser.add_argument("--timeout-seconds", type=float, default=240)
     parser.add_argument("--receipt-mode", choices=("valid", "absent", "malformed"),
                         default="valid")
+    parser.add_argument("--scenario", choices=SCENARIOS, default="semantic-hits")
     args = parser.parse_args(argv)
     if args.rounds < 1:
         parser.error("--rounds must be positive")
@@ -465,13 +478,74 @@ def cache_snapshot(index):
     return {"names": [path.name], "bytes": path.read_bytes(), "mtime_ns": path.stat().st_mtime_ns}
 
 
-def validate_pair(arm, cold, warm, before, after, reference_hits, receipt_mode):
+def semantic_hits(data, label):
+    require(isinstance(data, dict), f"{label}: semantic response has no payload")
+    hits = data.get("hits")
+    require(isinstance(hits, list) and hits, f"{label}: semantic search returned no hits")
+    require(any(isinstance(hit, dict) and hit.get("semantic_rank") is not None for hit in hits)
+            and data.get("vector_generation_is_hash") is not True,
+            f"{label}: result did not exercise the semantic lane")
+    return hits
+
+
+def search_command(config, index, scenario):
+    require(scenario in SCENARIOS, "unknown benchmark scenario")
+    command = [
+        "search", QUERY, "--config", str(config), "--index-dir", str(index),
+        "--no-daemon", "--fast-only", "--limit", "3", "--format", "json",
+    ]
+    if scenario == "filtered-empty":
+        command.extend(["--filter", EMPTY_FILTER])
+    return command
+
+
+def run_semantic_controls(runner, binaries, output, template, config, receipt_state):
+    controls = {}
+    reference_hits = None
+    reference_generation = None
+    for arm in ARMS:
+        index = output / f"{arm}-semantic-control-index"
+        shutil.copytree(template, index)
+        require(not list((index / "query_cache").glob("*.json")),
+                "semantic control must start without a persisted answer")
+        validate_receipt_state(output, receipt_state)
+        result = runner.invoke(
+            binaries[arm], f"{arm}-semantic-control",
+            search_command(config, index, "semantic-hits"),
+        )
+        validate_receipt_state(output, receipt_state)
+        require(result["model_loads"] == 1,
+                f"{arm}: semantic control must load Model2Vec exactly once")
+        data = result["response"].get("data")
+        hits = semantic_hits(data, f"{arm} control")
+        require(data.get("query") == QUERY and data.get("phase") == "initial"
+                and type(data.get("returned_hits")) is int and data["returned_hits"] == len(hits),
+                f"{arm}: semantic control did not answer the requested query")
+        generation = data.get("vector_generation_id")
+        require(isinstance(generation, str) and generation,
+                f"{arm}: semantic control has no producer identity")
+        require(reference_hits is None or hits == reference_hits,
+                "semantic control ordered hits/scores differ across arms")
+        require(reference_generation is None or generation == reference_generation,
+                "semantic control producer identities differ across arms")
+        reference_hits, reference_generation = hits, generation
+        controls[arm] = {**result, "vector_generation_id": generation}
+    return controls
+
+
+def validate_pair(arm, cold, warm, before, after, reference_hits, receipt_mode,
+                  scenario="semantic-hits", expected_generation_id=None):
+    require(scenario in SCENARIOS, "unknown benchmark scenario")
     cold_data, warm_data = cold["response"].get("data"), warm["response"].get("data")
     require(isinstance(cold_data, dict) and cold_data == warm_data,
             f"{arm}: warm cached payload differs from cold retrieval")
     require(before["names"] == after["names"], f"{arm}: warm cache record count/name changed")
     require(before["bytes"] == after["bytes"], f"{arm}: warm cache bytes changed")
-    require(before["mtime_ns"] == after["mtime_ns"], f"{arm}: warm cache was rewritten")
+    if scenario == "filtered-empty" and arm == "baseline":
+        require(before["mtime_ns"] != after["mtime_ns"],
+                "baseline: filtered-empty regression must recompute and rewrite the warm answer")
+    else:
+        require(before["mtime_ns"] == after["mtime_ns"], f"{arm}: warm cache was rewritten")
     require(cold["model_loads"] == 1, f"{arm}: cold search must load Model2Vec exactly once")
     require(warm["model_loads"] == (1 if arm == "baseline" else 0),
             f"{arm}: unexpected warm Model2Vec load count")
@@ -481,27 +555,40 @@ def validate_pair(arm, cold, warm, before, after, reference_hits, receipt_mode):
     else:
         require(warm["receipt_acceptances"] == 0,
                 f"{arm}: warm search accepted an absent or malformed receipt")
-    hits = cold_data.get("hits")
-    require(isinstance(hits, list) and hits, f"{arm}: semantic search returned no hits")
-    require(any(isinstance(hit, dict) and hit.get("semantic_rank") is not None for hit in hits)
-            and cold_data.get("vector_generation_is_hash") is not True,
-            f"{arm}: result did not exercise the semantic lane")
+    if scenario == "filtered-empty":
+        require(isinstance(expected_generation_id, str) and expected_generation_id,
+                "filtered-empty measurement requires an unfiltered semantic control")
+        hits = cold_data.get("hits")
+        require(hits == [] and type(cold_data.get("returned_hits")) is int
+                and cold_data["returned_hits"] == 0 and cold_data.get("phase") == "initial"
+                and cold_data.get("query") == QUERY,
+                f"{arm}: filtered-empty request did not return the expected empty Initial")
+        require(cold_data.get("vector_generation_id") == expected_generation_id
+                and cold_data.get("vector_generation_is_hash") is not True,
+                f"{arm}: filtered-empty producer differs from its semantic control")
+    else:
+        hits = semantic_hits(cold_data, arm)
     require(reference_hits is None or hits == reference_hits,
             f"{arm}: ordered hits/scores differ across arms or rounds")
     return hits
 
 
-def run_rounds(runner, binaries, output, template, config, rounds, receipt_state):
+def run_rounds(runner, binaries, output, template, config, rounds, receipt_state,
+               scenario="semantic-hits", semantic_controls=None):
+    require(scenario in SCENARIOS, "unknown benchmark scenario")
+    if scenario == "filtered-empty":
+        require(isinstance(semantic_controls, dict) and set(semantic_controls) == set(ARMS),
+                "filtered-empty measurement requires both semantic controls")
     rows = []
     reference_hits = None
+    reference_payload = None
     for ordinal in range(rounds):
         for arm in ARMS if ordinal % 2 == 0 else reversed(ARMS):
             index = output / f"{arm}-{ordinal}-index"
             shutil.copytree(template, index)
-            command = [
-                "search", QUERY, "--config", str(config), "--index-dir", str(index),
-                "--no-daemon", "--fast-only", "--limit", "3", "--format", "json",
-            ]
+            require(not list((index / "query_cache").glob("*.json")),
+                    f"{arm}: cold request already has a persisted answer")
+            command = search_command(config, index, scenario)
             validate_receipt_state(output, receipt_state)
             cold = runner.invoke(binaries[arm], f"{arm}-{ordinal}-cold", command)
             validate_receipt_state(output, receipt_state)
@@ -510,15 +597,22 @@ def run_rounds(runner, binaries, output, template, config, rounds, receipt_state
             validate_receipt_state(output, receipt_state)
             after = cache_snapshot(index)
             reference_hits = validate_pair(
-                arm, cold, warm, before, after, reference_hits, receipt_state["mode"])
+                arm, cold, warm, before, after, reference_hits, receipt_state["mode"], scenario,
+                semantic_controls[arm]["vector_generation_id"] if semantic_controls else None)
+            if scenario == "filtered-empty":
+                payload = cold["response"]["data"]
+                require(reference_payload is None or payload == reference_payload,
+                        "filtered-empty payload differs across arms or rounds")
+                reference_payload = payload
             for phase, result in (("cold", cold), ("warm", warm)):
                 rows.append({
                     **{key: value for key, value in result.items() if key != "response"},
                     "arm": arm, "round": ordinal, "phase": phase,
-                    "receipt_mode": receipt_state["mode"],
+                    "receipt_mode": receipt_state["mode"], "scenario": scenario,
                     "cache_sha256": hashlib.sha256(before["bytes"]).hexdigest(),
                     "warm_payload_identical": True, "cache_bytes_unchanged": True,
-                    "cache_mtime_unchanged": True, "cache_record_count": 1,
+                    "cache_mtime_unchanged": before["mtime_ns"] == after["mtime_ns"],
+                    "cache_record_count": 1,
                 })
     return rows
 
@@ -568,8 +662,12 @@ def run_benchmark(args):
         runner = CommandRunner(args.output, environment, args.timeout_seconds)
         template, config, receipt_state = setup_fixture(
             runner, binaries, args.output, args.receipt_mode)
+        semantic_controls = run_semantic_controls(
+            runner, binaries, args.output, template, config, receipt_state
+        ) if args.scenario == "filtered-empty" else None
         rows = run_rounds(
-            runner, binaries, args.output, template, config, args.rounds, receipt_state)
+            runner, binaries, args.output, template, config, args.rounds, receipt_state,
+            args.scenario, semantic_controls)
         summary = summarize(rows, args.rounds)
         for arm in ARMS:
             require(validate_source(getattr(args, arm + "_source"), metadata["arms"][arm])
@@ -585,7 +683,12 @@ def run_benchmark(args):
             "evidence_class": "diagnostic-maintenance",
             "qualifies_promotion": False, "qualifies_competitive_win": False,
             "feature_profile": metadata["feature_profile"],
-            "receipt_mode": args.receipt_mode,
+            "receipt_mode": args.receipt_mode, "scenario": args.scenario,
+            "filter": EMPTY_FILTER if args.scenario == "filtered-empty" else None,
+            "semantic_controls": semantic_controls,
+            "cross_arm_equivalence": ("complete-search-payloads"
+                                      if args.scenario == "filtered-empty"
+                                      else "ordered-hits-and-scores"),
             "cache_scope": (
                 "persisted legacy-layout answer cache (FSFS_COMPLETE_GENERATIONS=0); "
                 "fresh --no-daemon processes; no OS page cache eviction"
@@ -611,6 +714,7 @@ def run_benchmark(args):
             "evidence_class": "diagnostic-maintenance",
             "qualifies_promotion": False, "qualifies_competitive_win": False,
             "feature_profile": metadata["feature_profile"], "receipt_mode": args.receipt_mode,
+            "scenario": args.scenario,
             "source_heads": {arm: sources[arm]["head"] for arm in ARMS}, "summary": summary,
         }, indent=2, sort_keys=True), flush=True)
         return receipt
@@ -619,6 +723,7 @@ def run_benchmark(args):
             write_json(args.output / "failure.json", {
                 "status": "failed", "evidence_class": "diagnostic-maintenance",
                 "qualifies_measurement_result": False, "receipt_mode": args.receipt_mode,
+                "scenario": args.scenario,
                 "build_metadata": metadata, "source_provenance": sources,
                 "error_type": type(error).__name__, "error": str(error),
                 "completed_commands": runner.events if runner else [],

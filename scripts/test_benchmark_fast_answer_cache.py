@@ -26,7 +26,9 @@ EMPTY_DIFF = hashlib.sha256(b"").hexdigest()
 FIXTURE_RESPONSE = {
     "ok": True,
     "data": {
+        "query": bench.QUERY, "phase": "initial", "returned_hits": 1,
         "hits": [{"path": "fixture-only/retry.md", "semantic_rank": 0, "score": 0.5}],
+        "vector_generation_id": bench.MODEL_ID,
         "vector_generation_is_hash": False,
     },
 }
@@ -79,9 +81,17 @@ class FixtureRunner:
             index = Path(command[command.index("--index-dir") + 1])
             (index / "query_cache").mkdir()
             (index / "query_cache" / "fixture-only.json").write_bytes(b'{"fixture_only": true}')
+        if "--filter" in command:
+            response["data"].update(hits=[], returned_hits=0)
+            if label.startswith("baseline-") and label.endswith("-warm"):
+                index = Path(command[command.index("--index-dir") + 1])
+                path = index / "query_cache" / "fixture-only.json"
+                stamp = path.stat()
+                os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1))
         return {
             "response": response, "label": label, "elapsed_ms": 1,
-            "model_loads": int(label.endswith("-cold") or label.startswith("baseline-")),
+            "model_loads": int(label.endswith(("-cold", "-semantic-control"))
+                               or label.startswith("baseline-")),
             "receipt_acceptances": int(self.mode == "valid"),
         }
 
@@ -118,8 +128,9 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue(getattr(args, name).is_absolute())
             self.assertEqual(getattr(args, name).parent, self.root)
         self.assertEqual(args.receipt_mode, "valid")
+        self.assertEqual(args.scenario, "semantic-hits")
         for option in (["--rounds", "0"], ["--timeout-seconds", "nan"],
-                       ["--receipt-mode", "unknown"]):
+                       ["--receipt-mode", "unknown"], ["--scenario", "unknown"]):
             with self.subTest(option=option), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     bench.parse_args(self.arguments() + option)
@@ -306,6 +317,158 @@ class HarnessTests(unittest.TestCase):
             with self.subTest(data=data):
                 with self.assertRaises(bench.BenchmarkError):
                     bench.validate_pair("candidate", cold, warm, before, after, None, "valid")
+
+    def empty_pair(self, arm="candidate"):
+        cold, warm, before, after = self.pair(arm)
+        for result in (cold, warm):
+            result["response"]["data"].update(hits=[], returned_hits=0)
+        if arm == "baseline":
+            after["mtime_ns"] += 1
+        return cold, warm, before, after
+
+    def test_filtered_empty_has_distinct_strict_replay_and_identity_gates(self):
+        for arm in bench.ARMS:
+            cold, warm, before, after = self.empty_pair(arm)
+            self.assertEqual(bench.validate_pair(
+                arm, cold, warm, before, after, None, "valid",
+                "filtered-empty", bench.MODEL_ID), [])
+            with self.assertRaises(bench.BenchmarkError):
+                bench.validate_pair(arm, cold, warm, before, after, None, "valid")
+            with self.assertRaisesRegex(bench.BenchmarkError, "semantic control"):
+                bench.validate_pair(arm, cold, warm, before, after, None, "valid",
+                                    "filtered-empty")
+            after["mtime_ns"] = before["mtime_ns"] + int(arm == "candidate")
+            with self.assertRaisesRegex(bench.BenchmarkError, "rewrite|rewritten"):
+                bench.validate_pair(arm, cold, warm, before, after, None, "valid",
+                                    "filtered-empty", bench.MODEL_ID)
+        mutations = [
+            {"hits": [{"semantic_rank": 0}]}, {"returned_hits": 1},
+            {"returned_hits": False}, {"phase": "refined"}, {"query": ""},
+            {"vector_generation_id": "foreign-producer"}, {"vector_generation_is_hash": True},
+        ]
+        for changes in mutations:
+            cold, warm, before, after = self.empty_pair()
+            for result in (cold, warm):
+                result["response"]["data"].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(bench.BenchmarkError):
+                bench.validate_pair("candidate", cold, warm, before, after, None, "valid",
+                                    "filtered-empty", bench.MODEL_ID)
+        for field, replacement in (("bytes", b"rewritten"), ("names", ["other.json"])):
+            cold, warm, before, after = self.empty_pair("baseline")
+            after[field] = replacement
+            with self.subTest(field=field), self.assertRaises(bench.BenchmarkError):
+                bench.validate_pair("baseline", cold, warm, before, after, None, "valid",
+                                    "filtered-empty", bench.MODEL_ID)
+
+    def test_filtered_empty_requires_controls_on_separate_indexes_in_every_receipt_mode(self):
+        for mode in ("valid", "absent", "malformed"):
+            with self.subTest(mode=mode):
+                output = self.root / mode
+                (output / "models" / bench.MODEL_DIRECTORY).mkdir(parents=True)
+                runner = FixtureRunner(output, mode)
+                binaries = {arm: self.root / (arm + "-fixture-only") for arm in bench.ARMS}
+                template, config, state = bench.setup_fixture(runner, binaries, output, mode)
+                with self.assertRaisesRegex(bench.BenchmarkError, "both semantic controls"):
+                    bench.run_rounds(runner, binaries, output, template, config, 2, state,
+                                     "filtered-empty")
+                controls = bench.run_semantic_controls(
+                    runner, binaries, output, template, config, state)
+                rows = bench.run_rounds(runner, binaries, output, template, config, 2, state,
+                                        "filtered-empty", controls)
+                self.assertEqual([label for _, label, _ in runner.calls], [
+                    "setup-verify-model", "setup-index",
+                    "baseline-semantic-control", "candidate-semantic-control",
+                    "baseline-0-cold", "baseline-0-warm", "candidate-0-cold", "candidate-0-warm",
+                    "candidate-1-cold", "candidate-1-warm", "baseline-1-cold", "baseline-1-warm",
+                ])
+                self.assertEqual(len(rows), 8)
+                self.assertFalse((template / "query_cache").exists())
+                for arm in bench.ARMS:
+                    self.assertTrue(controls[arm]["response"]["data"]["hits"])
+                    self.assertEqual(controls[arm]["model_loads"], 1)
+                for _, label, command in runner.calls[2:]:
+                    index = Path(command[command.index("--index-dir") + 1])
+                    self.assertNotEqual(index, template)
+                    if label.endswith("-semantic-control"):
+                        self.assertNotIn("--filter", command)
+                        self.assertTrue(index.name.endswith("-semantic-control-index"))
+                    else:
+                        self.assertEqual(command[command.index("--filter") + 1], bench.EMPTY_FILTER)
+                        self.assertFalse(index.name.endswith("-semantic-control-index"))
+                for row in rows:
+                    self.assertEqual(row["scenario"], "filtered-empty")
+                    self.assertEqual(row["cache_mtime_unchanged"], row["arm"] == "candidate")
+                    self.assertTrue(row["warm_payload_identical"] and row["cache_bytes_unchanged"])
+                bench.summarize(rows, 2)
+
+    def test_empty_or_incompatible_semantic_controls_stop_before_measurement(self):
+        cases = [
+            ("baseline", {"hits": []}, 1),
+            ("baseline", {"hits": [{"semantic_rank": None}]}, 1),
+            ("baseline", {"vector_generation_is_hash": True}, 1),
+            ("baseline", {"vector_generation_id": ""}, 1),
+            ("baseline", {"query": "wrong query"}, 1),
+            ("baseline", {"phase": "refined"}, 1),
+            ("baseline", {"returned_hits": 0}, 1),
+            ("baseline", {}, 0),
+            ("candidate", {"vector_generation_id": "foreign-producer"}, 1),
+            ("candidate", {"hits": [{"semantic_rank": 0, "score": 9}]}, 1),
+        ]
+        for ordinal, (arm, changes, loads) in enumerate(cases):
+            output = self.root / f"control-{ordinal}"
+            (output / "models" / bench.MODEL_DIRECTORY).mkdir(parents=True)
+            runner = FixtureRunner(output, "valid")
+            binaries = {name: self.root / (name + "-fixture-only") for name in bench.ARMS}
+            template, config, state = bench.setup_fixture(runner, binaries, output, "valid")
+            invoke = runner.invoke
+
+            def corrupt_control(binary, label, command):
+                result = invoke(binary, label, command)
+                if label == f"{arm}-semantic-control":
+                    result["response"]["data"].update(changes)
+                    result["model_loads"] = loads
+                return result
+
+            with mock.patch.object(runner, "invoke", side_effect=corrupt_control):
+                with self.subTest(case=ordinal), self.assertRaises(bench.BenchmarkError):
+                    bench.run_semantic_controls(runner, binaries, output, template, config, state)
+            self.assertFalse(any(label.endswith(("-cold", "-warm"))
+                                 for _, label, _ in runner.calls))
+
+    def test_filtered_empty_rejects_complete_payload_drift_across_arms_and_rounds(self):
+        for ordinal, prefix in enumerate(("candidate-0-", "candidate-1-")):
+            output = self.root / f"payload-drift-{ordinal}"
+            (output / "models" / bench.MODEL_DIRECTORY).mkdir(parents=True)
+            runner = FixtureRunner(output, "valid")
+            binaries = {arm: self.root / (arm + "-fixture-only") for arm in bench.ARMS}
+            template, config, state = bench.setup_fixture(runner, binaries, output, "valid")
+            controls = bench.run_semantic_controls(
+                runner, binaries, output, template, config, state)
+            invoke = runner.invoke
+
+            def corrupt_payload(binary, label, command):
+                result = invoke(binary, label, command)
+                if label.startswith(prefix):
+                    result["response"]["data"]["skip_reason"] = "fixture-only policy drift"
+                return result
+
+            with mock.patch.object(runner, "invoke", side_effect=corrupt_payload):
+                with self.subTest(prefix=prefix), self.assertRaisesRegex(
+                        bench.BenchmarkError, "payload differs across arms or rounds"):
+                    bench.run_rounds(runner, binaries, output, template, config, 2, state,
+                                     "filtered-empty", controls)
+
+    def test_existing_answer_cannot_be_measured_as_cold(self):
+        (self.root / "models" / bench.MODEL_DIRECTORY).mkdir(parents=True)
+        runner = FixtureRunner(self.root, "valid")
+        binaries = {arm: self.root / (arm + "-fixture-only") for arm in bench.ARMS}
+        template, config, state = bench.setup_fixture(runner, binaries, self.root, "valid")
+        (template / "query_cache").mkdir()
+        (template / "query_cache" / "existing.json").write_bytes(b"fixture-only")
+        with self.assertRaisesRegex(bench.BenchmarkError, "already has a persisted answer"):
+            bench.run_rounds(runner, binaries, self.root, template, config, 1, state)
+        self.assertEqual([label for _, label, _ in runner.calls],
+                         ["setup-verify-model", "setup-index"])
 
     def test_cache_snapshot_requires_exactly_one_persisted_record(self):
         index = self.root / "index"
