@@ -177,16 +177,25 @@ fn code_belongs_to_image(cx: &Cx, image: &std::fs::Metadata) -> SearchResult<boo
         return Ok(false);
     };
     let address = current_image as *const () as usize;
+    let exe_link = std::fs::read_link("/proc/self/exe").ok();
+    let exe_path = exe_link.as_deref().and_then(std::path::Path::to_str);
     Ok(mapping_matches_image(
         maps,
         address,
         (libc::major(image.dev()), libc::minor(image.dev())),
         image.ino(),
+        exe_path,
     ))
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn mapping_matches_image(maps: &str, address: usize, device_id: (u32, u32), image_inode: u64) -> bool {
+fn mapping_matches_image(
+    maps: &str,
+    address: usize,
+    device_id: (u32, u32),
+    image_inode: u64,
+    exe_path: Option<&str>,
+) -> bool {
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
         let (Some(range), Some(permissions), Some(_offset), Some(device), Some(inode)) =
@@ -214,11 +223,25 @@ fn mapping_matches_image(maps: &str, address: usize, device_id: (u32, u32), imag
         let Some((major, minor)) = device.split_once(':') else {
             return false;
         };
+        let maps_major = u32::from_str_radix(major, 16).ok();
+        let maps_minor = u32::from_str_radix(minor, 16).ok();
+        // On btrfs the kernel assigns /proc/self/maps a different anonymous
+        // minor than stat's st_dev for the same image, so the minor cannot be
+        // compared when both are anonymous block devices (major 0). Fall back to
+        // requiring the mapping pathname to equal /proc/self/exe, refusing a
+        // missing or "(deleted)" path so an anonymous, unlinked, or replaced
+        // mapping cannot masquerade as the running image.
+        let device_ok = if maps_major == Some(0) && device_id.0 == 0 {
+            let pathname = fields.collect::<Vec<_>>().join(" ");
+            matches!(exe_path, Some(exe)
+                if !pathname.is_empty() && !pathname.ends_with("(deleted)") && pathname == exe)
+        } else {
+            maps_major == Some(device_id.0) && maps_minor == Some(device_id.1)
+        };
         return permissions.len() == 4
             && permissions.as_bytes().get(2) == Some(&b'x')
             && inode.parse::<u64>().ok() == Some(image_inode)
-            && u32::from_str_radix(major, 16).ok() == Some(device_id.0)
-            && u32::from_str_radix(minor, 16).ok() == Some(device_id.1);
+            && device_ok;
     }
     false
 }
@@ -392,14 +415,62 @@ mod tests {
         let maps = "1000-2000 r--p 0000 08:02 7 /binary\n\
                     2000-3000 r-xp 1000 08:02 7 /binary\n\
                     4000-5000 r-xp 0000 08:03 7 /plugin with spaces.so\n";
-        assert!(mapping_matches_image(maps, 0x2000, (8, 2), 7));
-        assert!(mapping_matches_image(maps, 0x2fff, (8, 2), 7));
+        assert!(mapping_matches_image(maps, 0x2000, (8, 2), 7, None));
+        assert!(mapping_matches_image(maps, 0x2fff, (8, 2), 7, None));
         for address in [0x1000, 0x3000, 0x4000, 0x6000] {
-            assert!(!mapping_matches_image(maps, address, (8, 2), 7));
+            assert!(!mapping_matches_image(maps, address, (8, 2), 7, None));
         }
-        assert!(!mapping_matches_image(maps, 0x2000, (8, 2), 8));
-        assert!(!mapping_matches_image(maps, 0x2000, (8, 3), 7));
-        assert!(!mapping_matches_image("invalid", 0x2000, (8, 2), 7));
-        assert!(!mapping_matches_image("2000-3000 rw-p 0000 08:02 7", 0x2000, (8, 2), 7));
+        assert!(!mapping_matches_image(maps, 0x2000, (8, 2), 8, None));
+        assert!(!mapping_matches_image(maps, 0x2000, (8, 3), 7, None));
+        assert!(!mapping_matches_image("invalid", 0x2000, (8, 2), 7, None));
+        assert!(!mapping_matches_image("2000-3000 rw-p 0000 08:02 7", 0x2000, (8, 2), 7, None));
+    }
+
+    // btrfs anonymous-device regression tests for the fingerprint fix. Range
+    // 0x1000-0x2000 contains 0x1500; `00:33` is the /proc/self/maps anonymous
+    // minor while `00:34` is stat's st_dev minor for the same btrfs image.
+    #[test]
+    fn btrfs_anonymous_dev_matching_pathname_is_accepted() {
+        let maps = "1000-2000 r-xp 00000000 00:33 1214620516 /path/to/fsfs\n";
+        assert!(mapping_matches_image(
+            maps,
+            0x1500,
+            (0, 0x34),
+            1_214_620_516,
+            Some("/path/to/fsfs"),
+        ));
+    }
+
+    #[test]
+    fn btrfs_anonymous_dev_deleted_pathname_is_refused() {
+        let maps = "1000-2000 r-xp 00000000 00:33 1214620516 /path/to/fsfs (deleted)\n";
+        assert!(!mapping_matches_image(
+            maps,
+            0x1500,
+            (0, 0x34),
+            1_214_620_516,
+            Some("/path/to/fsfs"),
+        ));
+    }
+
+    #[test]
+    fn btrfs_anonymous_dev_mismatched_or_missing_pathname_is_refused() {
+        let maps = "1000-2000 r-xp 00000000 00:33 1214620516 /path/to/other\n";
+        assert!(!mapping_matches_image(
+            maps,
+            0x1500,
+            (0, 0x34),
+            1_214_620_516,
+            Some("/path/to/fsfs"),
+        ));
+        assert!(!mapping_matches_image(maps, 0x1500, (0, 0x34), 1_214_620_516, None));
+    }
+
+    #[test]
+    fn real_block_device_still_requires_exact_device_and_inode() {
+        let maps = "1000-2000 r-xp 00000000 103:07 5108284793 /path/to/fsfs\n";
+        assert!(mapping_matches_image(maps, 0x1500, (0x103, 0x07), 5_108_284_793, None));
+        assert!(!mapping_matches_image(maps, 0x1500, (0x103, 0x08), 5_108_284_793, None));
+        assert!(!mapping_matches_image(maps, 0x1500, (0x103, 0x07), 999, None));
     }
 }
