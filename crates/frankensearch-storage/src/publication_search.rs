@@ -10,6 +10,7 @@ use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::types::{BoundQueryEmbedding, VectorHit};
 use frankensearch_core::{
     Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult,
+    with_cancellation,
 };
 use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
@@ -188,6 +189,10 @@ impl PublishedSearchSnapshot {
     /// by this snapshot or across the await. Cancellation dominates provider
     /// errors; caller-owned provider deadlines still apply. Exact scoring is
     /// synchronous after inference, as in `search`; this is not an ANN backend.
+    /// Pending inference has an independent cancellation wake registration, so
+    /// even a provider that never wakes or checks its context is dropped before
+    /// cancellation returns. The retained corpus remains available for later
+    /// queries; no database or source state is changed.
     pub async fn search_text(
         &self,
         cx: &Cx,
@@ -229,7 +234,12 @@ impl PublishedSearchSnapshot {
         if text.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let response = embedder.embed_bound(cx, &text).await;
+        let response = with_cancellation(
+            cx,
+            "storage.publication_search.inference",
+            embedder.embed_bound(cx, &text),
+        )
+        .await;
         checkpoint(cx)?;
         let response = match response {
             Err(error @ SearchError::Cancelled { .. }) => return Err(error),
@@ -473,9 +483,11 @@ mod tests {
     use frankensearch_core::IdentityBoundEmbedding;
     use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
+    use std::future::{Future, poll_fn};
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
 
     fn identity(name: &str) -> EmbeddingIdentityBundleV1 {
         // Synthetic semantic contract for API tests, not real-model evidence.
@@ -556,6 +568,7 @@ mod tests {
         DriftError,
         CancelError,
         ExplicitCancel,
+        Pending,
     }
 
     thread_local! {
@@ -580,6 +593,8 @@ mod tests {
         drift: Arc<AtomicBool>,
         calls: AtomicUsize,
         metadata_calls: AtomicUsize,
+        pending_polls: AtomicUsize,
+        pending_drops: AtomicUsize,
         inputs: Mutex<Vec<String>>,
         reply: QueryReply,
     }
@@ -597,8 +612,18 @@ mod tests {
                 drift: Arc::new(AtomicBool::new(false)),
                 calls: AtomicUsize::new(0),
                 metadata_calls: AtomicUsize::new(0),
+                pending_polls: AtomicUsize::new(0),
+                pending_drops: AtomicUsize::new(0),
                 inputs: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    struct PendingQueryDrop<'a>(&'a AtomicUsize);
+
+    impl Drop for PendingQueryDrop<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -627,6 +652,16 @@ mod tests {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.inputs.lock().unwrap().push(text.to_owned());
+                if matches!(self.reply, QueryReply::Pending) {
+                    let _drop = PendingQueryDrop(&self.pending_drops);
+                    // This provider never registers or wakes its task and does
+                    // not inspect the caller's cancellation context.
+                    return poll_fn(|_| {
+                        self.pending_polls.fetch_add(1, Ordering::SeqCst);
+                        Poll::Pending
+                    })
+                    .await;
+                }
                 asupersync::runtime::yield_now().await;
                 if matches!(
                     self.reply,
@@ -920,6 +955,130 @@ mod tests {
             ));
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
         });
+    }
+
+    #[derive(Default)]
+    struct QueryWake(AtomicUsize);
+
+    impl Wake for QueryWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pending_text_query_cancellation_wakes_snapshot_and_cohort_without_losing_sources() {
+        use crate::{PublishedSearchTextQuery, PublishedSearchTierRequest};
+
+        for use_cohort in [false, true] {
+            let cx = Cx::for_testing();
+            let (storage, queue) = fixture();
+            publish(
+                &storage,
+                &queue,
+                "doc",
+                "retained orchard source",
+                [1.0, 0.0],
+            );
+            let captured = load(&storage, &cx);
+            let cohort = storage
+                .load_published_search_cohort(
+                    &cx,
+                    &[PublishedSearchTierRequest {
+                        embedder_id: "model",
+                        identity: captured.identity(),
+                    }],
+                    PublishedSearchReadLimits::default(),
+                )
+                .unwrap();
+            publish(&storage, &queue, "doc", "new database source", [0.0, 1.0]);
+            let before = storage.metrics_snapshot();
+            let probe = QueryProbe::new(QueryReply::Pending);
+            let canonicalizer = QueryCanonicalizer {
+                drift: None,
+                empty: false,
+            };
+            let filter = SourceFilterProbe {
+                calls: AtomicUsize::new(0),
+                cancel: None,
+                accept: true,
+            };
+            let requests = [PublishedSearchTextQuery {
+                embedder_id: "model",
+                embedder: &probe,
+                canonicalizer: &canonicalizer,
+                limit: 1,
+            }];
+            let mut query = Box::pin(async {
+                if use_cohort {
+                    cohort
+                        .search_text_filtered(&cx, "orchard", &requests, Some(&filter))
+                        .await
+                        .map(|_| ())
+                } else {
+                    captured
+                        .search_text_filtered(
+                            &cx,
+                            &probe,
+                            &canonicalizer,
+                            "orchard",
+                            1,
+                            Some(&filter),
+                        )
+                        .await
+                        .map(|_| ())
+                }
+            });
+            let wakes = Arc::new(QueryWake::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task = Context::from_waker(&waker);
+            assert!(query.as_mut().poll(&mut task).is_pending());
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.pending_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.pending_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+            cx.cancel_fast(asupersync::CancelKind::User);
+            // Cancellation must schedule a real repoll, without relying on a
+            // provider wake, timeout, or test driver that polls unconditionally.
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            assert!(matches!(
+                query.as_mut().poll(&mut task),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            assert_eq!(probe.pending_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.pending_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(storage.metrics_snapshot(), before);
+            drop(query);
+
+            let retained = if use_cohort {
+                cohort.get("model").unwrap()
+            } else {
+                &captured
+            };
+            let next_cx = Cx::for_testing();
+            let bound = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
+            let hits = retained
+                .search_filtered(&next_cx, &bound, 1, Some(&filter))
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                hits[0].document().canonical_text(),
+                "retained orchard source"
+            );
+            assert_eq!(
+                hits[0].publication().content_hash,
+                ContentHasher::hash("retained orchard source")
+            );
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(storage.metrics_snapshot(), before);
+        }
     }
 
     #[test]
