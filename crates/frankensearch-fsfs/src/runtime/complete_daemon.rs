@@ -2754,14 +2754,17 @@ mod generation_tests {
                 panic!("snapshot preparation must not run reranking inference");
             }
 
-            fn id(&self) -> &str {
-                if let Some(hook) = self.0.lock().unwrap().take() {
+            fn id(&self) -> &'static str {
+                // Release the lock before the hook runs, so a hook that asks for
+                // the id again cannot deadlock on it.
+                let hook = self.0.lock().unwrap().take();
+                if let Some(hook) = hook {
                     hook();
                 }
                 "snapshot-reranker"
             }
 
-            fn model_name(&self) -> &str {
+            fn model_name(&self) -> &'static str {
                 "Snapshot key probe"
             }
         }
