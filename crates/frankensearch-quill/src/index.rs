@@ -3,7 +3,8 @@
 //! This module deliberately joins the already-final Scribe, FSLX, Keeper,
 //! parser, cursor, scorer, and collector boundaries. Immutable Delta epochs,
 //! their composite statistics, scorer adapters, and seal transaction are
-//! assembled here; later mixed-state beads wire them into the public writer loop.
+//! assembled here, including explicit process-local visible ingestion and its
+//! durable commit boundary.
 
 use std::borrow::Cow;
 #[cfg(test)]
@@ -69,7 +70,10 @@ use crate::argus::{
     ConformanceUnionRefillStrategy,
 };
 use crate::config::QuillConfig;
-use crate::delta::{DeltaSnapshot, DeltaStoredMaterialization};
+use crate::delta::{
+    DeltaError, DeltaFieldNorm, DeltaNumericValue, DeltaSegment, DeltaSnapshot,
+    DeltaStoredMaterialization, DeltaStoredValue, DeltaTermPosting,
+};
 use crate::error::QuillError;
 use crate::grimoire::{
     ByteSpan, MAX_TERM_BYTES, TermDictionary, TermDictionaryError, star_glob_matches,
@@ -102,11 +106,11 @@ use crate::quiver::{
 };
 use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
-    AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES, DeltaFlushInput,
-    DocIdAllocator, DocIdSpan, DocumentAccumulation, FIELD_PREFIX_BYTES, FlushDocumentInput,
-    FlushError, FlushMode, FlushSegmentInput, FrankensearchTokenizer, IndexedFieldValue,
-    IndexedNumericValue, ShardRouter, StoredFieldValue, TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer,
-    flush_accumulator_with_mode, flush_delta_snapshot,
+    AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES,
+    DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator, DocIdSpan, DocumentAccumulation,
+    FIELD_PREFIX_BYTES, FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput,
+    FrankensearchTokenizer, IndexedFieldValue, IndexedNumericValue, ShardRouter, StoredFieldValue,
+    TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer, flush_accumulator_with_mode, flush_delta_snapshot,
 };
 use crate::segment::{EncodedSegment, SectionKind};
 use crate::snippet::{SnippetConfig, SnippetGenerator, SnippetTerm};
@@ -170,6 +174,9 @@ pub enum QuillIndexError {
     /// One document could not be accumulated atomically.
     #[error(transparent)]
     Accumulator(#[from] AccumulatorError),
+    /// A document could not be represented in a searchable Delta epoch.
+    #[error(transparent)]
+    Delta(#[from] DeltaError),
     /// A scalar accumulator could not be sealed.
     #[error(transparent)]
     Flush(#[from] FlushError),
@@ -5236,18 +5243,28 @@ impl LifecycleTrigger {
 }
 
 struct PendingDeltaSeal {
-    /// Retained encoded segment shared with the in-flight publication task.
+    /// Retained encoded segments shared with the in-flight publication task.
     ///
     /// The outer [`Arc`] shares the whole segment (header plus section
     /// table) with `KeeperWriter::publish_encoded_segment_retryable`, which
     /// needs `'static` ownership on the blocking lane. The segment's byte
     /// payload is additionally backing-shared, so the memory-backend
     /// republication copies stay O(1) in the payload.
-    encoded: Option<Arc<EncodedSegment>>,
-    segment_installed: bool,
+    encoded: Vec<Arc<EncodedSegment>>,
+    segments_installed: usize,
+    /// The public visible-ingest lane owns this complete-table transaction.
+    visible_ingest: bool,
     manifest: Manifest,
     prepared: PreparedSealedPublication,
     next_seal_seq: u64,
+    successor_watermark: u64,
+}
+
+/// An admitted visible batch retained before asynchronous FSLX construction.
+/// Keeping its source table closes the retry window before an encoded proposal
+/// exists; it is private writer state, never a second publication authority.
+struct PendingVisibleBatch {
+    deltas: Vec<Arc<DeltaSnapshot>>,
     successor_watermark: u64,
 }
 
@@ -5968,6 +5985,10 @@ struct QuillWriterState {
     pending_manifest: Option<Manifest>,
     pending_replacement_manifest: Option<Manifest>,
     pending_delta_seal: Option<PendingDeltaSeal>,
+    pending_visible_batch: Option<PendingVisibleBatch>,
+    /// The published Delta table belongs to explicit visible ingestion, not
+    /// to a caller using the low-level epoch/seal APIs.
+    visible_ingest: bool,
     unpublished_since: Option<Instant>,
     /// A prior scalar ingest returned an error after mutation may have begun.
     ///
@@ -5995,6 +6016,9 @@ struct QuillWriterState {
     /// `check_cancel` poll; nothing else is short-circuited.
     #[cfg(test)]
     cancel_ingest_after_documents: Option<usize>,
+    /// Cancel after real visible-seal encoding and before a proposal is staged.
+    #[cfg(test)]
+    cancel_visible_seal_after_build: bool,
     /// Documents actually analyzed by the adaptive budget proof. This is
     /// per-index and test-only so a regression can distinguish bounded-wave
     /// refusal from eagerly analyzing the whole rejected batch.
@@ -6446,6 +6470,8 @@ impl QuillWriterState {
             pending_manifest: None,
             pending_replacement_manifest: None,
             pending_delta_seal: None,
+            pending_visible_batch: None,
+            visible_ingest: false,
             unpublished_since: None,
             ingest_retry_required: false,
             #[cfg(any(test, feature = "bench-internals"))]
@@ -6454,6 +6480,8 @@ impl QuillWriterState {
             force_ingest_overlap_rendezvous: false,
             #[cfg(test)]
             cancel_ingest_after_documents: None,
+            #[cfg(test)]
+            cancel_visible_seal_after_build: false,
             #[cfg(test)]
             parallel_budget_documents_analyzed: AtomicUsize::new(0),
         })
@@ -6631,12 +6659,17 @@ impl QuillWriterState {
                 .pending_delta_seal
                 .take()
                 .expect("validated pending Delta seal remains present");
+            let visible_ingest = pending.visible_ingest;
             let installed = self
                 .reader
                 .install_validated_prepared_sealed(authority, pending.prepared)?;
             self.next_seal_seq = pending.next_seal_seq;
             self.next_lease_base = next_lease_base;
             self.docid_allocator = docid_allocator;
+            if visible_ingest {
+                self.visible_ingest = false;
+                self.unpublished_since = None;
+            }
             return Ok(installed);
         }
 
@@ -6657,6 +6690,7 @@ impl QuillWriterState {
             || !self.pending_owned_segments.is_empty()
             || !self.pending_field_stats.is_empty()
             || self.pending_replacement_manifest.is_some()
+            || self.pending_visible_batch.is_some()
         {
             return Err(invalid_state(
                 "durable authority advanced while a scalar transaction lacks its retained MANIFEST proposal",
@@ -6829,8 +6863,9 @@ impl QuillWriterState {
             .published_snapshot
             .prepare_sealed_manifest_with_deltas(self.schema, &manifest, replacement_deltas)?;
         self.pending_delta_seal = Some(PendingDeltaSeal {
-            encoded,
-            segment_installed: false,
+            encoded: encoded.into_iter().collect(),
+            segments_installed: 0,
+            visible_ingest: false,
             manifest,
             prepared,
             next_seal_seq,
@@ -6866,7 +6901,7 @@ impl QuillWriterState {
         &mut self,
         cx: &Cx,
     ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
-        let (encoded, segment_installed, manifest, memory_owned) = {
+        let (encoded, segments_installed, manifest, memory_owned) = {
             let pending = self
                 .pending_delta_seal
                 .as_ref()
@@ -6883,7 +6918,7 @@ impl QuillWriterState {
             };
             (
                 encoded,
-                pending.segment_installed,
+                pending.segments_installed,
                 pending.manifest.clone(),
                 memory_owned,
             )
@@ -6896,16 +6931,16 @@ impl QuillWriterState {
                 .prepared,
         )?;
 
-        if let (Some(encoded), IndexBackend::Durable(writer)) = (encoded, &mut self.backend)
-            && !segment_installed
-        {
-            writer
-                .publish_encoded_segment_retryable(cx, encoded)
-                .await?;
-            self.pending_delta_seal
-                .as_mut()
-                .expect("installed Delta segment retains transaction state")
-                .segment_installed = true;
+        if let IndexBackend::Durable(writer) = &mut self.backend {
+            for encoded in encoded.into_iter().skip(segments_installed) {
+                writer
+                    .publish_encoded_segment_retryable(cx, encoded)
+                    .await?;
+                self.pending_delta_seal
+                    .as_mut()
+                    .expect("installed Delta segment retains transaction state")
+                    .segments_installed += 1;
+            }
         }
         check_cancel(cx, "Delta MANIFEST publish")?;
         match &mut self.backend {
@@ -6945,12 +6980,17 @@ impl QuillWriterState {
             .pending_delta_seal
             .take()
             .expect("published Delta seal retains its prepared local swap");
+        let visible_ingest = pending.visible_ingest;
         let installed = self
             .reader
             .install_validated_prepared_sealed(authority, pending.prepared)?;
         self.next_seal_seq = pending.next_seal_seq;
         self.next_lease_base = next_lease_base;
         self.docid_allocator = docid_allocator;
+        if visible_ingest {
+            self.visible_ingest = false;
+            self.unpublished_since = None;
+        }
         Ok(installed)
     }
 
@@ -6960,9 +7000,13 @@ impl QuillWriterState {
         self.backend.retained_snapshot_for_bookkeeping().directory()
     }
 
-    /// Whether the writer holds documents or installed segments not yet visible.
+    /// Whether the writer holds staged or visible documents not yet committed.
     #[must_use]
     pub fn has_uncommitted_changes(&self) -> bool {
+        self.has_scalar_changes() || self.visible_ingest
+    }
+
+    fn has_scalar_changes(&self) -> bool {
         self.shards
             .iter()
             .any(|shard| shard.accumulator.document_count() != 0)
@@ -6971,6 +7015,7 @@ impl QuillWriterState {
             || self.pending_manifest.is_some()
             || self.pending_replacement_manifest.is_some()
             || self.pending_delta_seal.is_some()
+            || self.pending_visible_batch.is_some()
             || self.publication_awaits_reconciliation()
     }
 
@@ -7158,6 +7203,20 @@ impl QuillWriterState {
             "pending replacement MANIFEST",
         )?;
         conformance_hash_optional_delta_seal(&mut hasher, self.pending_delta_seal.as_ref())?;
+        hasher.update([u8::from(self.visible_ingest)]);
+        if let Some(pending) = &self.pending_visible_batch {
+            hasher.update([1]);
+            hasher.update(pending.successor_watermark.to_be_bytes());
+            hasher.update(
+                conformance_usize_to_u64(pending.deltas.len(), "pending visible Delta count")?
+                    .to_be_bytes(),
+            );
+            for delta in &pending.deltas {
+                conformance_hash_bytes(&mut hasher, &delta.conformance_content_sha256()?);
+            }
+        } else {
+            hasher.update([0]);
+        }
 
         Ok(ConformancePendingWriterState {
             digest_sha256: hasher.finalize().into(),
@@ -7396,6 +7455,237 @@ impl QuillWriterState {
             #[cfg(test)]
             budget_worker_slots,
         }))
+    }
+
+    /// Build a complete add-only batch privately, then publish its Delta table
+    /// or durably seal the table when the batch crosses the Delta budget.
+    async fn index_visible_batch(
+        &mut self,
+        cx: &Cx,
+        documents: IngestBatch<'_>,
+    ) -> Result<(), QuillIndexError> {
+        check_cancel(cx, "visible index")?;
+        if self.has_scalar_changes() || self.ingest_retry_required {
+            return Err(invalid_state(
+                "commit or reconcile staged writes before visible indexing",
+            ));
+        }
+        if self.has_active_deltas() && !self.visible_ingest {
+            return Err(invalid_state(
+                "visible indexing cannot replace caller-managed Delta epochs",
+            ));
+        }
+        let current = self.reader.checked_published_snapshot()?;
+        self.authority_snapshot()?;
+        let no_replacements = BTreeSet::new();
+        self.admit_batch(cx, documents, &no_replacements, |document_id| {
+            Ok(current.resolve_document_id(document_id)?.is_some())
+        })?;
+        if documents.is_empty() {
+            return Ok(());
+        }
+        let unpublished_since = self.unpublished_since.unwrap_or_else(Instant::now);
+        let document_count = u64::try_from(documents.len())
+            .map_err(|_| invalid_state("visible batch document count does not fit u64"))?;
+        let successor_watermark = self
+            .next_lease_base
+            .checked_add(document_count)
+            .filter(|watermark| *watermark <= MAX_GLOBAL_DOCID_EXCLUSIVE)
+            .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
+        // Construct every fallible bookkeeping value before publication. No
+        // issued id or reader epoch changes when private batch analysis fails.
+        let allocator = DocIdAllocator::open(successor_watermark, self.shard_router.shard_count())
+            .map_err(|error| invalid_state(error.to_string()))?;
+        let mut deltas = current.delta_snapshots().to_vec();
+        let lease_width = u64::from(DOC_ORDS_PER_LEASE);
+        let mut next_docid = self.next_lease_base;
+        let lease_base = next_docid / lease_width * lease_width;
+        let mut delta = if deltas
+            .last()
+            .is_some_and(|last| last.lease_base() == lease_base)
+        {
+            deltas
+                .pop()
+                .expect("the matching final Delta remains present")
+                .fork_segment()
+        } else {
+            DeltaSegment::new(self.schema, lease_base, self.config.delta_budget_bytes)?
+        };
+        let mut scratch = ColumnarAccumulator::new(self.schema)?;
+        let mut metadata = Vec::new();
+        for (document_index, document) in documents.iter().enumerate() {
+            #[cfg(test)]
+            if self.cancel_ingest_after_documents == Some(document_index) {
+                cx.set_cancel_requested(true);
+            }
+            // The index is used only by the deterministic cancellation seam.
+            #[cfg(not(test))]
+            let _ = document_index;
+            check_cancel(cx, "visible index analysis")?;
+            if next_docid == delta.lease_end() {
+                deltas.push(Arc::new(delta.into_snapshot(current.keeper_generation())));
+                delta = DeltaSegment::new(self.schema, next_docid, self.config.delta_budget_bytes)?;
+            }
+            scratch.reset();
+            document.write_canonical_metadata(&mut metadata)?;
+            document.accumulate(&mut scratch, 0, next_docid, &metadata)?;
+            let content_hash = document.content_hash(&metadata)?;
+            append_accumulated_delta_document(
+                &mut delta,
+                &scratch,
+                u32::try_from(next_docid)
+                    .map_err(|_| invalid_state("visible document id does not fit u32"))?,
+                document.id(),
+                content_hash,
+            )?;
+            next_docid += 1;
+        }
+        deltas.push(Arc::new(delta.into_snapshot(current.keeper_generation())));
+        let logical_bytes = deltas.iter().try_fold(0_usize, |total, delta| {
+            total
+                .checked_add(delta.segment().bytes_used())
+                .ok_or_else(|| invalid_state("visible Delta byte count overflow"))
+        })?;
+        check_cancel(cx, "visible index publication")?;
+        let visibility_due =
+            unpublished_since.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms);
+        if logical_bytes >= self.config.delta_budget_bytes || visibility_due {
+            // The batch has not been exposed. One exact proposal contains both
+            // earlier visible rows and this whole batch; a failed install keeps
+            // the previous epoch readable and commit can retry the proposal.
+            self.seal_visible_deltas(cx, deltas, successor_watermark)
+                .await?;
+        } else {
+            self.reader
+                .publish_complete(current.keeper_snapshot_arc(), deltas)?;
+            // No await or fallible work between the ArcSwap and ownership/id
+            // bookkeeping. Ordinary writes cannot enter while this lock is held.
+            self.next_lease_base = successor_watermark;
+            self.docid_allocator = allocator;
+            self.visible_ingest = true;
+            self.unpublished_since = Some(unpublished_since);
+        }
+        Ok(())
+    }
+
+    /// Seal the entire writer-owned table through the existing exact-retry
+    /// protocol. All FSLX files precede one MANIFEST, including across leases.
+    async fn seal_visible_deltas(
+        &mut self,
+        cx: &Cx,
+        deltas: Vec<Arc<DeltaSnapshot>>,
+        successor_watermark: u64,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        self.pending_visible_batch = Some(PendingVisibleBatch {
+            deltas,
+            successor_watermark,
+        });
+        self.visible_ingest = true;
+        self.unpublished_since.get_or_insert_with(Instant::now);
+        self.finish_visible_delta_build(cx).await
+    }
+
+    async fn finish_visible_delta_build(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        let pending = self
+            .pending_visible_batch
+            .as_ref()
+            .expect("visible seal encoding requires its retained source table");
+        let deltas = pending.deltas.clone();
+        let successor_watermark = pending.successor_watermark;
+        let mut manifest = self.authority_snapshot()?.next_manifest()?;
+        Self::preflight_successor_generation(manifest.generation)?;
+        manifest.last_publish_unix_s = 0;
+        manifest.docid_high_watermark = manifest.docid_high_watermark.max(successor_watermark);
+        let created_unix_s = self.created_unix_s()?;
+        let mut next_seal_seq = self.next_seal_seq;
+        let mut reserved_segment_ids = BTreeSet::new();
+        let mut encoded_segments = Vec::new();
+        let mut field_stats = BTreeMap::<u16, (u64, u32)>::new();
+        for delta in deltas {
+            check_cancel(cx, "visible Delta seal")?;
+            let mut batch_hasher = Xxh3::new();
+            for (docid, _) in delta.live_documents() {
+                let content_hash = delta.content_hash(docid).ok_or_else(|| {
+                    invalid_state("visible Delta row omitted its canonical content witness")
+                })?;
+                batch_hasher.update(&content_hash.to_le_bytes());
+            }
+            let segment_id = self.derive_segment_id_for_digest(
+                delta.lease_base(),
+                created_unix_s,
+                batch_hasher.digest(),
+                &reserved_segment_ids,
+            )?;
+            reserved_segment_ids.insert(segment_id);
+            let source = Arc::clone(&delta);
+            let encoded = spawn_blocking(move || {
+                flush_delta_snapshot(
+                    &source,
+                    DeltaFlushInput {
+                        segment_id,
+                        created_unix_s,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+            })
+            .await?;
+            check_cancel(cx, "visible Delta seal")?;
+            if let Some(encoded) = encoded {
+                manifest
+                    .segments
+                    .push(manifest_segment(&encoded, next_seal_seq));
+                next_seal_seq = next_seal_seq
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+                encoded_segments.push(Arc::new(encoded));
+            }
+            let count = u32::try_from(delta.live_document_count())
+                .map_err(|_| invalid_state("visible Delta document count does not fit u32"))?;
+            for field in
+                self.schema.fields.iter().filter(|field| {
+                    matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. })
+                })
+            {
+                let tokens = delta.live_total_tokens(field.id).ok_or_else(|| {
+                    invalid_state("visible Delta omitted indexed field statistics")
+                })?;
+                let row = field_stats.entry(field.id).or_default();
+                row.0 = row
+                    .0
+                    .checked_add(tokens)
+                    .ok_or_else(|| invalid_state("visible Delta token count overflow"))?;
+                row.1 = row
+                    .1
+                    .checked_add(count)
+                    .ok_or_else(|| invalid_state("visible Delta document count overflow"))?;
+            }
+        }
+        manifest
+            .segments
+            .sort_unstable_by_key(|segment| segment.docid_lo);
+        manifest.field_stats = merge_field_stats(&manifest.field_stats, &field_stats)?;
+        let prepared = self
+            .published_snapshot
+            .prepare_sealed_manifest(self.schema, &manifest)?;
+        #[cfg(test)]
+        if self.cancel_visible_seal_after_build {
+            cx.set_cancel_requested(true);
+        }
+        check_cancel(cx, "visible Delta install")?;
+        self.pending_delta_seal = Some(PendingDeltaSeal {
+            encoded: encoded_segments,
+            segments_installed: 0,
+            visible_ingest: true,
+            manifest,
+            prepared,
+            next_seal_seq,
+            successor_watermark,
+        });
+        self.pending_visible_batch = None;
+        self.finish_pending_delta_seal(cx).await
     }
 
     /// Route and accumulate one bounded batch into the production Scribe shard set.
@@ -8165,6 +8455,11 @@ impl QuillWriterState {
             };
             let outcome: Result<(), QuillIndexError> = async {
                 check_cancel(cx, "index")?;
+                if self.pending_visible_batch.is_some() {
+                    return Err(invalid_state(
+                        "commit the retained visible batch before scalar indexing",
+                    ));
+                }
                 if self.pending_delta_seal.is_some() {
                     return Err(invalid_state(
                         "resume the retained Delta seal before scalar indexing",
@@ -8850,6 +9145,17 @@ impl QuillWriterState {
         trigger: LifecycleTrigger,
     ) -> Result<&KeeperSnapshot, QuillIndexError> {
         check_cancel(cx, "commit")?;
+        if self.visible_ingest {
+            if self.pending_delta_seal.is_some() {
+                self.finish_pending_delta_seal(cx).await?;
+            } else if self.pending_visible_batch.is_some() {
+                self.finish_visible_delta_build(cx).await?;
+            } else {
+                let deltas = self.published_snapshot.load().delta_snapshots().to_vec();
+                self.seal_visible_deltas(cx, deltas, self.next_lease_base)
+                    .await?;
+            }
+        }
         if self.pending_delta_seal.is_some() {
             return Err(invalid_state(
                 "resume the retained Delta seal before scalar commit",
@@ -9668,7 +9974,8 @@ impl QuillWriterState {
             || self.staged_flush.is_some()
             || self.pending_manifest.is_some()
             || self.pending_replacement_manifest.is_some()
-            || self.pending_delta_seal.is_some();
+            || self.pending_delta_seal.is_some()
+            || self.pending_visible_batch.is_some();
         if !scalar_retry_pending
             && self.has_uncommitted_changes()
             && !self.has_active_deltas()
@@ -10568,6 +10875,25 @@ impl QuillWriterState {
         created_unix_s: i64,
         reserved_segment_ids: &BTreeSet<u64>,
     ) -> Result<u64, QuillIndexError> {
+        let mut batch_hasher = Xxh3::new();
+        for identity in &state.identities {
+            batch_hasher.update(&identity.content_hash.to_le_bytes());
+        }
+        self.derive_segment_id_for_digest(
+            lease_base,
+            created_unix_s,
+            batch_hasher.digest(),
+            reserved_segment_ids,
+        )
+    }
+
+    fn derive_segment_id_for_digest(
+        &self,
+        lease_base: u64,
+        created_unix_s: i64,
+        batch_digest: u64,
+        reserved_segment_ids: &BTreeSet<u64>,
+    ) -> Result<u64, QuillIndexError> {
         let authority = self.authority_snapshot()?;
         let generation = authority
             .loaded_manifest()
@@ -10576,11 +10902,6 @@ impl QuillWriterState {
             .checked_add(1)
             .ok_or_else(|| invalid_state("manifest generation exhausted"))?;
         let schema_id = self.schema.schema_id()?;
-        let mut batch_hasher = Xxh3::new();
-        for identity in &state.identities {
-            batch_hasher.update(&identity.content_hash.to_le_bytes());
-        }
-        let batch_digest = batch_hasher.digest();
         for salt in 0_u64..=u64::from(u16::MAX) {
             let mut preimage = [0_u8; 52];
             preimage[..8].copy_from_slice(&schema_id.to_le_bytes());
@@ -13759,7 +14080,7 @@ impl QuillIndex {
         Ok(self.checked_published_snapshot()?.live_doc_count())
     }
 
-    /// Whether the writer holds documents or installed segments not yet visible.
+    /// Whether staged or process-locally visible writes await durable commit.
     #[must_use]
     pub fn has_uncommitted_changes(&self) -> bool {
         self.writer
@@ -13867,6 +14188,78 @@ impl QuillIndex {
         writer.index_documents(cx, documents).await
     }
 
+    /// Add a complete batch and make it searchable in this process before commit.
+    ///
+    /// This explicit visibility boundary leaves [`Self::index_documents`] and
+    /// staged upserts unchanged. Only new, unique document IDs are accepted.
+    /// Every document is analyzed and validated privately before the complete
+    /// batch replaces the published snapshot. Pinned readers retain their old
+    /// view. Another process sees these rows only after a durable publication.
+    ///
+    /// [`Self::commit`] seals all writer-owned visible epochs in one MANIFEST.
+    /// Reaching [`QuillConfig::delta_budget_bytes`] does that seal within this
+    /// call, before exposing the new batch. The threshold is checked at batch
+    /// boundaries: one atomic caller batch and held reader snapshots can exceed
+    /// it, so it is not a hard allocation or RSS limit.
+    /// [`QuillConfig::max_visibility_lag_ms`] is also checked at these boundaries;
+    /// an aged visible table is sealed with the next admitted batch. There is
+    /// no background timer, so an idle caller still uses `commit` for durability.
+    ///
+    /// Ordinary staged writes and caller-managed Delta tables cannot be mixed
+    /// with this lane. Commit the current transaction before changing lanes.
+    ///
+    /// ```no_run
+    /// # async fn example(cx: &asupersync::Cx) -> Result<(), frankensearch_quill::QuillIndexError> {
+    /// use frankensearch_core::IndexableDocument;
+    /// use frankensearch_quill::{QuillConfig, QuillIndex};
+    /// let index = QuillIndex::create(cx, "lexical", QuillConfig::default()).await?;
+    /// index.index_documents_visible(cx, &[IndexableDocument::new("note", "visible words")]).await?;
+    /// assert_eq!(index.doc_count()?, 1);
+    /// index.commit(cx).await?; // durable for fresh readers and reopen
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Duplicate IDs, malformed documents and cancellation during private
+    /// analysis leave visibility unchanged. Once a budget-triggered seal begins,
+    /// its complete admitted source table is retained before asynchronous
+    /// encoding, followed by the exact encoded publication proposal. On a seal
+    /// failure, call `commit` to retry without replaying documents. Further
+    /// ingestion is refused until that transaction is committed or its
+    /// publication reconciled.
+    pub async fn index_documents_visible(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "visible index writer lock").await?;
+        writer
+            .index_visible_batch(cx, IngestBatch::Default(documents))
+            .await
+    }
+
+    /// Add schema-projected documents at an explicit process-local visibility
+    /// boundary. Stored and numeric columns use the ordinary schema projection.
+    ///
+    /// # Errors
+    ///
+    /// Has the same transaction, budget and retry contract as
+    /// [`Self::index_documents_visible`].
+    pub async fn index_schema_documents_visible(
+        &self,
+        cx: &Cx,
+        documents: &[SchemaDocument],
+    ) -> Result<(), QuillIndexError> {
+        let mut writer = self
+            .lock_writer(cx, "visible schema index writer lock")
+            .await?;
+        writer
+            .index_visible_batch(cx, IngestBatch::Schema(documents))
+            .await
+    }
+
     /// Accumulate one bounded batch into the scalar writer and return the
     /// whole-call outcome paired with its run-scoped [`QuillScaleoutWitness`].
     ///
@@ -13938,7 +14331,8 @@ impl QuillIndex {
             .await
     }
 
-    /// Seal pending writes and atomically publish the next MANIFEST.
+    /// Seal staged writes or all writer-owned visible Delta epochs and
+    /// atomically publish the next MANIFEST.
     ///
     /// # Errors
     ///
@@ -15737,6 +16131,99 @@ fn accumulate_shard_run(
     Ok((bytes_used_high_water, bytes_reserved_high_water))
 }
 
+/// Transfer the one-document Scribe projection into a sealable Delta row.
+/// Analysis, field norms, numeric coercion, stored values and oversized-token
+/// policy therefore stay identical to ordinary staged ingestion.
+fn append_accumulated_delta_document(
+    delta: &mut DeltaSegment,
+    accumulator: &ColumnarAccumulator,
+    global_docid: u32,
+    document_id: &str,
+    content_hash: u64,
+) -> Result<(), QuillIndexError> {
+    let mut fieldnorms = Vec::new();
+    let mut terms = BTreeMap::<u32, (u32, Option<Vec<u32>>)>::new();
+    for field in accumulator.fields() {
+        fieldnorms.push(DeltaFieldNorm {
+            field_ord: field.field_ord(),
+            raw_length: *field
+                .document_lengths()
+                .first()
+                .ok_or_else(|| invalid_state("visible document omitted an indexed field length"))?,
+            fieldnorm_id: *field
+                .fieldnorm_ids()
+                .first()
+                .ok_or_else(|| invalid_state("visible document omitted an indexed field norm"))?,
+        });
+        for (offset, &term_id) in field.term_ids().iter().enumerate() {
+            let (frequency, positions) = terms
+                .entry(term_id)
+                .or_insert_with(|| (0, field.positions().map(|_| Vec::new())));
+            *frequency = frequency
+                .checked_add(1)
+                .ok_or_else(|| invalid_state("visible term frequency exceeds u32"))?;
+            if let (Some(output), Some(input)) = (positions, field.positions()) {
+                output.push(input[offset]);
+            }
+        }
+    }
+    let postings = terms
+        .iter()
+        .map(|(&term_id, (frequency, positions))| {
+            let (field_ord, term) = accumulator.terms().field_and_term(term_id);
+            DeltaTermPosting {
+                field_ord,
+                term,
+                frequency: *frequency,
+                positions: positions.as_deref(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let numeric = accumulator
+        .numeric_fields()
+        .iter()
+        .filter_map(|field| {
+            field
+                .values()
+                .first()
+                .copied()
+                .flatten()
+                .map(|value| DeltaNumericValue {
+                    field_ord: field.field_ord(),
+                    value,
+                })
+        })
+        .collect::<Vec<_>>();
+    let stored = accumulator
+        .stored_fields()
+        .iter()
+        .filter_map(|field| {
+            // Delta derives a stored numeric field from its admitted numeric value;
+            // supplying its canonical bytes as well would duplicate that column.
+            if numeric
+                .iter()
+                .any(|value| value.field_ord == field.field_ord())
+            {
+                None
+            } else {
+                field
+                    .value(0)
+                    .map(|bytes| DeltaStoredValue::new(field.field_ord(), bytes))
+            }
+        })
+        .collect::<Vec<_>>();
+    delta.apply_document_with_values(
+        global_docid,
+        document_id.to_owned().into(),
+        content_hash,
+        &fieldnorms,
+        &postings,
+        &numeric,
+        &stored,
+    )?;
+    Ok(())
+}
+
 /// One document already projected onto an arbitrary compiled schema.
 ///
 /// [`IndexableDocument`] is the five-field shipping shape and stays the input
@@ -16202,14 +16689,18 @@ fn conformance_hash_optional_delta_seal(
         return Ok(());
     };
     hasher.update([1]);
-    match &pending.encoded {
-        None => hasher.update([0]),
-        Some(encoded) => {
-            hasher.update([1]);
-            conformance_hash_bytes(hasher, encoded.as_bytes());
-        }
+    hasher.update(
+        conformance_usize_to_u64(pending.encoded.len(), "pending Delta segment count")?
+            .to_be_bytes(),
+    );
+    for encoded in &pending.encoded {
+        conformance_hash_bytes(hasher, encoded.as_bytes());
     }
-    hasher.update([u8::from(pending.segment_installed)]);
+    hasher.update(
+        conformance_usize_to_u64(pending.segments_installed, "installed Delta segment count")?
+            .to_be_bytes(),
+    );
+    hasher.update([u8::from(pending.visible_ingest)]);
     conformance_hash_bytes(
         hasher,
         &conformance_manifest_bytes(&pending.manifest, "pending Delta MANIFEST")?,
@@ -28340,6 +28831,654 @@ mod tests {
     }
 
     #[test]
+    fn visible_ingest_commits_dense_ids_and_preserves_lexical_results_on_reopen() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let config = QuillConfig {
+                delta_budget_bytes: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                tier_fanout: 32,
+                ..deterministic_config()
+            };
+            let index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .unwrap();
+            index
+                .index_documents(&cx, &[IndexableDocument::new("sealed", "base alpha")])
+                .await
+                .unwrap();
+            assert_eq!(
+                index.doc_count().unwrap(),
+                0,
+                "ordinary staging stays private"
+            );
+            index.commit(&cx).await.unwrap();
+            let cold = QuillSearchIndex::open(&cx, directory.path(), config.clone())
+                .await
+                .unwrap();
+            let initial_generation = index
+                .snapshot()
+                .unwrap()
+                .loaded_manifest()
+                .manifest
+                .generation;
+
+            for ordinal in 1_u32..=2 {
+                let before = index.search_snapshot().unwrap();
+                let mut document =
+                    IndexableDocument::new(format!("visible-{ordinal}"), "Café alpha alpha beta")
+                        .with_title("Rust guide");
+                document
+                    .metadata
+                    .insert("path".into(), format!("notes/{ordinal}.md"));
+                index
+                    .index_documents_visible(&cx, std::slice::from_ref(&document))
+                    .await
+                    .unwrap();
+                let witness = index.document_witness(&document.id).unwrap().unwrap();
+                assert_eq!(witness.global_docid, ordinal);
+                assert_eq!(
+                    witness.content_hash,
+                    indexable_document_content_hash(&document).unwrap()
+                );
+                assert_eq!(index.doc_count().unwrap(), u64::from(ordinal) + 1);
+                assert_eq!(cold.doc_count().unwrap(), u64::from(ordinal));
+                assert_eq!(before.live_doc_count(), u64::from(ordinal));
+                assert!(before.materialize_document_id(ordinal).is_none());
+                assert!(index.has_uncommitted_changes());
+                let visible = index.search_snapshot().unwrap();
+                assert_eq!(visible.delta_count(), 1);
+                assert_eq!(
+                    visible.stored_field_value(METADATA_FIELD, ordinal).unwrap(),
+                    Some(canonical_metadata(&document.metadata).unwrap()),
+                );
+                let queries = [
+                    "alpha",
+                    "alpha OR base",
+                    "\"alpha alpha\"",
+                    "alp*",
+                    "title:rust",
+                    "ord:[1 TO 2]",
+                ];
+                let results = queries
+                    .iter()
+                    .map(|query| index.search_paginated(&cx, query, 10, 0, true).unwrap())
+                    .collect::<Vec<_>>();
+                let committed = index.commit(&cx).await.unwrap();
+                assert_eq!(
+                    committed.loaded_manifest().manifest.generation,
+                    initial_generation + u64::from(ordinal)
+                );
+                assert_eq!(
+                    committed.loaded_manifest().manifest.docid_high_watermark,
+                    u64::from(ordinal) + 1
+                );
+                assert_eq!(index.search_snapshot().unwrap().delta_count(), 0);
+                assert!(!index.has_uncommitted_changes());
+                assert_eq!(visible.live_doc_count(), u64::from(ordinal) + 1);
+                for (query, expected) in queries.iter().zip(&results) {
+                    assert_eq!(
+                        &index.search_paginated(&cx, query, 10, 0, true).unwrap(),
+                        expected,
+                        "seal changed {query}"
+                    );
+                }
+                assert!(cold.refresh(&cx).await.unwrap());
+                assert_eq!(cold.doc_count().unwrap(), u64::from(ordinal) + 1);
+            }
+            index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new("ordinary-after", "gamma alpha")],
+                )
+                .await
+                .unwrap();
+            assert_eq!(index.doc_count().unwrap(), 3);
+            index.commit(&cx).await.unwrap();
+            assert_eq!(
+                index
+                    .document_witness("ordinary-after")
+                    .unwrap()
+                    .unwrap()
+                    .global_docid,
+                3
+            );
+            let expected = index.search_paginated(&cx, "alpha", 10, 0, true).unwrap();
+            drop(index);
+            let reopened = QuillSearchIndex::open(&cx, directory.path(), config)
+                .await
+                .unwrap();
+            assert_eq!(reopened.doc_count().unwrap(), 4);
+            assert_eq!(
+                reopened
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .unwrap(),
+                expected
+            );
+        });
+    }
+
+    #[test]
+    fn visible_ingest_rejects_duplicates_mixed_writes_and_partial_cancelled_batches() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(QuillConfig {
+                delta_budget_bytes: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            })
+            .unwrap();
+            index
+                .index_documents(&cx, &[IndexableDocument::new("sealed", "base")])
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .index_documents_visible(&cx, &[IndexableDocument::new("blocked", "no")])
+                    .await
+                    .is_err()
+            );
+            assert_eq!(index.doc_count().unwrap(), 0);
+            index.commit(&cx).await.unwrap();
+            index
+                .index_documents_visible(&cx, &[IndexableDocument::new("visible", "alpha")])
+                .await
+                .unwrap();
+            let before = index.search_snapshot().unwrap();
+            for duplicate in ["sealed", "visible", "fresh"] {
+                let batch = [
+                    IndexableDocument::new("fresh", "new"),
+                    IndexableDocument::new(duplicate, "duplicate"),
+                ];
+                let error = index
+                    .index_documents_visible(&cx, &batch)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("duplicate live document id"));
+                assert!(Arc::ptr_eq(&before, &index.search_snapshot().unwrap()));
+                assert!(index.document_witness("fresh").unwrap().is_none());
+            }
+            assert!(
+                index
+                    .index_documents(&cx, &[IndexableDocument::new("scalar", "no")])
+                    .await
+                    .is_err()
+            );
+            assert!(
+                index
+                    .upsert_documents(&cx, &[IndexableDocument::new("sealed", "replacement")])
+                    .await
+                    .is_err()
+            );
+            assert!(index.delete_document(&cx, "visible").await.is_err());
+            assert!(index.publish_delta_table(Vec::new()).is_err());
+            assert!(Arc::ptr_eq(&before, &index.search_snapshot().unwrap()));
+
+            let batch = [
+                IndexableDocument::new("cancel-a", "delta"),
+                IndexableDocument::new("cancel-b", "delta"),
+            ];
+            index.writer_mut().cancel_ingest_after_documents = Some(1);
+            let cancelled = Cx::for_testing();
+            assert!(matches!(
+                index.index_documents_visible(&cancelled, &batch).await,
+                Err(QuillIndexError::Cancelled { .. })
+            ));
+            index.writer_mut().cancel_ingest_after_documents = None;
+            assert!(Arc::ptr_eq(&before, &index.search_snapshot().unwrap()));
+            assert!(index.writer_mut().pending_visible_batch.is_none());
+            assert!(index.writer_mut().pending_delta_seal.is_none());
+            index.index_documents_visible(&cx, &batch).await.unwrap();
+            assert_eq!(
+                index
+                    .document_witness("cancel-a")
+                    .unwrap()
+                    .unwrap()
+                    .global_docid,
+                2
+            );
+            assert_eq!(
+                index
+                    .document_witness("cancel-b")
+                    .unwrap()
+                    .unwrap()
+                    .global_docid,
+                3
+            );
+            assert_eq!(
+                before.live_doc_count(),
+                2,
+                "a held epoch never sees later additions"
+            );
+            index.commit(&cx).await.unwrap();
+            assert_eq!(index.doc_count().unwrap(), 4);
+        });
+    }
+
+    #[test]
+    fn visible_ingest_budget_seal_retains_admitted_rows_before_encoded_proposal() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let config = QuillConfig {
+                delta_budget_bytes: 1,
+                ..deterministic_config()
+            };
+            let mut index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .unwrap();
+            index
+                .index_documents(&cx, &[IndexableDocument::new("sealed", "original")])
+                .await
+                .unwrap();
+            index.commit(&cx).await.unwrap();
+            let before = index.search_snapshot().unwrap();
+            let generation = before.keeper_generation();
+            let batch = [
+                IndexableDocument::new("retained-a", "new alpha"),
+                IndexableDocument::new("retained-b", "new beta"),
+            ];
+            index.writer_mut().cancel_visible_seal_after_build = true;
+            let cancelled = Cx::for_testing();
+            assert!(matches!(
+                index.index_documents_visible(&cancelled, &batch).await,
+                Err(QuillIndexError::Cancelled {
+                    phase: "visible Delta install"
+                })
+            ));
+            index.writer_mut().cancel_visible_seal_after_build = false;
+            assert!(index.writer_mut().pending_visible_batch.is_some());
+            assert!(
+                index.writer_mut().pending_delta_seal.is_none(),
+                "cancellation precedes encoded proposal retention"
+            );
+            assert!(Arc::ptr_eq(&before, &index.search_snapshot().unwrap()));
+            assert!(index.document_witness("retained-a").unwrap().is_none());
+            assert!(index.has_uncommitted_changes());
+            assert!(
+                index
+                    .index_documents(&cx, &[IndexableDocument::new("collision", "no")])
+                    .await
+                    .is_err()
+            );
+            assert!(
+                index
+                    .upsert_documents(&cx, &[IndexableDocument::new("sealed", "must not replace")])
+                    .await
+                    .is_err()
+            );
+            assert!(index.index_documents_visible(&cx, &batch).await.is_err());
+            assert_eq!(
+                index
+                    .snapshot()
+                    .unwrap()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation
+            );
+            index.commit(&cx).await.unwrap();
+            assert_eq!(index.doc_count().unwrap(), 3);
+            assert_eq!(
+                index
+                    .document_witness("retained-a")
+                    .unwrap()
+                    .unwrap()
+                    .global_docid,
+                1
+            );
+            assert_eq!(
+                index
+                    .document_witness("retained-b")
+                    .unwrap()
+                    .unwrap()
+                    .global_docid,
+                2
+            );
+            assert_eq!(
+                index
+                    .snapshot()
+                    .unwrap()
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation + 1
+            );
+            assert!(index.writer_mut().pending_visible_batch.is_none());
+            assert!(!index.has_uncommitted_changes());
+            let reopened = QuillSearchIndex::open(&cx, directory.path(), config)
+                .await
+                .unwrap();
+            assert_eq!(reopened.doc_count().unwrap(), 3);
+            assert_eq!(
+                reopened
+                    .search_paginated(&cx, "new", 10, 0, true)
+                    .unwrap()
+                    .total_count,
+                Some(2)
+            );
+        });
+    }
+
+    #[test]
+    fn visible_ingest_seals_multiple_leases_in_one_retryable_manifest() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let config = QuillConfig {
+                delta_budget_bytes: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                tier_fanout: 32,
+                ..deterministic_config()
+            };
+            let mut index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .unwrap();
+            // Position the real allocator at a lease cut without a 65K-row test
+            // corpus. Every admission, encoding and durable operation is live.
+            let frontier = u64::from(DOC_ORDS_PER_LEASE) - 1;
+            index.writer_mut().next_lease_base = frontier;
+            index.writer_mut().docid_allocator = DocIdAllocator::open(frontier, 1).unwrap();
+            let batch = [
+                IndexableDocument::new("left", "shared alpha"),
+                IndexableDocument::new("right-a", "shared beta"),
+                IndexableDocument::new("right-b", "shared gamma"),
+            ];
+            index.index_documents_visible(&cx, &batch).await.unwrap();
+            let before = index.search_snapshot().unwrap();
+            assert_eq!(before.delta_count(), 2);
+            let generation = before.keeper_generation();
+            let expected = index.search_paginated(&cx, "shared", 10, 0, true).unwrap();
+            let cold = QuillSearchIndex::open(&cx, directory.path(), config.clone())
+                .await
+                .unwrap();
+            assert_eq!(cold.doc_count().unwrap(), 0);
+            let collision = directory
+                .path()
+                .join(format!(".tmp-manifest-{}", generation + 1));
+            std::fs::write(&collision, b"preserved manifest conflict").unwrap();
+            assert!(matches!(
+                index.commit(&cx).await,
+                Err(QuillIndexError::Keeper(KeeperError::TempConflict { .. }))
+            ));
+            assert!(Arc::ptr_eq(&before, &index.search_snapshot().unwrap()));
+            assert_eq!(
+                index.search_paginated(&cx, "shared", 10, 0, true).unwrap(),
+                expected
+            );
+            let segment_ids = {
+                let pending = index.writer_mut().pending_delta_seal.as_ref().unwrap();
+                assert_eq!(pending.encoded.len(), 2);
+                assert_eq!(pending.segments_installed, 2);
+                pending
+                    .encoded
+                    .iter()
+                    .map(|encoded| encoded.header().segment_id)
+                    .collect::<Vec<_>>()
+            };
+            assert!(!cold.refresh(&cx).await.unwrap());
+            assert_eq!(
+                cold.doc_count().unwrap(),
+                0,
+                "installed files alone cannot expose half a batch"
+            );
+            std::fs::rename(
+                &collision,
+                directory.path().join("preserved-manifest-conflict"),
+            )
+            .unwrap();
+            let committed = index.commit(&cx).await.unwrap();
+            let manifest = &committed.loaded_manifest().manifest;
+            assert_eq!(manifest.generation, generation + 1);
+            assert_eq!(manifest.docid_high_watermark, frontier + 3);
+            assert_eq!(
+                manifest
+                    .segments
+                    .iter()
+                    .map(|segment| segment.segment_id)
+                    .collect::<Vec<_>>(),
+                segment_ids
+            );
+            assert_eq!(index.search_snapshot().unwrap().delta_count(), 0);
+            assert_eq!(
+                index.search_paginated(&cx, "shared", 10, 0, true).unwrap(),
+                expected
+            );
+            assert!(cold.refresh(&cx).await.unwrap());
+            assert_eq!(cold.doc_count().unwrap(), 3);
+            assert_eq!(
+                cold.search_paginated(&cx, "shared", 10, 0, true).unwrap(),
+                expected
+            );
+        });
+    }
+
+    #[test]
+    fn visible_ingest_schema_projection_matches_staged_and_sealed_queries() {
+        run_with_cx(|cx| async move {
+            let make_index = || {
+                QuillIndex::from_backend(
+                    IndexBackend::Memory(KeeperSnapshot::in_memory(DELTA_PARITY_SCHEMA).unwrap()),
+                    DELTA_PARITY_SCHEMA,
+                    QuillConfig {
+                        delta_budget_bytes: usize::MAX,
+                        ..deterministic_config()
+                    },
+                )
+                .unwrap()
+            };
+            let visible = make_index();
+            let staged = make_index();
+            let documents = [
+                SchemaDocument {
+                    id: "schema-a".into(),
+                    indexed: vec![
+                        (0, "schema-a".into()),
+                        (1, "Café alpha beta alpha".into()),
+                        (4, "Rust title".into()),
+                    ],
+                    numeric: vec![(2, NumericValue::U64(7)), (5, NumericValue::U64(90))],
+                    stored: vec![(3, vec![0, 255, 7])],
+                },
+                SchemaDocument {
+                    id: "schema-b".into(),
+                    indexed: vec![(0, "schema-b".into()), (1, "beta gamma".into())],
+                    numeric: vec![(2, NumericValue::U64(9)), (5, NumericValue::U64(100))],
+                    stored: vec![(3, b"opaque bytes".to_vec())],
+                },
+            ];
+            visible
+                .index_schema_documents_visible(&cx, &documents)
+                .await
+                .unwrap();
+            staged
+                .index_schema_documents(&cx, &documents)
+                .await
+                .unwrap();
+            staged.commit(&cx).await.unwrap();
+            let before = visible.search_snapshot().unwrap();
+            assert_eq!(before.delta_count(), 1);
+            for (docid, document) in documents.iter().enumerate() {
+                let docid = u32::try_from(docid).unwrap();
+                for field in DELTA_PARITY_SCHEMA
+                    .fields
+                    .iter()
+                    .filter(|field| field.stored)
+                {
+                    assert_eq!(
+                        before.stored_field_value(field.id, docid).unwrap(),
+                        staged
+                            .search_snapshot()
+                            .unwrap()
+                            .stored_field_value(field.id, docid)
+                            .unwrap()
+                    );
+                }
+                assert_eq!(
+                    visible.document_witness(&document.id).unwrap(),
+                    staged.document_witness(&document.id).unwrap()
+                );
+            }
+            assert_eq!(
+                before.stored_field_value(2, 0).unwrap(),
+                Some(7_u64.to_le_bytes().to_vec())
+            );
+            assert_eq!(
+                before.stored_field_value(3, 0).unwrap(),
+                Some(vec![0, 255, 7])
+            );
+            let queries = [
+                "alpha",
+                "\"alpha beta\"",
+                "title:rust",
+                "rank:[7 TO 9]",
+                "fast_rank:[90 TO 90]",
+                "alp*",
+            ];
+            let expected = queries
+                .iter()
+                .map(|query| staged.search_paginated(&cx, query, 10, 0, true).unwrap())
+                .collect::<Vec<_>>();
+            for (query, expected) in queries.iter().zip(&expected) {
+                assert_eq!(
+                    &visible.search_paginated(&cx, query, 10, 0, true).unwrap(),
+                    expected,
+                    "visible schema query {query}"
+                );
+            }
+            let mut valid = documents[0].clone();
+            valid.id = "schema-fresh".into();
+            let mut invalid = documents[1].clone();
+            invalid.id = "schema-invalid".into();
+            invalid.numeric[0].1 = NumericValue::I64(-1);
+            assert!(matches!(
+                visible
+                    .index_schema_documents_visible(&cx, &[valid, invalid])
+                    .await,
+                Err(QuillIndexError::Accumulator(_))
+            ));
+            assert!(Arc::ptr_eq(&before, &visible.search_snapshot().unwrap()));
+            visible.commit(&cx).await.unwrap();
+            for (query, expected) in queries.iter().zip(&expected) {
+                assert_eq!(
+                    &visible.search_paginated(&cx, query, 10, 0, true).unwrap(),
+                    expected,
+                    "sealed schema query {query}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn visible_ingest_budget_publishes_all_leases_in_one_generation() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let config = QuillConfig {
+                delta_budget_bytes: 1,
+                ..deterministic_config()
+            };
+            let mut index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .unwrap();
+            let generation = index.search_snapshot().unwrap().keeper_generation();
+            let frontier = u64::from(DOC_ORDS_PER_LEASE) - 1;
+            index.writer_mut().next_lease_base = frontier;
+            index.writer_mut().docid_allocator = DocIdAllocator::open(frontier, 1).unwrap();
+            index
+                .index_documents_visible(
+                    &cx,
+                    &[
+                        IndexableDocument::new("budget-left", "shared alpha"),
+                        IndexableDocument::new("budget-right", "shared beta"),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(index.doc_count().unwrap(), 2);
+            assert_eq!(index.search_snapshot().unwrap().delta_count(), 0);
+            assert!(!index.has_uncommitted_changes());
+            let committed = index.snapshot().unwrap();
+            assert_eq!(
+                committed.loaded_manifest().manifest.generation,
+                generation + 1
+            );
+            assert_eq!(committed.loaded_manifest().manifest.segments.len(), 2);
+            assert_eq!(
+                committed.loaded_manifest().manifest.docid_high_watermark,
+                frontier + 2
+            );
+            let reopened = QuillSearchIndex::open(&cx, directory.path(), config)
+                .await
+                .unwrap();
+            assert_eq!(reopened.doc_count().unwrap(), 2);
+            assert_eq!(
+                reopened
+                    .search_paginated(&cx, "shared", 10, 0, true)
+                    .unwrap()
+                    .total_count,
+                Some(2)
+            );
+        });
+    }
+
+    #[test]
+    fn visible_ingest_visibility_lag_retains_timer_and_batch_across_cancelled_seal() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let config = QuillConfig {
+                delta_budget_bytes: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            };
+            let mut index = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .unwrap();
+            index
+                .index_documents_visible(
+                    &cx,
+                    &[IndexableDocument::new("lag-first", "first visible")],
+                )
+                .await
+                .unwrap();
+            let before = index.search_snapshot().unwrap();
+            assert_eq!(before.delta_count(), 1);
+            // Arm the age check only after establishing the fixture so host
+            // scheduling cannot accidentally seal its first batch.
+            index.writer_mut().reader.config.max_visibility_lag_ms = 10;
+            let aged = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+            index.writer_mut().unpublished_since = Some(aged);
+            index.writer_mut().cancel_visible_seal_after_build = true;
+            let cancelled = Cx::for_testing();
+            assert!(matches!(
+                index
+                    .index_documents_visible(
+                        &cancelled,
+                        &[IndexableDocument::new("lag-second", "second visible"),]
+                    )
+                    .await,
+                Err(QuillIndexError::Cancelled {
+                    phase: "visible Delta install"
+                })
+            ));
+            index.writer_mut().cancel_visible_seal_after_build = false;
+            assert_eq!(index.writer_mut().unpublished_since, Some(aged));
+            assert!(index.writer_mut().pending_visible_batch.is_some());
+            assert!(Arc::ptr_eq(&before, &index.search_snapshot().unwrap()));
+            let cold = QuillSearchIndex::open(&cx, directory.path(), config)
+                .await
+                .unwrap();
+            assert_eq!(cold.doc_count().unwrap(), 0);
+            index.commit(&cx).await.unwrap();
+            assert_eq!(index.doc_count().unwrap(), 2);
+            assert_eq!(
+                index.search_snapshot().unwrap().keeper_generation(),
+                before.keeper_generation() + 1
+            );
+            assert!(index.writer_mut().unpublished_since.is_none());
+            assert!(!index.has_uncommitted_changes());
+            assert!(cold.refresh(&cx).await.unwrap());
+            assert_eq!(cold.doc_count().unwrap(), 2);
+        });
+    }
+
+    #[test]
     fn scalar_and_delta_writer_modes_cannot_discard_each_others_pending_state() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
@@ -30587,8 +31726,9 @@ mod tests {
                 .prepare_sealed_manifest(DEFAULT_SCHEMA, &manifest)
                 .expect("prepare retained local swap");
             index.writer_mut().pending_delta_seal = Some(PendingDeltaSeal {
-                encoded: Some(Arc::clone(&encoded)),
-                segment_installed: false,
+                encoded: vec![Arc::clone(&encoded)],
+                segments_installed: 0,
+                visible_ingest: false,
                 manifest,
                 prepared,
                 next_seal_seq: 2,
@@ -30730,8 +31870,9 @@ mod tests {
                 .prepare_sealed_manifest(DEFAULT_SCHEMA, &manifest)
                 .expect("prepare retained local swap");
             index.writer_mut().pending_delta_seal = Some(PendingDeltaSeal {
-                encoded: Some(Arc::clone(&encoded)),
-                segment_installed: false,
+                encoded: vec![Arc::clone(&encoded)],
+                segments_installed: 0,
+                visible_ingest: false,
                 manifest,
                 prepared,
                 next_seal_seq: base_seal_seq + 1,
@@ -30751,7 +31892,7 @@ mod tests {
                 .as_ref()
                 .expect("aborted attempt must retain the pending seal")
                 .encoded
-                .as_ref()
+                .first()
                 .map(Arc::clone)
                 .expect("retained seal keeps its encoded segment");
             assert!(
@@ -30877,8 +32018,9 @@ mod tests {
                 .prepare_sealed_manifest(DEFAULT_SCHEMA, &manifest)
                 .expect("prepare retained local swap");
             index.writer_mut().pending_delta_seal = Some(PendingDeltaSeal {
-                encoded: Some(Arc::clone(&encoded)),
-                segment_installed: false,
+                encoded: vec![Arc::clone(&encoded)],
+                segments_installed: 0,
+                visible_ingest: false,
                 manifest,
                 prepared,
                 next_seal_seq: base_seal_seq + 1,
@@ -30945,13 +32087,13 @@ mod tests {
                     .pending_delta_seal
                     .as_ref()
                     .expect("failed publication must retain the pending seal");
-                assert!(
-                    retained.segment_installed,
+                assert_eq!(
+                    retained.segments_installed, 1,
                     "the reconciled install must be recorded before the failed publish"
                 );
                 assert!(
                     Arc::ptr_eq(
-                        retained.encoded.as_ref().expect("retained encoded segment"),
+                        retained.encoded.first().expect("retained encoded segment"),
                         &encoded
                     ),
                     "the retained seal must still reference the exact encoded bytes"

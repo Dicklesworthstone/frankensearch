@@ -854,6 +854,12 @@ impl DeltaSnapshot {
         &self.segment
     }
 
+    /// Copy a published epoch into private, independently owned writer state.
+    /// The caller can abandon an incomplete batch without changing any reader.
+    pub(crate) fn fork_segment(&self) -> DeltaSegment {
+        self.segment.snapshot_copy()
+    }
+
     /// Canonically ordered term views for this immutable generation.
     ///
     /// Query lowering must pre-admit the first view before calling this; the
@@ -1292,14 +1298,17 @@ impl DeltaSegment {
     /// batch boundary; composite publication rejects a stale witness.
     #[must_use]
     pub fn freeze(&self, keeper_generation: u64) -> DeltaSnapshot {
-        let snapshot_owner_id = NEXT_DELTA_OWNER_ID.fetch_add(1, Ordering::Relaxed);
-        let segment = Self {
+        self.snapshot_copy().into_snapshot(keeper_generation)
+    }
+
+    fn snapshot_copy(&self) -> Self {
+        Self {
             schema: self.schema,
             lease_base: self.lease_base,
             lease_end: self.lease_end,
             next_docid_floor: self.next_docid_floor,
             budget_bytes: self.budget_bytes,
-            owner_id: snapshot_owner_id,
+            owner_id: NEXT_DELTA_OWNER_ID.fetch_add(1, Ordering::Relaxed),
             generation: self.generation,
             fields: self.fields.clone(),
             terms: self.terms.clone(),
@@ -1318,18 +1327,24 @@ impl DeltaSegment {
             tombstone_words: self.tombstone_words.clone(),
             tombstone_count: self.tombstone_count,
             logical_bytes_used: self.logical_bytes_used,
-        };
+        }
+    }
+
+    /// Publish private batch state without copying its arenas a second time.
+    /// Consuming the writer prevents later mutation through the original owner.
+    pub(crate) fn into_snapshot(self, keeper_generation: u64) -> DeltaSnapshot {
+        let lineage_id = self.owner_id;
         // No publication pass: the live counts ride along inside the cloned
         // chains, already exact.
         DeltaSnapshot {
-            segment,
+            segment: self,
             ordered_term_ids: OnceLock::new(),
             keeper_generation,
             // Each frozen epoch is a distinct publication candidate, even
             // when two freezes observe the same mutable Delta generation.
             // Rebinding deliberately preserves this witness; a later freeze
             // must never be replaceable by an earlier, shorter snapshot.
-            lineage_id: snapshot_owner_id,
+            lineage_id,
             #[cfg(test)]
             materialization_attempts: AtomicUsize::new(0),
         }

@@ -57,7 +57,14 @@ pub struct QuillConfig {
     /// never as `active_shards * budget`. `bytes_reserved`/RSS diagnostics may
     /// exceed it because one document and allocator capacity are indivisible.
     pub scribe_shard_budget_bytes: usize,
-    /// Maximum bytes in one shard's searchable delta before seal.
+    /// Logical byte threshold for explicit visible ingestion to seal its table.
+    ///
+    /// [`crate::QuillIndex::index_documents_visible`] checks this after privately
+    /// building one atomic batch. A crossing seals all visible epochs and the
+    /// whole new batch in one durable publication. One caller batch, allocator
+    /// capacity and snapshots retained by readers can exceed this threshold;
+    /// it is not a hard memory limit. Ordinary staged Scribe ingestion uses
+    /// [`Self::scribe_shard_budget_bytes`] instead.
     pub delta_budget_bytes: usize,
     /// Number of segments at one tier that triggers promotion/merge.
     pub tier_fanout: usize,
