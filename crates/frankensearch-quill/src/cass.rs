@@ -1042,7 +1042,7 @@ mod tests {
                 ("punctuation", "review", "pré-commit l'été"),
                 ("dotted_i", "review", "İSTANBUL"),
                 ("ascii_i", "review", "istanbul"),
-                ("kelvin_sign", "review", "Kelvin"),
+                ("kelvin_sign", "review", "\u{212A}elvin"),
                 ("ascii_kelvin", "review", "kelvin"),
                 ("cafe", "review", "café"),
                 ("cafe_compound", "review", "caféteria"),
@@ -1166,7 +1166,7 @@ mod tests {
                 ("İSTANBUL", &["dotted_i"][..]),
                 ("İSTAN*", &["dotted_i"][..]),
                 ("istanbul", &["ascii_i"][..]),
-                ("Kelvin", &["kelvin_sign"][..]),
+                ("\u{212A}elvin", &["kelvin_sign"][..]),
                 ("kelvin", &["ascii_kelvin"][..]),
                 ("café*", &["cafe", "cafe_compound"][..]),
                 ("\"café\"", &["cafe", "cafe_compound"][..]),
@@ -1639,7 +1639,6 @@ mod tests {
                     );
                 }
             }
-
             let snapshot = writer.snapshot().expect("pre-merge budget snapshot");
             let inputs: Vec<_> = snapshot
                 .segments()
@@ -1807,14 +1806,16 @@ mod tests {
         });
     }
 
-    /// Opt-in large-index measurement of exact-query normalization. The live
-    /// A/A control is the existing quoted ASCII-fragment query, compared with
-    /// the equivalent quoted accented query. This reports normalization overhead,
-    /// not a speedup against an older binary. Implicit-prefix timing is outside
-    /// this probe. Corpus construction is streamed in small batches.
+    /// Opt-in large-index measurement. The quoted ASCII-fragment A/A controls
+    /// and equivalent quoted accented query measure normalization overhead.
+    /// The implicit-prefix query is a separate workload, not an equivalent
+    /// exact-query comparison. No speedup against an older binary is claimed.
+    /// Corpus construction is streamed in small batches.
     ///
-    /// CASS_MULTILINGUAL_PERF_DOCS=100000 (default) or 1000000; run with:
+    /// `CASS_MULTILINGUAL_PERF_DOCS=100000` (default) or 1000000; run with:
+    /// ```sh
     /// cargo test -p frankensearch-quill --release cass_multilingual_query_scaling -- --ignored --nocapture
+    /// ```
     #[test]
     #[ignore = "large-index measurement; run explicitly under --release --ignored"]
     fn cass_multilingual_query_scaling() {
@@ -1915,6 +1916,7 @@ mod tests {
                 ("aligned_phrase", "\"k rlek\""),
                 ("aligned_phrase_repeat", "\"k rlek\""),
                 ("accented_phrase", "\"kérlek\""),
+                ("accented_word", "kérlek"),
                 ("ascii_control", "markerselected"),
             ];
 
@@ -2259,7 +2261,7 @@ mod tests {
             let overlong = format!("backup{}é", " ".repeat(10_000));
             for hostile in [&oversized, &trailing_oversized, &expansion, &overlong] {
                 for raw in [
-                    hostile.to_string(),
+                    hostile.clone(),
                     format!("NOT {hostile}"),
                     format!("backup OR {hostile}"),
                     format!("\"{hostile}\""),
@@ -2852,7 +2854,6 @@ mod tests {
                 expected
             );
         }
-
         let document = sample_document("legacy", 4, "codex", "pré-commit", "kérlek café");
         let current = document.to_schema_document();
         let retained = legacy_v9::to_schema_document(&document);

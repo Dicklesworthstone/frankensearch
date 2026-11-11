@@ -7212,7 +7212,7 @@ mod tests {
             &phrase_expanded,
         ] {
             for expression in [
-                raw.to_string(),
+                raw.clone(),
                 format!("NOT {raw}"),
                 format!("backup OR {raw}"),
             ] {
@@ -7270,7 +7270,7 @@ mod tests {
             ("KÉRLEK", vec!["k", "rlek"]),
             ("İSTANBUL", vec!["stanbul"]),
             ("STRAẞE", vec!["stra", "e"]),
-            ("Key", vec!["ey"]),
+            ("\u{212A}ey", vec!["ey"]),
             ("éß", vec![]),
             ("привет", vec![]),
         ] {
@@ -7347,7 +7347,7 @@ mod tests {
         for operand in [
             "привет",
             "éß",
-            "K",
+            "\u{212A}",
             "İ",
             "🚀",
             "...",
@@ -8036,9 +8036,9 @@ mod tests {
             "İstanbul",
             "İstan*",
             "istanbul",
-            "K",
+            "\u{212A}",
             "İ",
-            "NOT K",
+            "NOT \u{212A}",
             "DÉJÀ",
             "ZAŻÓŁĆ",
             "PŘÍLIŠ",

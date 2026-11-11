@@ -5300,7 +5300,7 @@ mod cass_query_tests {
             ("\"İstanbul\"", vec![7]),
             ("İstanbul*", vec![0, 7]),
             ("istanbul", vec![]),
-            ("K", vec![]),
+            ("\u{212A}", vec![]),
             ("İ", vec![]),
             ("ke\u{301}rlek", vec![8]),
             ("\"ke\u{301}rlek\"", vec![8]),
@@ -5910,7 +5910,10 @@ mod cass_query_tests {
             negative.len()
         );
         for (score, address) in searcher
-            .search(&*query, &tantivy::collector::TopDocs::with_limit(18))
+            .search(
+                &*query,
+                &tantivy::collector::TopDocs::with_limit(18).order_by_score(),
+            )
             .expect("search explained prefix exclusion")
         {
             let explanation = query
@@ -5949,7 +5952,10 @@ mod cass_query_tests {
                 "{raw:?}"
             );
             let page = searcher
-                .search(&*query, &tantivy::collector::TopDocs::with_limit(80))
+                .search(
+                    &*query,
+                    &tantivy::collector::TopDocs::with_limit(80).order_by_score(),
+                )
                 .expect("complete prefix page");
             assert_eq!(page.len(), 80, "{raw:?}");
             if raw.starts_with('é') {
@@ -5963,7 +5969,9 @@ mod cass_query_tests {
                 searcher
                     .search(
                         &*query,
-                        &tantivy::collector::TopDocs::with_limit(10).and_offset(70),
+                        &tantivy::collector::TopDocs::with_limit(10)
+                            .and_offset(70)
+                            .order_by_score(),
                     )
                     .expect("prefix page past the old expansion limit")
                     .len(),
@@ -6054,7 +6062,10 @@ mod cass_query_tests {
                 .expect_err("overflow must reject count before scoring");
             assert!(count_error.to_string().contains("1024"), "{raw:?}");
             let page_error = searcher
-                .search(&*query, &tantivy::collector::TopDocs::with_limit(1))
+                .search(
+                    &*query,
+                    &tantivy::collector::TopDocs::with_limit(1).order_by_score(),
+                )
                 .expect_err("overflow must not return a partial page");
             assert!(page_error.to_string().contains("1024"), "{raw:?}");
         }
@@ -6255,7 +6266,10 @@ mod cass_query_tests {
                 "count for {raw:?}"
             );
             for (score, address) in searcher
-                .search(&*query, &tantivy::collector::TopDocs::with_limit(5))
+                .search(
+                    &*query,
+                    &tantivy::collector::TopDocs::with_limit(5).order_by_score(),
+                )
                 .expect("search explained exclusions")
             {
                 let explanation = query
@@ -6280,14 +6294,20 @@ mod cass_query_tests {
         // Native PhraseWeight::explain otherwise seeks backwards for the
         // first of these; the adapter must return an ordinary nonmatch error.
         for (_, address) in searcher
-            .search(&*excluded, &tantivy::collector::TopDocs::with_limit(5))
+            .search(
+                &*excluded,
+                &tantivy::collector::TopDocs::with_limit(5).order_by_score(),
+            )
             .expect("find phrase nonmatches")
         {
             assert!(phrase.explain(&searcher, address).is_err());
             assert!(absent_phrase.explain(&searcher, address).is_err());
         }
         for (score, address) in searcher
-            .search(&*phrase, &tantivy::collector::TopDocs::with_limit(5))
+            .search(
+                &*phrase,
+                &tantivy::collector::TopDocs::with_limit(5).order_by_score(),
+            )
             .expect("find phrase matches")
         {
             let explanation = phrase.explain(&searcher, address).expect("explain phrase");
@@ -6318,7 +6338,7 @@ mod cass_query_tests {
             ("İstanbul", vec!["stanbul"]),
             ("kérlek--mentést", vec!["k", "rlek", "ment", "st"]),
             ("Straße", vec!["stra", "e"]),
-            ("K", vec![]),
+            ("\u{212A}", vec![]),
             ("привет", vec![]),
             ("ASCII", vec!["ascii"]),
             ("foo-bar", vec!["foo-bar"]),

@@ -7104,7 +7104,7 @@ mod tests {
             .with_quality_embedder(quality)
             .with_circuit_breaker(breaker.clone());
             let cancelled = &cancelled;
-            for _ in 0..breaker.config().failure_threshold + 1 {
+            for _ in 0..=breaker.config().failure_threshold {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let mut phases = Vec::new();
                     let error = cancelled
