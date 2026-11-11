@@ -5768,7 +5768,8 @@ pub mod generation_reader {
         },
     }
 
-    /// Why a fresh open did not admit a snapshot. Never a silent fallback.
+    /// Why a fresh open or current snapshot installation was refused.
+    /// Never a silent fallback.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SnapshotRefusalV1 {
         /// A publisher holds the exclusive anchor lock; retry later.
@@ -5838,14 +5839,22 @@ pub mod generation_reader {
             /// Sequence the fresh open observed.
             observed: u64,
         },
+        /// An explicitly selected historical snapshot cannot become a cell's
+        /// current head. Rollback must publish a new, higher authority sequence.
+        HistoricalSelection {
+            /// Sequence of the historical read/rollback target.
+            selected: u64,
+            /// Current sequence that authorized the historical selection.
+            current: u64,
+        },
     }
 
-    /// Outcome of one fresh open.
+    /// Outcome of one fresh open or current-snapshot installation.
     #[derive(Debug)]
     pub enum SnapshotOpenOutcomeV1 {
         /// One owned, fully validated snapshot.
         Opened(Arc<OpenedGenerationSnapshotV1>),
-        /// Typed refusal with zero retained state.
+        /// Typed refusal. Any previously installed snapshot remains unchanged.
         Refused(SnapshotRefusalV1),
     }
 
@@ -7282,12 +7291,76 @@ pub mod generation_reader {
             self.inner.load_full()
         }
 
-        /// Install an already-admitted snapshot; returns the previous one.
+        /// Install an already-admitted current snapshot atomically.
+        ///
+        /// Admission proves the snapshot's bytes and authority at open time;
+        /// it does not authorize replacing a newer installed head. Installation
+        /// therefore applies the same monotone, exact-authority checks as
+        /// [`Self::refresh`], including after a concurrent install wins the race.
+        /// A different root identity remains an explicit caller-selected switch.
+        /// Historical read/rollback targets are refused even in an empty cell:
+        /// a rollback becomes current only through a new authority publication.
+        /// Refusal preserves the installed `Arc` and every retained reader.
+        ///
+        /// # Errors
+        ///
+        /// Returns the same installation infrastructure errors as [`Self::refresh`].
+        /// Stale heads, equal-sequence forks, and historical selections return a
+        /// typed [`SnapshotOpenOutcomeV1::Refused`] without changing the cell.
         pub fn install(
             &self,
             snapshot: Arc<OpenedGenerationSnapshotV1>,
-        ) -> Option<Arc<OpenedGenerationSnapshotV1>> {
-            self.inner.swap(Some(snapshot))
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            if let Some(current) = snapshot.selected_history_of() {
+                return Ok(SnapshotOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::HistoricalSelection {
+                        selected: snapshot.head().authority.sequence,
+                        current: current.sequence,
+                    },
+                ));
+            }
+            let mut installed = self.inner.load();
+            loop {
+                if let Some(current) = installed.as_ref()
+                    && current.root_id() == snapshot.root_id()
+                {
+                    let current_head = current.head().authority;
+                    let fresh_head = snapshot.head().authority;
+                    if current_head.sequence > fresh_head.sequence {
+                        return Ok(SnapshotOpenOutcomeV1::Refused(
+                            SnapshotRefusalV1::RegressedHead {
+                                installed: current_head.sequence,
+                                observed: fresh_head.sequence,
+                            },
+                        ));
+                    }
+                    if current_head.sequence == fresh_head.sequence && current_head != fresh_head {
+                        return Ok(SnapshotOpenOutcomeV1::Refused(
+                            SnapshotRefusalV1::Authority(
+                                GenerationAuthorityErrorV1::EqualSequenceFork,
+                            ),
+                        ));
+                    }
+                }
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+                super::platform::test_boundary(
+                    super::platform::TestBoundary::BeforeSnapshotCellCompareExchange,
+                )?;
+                let previous = self
+                    .inner
+                    .compare_and_swap(&*installed, Some(Arc::clone(&snapshot)));
+                let exchanged = match (&*installed, &*previous) {
+                    (None, None) => true,
+                    (Some(expected), Some(previous)) => Arc::ptr_eq(expected, previous),
+                    _ => false,
+                };
+                if exchanged {
+                    return Ok(SnapshotOpenOutcomeV1::Opened(snapshot));
+                }
+                // Another installer won after our observation. Recheck its
+                // exact head rather than overwriting it with stale admission.
+                installed = previous;
+            }
         }
 
         /// Open a fresh snapshot of `root` and install it on success.
@@ -7340,50 +7413,9 @@ pub mod generation_reader {
                 floor,
                 max_owned_image_bytes,
             )?;
-            let SnapshotOpenOutcomeV1::Opened(fresh) = &outcome else {
-                return Ok(outcome);
-            };
-            let mut installed = self.inner.load();
-            loop {
-                if let Some(current) = installed.as_ref()
-                    && current.root_id() == fresh.root_id()
-                {
-                    let current_head = current.head().authority;
-                    let fresh_head = fresh.head().authority;
-                    if current_head.sequence > fresh_head.sequence {
-                        return Ok(SnapshotOpenOutcomeV1::Refused(
-                            SnapshotRefusalV1::RegressedHead {
-                                installed: current_head.sequence,
-                                observed: fresh_head.sequence,
-                            },
-                        ));
-                    }
-                    if current_head.sequence == fresh_head.sequence && current_head != fresh_head {
-                        return Ok(SnapshotOpenOutcomeV1::Refused(
-                            SnapshotRefusalV1::Authority(
-                                GenerationAuthorityErrorV1::EqualSequenceFork,
-                            ),
-                        ));
-                    }
-                }
-                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-                super::platform::test_boundary(
-                    super::platform::TestBoundary::BeforeSnapshotCellCompareExchange,
-                )?;
-                let previous = self
-                    .inner
-                    .compare_and_swap(&*installed, Some(Arc::clone(fresh)));
-                let exchanged = match (&*installed, &*previous) {
-                    (None, None) => true,
-                    (Some(expected), Some(previous)) => Arc::ptr_eq(expected, previous),
-                    _ => false,
-                };
-                if exchanged {
-                    return Ok(outcome);
-                }
-                // Another refresher won after our observation. Recheck its
-                // exact head rather than overwriting it with a stale admission.
-                installed = previous;
+            match outcome {
+                SnapshotOpenOutcomeV1::Opened(fresh) => self.install(fresh),
+                SnapshotOpenOutcomeV1::Refused(_) => Ok(outcome),
             }
         }
     }
@@ -11541,19 +11573,26 @@ pub mod generation_reader {
                 }
             );
             assert!(Arc::ptr_eq(&cell.load().expect("kept"), &current));
-            // Explicit install is the caller's decision and is not gated.
+            // A separately admitted snapshot cannot bypass the same guard
+            // through direct installation.
             let stale = opened(open(
                 &root_b,
                 GenerationRootSecurityProfileV1::CooperativeLocal,
                 None,
             ));
-            let previous = cell.install(Arc::clone(&stale)).expect("previous");
-            assert!(Arc::ptr_eq(&previous, &current));
-            assert!(Arc::ptr_eq(&cell.load().expect("stale"), &stale));
+            assert_eq!(
+                refused(cell.install(Arc::clone(&stale)).expect("checked install")),
+                SnapshotRefusalV1::RegressedHead {
+                    installed: 2,
+                    observed: 1,
+                }
+            );
+            assert!(Arc::ptr_eq(&cell.load().expect("current stays"), &current));
+            assert_eq!(stale.head().authority.sequence, 1);
         }
 
         #[test]
-        fn concurrent_refresh_cannot_overwrite_a_newer_installed_head() {
+        fn concurrent_cell_installations_cannot_overwrite_a_newer_head() {
             let (_, stale_root, _) = genesis_root("cell-concurrent-stale");
             let (current_path, current_root, genesis_slot) =
                 genesis_root("cell-concurrent-current");
@@ -11579,19 +11618,36 @@ pub mod generation_reader {
                 .bytes(GenerationComponentRole::Vector)
                 .expect("mandatory vector");
 
-            // Exercise a race from both None and an installed generation. In
-            // either case the slow thread has already observed the cell before
-            // the newer refresh wins, so a load/check/store would regress it.
-            for initially_populated in [false, true] {
+            let fresh = opened(open(
+                &current_root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            // Exercise direct installation and fresh admission on both sides
+            // of the race, from empty and populated cells. The slow operation
+            // has observed the cell before the newer one wins, so a separate
+            // load/check/store would regress it.
+            for (initially_populated, slow_direct, winner_direct) in [
+                (false, false, false),
+                (false, false, true),
+                (false, true, false),
+                (false, true, true),
+                (true, false, false),
+                (true, false, true),
+                (true, true, false),
+                (true, true, true),
+            ] {
                 let cell = GenerationSnapshotCellV1::new();
                 if initially_populated {
-                    assert!(cell.install(Arc::clone(&old)).is_none());
+                    let initial = opened(cell.install(Arc::clone(&old)).expect("initial install"));
+                    assert!(Arc::ptr_eq(&initial, &old));
                 }
                 let (observed_tx, observed_rx) = std::sync::mpsc::channel();
                 let (resume_tx, resume_rx) = std::sync::mpsc::channel();
                 std::thread::scope(|scope| {
                     let cell = &cell;
                     let stale_root = &stale_root;
+                    let stale = Arc::clone(&old);
                     let slow = scope.spawn(move || {
                         let mut paused = false;
                         let _hook = platform::install_test_hook(move |boundary| {
@@ -11606,25 +11662,33 @@ pub mod generation_reader {
                             }
                             Ok(())
                         });
-                        cell.refresh(
-                            stale_root,
-                            ROOT_ID,
-                            GenerationRootSecurityProfileV1::CooperativeLocal,
-                            None,
-                        )
-                        .expect("slow refresh runs")
+                        if slow_direct {
+                            cell.install(stale)
+                        } else {
+                            cell.refresh(
+                                stale_root,
+                                ROOT_ID,
+                                GenerationRootSecurityProfileV1::CooperativeLocal,
+                                None,
+                            )
+                        }
+                        .expect("slow installation runs")
                     });
                     observed_rx
                         .recv_timeout(std::time::Duration::from_secs(30))
                         .expect("slow refresh observed the cell");
                     let newer = opened(
-                        cell.refresh(
-                            &current_root,
-                            ROOT_ID,
-                            GenerationRootSecurityProfileV1::CooperativeLocal,
-                            None,
-                        )
-                        .expect("newer refresh runs without waiting for slow admission"),
+                        if winner_direct {
+                            cell.install(Arc::clone(&fresh))
+                        } else {
+                            cell.refresh(
+                                &current_root,
+                                ROOT_ID,
+                                GenerationRootSecurityProfileV1::CooperativeLocal,
+                                None,
+                            )
+                        }
+                        .expect("newer installation runs without waiting for slow admission"),
                     );
                     resume_tx.send(()).expect("release slow refresher");
                     assert_eq!(
@@ -11670,6 +11734,11 @@ pub mod generation_reader {
                 .expect("same exact authority remains admissible"),
             );
             assert_eq!(same.head(), first.head());
+            let same_installed = opened(
+                cell.install(Arc::clone(&same))
+                    .expect("same authority can be installed directly"),
+            );
+            assert!(Arc::ptr_eq(&same_installed, &same));
 
             // A separately admitted root has identical manifest/component
             // bytes at the same sequence, but a different exact authority
@@ -11700,6 +11769,165 @@ pub mod generation_reader {
                 SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::EqualSequenceFork)
             );
             assert!(Arc::ptr_eq(&cell.load().expect("original stays"), &same));
+            let fork = opened(open(
+                &fork_root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            assert_eq!(
+                refused(cell.install(fork).expect("checked fork installation")),
+                SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::EqualSequenceFork)
+            );
+            assert!(Arc::ptr_eq(&cell.load().expect("original stays"), &same));
+        }
+
+        #[test]
+        fn cell_refuses_historical_selections_but_accepts_a_published_rollback() {
+            let (path, root, current, first) = historical_root("cell-history", true);
+            let predecessor = opened(
+                root.open_predecessor_generation_snapshot_with_budget(
+                    &current,
+                    current
+                        .manifest()
+                        .predecessor()
+                        .expect("current predecessor"),
+                    u64::MAX,
+                )
+                .expect("immediate historical selection"),
+            );
+            let ancestor = opened(
+                root.open_historical_generation_snapshot_with_budget(&current, first, 3, u64::MAX)
+                    .expect("older historical selection"),
+            );
+            let current_bytes = current.manifest_bytes();
+            for selected in [&predecessor, &ancestor] {
+                for initially_populated in [false, true] {
+                    let cell = GenerationSnapshotCellV1::new();
+                    if initially_populated {
+                        opened(cell.install(Arc::clone(&current)).expect("current install"));
+                    }
+                    assert_eq!(
+                        refused(
+                            cell.install(Arc::clone(selected))
+                                .expect("historical installation is classified")
+                        ),
+                        SnapshotRefusalV1::HistoricalSelection {
+                            selected: selected.head().authority.sequence,
+                            current: current.head().authority.sequence,
+                        },
+                    );
+                    if initially_populated {
+                        assert!(Arc::ptr_eq(
+                            &cell.load().expect("current remains"),
+                            &current
+                        ));
+                    } else {
+                        assert!(cell.load().is_none());
+                    }
+                }
+            }
+
+            // Reusing old artifact bytes is allowed through an actual rollback
+            // publication. Only authority sequence must advance; the artifact
+            // generation itself may be older than the previously served one.
+            let rollback = ActivationManifest::V2(
+                ActivationManifestV2::new(
+                    5,
+                    Some(current.head().authority),
+                    GenerationAuthorityActionV1::Rollback,
+                    ancestor.manifest().generation(),
+                    [0x41; 32],
+                    ancestor.manifest().source_checkpoint_sha256(),
+                    ancestor.manifest().document_set_sha256(),
+                    ancestor.manifest().components(),
+                )
+                .expect("higher-sequence rollback manifest"),
+            );
+            publish_manifest(
+                &path,
+                &publisher(&root),
+                &rollback,
+                current.authority_pair(),
+                None,
+            );
+            let rolled_back = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            let cell = GenerationSnapshotCellV1::new();
+            opened(cell.install(Arc::clone(&current)).expect("current install"));
+            let installed = opened(
+                cell.install(Arc::clone(&rolled_back))
+                    .expect("published rollback install"),
+            );
+            assert!(Arc::ptr_eq(&installed, &rolled_back));
+            assert!(Arc::ptr_eq(
+                &cell.load().expect("rollback current"),
+                &rolled_back
+            ));
+            assert_eq!(installed.head().authority.sequence, 5);
+            assert_eq!(
+                installed.manifest().generation(),
+                ancestor.manifest().generation()
+            );
+            for role in ROLES {
+                assert_eq!(
+                    installed.closure().bytes(role),
+                    ancestor.closure().bytes(role)
+                );
+            }
+            assert_eq!(current.manifest_bytes(), current_bytes);
+            assert_eq!(current.head().authority.sequence, 4);
+        }
+
+        #[test]
+        fn cell_allows_an_explicit_new_root_identity() {
+            let (_, _, current, _) = predecessor_root("cell-old-incarnation", true, None);
+            let path = fixture_root("cell-new-incarnation");
+            let root = admit(&path);
+            let new_root_id = [0xe1; 16];
+            assert_ne!(new_root_id, current.root_id());
+            let publisher = root
+                .authority_publisher(
+                    new_root_id,
+                    WRITER,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("new root publisher");
+            publish_with_manifest(
+                &path,
+                &publisher,
+                1,
+                None,
+                ExpectedAuthorityPairV1::default(),
+                None,
+            );
+            let replacement = opened(
+                root.open_generation_snapshot(
+                    new_root_id,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                )
+                .expect("admit new root"),
+            );
+            let cell = GenerationSnapshotCellV1::new();
+            opened(
+                cell.install(Arc::clone(&current))
+                    .expect("old root install"),
+            );
+            let installed = opened(
+                cell.install(Arc::clone(&replacement))
+                    .expect("explicit new root install"),
+            );
+            assert!(Arc::ptr_eq(&installed, &replacement));
+            assert!(Arc::ptr_eq(
+                &cell.load().expect("new root current"),
+                &replacement
+            ));
+            assert_eq!(installed.root_id(), new_root_id);
+            assert_eq!(installed.head().authority.sequence, 1);
+            assert_eq!(current.head().authority.sequence, 2);
         }
 
         #[test]
