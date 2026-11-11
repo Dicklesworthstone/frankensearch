@@ -894,8 +894,8 @@ mod tests {
                     .ingest(IngestRequest::new("parked", "retained input for retry"))
                     .unwrap();
                 let shutdown = AtomicBool::new(false);
-                let wakes = Arc::new(InferenceWake::default());
-                let waker = Waker::from(Arc::clone(&wakes));
+                let notifications = Arc::new(InferenceWake::default());
+                let waker = Waker::from(Arc::clone(&notifications));
                 let mut task = Context::from_waker(&waker);
                 let mut service = Box::pin(worker.run(&cx, "cancelled-worker", &shutdown));
                 let first_poll = service.as_mut().poll(&mut task);
@@ -905,11 +905,11 @@ mod tests {
                     assert!(first_poll.is_pending());
                     assert_eq!(probe.polls.load(Ordering::SeqCst), 1);
                     assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
-                    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+                    assert_eq!(notifications.0.load(Ordering::SeqCst), 0);
                     cx.cancel_fast(asupersync::CancelKind::User);
                     // A manual repoll without this check would hide the bug:
                     // nothing in the provider can schedule the worker again.
-                    assert!(wakes.0.load(Ordering::SeqCst) > 0);
+                    assert!(notifications.0.load(Ordering::SeqCst) > 0);
                     service.as_mut().poll(&mut task)
                 };
                 assert!(

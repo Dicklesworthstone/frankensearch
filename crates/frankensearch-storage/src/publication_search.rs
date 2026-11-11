@@ -1034,18 +1034,18 @@ mod tests {
                         .map(|_| ())
                 }
             });
-            let wakes = Arc::new(QueryWake::default());
-            let waker = Waker::from(Arc::clone(&wakes));
+            let notifications = Arc::new(QueryWake::default());
+            let waker = Waker::from(Arc::clone(&notifications));
             let mut task = Context::from_waker(&waker);
             assert!(query.as_mut().poll(&mut task).is_pending());
             assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
             assert_eq!(probe.pending_polls.load(Ordering::SeqCst), 1);
             assert_eq!(probe.pending_drops.load(Ordering::SeqCst), 0);
-            assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+            assert_eq!(notifications.0.load(Ordering::SeqCst), 0);
             cx.cancel_fast(asupersync::CancelKind::User);
             // Cancellation must schedule a real repoll, without relying on a
             // provider wake, timeout, or test driver that polls unconditionally.
-            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            assert!(notifications.0.load(Ordering::SeqCst) > 0);
             assert!(matches!(
                 query.as_mut().poll(&mut task),
                 Poll::Ready(Err(SearchError::Cancelled { .. }))
