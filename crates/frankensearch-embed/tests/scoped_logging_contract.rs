@@ -628,7 +628,7 @@ impl ReceiptIdentity {
             ),
             active_features_sha256: output_sha256(active_features.as_bytes(), &[]),
             active_features,
-            asupersync: registry_package_identity(&lock, "asupersync", "0.5.0"),
+            asupersync: registry_package_identity(&lock, "asupersync", "0.6.2"),
             tokenizers: registry_package_identity(&lock, "tokenizers", "0.23.2"),
         }
     }
@@ -826,7 +826,7 @@ fn assert_sealed_receipt(
         !receipt.identity.active_features.is_empty(),
         "receipt must retain the exact active feature set"
     );
-    assert_registry_package_identity(&receipt.identity.asupersync, "asupersync", "0.5.0");
+    assert_registry_package_identity(&receipt.identity.asupersync, "asupersync", "0.6.2");
     assert_registry_package_identity(&receipt.identity.tokenizers, "tokenizers", "0.23.2");
 }
 
@@ -876,7 +876,7 @@ fn fresh_process_contract_binds_pinned_dependency_and_source_identities() {
     let lock = std::fs::read_to_string(root.join("Cargo.lock"))
         .expect("fresh-process contract must read the workspace Cargo.lock");
     for (name, version) in [
-        ("asupersync", "0.5.0"),
+        ("asupersync", "0.6.2"),
         ("tokenizers", "0.23.2"),
         ("safetensors", "0.8.0"),
     ] {

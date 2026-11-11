@@ -2062,7 +2062,12 @@ mod tests {
             )
             .expect("wrapper"),
         );
-        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        // Asupersync 0.6 gives a runtime a lazy blocking pool by default;
+        // (0, 0) configures none.
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("runtime");
         let task_wrapper = wrapper.clone();
         let task = runtime.handle().spawn(async move {
             let cx = Cx::current().expect("request context");
@@ -2191,7 +2196,10 @@ mod tests {
 
     #[test]
     fn inline_opt_in_does_not_publish_a_cancelled_shadow_result() {
-        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("runtime");
         let cx = runtime.request_cx_with_budget(Budget::INFINITE);
         assert!(cx.blocking_pool_handle().is_none());
         let cancel_cx = cx.clone();

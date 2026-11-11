@@ -2,6 +2,7 @@
 //! Acquisition verifies artifacts and real producer execution before publication.
 //! It never selects or rebuilds an index or executes a core `RecoveryPlan`.
 
+#![recursion_limit = "512"]
 #![deny(unsafe_code)]
 
 use std::collections::HashSet;
