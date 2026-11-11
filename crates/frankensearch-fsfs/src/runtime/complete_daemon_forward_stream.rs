@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::super::super::super::{
     SearchOutputPhase, SearchServeFrame, SearchServeOptions, SearchStreamResources,
 };
-use super::super::{FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL, streaming};
+use super::super::{FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL, admission, streaming};
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_RESPONSE_MAX_BYTES, ForwardedSearch, FsfsRuntime,
     LiveRetainedSearchReader, PeerOutcome, Reply, SearchCacheKey, SearchExecutionFlags, VERSION,
@@ -39,6 +39,9 @@ use crate::stream_protocol::{
 };
 
 type Frame = StreamFrame<SearchHitPayload>;
+
+const MAX_RECEIVE_TURN_BYTES: usize = 64 * 1024;
+const MAX_RECEIVE_TURN_READS: usize = 32;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -428,10 +431,26 @@ where
     let mut record = Vec::new();
     let mut chunk = [0_u8; 8192];
     let mut expansion_future = Some(expansion_future);
+    let mut turn_bytes = 0;
+    let mut turn_reads = 0;
     loop {
         retained_search_checkpoint(cx)?;
         let remaining = control::remaining(started, timeout)?;
-        match peer.read(&mut chunk) {
+        // A warm daemon can keep the socket readable through an entire large
+        // result set. Checkpoints alone cannot let another task request
+        // cancellation on the same worker: yield after bounded byte/syscall
+        // progress, just as the daemon's request reader and output drain do.
+        // EINTR consumes a turn too. This is a scheduler yield, not an added
+        // I/O-timer delay for every chunk of an otherwise ready response.
+        if turn_bytes >= MAX_RECEIVE_TURN_BYTES || turn_reads == MAX_RECEIVE_TURN_READS {
+            admission::yield_turn(cx).await?;
+            turn_bytes = 0;
+            turn_reads = 0;
+            continue;
+        }
+        let read_limit = chunk.len().min(MAX_RECEIVE_TURN_BYTES - turn_bytes);
+        turn_reads += 1;
+        match peer.read(&mut chunk[..read_limit]) {
             Ok(0) => {
                 if !record.is_empty() {
                     return Err(io::Error::new(
@@ -459,6 +478,7 @@ where
                 return Ok(error);
             }
             Ok(count) => {
+                turn_bytes += count;
                 for part in chunk[..count].split_inclusive(|byte| *byte == b'\n') {
                     retained_search_checkpoint(cx)?;
                     control::remaining(started, timeout)?;
@@ -510,6 +530,8 @@ where
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 asupersync::time::sleep(cx.now(), remaining.min(IO_POLL_INTERVAL)).await;
+                turn_bytes = 0;
+                turn_reads = 0;
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => return Err(error.into()),
@@ -1119,6 +1141,153 @@ mod tests {
             let toon = String::from_utf8(toon).unwrap();
             assert_eq!(toon.matches('\u{001e}').count(), 2);
             assert!(toon.contains("toon"));
+        });
+    }
+
+    fn queued_large_stream(request: &ForwardedSearch) -> (UnixStream, Vec<u8>) {
+        use crate::stream_protocol::StreamResultEvent;
+
+        let mut frames = vec![started(request), initial(request)];
+        for rank in 1..=request.search.limit {
+            frames.push(Frame::new(
+                &request.request_id,
+                u64::try_from(frames.len()).unwrap(),
+                "2026-09-21T00:00:00Z",
+                "search",
+                StreamEvent::Result(StreamResultEvent {
+                    rank: u64::try_from(rank).unwrap(),
+                    item: SearchHitPayload {
+                        rank,
+                        path: format!("src/document-{rank}.rs"),
+                        line: Some(1),
+                        score: 0.5,
+                        snippet: Some("a matching source line with useful context ".repeat(24)),
+                        lexical_rank: Some(rank),
+                        semantic_rank: None,
+                        hash_rank: None,
+                        in_both_sources: false,
+                    },
+                }),
+            ));
+        }
+        frames.push(Frame {
+            seq: u64::try_from(frames.len()).unwrap(),
+            ..completed(request)
+        });
+        let wire = frames_bytes(&frames);
+        assert!(wire.len() > MAX_RECEIVE_TURN_BYTES);
+        let (peer, mut server) = UnixStream::pair().unwrap();
+        // Queue the complete reply and EOF before the first client poll. A
+        // missing cooperative budget then deterministically returns Ready,
+        // rather than accidentally yielding on a concurrent writer's timing.
+        rustix::net::sockopt::set_socket_send_buffer_size(&server, wire.len() * 2).unwrap();
+        rustix::net::sockopt::set_socket_recv_buffer_size(&peer, wire.len() * 2).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        server.set_nonblocking(true).unwrap();
+        server.write_all(&wire).unwrap();
+        server.shutdown(Shutdown::Write).unwrap();
+        (peer, wire)
+    }
+
+    #[test]
+    fn continuously_readable_stream_yields_and_preserves_records_in_both_formats() {
+        use std::task::{Context, Waker};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+                let mut request = request();
+                request.search.limit = 96;
+                let (mut peer, wire) = queued_large_stream(&request);
+                let mut state = ReceiveState::default();
+                let mut output = Vec::new();
+                let mut operation = Box::pin(receive(
+                    &cx,
+                    &mut peer,
+                    &request,
+                    Instant::now(),
+                    Duration::from_secs(5),
+                    format,
+                    &mut state,
+                    &mut output,
+                ));
+                {
+                    let mut task = Context::from_waker(Waker::noop());
+                    assert!(
+                        operation.as_mut().poll(&mut task).is_pending(),
+                        "a ready large response must give the owning runtime another turn"
+                    );
+                }
+                let result = operation.await;
+                finish_receive(&mut state, &request, format, &mut output, result).unwrap();
+                if format == OutputFormat::Jsonl {
+                    // Includes records straddling both socket chunks and the
+                    // cooperative turn: no omission, replay or partial JSON.
+                    assert_eq!(output, wire);
+                } else {
+                    let output = String::from_utf8(output).unwrap();
+                    assert_eq!(output.matches('\u{001e}').count(), request.search.limit + 3);
+                    assert!(output.contains("document-96.rs"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn large_ready_stream_observes_cancellation_before_draining_the_remaining_reply() {
+        use std::task::{Context, Poll, Waker};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut request = request();
+            request.search.limit = 96;
+            let (mut peer, _wire) = queued_large_stream(&request);
+            let mut state = ReceiveState::default();
+            let mut output = Vec::new();
+            let mut operation = Box::pin(receive(
+                &cx,
+                &mut peer,
+                &request,
+                Instant::now(),
+                Duration::from_secs(5),
+                OutputFormat::Jsonl,
+                &mut state,
+                &mut output,
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut task).is_pending());
+            // This is the turn an owner task needs in order to cancel a
+            // response whose peer never becomes WouldBlock before EOF.
+            cx.set_cancel_requested(true);
+            let Poll::Ready(result) = operation.as_mut().poll(&mut task) else {
+                panic!("cancelled ready stream must stop on its next owned poll"); // ubs:ignore — cfg(test) failure.
+            };
+            drop(operation);
+            cx.set_cancel_requested(false);
+            assert!(matches!(&result, Err(SearchError::Cancelled { .. })));
+            let error = finish_receive(
+                &mut state,
+                &request,
+                OutputFormat::Jsonl,
+                &mut output,
+                result,
+            )
+            .unwrap_err();
+            assert!(FsfsRuntime::forwarded_search_error_was_emitted(&error));
+            let frames = output
+                .split(|&byte| byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<Frame>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert!(frames.len() < request.search.limit + 3);
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| matches!(frame.event, StreamEvent::Terminal(_)))
+                    .count(),
+                1
+            );
+            assert!(matches!(&frames.last().unwrap().event,
+                StreamEvent::Terminal(terminal) if terminal.status == StreamTerminalStatus::Cancelled));
+            retained_search_checkpoint(&cx).unwrap();
         });
     }
 
