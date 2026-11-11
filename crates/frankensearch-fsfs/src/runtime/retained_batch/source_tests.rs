@@ -39,7 +39,7 @@ fn source_attributes_preserve_class_timestamp_and_the_original_document_api() {
         assert!(ordinary.semantic());
         assert_eq!(ordinary.revision(99), 99);
         assert_eq!(
-            ordinary.reason(IngestionClass::FullSemanticLexical),
+            ordinary.reason(IngestionClass::FullSemanticLexical, BatchOrigin::Mutations),
             "retained_batch"
         );
         attach_sources(
@@ -52,7 +52,7 @@ fn source_attributes_preserve_class_timestamp_and_the_original_document_api() {
         assert!(!body.semantic());
         assert_eq!(body.revision(99), 42);
         assert_eq!(
-            body.reason(IngestionClass::FullSemanticLexical),
+            body.reason(IngestionClass::FullSemanticLexical, BatchOrigin::Mutations),
             "index.plan.lexical_only"
         );
         assert_eq!(
@@ -249,7 +249,7 @@ fn metadata_sources_are_path_only_and_never_certify_file_content() {
         assert_eq!(body.lexical, "alpha.md");
         assert_eq!(body.revision(0), 42);
         assert_eq!(
-            body.reason(IngestionClass::LexicalOnly),
+            body.reason(IngestionClass::LexicalOnly, BatchOrigin::Mutations),
             "index.plan.metadata_only"
         );
         assert_eq!(

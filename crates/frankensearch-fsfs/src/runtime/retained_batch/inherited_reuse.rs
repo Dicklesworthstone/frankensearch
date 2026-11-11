@@ -90,7 +90,9 @@ pub(super) fn record_source_inputs(
                 ingestion_class: ingestion_class_label(source.ingestion_class).to_owned(),
                 canonical_bytes: u64::try_from(body.embedding.len())
                     .map_err(|_| invalid("source canonical length overflow"))?,
-                reason_code: body.reason(source.ingestion_class).to_owned(),
+                reason_code: body
+                    .reason(source.ingestion_class, super::BatchOrigin::Mutations)
+                    .to_owned(),
             },
         );
     }

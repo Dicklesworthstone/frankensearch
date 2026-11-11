@@ -39,7 +39,7 @@ use crate::generation_store::{
 // module would resolve beside it in `runtime/`, not in `runtime/retained_reuse/`.
 #[path = "retained_reuse/append_input.rs"]
 mod append_input;
-pub(super) use append_input::read_append_documents;
+pub(super) use append_input::{AppendDocument, read_append_documents};
 #[path = "retained_reuse/configuration.rs"]
 mod configuration;
 #[path = "retained_reuse/execution.rs"]
@@ -3148,7 +3148,7 @@ mod generation_tests {
         }
 
         #[test]
-        fn independent_producer_drift_and_append_invalidate_completed_reuse() {
+        fn independent_producer_drift_and_append_invalidate_only_incompatible_reuse() {
             run_test_with_cx(|cx| async move {
                 let parent = tempfile::tempdir().unwrap();
                 fixture(parent.path(), 2);
@@ -3176,11 +3176,11 @@ mod generation_tests {
                 assert_eq!(appended["fast_documents"], 1);
                 assert_eq!(appended["quality_documents"], 1);
                 assert_eq!(
-                    appended["receipt_present"], false,
-                    "explicit mutation must not copy old source evidence"
+                    appended["receipt_present"], true,
+                    "untouched rows retain their authenticated source evidence"
                 );
                 let rebuilt = run_counted(&cx, parent.path(), "index").await;
-                assert_index_calls(&rebuilt, 2, 2);
+                assert_index_calls(&rebuilt, 1, 1);
                 let reused = run_counted(&cx, parent.path(), "index").await;
                 assert_index_calls(&reused, 0, 0);
             });

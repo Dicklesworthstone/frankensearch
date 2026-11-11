@@ -110,6 +110,34 @@ struct Body {
 
 type PreparedBatch = BTreeMap<String, Option<Body>>;
 
+struct BatchInput {
+    documents: PreparedBatch,
+    source_inputs: BTreeMap<String, inherited_reuse::SourceInput>,
+    origin: BatchOrigin,
+}
+
+#[derive(Clone, Copy)]
+enum BatchOrigin {
+    Mutations,
+    Append,
+}
+
+impl BatchOrigin {
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Mutations => "retained-batch",
+            Self::Append => "append-batch",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Mutations => "retained_batch",
+            Self::Append => "append_batch",
+        }
+    }
+}
+
 /// Supplied only by a source owner after normal discovery/classification. The
 /// public document API never infers filesystem authority from an opaque ID.
 #[derive(Debug, Clone)]
@@ -208,11 +236,11 @@ impl Body {
         })
     }
 
-    fn reason(&self, default: IngestionClass) -> &'static str {
+    fn reason(&self, default: IngestionClass, origin: BatchOrigin) -> &'static str {
         if self.source.is_some() {
             super::ingestion_plan_reason(self.class(default))
         } else {
-            "retained_batch"
+            origin.reason()
         }
     }
 }
@@ -365,7 +393,11 @@ impl Producer {
         let (embedder, relative, role) = if quality {
             (
                 runtime.resolve_quality_embedder()?.ok_or_else(|| {
-                    invalid("the existing quality tier requires its verified producer")
+                    SearchError::EmbedderUnavailable {
+                        model: runtime.config.indexing.quality_model.clone(),
+                        reason: "the selected generation has a quality tier but no verified quality producer is available to extend it"
+                            .to_owned(),
+                    }
                 })?,
                 FSFS_VECTOR_QUALITY_INDEX_FILE,
                 "fsfs.retained_batch.quality",
@@ -512,8 +544,53 @@ impl FsfsRuntime {
             cx,
             store_root,
             expected,
-            documents,
-            BTreeMap::new(),
+            BatchInput {
+                documents,
+                source_inputs: BTreeMap::new(),
+                origin: BatchOrigin::Mutations,
+            },
+            precommit,
+        )
+        .await
+    }
+
+    /// JSONL admission has already checked every record, resolved duplicates
+    /// and produced both canonical text representations. Keep its larger batch
+    /// limit and avoid canonicalizing those texts again, while sharing every
+    /// pressure, inference, identity and publication boundary with mixed updates.
+    #[allow(clippy::future_not_send)]
+    pub(super) async fn apply_retained_append_with_precommit<F>(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        expected: &PublishedGeneration,
+        documents: BTreeMap<String, retained_reuse::AppendDocument>,
+        precommit: F,
+    ) -> SearchResult<RetainedBatchResult>
+    where
+        F: FnOnce(&Cx) -> SearchResult<()> + Send,
+    {
+        let mut prepared = BTreeMap::new();
+        for (id, document) in documents {
+            retained_search_checkpoint(cx)?;
+            prepared.insert(
+                id,
+                Some(Body {
+                    embedding: document.embedding_text,
+                    lexical: document.lexical_text,
+                    source: None,
+                }),
+            );
+        }
+        self.apply_prepared_retained_batch(
+            cx,
+            store_root,
+            expected,
+            BatchInput {
+                documents: prepared,
+                source_inputs: BTreeMap::new(),
+                origin: BatchOrigin::Append,
+            },
             precommit,
         )
         .await
@@ -542,8 +619,11 @@ impl FsfsRuntime {
             cx,
             store_root,
             expected,
-            documents,
-            source_inputs,
+            BatchInput {
+                documents,
+                source_inputs,
+                origin: BatchOrigin::Mutations,
+            },
             move |cx| {
                 // Discovery/backend/selection admission remains first. Additional
                 // source evidence cannot override a failure or acknowledge a source
@@ -565,13 +645,17 @@ impl FsfsRuntime {
         cx: &Cx,
         store_root: &Path,
         expected: &PublishedGeneration,
-        mut documents: PreparedBatch,
-        source_inputs: BTreeMap<String, inherited_reuse::SourceInput>,
+        batch: BatchInput,
         precommit: F,
     ) -> SearchResult<RetainedBatchResult>
     where
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
+        let BatchInput {
+            mut documents,
+            source_inputs,
+            origin,
+        } = batch;
         retained_search_checkpoint(cx)?;
         if documents.values().any(Option::is_some) {
             self.validate_content_upserts_allowed()?;
@@ -771,7 +855,7 @@ impl FsfsRuntime {
                             id.clone(),
                             timestamp,
                             IngestionClass::Skip,
-                            "retained_batch",
+                            origin.reason(),
                         )
                     },
                     |body| {
@@ -784,7 +868,7 @@ impl FsfsRuntime {
                             modified,
                             body.class(class),
                             body.lexical.clone(),
-                            body.reason(class),
+                            body.reason(class, origin),
                         );
                         if let Some(source) = &body.source {
                             mutation.title.clone_from(&source.title);
@@ -895,7 +979,7 @@ impl FsfsRuntime {
                     ingestion_class: ingestion_class_label(body.class(class)).to_owned(),
                     canonical_bytes: u64::try_from(body.embedding.len())
                         .map_err(|_| invalid("canonical document length overflow"))?,
-                    reason_code: body.reason(class).to_owned(),
+                    reason_code: body.reason(class, origin).to_owned(),
                     fast_windows: windows.remove(&id),
                 };
                 manifests.insert(id, entry);
@@ -916,7 +1000,7 @@ impl FsfsRuntime {
         candidate.write_index_artifacts(build.path(), &lexical_manifest, &manifests)?;
         let mut sentinel = Self::read_index_sentinel(build.path())?
             .ok_or_else(|| invalid("candidate completion sentinel is absent"))?;
-        "retained-batch".clone_into(&mut sentinel.command);
+        origin.command().clone_into(&mut sentinel.command);
         sentinel.generated_at_ms = timestamp;
         sentinel.indexed_files = manifests.len();
         sentinel.discovered_files = sentinel.discovered_files.max(manifests.len());

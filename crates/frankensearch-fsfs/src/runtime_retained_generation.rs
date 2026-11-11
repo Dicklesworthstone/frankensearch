@@ -649,6 +649,10 @@ impl FsfsRuntime {
     /// input drives vectors and catalog identity; complete lexical text remains
     /// searchable, including content beyond the models' input budget. A
     /// lexical-only generation has no vector tier and gains keyword rows only.
+    /// Bounded native inference groups share workload and pressure admission
+    /// with mixed updates; both tiers share a 128 MiB staged-vector limit.
+    /// Untouched source rows keep their authenticated reuse evidence, while
+    /// every supplied body requires fresh source validation before later reuse.
     /// No source directory is scanned or changed. Empty input publishes nothing.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn append_retained_generation(
@@ -663,7 +667,7 @@ impl FsfsRuntime {
             .await
     }
 
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
     async fn append_retained_generation_with_precommit<F>(
         &self,
         cx: &Cx,
@@ -695,350 +699,22 @@ impl FsfsRuntime {
             return Ok((None, 0));
         }
         let store = CompleteGenerationStore::open(cx, store_root)?;
-        let build = store.begin(cx)?;
         let predecessor = store.active(cx)?.ok_or_else(|| {
             complete_cli::complete_cli_error(
                 "selection",
                 "no complete generation has been published",
             )
         })?;
-        Self::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
-        self.validate_append_indexing_mode(predecessor.path())?;
-        let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
-            .ok_or_else(|| {
-                complete_cli::complete_cli_error(
-                    "append_membership",
-                    "selected membership manifests disagree",
-                )
-            })?;
-
-        // A lexical-only predecessor (explicitly selected or built without
-        // semantic loaders) has no vector tier: as on the legacy layout, only
-        // keyword rows and membership change, and nothing is embedded.
-        let lexical_only = Self::is_lexical_only_generation(predecessor.path());
-        let window_maximum = if lexical_only {
-            for id in documents.keys() {
-                semantic_windows::validate_source_id(id)?;
-            }
-            1
-        } else {
-            Self::fast_window_policy_at_root(predecessor.path())?
-        };
-        let mut window_plans = BTreeMap::new();
-        if window_maximum > 1 {
-            for (id, document) in &documents {
-                semantic_windows::validate_source_id(id)?;
-                let plan = semantic_windows::plan(&document.lexical_text, window_maximum)?;
-                if plan
-                    .row_ids(id)
-                    .iter()
-                    .any(|row| row.len() > usize::from(u16::MAX))
-                {
-                    return Err(complete_cli::complete_cli_error(
-                        "append_id",
-                        "document ID leaves insufficient room for its semantic window row IDs",
-                    ));
-                }
-                window_plans.insert(id.clone(), plan);
-            }
-        }
-
-        let mut input = self.cli_input.clone();
-        input.index_dir = Some(build.path().to_path_buf());
-        input.daemon = false;
-        input.daemon_socket = None;
-        let candidate = self.clone().with_cli_input(input);
-        if retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?
-            != predecessor
-        {
-            return Err(complete_cli::complete_cli_error(
-                "append_selection",
-                "selected predecessor changed while preparing the batch",
-            ));
-        }
-        let candidate_lease = crate::lifecycle::PublicationLease::acquire(build.path())?;
-        candidate_lease.fence("complete-generation append deferred-input admission")?;
-        let deferred_upserts =
-            deferred_quality::begin_content_upserts(cx, &candidate, &predecessor)?;
-
-        // Use the same producer-resolution and admission checks as the ordinary
-        // appender. Do not borrow a different tier's identity or manufacture
-        // vectors from copied producer labels. No mutable mapping spans inference.
-        let fast = if lexical_only {
-            None
-        } else {
-            let fast_embedder = self.resolve_fast_embedder()?;
-            let index =
-                VectorIndex::open_read_only(&predecessor.path().join(FSFS_VECTOR_INDEX_FILE))?;
-            semantic_windows::load_mapping(predecessor.path(), &index)?;
-            Self::admit_vector_generation_for_embedder(&index, fast_embedder.as_ref())?;
-            let identity = fast_embedder.identity()?.clone();
-            identity.validate()?;
-            if index.embedder_revision() != identity.fingerprint() {
-                return Err(SearchError::UnverifiableRemoteSpace {
-                    producer: "fsfs.append_batch.fast".to_owned(),
-                    reason: "the fast producer identity changed during admission".to_owned(),
-                });
-            }
-            Some((fast_embedder, identity))
-        };
-        let quality = if predecessor
-            .path()
-            .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
-            .exists()
-        {
-            let embedder = self.resolve_quality_embedder()?.ok_or_else(|| {
-                SearchError::EmbedderUnavailable {
-                    model: self.config.indexing.quality_model.clone(),
-                    reason: "the selected generation has a quality tier but no verified quality producer is available to extend it"
-                        .to_owned(),
-                }
-            })?;
-            let index = VectorIndex::open_read_only(
-                &predecessor.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE),
-            )?;
-            Self::admit_quality_generation_for_embedder(&index, embedder.as_ref())?;
-            let identity = embedder.identity()?.clone();
-            identity.validate()?;
-            if index.embedder_revision() != identity.fingerprint() {
-                return Err(SearchError::UnverifiableRemoteSpace {
-                    producer: "fsfs.append_batch.quality".to_owned(),
-                    reason: "the quality producer identity changed during admission".to_owned(),
-                });
-            }
-            Some((embedder, identity))
-        } else {
-            None
-        };
-        let mut fast_entries = Vec::with_capacity(documents.len());
-        let mut quality_entries = Vec::new();
-        for (id, document) in &documents {
-            if let Some((fast_embedder, fast_identity)) = fast.as_ref() {
-                let texts = match window_plans.get(id) {
-                    Some(plan) => plan.texts(&document.lexical_text)?,
-                    None => vec![document.embedding_text.as_str()],
-                };
-                for (ordinal, text) in texts.into_iter().enumerate() {
-                    retained_search_checkpoint(cx)?;
-                    let response = with_cancellation(
-                        cx,
-                        "fsfs.append_batch.fast",
-                        fast_embedder.embed_bound(cx, text),
-                    )
-                    .await;
-                    retained_search_checkpoint(cx)?;
-                    let embedding = response?;
-                    embedding.validate()?;
-                    if &embedding.identity != fast_identity {
-                        return Err(SearchError::UnverifiableRemoteSpace {
-                            producer: "fsfs.append_batch.fast".to_owned(),
-                            reason:
-                                "the returned fast embedding does not carry the admitted producer identity"
-                                    .to_owned(),
-                        });
-                    }
-                    fast_entries.push((semantic_windows::row_id(id, ordinal), embedding.values));
-                }
-            }
-            if let Some((embedder, identity)) = quality.as_ref() {
-                retained_search_checkpoint(cx)?;
-                let response = with_cancellation(
-                    cx,
-                    "fsfs.append_batch.quality",
-                    embedder.embed_bound(cx, &document.embedding_text),
-                )
-                .await;
-                retained_search_checkpoint(cx)?;
-                let embedding = response?;
-                embedding.validate()?;
-                if &embedding.identity != identity {
-                    return Err(SearchError::UnverifiableRemoteSpace {
-                        producer: "fsfs.append_batch.quality".to_owned(),
-                        reason: "the returned quality embedding does not carry the admitted producer identity"
-                            .to_owned(),
-                    });
-                }
-                quality_entries.push((id.clone(), embedding.values));
-            }
-        }
-        retained_search_checkpoint(cx)?;
-        let timestamp = pressure_timestamp_ms();
-        let ingestion_class = if lexical_only {
-            IngestionClass::LexicalOnly
-        } else {
-            IngestionClass::FullSemanticLexical
-        };
-        candidate_lease.fence("complete-generation append lexical mutation")?;
-        let lexical_mutations = documents
-            .iter()
-            .map(|(id, document)| {
-                LexicalMutation::upsert(
-                    id.clone(),
-                    timestamp,
-                    ingestion_class,
-                    document.lexical_text.clone(),
-                    "append_batch",
-                )
-            })
-            .collect::<Vec<_>>();
-        let lexical_reclaimed = candidate
-            .apply_candidate_lexical_mutations(cx, build.path(), &lexical_mutations)
-            .await?;
-        for (relative, embedder, entries) in [
-            (
-                FSFS_VECTOR_INDEX_FILE,
-                fast.as_ref().map(|(embedder, _)| embedder),
-                &fast_entries,
-            ),
-            (
-                FSFS_VECTOR_QUALITY_INDEX_FILE,
-                quality.as_ref().map(|(embedder, _)| embedder),
-                &quality_entries,
-            ),
-        ] {
-            let Some(embedder) = embedder else {
-                continue;
-            };
-            retained_search_checkpoint(cx)?;
-            candidate_lease.fence("complete-generation append vector mutation")?;
-            let mut index = Self::open_vector_index_for_mutation(&build.path().join(relative))?;
-            if relative == FSFS_VECTOR_INDEX_FILE {
-                Self::admit_vector_generation_for_embedder(&index, embedder.as_ref())?;
-            } else {
-                Self::admit_quality_generation_for_embedder(&index, embedder.as_ref())?;
-            }
-            // append_batch logs replacement before superseding an older row.
-            // Freeze both tiers without pending WALs before sealing the bundle.
-            index.append_batch(entries)?;
-            if relative == FSFS_VECTOR_INDEX_FILE && window_maximum > 1 {
-                // Replacing a document with fewer windows must retire every
-                // old trailing row in this private candidate before sealing.
-                let new_rows = entries
-                    .iter()
-                    .map(|(id, _)| id.as_str())
-                    .collect::<HashSet<_>>();
-                let stale = index
-                    .live_doc_ids()?
-                    .into_iter()
-                    .filter(|row| {
-                        documents.contains_key(semantic_windows::source_id(row))
-                            && !new_rows.contains(row.as_str())
-                    })
-                    .collect::<Vec<_>>();
-                index.soft_delete_batch(&stale.iter().map(String::as_str).collect::<Vec<_>>())?;
-            }
-            index.compact()?;
-            index.vacuum()?;
-        }
-        retained_search_checkpoint(cx)?;
-        candidate_lease.fence("complete-generation append metadata mutation")?;
-        let revision = i64::try_from(timestamp).unwrap_or(i64::MAX);
-        let catalog_path = candidate.resolve_storage_db_path()?;
-        if catalog_path.exists() {
-            let storage = Storage::open(PipelineStorageConfig {
-                db_path: catalog_path,
-                ..PipelineStorageConfig::default()
-            })?;
-            for (id, document) in &documents {
-                retained_search_checkpoint(cx)?;
-                let text = &document.embedding_text;
-                let created_at = storage
-                    .get_document(id)?
-                    .map_or(revision, |document| document.created_at);
-                storage.upsert_document(&frankensearch_storage::DocumentRecord::new(
-                    id,
-                    text.chars().take(400).collect::<String>(),
-                    frankensearch_storage::ContentHasher::hash(text),
-                    text.chars().count(),
-                    created_at,
-                    revision.max(created_at),
-                ))?;
-                if deferred_upserts {
-                    deferred_quality::capture_content_upsert(&storage, id, text, revision)?;
-                }
-                if let Some((embedder, _)) = fast.as_ref() {
-                    storage.mark_embedded(id, embedder.id())?;
-                }
-                if let Some((embedder, _)) = quality.as_ref() {
-                    storage.mark_embedded(id, embedder.id())?;
-                }
-            }
-        }
-        for (id, document) in &documents {
-            manifests.insert(
-                id.clone(),
-                IndexManifestEntry {
-                    file_key: id.clone(),
-                    revision,
-                    ingestion_class: ingestion_class_label(ingestion_class).to_owned(),
-                    canonical_bytes: u64::try_from(document.embedding_text.len())
-                        .unwrap_or(u64::MAX),
-                    reason_code: "append_batch".to_owned(),
-                    fast_windows: window_plans.remove(id),
-                },
-            );
-        }
-        let manifests = manifests.into_values().collect::<Vec<_>>();
-        let layout = Self::resolve_lexical_engine(build.path())?;
-        let lexical_manifest_path = if layout.lexical_root() == build.path() {
-            layout
-                .engine_dir()
-                .map(|path| path.join(FSFS_INDEX_MANIFEST_FILE_NAME))
-                .unwrap_or_else(|| build.path().join(FSFS_LEXICAL_MANIFEST_FILE))
-        } else {
-            build.path().join(FSFS_LEXICAL_MANIFEST_FILE)
-        };
-        candidate.write_index_artifacts(build.path(), &lexical_manifest_path, &manifests)?;
-        let mut sentinel = Self::read_index_sentinel(build.path())?.ok_or_else(|| {
-            complete_cli::complete_cli_error(
-                "append_membership",
-                "candidate has no completion sentinel",
-            )
-        })?;
-        "append-batch".clone_into(&mut sentinel.command);
-        sentinel.generated_at_ms = timestamp;
-        sentinel.indexed_files = manifests.len();
-        sentinel.discovered_files = sentinel.discovered_files.max(manifests.len());
-        sentinel.skipped_files = sentinel.discovered_files.saturating_sub(manifests.len());
-        sentinel.total_canonical_bytes = manifests.iter().fold(0_u64, |total, entry| {
-            total.saturating_add(entry.canonical_bytes)
-        });
-        sentinel.source_hash_hex = index_source_hash_hex(&manifests);
-        for reason in protect_vector_generations(build.path(), "complete-generation append") {
-            if !sentinel.reason_codes.contains(&reason) {
-                sentinel.reason_codes.push(reason);
-            }
-        }
-        candidate.write_index_sentinel(build.path(), &sentinel)?;
-        if deferred_upserts {
-            deferred_quality::finish_content_upserts(cx, &candidate, build.path())?;
-        }
-        candidate_lease.fence("complete-generation append candidate complete")?;
-        drop(candidate_lease);
-        if !lexical_reclaimed {
-            reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
-        }
-        let candidate_mode = if lexical_only {
-            SearchExecutionMode::LexicalOnly
-        } else {
-            SearchExecutionMode::Full
-        };
-        let resources = Box::pin(
-            candidate.prepare_search_execution_resources_at_root_with_modes(
+        let result = self
+            .apply_retained_append_with_precommit(
                 cx,
-                build.path(),
-                candidate_mode,
-                candidate_mode,
-            ),
-        )
-        .await?;
-        drop(resources);
-        let publication = build.publish_with_precommit(
-            cx,
-            |_, path| Self::validate_search_generation_at_root(path, candidate_mode),
-            precommit,
-        )?;
-        Ok((Some(publication), documents.len()))
+                store_root,
+                &predecessor,
+                documents,
+                precommit,
+            )
+            .await?;
+        Ok((result.publication, result.upserted))
     }
 
     /// Delete exact IDs or prefixes from an isolated complete successor.
@@ -1703,6 +1379,119 @@ mod retained_delete_tests {
         }
     }
 
+    /// Observes actual bound dispatch through the CLI append path. Deliberate
+    /// drift returns an old, valid response after changing the live producer;
+    /// response-only identity checks cannot detect that failure.
+    struct ObservedAppendEmbedder {
+        inner: Arc<dyn Embedder>,
+        foreign: frankensearch_core::EmbeddingIdentityBundleV1,
+        drift_after_inference: bool,
+        drifted: std::sync::atomic::AtomicBool,
+        singles: std::sync::atomic::AtomicUsize,
+        batches: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl ObservedAppendEmbedder {
+        fn new(inner: Arc<dyn Embedder>, drift_after_inference: bool) -> Self {
+            let mut foreign = inner.identity().unwrap().clone();
+            foreign
+                .producer
+                .implementation_revision
+                .push_str("-changed");
+            Self {
+                inner,
+                foreign,
+                drift_after_inference,
+                drifted: std::sync::atomic::AtomicBool::new(false),
+                singles: std::sync::atomic::AtomicUsize::new(0),
+                batches: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn respond(
+            &self,
+            cx: &Cx,
+            texts: &[&str],
+        ) -> SearchResult<Vec<frankensearch_core::IdentityBoundEmbedding>> {
+            let mut rows = Vec::with_capacity(texts.len());
+            for text in texts {
+                rows.push(self.inner.embed_bound(cx, text).await?);
+            }
+            if self.drift_after_inference {
+                self.drifted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(rows)
+        }
+    }
+
+    impl Embedder for ObservedAppendEmbedder {
+        fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+            if self.drifted.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(&self.foreign)
+            } else {
+                self.inner.identity()
+            }
+        }
+
+        fn bound_batch_is_native(&self) -> bool {
+            true
+        }
+
+        fn embed<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> frankensearch_core::SearchFuture<'a, Vec<f32>> {
+            self.inner.embed(cx, text)
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> frankensearch_core::SearchFuture<'a, frankensearch_core::IdentityBoundEmbedding>
+        {
+            Box::pin(async move {
+                self.singles
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(self.respond(cx, &[text]).await?.pop().unwrap())
+            })
+        }
+
+        fn embed_batch_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> frankensearch_core::SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>>
+        {
+            Box::pin(async move {
+                self.batches.lock().unwrap().push(texts.len());
+                self.respond(cx, texts).await
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn is_semantic(&self) -> bool {
+            self.inner.is_semantic()
+        }
+
+        fn category(&self) -> ModelCategory {
+            self.inner.category()
+        }
+    }
+
     fn append_input(runtime: &FsfsRuntime, parent: &Path, text: &str) -> FsfsRuntime {
         let path = parent.join("append.jsonl");
         fs::write(&path, text).unwrap();
@@ -1887,7 +1676,36 @@ mod retained_delete_tests {
             }
             assert!(!source.join("alpha.md").exists());
             assert!(!source.join("virtual/new.md").exists());
-            assert!(!next.path().join("FSFS-REUSE.json").exists());
+            let old_reuse: serde_json::Value =
+                serde_json::from_slice(&before[Path::new("FSFS-REUSE.json")]).unwrap();
+            let new_reuse: serde_json::Value =
+                serde_json::from_slice(&fs::read(next.path().join("FSFS-REUSE.json")).unwrap())
+                    .unwrap();
+            for key in [
+                "session",
+                "executable_sha256",
+                "configuration_sha256",
+                "indexing_contract_sha256",
+            ] {
+                assert_eq!(
+                    new_reuse[key], old_reuse[key],
+                    "preserve the original scope"
+                );
+            }
+            for id in ["beta.md", "beta-notes.md"] {
+                assert_eq!(
+                    new_reuse["checkpoint"]["files"][id], old_reuse["checkpoint"]["files"][id],
+                    "an untouched source keeps its exact witness"
+                );
+            }
+            for id in ["alpha.md", "virtual/new.md"] {
+                let entry = &new_reuse["checkpoint"]["files"][id];
+                assert_eq!(entry["lexical_indexed"], false);
+                assert_eq!(entry["semantic_indexed"], false);
+                assert_eq!(entry["content_hash_hex"], "");
+                assert_eq!(entry["reason_code"], "append_batch");
+            }
+            assert_eq!(sentinel.command, "append-batch");
             assert_eq!(file_bytes(predecessor.path()), before);
             assert_eq!(
                 CompleteGenerationStore::open(&cx, &root)
@@ -1896,6 +1714,142 @@ mod retained_delete_tests {
                     .unwrap(),
                 Some(next)
             );
+        });
+    }
+
+    #[test]
+    fn retained_append_waits_for_shared_admission_and_uses_bounded_native_batches() {
+        use crate::concurrency::{BudgetSchedulerMode, RuntimeWorkloadScheduler, WorkloadClass};
+        use std::sync::atomic::Ordering;
+
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let _restore_quality = RestoreQuality(test_quality_embedder_override());
+            let _restore_fast = RestoreFast(test_fast_embedder_override());
+            let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                changed_revision: false,
+            });
+            set_test_quality_embedder(Some(Arc::clone(&quality)));
+            let (mut runtime, _, root, predecessor) =
+                fixture_with_quality(&cx, parent.path(), false, Some(quality.as_ref())).await;
+            let before = file_bytes(predecessor.path());
+            let fast = Arc::new(ObservedAppendEmbedder::new(
+                runtime.resolve_fast_embedder().unwrap(),
+                false,
+            ));
+            let quality = Arc::new(ObservedAppendEmbedder::new(quality, false));
+            set_test_fast_embedder(Some(fast.clone()));
+            set_test_quality_embedder(Some(quality.clone()));
+            runtime.workload_scheduler = Arc::new(RuntimeWorkloadScheduler::new(
+                1,
+                BudgetSchedulerMode::FairShare,
+            ));
+            let held = runtime
+                .workload_scheduler
+                .acquire(&cx, WorkloadClass::Query)
+                .await
+                .unwrap();
+            let input = (0..130)
+                .map(|n| {
+                    serde_json::json!({"id": format!("new-{n:03}.md"), "text": "new body"})
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let command = append_input(&runtime, parent.path(), &input);
+            let mut pending = Box::pin(command.append_retained_generation(&cx, &root));
+            std::future::poll_fn(|task| {
+                assert!(pending.as_mut().poll(task).is_pending());
+                if runtime.workload_scheduler.pending_for(WorkloadClass::Embed) == 1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            for producer in [&fast, &quality] {
+                assert_eq!(producer.singles.load(Ordering::SeqCst), 0);
+                assert!(producer.batches.lock().unwrap().is_empty());
+            }
+            assert_eq!(file_bytes(predecessor.path()), before);
+            cx.set_cancel_requested(true);
+            assert!(matches!(pending.await, Err(SearchError::Cancelled { .. })));
+            cx.set_cancel_requested(false);
+            assert_eq!(
+                runtime.workload_scheduler.pending_for(WorkloadClass::Embed),
+                0
+            );
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(predecessor.clone())
+            );
+            drop(held);
+
+            let (publication, count) = command
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 130);
+            let Some(GenerationPublication::Durable(next)) = publication else {
+                panic!("admitted append must publish durably");
+            };
+            for producer in [&fast, &quality] {
+                assert_eq!(producer.singles.load(Ordering::SeqCst), 0);
+                assert_eq!(*producer.batches.lock().unwrap(), [64, 64, 2]);
+            }
+            assert_eq!(live_ids(next.path(), FSFS_VECTOR_INDEX_FILE).len(), 133);
+            assert_eq!(
+                live_ids(next.path(), FSFS_VECTOR_QUALITY_INDEX_FILE).len(),
+                132
+            );
+            assert_eq!(file_bytes(predecessor.path()), before);
+        });
+    }
+
+    #[test]
+    fn retained_append_rechecks_live_producer_after_an_old_identity_response() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let _restore_quality = RestoreQuality(test_quality_embedder_override());
+            let _restore_fast = RestoreFast(test_fast_embedder_override());
+            let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                changed_revision: false,
+            });
+            set_test_quality_embedder(Some(Arc::clone(&quality)));
+            let (runtime, _, root, predecessor) =
+                fixture_with_quality(&cx, parent.path(), false, Some(quality.as_ref())).await;
+            let fast = runtime.resolve_fast_embedder().unwrap();
+            let before = file_bytes(predecessor.path());
+            let command = append_input(
+                &runtime,
+                parent.path(),
+                "{\"id\":\"alpha.md\",\"text\":\"must not replace the old document\"}",
+            );
+            for drifting_tier in ["fast", "quality"] {
+                set_test_fast_embedder(Some(Arc::new(ObservedAppendEmbedder::new(
+                    Arc::clone(&fast),
+                    drifting_tier == "fast",
+                ))));
+                set_test_quality_embedder(Some(Arc::new(ObservedAppendEmbedder::new(
+                    Arc::clone(&quality),
+                    drifting_tier == "quality",
+                ))));
+                assert!(matches!(
+                    command.append_retained_generation(&cx, &root).await,
+                    Err(SearchError::UnverifiableRemoteSpace { .. })
+                ));
+                assert_eq!(file_bytes(predecessor.path()), before);
+                assert_eq!(
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap(),
+                    Some(predecessor.clone())
+                );
+            }
         });
     }
 
