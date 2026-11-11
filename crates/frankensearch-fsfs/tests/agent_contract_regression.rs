@@ -27,6 +27,129 @@ use serde_json::Value;
 
 // --- Test Helpers -----------------------------------------------------------
 
+#[cfg(unix)]
+#[test]
+fn table_output_reports_closed_stdout_as_io_error_without_panicking() {
+    assert_table_output_handles_closed_stdout(&[
+        &["status", "--format", "table"],
+        &["doctor", "--format", "table"],
+        &["download-models", "--list", "--format", "table"],
+        &["completions", "bash", "--format", "table"],
+        &["help", "--format", "table"],
+        &["--help", "--format", "table"],
+        &["-h", "--format", "table"],
+    ]);
+}
+
+#[cfg(unix)]
+#[test]
+fn configuration_and_version_report_closed_stdout_as_io_error_without_panicking() {
+    assert_table_output_handles_closed_stdout(&[
+        &["version", "--format", "table"],
+        &["config", "init", "--format", "table"],
+        &["config", "show", "--format", "table"],
+        &["config", "get", "search.default_limit", "--format", "table"],
+        &["config", "validate", "--format", "table"],
+        &[
+            "config",
+            "set",
+            "search.default_limit",
+            "17",
+            "--format",
+            "table",
+        ],
+        &["config", "reset", "--format", "table"],
+    ]);
+}
+
+#[cfg(unix)]
+fn assert_table_output_handles_closed_stdout(commands: &[&[&str]]) {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().expect("isolated command root");
+    let index = root.path().join("index");
+    std::fs::create_dir(&index).expect("empty index root");
+    let normal_stdout = root.path().join("normal.stdout");
+    let captured_stderr = root.path().join("command.stderr");
+    let config = root.path().join("commands.toml");
+    for args in commands {
+        for closed in [false, true] {
+            let stdout = if closed {
+                // Close the peer before spawn, so this cannot race the child's
+                // first write. A real OS transport must return BrokenPipe.
+                let (output, peer) = UnixStream::pair().expect("stdout transport");
+                drop(peer);
+                Stdio::from(OwnedFd::from(output))
+            } else {
+                Stdio::from(std::fs::File::create(&normal_stdout).expect("normal stdout"))
+            };
+            let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+            command.args(*args).arg("--index-dir").arg(&index);
+            if args[0] == "config" {
+                command.arg("--config").arg(&config);
+            }
+            let mut child = command
+                .current_dir(root.path())
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("FRANKENSEARCH_MODEL_DIR", root.path().join("no-models"))
+                .env("FRANKENSEARCH_OFFLINE", "1")
+                .env("FRANKENSEARCH_ALLOW_DOWNLOAD", "0")
+                .env("FRANKENSEARCH_CHECK_UPDATES", "0")
+                .env("NO_COLOR", "1")
+                .stdin(Stdio::null())
+                .stdout(stdout)
+                .stderr(Stdio::from(
+                    std::fs::File::create(&captured_stderr).expect("captured stderr"),
+                ))
+                .spawn()
+                .expect("spawn production fsfs");
+            let started = Instant::now();
+            loop {
+                let polled = child.try_wait();
+                if polled.as_ref().is_ok_and(Option::is_some) {
+                    break;
+                }
+                if polled.is_err() || started.elapsed() > Duration::from_secs(20) {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().expect("reap timed-out fsfs");
+                    let stderr =
+                        std::fs::read_to_string(&captured_stderr).expect("read child stderr");
+                    panic!("{args:?} closed={closed} poll={polled:?}: {output:?}\n{stderr}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().expect("collect fsfs");
+            let stderr = std::fs::read_to_string(&captured_stderr).expect("read child stderr");
+            assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+            if closed {
+                assert_eq!(
+                    output.status.code(),
+                    Some(exit_code::RUNTIME_ERROR),
+                    "{args:?}: {stderr}"
+                );
+                assert!(stderr.contains("[io_error]"), "{args:?}: {stderr}");
+            } else {
+                if matches!(args[0], "version" | "config" | "help" | "--help" | "-h") {
+                    assert!(output.status.success(), "{args:?}: {stderr}");
+                }
+                assert!(
+                    !std::fs::read(&normal_stdout)
+                        .expect("read normal stdout")
+                        .is_empty(),
+                    "{args:?}: {stderr}"
+                );
+                assert!(!stderr.contains("[io_error]"), "{args:?}: {stderr}");
+            }
+        }
+    }
+}
+
 fn test_meta() -> OutputMeta {
     OutputMeta {
         command: "search".to_string(),

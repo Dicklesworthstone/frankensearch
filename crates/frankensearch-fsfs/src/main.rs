@@ -171,12 +171,14 @@ fn run(args: Vec<String>) -> SearchResult<()> {
 
     // Version is handled immediately, before config loading.
     if cli_input.command == CliCommand::Version {
-        println!(
+        let mut stdout = std::io::stdout().lock();
+        writeln!(
+            stdout,
             "fsfs {} (frankensearch {})",
             env!("CARGO_PKG_VERSION"),
             env!("CARGO_PKG_VERSION"),
-        );
-        std::process::exit(exit_code::OK);
+        )?;
+        return stdout.flush().map_err(SearchError::Io);
     }
 
     // Initialize tracing subscriber before anything else that emits events.
@@ -464,19 +466,21 @@ fn run_config_command(
                 warnings: loaded.warnings.clone(),
             };
             if cli_input.format == OutputFormat::Table {
-                print!("config is valid");
+                let mut stdout = std::io::stdout().lock();
+                write!(stdout, "config is valid")?;
                 if payload.warning_count > 0 {
-                    println!(" (warnings: {})", payload.warning_count);
+                    writeln!(stdout, " (warnings: {})", payload.warning_count)?;
                     for warning in &loaded.warnings {
-                        println!(
+                        writeln!(
+                            stdout,
                             "- [{}] {} ({})",
                             warning.reason_code, warning.field, warning.message
-                        );
+                        )?;
                     }
                 } else {
-                    println!();
+                    writeln!(stdout)?;
                 }
-                return Ok(());
+                return stdout.flush().map_err(SearchError::Io);
             }
             emit_success_payload("config", &payload, cli_input.format)
         }
@@ -533,8 +537,13 @@ fn run_config_get_command(
         })?;
     let source = source_for_key(key, &value, &stage_snapshots).to_owned();
     if cli_input.format == OutputFormat::Table {
-        println!("{key} = {} ({source})", format_value_for_table(&value));
-        return Ok(());
+        let mut stdout = std::io::stdout().lock();
+        writeln!(
+            stdout,
+            "{key} = {} ({source})",
+            format_value_for_table(&value)
+        )?;
+        return stdout.flush().map_err(SearchError::Io);
     }
     let payload = ConfigGetPayload {
         key: key.to_owned(),
@@ -572,21 +581,27 @@ fn run_config_show_command(
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let mut stdout = std::io::stdout().lock();
         for (key, value) in &final_values {
             let source = value_sources.get(key).map_or("defaults", String::as_str);
-            println!("{key} = {} ({source})", format_value_for_table(value));
+            writeln!(
+                stdout,
+                "{key} = {} ({source})",
+                format_value_for_table(value)
+            )?;
         }
         if !loaded.warnings.is_empty() {
-            println!();
-            println!("warnings:");
+            writeln!(stdout)?;
+            writeln!(stdout, "warnings:")?;
             for warning in &loaded.warnings {
-                println!(
+                writeln!(
+                    stdout,
                     "- [{}] {} ({})",
                     warning.reason_code, warning.field, warning.message
-                );
+                )?;
             }
         }
-        return Ok(());
+        return stdout.flush().map_err(SearchError::Io);
     }
     let payload = loaded.to_effective_snapshot_at(iso_timestamp_now());
     emit_success_payload("config", &payload, cli_input.format)
@@ -627,12 +642,13 @@ fn run_config_init_command(
         true
     };
     if cli_input.format == OutputFormat::Table {
+        let mut stdout = std::io::stdout().lock();
         if created {
-            println!("created {}", path.display());
+            writeln!(stdout, "created {}", path.display())?;
         } else {
-            println!("exists {}", path.display());
+            writeln!(stdout, "exists {}", path.display())?;
         }
-        return Ok(());
+        return stdout.flush().map_err(SearchError::Io);
     }
     let payload = ConfigInitPayload {
         created,
@@ -790,8 +806,9 @@ fn run_config_set_command(
     std::fs::write(&path, &output)?;
 
     if cli_input.format == OutputFormat::Table {
-        println!("set {key}={value} in {}", path.display());
-        return Ok(());
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "set {key}={value} in {}", path.display())?;
+        return stdout.flush().map_err(SearchError::Io);
     }
     let payload = ConfigSetPayload {
         path: path.display().to_string(),
@@ -824,8 +841,9 @@ fn run_config_reset_command(
     std::fs::write(&path, &template)?;
 
     if cli_input.format == OutputFormat::Table {
-        println!("reset config to defaults at {}", path.display());
-        return Ok(());
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "reset config to defaults at {}", path.display())?;
+        return stdout.flush().map_err(SearchError::Io);
     }
     let payload = ConfigResetPayload {
         path: path.display().to_string(),
@@ -1123,6 +1141,8 @@ where
     if FsfsRuntime::forwarded_search_error_was_emitted(error) {
         return code;
     }
+    let primary_error = remote.cloned().unwrap_or_else(|| output_error_from(error));
+    let primary_code = primary_error.code.clone();
     if context.stream {
         use frankensearch_fsfs::adapters::format_emitter::emit_stream_frame;
         use frankensearch_fsfs::stream_protocol::{
@@ -1152,6 +1172,7 @@ where
         if let Err(emission_error) = emit_stream_frame(&started, context.format, stdout)
             .and_then(|()| emit_stream_frame(&terminal, context.format, stdout))
         {
+            let _ = writeln!(stderr, "error: [{primary_code}] {error}");
             let _ = writeln!(
                 stderr,
                 "error: failed to render fsfs stream error: {emission_error}"
@@ -1160,7 +1181,7 @@ where
         return code;
     }
     let envelope: OutputEnvelope<()> = OutputEnvelope::error(
-        remote.cloned().unwrap_or_else(|| output_error_from(error)),
+        primary_error,
         meta_for_format(&context.command, context.format),
         timestamp,
     );
@@ -1172,7 +1193,7 @@ where
     };
 
     if let Err(emission_error) = emission {
-        let _ = writeln!(stderr, "error: {error}");
+        let _ = writeln!(stderr, "error: [{primary_code}] {error}");
         let _ = writeln!(
             stderr,
             "error: failed to render structured fsfs error output: {emission_error}"
@@ -1189,19 +1210,9 @@ fn emit_error_envelope<W: Write>(
 ) -> SearchResult<()> {
     emit_envelope(envelope, format, writer)?;
     if format != OutputFormat::Jsonl {
-        writer
-            .write_all(b"\n")
-            .map_err(|source| SearchError::SubsystemError {
-                subsystem: "fsfs.process",
-                source: Box::new(source),
-            })?;
+        writer.write_all(b"\n").map_err(SearchError::Io)?;
     }
-    writer
-        .flush()
-        .map_err(|source| SearchError::SubsystemError {
-            subsystem: "fsfs.process",
-            source: Box::new(source),
-        })
+    writer.flush().map_err(SearchError::Io)
 }
 
 fn emit_success_payload<T: Serialize>(
@@ -1217,12 +1228,7 @@ fn emit_success_payload<T: Serialize>(
     let mut stdout = std::io::stdout();
     emit_envelope(&envelope, format, &mut stdout)?;
     if format != OutputFormat::Jsonl {
-        stdout
-            .write_all(b"\n")
-            .map_err(|source| SearchError::SubsystemError {
-                subsystem: CONFIG_SUBSYSTEM,
-                source: Box::new(source),
-            })?;
+        stdout.write_all(b"\n").map_err(SearchError::Io)?;
     }
     Ok(())
 }
@@ -1517,6 +1523,183 @@ mod tests {
         );
         assert_eq!(stdout, b"already emitted terminal\n");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn process_error_emission_preserves_trailer_and_flush_io_errors() {
+        struct Transport {
+            remaining: usize,
+            failed: bool,
+        }
+        impl std::io::Write for Transport {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(!self.failed, "no write after the first transport failure");
+                if self.remaining == 0 {
+                    self.failed = true;
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let count = bytes.len().min(self.remaining);
+                self.remaining -= count;
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert!(!self.failed, "no flush after a failed write");
+                self.failed = true;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for format in [
+            OutputFormat::Json,
+            OutputFormat::Jsonl,
+            OutputFormat::Toon,
+            OutputFormat::Csv,
+            OutputFormat::Table,
+        ] {
+            let envelope = super::OutputEnvelope::<()>::error(
+                super::output_error_from(&SearchError::ModelNotFound {
+                    name: "model".into(),
+                }),
+                super::meta_for_format("search", format),
+                "2026-11-10T00:00:00Z".to_owned(),
+            );
+            let mut successful = Vec::new();
+            super::emit_error_envelope(&envelope, format, &mut successful).unwrap();
+            for remaining in [successful.len() - 1, usize::MAX] {
+                let mut writer = Transport {
+                    remaining,
+                    failed: false,
+                };
+                let error = super::emit_error_envelope(&envelope, format, &mut writer).unwrap_err();
+                assert!(writer.failed, "the transport failure must execute");
+                assert!(matches!(error, SearchError::Io(source)
+                    if source.kind() == std::io::ErrorKind::BrokenPipe));
+            }
+        }
+    }
+
+    #[test]
+    fn process_error_fallback_preserves_primary_code_and_exit_on_transport_failure() {
+        struct Transport {
+            remaining: usize,
+            fail_flush: bool,
+            failed: bool,
+        }
+        impl std::io::Write for Transport {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(!self.failed, "no write after the first transport failure");
+                if self.remaining == 0 {
+                    self.failed = true;
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let count = bytes.len().min(self.remaining);
+                self.remaining -= count;
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert!(!self.failed, "no flush after a failed write");
+                if self.fail_flush {
+                    self.failed = true;
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let error = SearchError::ModelNotFound {
+            name: "potion-128m".to_owned(),
+        };
+        for (format, stream) in [
+            (OutputFormat::Json, false),
+            (OutputFormat::Jsonl, false),
+            (OutputFormat::Toon, false),
+            (OutputFormat::Csv, false),
+            (OutputFormat::Jsonl, true),
+            (OutputFormat::Toon, true),
+        ] {
+            let context = ProcessErrorContext {
+                command: "search".to_owned(),
+                format,
+                stream,
+            };
+            let mut successful = Vec::new();
+            let mut stderr = Vec::new();
+            assert_eq!(
+                report_process_error(
+                    &error,
+                    &context,
+                    &mut successful,
+                    &mut stderr,
+                    "2026-11-11T00:00:00Z".to_owned(),
+                ),
+                78
+            );
+            assert!(stderr.is_empty());
+            for (remaining, fail_flush) in [
+                (0, false),
+                (successful.len() - 1, false),
+                (usize::MAX, true),
+            ] {
+                let mut stdout = Transport {
+                    remaining,
+                    fail_flush,
+                    failed: false,
+                };
+                let mut stderr = Vec::new();
+                assert_eq!(
+                    report_process_error(
+                        &error,
+                        &context,
+                        &mut stdout,
+                        &mut stderr,
+                        "2026-11-11T00:00:00Z".to_owned(),
+                    ),
+                    78
+                );
+                assert!(stdout.failed, "the transport failure must execute");
+                let stderr = String::from_utf8(stderr).expect("UTF-8 fallback diagnostic");
+                let primary = stderr.lines().next().expect("primary failure diagnostic");
+                assert!(primary.starts_with("error: [model_not_found] "));
+                assert!(primary.contains("potion-128m"));
+                assert!(stderr.contains("error: failed to render "));
+                // This transport injects ErrorKind, whose display is lowercase;
+                // an OS-backed EPIPE can instead display "Broken pipe".
+                assert!(stderr.contains("broken pipe"), "{stderr}");
+            }
+        }
+    }
+
+    #[test]
+    fn process_io_emission_keeps_input_pipe_errors_structured() {
+        // ErrorKind alone does not establish that stdout failed: an input
+        // or network operation can return BrokenPipe too.
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let context = ProcessErrorContext {
+                command: "search".to_owned(),
+                format: OutputFormat::Json,
+                stream: false,
+            };
+            let error = SearchError::Io(kind.into());
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            assert_eq!(
+                report_process_error(
+                    &error,
+                    &context,
+                    &mut stdout,
+                    &mut stderr,
+                    "2026-11-10T00:00:00Z".to_owned(),
+                ),
+                super::exit_code_for(&error)
+            );
+            let record: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(record["error"]["code"], "io_error");
+            assert!(stderr.is_empty());
+        }
     }
 
     #[test]

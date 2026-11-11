@@ -46,7 +46,8 @@ const SUBSYSTEM: &str = "fsfs_format_emitter";
 ///
 /// # Errors
 ///
-/// Returns `SearchError::SubsystemError` if serialization fails.
+/// Returns `SearchError::SubsystemError` if serialization fails, or
+/// `SearchError::Io` if the writer fails.
 pub fn emit_envelope<T, W>(
     envelope: &OutputEnvelope<T>,
     format: OutputFormat,
@@ -94,7 +95,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns `SearchError::SubsystemError` if serialization or writing fails.
+/// Returns `SearchError::SubsystemError` if serialization fails, or
+/// `SearchError::Io` if the writer fails.
 pub(crate) fn emit_compact_search_envelope<W: Write>(
     envelope: &OutputEnvelope<SearchPayload>,
     format: OutputFormat,
@@ -129,11 +131,24 @@ pub(crate) fn emit_compact_search_envelope<W: Write>(
                 Ok(())
             }
         })
-        .map_err(|source| SearchError::SubsystemError {
-            subsystem: SUBSYSTEM,
-            source: Box::new(source),
-        })?;
+        .map_err(write_err)?;
     Ok(true)
+}
+
+/// Buffer one response and flush it exactly once on successful emission.
+/// Returned errors abandon any unwritten suffix: `BufWriter`'s destructor
+/// must not retry a failed transport or flush a failed serialization's suffix.
+pub(crate) fn with_buffered_output<W, F>(writer: &mut W, emit: F) -> SearchResult<()>
+where
+    W: Write,
+    F: FnOnce(&mut io::BufWriter<&mut W>) -> SearchResult<()>,
+{
+    let mut buffered = io::BufWriter::with_capacity(1 << 20, writer);
+    let result = emit(&mut buffered).and_then(|()| buffered.flush().map_err(write_err));
+    // Unlike into_inner(), this never writes. In particular, a partial
+    // flush failure must not be retried implicitly when the buffer drops.
+    let _ = buffered.into_parts();
+    result
 }
 
 /// Emit an [`OutputEnvelope`] as a string in the requested format.
@@ -171,6 +186,8 @@ where
 /// # Errors
 ///
 /// Returns `SearchError::InvalidConfig` when `format` is not `jsonl` or `toon`.
+/// Serialization failures return `SearchError::SubsystemError`; writer and
+/// flush failures return `SearchError::Io` with the original I/O error.
 pub fn emit_stream_frame<T, W>(
     frame: &StreamFrame<T>,
     format: OutputFormat,
@@ -204,14 +221,8 @@ where
     match format {
         OutputFormat::Jsonl => {
             // Write directly to the writer to avoid an intermediate String allocation.
-            serde_json::to_writer(&mut *writer, frame).map_err(|source| {
-                SearchError::SubsystemError {
-                    subsystem: SUBSYSTEM,
-                    source: Box::new(io::Error::other(format!(
-                        "failed to serialize stream frame as NDJSON: {source}"
-                    ))),
-                }
-            })?;
+            serde_json::to_writer(&mut *writer, frame)
+                .map_err(|source| json_write_err(source, "stream frame as NDJSON"))?;
             writer.write_all(b"\n").map_err(write_err)
         }
         OutputFormat::Toon => {
@@ -259,12 +270,8 @@ fn emit_json<T: Serialize, W: Write>(
     envelope: &OutputEnvelope<T>,
     writer: &mut W,
 ) -> SearchResult<()> {
-    serde_json::to_writer_pretty(writer, envelope).map_err(|source| SearchError::SubsystemError {
-        subsystem: SUBSYSTEM,
-        source: Box::new(io::Error::other(format!(
-            "failed to serialize envelope as JSON: {source}"
-        ))),
-    })
+    serde_json::to_writer_pretty(writer, envelope)
+        .map_err(|source| json_write_err(source, "envelope as JSON"))
 }
 
 // ─── TOON ───────────────────────────────────────────────────────────────────
@@ -274,12 +281,7 @@ fn emit_toon<T: Serialize, W: Write>(
     writer: &mut W,
 ) -> SearchResult<()> {
     let toon = encode_envelope_toon(envelope)?;
-    writer
-        .write_all(toon.as_bytes())
-        .map_err(|source| SearchError::SubsystemError {
-            subsystem: SUBSYSTEM,
-            source: Box::new(source),
-        })
+    writer.write_all(toon.as_bytes()).map_err(write_err)
 }
 
 // ─── JSONL ──────────────────────────────────────────────────────────────────
@@ -288,20 +290,9 @@ fn emit_jsonl<T: Serialize, W: Write>(
     envelope: &OutputEnvelope<T>,
     writer: &mut W,
 ) -> SearchResult<()> {
-    serde_json::to_writer(&mut *writer, envelope).map_err(|source| {
-        SearchError::SubsystemError {
-            subsystem: SUBSYSTEM,
-            source: Box::new(io::Error::other(format!(
-                "failed to serialize envelope as JSONL: {source}"
-            ))),
-        }
-    })?;
-    writer
-        .write_all(b"\n")
-        .map_err(|source| SearchError::SubsystemError {
-            subsystem: SUBSYSTEM,
-            source: Box::new(source),
-        })
+    serde_json::to_writer(&mut *writer, envelope)
+        .map_err(|source| json_write_err(source, "envelope as JSONL"))?;
+    writer.write_all(b"\n").map_err(write_err)
 }
 
 // ─── Table ──────────────────────────────────────────────────────────────────
@@ -663,8 +654,8 @@ fn render_search_table_with_options(
             let _ = write!(
                 out,
                 " [L{} {vector_label}{}]",
-                lexical_rank + 1,
-                vector_rank + 1
+                lexical_rank.saturating_add(1),
+                vector_rank.saturating_add(1)
             );
         }
         let _ = writeln!(out);
@@ -844,9 +835,21 @@ fn highlight_query_terms(text: &str, query_terms: &[String], color_enabled: bool
 }
 
 fn write_err(source: io::Error) -> SearchError {
+    SearchError::Io(source)
+}
+
+fn json_write_err(source: serde_json::Error, context: &str) -> SearchError {
+    // serde_json retains writer errors, including their ErrorKind, in its
+    // I/O variant. Converting only that variant preserves transport identity
+    // without misclassifying a payload's Serialize failure as a broken pipe.
+    if source.is_io() {
+        return SearchError::Io(source.into());
+    }
     SearchError::SubsystemError {
         subsystem: SUBSYSTEM,
-        source: Box::new(source),
+        source: Box::new(io::Error::other(format!(
+            "failed to serialize {context}: {source}"
+        ))),
     }
 }
 
@@ -984,6 +987,220 @@ mod tests {
             self.flushes = self.flushes.saturating_add(1);
             Ok(())
         }
+    }
+
+    #[test]
+    fn emission_preserves_writer_io_errors_without_retry() {
+        struct FailingWriter {
+            remaining: usize,
+            fail_flush: bool,
+            failed: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(!self.failed, "emission must stop after the transport fails");
+                if self.remaining == 0 {
+                    self.failed = true;
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                let written = bytes.len().min(self.remaining);
+                self.remaining -= written;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                assert!(!self.failed, "emission must not flush after a failed write");
+                if self.fail_flush {
+                    self.failed = true;
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(())
+            }
+        }
+        let writer = |remaining, fail_flush| FailingWriter {
+            remaining,
+            fail_flush,
+            failed: false,
+        };
+        let assert_transport = |error: SearchError, writer: &FailingWriter| {
+            assert!(writer.failed, "the transport failure must be reached");
+            assert_eq!(crate::output_schema::error_code_for(&error), "io_error");
+            match error {
+                SearchError::Io(source) => assert_eq!(source.kind(), io::ErrorKind::BrokenPipe),
+                other => panic!("writer error lost its I/O identity: {other:?}"),
+            }
+        };
+        let envelope = OutputEnvelope::success(
+            vec!["a result long enough to force a partial write"],
+            sample_meta("json"),
+            sample_ts(),
+        );
+        let compact = OutputEnvelope::success(
+            SearchPayload::new("transport", SearchOutputPhase::Initial, 0, Vec::new()),
+            sample_meta("json"),
+            sample_ts(),
+        );
+        for remaining in [0, 7] {
+            for format in [
+                OutputFormat::Json,
+                OutputFormat::Jsonl,
+                OutputFormat::Toon,
+                OutputFormat::Table,
+                OutputFormat::Csv,
+            ] {
+                let mut output = writer(remaining, false);
+                let error = emit_envelope(&envelope, format, &mut output).unwrap_err();
+                assert_transport(error, &output);
+            }
+            for format in [OutputFormat::Json, OutputFormat::Jsonl, OutputFormat::Toon] {
+                let mut output = writer(remaining, false);
+                let error =
+                    emit_compact_search_envelope(&compact, format, &mut output).unwrap_err();
+                assert_transport(error, &output);
+            }
+        }
+        for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+            for (remaining, fail_flush) in [(0, false), (7, false), (usize::MAX, true)] {
+                let mut output = writer(remaining, fail_flush);
+                let error =
+                    emit_stream_frame(&sample_stream_frame(), format, &mut output).unwrap_err();
+                assert_transport(error, &output);
+            }
+        }
+    }
+
+    #[test]
+    fn emission_keeps_serialization_failures_distinct_from_transport() {
+        struct CannotSerialize;
+        impl Serialize for CannotSerialize {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("deliberate payload failure"))
+            }
+        }
+        let envelope = OutputEnvelope::success(CannotSerialize, sample_meta("json"), sample_ts());
+        let frame = StreamFrame::new(
+            "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+            1,
+            sample_ts(),
+            "search",
+            StreamEvent::Result(StreamResultEvent {
+                rank: 1,
+                item: CannotSerialize,
+            }),
+        );
+        let assert_serialization = |error: SearchError| {
+            assert!(matches!(&error, SearchError::SubsystemError { .. }));
+            assert!(error.to_string().contains("deliberate payload failure"));
+        };
+        for format in [
+            OutputFormat::Json,
+            OutputFormat::Jsonl,
+            OutputFormat::Toon,
+            OutputFormat::Table,
+            OutputFormat::Csv,
+        ] {
+            assert_serialization(emit_envelope(&envelope, format, &mut Vec::new()).unwrap_err());
+        }
+        for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+            assert_serialization(emit_stream_frame(&frame, format, &mut Vec::new()).unwrap_err());
+        }
+    }
+
+    #[test]
+    fn buffered_emission_does_not_retry_partial_writes_or_failed_flushes() {
+        struct Transport {
+            accepted: usize,
+            flushes: usize,
+            fail_flush: bool,
+            failed: bool,
+            calls_after_failure: usize,
+        }
+        impl Write for Transport {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.failed {
+                    self.calls_after_failure += 1;
+                    return Ok(bytes.len());
+                }
+                if !self.fail_flush && self.accepted == 7 {
+                    self.failed = true;
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                let count = if self.fail_flush {
+                    bytes.len()
+                } else {
+                    bytes.len().min(7 - self.accepted)
+                };
+                self.accepted += count;
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                if self.failed {
+                    self.calls_after_failure += 1;
+                }
+                self.flushes += 1;
+                self.failed = true;
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        // Exercise both a buffered flush and a write larger than the buffer.
+        for size in [31, (1 << 20) + 31] {
+            for fail_flush in [false, true] {
+                let mut transport = Transport {
+                    accepted: 0,
+                    flushes: 0,
+                    fail_flush,
+                    failed: false,
+                    calls_after_failure: 0,
+                };
+                let error = with_buffered_output(&mut transport, |writer| {
+                    writer.write_all(&vec![b'x'; size]).map_err(SearchError::Io)
+                })
+                .unwrap_err();
+                assert!(matches!(error, SearchError::Io(source)
+                    if source.kind() == io::ErrorKind::BrokenPipe));
+                assert!(transport.failed);
+                assert_eq!(transport.calls_after_failure, 0);
+                assert_eq!(transport.accepted, if fail_flush { size } else { 7 });
+                assert_eq!(transport.flushes, usize::from(fail_flush));
+            }
+        }
+        let mut bytes = Vec::new();
+        with_buffered_output(&mut bytes, |writer| {
+            writer
+                .write_all(b"complete response\n")
+                .map_err(SearchError::Io)
+        })
+        .unwrap();
+        assert_eq!(bytes, b"complete response\n");
+    }
+
+    #[test]
+    fn buffered_emission_abandons_a_failed_serialization_suffix() {
+        struct CannotSerialize;
+        impl Serialize for CannotSerialize {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom(
+                    "deliberate buffered payload failure",
+                ))
+            }
+        }
+        let envelope = OutputEnvelope::success(CannotSerialize, sample_meta("json"), sample_ts());
+        let mut bytes = Vec::new();
+        let error = with_buffered_output(&mut bytes, |writer| {
+            let result = emit_envelope(&envelope, OutputFormat::Json, writer);
+            assert!(
+                !writer.buffer().is_empty(),
+                "partial envelope reached the buffer"
+            );
+            result
+        })
+        .unwrap_err();
+        assert!(matches!(error, SearchError::SubsystemError { .. }));
+        assert!(
+            bytes.is_empty(),
+            "failed serialization must not flush on drop"
+        );
     }
 
     // ─── JSON emission ──────────────────────────────────────────────────
@@ -1168,6 +1385,32 @@ mod tests {
         assert!(output.contains("No results for \"auth middleware\"."));
         assert!(output.contains("checking the index with fsfs status"));
         assert!(output.contains("0 results in 19ms"));
+    }
+
+    #[test]
+    fn render_search_table_handles_maximum_source_ranks() {
+        for (rank, displayed) in [
+            (0, 1),
+            (usize::MAX - 1, usize::MAX),
+            (usize::MAX, usize::MAX),
+        ] {
+            for hash in [false, true] {
+                let mut payload = sample_search_payload();
+                payload.hits.truncate(1);
+                payload.returned_hits = 1;
+                payload.vector_generation_is_hash = hash;
+                let hit = &mut payload.hits[0];
+                hit.lexical_rank = Some(rank);
+                hit.semantic_rank = (!hash).then_some(rank);
+                hit.hash_rank = hash.then_some(rank);
+                let output = render_search_table_with_options(&payload, None, false, 80);
+                let label = if hash { "H" } else { "S" };
+                assert!(
+                    output.contains(&format!("[L{displayed} {label}{displayed}]")),
+                    "source-rank boundary {rank} hash={hash}: {output}"
+                );
+            }
+        }
     }
 
     #[test]
