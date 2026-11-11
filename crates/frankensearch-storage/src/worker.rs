@@ -401,6 +401,9 @@ impl PersistentEmbeddingWorker {
     /// Graceful shutdown is observed between batches and before recovery. It
     /// does not interrupt a batch already in progress. Cancellation and storage
     /// errors propagate; uncompleted claims retain the queue's recovery lease.
+    /// Cancellation wakes and drops pending inference even when its provider
+    /// does not observe the context or register a waker. Synchronous provider
+    /// work still cannot be preempted.
     /// No database transaction is held over inference or an await point.
     #[allow(clippy::future_not_send)]
     pub async fn run(
@@ -643,13 +646,14 @@ mod tests {
     #![allow(clippy::arc_with_non_send_sync)]
 
     use std::future::{Future, poll_fn};
+    use std::pin::Pin;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
-    use std::task::Poll;
+    use std::task::{Context, Poll, Wake, Waker};
 
-    use frankensearch_core::EmbeddingIdentityBundleV1;
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
+    use frankensearch_core::{EmbeddingIdentityBundleV1, IdentityBoundEmbedding};
     use fsqlite_types::value::SqliteValue;
 
     use super::*;
@@ -759,6 +763,239 @@ mod tests {
             .connection()
             .execute_sync("UPDATE embedding_jobs SET started_at = 0 WHERE status = 'processing';")
             .unwrap();
+    }
+
+    struct ParkedProbe {
+        identity: EmbeddingIdentityBundleV1,
+        ready: AtomicBool,
+        cancel_on_create: AtomicBool,
+        calls: AtomicUsize,
+        polls: AtomicUsize,
+        drops: AtomicUsize,
+    }
+
+    // Deliberately neither reads Cx nor saves/wakes its task. Only the caller's
+    // cancellation boundary can wake a worker parked in this provider.
+    struct ParkedInference<'a>(&'a ParkedProbe);
+
+    impl Future for ParkedInference<'_> {
+        type Output = SearchResult<IdentityBoundEmbedding>;
+
+        fn poll(self: Pin<&mut Self>, _task: &mut Context<'_>) -> Poll<Self::Output> {
+            self.0.polls.fetch_add(1, Ordering::SeqCst);
+            if self.0.ready.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(IdentityBoundEmbedding {
+                    values: vec![0.6, 0.8],
+                    identity: self.0.identity.clone(),
+                }))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for ParkedInference<'_> {
+        fn drop(&mut self) {
+            self.0.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Embedder for ParkedProbe {
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            panic!("worker publication must use the actual bound response")
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_on_create.load(Ordering::SeqCst) {
+                cx.cancel_fast(asupersync::CancelKind::User);
+            }
+            Box::pin(ParkedInference(self))
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn id(&self) -> &'static str {
+            "parked-probe"
+        }
+
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[derive(Default)]
+    struct InferenceWake(AtomicUsize);
+
+    impl Wake for InferenceWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pending_inference_cancellation_preserves_claims_for_lease_recovery() {
+        for database_publication in [false, true] {
+            for cancel_on_create in [false, true] {
+                let cx = Cx::for_testing();
+                let storage = Arc::new(Storage::open_in_memory().unwrap());
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let probe = Arc::new(ParkedProbe {
+                    identity: EmbeddingIdentityBundleV1::explicit_test_model("parked-probe", 2),
+                    ready: AtomicBool::new(false),
+                    cancel_on_create: AtomicBool::new(cancel_on_create),
+                    calls: AtomicUsize::new(0),
+                    polls: AtomicUsize::new(0),
+                    drops: AtomicUsize::new(0),
+                });
+                let worker = PersistentEmbeddingWorker::new(
+                    Arc::clone(&storage),
+                    JobQueueConfig {
+                        batch_size: 1,
+                        max_retries: 1,
+                        retry_base_delay_ms: 0,
+                        ..JobQueueConfig::default()
+                    },
+                    Arc::new(DefaultCanonicalizer::default()),
+                    probe.clone(),
+                    sink.clone(),
+                )
+                .unwrap();
+                let worker = if database_publication {
+                    worker.with_database_publication()
+                } else {
+                    worker
+                };
+                worker
+                    .runner()
+                    .ingest(IngestRequest::new("parked", "retained input for retry"))
+                    .unwrap();
+                let shutdown = AtomicBool::new(false);
+                let wakes = Arc::new(InferenceWake::default());
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut task = Context::from_waker(&waker);
+                let mut service = Box::pin(worker.run(&cx, "cancelled-worker", &shutdown));
+                let first_poll = service.as_mut().poll(&mut task);
+                let outcome = if cancel_on_create {
+                    first_poll
+                } else {
+                    assert!(first_poll.is_pending());
+                    assert_eq!(probe.polls.load(Ordering::SeqCst), 1);
+                    assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+                    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+                    cx.cancel_fast(asupersync::CancelKind::User);
+                    // A manual repoll without this check would hide the bug:
+                    // nothing in the provider can schedule the worker again.
+                    assert!(wakes.0.load(Ordering::SeqCst) > 0);
+                    service.as_mut().poll(&mut task)
+                };
+                assert!(
+                    matches!(&outcome, Poll::Ready(Err(SearchError::Cancelled { .. }))),
+                    "database={database_publication}, factory={cancel_on_create}: {outcome:?}"
+                );
+                let expected_polls = usize::from(!cancel_on_create);
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(probe.polls.load(Ordering::SeqCst), expected_polls);
+                assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
+                assert!(sink.entries().is_empty());
+                assert!(
+                    storage
+                        .connection()
+                        .query_sync("SELECT doc_id FROM published_embeddings;")
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    worker.queue().queue_depth().unwrap(),
+                    QueueDepth {
+                        processing: 1,
+                        ..QueueDepth::default()
+                    }
+                );
+                let counts = storage.count_by_status(probe.id()).unwrap();
+                assert_eq!(counts.pending, 1);
+                assert_eq!(counts.embedded + counts.failed, 0);
+                let rows = storage
+                    .connection()
+                    .query_sync("SELECT retry_count, claim_epoch FROM embedding_jobs;")
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(0)));
+                assert_eq!(rows[0].get(1), Some(&SqliteValue::Integer(1)));
+                let metrics = worker.queue().metrics().snapshot();
+                assert_eq!(
+                    metrics.total_completed + metrics.total_failed + metrics.total_retried,
+                    0
+                );
+                let metrics = worker.runner().metrics().snapshot();
+                assert_eq!(metrics.total_jobs_completed + metrics.total_jobs_failed, 0);
+                drop(service);
+
+                // Cancellation leaves the ordinary lease recovery in charge;
+                // it must not spend the one retry before that lease expires.
+                probe.cancel_on_create.store(false, Ordering::SeqCst);
+                probe.ready.store(true, Ordering::SeqCst);
+                expire_claims(&storage);
+                assert_eq!(worker.queue().reclaim_stale_jobs().unwrap(), 1);
+                let retry_cx = Cx::for_testing();
+                let mut retry = Box::pin(worker.process_batch(&retry_cx, "replacement-worker"));
+                let Poll::Ready(Ok(recovered)) = retry.as_mut().poll(&mut task) else {
+                    panic!("the admitted retry must complete with a ready provider");
+                };
+                assert_eq!(recovered.jobs_claimed, 1);
+                assert_eq!(recovered.jobs_completed, 1);
+                assert_eq!(recovered.jobs_failed, 0);
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(probe.polls.load(Ordering::SeqCst), expected_polls + 1);
+                assert_eq!(probe.drops.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    worker.queue().queue_depth().unwrap(),
+                    QueueDepth {
+                        completed: 1,
+                        ..QueueDepth::default()
+                    }
+                );
+                let published = storage
+                    .get_published_embedding("parked", probe.id(), &probe.identity)
+                    .unwrap();
+                if database_publication {
+                    let published = published.unwrap();
+                    assert_eq!(published.claim_epoch, 2);
+                    assert_eq!(published.embedding.values, vec![0.6, 0.8]);
+                    assert!(sink.entries().is_empty());
+                } else {
+                    assert!(published.is_none());
+                    let entries = sink.entries();
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].doc_id, "parked");
+                    assert_eq!(entries[0].embedding.values, vec![0.6, 0.8]);
+                    assert_eq!(entries[0].embedding.identity, probe.identity);
+                }
+            }
+        }
     }
 
     #[test]

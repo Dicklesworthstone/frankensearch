@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asupersync::Cx;
 use frankensearch_core::generation::QuantizationFormat;
 use frankensearch_core::{
-    Canonicalizer, Embedder, IdentityBoundEmbedding, SearchError, SearchResult,
+    Canonicalizer, Embedder, IdentityBoundEmbedding, SearchError, SearchResult, with_cancellation,
 };
 use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
@@ -1385,7 +1385,15 @@ async fn embed_for_persistence(
         });
     }
 
-    let response = embedder.embed_bound(cx, text).await;
+    // A remote/custom provider may park without checking the caller's context
+    // or retaining its waker. Cancellation must still wake this worker and
+    // drop its owned inference before leaving the claim to lease recovery.
+    let response = with_cancellation(
+        cx,
+        "storage.pipeline.inference",
+        embedder.embed_bound(cx, text),
+    )
+    .await;
     // Cancellation dominates both a successful response and a provider error.
     // A cancelled worker must not persist, fail, or complete a claimed job.
     pipeline_checkpoint(cx, "storage.pipeline.embed_complete")?;

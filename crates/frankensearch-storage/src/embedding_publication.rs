@@ -12,6 +12,7 @@ use asupersync::Cx;
 use frankensearch_core::generation::QuantizationFormat;
 use frankensearch_core::{
     Embedder, EmbeddingIdentityBundleV1, IdentityBoundEmbedding, SearchError, SearchResult,
+    with_cancellation,
 };
 use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
@@ -122,6 +123,9 @@ impl Storage {
     /// caller applying an explicit failure must use the original input revision,
     /// never a newly fetched document hash. Structured cancellation propagates
     /// without deliberately failing, completing, or releasing the claim.
+    /// Pending inference has its own cancellation wake registration; providers
+    /// need not wake or observe cancellation themselves. The provider future is
+    /// dropped before returning, while the untouched claim remains recoverable.
     ///
     /// This API is opt-in. Existing runner/worker sinks and external FSVI/ANN
     /// publication are unchanged; queue-instance counters are not updated here.
@@ -198,7 +202,12 @@ impl Storage {
             Ok(expected) => expected,
             Err(error) => return reject_attempt(document.content_hash, error),
         };
-        let response = embedder.embed_bound(cx, &text).await;
+        let response = with_cancellation(
+            cx,
+            "storage.embedding_publication.inference",
+            embedder.embed_bound(cx, &text),
+        )
+        .await;
         publication_checkpoint(cx)?;
         let response = match response {
             Err(error @ SearchError::Cancelled { .. }) => return Err(error),
