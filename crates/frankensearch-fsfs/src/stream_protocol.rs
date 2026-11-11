@@ -466,7 +466,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns `SearchError::SubsystemError` if serialization/encoding fails.
+/// Returns `SearchError::InvalidConfig` if a payload contains the reserved
+/// record separator; use NDJSON to encode that data losslessly. Other
+/// serialization/encoding failures return `SearchError::SubsystemError`.
 pub fn encode_stream_frame_toon<T>(frame: &StreamFrame<T>) -> SearchResult<String>
 where
     T: Serialize,
@@ -478,12 +480,23 @@ where
         ))),
     })?;
 
-    toon_format::encode_default(&value).map_err(|source| SearchError::SubsystemError {
-        subsystem: SUBSYSTEM,
-        source: Box::new(io::Error::other(format!(
-            "failed to encode stream frame as TOON: {source}"
-        ))),
-    })
+    let toon =
+        toon_format::encode_default(&value).map_err(|source| SearchError::SubsystemError {
+            subsystem: SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "failed to encode stream frame as TOON: {source}"
+            ))),
+        })?;
+    // TOON leaves this control byte raw, but the stream transport uses it as
+    // a frame boundary. Refuse before the emitter writes any framing bytes.
+    if toon.contains(TOON_STREAM_RECORD_SEPARATOR) {
+        return Err(SearchError::InvalidConfig {
+            field: "stream.toon_payload".to_owned(),
+            value: "record_separator".to_owned(),
+            reason: "TOON stream payload contains the reserved record separator; use --format jsonl to preserve this data".to_owned(),
+        });
+    }
+    Ok(toon)
 }
 
 /// Decode one TOON stream frame.
@@ -686,6 +699,50 @@ mod tests {
             "search",
             event,
         )
+    }
+
+    #[test]
+    fn toon_stream_refuses_payload_separators_without_writing_partial_frames() {
+        use crate::adapters::cli::OutputFormat;
+        use crate::adapters::format_emitter::emit_stream_frame;
+
+        for event in [
+            StreamEvent::Started(StreamStartedEvent::new(
+                "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+                "left\u{001e}right",
+                "toon",
+            )),
+            StreamEvent::Result(StreamResultEvent {
+                rank: 1,
+                item: vec!["left\u{001e}right".to_owned()],
+            }),
+        ] {
+            let mut frame = sample_frame(event);
+            let mut toon = b"previous-frame\n".to_vec();
+            let error = emit_stream_frame(&frame, OutputFormat::Toon, &mut toon)
+                .expect_err("a payload separator must never become a transport boundary");
+            assert!(matches!(
+                &error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "stream.toon_payload" && value == "record_separator"
+            ));
+            assert_eq!(toon, b"previous-frame\n");
+            assert!(!error.to_string().contains(TOON_STREAM_RECORD_SEPARATOR));
+
+            if let StreamEvent::Started(started) = &mut frame.event {
+                started.format = "jsonl".to_owned();
+            }
+            let mut jsonl = Vec::new();
+            emit_stream_frame(&frame, OutputFormat::Jsonl, &mut jsonl)
+                .expect("JSONL can preserve a payload separator without ambiguity");
+            assert!(!jsonl.contains(&TOON_STREAM_RECORD_SEPARATOR_BYTE));
+            let jsonl = String::from_utf8(jsonl).expect("UTF-8 JSONL");
+            assert_eq!(jsonl.lines().count(), 1);
+            assert_eq!(
+                decode_stream_frame_ndjson::<Vec<String>>(&jsonl).unwrap(),
+                frame
+            );
+        }
     }
 
     #[test]

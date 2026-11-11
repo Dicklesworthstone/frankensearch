@@ -185,9 +185,10 @@ where
 ///
 /// # Errors
 ///
-/// Returns `SearchError::InvalidConfig` when `format` is not `jsonl` or `toon`.
-/// Serialization failures return `SearchError::SubsystemError`; writer and
-/// flush failures return `SearchError::Io` with the original I/O error.
+/// Returns `SearchError::InvalidConfig` when `format` is not `jsonl` or `toon`,
+/// or a TOON payload contains the reserved record separator. Serialization
+/// failures return `SearchError::SubsystemError`; writer and flush failures
+/// return `SearchError::Io` with the original I/O error.
 pub fn emit_stream_frame<T, W>(
     frame: &StreamFrame<T>,
     format: OutputFormat,

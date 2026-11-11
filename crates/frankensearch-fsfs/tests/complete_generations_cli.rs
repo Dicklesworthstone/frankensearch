@@ -914,6 +914,60 @@ fn complete_cli_binary_default_search_without_a_daemon_runs_in_process() {
 }
 
 #[test]
+fn stream_encoding_refusal_is_reported_before_output_ownership() {
+    use frankensearch_fsfs::stream_protocol::{
+        StreamEvent, StreamFrame, StreamTerminalStatus, decode_stream_frame_ndjson,
+    };
+
+    let fixture = Fixture::new();
+    json_output(
+        &execute(
+            fixture
+                .lexical_discovery_command("index")
+                .arg("--no-watch-mode"),
+        ),
+        true,
+    );
+    let query = "sharedtoken\u{001e}";
+    for format in ["jsonl", "toon"] {
+        // The alias avoids the helper's fixed search positional argument.
+        let output = execute(fixture.lexical_discovery_command("s").arg(query).args([
+            "--format",
+            format,
+            "--stream",
+            "--no-daemon",
+        ]));
+        if format == "toon" {
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            let diagnostic = String::from_utf8(output.stderr).expect("UTF-8 public error");
+            assert!(diagnostic.contains("[invalid_config]"), "{diagnostic}");
+            assert!(diagnostic.contains("--format jsonl"), "{diagnostic}");
+            assert!(!diagnostic.contains('\u{001e}'));
+        } else {
+            assert!(output.status.success(), "{output:?}");
+            let text = std::str::from_utf8(&output.stdout).expect("UTF-8 JSONL");
+            assert!(!text.contains('\u{001e}'));
+            let frames: Vec<StreamFrame<Value>> = text
+                .lines()
+                .map(|line| decode_stream_frame_ndjson(line).expect("JSONL stream frame"))
+                .collect();
+            let Some(StreamEvent::Started(started)) = frames.first().map(|frame| &frame.event)
+            else {
+                panic!("started frame: {output:?}");
+            };
+            assert_eq!(started.query, query);
+            let Some(StreamEvent::Terminal(terminal)) = frames.last().map(|frame| &frame.event)
+            else {
+                panic!("terminal frame: {output:?}");
+            };
+            assert_eq!(terminal.status, StreamTerminalStatus::Completed);
+            assert_eq!(terminal.exit_code, 0);
+        }
+    }
+}
+
+#[test]
 fn named_daemon_refusal_preserves_public_error_in_stream_terminal() {
     use frankensearch_fsfs::stream_protocol::{
         StreamEvent, StreamFailureCategory, StreamFrame, StreamRetryDirective, StreamTerminalEvent,
