@@ -1575,6 +1575,11 @@ pub struct InMemoryVectorIndex {
     /// header's empty revision is preserved as `Some("")`, distinct from the
     /// `None` of a source with no header at all.
     embedder_revision: Option<String>,
+    /// Publication marker retained from a pathname-opened v1 source. This
+    /// detects interrupted two-file publication after loading into memory;
+    /// it is not a complete v2 generation or an embedding-space identity.
+    /// Caller-built vectors and admitted v2 sources do not use this marker.
+    legacy_publication_nonce: Option<u16>,
     /// Complete binding of the exactly admitted source image, present only
     /// after [`Self::from_admitted_v2`]. This is source provenance: an F32
     /// artifact is converted into the resident F16 slab, so its storage
@@ -1725,6 +1730,7 @@ impl InMemoryVectorIndex {
             space_fingerprint_hex: None,
             embedder_id: None,
             embedder_revision: None,
+            legacy_publication_nonce: None,
             admitted_source_binding: None,
             dimension,
             residual_source_binding: None,
@@ -2182,6 +2188,10 @@ impl InMemoryVectorIndex {
             space_fingerprint_hex,
             embedder_id,
             embedder_revision,
+            legacy_publication_nonce: index
+                .identity_v2()
+                .is_none()
+                .then_some(index.publication_nonce()),
             admitted_source_binding: None,
             dimension,
             residual_source_binding: None,
@@ -3738,17 +3748,35 @@ fn validate_tier_source_bindings(
     Ok(())
 }
 
+fn validate_legacy_tier_publications(fast: Option<u16>, quality: Option<u16>) -> SearchResult<()> {
+    if let (Some(fast), Some(quality)) = (fast, quality)
+        && fast != quality
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "in_memory.tiers.publication_nonce".to_owned(),
+            value: format!("fast={fast}, quality={quality}"),
+            reason: "persisted tiers came from different publications; reopen a coherent pair \
+                     or rebuild before blending their vectors"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl InMemoryTwoTierIndex {
     /// Create from two pre-built in-memory indices.
     ///
     /// Admitted tiers must share a complete generation, semantic kind, and
     /// document-ID contract. Models, dimensions, and coverage may differ.
     /// A pair of legacy or caller-declared tiers retains its weaker contract;
-    /// mixing either with an admitted tier is rejected.
+    /// mixing either with an admitted tier is rejected. Persisted v1 tiers
+    /// must also retain matching publication markers. Equal legacy markers
+    /// do not establish complete v2 generation authority.
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError::InvalidConfig`] for incompatible source bindings.
+    /// Returns [`SearchError::InvalidConfig`] for incompatible source bindings
+    /// or mismatched persisted publication markers.
     pub fn new(
         fast_index: InMemoryVectorIndex,
         quality_index: Option<InMemoryVectorIndex>,
@@ -3757,6 +3785,10 @@ impl InMemoryTwoTierIndex {
             validate_tier_source_bindings(
                 fast_index.admitted_source_binding(),
                 quality.admitted_source_binding(),
+            )?;
+            validate_legacy_tier_publications(
+                fast_index.legacy_publication_nonce,
+                quality.legacy_publication_nonce,
             )?;
         }
         Ok(Self {
@@ -3806,7 +3838,9 @@ impl InMemoryTwoTierIndex {
     ///
     /// # Errors
     ///
-    /// Returns errors from FSVI parsing or vector loading.
+    /// Returns errors from FSVI parsing or vector loading. An interrupted
+    /// publication with different fast/quality markers is refused before
+    /// either source is materialized into the resident vector slab.
     pub fn from_dir(dir: &Path) -> SearchResult<Self> {
         let fast_path = dir.join(crate::two_tier::VECTOR_INDEX_FAST_FILENAME);
         let fast_path = if fast_path.exists() {
@@ -3818,14 +3852,24 @@ impl InMemoryTwoTierIndex {
             }
             fallback
         };
-        let fast_index = InMemoryVectorIndex::from_fsvi(&fast_path)?;
-
+        let fast_source = VectorIndex::open_read_only(&fast_path)?;
         let quality_path = dir.join(crate::two_tier::VECTOR_INDEX_QUALITY_FILENAME);
-        let quality_index = if quality_path.exists() {
-            Some(InMemoryVectorIndex::from_fsvi(&quality_path)?)
+        let quality_source = if quality_path.exists() {
+            Some(VectorIndex::open_read_only(&quality_path)?)
         } else {
             None
         };
+        if let Some(quality) = &quality_source {
+            validate_legacy_tier_publications(
+                Some(fast_source.publication_nonce()),
+                Some(quality.publication_nonce()),
+            )?;
+        }
+        let fast_index = InMemoryVectorIndex::from_open_index(&fast_source)?;
+        let quality_index = quality_source
+            .as_ref()
+            .map(InMemoryVectorIndex::from_open_index)
+            .transpose()?;
 
         Self::new(fast_index, quality_index)
     }
@@ -5559,6 +5603,55 @@ mod tests {
         let composed = InMemoryTwoTierIndex::new(fast_only, None).expect("legacy fast-only index");
         assert_eq!(composed.fast_space_fingerprint_hex(), None);
         assert_eq!(composed.quality_space_fingerprint_hex(), None);
+    }
+
+    #[test]
+    fn persisted_two_tier_publications_stay_coherent_after_reopen_and_clone() {
+        for (fast_nonce, quality_nonce) in [(0, 0), (11, 11), (11, 12), (0, 11), (11, 0)] {
+            let dir = owned_temp_dir("in_memory_publication_pair");
+            let fast_path = dir.path().join(crate::two_tier::VECTOR_INDEX_FAST_FILENAME);
+            let quality_path = dir
+                .path()
+                .join(crate::two_tier::VECTOR_INDEX_QUALITY_FILENAME);
+            for (path, nonce) in [(&fast_path, fast_nonce), (&quality_path, quality_nonce)] {
+                let mut writer = crate::VectorIndex::create(path, "same-model", 2)
+                    .unwrap()
+                    .with_publication_nonce(nonce);
+                writer.write_record("same-document", &[1.0, 0.0]).unwrap();
+                writer.finish().unwrap();
+            }
+
+            // Same model, dimensions, count and document IDs cannot conceal
+            // a crash between publications. Both construction routes must
+            // retain the header marker, including through an in-memory clone.
+            let fast = InMemoryVectorIndex::from_fsvi(&fast_path).unwrap();
+            let quality = InMemoryVectorIndex::from_fsvi(&quality_path).unwrap();
+            for result in [
+                InMemoryTwoTierIndex::from_dir(dir.path()),
+                InMemoryTwoTierIndex::new(fast.clone(), Some(quality.clone())),
+            ] {
+                if fast_nonce == quality_nonce {
+                    let pair = result.expect("matching publication markers");
+                    assert_eq!(pair.doc_count(), 1);
+                    assert!(pair.has_quality_index());
+                    assert!(!pair.fast_identity_is_attested());
+                    assert!(!pair.quality_identity_is_attested());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::InvalidConfig { ref field, .. })
+                            if field == "in_memory.tiers.publication_nonce"
+                    ));
+                }
+            }
+            // A coherent retained fast snapshot remains usable even when a
+            // separately opened quality candidate was refused.
+            let fast_only = InMemoryTwoTierIndex::new(fast, None).unwrap();
+            assert_eq!(
+                fast_only.search_fast(&[1.0, 0.0], 1).unwrap()[0].doc_id,
+                "same-document"
+            );
+        }
     }
 
     #[test]

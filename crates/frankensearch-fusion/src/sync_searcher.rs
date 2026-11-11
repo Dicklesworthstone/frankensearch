@@ -57,9 +57,9 @@ struct AdmittedSyncQuery<'query> {
 /// Same distinction the async searcher draws: `Retrieved` is the quality
 /// tier's OWN top-k and can name documents the fast tier never selected;
 /// `RescoredFastPool` can only re-rank what the fast tier already chose.
-/// Which one runs is decided by whether the quality tier's space identity is
-/// attested — never by convenience — so the two searchers expand the returned
-/// candidate set under the same condition.
+/// Independent retrieval requires an admitted v2 owner or a persisted v1
+/// producer fingerprint joined to the bound query. A caller-declared space
+/// alone does not establish that producer contract.
 enum SyncQualityPool {
     /// The quality tier's own top-k for the quality-bound query.
     Retrieved(Vec<VectorHit>),
@@ -75,8 +75,9 @@ enum SyncQualityPool {
 /// comparison telemetry and cannot authorize retrieval.
 ///
 /// A caller-declared space has no admitted producer to check, so it keeps its
-/// space-only join. A legacy unidentified tier has neither binding nor space
-/// fingerprint and keeps its weaker contract without fabricating authority.
+/// space-only join. Persisted v1 revisions bind the complete query identity,
+/// as in the async searcher; an unstamped file cannot admit a semantic query.
+/// Bare caller-built vectors retain their explicitly unidentified contract.
 fn admit_tier_query(
     tier_index: &InMemoryVectorIndex,
     query: &BoundQueryEmbedding,
@@ -99,6 +100,18 @@ fn admit_tier_query(
         }
     } else if let Some(expected) = tier_index.space_fingerprint_hex() {
         query.verify_space_identity(expected, tier)?;
+    } else if let Some(revision) = tier_index.embedder_revision()
+        && (!revision.is_empty() || query.identity().space.kind == EmbeddingSpaceKindV1::Semantic)
+        && revision != query.identity_fingerprint()
+    {
+        return Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.producer_revision"),
+            value: "incompatible_or_missing".to_owned(),
+            reason: format!(
+                "the stored {tier} vectors do not bind this query's complete producer \
+                 identity; rebuild the index with this producer before searching"
+            ),
+        });
     }
     // Identity refusals take precedence, but every tier must also admit the
     // read's shape. Legacy tiers cannot infer this from a retained identity,
@@ -814,24 +827,18 @@ impl SyncTwoTierSearcher {
             .expect("admission binds a quality query only when a quality tier exists");
 
         let phase2_started = Instant::now();
-        // TWO THINGS CHANGE HERE, and only one of them is unconditional.
-        //
-        // Unconditional: the quality tier is scored with the QUALITY-bound
-        // query. It used to be scored with the fast tier's vector, which is a
-        // cross-space read no dimension check can catch because the two tiers
-        // usually have the same width. That was the defect.
-        //
-        // Conditional: independent RETRIEVAL from the quality tier — which can
-        // surface a document the fast pool never selected (bd-ctzo C2) — runs
-        // only when the quality tier's space identity is ATTESTED, i.e. read
-        // out of an admitted FSVI v2 artifact's own header. That gate is not
-        // timidity; it keeps this path behaviourally identical to the async
-        // searcher, which can only retrieve through the owner-backed
-        // activation and rescores on a legacy artifact. Expanding the returned
-        // candidate set is conditioned on being able to prove the pool being
-        // expanded into is the right space, on both sides. A legacy pair keeps
-        // the aligned rescoring shape — with the correct vector.
-        let quality_pool = if quality_index.space_identity_is_attested() {
+        // Retrieve independently after joining the quality query to its
+        // retained producer. Both admitted v2 and producer-stamped v1 sources
+        // can find documents outside the fast pool, matching the async path.
+        // The v1 fingerprint does not manufacture v2 generation authority or
+        // coverage. Caller-declared spaces and unstamped control fixtures keep
+        // their existing rescoring contract.
+        let independent_quality = quality_index.space_identity_is_attested()
+            || (quality_index.space_fingerprint_hex().is_none()
+                && quality_index
+                    .embedder_revision()
+                    .is_some_and(|revision| !revision.is_empty()));
+        let quality_pool = if independent_quality {
             quality_index
                 .search_top_k(quality_query.vector(), fetch, filter)
                 .map(SyncQualityPool::Retrieved)
@@ -1552,6 +1559,171 @@ mod tests {
             .validate()
             .expect("semantic fixture identity validates");
         identity
+    }
+
+    fn persisted_producer_pair(
+        dir: &Path,
+    ) -> (EmbeddingIdentityBundleV1, EmbeddingIdentityBundleV1) {
+        let fast = semantic_identity("persisted-fast", 2);
+        let quality = semantic_identity("persisted-quality", 3);
+        let mut writer =
+            frankensearch_index::TwoTierIndex::create(dir, TwoTierConfig::default()).unwrap();
+        writer.set_fast_embedder_id("persisted-fast");
+        writer.set_quality_embedder_id("persisted-quality");
+        writer.set_fast_identity(&fast).unwrap();
+        writer.set_quality_identity(&quality).unwrap();
+        writer.add_fast_record("a", &[0.6, 0.8]).unwrap();
+        writer.add_quality_record("a", &[0.0, 0.0, 1.0]).unwrap();
+        writer.add_quality_record("b", &[1.0, 0.0, 0.0]).unwrap();
+        writer.add_quality_record("c", &[0.8, 0.6, 0.0]).unwrap();
+        drop(writer.finish().unwrap());
+        (fast, quality)
+    }
+
+    #[test]
+    fn persisted_producer_fingerprints_reject_drift_before_search() {
+        struct UnreachableLexical;
+        impl SyncLexicalSearch for UnreachableLexical {
+            fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+                panic!("producer refusal must precede lexical retrieval");
+            }
+        }
+
+        let dir = temp_dir("persisted-producer-admission");
+        let (fast, quality) = persisted_producer_pair(dir.path());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap());
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+            .with_lexical(Arc::new(UnreachableLexical));
+        for tier in ["fast", "quality"] {
+            for change_space in [false, true] {
+                let mut foreign_fast = fast.clone();
+                let mut foreign_quality = quality.clone();
+                let foreign = if tier == "fast" {
+                    &mut foreign_fast
+                } else {
+                    &mut foreign_quality
+                };
+                if change_space {
+                    "new-weights-same-model".clone_into(&mut foreign.space.immutable_revision);
+                    foreign.producer.space_fingerprint = foreign.space.fingerprint();
+                } else {
+                    "foreign-backend".clone_into(&mut foreign.producer.backend);
+                }
+                foreign.validate().unwrap();
+                for k in [0, 1] {
+                    for zero in [false, true] {
+                        let signal = if zero { 0.0 } else { 1.0 };
+                        let query = TieredQueryEmbeddings::progressive(
+                            BoundQueryEmbedding::new(vec![signal, 0.0], foreign_fast.clone())
+                                .unwrap(),
+                            BoundQueryEmbedding::new(
+                                vec![signal, 0.0, 0.0],
+                                foreign_quality.clone(),
+                            )
+                            .unwrap(),
+                        );
+                        assert_admission_refusal(
+                            &searcher,
+                            &query,
+                            k,
+                            &format!("search_activation.{tier}.producer_revision"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_quality_retrieval_reaches_outside_fast_pool_after_reopen() {
+        let dir = temp_dir("persisted-quality-retrieval");
+        let (fast, quality) = persisted_producer_pair(dir.path());
+        // Drop and reopen every owner: no process-local builder identity can
+        // supply the missing admission or the quality-only document here.
+        for _ in 0..2 {
+            let index = Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap());
+            assert!(index.fast_index().admitted_source_binding().is_none());
+            assert!(
+                index
+                    .quality_index()
+                    .unwrap()
+                    .space_fingerprint_hex()
+                    .is_none()
+            );
+            let searcher = SyncTwoTierSearcher::new(
+                index,
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    quality_weight: 1.0,
+                    ..TwoTierConfig::default()
+                },
+            );
+            for fast_signal in [1.0, 0.0] {
+                let query = TieredQueryEmbeddings::progressive(
+                    BoundQueryEmbedding::new(vec![fast_signal, 0.0], fast.clone()).unwrap(),
+                    BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality.clone()).unwrap(),
+                );
+                let phases = searcher.search_iter(&query, 1).collect::<Vec<_>>();
+                let [
+                    SearchPhase::Initial {
+                        results: initial, ..
+                    },
+                    SearchPhase::Refined { results, .. },
+                ] = phases.as_slice()
+                else {
+                    panic!("both independently bound tiers must run: {phases:?}");
+                };
+                if fast_signal == 0.0 {
+                    assert!(initial.is_empty());
+                } else {
+                    assert_eq!(initial[0].doc_id, "a");
+                }
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].doc_id, "b");
+                assert_eq!(results[0].index, None);
+                assert_eq!(results[0].fast_score, None);
+                assert_eq!(results[0].quality_score, Some(1.0));
+                let (filtered, metrics) = searcher
+                    .search_collect_with_filter(&query, 1, Some(&ExcludeB))
+                    .unwrap();
+                assert_eq!(filtered[0].doc_id, "c");
+                assert_eq!(filtered[0].fast_score, None);
+                assert!(metrics.coverage.is_none(), "v1 does not mint v2 coverage");
+                assert!(metrics.zero_signal.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_legacy_revision_cannot_admit_a_semantic_query() {
+        for revision in ["", "old-model-revision"] {
+            let dir = temp_dir("persisted-legacy-refusal");
+            let path = dir.path().join("vector.fast.idx");
+            let mut writer = frankensearch_index::VectorIndex::create_with_revision(
+                &path,
+                "persisted-fast",
+                revision,
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer.write_record("a", &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let index = Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap());
+            let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+            let query = TieredQueryEmbeddings::fast_only(
+                BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("persisted-fast", 2))
+                    .unwrap(),
+            );
+            for k in [0, 1] {
+                assert_admission_refusal(
+                    &searcher,
+                    &query,
+                    k,
+                    "search_activation.fast.producer_revision",
+                );
+            }
+        }
     }
 
     /// An in-memory tier loaded through exact FSVI v2 admission, so it carries
