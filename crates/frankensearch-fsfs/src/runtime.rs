@@ -32,8 +32,9 @@ use frankensearch_core::parsed_query::ParsedQuery;
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
-    HitExplanation, IndexableDocument, LexicalTermScore, ModelCategory, RerankDocument, Reranker,
-    ScoreComponent, SearchError, SearchResult, VectorHit, with_cancellation,
+    HitExplanation, IdentityBoundEmbedding, IndexableDocument, LexicalTermScore, ModelCategory,
+    RerankDocument, Reranker, ScoreComponent, SearchError, SearchResult, VectorHit,
+    with_cancellation,
 };
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
@@ -4071,17 +4072,23 @@ impl EmbeddingVectorSink for LiveVectorSink {
     fn persist(
         &self,
         doc_id: &str,
-        _embedding_embedder_id: &str,
-        embedding: &[f32],
+        embedder_id: &str,
+        embedding: &IdentityBoundEmbedding,
     ) -> SearchResult<()> {
+        embedding.validate()?;
         let mut vi = self
             .vector_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The runner's response admission does not establish compatibility
+        // with this retained generation. Keep that check and the append under
+        // the same index lock, using the response's actual complete identity.
+        FsfsRuntime::validate_fast_producer_shape(&vi, embedder_id, embedding.values.len())?;
+        FsfsRuntime::validate_vector_producer_identity(&vi, &embedding.identity)?;
         // `VectorIndex::append` is the atomic replacement primitive: it
         // durably logs the new value before superseding older resident copies.
         // Deleting first would turn a failed WAL append into durable data loss.
-        vi.append(doc_id, embedding)?;
+        vi.append(doc_id, &embedding.values)?;
         drop(vi);
         Ok(())
     }
@@ -48156,6 +48163,86 @@ mod tests {
     }
 
     #[test]
+    fn live_vector_sink_requires_the_complete_bound_response_before_writing() {
+        use frankensearch_core::{EmbeddingIdentityBundleV1, IdentityBoundEmbedding};
+
+        let temp = tempfile::tempdir().unwrap();
+        let vector_path = temp.path().join("fast.fsvi");
+        let identity = EmbeddingIdentityBundleV1::explicit_test_model("sink-fast", 2);
+        let mut writer = VectorIndex::create_with_revision(
+            &vector_path,
+            "sink-fast",
+            &identity.fingerprint(),
+            2,
+            frankensearch_index::Quantization::F16,
+        )
+        .unwrap();
+        writer.write_record("doc.md", &[0.0, 1.0]).unwrap();
+        writer.finish().unwrap();
+        let original_bytes = fs::read(&vector_path).unwrap();
+        let sink = LiveVectorSink {
+            vector_index: Arc::new(Mutex::new(VectorIndex::open(&vector_path).unwrap())),
+        };
+        let wal_path = frankensearch_index::wal_path_for(&vector_path);
+
+        let mut changed_producer = identity.clone();
+        changed_producer
+            .producer
+            .implementation_revision
+            .push_str("-changed");
+        let mut changed_input = identity.clone();
+        changed_input.input.content_selection.push_str("-changed");
+        changed_input.space.input_contract_fingerprint = changed_input.input.fingerprint();
+        changed_input.producer.space_fingerprint = changed_input.space.fingerprint();
+        let mut changed_storage = identity.clone();
+        changed_storage.storage.format.push_str("-changed");
+        let changed_space = EmbeddingIdentityBundleV1::explicit_test_model("foreign-space", 2);
+
+        for foreign in [
+            changed_producer,
+            changed_input,
+            changed_storage,
+            changed_space,
+        ] {
+            // Every candidate is independently valid and has the same width.
+            // Only admission against the retained complete identity rejects it.
+            foreign.validate().unwrap();
+            let response = IdentityBoundEmbedding {
+                values: vec![1.0, 0.0],
+                identity: foreign,
+            };
+            assert!(matches!(
+                sink.persist("doc.md", "sink-fast", &response),
+                Err(SearchError::UnverifiableRemoteSpace { .. })
+            ));
+            assert_eq!(fs::read(&vector_path).unwrap(), original_bytes);
+            assert!(!wal_path.exists(), "identity refusal must precede the WAL write");
+            let index = sink.vector_index.lock().unwrap();
+            let hits = index.search_top_k(&[0.0, 1.0], 2, None).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc.md");
+            assert!(hits[0].score > 0.99);
+            assert!(!index.is_deleted(0));
+        }
+
+        sink.persist(
+            "doc.md",
+            "sink-fast",
+            &IdentityBoundEmbedding {
+                values: vec![1.0, 0.0],
+                identity,
+            },
+        )
+        .unwrap();
+        drop(sink);
+        let durable = VectorIndex::open_read_only(&vector_path).unwrap();
+        let hits = durable.search_top_k(&[1.0, 0.0], 2, None).unwrap();
+        assert_eq!(hits.len(), 1, "successful replacement must not duplicate the row");
+        assert_eq!(hits[0].doc_id, "doc.md");
+        assert!(hits[0].score > 0.99);
+    }
+
+    #[test]
     fn live_vector_sink_preserves_old_vector_on_append_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_root = temp.path().join("index");
@@ -48165,9 +48252,18 @@ mod tests {
             .expect("create vector artifact directory");
         let old_vector = [1.0_f32, 0.0, 0.0, 0.0];
         let new_vector = [0.0_f32, 1.0, 0.0, 0.0];
-        let mut writer =
-            VectorIndex::create(&vector_path, "publication-lease-test", old_vector.len())
-                .expect("create vector index");
+        let identity = frankensearch_core::EmbeddingIdentityBundleV1::explicit_test_model(
+            "publication-lease-test",
+            4,
+        );
+        let mut writer = VectorIndex::create_with_revision(
+            &vector_path,
+            "publication-lease-test",
+            &identity.fingerprint(),
+            old_vector.len(),
+            frankensearch_index::Quantization::F16,
+        )
+        .expect("create vector index");
         writer
             .write_record("doc.md", &old_vector)
             .expect("write old vector");
@@ -48181,8 +48277,17 @@ mod tests {
         let wal_path = frankensearch_index::wal_path_for(&vector_path);
         fs::create_dir(&wal_path).expect("block WAL creation with a directory");
 
-        sink.persist("doc.md", "publication-lease-test", &new_vector)
+        let replacement = frankensearch_core::IdentityBoundEmbedding {
+            values: new_vector.to_vec(),
+            identity,
+        };
+        let error = sink
+            .persist("doc.md", "publication-lease-test", &replacement)
             .expect_err("blocked WAL append must fail");
+        assert!(
+            matches!(error, SearchError::Io(_)),
+            "the actual WAL write must fail after identity admission"
+        );
 
         let displaced_wal = index_root.join("blocked-vector-wal");
         fs::rename(&wal_path, &displaced_wal).expect("preserve and displace WAL blocker");
@@ -48661,7 +48766,15 @@ mod tests {
             let fast_path = temp.path().join("fast.fsvi");
             let quality_path = temp.path().join("quality.fsvi");
             for (path, id) in [(&fast_path, "retry-fast"), (&quality_path, "retry-quality")] {
-                let mut writer = VectorIndex::create(path, id, 2).unwrap();
+                let identity = StorageRetryEmbedder::new(id).identity;
+                let mut writer = VectorIndex::create_with_revision(
+                    path,
+                    id,
+                    &identity.fingerprint(),
+                    2,
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap();
                 writer.write_record("doc.md", &[0.0, 1.0]).unwrap();
                 writer.finish().unwrap();
             }
@@ -48815,7 +48928,13 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             fs::write(temp.path().join("doc.md"), "interrupted worker content").unwrap();
             let vector_path = temp.path().join("fast.fsvi");
-            VectorIndex::create(&vector_path, "retry-fast", 2)
+            VectorIndex::create_with_revision(
+                &vector_path,
+                "retry-fast",
+                &StorageRetryEmbedder::new("retry-fast").identity.fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
                 .unwrap()
                 .finish()
                 .unwrap();
@@ -48880,11 +48999,110 @@ mod tests {
     }
 
     #[test]
+    fn live_ingest_storage_refuses_producer_drift_before_vector_publication() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let vector_path = temp.path().join("fast.fsvi");
+            let mut provider = ScriptedBoundEmbedder::new(BoundScript::Values(vec![1.0, 0.0]));
+            let original = provider.advertised.clone();
+            let mut foreign = original.clone();
+            foreign
+                .producer
+                .implementation_revision
+                .push_str("-changed");
+            foreign.validate().unwrap();
+            provider.drifted = Some(foreign);
+            let provider = Arc::new(provider);
+            let mut writer = VectorIndex::create_with_revision(
+                &vector_path,
+                provider.id(),
+                &original.fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer.write_record("doc.md", &[0.0, 1.0]).unwrap();
+            writer.finish().unwrap();
+            let original_bytes = fs::read(&vector_path).unwrap();
+            let pipeline = LiveIngestPipeline::new(
+                temp.path().to_path_buf(),
+                create_test_quill(&cx, &temp.path().join("lexical")).await,
+                VectorIndex::open(&vector_path).unwrap(),
+                admitted_shared(&provider),
+            )
+            .with_storage_db_path(temp.path().join("catalog.db"));
+            let context = pipeline.build_storage_batch_context().unwrap().unwrap();
+            LiveIngestPipeline::enqueue_storage_upsert(
+                &context,
+                "doc.md",
+                "retained replacement input",
+                &temp.path().join("doc.md"),
+            )
+            .unwrap();
+
+            // Drift before inference: the advertised identity and actual
+            // response agree with each other, but neither belongs to this index.
+            provider.drift.store(true, Ordering::SeqCst);
+            let refused = context
+                .runner
+                .process_batch(&cx, "drifted-storage-producer")
+                .await
+                .unwrap();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(refused.jobs_failed, 1);
+            assert_eq!(refused.jobs_completed, 0);
+            assert_eq!(fs::read(&vector_path).unwrap(), original_bytes);
+            assert!(!frankensearch_index::wal_path_for(&vector_path).exists());
+            {
+                let index = pipeline.vector_index.lock().unwrap();
+                let hits = index.search_top_k(&[0.0, 1.0], 2, None).unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id, "doc.md");
+                assert!(hits[0].score > 0.99);
+                assert!(!index.is_deleted(0));
+            }
+
+            // Restore the admitted producer and admit the ordinary queued
+            // retry without waiting through its backoff.
+            provider.drift.store(false, Ordering::SeqCst);
+            context
+                .storage
+                .connection()
+                .execute_with_params_sync(
+                    "UPDATE embedding_jobs SET submitted_at = 0 WHERE doc_id = ?1;",
+                    &[SqliteValue::Text("doc.md".into())],
+                )
+                .unwrap();
+            let recovered = context
+                .runner
+                .process_batch(&cx, "restored-storage-producer")
+                .await
+                .unwrap();
+            assert_eq!(recovered.jobs_completed, 1);
+            assert_eq!(recovered.jobs_failed, 0);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            drop(context);
+            drop(pipeline);
+            let durable = VectorIndex::open_read_only(&vector_path).unwrap();
+            let hits = durable.search_top_k(&[1.0, 0.0], 2, None).unwrap();
+            assert_eq!(hits.len(), 1, "retry must replace exactly once");
+            assert_eq!(hits[0].doc_id, "doc.md");
+            assert!(hits[0].score > 0.99);
+        });
+    }
+
+    #[test]
     fn live_ingest_storage_uses_prepared_input_without_recanonicalizing() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
             let vector_path = temp.path().join("fast.fsvi");
-            VectorIndex::create(&vector_path, "retry-fast", 2)
+            VectorIndex::create_with_revision(
+                &vector_path,
+                "retry-fast",
+                &StorageRetryEmbedder::new("retry-fast").identity.fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
                 .unwrap()
                 .finish()
                 .unwrap();

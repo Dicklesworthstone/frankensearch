@@ -5,7 +5,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use frankensearch_core::generation::QuantizationFormat;
-use frankensearch_core::{Canonicalizer, Embedder, SearchError, SearchResult};
+use frankensearch_core::{
+    Canonicalizer, Embedder, IdentityBoundEmbedding, SearchError, SearchResult,
+};
 use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
@@ -179,9 +181,11 @@ impl PipelineMetrics {
 }
 
 pub trait EmbeddingVectorSink: Send + Sync {
-    /// Persist a vector after the job runner has validated its complete
-    /// producer identity and response. Implementations remain responsible for
-    /// admitting that producer against their own retained index generation.
+    /// Persist the actual identity-bound response after the job runner has
+    /// validated it. Implementations must admit its complete identity against
+    /// their own retained index generation before writing any vector bytes.
+    /// The operational `embedder_id` routes work; it cannot establish producer
+    /// compatibility or replace the response's original identity.
     ///
     /// The runner checks claim ownership and document version immediately
     /// before this call, without holding a database transaction across it.
@@ -189,7 +193,12 @@ pub trait EmbeddingVectorSink: Send + Sync {
     /// the stale worker, but this interface cannot undo already written vector
     /// bytes. Sinks that need atomic version publication must provide their
     /// own version-aware compare-and-swap boundary.
-    fn persist(&self, doc_id: &str, embedder_id: &str, embedding: &[f32]) -> SearchResult<()>;
+    fn persist(
+        &self,
+        doc_id: &str,
+        embedder_id: &str,
+        embedding: &IdentityBoundEmbedding,
+    ) -> SearchResult<()>;
 }
 
 #[derive(Debug, Default)]
@@ -201,7 +210,7 @@ pub struct InMemoryVectorSink {
 pub struct PersistedEmbedding {
     pub doc_id: String,
     pub embedder_id: String,
-    pub embedding: Vec<f32>,
+    pub embedding: IdentityBoundEmbedding,
 }
 
 impl InMemoryVectorSink {
@@ -221,7 +230,13 @@ impl InMemoryVectorSink {
 }
 
 impl EmbeddingVectorSink for InMemoryVectorSink {
-    fn persist(&self, doc_id: &str, embedder_id: &str, embedding: &[f32]) -> SearchResult<()> {
+    fn persist(
+        &self,
+        doc_id: &str,
+        embedder_id: &str,
+        embedding: &IdentityBoundEmbedding,
+    ) -> SearchResult<()> {
+        embedding.validate()?;
         {
             let mut guard = self.entries.lock().unwrap_or_else(|poisoned| {
                 tracing::warn!(
@@ -233,7 +248,7 @@ impl EmbeddingVectorSink for InMemoryVectorSink {
             guard.push(PersistedEmbedding {
                 doc_id: doc_id.to_owned(),
                 embedder_id: embedder_id.to_owned(),
-                embedding: embedding.to_vec(),
+                embedding: embedding.clone(),
             });
         }
         Ok(())
@@ -735,8 +750,8 @@ impl StorageBackedJobRunner {
             // all-zero or non-finite vector can never match a query, and a
             // persisted one becomes a permanently dead record that drags the
             // index toward the NoUsableVectors zero-signal state (bd-tqhc).
-            let norm_sq: f32 = embedding.iter().map(|value| value * value).sum();
-            if embedding.iter().any(|value| !value.is_finite())
+            let norm_sq: f32 = embedding.values.iter().map(|value| value * value).sum();
+            if embedding.values.iter().any(|value| !value.is_finite())
                 || norm_sq == 0.0
                 || !norm_sq.is_finite()
             {
@@ -1343,7 +1358,7 @@ async fn embed_for_persistence(
     cx: &Cx,
     embedder: &dyn Embedder,
     text: &str,
-) -> SearchResult<Vec<f32>> {
+) -> SearchResult<IdentityBoundEmbedding> {
     pipeline_checkpoint(cx, "storage.pipeline.embed")?;
     let expected = embedder.identity()?.clone();
     expected.validate()?;
@@ -1390,7 +1405,7 @@ async fn embed_for_persistence(
             reason: "provider changed its declared identity during inference".to_owned(),
         });
     }
-    Ok(bound.values)
+    Ok(bound)
 }
 
 fn usize_to_u64(value: usize) -> u64 {
@@ -2345,8 +2360,13 @@ mod tests {
     }
 
     impl EmbeddingVectorSink for ClaimProbeSink {
-        fn persist(&self, doc_id: &str, embedder_id: &str, values: &[f32]) -> SearchResult<()> {
-            self.stored.persist(doc_id, embedder_id, values)?;
+        fn persist(
+            &self,
+            doc_id: &str,
+            embedder_id: &str,
+            embedding: &IdentityBoundEmbedding,
+        ) -> SearchResult<()> {
+            self.stored.persist(doc_id, embedder_id, embedding)?;
             run_claim_hook(ClaimHookStage::Persistence);
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 return Err(SearchError::EmbeddingFailed {
@@ -2801,7 +2821,8 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].doc_id, "doc-bound");
                 assert_eq!(entries[0].embedder_id, probe.id);
-                assert_eq!(entries[0].embedding, vec![0.6, 0.8]);
+                assert_eq!(entries[0].embedding.values, vec![0.6, 0.8]);
+                assert_eq!(entries[0].embedding.identity, *probe.identity().unwrap());
 
                 let counts = runner
                     .storage
@@ -4379,12 +4400,22 @@ mod tests {
     #[test]
     fn in_memory_vector_sink_persist_accumulates() {
         let sink = InMemoryVectorSink::default();
-        sink.persist("doc-1", "fast", &[1.0, 2.0]).unwrap();
-        sink.persist("doc-2", "fast", &[3.0, 4.0]).unwrap();
+        let first = IdentityBoundEmbedding {
+            values: vec![1.0, 2.0],
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("fast", 2),
+        };
+        let second = IdentityBoundEmbedding {
+            values: vec![3.0, 4.0],
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("fast", 2),
+        };
+        sink.persist("doc-1", "fast", &first).unwrap();
+        sink.persist("doc-2", "fast", &second).unwrap();
         let entries = sink.entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].doc_id, "doc-1");
         assert_eq!(entries[1].doc_id, "doc-2");
+        assert_eq!(entries[0].embedding, first);
+        assert_eq!(entries[1].embedding, second);
     }
 
     #[test]
@@ -4696,7 +4727,10 @@ mod tests {
         let e = PersistedEmbedding {
             doc_id: "d".into(),
             embedder_id: "e".to_owned(),
-            embedding: vec![1.0, 2.0],
+            embedding: IdentityBoundEmbedding {
+                values: vec![1.0, 2.0],
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("e", 2),
+            },
         };
         let e2 = e.clone();
         assert_eq!(e, e2);
@@ -5602,12 +5636,12 @@ mod integration_tests {
 
             // Verify dimensionality.
             for e in &fast_entries {
-                assert_eq!(e.embedding.len(), 256);
-                assert!((e.embedding[0] - 0.5).abs() < f32::EPSILON);
+                assert_eq!(e.embedding.values.len(), 256);
+                assert!((e.embedding.values[0] - 0.5).abs() < f32::EPSILON);
             }
             for e in &quality_entries {
-                assert_eq!(e.embedding.len(), 384);
-                assert!((e.embedding[0] - 0.9).abs() < f32::EPSILON);
+                assert_eq!(e.embedding.values.len(), 384);
+                assert!((e.embedding.values[0] - 0.9).abs() < f32::EPSILON);
             }
 
             // Verify both tiers show as embedded in storage.

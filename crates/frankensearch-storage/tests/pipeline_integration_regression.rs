@@ -7,7 +7,8 @@ use std::sync::atomic::AtomicBool;
 use asupersync::Cx;
 use frankensearch_core::traits::{ModelCategory, SearchFuture};
 use frankensearch_core::{
-    Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult,
+    Canonicalizer, Embedder, EmbeddingIdentityBundleV1, IdentityBoundEmbedding, SearchError,
+    SearchResult,
 };
 use frankensearch_storage::{
     EmbeddingVectorSink, InMemoryVectorSink, IngestAction, IngestRequest, JobQueueConfig,
@@ -189,7 +190,7 @@ impl EmbeddingVectorSink for CancelledVectorSink {
         &self,
         _doc_id: &str,
         _embedder_id: &str,
-        _embedding: &[f32],
+        _embedding: &IdentityBoundEmbedding,
     ) -> Result<(), SearchError> {
         Err(SearchError::Cancelled {
             phase: "storage-pipeline-persist".to_owned(),
