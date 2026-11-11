@@ -5744,7 +5744,8 @@ mod cass_query_tests {
                         .search(
                             &*query,
                             &(
-                                tantivy::collector::TopDocs::with_limit(documents.len()),
+                                tantivy::collector::TopDocs::with_limit(documents.len())
+                                    .order_by_score(),
                                 tantivy::collector::Count,
                             ),
                         )
@@ -5776,7 +5777,9 @@ mod cass_query_tests {
                         .search(
                             &*query,
                             &(
-                                tantivy::collector::TopDocs::with_limit(17).and_offset(offset),
+                                tantivy::collector::TopDocs::with_limit(17)
+                                    .and_offset(offset)
+                                    .order_by_score(),
                                 tantivy::collector::Count,
                             ),
                         )
