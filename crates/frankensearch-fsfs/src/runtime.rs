@@ -1720,6 +1720,22 @@ struct SearchStreamResources<'a> {
 struct SearchStreamWriter<'a, W> {
     inner: &'a mut W,
     failed: bool,
+    wrote: bool,
+}
+
+impl<W> SearchStreamWriter<'_, W> {
+    fn mark_error_if_output_owned(&self, error: SearchError) -> SearchError {
+        // Encoding can fail before Started writes anything. Leave that error
+        // to the process reporter. Visible output or a failed transport must
+        // never trigger another attempt on stdout.
+        if self.wrote || self.failed {
+            crate::output_schema::mark_output_reported(crate::output_schema::output_error_from(
+                &error,
+            ))
+        } else {
+            error
+        }
+    }
 }
 
 impl<W: Write> Write for SearchStreamWriter<'_, W> {
@@ -1732,6 +1748,7 @@ impl<W: Write> Write for SearchStreamWriter<'_, W> {
         }
         let result = self.inner.write(bytes);
         self.failed = result.is_err() || matches!(result, Ok(0) if !bytes.is_empty());
+        self.wrote |= matches!(result, Ok(written) if written > 0);
         result
     }
 
@@ -9439,11 +9456,14 @@ impl FsfsRuntime {
 
         let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
         let mut stdout = std::io::stdout();
-        self.run_search_stream_command_with_writer(cx, query, limit, &stream_id, &mut stdout, None)
+        let mut writer = SearchStreamWriter {
+            inner: &mut stdout,
+            failed: false,
+            wrote: false,
+        };
+        self.run_search_stream_command_with_writer(cx, query, limit, &stream_id, &mut writer, None)
             .await
-            .map_err(|error| {
-                crate::output_schema::mark_output_reported(self.search_output_error(&error))
-            })
+            .map_err(|error| writer.mark_error_if_output_owned(error))
     }
 
     async fn run_search_stream_command_with_writer<W: Write + Send>(
@@ -9487,6 +9507,7 @@ impl FsfsRuntime {
         let mut tracked = SearchStreamWriter {
             inner: writer,
             failed: false,
+            wrote: false,
         };
         let writer = &mut tracked;
         let mut seq = 0_u64;

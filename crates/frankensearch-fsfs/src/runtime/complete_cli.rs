@@ -1246,6 +1246,11 @@ impl FsfsRuntime {
             .enable_complete_generation_explanations(root, &reader.generation)?;
         if self.cli_input.stream {
             let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
+            let mut tracked = super::SearchStreamWriter {
+                inner: writer,
+                failed: false,
+                wrote: false,
+            };
             return reader
                 .runtime
                 .run_search_stream_command_with_writer(
@@ -1253,7 +1258,7 @@ impl FsfsRuntime {
                     query,
                     limit,
                     &stream_id,
-                    writer,
+                    &mut tracked,
                     Some(SearchStreamResources {
                         resources: &mut reader.resources,
                         flags: SearchExecutionFlags {
@@ -1264,11 +1269,7 @@ impl FsfsRuntime {
                     }),
                 )
                 .await
-                .map_err(|error| {
-                    crate::output_schema::mark_output_reported(
-                        reader.runtime.search_output_error(&error),
-                    )
-                });
+                .map_err(|error| tracked.mark_error_if_output_owned(error));
         }
         let mode = reader.search_mode()?;
         let payloads = Box::pin(reader.runtime.execute_retained_cli_search(
@@ -1460,6 +1461,11 @@ impl FsfsRuntime {
         // Share the progressive stream's single original retrieval, cancellation
         // wakeups and output ownership. The retained resources keep every query
         // variant on this admitted generation even if publication advances.
+        let mut tracked = super::SearchStreamWriter {
+            inner: writer,
+            failed: false,
+            wrote: false,
+        };
         reader
             .runtime
             .run_search_stream_with_query_expansion(
@@ -1467,7 +1473,7 @@ impl FsfsRuntime {
                 query,
                 limit,
                 &stream_id,
-                writer,
+                &mut tracked,
                 Some(SearchStreamResources {
                     resources: &mut reader.resources,
                     flags: SearchExecutionFlags {
@@ -1479,11 +1485,7 @@ impl FsfsRuntime {
                 expansion,
             )
             .await
-            .map_err(|error| {
-                crate::output_schema::mark_output_reported(crate::output_schema::output_error_from(
-                    &error,
-                ))
-            })
+            .map_err(|error| tracked.mark_error_if_output_owned(error))
     }
 
     async fn execute_retained_expanded_queries(

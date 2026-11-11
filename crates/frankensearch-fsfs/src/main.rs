@@ -2025,6 +2025,9 @@ mod tests {
             ("s", "café 東京", "toon", true),
             ("s", "--limit=5", "jsonl", false),
             ("search", "--format toon --stream", "toon", true),
+            ("search", "line one\r\nline two\t尾", "toon", true),
+            ("search", "line one\nline two\u{001e}尾", "jsonl", true),
+            ("s", "line one\nline two\u{001e}尾", "toon", true),
         ] {
             let mut args = vec![command.to_owned(), "--stream".to_owned()];
             if explicit_format {
@@ -2050,6 +2053,15 @@ mod tests {
                 ),
                 78
             );
+            if format == "toon" && query.contains('\u{001e}') {
+                assert!(stdout.is_empty(), "refuse before writing a frame prefix");
+                let diagnostic = String::from_utf8(stderr).expect("UTF-8 public fallback");
+                assert!(diagnostic.contains("[model_not_found]"));
+                assert!(diagnostic.contains("[invalid_config]"));
+                assert!(diagnostic.contains("--format jsonl"));
+                assert!(!diagnostic.contains('\u{001e}'));
+                continue;
+            }
             assert!(stderr.is_empty());
             let text = String::from_utf8(stdout).expect("utf8 stream");
             let frames: Vec<StreamFrame<serde_json::Value>> = if format == "jsonl" {
