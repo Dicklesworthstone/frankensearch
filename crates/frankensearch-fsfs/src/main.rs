@@ -72,6 +72,7 @@ struct ConfigStageSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessErrorContext {
     command: String,
+    query: String,
     format: OutputFormat,
     stream: bool,
 }
@@ -81,6 +82,7 @@ impl ProcessErrorContext {
         if let Ok(cli_input) = parse_cli_args(args.iter().cloned()) {
             return Self {
                 command: cli_command_name(cli_input.command).to_owned(),
+                query: cli_input.query.unwrap_or_default(),
                 format: resolve_output_format(
                     cli_input.format,
                     cli_input.format_explicit,
@@ -94,6 +96,7 @@ impl ProcessErrorContext {
 
         Self {
             command: fallback_command_name(args),
+            query: String::new(),
             stream: false,
             format: requested_output_format(args).unwrap_or_else(|| {
                 resolve_output_format(OutputFormat::Table, false, stdout_is_tty)
@@ -1142,11 +1145,11 @@ where
         return code;
     }
     let primary_error = remote.cloned().unwrap_or_else(|| output_error_from(error));
-    let primary_code = primary_error.code.clone();
+    let primary_summary = format!("error: [{}] {}", primary_error.code, primary_error.message);
     if context.stream {
         use frankensearch_fsfs::adapters::format_emitter::emit_stream_frame;
         use frankensearch_fsfs::stream_protocol::{
-            StreamEvent, StreamFrame, StreamStartedEvent, terminal_event_from_error,
+            StreamEvent, StreamFrame, StreamStartedEvent, terminal_event_from_output_error,
         };
         // Preparation failed before the runtime acquired output ownership.
         // Render the same stream protocol, with no speculative admission claim.
@@ -1158,7 +1161,7 @@ where
             "search",
             StreamEvent::<()>::Started(StreamStartedEvent::new(
                 &stream_id,
-                "",
+                &context.query,
                 context.format.to_string(),
             )),
         );
@@ -1167,15 +1170,16 @@ where
             1,
             &timestamp,
             "search",
-            StreamEvent::<()>::Terminal(terminal_event_from_error(error, 1, 1)),
+            StreamEvent::<()>::Terminal(terminal_event_from_output_error(primary_error, 1, 1)),
         );
         if let Err(emission_error) = emit_stream_frame(&started, context.format, stdout)
             .and_then(|()| emit_stream_frame(&terminal, context.format, stdout))
         {
-            let _ = writeln!(stderr, "error: [{primary_code}] {error}");
+            let emission_error = output_error_from(&emission_error);
             let _ = writeln!(
                 stderr,
-                "error: failed to render fsfs stream error: {emission_error}"
+                "{primary_summary}\nerror: failed to render fsfs stream error: [{}] {}",
+                emission_error.code, emission_error.message
             );
         }
         return code;
@@ -1193,10 +1197,16 @@ where
     };
 
     if let Err(emission_error) = emission {
-        let _ = writeln!(stderr, "error: [{primary_code}] {error}");
+        // Table errors already use stderr. Once that writer fails, another
+        // diagnostic cannot repair its partial output or safely retry it.
+        if context.format == OutputFormat::Table && matches!(&emission_error, SearchError::Io(_)) {
+            return code;
+        }
+        let emission_error = output_error_from(&emission_error);
         let _ = writeln!(
             stderr,
-            "error: failed to render structured fsfs error output: {emission_error}"
+            "{primary_summary}\nerror: failed to render structured fsfs error output: [{}] {}",
+            emission_error.code, emission_error.message
         );
     }
 
@@ -1433,6 +1443,7 @@ mod tests {
 
         assert_eq!(context.command, "search");
         assert_eq!(context.format, OutputFormat::Json);
+        assert_eq!(context.query, "semantic query");
     }
 
     #[test]
@@ -1454,6 +1465,8 @@ mod tests {
 
         assert_eq!(context.command, "search");
         assert_eq!(context.format, OutputFormat::Toon);
+        assert!(context.query.is_empty());
+        assert!(!context.stream);
     }
 
     #[test]
@@ -1463,6 +1476,7 @@ mod tests {
         };
         let context = ProcessErrorContext {
             command: "search".to_owned(),
+            query: "query".to_owned(),
             format: OutputFormat::Json,
             stream: false,
         };
@@ -1506,6 +1520,7 @@ mod tests {
         }));
         let context = ProcessErrorContext {
             command: "search".to_owned(),
+            query: "query".to_owned(),
             format: OutputFormat::Jsonl,
             stream: true,
         };
@@ -1620,6 +1635,7 @@ mod tests {
         ] {
             let context = ProcessErrorContext {
                 command: "search".to_owned(),
+                query: "query".to_owned(),
                 format,
                 stream,
             };
@@ -1663,10 +1679,178 @@ mod tests {
                 assert!(primary.starts_with("error: [model_not_found] "));
                 assert!(primary.contains("potion-128m"));
                 assert!(stderr.contains("error: failed to render "));
-                // This transport injects ErrorKind, whose display is lowercase;
-                // an OS-backed EPIPE can instead display "Broken pipe".
-                assert!(stderr.contains("broken pipe"), "{stderr}");
+                // Public diagnostics preserve the I/O class and kind without
+                // invoking the opaque source's Display implementation.
+                assert!(stderr.contains("[io_error]"), "{stderr}");
+                assert!(stderr.contains("BrokenPipe"), "{stderr}");
             }
+        }
+    }
+
+    #[test]
+    fn process_error_transport_fallback_never_formats_opaque_sources() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const PRIVATE: &str = "PRIVATE_PROVIDER_BODY_MUST_NOT_BE_RENDERED";
+        #[derive(Debug)]
+        struct PrivateSource(Arc<AtomicUsize>);
+        impl std::fmt::Display for PrivateSource {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                formatter.write_str(PRIVATE)
+            }
+        }
+        impl std::error::Error for PrivateSource {}
+        struct Transport {
+            private: bool,
+            formatted: Arc<AtomicUsize>,
+            failed: bool,
+        }
+        impl std::io::Write for Transport {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(!self.failed, "no write after the first transport failure");
+                self.failed = true;
+                Err(if self.private {
+                    std::io::Error::other(PrivateSource(Arc::clone(&self.formatted)))
+                } else {
+                    std::io::ErrorKind::BrokenPipe.into()
+                })
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert!(!self.failed, "no flush after a failed write");
+                Ok(())
+            }
+        }
+        for (format, stream) in [
+            (OutputFormat::Json, false),
+            (OutputFormat::Jsonl, false),
+            (OutputFormat::Toon, false),
+            (OutputFormat::Csv, false),
+            (OutputFormat::Jsonl, true),
+            (OutputFormat::Toon, true),
+        ] {
+            for (private_primary, private_transport) in [(true, false), (false, true), (true, true)]
+            {
+                let formatted = Arc::new(AtomicUsize::new(0));
+                let error = if private_primary {
+                    SearchError::ModelLoadFailed {
+                        // Model paths are a bounded public field; only the
+                        // opaque source below carries the private marker.
+                        path: "/models/broken.onnx".into(),
+                        source: Box::new(PrivateSource(Arc::clone(&formatted))),
+                    }
+                } else {
+                    SearchError::ModelNotFound {
+                        name: "potion-128m".to_owned(),
+                    }
+                };
+                let public = super::output_error_from(&error);
+                let context = ProcessErrorContext {
+                    command: "search".to_owned(),
+                    query: "query".to_owned(),
+                    format,
+                    stream,
+                };
+                let mut successful = Vec::new();
+                let mut stderr = Vec::new();
+                assert_eq!(
+                    report_process_error(
+                        &error,
+                        &context,
+                        &mut successful,
+                        &mut stderr,
+                        "2026-11-11T00:00:00Z".to_owned()
+                    ),
+                    78
+                );
+                assert!(stderr.is_empty());
+                let successful = String::from_utf8(successful).expect("UTF-8 public error");
+                assert!(successful.contains(&public.code));
+                assert!(!successful.contains(PRIVATE));
+                assert_eq!(formatted.load(Ordering::SeqCst), 0);
+                let mut stdout = Transport {
+                    private: private_transport,
+                    formatted: Arc::clone(&formatted),
+                    failed: false,
+                };
+                assert_eq!(
+                    report_process_error(
+                        &error,
+                        &context,
+                        &mut stdout,
+                        &mut stderr,
+                        "2026-11-11T00:00:00Z".to_owned()
+                    ),
+                    78
+                );
+                assert!(stdout.failed, "the transport failure must execute");
+                let stderr = String::from_utf8(stderr).expect("UTF-8 public fallback");
+                assert!(!stderr.contains(PRIVATE), "{stderr}");
+                assert_eq!(formatted.load(Ordering::SeqCst), 0);
+                assert!(stderr.starts_with(&format!("error: [{}] ", public.code)));
+                assert!(stderr.contains(&public.message));
+                assert!(stderr.contains("error: failed to render "));
+                assert!(stderr.contains("[io_error]"), "{stderr}");
+                assert!(stderr.contains(if private_transport {
+                    "Other"
+                } else {
+                    "BrokenPipe"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn process_error_does_not_retry_a_failed_stderr() {
+        #[derive(Default)]
+        struct BrokenOutput {
+            failed: bool,
+        }
+        impl std::io::Write for BrokenOutput {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(!self.failed, "no write after the first transport failure");
+                self.failed = true;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert!(!self.failed, "no flush after a failed write");
+                Ok(())
+            }
+        }
+        for (format, stream) in [
+            (OutputFormat::Table, false),
+            (OutputFormat::Json, false),
+            (OutputFormat::Jsonl, false),
+            (OutputFormat::Toon, false),
+            (OutputFormat::Csv, false),
+            (OutputFormat::Jsonl, true),
+            (OutputFormat::Toon, true),
+        ] {
+            let error = SearchError::ModelNotFound {
+                name: "potion-128m".to_owned(),
+            };
+            let context = ProcessErrorContext {
+                command: "search".to_owned(),
+                query: "query".to_owned(),
+                format,
+                stream,
+            };
+            let mut stdout = BrokenOutput::default();
+            let mut stderr = BrokenOutput::default();
+            assert_eq!(
+                report_process_error(
+                    &error,
+                    &context,
+                    &mut stdout,
+                    &mut stderr,
+                    "2026-11-11T00:00:00Z".to_owned()
+                ),
+                78
+            );
+            assert!(stderr.failed, "every error route must exercise stderr");
+            assert_eq!(stdout.failed, format != OutputFormat::Table);
         }
     }
 
@@ -1680,6 +1864,7 @@ mod tests {
         ] {
             let context = ProcessErrorContext {
                 command: "search".to_owned(),
+                query: "query".to_owned(),
                 format: OutputFormat::Json,
                 stream: false,
             };
@@ -1705,9 +1890,21 @@ mod tests {
     #[test]
     fn preparation_failure_uses_the_requested_stream_protocol() {
         use frankensearch_fsfs::stream_protocol::{StreamEvent, StreamFrame};
-        for format in ["jsonl", "toon"] {
-            let args = ["search", "query", "--stream", "--format", format].map(str::to_owned);
+        for (command, query, format, explicit_format) in [
+            ("search", "query", "jsonl", true),
+            ("s", "café 東京", "toon", true),
+            ("s", "--limit=5", "jsonl", false),
+            ("search", "--format toon --stream", "toon", true),
+        ] {
+            let mut args = vec![command.to_owned(), "--stream".to_owned()];
+            if explicit_format {
+                args.extend(["--format".to_owned(), format.to_owned()]);
+            }
+            args.extend(["--".to_owned(), query.to_owned()]);
             let context = ProcessErrorContext::from_args(&args, false);
+            assert_eq!(context.command, "search");
+            assert_eq!(context.query, query);
+            assert!(context.stream);
             let error = SearchError::ModelNotFound {
                 name: "potion-128m".to_owned(),
             };
@@ -1739,7 +1936,12 @@ mod tests {
                     .collect()
             };
             assert_eq!(frames.len(), 2, "Started and one final terminal only");
-            assert!(matches!(frames[0].event, StreamEvent::Started(_)));
+            let StreamEvent::Started(started) = &frames[0].event else {
+                panic!("started frame");
+            };
+            assert_eq!(started.query, query);
+            assert_eq!(started.stream_id, frames[0].stream_id);
+            assert_eq!(started.format, format);
             assert_eq!(frames[0].seq, 0);
             assert_eq!(frames[1].seq, 1);
             assert_eq!(frames[0].stream_id, frames[1].stream_id);
@@ -1758,6 +1960,7 @@ mod tests {
         };
         let context = ProcessErrorContext {
             command: "search".to_owned(),
+            query: "query".to_owned(),
             format: OutputFormat::Table,
             stream: false,
         };
