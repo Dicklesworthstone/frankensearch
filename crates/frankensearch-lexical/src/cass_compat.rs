@@ -2049,10 +2049,14 @@ pub fn cass_build_preview_slow(content: &str, max_chars: usize) -> String {
     out
 }
 
+/// Bytes of message content that feed the edge-ngram prefix column. Matches
+/// beyond it are found only through the complete content field, which the
+/// ASCII-prefix tests rely on.
+const CONTENT_PREFIX_MAX_BYTES: usize = 4 * 1024;
+
 #[must_use]
 fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
     const PREVIEW_MAX_CHARS: usize = 400;
-    const CONTENT_PREFIX_MAX_BYTES: usize = 4 * 1024;
 
     let prefix_source = cass_prefix_source(content, CONTENT_PREFIX_MAX_BYTES);
     (
