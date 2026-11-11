@@ -15,6 +15,7 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::config::project_layered_sources_for_inspection;
+use frankensearch_fsfs::degradation_advisor::SearchRecoveryContext;
 use frankensearch_fsfs::runtime::SearchBlockingPool;
 use frankensearch_fsfs::{
     CliCommand, CliInput, CliOverrides, ConfigAction, ConfigLoadResult, ConfigWarning, FsfsConfig,
@@ -75,6 +76,7 @@ struct ProcessErrorContext {
     query: String,
     format: OutputFormat,
     stream: bool,
+    search_recovery: Option<SearchRecoveryContext>,
 }
 
 impl ProcessErrorContext {
@@ -91,6 +93,7 @@ impl ProcessErrorContext {
                 stream: cli_input.command == CliCommand::Search
                     && cli_input.stream
                     && matches!(cli_input.format, OutputFormat::Jsonl | OutputFormat::Toon),
+                search_recovery: None,
             };
         }
 
@@ -101,6 +104,7 @@ impl ProcessErrorContext {
             format: requested_output_format(args).unwrap_or_else(|| {
                 resolve_output_format(OutputFormat::Table, false, stdout_is_tty)
             }),
+            search_recovery: None,
         }
     }
 }
@@ -129,9 +133,9 @@ fn main() {
     }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let error_context = ProcessErrorContext::from_args(&args, stdout_is_tty);
+    let mut error_context = ProcessErrorContext::from_args(&args, stdout_is_tty);
 
-    if let Err(error) = run(args) {
+    if let Err(error) = run(args, &mut error_context) {
         let mut stdout = std::io::stdout().lock();
         let mut stderr = std::io::stderr().lock();
         let code = report_process_error(
@@ -146,7 +150,7 @@ fn main() {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run(args: Vec<String>) -> SearchResult<()> {
+fn run(args: Vec<String>, error_context: &mut ProcessErrorContext) -> SearchResult<()> {
     #[cfg(feature = "embedded-models")]
     if args
         .first()
@@ -258,6 +262,14 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         runtime_cli_input.format_explicit,
         is_tty,
     );
+    error_context.command = cli_command_name(command).to_owned();
+    error_context.format = runtime_cli_input.format;
+    error_context.stream = command == CliCommand::Search
+        && runtime_cli_input.stream
+        && matches!(
+            runtime_cli_input.format,
+            OutputFormat::Jsonl | OutputFormat::Toon
+        );
     if command == CliCommand::Config {
         return run_config_command(
             &loaded,
@@ -300,6 +312,11 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         .with_complete_generations_for_new_roots(complete_generations_for_new_roots);
     #[cfg(feature = "embedded-models")]
     let app_runtime = app_runtime.with_bundled_model_materializer(std::env::current_exe()?);
+    if command == CliCommand::Search {
+        // Retain the same resolved policy used by execution. Configuration
+        // failures before this point do not establish a recovery request.
+        error_context.search_recovery = app_runtime.search_recovery_context();
+    }
     let interface_mode = match command {
         CliCommand::Tui => InterfaceMode::Tui,
         _ => InterfaceMode::Cli,
@@ -1144,7 +1161,12 @@ where
     if FsfsRuntime::forwarded_search_error_was_emitted(error) {
         return code;
     }
-    let primary_error = remote.cloned().unwrap_or_else(|| output_error_from(error));
+    let primary_error = remote.cloned().unwrap_or_else(|| {
+        context.search_recovery.as_ref().map_or_else(
+            || output_error_from(error),
+            |recovery| recovery.output_error(error),
+        )
+    });
     let primary_summary = format!("error: [{}] {}", primary_error.code, primary_error.message);
     if context.stream {
         use frankensearch_fsfs::adapters::format_emitter::emit_stream_frame;
@@ -1465,8 +1487,110 @@ mod tests {
 
         assert_eq!(context.command, "search");
         assert_eq!(context.format, OutputFormat::Toon);
+        assert!(context.search_recovery.is_none());
         assert!(context.query.is_empty());
         assert!(!context.stream);
+    }
+
+    #[test]
+    fn terminal_recovery_matches_json_jsonl_and_toon_with_resolved_offline_policy() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            SemanticReadiness, TrustedRecoveryContext, plan,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+        use frankensearch_fsfs::stream_protocol::{StreamEvent, StreamFrame, StreamTerminalStatus};
+        use frankensearch_fsfs::{CliCommand, FsfsConfig, FsfsRuntime};
+
+        let error = SearchError::ModelLoadFailed {
+            path: PathBuf::from("/private/model/weights.bin"),
+            source: Box::new(std::io::Error::other("private provider body and query")),
+        };
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        let state = SemanticReadiness::ReadinessUnproven;
+        let request = RecoveryRequest {
+            mode: RequestMode::ExplicitSemantic,
+            requested_topology: RetrievalTopology::QualityOnly,
+        };
+        let expected_plan = serde_json::to_value(
+            plan(TrustedRecoveryContext::new(
+                &state, request, &policy, None, 0,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!expected_plan.to_string().contains("/private/model/"));
+        let mut expected = super::output_error_from(&error);
+        expected.recovery_plan = Some(expected_plan);
+        for (format, stream) in [
+            (OutputFormat::Json, false),
+            (OutputFormat::Jsonl, true),
+            (OutputFormat::Toon, true),
+        ] {
+            let mut config = FsfsConfig::default();
+            // Policy comes from resolved config, with no --offline CLI flag.
+            config.indexing.offline = true;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                quality_only: true,
+                format,
+                stream,
+                ..CliInput::default()
+            });
+            let context = ProcessErrorContext {
+                command: "search".to_owned(),
+                query: "query".to_owned(),
+                format,
+                stream,
+                search_recovery: runtime.search_recovery_context(),
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            assert_eq!(
+                report_process_error(
+                    &error,
+                    &context,
+                    &mut stdout,
+                    &mut stderr,
+                    "2026-11-11T00:00:00Z".to_owned(),
+                ),
+                expected.exit_code
+            );
+            assert!(stderr.is_empty());
+            let text = String::from_utf8(stdout).unwrap();
+            assert!(!text.contains("private provider body and query"));
+            if !stream {
+                let envelope: frankensearch_fsfs::OutputEnvelope<()> =
+                    serde_json::from_str(&text).unwrap();
+                assert_eq!(envelope.error.as_ref(), Some(&expected));
+                continue;
+            }
+            let frames: Vec<StreamFrame<serde_json::Value>> = if format == OutputFormat::Jsonl {
+                text.lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            } else {
+                text.split('\u{001e}')
+                    .filter(|record| !record.trim().is_empty())
+                    .map(|record| {
+                        frankensearch_fsfs::stream_protocol::decode_stream_frame_toon(record.trim())
+                            .unwrap()
+                    })
+                    .collect()
+            };
+            assert_eq!(frames.len(), 2);
+            assert!(matches!(frames[0].event, StreamEvent::Started(_)));
+            let StreamEvent::Terminal(terminal) = &frames[1].event else {
+                panic!("exactly one terminal must follow Started");
+            };
+            assert_eq!(terminal.status, StreamTerminalStatus::Failed);
+            assert_eq!(terminal.exit_code, expected.exit_code);
+            assert_eq!(terminal.error.as_ref(), Some(&expected));
+        }
     }
 
     #[test]
@@ -1479,6 +1603,7 @@ mod tests {
             query: "query".to_owned(),
             format: OutputFormat::Json,
             stream: false,
+            search_recovery: None,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1523,6 +1648,7 @@ mod tests {
             query: "query".to_owned(),
             format: OutputFormat::Jsonl,
             stream: true,
+            search_recovery: None,
         };
         let mut stdout = b"already emitted terminal\n".to_vec();
         let mut stderr = Vec::new();
@@ -1638,6 +1764,7 @@ mod tests {
                 query: "query".to_owned(),
                 format,
                 stream,
+                search_recovery: None,
             };
             let mut successful = Vec::new();
             let mut stderr = Vec::new();
@@ -1751,6 +1878,7 @@ mod tests {
                     query: "query".to_owned(),
                     format,
                     stream,
+                    search_recovery: None,
                 };
                 let mut successful = Vec::new();
                 let mut stderr = Vec::new();
@@ -1836,6 +1964,7 @@ mod tests {
                 query: "query".to_owned(),
                 format,
                 stream,
+                search_recovery: None,
             };
             let mut stdout = BrokenOutput::default();
             let mut stderr = BrokenOutput::default();
@@ -1867,6 +1996,7 @@ mod tests {
                 query: "query".to_owned(),
                 format: OutputFormat::Json,
                 stream: false,
+                search_recovery: None,
             };
             let error = SearchError::Io(kind.into());
             let mut stdout = Vec::new();
@@ -1963,6 +2093,7 @@ mod tests {
             query: "query".to_owned(),
             format: OutputFormat::Table,
             stream: false,
+            search_recovery: None,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();

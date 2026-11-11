@@ -222,9 +222,10 @@ pub struct OutputError {
     /// Additional context explaining why the error matters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    /// Canonical semantic recovery advice, when the producing command has
-    /// independently probed readiness. Deserialized JSON remains untrusted
-    /// diagnostic data and is never an executable recovery capability.
+    /// Canonical semantic recovery advice from independently probed readiness
+    /// or a typed terminal failure. Unobserved readiness remains unresolved.
+    /// Deserialized JSON remains untrusted diagnostic data and is never an
+    /// executable recovery capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_plan: Option<serde_json::Value>,
 }

@@ -14,6 +14,94 @@ use serde::{Deserialize, Serialize};
 
 pub const DEGRADATION_ADVICE_SCHEMA_VERSION: &str = "fsfs.degradation.advice.v2";
 
+/// Resolved request policy retained for a failed search's public diagnostics.
+///
+/// This is not readiness evidence or an execution capability. In particular,
+/// a terminal failure has not independently verified a model, counted usable
+/// vectors, or identified which tier failed in a progressive request. Its plan
+/// preserves those unknowns instead of manufacturing a rebuild authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRecoveryContext {
+    request: RecoveryRequest,
+    policy: RecoveryPolicy,
+}
+
+impl SearchRecoveryContext {
+    pub(crate) const fn new(request: RecoveryRequest, policy: RecoveryPolicy) -> Self {
+        Self { request, policy }
+    }
+
+    /// Project a terminal search failure through the shared recovery planner.
+    ///
+    /// The original code, exit status and bounded public error remain intact.
+    /// Cancellation and invalid query syntax have no semantic repair plan.
+    /// Wire plans remain untrusted diagnostic JSON, as in doctor output; no
+    /// model acquisition, index mutation or retry is performed here.
+    #[must_use]
+    pub fn output_error(&self, error: &SearchError) -> crate::output_schema::OutputError {
+        let mut output = crate::output_schema::output_error_from(error);
+        self.attach_to(error, &mut output);
+        output
+    }
+
+    /// Enrich an existing projection without replacing an already attached
+    /// canonical plan, including one preserved by a forwarding transport.
+    pub(crate) fn attach_to(
+        &self,
+        error: &SearchError,
+        output: &mut crate::output_schema::OutputError,
+    ) {
+        if output.recovery_plan.is_some()
+            || crate::output_schema::reported_output_error(error).is_some()
+            || matches!(
+                error,
+                SearchError::Cancelled { .. }
+                    | SearchError::QueryParseError { .. }
+                    | SearchError::RerankerUnavailable { .. }
+                    | SearchError::RerankFailed { .. }
+            )
+        {
+            return;
+        }
+        if let SearchError::InvalidConfig { field, value, .. } = error
+            && !(field == "semantic.vector_generation" && value == "legacy_hash")
+        {
+            return;
+        }
+        let readiness = match error {
+            // Missing index paths do not establish that a compatible model is
+            // installed. Only an independent readiness probe can assert the
+            // stronger IndexAbsent state and select a build action.
+            SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => {
+                SemanticReadiness::ReadinessUnproven
+            }
+            // Generic model failures do not carry their failing tier. Even a
+            // single-tier request can prepare a bundle containing both models.
+            // Unavailable also covers compiled-out loaders and refused remote
+            // intent. Never infer readiness from names, filenames or messages.
+            SearchError::ModelNotFound { .. }
+            | SearchError::EmbedderUnavailable { .. }
+            | SearchError::ModelLoadFailed { .. }
+            | SearchError::HashMismatch { .. } => SemanticReadiness::ReadinessUnproven,
+            // Local generation identity checks also use this error variant.
+            // It does not prove that the caller selected a remote producer.
+            SearchError::UnverifiableRemoteSpace { .. } => SemanticReadiness::ReadinessUnproven,
+            _ => semantic_readiness_for_search_error(
+                error,
+                self.request.mode,
+                self.request.requested_topology,
+            ),
+        };
+        // These inputs come from the resolved runtime and contain no model
+        // acquisition authorization, so no clock or external probe is needed.
+        // A diagnostic-construction failure must not replace the primary error.
+        output.recovery_plan =
+            recovery_plan_for_readiness(&readiness, self.request, &self.policy, None, 0)
+                .ok()
+                .and_then(|plan| serde_json::to_value(plan).ok());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DegradationFailureKind {
@@ -696,6 +784,128 @@ mod tests {
         DegradationFailureKind, advice_for_search_error, advice_for_zero_signal,
         synthetic_degradation_advice_fixture,
     };
+
+    #[test]
+    fn terminal_recovery_preserves_unknown_tier_and_requires_independent_index_readiness() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            SemanticReadiness, TrustedRecoveryContext, UntrustedRecoveryPlan,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        let errors = [
+            SearchError::ModelNotFound {
+                name: "a-display-name-does-not-prove-the-tier".to_owned(),
+            },
+            SearchError::EmbedderUnavailable {
+                model: "configured-producer".to_owned(),
+                reason: "semantic loaders are compiled out".to_owned(),
+            },
+            SearchError::ModelLoadFailed {
+                path: PathBuf::from("/private/model/weights.bin"),
+                source: Box::new(std::io::Error::other("private provider diagnostic")),
+            },
+            SearchError::HashMismatch {
+                path: PathBuf::from("/private/model/weights.bin"),
+                expected: "expected-digest".to_owned(),
+                actual: "actual-digest".to_owned(),
+            },
+            SearchError::UnverifiableRemoteSpace {
+                producer: "fsfs.vector_generation".to_owned(),
+                reason: "local persisted producer revision does not match".to_owned(),
+            },
+            SearchError::IndexNotFound {
+                path: PathBuf::from("/private/index/fast.fsvi"),
+            },
+            SearchError::IndexCandidatesNotFound {
+                paths: vec![PathBuf::from("/private/index/quality.fsvi")],
+            },
+        ];
+        for requested_topology in [
+            RetrievalTopology::FastOnly,
+            RetrievalTopology::QualityOnly,
+            RetrievalTopology::FullProgressive,
+        ] {
+            let request = RecoveryRequest {
+                mode: if requested_topology == RetrievalTopology::QualityOnly {
+                    RequestMode::ExplicitSemantic
+                } else {
+                    RequestMode::Hybrid
+                },
+                requested_topology,
+            };
+            let context = super::SearchRecoveryContext::new(request, policy.clone());
+            for error in &errors {
+                let state = SemanticReadiness::ReadinessUnproven;
+                let output = context.output_error(error);
+                let wire = output
+                    .recovery_plan
+                    .clone()
+                    .expect("terminal recovery plan");
+                assert!(!wire.to_string().contains("/private/"));
+                assert!(!wire.to_string().contains("a-display-name"));
+                let untrusted: UntrustedRecoveryPlan = serde_json::from_value(wire).unwrap();
+                let plan = untrusted
+                    .validate_against(TrustedRecoveryContext::new(
+                        &state, request, &policy, None, 0,
+                    ))
+                    .expect("terminal plan matches independently known state and policy");
+                assert_eq!(plan.state(), &state);
+                let mut expected = crate::output_schema::output_error_from(error);
+                expected.recovery_plan = Some(serde_json::to_value(&plan).unwrap());
+                assert_eq!(output, expected, "original public error must remain intact");
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_recovery_does_not_reinterpret_cancelled_invalid_or_reported_errors() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+
+        let context = super::SearchRecoveryContext::new(
+            RecoveryRequest {
+                mode: RequestMode::ExplicitSemantic,
+                requested_topology: RetrievalTopology::QualityOnly,
+            },
+            RecoveryPolicy {
+                interaction: InteractionPolicy::NonInteractive,
+                network: NetworkPolicy::Offline,
+                acquisition_authorization: None,
+            },
+        );
+        for error in [
+            SearchError::Cancelled {
+                phase: "query".to_owned(),
+                reason: "caller cancelled".to_owned(),
+            },
+            SearchError::QueryParseError {
+                query: "private query".to_owned(),
+                detail: "invalid query".to_owned(),
+            },
+            SearchError::InvalidConfig {
+                field: "search.option".to_owned(),
+                value: "invalid".to_owned(),
+                reason: "request rejected".to_owned(),
+            },
+            SearchError::RerankerUnavailable {
+                model: "reranker".to_owned(),
+            },
+        ] {
+            let expected = crate::output_schema::output_error_from(&error);
+            assert!(expected.recovery_plan.is_none());
+            assert_eq!(context.output_error(&error), expected);
+            let reported = crate::output_schema::mark_output_reported(expected.clone());
+            assert_eq!(context.output_error(&reported), expected);
+        }
+    }
 
     #[test]
     fn synthetic_fixture_covers_every_failure_kind_with_stable_codes() {

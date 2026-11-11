@@ -1266,7 +1266,7 @@ impl FsfsRuntime {
                 .await
                 .map_err(|error| {
                     crate::output_schema::mark_output_reported(
-                        crate::output_schema::output_error_from(&error),
+                        reader.runtime.search_output_error(&error),
                     )
                 });
         }
@@ -4815,9 +4815,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, _, root) = fixture(directory.path());
         fs::create_dir(&root).unwrap();
-        let authority = root.join(
-            frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME,
-        );
+        let authority =
+            root.join(frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME);
         fs::write(&authority, b"fixed authority").unwrap();
         let nested = root.join("existing");
         fs::create_dir(&nested).unwrap();
@@ -4871,9 +4870,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         std::os::unix::fs::symlink(
             "absent-authority",
-            root.join(
-                frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME,
-            ),
+            root.join(frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME),
         )
         .unwrap();
         let selection = root.join(COMPLETE_GENERATION_POINTER);

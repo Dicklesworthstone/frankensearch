@@ -29,6 +29,7 @@ use super::{
     retained_search_checkpoint, run_request, streaming, write_response,
 };
 use crate::adapters::format_emitter::meta_for_format;
+use crate::degradation_advisor::SearchRecoveryContext;
 use crate::output_schema::{
     OUTPUT_SCHEMA_VERSION, OutputEnvelope, OutputError, SearchPayload, output_error_from,
 };
@@ -590,6 +591,20 @@ fn query_runtime(
     Ok(query_runtime)
 }
 
+fn request_recovery_context(
+    runtime: &FsfsRuntime,
+    request: &SearchRequest,
+) -> Option<SearchRecoveryContext> {
+    // Reuse the server's resolved policy and the same request overrides as
+    // execution. The transport never authorizes interactive acquisition.
+    // This clone performs no readiness probe, model loading or filesystem work.
+    let mut runtime = runtime.clone();
+    runtime.cli_input.quality_only = request.quality_only;
+    runtime.cli_input.format = OutputFormat::Json;
+    request.policy.apply_to(&mut runtime).ok()?;
+    runtime.search_recovery_context()
+}
+
 async fn execute(
     cx: &Cx,
     runtime: &FsfsRuntime,
@@ -724,22 +739,29 @@ pub(super) async fn serve(
         .await;
     }
     let mut expansion_peer = peer.try_clone()?;
-    serve_buffered(cx, peer, bytes, timeout, |request, output| async move {
-        if request.search.expand {
-            Box::pin(execute_expanded(
-                cx,
-                runtime,
-                session,
-                &request,
-                cache,
-                &mut expansion_peer,
-                output,
-            ))
-            .await
-        } else {
-            Box::pin(execute(cx, runtime, session, &request, cache)).await
-        }
-    })
+    serve_buffered_with_recovery(
+        cx,
+        peer,
+        bytes,
+        timeout,
+        Some(runtime),
+        |request, output| async move {
+            if request.search.expand {
+                Box::pin(execute_expanded(
+                    cx,
+                    runtime,
+                    session,
+                    &request,
+                    cache,
+                    &mut expansion_peer,
+                    output,
+                ))
+                .await
+            } else {
+                Box::pin(execute(cx, runtime, session, &request, cache)).await
+            }
+        },
+    )
     .await
 }
 
@@ -780,15 +802,19 @@ pub(super) fn cache_request(
 
 pub(super) async fn refuse_admission(
     cx: &Cx,
+    runtime: &FsfsRuntime,
     peer: &mut UnixStream,
     bytes: &[u8],
     timeout: Duration,
     error: SearchError,
 ) -> SearchResult<PeerOutcome> {
     if progressive::is_streamed(bytes) {
-        progressive::refuse_admission(cx, peer, bytes, timeout, error).await
+        progressive::refuse_admission(cx, runtime, peer, bytes, timeout, error).await
     } else {
-        serve_buffered(cx, peer, bytes, timeout, |_, _| async { Err(error) }).await
+        serve_buffered_with_recovery(cx, peer, bytes, timeout, Some(runtime), |_, _| async {
+            Err(error)
+        })
+        .await
     }
 }
 
@@ -797,6 +823,7 @@ pub(super) async fn refuse_admission(
 /// writer to ordinary search. Expanded requests use the shared output queue
 /// only for their correlated internal handshake. Peer loss releases the execution borrow before the next client;
 /// its own delivery budget still owns deadlines and caller cancellation.
+#[cfg(test)]
 async fn serve_buffered<F, Fut>(
     cx: &Cx,
     peer: &mut UnixStream,
@@ -808,7 +835,26 @@ where
     F: FnOnce(ForwardedSearch, streaming::PhaseWriter) -> Fut,
     Fut: Future<Output = SearchResult<SearchPayload>>,
 {
+    serve_buffered_with_recovery(cx, peer, bytes, timeout, None, execute).await
+}
+
+async fn serve_buffered_with_recovery<F, Fut>(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    bytes: &[u8],
+    timeout: Duration,
+    recovery_runtime: Option<&FsfsRuntime>,
+    execute: F,
+) -> SearchResult<PeerOutcome>
+where
+    F: FnOnce(ForwardedSearch, streaming::PhaseWriter) -> Fut,
+    Fut: Future<Output = SearchResult<SearchPayload>>,
+{
     let request = decode_request(bytes);
+    let recovery_context = request
+        .as_ref()
+        .ok()
+        .and_then(|request| request_recovery_context(recovery_runtime?, &request.search));
     let request_id = request
         .as_ref()
         .map_or_else(|_| String::new(), |value| value.request_id.clone());
@@ -855,7 +901,7 @@ where
             )
             .with_warnings(warnings)
         }
-        Err(error) => error_envelope(&error),
+        Err(error) => error_envelope_with_recovery(&error, recovery_context.as_ref()),
     };
     let reply = Reply {
         fsfs_complete_cli: VERSION,
@@ -875,8 +921,18 @@ where
 }
 
 fn error_envelope(error: &SearchError) -> OutputEnvelope<SearchPayload> {
+    error_envelope_with_recovery(error, None)
+}
+
+fn error_envelope_with_recovery(
+    error: &SearchError,
+    recovery: Option<&SearchRecoveryContext>,
+) -> OutputEnvelope<SearchPayload> {
     OutputEnvelope::error(
-        output_error_from(error),
+        recovery.map_or_else(
+            || output_error_from(error),
+            |context| context.output_error(error),
+        ),
         meta_for_format("search", OutputFormat::Json),
         super::super::iso_timestamp_now(),
     )
@@ -2255,6 +2311,95 @@ mod buffered_transport_tests {
     }
 
     #[test]
+    fn buffered_terminal_recovery_uses_request_policy_and_survives_forwarding() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            SemanticReadiness, TrustedRecoveryContext, plan,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+
+        run_test_with_cx(|cx| async move {
+            let mut config = FsfsConfig::default();
+            config.search.fast_only = true;
+            config.indexing.offline = true;
+            let runtime = FsfsRuntime::new(config);
+            let mut request = request();
+            request.search.quality_only = true;
+            request.search.policy.fast_only = false;
+            let failure = || SearchError::ModelNotFound {
+                name: "quality-producer".to_owned(),
+            };
+            let mut expected = output_error_from(&failure());
+            let state = SemanticReadiness::ReadinessUnproven;
+            let policy = RecoveryPolicy {
+                interaction: InteractionPolicy::NonInteractive,
+                network: NetworkPolicy::Offline,
+                acquisition_authorization: None,
+            };
+            expected.recovery_plan = Some(
+                serde_json::to_value(
+                    plan(TrustedRecoveryContext::new(
+                        &state,
+                        RecoveryRequest {
+                            mode: RequestMode::ExplicitSemantic,
+                            requested_topology: RetrievalTopology::QualityOnly,
+                        },
+                        &policy,
+                        None,
+                        0,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            for (admission_refused, streamed) in [(false, false), (true, false), (true, true)] {
+                let bytes = if streamed {
+                    serde_json::to_vec(&serde_json::json!({
+                        "fsfs_complete_cli_stream": VERSION,
+                        "request": &request,
+                    }))
+                    .unwrap()
+                } else {
+                    serde_json::to_vec(&request).unwrap()
+                };
+                let (mut client, mut server) = UnixStream::pair().unwrap();
+                if admission_refused {
+                    refuse_admission(
+                        &cx,
+                        &runtime,
+                        &mut server,
+                        &bytes,
+                        Duration::from_secs(1),
+                        failure(),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    serve_buffered_with_recovery(
+                        &cx,
+                        &mut server,
+                        &bytes,
+                        Duration::from_secs(1),
+                        Some(&runtime),
+                        |_, _| async { Err(failure()) },
+                    )
+                    .await
+                    .unwrap();
+                }
+                drop(server);
+                let mut reply = Vec::new();
+                client.read_to_end(&mut reply).unwrap();
+                assert_eq!(reply.split(|&byte| byte == b'\n').count(), 2);
+                let error = decode_reply(&reply, &request).unwrap_err();
+                assert_eq!(FsfsRuntime::forwarded_search_error(&error), Some(&expected));
+            }
+            let plan = expected.recovery_plan.unwrap().to_string();
+            assert!(!plan.contains(&request.search.query));
+            assert!(!plan.contains("/transport-fixture"));
+        });
+    }
+
+    #[test]
     fn closed_buffered_peer_starts_no_executor_or_response_work() {
         run_test_with_cx(|cx| async move {
             let (client, mut server) = UnixStream::pair().unwrap();
@@ -2479,15 +2624,17 @@ mod buffered_transport_tests {
     #[test]
     fn buffered_cancellation_cannot_become_a_success_or_error_envelope() {
         run_test_with_cx(|cx| async move {
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
             for fail in [false, true] {
                 let (mut client, mut server) = UnixStream::pair().unwrap();
                 client.set_nonblocking(true).unwrap();
                 let bytes = serde_json::to_vec(&request()).unwrap();
-                let result = serve_buffered(
+                let result = serve_buffered_with_recovery(
                     &cx,
                     &mut server,
                     &bytes,
                     Duration::from_secs(1),
+                    Some(&runtime),
                     |request, _| async {
                         cx.set_cancel_requested(true);
                         if fail {

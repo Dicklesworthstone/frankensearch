@@ -23,8 +23,8 @@ use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_RESPONSE_MAX_BYTES, ForwardedSearch, FsfsRuntime,
     LiveRetainedSearchReader, PeerOutcome, Reply, SearchCacheKey, SearchExecutionFlags, VERSION,
     codec_error, complete_cli_error, control, decode_reply, decode_request, encode_response,
-    error_envelope, expansion, make_request, query_runtime, retained_search_checkpoint,
-    run_request, validate_request, write_response,
+    error_envelope, expansion, make_request, query_runtime, request_recovery_context,
+    retained_search_checkpoint, run_request, validate_request, write_response,
 };
 #[cfg(test)]
 use crate::CliCommand;
@@ -84,16 +84,18 @@ pub(super) fn cache_request(bytes: &[u8]) -> SearchResult<ForwardedSearch> {
 
 pub(super) async fn refuse_admission(
     cx: &Cx,
+    runtime: &FsfsRuntime,
     peer: &mut UnixStream,
     bytes: &[u8],
     timeout: Duration,
     error: SearchError,
 ) -> SearchResult<PeerOutcome> {
-    write_refusal(cx, peer, parse_request(bytes)?, timeout, error).await
+    write_refusal(cx, runtime, peer, parse_request(bytes)?, timeout, error).await
 }
 
 async fn write_refusal(
     cx: &Cx,
+    runtime: &FsfsRuntime,
     peer: &mut UnixStream,
     request: StreamRequest,
     timeout: Duration,
@@ -102,11 +104,15 @@ async fn write_refusal(
     if matches!(error, SearchError::Cancelled { .. }) {
         return Err(error);
     }
+    let mut result = error_envelope(&error);
+    if let Some(recovery) = request_recovery_context(runtime, &request.request.search) {
+        result.error = Some(recovery.output_error(&error));
+    }
     let reply = Reply {
         fsfs_complete_cli: VERSION,
         request_id: request.request.request_id,
         query: request.request.search.query,
-        result: error_envelope(&error),
+        result,
     };
     let bytes = encode_response(&reply)?;
     write_response(cx, peer, &bytes, timeout).await?;
@@ -201,7 +207,7 @@ pub(super) async fn serve(
         Err(error) => {
             // Before any canonical frame was exposed, use the same correlated
             // refusal as buffered forwarding. Never switch protocols mid-stream.
-            write_refusal(cx, peer, request, timeout, error).await
+            write_refusal(cx, runtime, peer, request, timeout, error).await
         }
     }
 }
@@ -280,7 +286,13 @@ async fn serve_cached_search(
     match result {
         Ok(_) => runtime.emit_search_stream_terminal_completed(stream_id, &mut sequence, writer),
         Err(error) => {
-            runtime.emit_search_stream_terminal_error(stream_id, &error, &mut sequence, writer)?;
+            runtime.emit_search_stream_terminal_error(
+                stream_id,
+                &error,
+                runtime.requested_search_mode(),
+                &mut sequence,
+                writer,
+            )?;
             Err(error)
         }
     }

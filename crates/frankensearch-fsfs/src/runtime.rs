@@ -9442,9 +9442,7 @@ impl FsfsRuntime {
         self.run_search_stream_command_with_writer(cx, query, limit, &stream_id, &mut stdout, None)
             .await
             .map_err(|error| {
-                crate::output_schema::mark_output_reported(crate::output_schema::output_error_from(
-                    &error,
-                ))
+                crate::output_schema::mark_output_reported(self.search_output_error(&error))
             })
     }
 
@@ -9662,7 +9660,13 @@ impl FsfsRuntime {
             }
             Err(error) => {
                 if !writer.failed {
-                    self.emit_search_stream_terminal_error(stream_id, &error, &mut seq, writer)?;
+                    self.emit_search_stream_terminal_error(
+                        stream_id,
+                        &error,
+                        requested_mode,
+                        &mut seq,
+                        writer,
+                    )?;
                 }
                 Err(error)
             }
@@ -11881,15 +11885,20 @@ impl FsfsRuntime {
         &self,
         stream_id: &str,
         error: &SearchError,
+        requested_mode: SearchExecutionMode,
         seq: &mut u64,
         writer: &mut W,
     ) -> SearchResult<()> {
+        let mut terminal = terminal_event_from_error(error, 0, 3);
+        if let Some(context) = self.search_recovery_context_for_mode(requested_mode) {
+            terminal.error = Some(context.output_error(error));
+        }
         let frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
             iso_timestamp_now(),
             "search",
-            StreamEvent::<SearchHitPayload>::Terminal(terminal_event_from_error(error, 0, 3)),
+            StreamEvent::<SearchHitPayload>::Terminal(terminal),
         );
         emit_stream_frame(&frame, self.cli_input.format, writer)?;
         *seq = seq.saturating_add(1);
@@ -18604,6 +18613,53 @@ impl FsfsRuntime {
             }
         })?);
         Ok(payload)
+    }
+
+    /// Freeze the resolved semantic request and policy for terminal diagnostics.
+    /// Lexical-only execution has no semantic recovery obligation. This does
+    /// not probe readiness, authorize acquisition or mutate the selected index.
+    #[must_use]
+    pub fn search_recovery_context(
+        &self,
+    ) -> Option<crate::degradation_advisor::SearchRecoveryContext> {
+        self.search_recovery_context_for_mode(self.requested_search_mode())
+    }
+
+    fn search_recovery_context_for_mode(
+        &self,
+        requested_mode: SearchExecutionMode,
+    ) -> Option<crate::degradation_advisor::SearchRecoveryContext> {
+        let mut mode =
+            match degraded_search_mode(self.config.pressure.degradation_override, requested_mode) {
+                Ok(mode) => mode,
+                // A semantic-only request still requires quality when this build
+                // cannot load it. Its typed refusal must not become lexical.
+                Err(_) if requested_mode == SearchExecutionMode::QualityOnly => requested_mode,
+                Err(_) => return None,
+            };
+        if mode == SearchExecutionMode::LexicalOnly {
+            return None;
+        }
+        if mode == SearchExecutionMode::Full
+            && self
+                .cli_input
+                .overrides
+                .fast_only
+                .unwrap_or(self.quality_disabled_by_policy())
+        {
+            mode = SearchExecutionMode::FastOnly;
+        }
+        Some(crate::degradation_advisor::SearchRecoveryContext::new(
+            Self::runtime_recovery_request(mode, false),
+            self.runtime_recovery_policy(),
+        ))
+    }
+
+    fn search_output_error(&self, error: &SearchError) -> crate::output_schema::OutputError {
+        self.search_recovery_context().map_or_else(
+            || crate::output_schema::output_error_from(error),
+            |context| context.output_error(error),
+        )
     }
 
     const fn runtime_recovery_request(
@@ -48216,7 +48272,10 @@ mod tests {
                 Err(SearchError::UnverifiableRemoteSpace { .. })
             ));
             assert_eq!(fs::read(&vector_path).unwrap(), original_bytes);
-            assert!(!wal_path.exists(), "identity refusal must precede the WAL write");
+            assert!(
+                !wal_path.exists(),
+                "identity refusal must precede the WAL write"
+            );
             let index = sink.vector_index.lock().unwrap();
             let hits = index.search_top_k(&[0.0, 1.0], 2, None).unwrap();
             assert_eq!(hits.len(), 1);
@@ -48237,7 +48296,11 @@ mod tests {
         drop(sink);
         let durable = VectorIndex::open_read_only(&vector_path).unwrap();
         let hits = durable.search_top_k(&[1.0, 0.0], 2, None).unwrap();
-        assert_eq!(hits.len(), 1, "successful replacement must not duplicate the row");
+        assert_eq!(
+            hits.len(),
+            1,
+            "successful replacement must not duplicate the row"
+        );
         assert_eq!(hits[0].doc_id, "doc.md");
         assert!(hits[0].score > 0.99);
     }
@@ -48931,13 +48994,15 @@ mod tests {
             VectorIndex::create_with_revision(
                 &vector_path,
                 "retry-fast",
-                &StorageRetryEmbedder::new("retry-fast").identity.fingerprint(),
+                &StorageRetryEmbedder::new("retry-fast")
+                    .identity
+                    .fingerprint(),
                 2,
                 frankensearch_index::Quantization::F16,
             )
-                .unwrap()
-                .finish()
-                .unwrap();
+            .unwrap()
+            .finish()
+            .unwrap();
             let pipeline = LiveIngestPipeline::new(
                 temp.path().to_path_buf(),
                 create_test_quill(&cx, &temp.path().join("lexical")).await,
@@ -49099,13 +49164,15 @@ mod tests {
             VectorIndex::create_with_revision(
                 &vector_path,
                 "retry-fast",
-                &StorageRetryEmbedder::new("retry-fast").identity.fingerprint(),
+                &StorageRetryEmbedder::new("retry-fast")
+                    .identity
+                    .fingerprint(),
                 2,
                 frankensearch_index::Quantization::F16,
             )
-                .unwrap()
-                .finish()
-                .unwrap();
+            .unwrap()
+            .finish()
+            .unwrap();
             let pipeline = LiveIngestPipeline::new(
                 temp.path().to_path_buf(),
                 create_test_quill(&cx, &temp.path().join("lexical")).await,
@@ -56653,6 +56720,82 @@ mod tests {
     }
 
     #[test]
+    fn runtime_terminal_recovery_matches_resolved_request_and_preserves_cancellation() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            SemanticReadiness, TrustedRecoveryContext, plan,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+
+        let mut config = FsfsConfig::default();
+        config.indexing.offline = true;
+        // The resources can name a different request mode than the owning
+        // runtime's default. The terminal must use the admitted request mode.
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Search,
+            format: OutputFormat::Jsonl,
+            stream: true,
+            ..CliInput::default()
+        });
+        let error = SearchError::ModelNotFound {
+            name: "quality-producer".to_owned(),
+        };
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        let state = SemanticReadiness::ReadinessUnproven;
+        let request = RecoveryRequest {
+            mode: RequestMode::ExplicitSemantic,
+            requested_topology: RetrievalTopology::QualityOnly,
+        };
+        let expected_plan = serde_json::to_value(
+            plan(TrustedRecoveryContext::new(
+                &state, request, &policy, None, 0,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        for error in [
+            error,
+            SearchError::Cancelled {
+                phase: "quality".to_owned(),
+                reason: "caller cancelled".to_owned(),
+            },
+        ] {
+            let writer = FlushVisibleWriter::default();
+            let mut transport = writer.clone();
+            let mut seq = 7;
+            runtime
+                .emit_search_stream_terminal_error(
+                    "terminal-recovery",
+                    &error,
+                    SearchExecutionMode::QualityOnly,
+                    &mut seq,
+                    &mut transport,
+                )
+                .unwrap();
+            assert_eq!(seq, 8);
+            let frames = decode_visible_stream(&writer);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].seq, 7);
+            let StreamEvent::Terminal(terminal) = &frames[0].event else {
+                panic!("terminal emission cannot become a result or progress frame");
+            };
+            let mut expected_error = crate::output_schema::output_error_from(&error);
+            if matches!(error, SearchError::Cancelled { .. }) {
+                assert_eq!(terminal.status, StreamTerminalStatus::Cancelled);
+            } else {
+                assert_eq!(terminal.status, StreamTerminalStatus::Failed);
+                expected_error.recovery_plan = Some(expected_plan.clone());
+            }
+            assert_eq!(terminal.exit_code, expected_error.exit_code);
+            assert_eq!(terminal.error.as_ref(), Some(&expected_error));
+        }
+    }
+
+    #[test]
     fn runtime_stream_fast_embed_cancellation_emits_cancelled_terminal() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -56746,6 +56889,7 @@ mod tests {
                 panic!("filtered frame must be terminal");
             };
             assert_eq!(terminal.status, StreamTerminalStatus::Cancelled);
+            assert!(terminal.error.as_ref().unwrap().recovery_plan.is_none());
             // No payload may follow cancellation: the lexical fallback that
             // used to swallow the cancel would have emitted an Initial result
             // plus a Completed terminal.

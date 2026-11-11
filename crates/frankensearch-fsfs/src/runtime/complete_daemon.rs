@@ -585,6 +585,7 @@ impl FsfsRuntime {
                     Err(error) if forwarding::is_forwarded(&bytes) => {
                         return forwarding::refuse_admission(
                             cx,
+                            self,
                             &mut peer,
                             &bytes,
                             peer_timeout,
