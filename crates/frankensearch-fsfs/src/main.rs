@@ -262,7 +262,7 @@ fn run(args: Vec<String>, error_context: &mut ProcessErrorContext) -> SearchResu
         runtime_cli_input.format_explicit,
         is_tty,
     );
-    error_context.command = cli_command_name(command).to_owned();
+    cli_command_name(command).clone_into(&mut error_context.command);
     error_context.format = runtime_cli_input.format;
     error_context.stream = command == CliCommand::Search
         && runtime_cli_input.stream

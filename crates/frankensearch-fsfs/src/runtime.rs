@@ -1724,14 +1724,16 @@ struct SearchStreamWriter<'a, W> {
 }
 
 impl<W> SearchStreamWriter<'_, W> {
-    fn mark_error_if_output_owned(&self, error: SearchError) -> SearchError {
+    fn mark_error_if_output_owned(
+        &self,
+        error: SearchError,
+        project: impl FnOnce(&SearchError) -> OutputError,
+    ) -> SearchError {
         // Encoding can fail before Started writes anything. Leave that error
         // to the process reporter. Visible output or a failed transport must
         // never trigger another attempt on stdout.
         if self.wrote || self.failed {
-            crate::output_schema::mark_output_reported(crate::output_schema::output_error_from(
-                &error,
-            ))
+            crate::output_schema::mark_output_reported(project(&error))
         } else {
             error
         }
@@ -1747,7 +1749,10 @@ impl<W: Write> Write for SearchStreamWriter<'_, W> {
             ));
         }
         let result = self.inner.write(bytes);
-        self.failed = result.is_err() || matches!(result, Ok(0) if !bytes.is_empty());
+        // Interrupted is retryable: write_all must be able to call us again
+        // without turning an interrupted syscall into a permanent failure.
+        self.failed = matches!(&result, Err(error) if error.kind() != ErrorKind::Interrupted)
+            || matches!(result, Ok(0) if !bytes.is_empty());
         self.wrote |= matches!(result, Ok(written) if written > 0);
         result
     }
@@ -9461,9 +9466,14 @@ impl FsfsRuntime {
             failed: false,
             wrote: false,
         };
+        let requested_mode = self.requested_search_mode();
         self.run_search_stream_command_with_writer(cx, query, limit, &stream_id, &mut writer, None)
             .await
-            .map_err(|error| writer.mark_error_if_output_owned(error))
+            .map_err(|error| {
+                writer.mark_error_if_output_owned(error, |error| {
+                    self.search_output_error_for_mode(error, requested_mode)
+                })
+            })
     }
 
     async fn run_search_stream_command_with_writer<W: Write + Send>(
@@ -11911,9 +11921,7 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         let mut terminal = terminal_event_from_error(error, 0, 3);
-        if let Some(context) = self.search_recovery_context_for_mode(requested_mode) {
-            terminal.error = Some(context.output_error(error));
-        }
+        terminal.error = Some(self.search_output_error_for_mode(error, requested_mode));
         let frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
@@ -18666,7 +18674,7 @@ impl FsfsRuntime {
                 .cli_input
                 .overrides
                 .fast_only
-                .unwrap_or(self.quality_disabled_by_policy())
+                .unwrap_or_else(|| self.quality_disabled_by_policy())
         {
             mode = SearchExecutionMode::FastOnly;
         }
@@ -18676,11 +18684,16 @@ impl FsfsRuntime {
         ))
     }
 
-    fn search_output_error(&self, error: &SearchError) -> crate::output_schema::OutputError {
-        self.search_recovery_context().map_or_else(
-            || crate::output_schema::output_error_from(error),
-            |context| context.output_error(error),
-        )
+    fn search_output_error_for_mode(
+        &self,
+        error: &SearchError,
+        requested_mode: SearchExecutionMode,
+    ) -> OutputError {
+        self.search_recovery_context_for_mode(requested_mode)
+            .map_or_else(
+                || crate::output_schema::output_error_from(error),
+                |context| context.output_error(error),
+            )
     }
 
     const fn runtime_recovery_request(
@@ -48303,6 +48316,7 @@ mod tests {
             assert_eq!(hits[0].doc_id, "doc.md");
             assert!(hits[0].score > 0.99);
             assert!(!index.is_deleted(0));
+            drop(index);
         }
 
         sink.persist(
@@ -49146,6 +49160,7 @@ mod tests {
                 assert_eq!(hits[0].doc_id, "doc.md");
                 assert!(hits[0].score > 0.99);
                 assert!(!index.is_deleted(0));
+                drop(index);
             }
 
             // Restore the admitted producer and admit the ordinary queued
@@ -56761,6 +56776,20 @@ mod tests {
         let error = SearchError::ModelNotFound {
             name: "quality-producer".to_owned(),
         };
+        let mut untouched = Vec::<u8>::new();
+        let unowned = SearchStreamWriter {
+            inner: &mut untouched,
+            failed: false,
+            wrote: false,
+        };
+        let unreported = unowned.mark_error_if_output_owned(
+            SearchError::ModelNotFound {
+                name: "quality-producer".to_owned(),
+            },
+            |_| panic!("prewrite refusal must retain its raw error without projection"),
+        );
+        assert!(matches!(unreported, SearchError::ModelNotFound { .. }));
+        assert!(untouched.is_empty());
         let policy = RecoveryPolicy {
             interaction: InteractionPolicy::NonInteractive,
             network: NetworkPolicy::Offline,
@@ -56786,7 +56815,12 @@ mod tests {
             },
         ] {
             let writer = FlushVisibleWriter::default();
-            let mut transport = writer.clone();
+            let mut visible = writer.clone();
+            let mut transport = SearchStreamWriter {
+                inner: &mut visible,
+                failed: false,
+                wrote: false,
+            };
             let mut seq = 7;
             runtime
                 .emit_search_stream_terminal_error(
@@ -56813,6 +56847,13 @@ mod tests {
             }
             assert_eq!(terminal.exit_code, expected_error.exit_code);
             assert_eq!(terminal.error.as_ref(), Some(&expected_error));
+            let returned = transport.mark_error_if_output_owned(error, |error| {
+                runtime.search_output_error_for_mode(error, SearchExecutionMode::QualityOnly)
+            });
+            assert_eq!(
+                crate::output_schema::reported_output_error(&returned),
+                Some(&expected_error),
+            );
         }
     }
 

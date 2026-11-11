@@ -986,7 +986,7 @@ fn named_daemon_refusal_preserves_public_error_in_stream_terminal() {
         }
     }
 
-    let frames = |output: &Output, format: &str| -> Vec<StreamFrame<Value>> {
+    let frames = |output: &Output, format: &str, expected_query: &str| -> Vec<StreamFrame<Value>> {
         let text = std::str::from_utf8(&output.stdout).expect("UTF-8 stream");
         let frames = if format == "jsonl" {
             text.lines()
@@ -1009,7 +1009,7 @@ fn named_daemon_refusal_preserves_public_error_in_stream_terminal() {
         let StreamEvent::Started(started) = &frames[0].event else {
             panic!("started frame");
         };
-        assert_eq!(started.query, "sharedtoken", "{format}: {output:?}");
+        assert_eq!(started.query, expected_query, "{format}: {output:?}");
         assert_eq!(started.stream_id, frames[0].stream_id);
         assert_eq!(started.format, format);
         assert_eq!(
@@ -1085,12 +1085,38 @@ fn named_daemon_refusal_preserves_public_error_in_stream_terminal() {
     for format in ["jsonl", "toon"] {
         let output = query(format, true);
         assert!(output.status.success(), "{output:?}");
-        let frames = frames(&output, format);
+        let frames = frames(&output, format, "sharedtoken");
         let StreamEvent::Terminal(terminal) = &frames.last().unwrap().event else {
             panic!("terminal frame");
         };
         assert_eq!(terminal.status, StreamTerminalStatus::Completed);
         assert_eq!(terminal.exit_code, 0);
+    }
+
+    let separator_query = "sharedtoken\u{001e}";
+    for format in ["jsonl", "toon"] {
+        let output = execute(
+            fixture
+                .lexical_discovery_command("s")
+                .arg(separator_query)
+                .args(["--daemon", "--daemon-socket"])
+                .arg(&socket)
+                .args(["--format", format, "--stream"]),
+        );
+        if format == "toon" {
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stdout.is_empty(), "refuse before any TOON frame");
+            let diagnostic = String::from_utf8(output.stderr).expect("UTF-8 public error");
+            assert!(diagnostic.contains("[invalid_config]"), "{diagnostic}");
+            assert!(diagnostic.contains("--format jsonl"), "{diagnostic}");
+            assert!(!diagnostic.contains('\u{001e}'));
+        } else {
+            assert!(output.status.success(), "{output:?}");
+            let frames = frames(&output, format, separator_query);
+            assert!(matches!(&frames.last().unwrap().event,
+                StreamEvent::Terminal(terminal) if terminal.status == StreamTerminalStatus::Completed
+                    && terminal.exit_code == 0));
+        }
     }
 
     let mut config: FsfsConfig =
@@ -1122,7 +1148,7 @@ fn named_daemon_refusal_preserves_public_error_in_stream_terminal() {
     }
     let actual = refused.map(|(format, output)| {
         assert_eq!(output.status.code(), Some(2), "{format}: {output:?}");
-        let frames = frames(&output, format);
+        let frames = frames(&output, format, "sharedtoken");
         assert_eq!(frames.len(), 2, "a refused query must emit no result rows");
         let StreamEvent::Terminal(terminal) = &frames[1].event else {
             panic!("terminal frame");

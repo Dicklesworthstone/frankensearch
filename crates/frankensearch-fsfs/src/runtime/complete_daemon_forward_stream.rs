@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::super::super::{
     SearchOutputPhase, SearchServeFrame, SearchServeOptions, SearchStreamResources,
+    SearchStreamWriter,
 };
 use super::super::{FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL, admission, streaming};
 use super::{
@@ -414,11 +415,22 @@ impl ReceiveState {
         if let StreamEvent::Started(started) = &mut frame.event {
             started.format = format.to_string();
         }
-        self.output_attempted = true;
-        let result = emit_stream_frame(&frame, format, output)
-            .and_then(|()| output.flush().map_err(SearchError::Io));
+        let mut tracked = SearchStreamWriter {
+            inner: output,
+            failed: false,
+            wrote: false,
+        };
+        let result = emit_stream_frame(&frame, format, &mut tracked)
+            .and_then(|()| tracked.flush().map_err(SearchError::Io));
+        let attempted = tracked.wrote || tracked.failed;
+        self.output_attempted |= attempted;
         if result.is_err() {
-            self.output_failed = true;
+            self.output_failed |= attempted;
+            if !attempted {
+                // A rejected encoding exposed no frame. Reuse its sequence
+                // for the failure terminal rather than leaving an output gap.
+                self.next_sequence = frame.seq;
+            }
         }
         result
     }
@@ -1719,6 +1731,133 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn toon_started_encoding_refusal_leaves_output_unowned() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut request = request();
+            request.search.query.push('\u{001e}');
+            let bytes = frames_bytes(&[started(&request), completed(&request)]);
+            for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+                let (output, result) = read(&cx, &request, &bytes, format).await;
+                if format == OutputFormat::Jsonl {
+                    assert!(result.is_ok());
+                    assert_eq!(output, bytes, "JSONL preserves the complete query");
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(output.is_empty(), "no partial TOON prefix");
+                    assert!(matches!(&error, SearchError::InvalidConfig { field, value, .. }
+                        if field == "stream.toon_payload" && value == "record_separator"));
+                    assert!(reported_error(&error).is_none());
+                    assert!(!FsfsRuntime::forwarded_search_error_was_emitted(&error));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn toon_encoding_refusal_after_started_keeps_terminal_sequence_contiguous() {
+        use crate::stream_protocol::{
+            StreamFailureCategory, StreamRetryDirective, decode_stream_frame_toon,
+        };
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let request = request();
+            for base in [0_u64, 47] {
+                let mut first = started(&request);
+                first.seq = base;
+                let mut rejected = initial(&request);
+                rejected.seq = base + 1;
+                let StreamEvent::Progress(progress) = &mut rejected.event else {
+                    panic!("progress fixture");
+                };
+                progress.message = "left\u{001e}right".to_owned();
+                let mut last = completed(&request);
+                last.seq = base + 2;
+                let bytes = frames_bytes(&[first, rejected, last]);
+                for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+                    let (output, result) = read(&cx, &request, &bytes, format).await;
+                    if format == OutputFormat::Jsonl {
+                        assert!(result.is_ok());
+                        assert_eq!(output, bytes, "JSONL preserves the entire payload");
+                        continue;
+                    }
+                    let error = result.unwrap_err();
+                    let public = reported_error(&error).expect("failure terminal was emitted");
+                    assert_eq!(public.code, "invalid_config");
+                    assert_eq!(public.field.as_deref(), Some("stream.toon_payload"));
+                    let output = String::from_utf8(output).unwrap();
+                    let frames: Vec<Frame> = output
+                        .split(crate::stream_protocol::TOON_STREAM_RECORD_SEPARATOR)
+                        .filter(|record| !record.trim().is_empty())
+                        .map(|record| decode_stream_frame_toon(record).unwrap())
+                        .collect();
+                    assert_eq!(frames.len(), 2, "Started and exactly one terminal");
+                    assert_eq!(frames[0].seq, base);
+                    assert_eq!(frames[1].seq, base + 1, "rejected frame used no sequence");
+                    let StreamEvent::Terminal(terminal) = &frames[1].event else {
+                        panic!("failure terminal");
+                    };
+                    assert_eq!(terminal.status, StreamTerminalStatus::Failed);
+                    assert_eq!(terminal.exit_code, 2);
+                    assert_eq!(terminal.failure_category, Some(StreamFailureCategory::Config));
+                    assert_eq!(terminal.retry, StreamRetryDirective::None);
+                    assert_eq!(terminal.error.as_ref(), Some(public));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn stream_writer_preserves_interrupted_short_write_retries() {
+        struct InterruptedOutput {
+            bytes: Vec<u8>,
+            interrupt_next: bool,
+        }
+        impl Write for InterruptedOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.is_empty() {
+                    return Ok(0);
+                }
+                if self.interrupt_next {
+                    self.interrupt_next = false;
+                    return Err(io::Error::from(ErrorKind::Interrupted));
+                }
+                let written = bytes.len().min(3);
+                self.bytes.extend_from_slice(&bytes[..written]);
+                self.interrupt_next = true;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut output = InterruptedOutput {
+            bytes: Vec::new(),
+            interrupt_next: true,
+        };
+        {
+            let mut writer = SearchStreamWriter {
+                inner: &mut output,
+                failed: false,
+                wrote: false,
+            };
+            assert_eq!(
+                writer.write(b"first frame").unwrap_err().kind(),
+                ErrorKind::Interrupted
+            );
+            assert!(!writer.failed);
+            assert!(!writer.wrote);
+            writer.write_all(b"first frame").unwrap();
+            writer.write_all(b"second frame").unwrap();
+            writer.flush().unwrap();
+            assert!(!writer.failed);
+            assert!(writer.wrote);
+        }
+        assert_eq!(output.bytes, b"first framesecond frame");
     }
 
     #[test]
