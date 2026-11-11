@@ -914,6 +914,178 @@ fn complete_cli_binary_default_search_without_a_daemon_runs_in_process() {
 }
 
 #[test]
+fn named_daemon_refusal_preserves_public_error_in_stream_terminal() {
+    use frankensearch_fsfs::stream_protocol::{
+        StreamEvent, StreamFailureCategory, StreamFrame, StreamRetryDirective, StreamTerminalEvent,
+        StreamTerminalStatus, TOON_STREAM_RECORD_SEPARATOR, decode_stream_frame_ndjson,
+        decode_stream_frame_toon, validate_stream_frame,
+    };
+    use std::process::{Child, Stdio};
+
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            // This guard owns exactly the foreground process spawned below.
+            // A failed assertion must not leave a query daemon behind.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let frames = |output: &Output, format: &str| -> Vec<StreamFrame<Value>> {
+        let text = std::str::from_utf8(&output.stdout).expect("UTF-8 stream");
+        let frames = if format == "jsonl" {
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| decode_stream_frame_ndjson(line).expect("JSONL stream frame"))
+                .collect::<Vec<_>>()
+        } else {
+            assert!(text.starts_with(TOON_STREAM_RECORD_SEPARATOR), "{text}");
+            text.split(TOON_STREAM_RECORD_SEPARATOR)
+                .filter(|record| !record.trim().is_empty())
+                .map(|record| decode_stream_frame_toon(record).expect("TOON stream frame"))
+                .collect::<Vec<_>>()
+        };
+        assert!(!frames.is_empty(), "{output:?}");
+        for (sequence, frame) in frames.iter().enumerate() {
+            assert!(validate_stream_frame(frame).valid, "{frame:?}");
+            assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
+            assert_eq!(frame.stream_id, frames[0].stream_id);
+        }
+        let StreamEvent::Started(started) = &frames[0].event else {
+            panic!("started frame");
+        };
+        assert_eq!(started.query, "sharedtoken", "{format}: {output:?}");
+        assert_eq!(started.stream_id, frames[0].stream_id);
+        assert_eq!(started.format, format);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(frame.event, StreamEvent::Terminal(_)))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            frames.last().unwrap().event,
+            StreamEvent::Terminal(_)
+        ));
+        frames
+    };
+
+    let fixture = Fixture::new();
+    json_output(
+        &execute(
+            fixture
+                .lexical_discovery_command("index")
+                .arg("--no-watch-mode"),
+        ),
+        true,
+    );
+    assert!(fixture.store.join(COMPLETE_GENERATION_POINTER).is_file());
+    // Remote Cargo places TMPDIR beneath its long source namespace. The
+    // socket needs its own short path; the indexed store stays unchanged.
+    let socket_root = tempfile::tempdir_in("/tmp").expect("short Unix socket directory");
+    let socket = socket_root.path().join("query.sock");
+    assert!(socket.as_os_str().len() < 100, "short socket test fixture");
+    let daemon_stdout = fixture.directory.path().join("daemon.stdout");
+    let daemon_stderr = fixture.directory.path().join("daemon.stderr");
+    let mut daemon = Daemon(
+        fixture
+            .lexical_discovery_command("serve")
+            .args(["--daemon", "--daemon-socket"])
+            .arg(&socket)
+            .args(["--idle-timeout-ms", "30000"])
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&daemon_stdout).unwrap())
+            .stderr(fs::File::create(&daemon_stderr).unwrap())
+            .spawn()
+            .expect("start production query daemon"),
+    );
+    let started = Instant::now();
+    while !socket.exists() {
+        let status = daemon.0.try_wait().unwrap();
+        assert!(
+            status.is_none() && started.elapsed() < Duration::from_secs(20),
+            "daemon did not become ready: {status:?}\nstdout: {}\nstderr: {}",
+            fs::read_to_string(&daemon_stdout).unwrap(),
+            fs::read_to_string(&daemon_stderr).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let query = |format: &str, streamed: bool| {
+        let mut command = fixture.lexical_discovery_command("search");
+        command.args(["--daemon", "--daemon-socket"]).arg(&socket);
+        command.args(["--format", format]);
+        if streamed {
+            command.arg("--stream");
+        }
+        execute(&mut command)
+    };
+    assert_eq!(
+        json_output(&query("json", false), true)["data"]["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for format in ["jsonl", "toon"] {
+        let output = query(format, true);
+        assert!(output.status.success(), "{output:?}");
+        let frames = frames(&output, format);
+        let StreamEvent::Terminal(terminal) = &frames.last().unwrap().event else {
+            panic!("terminal frame");
+        };
+        assert_eq!(terminal.status, StreamTerminalStatus::Completed);
+        assert_eq!(terminal.exit_code, 0);
+    }
+
+    let mut config: FsfsConfig =
+        toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+    // Shadowing stays disabled. This is a harmless warmed-configuration
+    // mismatch, not a model/policy change or an invalid local configuration.
+    config.search.shadow_sample_rate_basis_points += 1;
+    fs::write(&fixture.config, config.to_toml().unwrap()).unwrap();
+    let buffered = query("json", false);
+    let expected = json_output(&buffered, false)["error"].clone();
+    // The established usage-error contract is 2 (output_schema::exit_code_for),
+    // including the buffered daemon refusal; stream metadata must agree.
+    assert_eq!(buffered.status.code(), Some(2), "{buffered:?}");
+    assert_eq!(expected["code"], "invalid_config");
+    assert_eq!(expected["field"], "complete_generation.daemon_config");
+    assert_eq!(expected["exit_code"], 2);
+    let refused = ["jsonl", "toon"].map(|format| (format, query(format, true)));
+    let stopped = execute(
+        fixture
+            .lexical_discovery_command("daemon")
+            .args(["--stop", "--daemon-socket"])
+            .arg(&socket),
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+    let stopping = Instant::now();
+    while daemon.0.try_wait().unwrap().is_none() {
+        assert!(stopping.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let actual = refused.map(|(format, output)| {
+        assert_eq!(output.status.code(), Some(2), "{format}: {output:?}");
+        let frames = frames(&output, format);
+        assert_eq!(frames.len(), 2, "a refused query must emit no result rows");
+        let StreamEvent::Terminal(terminal) = &frames[1].event else {
+            panic!("terminal frame");
+        };
+        (format, terminal.clone())
+    });
+    let expected = StreamTerminalEvent {
+        status: StreamTerminalStatus::Failed,
+        exit_code: 2,
+        failure_category: Some(StreamFailureCategory::Config),
+        error: Some(serde_json::from_value(expected).unwrap()),
+        retry: StreamRetryDirective::None,
+    };
+    assert_eq!(actual, [("jsonl", expected.clone()), ("toon", expected)]);
+}
+
+#[test]
 fn complete_cli_binary_retains_interrupted_store_without_selection() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.store.join("generations/unfinished")).unwrap();

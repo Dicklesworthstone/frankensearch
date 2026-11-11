@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::evidence::{ValidationResult, ValidationViolation};
 use crate::explanation_payload::FsfsExplanationPayload;
-use crate::output_schema::{OutputError, OutputWarning, exit_code_for, output_error_from};
+use crate::output_schema::{
+    OutputError, OutputErrorCode, OutputWarning, exit_code_for, output_error_from,
+};
 
 const SUBSYSTEM: &str = "fsfs_stream_protocol";
 
@@ -281,13 +283,64 @@ pub fn terminal_event_from_error(
         };
     }
 
-    let retry = retry_directive_for_error(err, attempt, max_attempts);
+    let retry = retry_directive(is_retryable_error(err), attempt, max_attempts);
     StreamTerminalEvent {
         status: StreamTerminalStatus::Failed,
         exit_code: exit_code_for(err),
         failure_category: Some(failure_category_for_error(err)),
         error: Some(output_error_from(err)),
         retry,
+    }
+}
+
+/// Build a terminal payload from an already-public failure.
+///
+/// Preserve a validated daemon reply's diagnostic and exit code: a transport
+/// wrapper must not replace them with its own failure class.
+/// Unknown public codes have an internal category and no automatic retry.
+#[must_use]
+pub fn terminal_event_from_output_error(
+    error: OutputError,
+    attempt: u32,
+    max_attempts: u32,
+) -> StreamTerminalEvent {
+    let (category, retryable) = match error.code.as_str() {
+        OutputErrorCode::INVALID_CONFIG | OutputErrorCode::QUERY_PARSE_ERROR => {
+            (StreamFailureCategory::Config, false)
+        }
+        OutputErrorCode::INDEX_CORRUPTED
+        | OutputErrorCode::INDEX_VERSION_MISMATCH
+        | OutputErrorCode::DIMENSION_MISMATCH
+        | OutputErrorCode::INDEX_NOT_FOUND => (StreamFailureCategory::Index, false),
+        OutputErrorCode::EMBEDDING_FAILED | OutputErrorCode::RERANK_FAILED => {
+            (StreamFailureCategory::Model, true)
+        }
+        OutputErrorCode::EMBEDDER_UNAVAILABLE
+        | OutputErrorCode::MODEL_NOT_FOUND
+        | OutputErrorCode::MODEL_LOAD_FAILED
+        | OutputErrorCode::UNVERIFIABLE_REMOTE_SPACE
+        | OutputErrorCode::RERANKER_UNAVAILABLE => (StreamFailureCategory::Model, false),
+        OutputErrorCode::SEARCH_TIMEOUT
+        | OutputErrorCode::FEDERATED_INSUFFICIENT
+        | OutputErrorCode::QUEUE_FULL => (StreamFailureCategory::Resource, true),
+        OutputErrorCode::CANCELLED => (StreamFailureCategory::Resource, false),
+        OutputErrorCode::IO_ERROR => (StreamFailureCategory::Io, true),
+        OutputErrorCode::HASH_MISMATCH | OutputErrorCode::DURABILITY_DISABLED => {
+            (StreamFailureCategory::Io, false)
+        }
+        OutputErrorCode::SUBSYSTEM_ERROR => (StreamFailureCategory::Internal, true),
+        _ => (StreamFailureCategory::Internal, false),
+    };
+    StreamTerminalEvent {
+        status: if error.code == OutputErrorCode::CANCELLED {
+            StreamTerminalStatus::Cancelled
+        } else {
+            StreamTerminalStatus::Failed
+        },
+        exit_code: error.exit_code,
+        failure_category: Some(category),
+        error: Some(error),
+        retry: retry_directive(retryable, attempt, max_attempts),
     }
 }
 
@@ -347,12 +400,8 @@ pub const fn retry_backoff_ms(attempt: u32) -> u64 {
     if delay > CAP_MS { CAP_MS } else { delay }
 }
 
-const fn retry_directive_for_error(
-    err: &SearchError,
-    attempt: u32,
-    max_attempts: u32,
-) -> StreamRetryDirective {
-    if !is_retryable_error(err) || max_attempts == 0 {
+const fn retry_directive(retryable: bool, attempt: u32, max_attempts: u32) -> StreamRetryDirective {
+    if !retryable || max_attempts == 0 {
         return StreamRetryDirective::None;
     }
 
@@ -637,6 +686,174 @@ mod tests {
             "search",
             event,
         )
+    }
+
+    #[test]
+    fn public_error_terminals_match_every_native_error_class() {
+        use std::collections::BTreeSet;
+
+        use crate::output_schema::ALL_OUTPUT_ERROR_CODES;
+
+        let errors = [
+            SearchError::EmbedderUnavailable {
+                model: "fast".into(),
+                reason: "offline".into(),
+            },
+            SearchError::EmbeddingFailed {
+                model: "fast".into(),
+                source: Box::new(io::Error::other("inference failed")),
+            },
+            SearchError::ModelNotFound {
+                name: "fast".into(),
+            },
+            SearchError::ModelLoadFailed {
+                path: "model".into(),
+                source: Box::new(io::Error::other("invalid model")),
+            },
+            SearchError::UnverifiableRemoteSpace {
+                producer: "remote".into(),
+                reason: "missing identity".into(),
+            },
+            SearchError::IndexCorrupted {
+                path: "index".into(),
+                detail: "checksum mismatch".into(),
+            },
+            SearchError::IndexVersionMismatch {
+                expected: 2,
+                found: 1,
+            },
+            SearchError::DimensionMismatch {
+                expected: 384,
+                found: 128,
+            },
+            SearchError::IndexNotFound {
+                path: "index".into(),
+            },
+            SearchError::IndexCandidatesNotFound {
+                paths: vec!["index".into()],
+            },
+            SearchError::QueryParseError {
+                query: "(".into(),
+                detail: "unclosed group".into(),
+            },
+            SearchError::SearchTimeout {
+                elapsed_ms: 200,
+                budget_ms: 150,
+            },
+            SearchError::FederatedInsufficientResponses {
+                required: 2,
+                received: 1,
+            },
+            SearchError::RerankerUnavailable {
+                model: "reranker".into(),
+            },
+            SearchError::RerankFailed {
+                model: "reranker".into(),
+                source: Box::new(io::Error::other("inference failed")),
+            },
+            SearchError::Io(io::Error::other("read failed")),
+            SearchError::InvalidConfig {
+                field: "search.limit".into(),
+                value: "0".into(),
+                reason: "must be positive".into(),
+            },
+            SearchError::HashMismatch {
+                path: "model".into(),
+                expected: "abcd".into(),
+                actual: "ef01".into(),
+            },
+            SearchError::Cancelled {
+                phase: "query".into(),
+                reason: "requested".into(),
+            },
+            SearchError::QueueFull {
+                pending: 10,
+                capacity: 10,
+            },
+            SearchError::SubsystemError {
+                subsystem: "storage",
+                source: Box::new(io::Error::other("unavailable")),
+            },
+            SearchError::DurabilityDisabled,
+        ];
+        let mut covered_codes = BTreeSet::new();
+        for error in errors {
+            let public = output_error_from(&error);
+            covered_codes.insert(public.code.clone());
+            for (attempt, max_attempts) in [
+                (0, 0),
+                (0, 3),
+                (1, 3),
+                (3, 3),
+                (u32::MAX - 1, u32::MAX),
+                (u32::MAX, u32::MAX),
+            ] {
+                assert_eq!(
+                    terminal_event_from_output_error(public.clone(), attempt, max_attempts),
+                    terminal_event_from_error(&error, attempt, max_attempts),
+                    "{} at attempt {attempt}/{max_attempts}",
+                    public.code,
+                );
+            }
+        }
+        let expected_codes: BTreeSet<String> = ALL_OUTPUT_ERROR_CODES
+            .iter()
+            .filter(|&&code| code != OutputErrorCode::INTERNAL)
+            .map(|&code| code.to_owned())
+            .collect();
+        assert_eq!(covered_codes, expected_codes);
+    }
+
+    #[test]
+    fn public_error_terminal_preserves_producer_metadata_and_exit_code() {
+        let mut error = OutputError::new(OutputErrorCode::INVALID_CONFIG, "daemon refused", 64)
+            .with_field("complete_generation.daemon_config")
+            .with_suggestion("restart the named daemon")
+            .with_context("the warmed configuration differs");
+        error.recovery_plan = Some(serde_json::json!({"action": "restart", "automatic": false}));
+        assert_eq!(
+            terminal_event_from_output_error(error.clone(), 1, 3),
+            StreamTerminalEvent {
+                status: StreamTerminalStatus::Failed,
+                exit_code: 64,
+                failure_category: Some(StreamFailureCategory::Config),
+                error: Some(error),
+                retry: StreamRetryDirective::None,
+            }
+        );
+    }
+
+    #[test]
+    fn public_error_terminal_keeps_unknown_errors_without_retry() {
+        for code in [OutputErrorCode::INTERNAL, "future_error"] {
+            let error = OutputError::new(code, "producer diagnostic", 73);
+            assert_eq!(
+                terminal_event_from_output_error(error.clone(), 0, 3),
+                StreamTerminalEvent {
+                    status: StreamTerminalStatus::Failed,
+                    exit_code: 73,
+                    failure_category: Some(StreamFailureCategory::Internal),
+                    error: Some(error),
+                    retry: StreamRetryDirective::None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn public_error_terminal_cancellation_never_retries() {
+        let error = OutputError::new(OutputErrorCode::CANCELLED, "cancelled remotely", 130)
+            .with_context("query scope closed");
+        assert_eq!(
+            terminal_event_from_output_error(error.clone(), 0, 3),
+            StreamTerminalEvent {
+                status: StreamTerminalStatus::Cancelled,
+                exit_code: 130,
+                failure_category: Some(StreamFailureCategory::Resource),
+                error: Some(error),
+                retry: StreamRetryDirective::None,
+            }
+        );
     }
 
     #[test]
@@ -1345,7 +1562,7 @@ mod tests {
     fn retry_directive_max_attempts_zero() {
         // max_attempts=0 should always return None regardless of error type.
         let err = SearchError::Io(io::Error::other("transient"));
-        let directive = retry_directive_for_error(&err, 0, 0);
+        let directive = retry_directive(is_retryable_error(&err), 0, 0);
         assert!(matches!(directive, StreamRetryDirective::None));
     }
 

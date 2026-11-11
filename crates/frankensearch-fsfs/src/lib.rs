@@ -354,7 +354,8 @@ pub use stream_protocol::{
     StreamWarningEvent, TOON_STREAM_RECORD_SEPARATOR, TOON_STREAM_RECORD_SEPARATOR_BYTE,
     decode_stream_frame_ndjson, decode_stream_frame_toon, encode_stream_frame_ndjson,
     encode_stream_frame_toon, failure_category_for_error, is_retryable_error, retry_backoff_ms,
-    terminal_event_completed, terminal_event_from_error, validate_stream_frame,
+    terminal_event_completed, terminal_event_from_error, terminal_event_from_output_error,
+    validate_stream_frame,
 };
 pub use tracing_setup::{
     LogFilterResolution, LogFilterSource, Verbosity, current_unicode_environment, init_subscriber,
