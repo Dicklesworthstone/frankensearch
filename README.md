@@ -694,10 +694,13 @@ by the query, so another search cannot replace its explanation context.
 Reranking reads the generation's stored document text, so edits or removals in
 the source tree cannot silently change the content scored for retained results.
 
-`tui` opens the search dashboard against one admitted generation for the entire
-session. Lexical, fast, and quality stages, snippets, and status refreshes keep
-using that generation while a watcher or another command publishes successors.
-Reopen the dashboard to select the latest generation. Without an interactive
+`tui` follows published complete generations. Each new query admits the latest
+selection, then keeps its lexical, fast, and quality stages and snippets on that
+one generation. When the dashboard is idle, its periodic status refresh also
+checks for publications and reruns the current query if the generation changed;
+press `r` outside the query field to refresh immediately. A corrupt or unavailable
+successor is reported as an error without displaying stale hits as fresh results.
+The ANSI fallback refreshes before each submitted query. Without an interactive
 terminal, the command reports the selected generation's status.
 
 `flush` revalidates and synchronizes the selected generation, its inventory,

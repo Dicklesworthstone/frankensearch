@@ -2018,6 +2018,7 @@ struct SearchDashboardState {
     active_hit_index: usize,
     context_scroll: u16,
     last_error: Option<String>,
+    generation_refresh_rejected: bool,
     last_search_elapsed_ms: Option<u64>,
     search_invocations: u64,
     latency_history_ms: VecDeque<f64>,
@@ -2034,7 +2035,114 @@ struct SearchDashboardState {
     compact_density: bool,
 }
 
+/// The dashboard may follow a store between queries, but every stage of one
+/// query borrows the same admitted runtime, catalog and search resources.
+enum SearchDashboardSession<'a> {
+    Legacy {
+        runtime: &'a FsfsRuntime,
+        resources: &'a mut SearchExecutionResources,
+    },
+    Retained(&'a mut LiveRetainedSearchReader),
+}
+
+impl SearchDashboardSession<'_> {
+    fn parts(&mut self) -> (&FsfsRuntime, &mut SearchExecutionResources) {
+        match self {
+            Self::Legacy { runtime, resources } => (runtime, resources),
+            Self::Retained(live) => (&live.reader.runtime, &mut live.reader.resources),
+        }
+    }
+
+    async fn refresh_generation(&mut self, cx: &Cx) -> SearchResult<bool> {
+        retained_search_checkpoint(cx)?;
+        match self {
+            Self::Legacy { .. } => Ok(false),
+            Self::Retained(live) => live.refresh(cx).await,
+        }
+    }
+
+    fn refresh_status(&mut self, state: &mut SearchDashboardState) -> SearchResult<()> {
+        let (runtime, resources) = self.parts();
+        let lexical_stats = resources
+            .lexical_index
+            .as_ref()
+            .map(SegmentStatsProvider::segment_stats)
+            .transpose()?;
+        let status = runtime.collect_status_payload_with_lexical_stats(lexical_stats)?;
+        let mode_hint = runtime.search_mode_hint()?;
+        state.status_payload = status;
+        state.mode_hint = mode_hint;
+        Ok(())
+    }
+
+    /// Admission failure keeps the old reader alive, but cannot answer a new
+    /// query with it or leave its hits looking like a successful refresh.
+    async fn begin_query(&mut self, cx: &Cx, state: &mut SearchDashboardState) -> bool {
+        match self.refresh_generation(cx).await {
+            Ok(changed) => {
+                if changed || state.generation_refresh_rejected {
+                    state.clear_search_results();
+                    if let Err(error) = self.refresh_status(state) {
+                        state.reject_generation_refresh(&error);
+                        return false;
+                    }
+                }
+                state.generation_refresh_rejected = false;
+                true
+            }
+            Err(error) => {
+                state.reject_generation_refresh(&error);
+                false
+            }
+        }
+    }
+
+    /// Follow completed publications while idle. A pending lexical/fast/quality
+    /// chain keeps its reader until completion; explicit refresh starts a new
+    /// chain. Publication churn therefore cannot starve an admitted refinement.
+    async fn refresh_idle(
+        &mut self,
+        cx: &Cx,
+        state: &mut SearchDashboardState,
+        force: bool,
+    ) -> bool {
+        if !matches!(self, Self::Retained(_))
+            || (!force
+                && (state.pending_lexical_refresh
+                    || state.pending_semantic_refresh
+                    || state.pending_quality_refresh))
+        {
+            return false;
+        }
+        match self.refresh_generation(cx).await {
+            Ok(changed) => {
+                if changed || force || state.generation_refresh_rejected {
+                    state.clear_search_results();
+                    state.generation_refresh_rejected = false;
+                    if !state.query_input.value().trim().is_empty() {
+                        state.force_refresh_now();
+                    }
+                }
+                changed
+            }
+            Err(error) => {
+                state.reject_generation_refresh(&error);
+                false
+            }
+        }
+    }
+}
+
 impl SearchDashboardState {
+    fn reject_generation_refresh(&mut self, error: &SearchError) {
+        self.clear_search_results();
+        self.pending_lexical_refresh = false;
+        self.pending_semantic_refresh = false;
+        self.pending_quality_refresh = false;
+        self.last_error = Some(error.to_string());
+        self.generation_refresh_rejected = true;
+    }
+
     fn with_view_settings(mut self, tui: &crate::config::TuiConfig) -> Self {
         self.show_explanations = tui.show_explanations;
         self.compact_density = tui.density == crate::config::Density::Compact;
@@ -2075,6 +2183,7 @@ impl SearchDashboardState {
             active_hit_index: 0,
             context_scroll: 0,
             last_error: None,
+            generation_refresh_rejected: false,
             last_search_elapsed_ms: None,
             search_invocations: 0,
             latency_history_ms: VecDeque::with_capacity(FSFS_TUI_SEARCH_HISTORY_LIMIT),
@@ -27411,25 +27520,22 @@ impl FsfsRuntime {
             SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color)
                 .with_view_settings(&self.config.tui);
         let mut resources = self.prepare_search_execution_resources(cx, mode).await?;
+        let mut search = SearchDashboardSession::Legacy {
+            runtime: self,
+            resources: &mut resources,
+        };
 
         match FtuiSession::enter() {
             Ok(mut session) => {
-                self.run_search_dashboard_ftui(
-                    cx,
-                    &mut session,
-                    &mut state,
-                    &mut resources,
-                    no_color,
-                )
-                .await
+                self.run_search_dashboard_ftui(cx, &mut session, &mut state, &mut search, no_color)
+                    .await
             }
             Err(error) => {
                 warn!(
                     error = %error,
                     "interactive fsfs search cockpit unavailable; falling back to ansi interaction"
                 );
-                self.run_search_dashboard_ansi(cx, &mut state, &mut resources, no_color)
-                    .await
+                Self::run_search_dashboard_ansi(cx, &mut state, &mut search, no_color).await
             }
         }
     }
@@ -27440,7 +27546,7 @@ impl FsfsRuntime {
         cx: &Cx,
         session: &mut FtuiSession,
         state: &mut SearchDashboardState,
-        resources: &mut SearchExecutionResources,
+        search: &mut SearchDashboardSession<'_>,
         no_color: bool,
     ) -> SearchResult<()> {
         // `tui.frame_budget_ms`: the minimum interval between redraws.
@@ -27452,11 +27558,17 @@ impl FsfsRuntime {
         let mut render_pending = true;
 
         loop {
+            retained_search_checkpoint(cx)?;
             let mut force_status_refresh = false;
             let mut interaction_changed = false;
             if let Some(event) =
                 session.poll_event(Duration::from_millis(FSFS_TUI_SEARCH_POLL_INTERVAL_MS))?
             {
+                if matches!(&event, Event::Key(key) if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(Modifiers::CTRL))
+                {
+                    return Ok(());
+                }
                 if state.search_active {
                     match &event {
                         Event::Key(key) => match (key.code, key.modifiers) {
@@ -27576,14 +27688,8 @@ impl FsfsRuntime {
                 edited_at.elapsed() < Duration::from_millis(FSFS_TUI_STATUS_REFRESH_ACTIVE_GRACE_MS)
             });
             if status_refresh_due && (!user_typing_recently || force_status_refresh) {
-                let lexical_stats = resources
-                    .lexical_index
-                    .as_ref()
-                    .map(SegmentStatsProvider::segment_stats)
-                    .transpose()?;
-                state.status_payload =
-                    self.collect_status_payload_with_lexical_stats(lexical_stats)?;
-                state.mode_hint = self.search_mode_hint()?;
+                search.refresh_idle(cx, state, force_status_refresh).await;
+                search.refresh_status(state)?;
                 last_status_refresh = Instant::now();
                 render_pending = true;
             }
@@ -27591,15 +27697,23 @@ impl FsfsRuntime {
             // Keep interaction responsive by prioritizing input and then executing
             // only one refresh tier per loop iteration.
             if state.should_refresh_lexical() {
-                self.refresh_search_dashboard_lexical(cx, state, resources)
-                    .await;
+                if search.begin_query(cx, state).await {
+                    let (runtime, resources) = search.parts();
+                    runtime
+                        .refresh_search_dashboard_lexical(cx, state, resources)
+                        .await;
+                }
                 render_pending = true;
             } else if state.should_refresh_semantic() {
-                self.refresh_search_dashboard_semantic_fast(cx, state, resources)
+                let (runtime, resources) = search.parts();
+                runtime
+                    .refresh_search_dashboard_semantic_fast(cx, state, resources)
                     .await;
                 render_pending = true;
             } else if state.should_refresh_quality() {
-                self.refresh_search_dashboard_quality(cx, state, resources)
+                let (runtime, resources) = search.parts();
+                runtime
+                    .refresh_search_dashboard_quality(cx, state, resources)
                     .await;
                 render_pending = true;
             }
@@ -27625,10 +27739,9 @@ impl FsfsRuntime {
     }
 
     async fn run_search_dashboard_ansi(
-        &self,
         cx: &Cx,
         state: &mut SearchDashboardState,
-        resources: &mut SearchExecutionResources,
+        search: &mut SearchDashboardSession<'_>,
         no_color: bool,
     ) -> SearchResult<()> {
         let width = tui_terminal_width().clamp(88, 168);
@@ -27636,13 +27749,8 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
 
         loop {
-            let lexical_stats = resources
-                .lexical_index
-                .as_ref()
-                .map(SegmentStatsProvider::segment_stats)
-                .transpose()?;
-            state.status_payload = self.collect_status_payload_with_lexical_stats(lexical_stats)?;
-            state.mode_hint = self.search_mode_hint()?;
+            retained_search_checkpoint(cx)?;
+            search.refresh_status(state)?;
 
             write!(stdout, "\u{1b}[2J\u{1b}[H").map_err(tui_io_error)?;
             writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
@@ -27698,9 +27806,12 @@ impl FsfsRuntime {
             stdout.flush().map_err(tui_io_error)?;
 
             let mut input = String::new();
-            std::io::stdin()
+            let read = std::io::stdin()
                 .read_line(&mut input)
                 .map_err(SearchError::Io)?;
+            if read == 0 {
+                return Ok(());
+            }
             let trimmed = input.trim();
             if matches!(trimmed, "q" | "Q" | "quit" | "QUIT" | "exit" | "EXIT") {
                 return Ok(());
@@ -27708,8 +27819,12 @@ impl FsfsRuntime {
 
             state.query_input.set_value(trimmed.to_owned());
             state.mark_query_dirty();
-            self.refresh_search_dashboard_full(cx, state, resources)
-                .await;
+            if search.begin_query(cx, state).await {
+                let (runtime, resources) = search.parts();
+                runtime
+                    .refresh_search_dashboard_full(cx, state, resources)
+                    .await;
+            }
         }
     }
 

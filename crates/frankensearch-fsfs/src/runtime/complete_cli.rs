@@ -13,9 +13,10 @@ use frankensearch_core::{GenerationRootSecurityProfileV1, SearchError, SearchRes
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
-    RetainedSearchReader, SearchDashboardState, SearchExecutionFlags, SearchStreamResources,
-    canonical_store_root, degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms,
-    retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
+    RetainedSearchReader, SearchDashboardSession, SearchDashboardState, SearchExecutionFlags,
+    SearchStreamResources, canonical_store_root, degraded_search_mode, iso_timestamp_now,
+    pressure_timestamp_ms, retained_search_checkpoint, store_overlaps_source,
+    validate_retained_catalog_path,
 };
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
@@ -423,10 +424,8 @@ impl FsfsRuntime {
         })
     }
 
-    /// Retain one complete generation for the dashboard's entire session, just
-    /// as the ordinary dashboard retains its initially opened search resources.
-    /// Reopening the dashboard observes a successor; editing a query does not
-    /// mix a new catalog or lexical snapshot into an earlier vector generation.
+    /// Follow complete generations between queries. The lexical, fast and
+    /// quality stages of each query retain one admitted snapshot throughout.
     async fn run_complete_generation_tui(&self, cx: &Cx, root: &Path) -> SearchResult<()> {
         retained_search_checkpoint(cx)?;
         if self.config.search.shadow_mode {
@@ -440,43 +439,31 @@ impl FsfsRuntime {
         if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
             return self.run_complete_generation_tui_status(cx, root);
         }
-        let mut reader = Box::pin(self.open_retained_search(cx, root)).await?;
+        let mut live = Box::pin(self.open_live_retained_search(cx, root)).await?;
         retained_search_checkpoint(cx)?;
         eprintln!(
-            "fsfs: dashboard is pinned to complete generation {}; reopen it to see a newer generation (type to search; Esc, then q, to quit)",
-            reader.generation().id(),
+            "fsfs: dashboard follows complete generations (current: {}; type to search; Esc, then q, to quit)",
+            live.generation().id(),
         );
         // Do not enter generic first-run onboarding: this runtime names a sealed
         // generation, whose catalog and search resources are already admitted.
-        // Initialize the dashboard from that runtime, then keep the retained
-        // resources in the existing render loops for the entire session.
+        // Initialize from the admitted runtime. The render loops refresh the
+        // whole reader only at a query boundary, never between its stages.
+        let reader = &live.reader;
         let no_color = reader.runtime.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
         let status_payload = reader.runtime.collect_status_payload()?;
         let mode_hint = reader.runtime.search_mode_hint()?;
-        let configured_limit = reader
-            .runtime
-            .cli_input
-            .overrides
-            .limit
-            .unwrap_or(reader.runtime.config.search.default_limit);
-        let result_limit = if configured_limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
-            FSFS_TUI_INTERACTIVE_RESULT_LIMIT
-        } else {
-            configured_limit.max(1)
+        let result_limit = match reader.runtime.cli_input.overrides.limit {
+            None | Some(FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL) => FSFS_TUI_INTERACTIVE_RESULT_LIMIT,
+            Some(limit) => limit.max(1),
         };
         let mut state =
-            SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color);
+            SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color)
+                .with_view_settings(&self.config.tui);
+        let mut search = SearchDashboardSession::Retained(&mut live);
         match FtuiSession::enter() {
             Ok(mut session) => {
-                reader
-                    .runtime
-                    .run_search_dashboard_ftui(
-                        cx,
-                        &mut session,
-                        &mut state,
-                        &mut reader.resources,
-                        no_color,
-                    )
+                self.run_search_dashboard_ftui(cx, &mut session, &mut state, &mut search, no_color)
                     .await
             }
             Err(error) => {
@@ -484,10 +471,7 @@ impl FsfsRuntime {
                     error = %error,
                     "interactive fsfs search cockpit unavailable; falling back to ansi interaction"
                 );
-                reader
-                    .runtime
-                    .run_search_dashboard_ansi(cx, &mut state, &mut reader.resources, no_color)
-                    .await
+                Self::run_search_dashboard_ansi(cx, &mut state, &mut search, no_color).await
             }
         }
     }
@@ -2697,19 +2681,24 @@ mod tests {
             )
             .unwrap();
             publish(&runtime, &cx, &root).await;
-            let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let mut reader = runtime.open_live_retained_search(&cx, &root).await.unwrap();
             let predecessor = reader.generation().clone();
             let before = sealed_inventory(predecessor.path());
-            let status = reader.runtime.collect_status_payload().unwrap();
+            let status = reader.reader.runtime.collect_status_payload().unwrap();
             assert_eq!(status.index.path, predecessor.path().display().to_string());
             let mut state = SearchDashboardState::new(status, None, 10, true);
             state
                 .query_input
                 .set_value("how to find sharedtoken document content");
-            reader
-                .runtime
-                .refresh_search_dashboard_lexical(&cx, &mut state, &mut reader.resources)
-                .await;
+            state.mark_query_dirty();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_lexical(&cx, &mut state, resources)
+                    .await;
+            }
             assert_eq!(state.stage_chain, vec![DashboardSearchStage::Lexical]);
             assert_eq!(state.latest_hits().len(), 1);
             assert_eq!(state.latest_hits()[0].path, "alpha.md");
@@ -2727,17 +2716,29 @@ mod tests {
             let successor_before = sealed_inventory(successor.path());
             assert_ne!(predecessor, successor);
 
-            reader
-                .runtime
-                .refresh_search_dashboard_semantic_fast(&cx, &mut state, &mut reader.resources)
-                .await;
+            assert!(state.pending_semantic_refresh);
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                session.refresh_idle(&cx, &mut state, false).await;
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_semantic_fast(&cx, &mut state, resources)
+                    .await;
+            }
             assert!(state.last_error.is_none(), "{:?}", state.last_error);
             assert_eq!(state.latest_hits().len(), 1);
             assert!(state.latest_hits()[0].semantic_rank.is_some());
-            reader
-                .runtime
-                .refresh_search_dashboard_quality(&cx, &mut state, &mut reader.resources)
-                .await;
+            // These test producers have no model-cache directory. Schedule the
+            // quality stage explicitly, as the dashboard does for cached models.
+            state.schedule_quality_refresh();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                session.refresh_idle(&cx, &mut state, false).await;
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_quality(&cx, &mut state, resources)
+                    .await;
+            }
             assert!(state.last_error.is_none(), "{:?}", state.last_error);
             let refined = state.latest_payload().unwrap();
             assert_eq!(refined.phase, SearchOutputPhase::Refined);
@@ -2788,14 +2789,53 @@ mod tests {
                     .unwrap()
                     .contains("rewritten")
             );
+
+            // A new query admits the successor without reopening the dashboard.
+            // The earlier lexical/fast/quality sequence still used only the
+            // predecessor, including its source snippets and vector owners.
+            state
+                .query_input
+                .set_value("how to find sharedtoken successor documents");
+            state.mark_query_dirty();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_full(&cx, &mut state, resources)
+                    .await;
+            }
+            assert!(state.last_error.is_none(), "{:?}", state.last_error);
+            assert_eq!(reader.generation(), &successor);
+            assert_eq!(
+                state.status_payload.index.path,
+                successor.path().display().to_string()
+            );
+            assert_eq!(state.latest_hits().len(), 2);
+            assert_eq!(
+                state.latest_payload().unwrap().phase,
+                SearchOutputPhase::Refined
+            );
+            assert!(
+                state
+                    .latest_hits()
+                    .iter()
+                    .find(|hit| hit.path == "alpha.md")
+                    .unwrap()
+                    .snippet
+                    .as_ref()
+                    .unwrap()
+                    .contains("rewritten")
+            );
             cx.set_cancel_requested(true);
             let error = reader
+                .reader
                 .runtime
                 .refresh_search_dashboard_mode_with_limit(
                     &cx,
                     &mut state,
                     SearchExecutionMode::Full,
-                    &mut reader.resources,
+                    &mut reader.reader.resources,
                     10,
                     true,
                 )
@@ -2803,10 +2843,312 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             cx.set_cancel_requested(false);
-            assert_eq!(reader.generation(), &predecessor);
+            assert_eq!(reader.generation(), &successor);
             assert_eq!(sealed_inventory(predecessor.path()), before);
             assert_eq!(sealed_inventory(successor.path()), successor_before);
             assert!(!root.join(FSFS_EXPLAIN_SESSION_FILE).exists());
+        });
+    }
+
+    #[test]
+    fn complete_tui_next_query_refuses_unadmitted_selection_and_recovers() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            publish(&runtime, &cx, &root).await;
+            let mut reader = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+            let predecessor = reader.generation().clone();
+            let before = sealed_inventory(predecessor.path());
+            let mut state = SearchDashboardState::new(
+                reader.reader.runtime.collect_status_payload().unwrap(),
+                None,
+                10,
+                true,
+            );
+            state.query_input.set_value("sharedtoken");
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_full(&cx, &mut state, resources)
+                    .await;
+            }
+            assert_eq!(state.latest_hits().len(), 1);
+            assert_eq!(state.latest_hits()[0].path, "alpha.md");
+            let invocations = state.search_invocations;
+
+            fs::write(source.join("beta.md"), "sharedtoken successor document").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let successor = store.active(&cx).unwrap().unwrap();
+            let successor_before = sealed_inventory(successor.path());
+            let selection_path = root.join(COMPLETE_GENERATION_POINTER);
+            let valid_selection = fs::read(&selection_path).unwrap();
+            fs::write(&selection_path, "corrupt selection").unwrap();
+
+            state.force_refresh_now();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(!session.begin_query(&cx, &mut state).await);
+            }
+            assert!(state.last_error.is_some());
+            assert!(state.latest_hits().is_empty());
+            assert!(!state.pending_lexical_refresh);
+            assert!(!state.pending_semantic_refresh);
+            assert!(!state.pending_quality_refresh);
+            assert_eq!(state.search_invocations, invocations);
+            assert_eq!(reader.generation(), &predecessor);
+            assert_eq!(
+                state.status_payload.index.path,
+                predecessor.path().display().to_string()
+            );
+            // Refusing a fresh query must not damage the retained incumbent.
+            // This explicit old-snapshot read is distinct from dashboard retry.
+            let retained = reader.reader.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(retained.last().unwrap().hits.len(), 1);
+            assert_eq!(retained.last().unwrap().hits[0].path, "alpha.md");
+
+            fs::write(&selection_path, &valid_selection).unwrap();
+            state.force_refresh_now();
+            cx.set_cancel_requested(true);
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(!session.begin_query(&cx, &mut state).await);
+            }
+            cx.set_cancel_requested(false);
+            assert!(state.last_error.is_some());
+            assert!(state.latest_hits().is_empty());
+            assert!(!state.pending_lexical_refresh);
+            assert!(!state.pending_semantic_refresh);
+            assert!(!state.pending_quality_refresh);
+            assert_eq!(state.search_invocations, invocations);
+            assert_eq!(reader.generation(), &predecessor);
+
+            state.force_refresh_now();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_full(&cx, &mut state, resources)
+                    .await;
+            }
+            assert!(state.last_error.is_none(), "{:?}", state.last_error);
+            assert_eq!(state.latest_hits().len(), 2);
+            assert!(state.latest_hits().iter().any(|hit| hit.path == "beta.md"));
+            assert_eq!(reader.generation(), &successor);
+            assert_eq!(
+                state.status_payload.index.path,
+                successor.path().display().to_string()
+            );
+            assert_eq!(state.search_invocations, invocations + 1);
+            assert_eq!(sealed_inventory(predecessor.path()), before);
+            assert_eq!(sealed_inventory(successor.path()), successor_before);
+            assert_eq!(fs::read(&selection_path).unwrap(), valid_selection);
+            assert!(!root.join(FSFS_EXPLAIN_SESSION_FILE).exists());
+        });
+    }
+
+    #[test]
+    fn complete_tui_idle_repair_of_same_generation_resumes_the_existing_query() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            publish(&runtime, &cx, &root).await;
+            let mut reader = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+            let generation = reader.generation().clone();
+            let before = sealed_inventory(generation.path());
+            let mut state = SearchDashboardState::new(
+                reader.reader.runtime.collect_status_payload().unwrap(),
+                None,
+                10,
+                true,
+            );
+            state.query_input.set_value("sharedtoken");
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_full(&cx, &mut state, resources)
+                    .await;
+            }
+            assert_eq!(state.latest_hits().len(), 1);
+            let selection_path = root.join(COMPLETE_GENERATION_POINTER);
+            let valid_selection = fs::read(&selection_path).unwrap();
+            fs::write(&selection_path, "corrupt selection").unwrap();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(!session.refresh_idle(&cx, &mut state, false).await);
+            }
+            assert!(state.last_error.is_some());
+            assert!(state.latest_hits().is_empty());
+            assert!(!state.pending_lexical_refresh);
+            assert!(!state.pending_semantic_refresh);
+            assert!(!state.pending_quality_refresh);
+            assert_eq!(reader.generation(), &generation);
+
+            // Repair returns exactly the already retained selection. A refresh
+            // reporting "unchanged" must still recover from the earlier refusal.
+            fs::write(&selection_path, &valid_selection).unwrap();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(!session.refresh_idle(&cx, &mut state, false).await);
+                assert!(state.last_error.is_none());
+                assert!(state.pending_lexical_refresh);
+                assert!(state.pending_semantic_refresh);
+                assert!(!state.pending_quality_refresh);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_lexical(&cx, &mut state, resources)
+                    .await;
+            }
+            assert!(state.last_error.is_none(), "{:?}", state.last_error);
+            assert_eq!(state.query_input.value(), "sharedtoken");
+            assert_eq!(state.latest_hits().len(), 1);
+            assert_eq!(state.latest_hits()[0].path, "alpha.md");
+            assert_eq!(reader.generation(), &generation);
+            assert_eq!(sealed_inventory(generation.path()), before);
+        });
+    }
+
+    #[test]
+    fn complete_tui_idle_refresh_waits_for_query_phases_then_requeries_same_text() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            publish(&runtime, &cx, &root).await;
+            let mut reader = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+            let predecessor = reader.generation().clone();
+            let before = sealed_inventory(predecessor.path());
+            let mut state = SearchDashboardState::new(
+                reader.reader.runtime.collect_status_payload().unwrap(),
+                None,
+                10,
+                true,
+            );
+            state.query_input.set_value("sharedtoken");
+            state.force_refresh_now();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_lexical(&cx, &mut state, resources)
+                    .await;
+            }
+            assert!(state.pending_semantic_refresh);
+            assert_eq!(state.latest_hits().len(), 1);
+
+            fs::write(source.join("beta.md"), "sharedtoken successor document").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let successor = store.active(&cx).unwrap().unwrap();
+            let successor_before = sealed_inventory(successor.path());
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                session.refresh_idle(&cx, &mut state, false).await;
+                session.refresh_status(&mut state).unwrap();
+            }
+            assert_eq!(reader.generation(), &predecessor);
+            assert_eq!(
+                state.status_payload.index.path,
+                predecessor.path().display().to_string()
+            );
+            assert_eq!(state.latest_hits().len(), 1);
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_semantic_fast(&cx, &mut state, resources)
+                    .await;
+                runtime
+                    .refresh_search_dashboard_quality(&cx, &mut state, resources)
+                    .await;
+            }
+            assert!(!state.pending_lexical_refresh);
+            assert!(!state.pending_semantic_refresh);
+            assert!(!state.pending_quality_refresh);
+            assert_eq!(state.latest_hits().len(), 1);
+
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                session.refresh_idle(&cx, &mut state, false).await;
+                assert!(state.pending_lexical_refresh);
+                assert!(state.pending_semantic_refresh);
+                assert!(!state.pending_quality_refresh);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_lexical(&cx, &mut state, resources)
+                    .await;
+                runtime
+                    .refresh_search_dashboard_semantic_fast(&cx, &mut state, resources)
+                    .await;
+                runtime
+                    .refresh_search_dashboard_quality(&cx, &mut state, resources)
+                    .await;
+            }
+            assert!(state.last_error.is_none(), "{:?}", state.last_error);
+            assert_eq!(reader.generation(), &successor);
+            assert_eq!(state.query_input.value(), "sharedtoken");
+            assert_eq!(state.latest_hits().len(), 2);
+            assert!(state.latest_hits().iter().any(|hit| hit.path == "beta.md"));
+            let invocations = state.search_invocations;
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                session.refresh_idle(&cx, &mut state, false).await;
+            }
+            assert_eq!(state.search_invocations, invocations);
+            assert!(!state.pending_lexical_refresh);
+            assert!(!state.pending_semantic_refresh);
+            assert!(!state.pending_quality_refresh);
+
+            // Explicit refresh starts a new query even while the old query has
+            // a delayed phase. It must replace the whole reader and stage chain.
+            fs::write(
+                source.join("gamma.md"),
+                "sharedtoken manual refresh document",
+            )
+            .unwrap();
+            publish(&runtime, &cx, &root).await;
+            let manually_selected = store.active(&cx).unwrap().unwrap();
+            state.schedule_quality_refresh();
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(!session.refresh_idle(&cx, &mut state, false).await);
+            }
+            assert_eq!(reader.generation(), &successor);
+            {
+                let mut session = SearchDashboardSession::Retained(&mut reader);
+                assert!(session.refresh_idle(&cx, &mut state, true).await);
+                session.refresh_status(&mut state).unwrap();
+                assert!(state.pending_lexical_refresh);
+                assert!(state.pending_semantic_refresh);
+                assert!(!state.pending_quality_refresh);
+                assert!(session.begin_query(&cx, &mut state).await);
+                let (runtime, resources) = session.parts();
+                runtime
+                    .refresh_search_dashboard_lexical(&cx, &mut state, resources)
+                    .await;
+            }
+            assert_eq!(reader.generation(), &manually_selected);
+            assert_eq!(state.latest_hits().len(), 3);
+            assert!(state.latest_hits().iter().any(|hit| hit.path == "gamma.md"));
+            assert_eq!(
+                state.status_payload.index.path,
+                manually_selected.path().display().to_string()
+            );
+            assert_eq!(sealed_inventory(predecessor.path()), before);
+            assert_eq!(sealed_inventory(successor.path()), successor_before);
         });
     }
 
