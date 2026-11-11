@@ -6001,12 +6001,19 @@ struct QuillWriterState {
     /// against the concurrent build in [`Self::seal_lease_cuts`].
     #[cfg(any(test, feature = "bench-internals"))]
     serial_lease_cut_seals: bool,
+    #[cfg(test)]
+    ingest_test_controls: IngestTestControls,
+}
+
+/// Per-index controls and observations for deterministic ingestion tests.
+#[cfg(test)]
+#[derive(Default)]
+struct IngestTestControls {
     /// Test-only, per index, default OFF. When set, the shared-nothing routes
     /// arm the shard rendezvous from their REAL plan so a test can force
     /// overlap. It must stay opt-in: arming it for every `cfg(test)` fan-out
     /// changes scheduling across the whole suite and makes a serial pool wait
     /// out the rendezvous deadline on every batch.
-    #[cfg(test)]
     force_ingest_overlap_rendezvous: bool,
     /// Test-only, default OFF. When set to `Some(n)`, the serial ingest route
     /// requests cancellation on the request `Cx` once exactly `n` documents of
@@ -6014,15 +6021,12 @@ struct QuillWriterState {
     /// batch that fails midway with real partial shard state behind it
     /// (gh#45). The cancellation is discovered by the ordinary
     /// `check_cancel` poll; nothing else is short-circuited.
-    #[cfg(test)]
     cancel_ingest_after_documents: Option<usize>,
     /// Cancel after real visible-seal encoding and before a proposal is staged.
-    #[cfg(test)]
     cancel_visible_seal_after_build: bool,
     /// Documents actually analyzed by the adaptive budget proof. This is
     /// per-index and test-only so a regression can distinguish bounded-wave
     /// refusal from eagerly analyzing the whole rejected batch.
-    #[cfg(test)]
     parallel_budget_documents_analyzed: AtomicUsize,
 }
 
@@ -6477,13 +6481,7 @@ impl QuillWriterState {
             #[cfg(any(test, feature = "bench-internals"))]
             serial_lease_cut_seals: false,
             #[cfg(test)]
-            force_ingest_overlap_rendezvous: false,
-            #[cfg(test)]
-            cancel_ingest_after_documents: None,
-            #[cfg(test)]
-            cancel_visible_seal_after_build: false,
-            #[cfg(test)]
-            parallel_budget_documents_analyzed: AtomicUsize::new(0),
+            ingest_test_controls: IngestTestControls::default(),
         })
     }
 
@@ -7348,7 +7346,7 @@ impl QuillWriterState {
             #[cfg(test)]
             let budget_observation = ParallelBatchObservation::default();
             #[cfg(test)]
-            if self.force_ingest_overlap_rendezvous {
+            if self.ingest_test_controls.force_ingest_overlap_rendezvous {
                 budget_observation.arm_rendezvous(active_shards);
             }
             let mut admitted_batch_bytes = 0_usize;
@@ -7365,7 +7363,8 @@ impl QuillWriterState {
                         let mut analyzer = FrankensearchTokenizer::default();
                         for (slot, document) in slots.iter_mut().zip(chunk) {
                             #[cfg(test)]
-                            self.parallel_budget_documents_analyzed
+                            self.ingest_test_controls
+                                .parallel_budget_documents_analyzed
                                 .fetch_add(1, Ordering::AcqRel);
                             let document_bound = parallel_document_logical_upper_bound(
                                 self.schema,
@@ -7498,8 +7497,7 @@ impl QuillWriterState {
             .map_err(|error| invalid_state(error.to_string()))?;
         let mut deltas = current.delta_snapshots().to_vec();
         let lease_width = u64::from(DOC_ORDS_PER_LEASE);
-        let mut next_docid = self.next_lease_base;
-        let lease_base = next_docid / lease_width * lease_width;
+        let lease_base = self.next_lease_base / lease_width * lease_width;
         let mut delta = if deltas
             .last()
             .is_some_and(|last| last.lease_base() == lease_base)
@@ -7513,9 +7511,11 @@ impl QuillWriterState {
         };
         let mut scratch = ColumnarAccumulator::new(self.schema)?;
         let mut metadata = Vec::new();
-        for (document_index, document) in documents.iter().enumerate() {
+        for (next_docid, (document_index, document)) in
+            (self.next_lease_base..successor_watermark).zip(documents.iter().enumerate())
+        {
             #[cfg(test)]
-            if self.cancel_ingest_after_documents == Some(document_index) {
+            if self.ingest_test_controls.cancel_ingest_after_documents == Some(document_index) {
                 cx.set_cancel_requested(true);
             }
             // The index is used only by the deterministic cancellation seam.
@@ -7538,7 +7538,6 @@ impl QuillWriterState {
                 document.id(),
                 content_hash,
             )?;
-            next_docid += 1;
         }
         deltas.push(Arc::new(delta.into_snapshot(current.keeper_generation())));
         let logical_bytes = deltas.iter().try_fold(0_usize, |total, delta| {
@@ -7671,7 +7670,7 @@ impl QuillWriterState {
             .published_snapshot
             .prepare_sealed_manifest(self.schema, &manifest)?;
         #[cfg(test)]
-        if self.cancel_visible_seal_after_build {
+        if self.ingest_test_controls.cancel_visible_seal_after_build {
             cx.set_cancel_requested(true);
         }
         check_cancel(cx, "visible Delta install")?;
@@ -7895,7 +7894,7 @@ impl QuillWriterState {
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
         #[cfg(test)]
-        if self.force_ingest_overlap_rendezvous {
+        if self.ingest_test_controls.force_ingest_overlap_rendezvous {
             observation.arm_rendezvous(plan.active_shards);
         }
         observation.set_route(QuillScaleoutRoute::SharedNothing);
@@ -8182,7 +8181,7 @@ impl QuillWriterState {
 
         let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
         #[cfg(test)]
-        if self.force_ingest_overlap_rendezvous {
+        if self.ingest_test_controls.force_ingest_overlap_rendezvous {
             observation.arm_rendezvous(plan.active_shards);
         }
         observation.set_route(QuillScaleoutRoute::SharedNothing);
@@ -8822,7 +8821,7 @@ impl QuillWriterState {
                     .get(document_index)
                     .ok_or_else(|| invalid_state("shard document index is outside the batch"))?;
                 #[cfg(test)]
-                if self.cancel_ingest_after_documents == Some(document_index) {
+                if self.ingest_test_controls.cancel_ingest_after_documents == Some(document_index) {
                     cx.set_cancel_requested(true);
                 }
                 document_index += 1;
@@ -9021,7 +9020,7 @@ impl QuillWriterState {
                 // borrows are carved out in ascending shard order, scoped so
                 // the shard-vector borrow ends before the seal pass below.
                 #[cfg(test)]
-                let force_overlap = self.force_ingest_overlap_rendezvous;
+                let force_overlap = self.ingest_test_controls.force_ingest_overlap_rendezvous;
                 let outcomes = {
                     let mut work: Vec<(&mut ScribeShardState, IngestBatch<'_>, DocIdSpan)> =
                         Vec::with_capacity(allocations.len());
@@ -26114,10 +26113,16 @@ mod tests {
                 .expect("stage accepted originals without committing");
                 assert!(index.has_uncommitted_changes());
                 let replacements = [("first", "omega one"), ("second", "omega two")];
-                index.writer_mut().cancel_ingest_after_documents = Some(1);
+                index
+                    .writer_mut()
+                    .ingest_test_controls
+                    .cancel_ingest_after_documents = Some(1);
                 let cancelled =
                     upsert_pending_fixture_documents(&index, &cx, schema, &replacements).await;
-                index.writer_mut().cancel_ingest_after_documents = None;
+                index
+                    .writer_mut()
+                    .ingest_test_controls
+                    .cancel_ingest_after_documents = None;
                 cx.set_cancel_requested(false);
                 assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
                 assert!(!index.has_uncommitted_changes());
@@ -26505,9 +26510,15 @@ mod tests {
                 IndexableDocument::new("gh45-3", "omega three"),
             ];
 
-            index.writer_mut().cancel_ingest_after_documents = Some(1);
+            index
+                .writer_mut()
+                .ingest_test_controls
+                .cancel_ingest_after_documents = Some(1);
             let cancelled = LexicalWrite::index_documents(&index, &cx, &replacements).await;
-            index.writer_mut().cancel_ingest_after_documents = None;
+            index
+                .writer_mut()
+                .ingest_test_controls
+                .cancel_ingest_after_documents = None;
             cx.set_cancel_requested(false);
             assert!(
                 matches!(
@@ -29017,13 +29028,19 @@ mod tests {
                 IndexableDocument::new("cancel-a", "delta"),
                 IndexableDocument::new("cancel-b", "delta"),
             ];
-            index.writer_mut().cancel_ingest_after_documents = Some(1);
+            index
+                .writer_mut()
+                .ingest_test_controls
+                .cancel_ingest_after_documents = Some(1);
             let cancelled = Cx::for_testing();
             assert!(matches!(
                 index.index_documents_visible(&cancelled, &batch).await,
                 Err(QuillIndexError::Cancelled { .. })
             ));
-            index.writer_mut().cancel_ingest_after_documents = None;
+            index
+                .writer_mut()
+                .ingest_test_controls
+                .cancel_ingest_after_documents = None;
             assert!(Arc::ptr_eq(&before, &index.search_snapshot().unwrap()));
             assert!(index.writer_mut().pending_visible_batch.is_none());
             assert!(index.writer_mut().pending_delta_seal.is_none());
@@ -29076,7 +29093,10 @@ mod tests {
                 IndexableDocument::new("retained-a", "new alpha"),
                 IndexableDocument::new("retained-b", "new beta"),
             ];
-            index.writer_mut().cancel_visible_seal_after_build = true;
+            index
+                .writer_mut()
+                .ingest_test_controls
+                .cancel_visible_seal_after_build = true;
             let cancelled = Cx::for_testing();
             assert!(matches!(
                 index.index_documents_visible(&cancelled, &batch).await,
@@ -29084,7 +29104,10 @@ mod tests {
                     phase: "visible Delta install"
                 })
             ));
-            index.writer_mut().cancel_visible_seal_after_build = false;
+            index
+                .writer_mut()
+                .ingest_test_controls
+                .cancel_visible_seal_after_build = false;
             assert!(index.writer_mut().pending_visible_batch.is_some());
             assert!(
                 index.writer_mut().pending_delta_seal.is_none(),
@@ -29444,7 +29467,10 @@ mod tests {
             index.writer_mut().reader.config.max_visibility_lag_ms = 10;
             let aged = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
             index.writer_mut().unpublished_since = Some(aged);
-            index.writer_mut().cancel_visible_seal_after_build = true;
+            index
+                .writer_mut()
+                .ingest_test_controls
+                .cancel_visible_seal_after_build = true;
             let cancelled = Cx::for_testing();
             assert!(matches!(
                 index
@@ -29457,7 +29483,10 @@ mod tests {
                     phase: "visible Delta install"
                 })
             ));
-            index.writer_mut().cancel_visible_seal_after_build = false;
+            index
+                .writer_mut()
+                .ingest_test_controls
+                .cancel_visible_seal_after_build = false;
             assert_eq!(index.writer_mut().unpublished_since, Some(aged));
             assert!(index.writer_mut().pending_visible_batch.is_some());
             assert!(Arc::ptr_eq(&before, &index.search_snapshot().unwrap()));
@@ -38060,7 +38089,7 @@ mod tests {
                 .expect("parallel budget preflight index");
                 let documents = parallel_budget_fixture_documents(5_000);
                 let writer = index.writer_mut();
-                writer.force_ingest_overlap_rendezvous = true;
+                writer.ingest_test_controls.force_ingest_overlap_rendezvous = true;
                 let plan = plan_parallel_ingest(
                     documents.len(),
                     writer.shard_router.shard_count(),
@@ -38126,6 +38155,7 @@ mod tests {
                     "the 6.25 MB QG-1 budget must reject the 5,000-document fixture",
                 );
                 let analyzed = writer
+                    .ingest_test_controls
                     .parallel_budget_documents_analyzed
                     .load(Ordering::Acquire);
                 assert_eq!(
@@ -38336,7 +38366,7 @@ mod tests {
                 let writer = index.writer_mut();
                 // Opt in explicitly: the rendezvous is per index and off by
                 // default, so no other test's scheduling is affected.
-                writer.force_ingest_overlap_rendezvous = true;
+                writer.ingest_test_controls.force_ingest_overlap_rendezvous = true;
                 let plan = plan_parallel_ingest(
                     documents.len(),
                     writer.shard_router.shard_count(),
@@ -38896,7 +38926,10 @@ mod tests {
                         ..QuillConfig::default()
                     };
                     let mut index = QuillIndex::in_memory(config).expect("success receipt index");
-                    index.writer_mut().force_ingest_overlap_rendezvous = true;
+                    index
+                        .writer_mut()
+                        .ingest_test_controls
+                        .force_ingest_overlap_rendezvous = true;
                     let documents = (0..250)
                         .map(|ordinal| {
                             IndexableDocument::new(
@@ -43239,7 +43272,10 @@ mod tests {
                     ..QuillConfig::default()
                 })
                 .expect("scaleout witness index");
-                index.writer_mut().force_ingest_overlap_rendezvous = true;
+                index
+                    .writer_mut()
+                    .ingest_test_controls
+                    .force_ingest_overlap_rendezvous = true;
 
                 // 1. SharedNothing parallel fan-out (250 docs -> 3 active shards).
                 let batch1 = (0..250)
@@ -43336,7 +43372,10 @@ mod tests {
 
                 // 5. Mid-accumulation cancellation inside the accumulation driver.
                 index.commit(&cx).await.expect("commit prior batches");
-                index.writer_mut().cancel_ingest_after_documents = Some(2);
+                index
+                    .writer_mut()
+                    .ingest_test_controls
+                    .cancel_ingest_after_documents = Some(2);
                 let mid_cancel_cx = Cx::for_testing();
                 let batch4 = (0..8)
                     .map(|ordinal| {
