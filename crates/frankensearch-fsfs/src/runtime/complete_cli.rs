@@ -3234,7 +3234,7 @@ mod tests {
     #[test]
     fn complete_search_falls_back_in_process_on_a_stale_store_socket() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let (runtime, _, root) = fixture(directory.path());
             publish(&runtime, &cx, &root).await;
             let socket = runtime.complete_generation_socket_path(&root).unwrap();
@@ -3456,7 +3456,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let excluded_ancestors = directory.path().join("build/target");
             fs::create_dir_all(&excluded_ancestors).unwrap();
             let temporary = tempfile::tempdir_in(&excluded_ancestors).unwrap();
@@ -3567,7 +3567,7 @@ mod tests {
             assert!(!socket.exists());
 
             // A named socket outside the store gets a daemon of its own.
-            let sockets = tempfile::tempdir().unwrap();
+            let sockets = tempfile::tempdir_in("/tmp").unwrap();
             let named = fs::canonicalize(sockets.path()).unwrap().join("named.sock");
             search.cli_input.daemon_socket = Some(named.clone());
             let first = Box::pin(search.run_complete_generation_search_with_writer(
@@ -3624,7 +3624,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let (runtime, _, root) = fixture(directory.path());
             publish(&runtime, &cx, &root).await;
             let socket = runtime.complete_generation_socket_path(&root).unwrap();
@@ -3758,7 +3758,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(directory.path());
             publish(&runtime, &cx, &root).await;
-            let sockets = tempfile::tempdir().unwrap();
+            let sockets = tempfile::tempdir_in("/tmp").unwrap();
             let socket = fs::canonicalize(sockets.path())
                 .unwrap()
                 .join("policy.sock");
@@ -4815,8 +4815,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, _, root) = fixture(directory.path());
         fs::create_dir(&root).unwrap();
-        let authority =
-            root.join(frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME);
+        let authority = root.join(
+            frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME,
+        );
         fs::write(&authority, b"fixed authority").unwrap();
         let nested = root.join("existing");
         fs::create_dir(&nested).unwrap();
@@ -4870,7 +4871,9 @@ mod tests {
         fs::create_dir(&root).unwrap();
         std::os::unix::fs::symlink(
             "absent-authority",
-            root.join(frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME),
+            root.join(
+                frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME,
+            ),
         )
         .unwrap();
         let selection = root.join(COMPLETE_GENERATION_POINTER);

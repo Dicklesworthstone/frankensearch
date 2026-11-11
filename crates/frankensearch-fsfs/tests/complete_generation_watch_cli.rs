@@ -16,6 +16,8 @@ struct Fixture {
     source: PathBuf,
     store: PathBuf,
     config: PathBuf,
+    #[cfg(feature = "semantic-support")]
+    quality: bool,
 }
 
 #[cfg(feature = "semantic-support")]
@@ -70,8 +72,9 @@ fn complete_stream_frames(output: &Output, format: &str) -> Vec<Value> {
 }
 
 impl Fixture {
-    fn new(models: Option<&Path>) -> Self {
-        let directory = tempfile::tempdir().unwrap();
+    fn new(models: Option<&Path>, quality: bool) -> Self {
+        // This fixture also binds the store's real AF_UNIX daemon socket.
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let source = directory.path().join("source");
         let store = directory.path().join("store");
         let config = directory.path().join("fsfs.toml");
@@ -81,8 +84,10 @@ impl Fixture {
         "{index_dir}/catalog.sqlite".clone_into(&mut settings.storage.db_path);
         settings.indexing.offline = true;
         settings.indexing.watch_mode = false;
-        settings.indexing.quality_model.clear();
-        settings.search.fast_only = true;
+        if !quality {
+            settings.indexing.quality_model.clear();
+        }
+        settings.search.fast_only = !quality;
         settings.search.rerank = false;
         if let Some(models) = models {
             settings.indexing.model_dir = models.display().to_string();
@@ -93,6 +98,8 @@ impl Fixture {
             source,
             store,
             config,
+            #[cfg(feature = "semantic-support")]
+            quality,
         }
     }
 
@@ -148,7 +155,7 @@ impl Process {
     fn assert_alive(&mut self) {
         assert!(
             self.child.try_wait().unwrap().is_none(),
-            "watch exited\n{}\n{}",
+            "fsfs subprocess exited\n{}\n{}",
             String::from_utf8_lossy(&self.stdout()),
             fs::read_to_string(self.capture.path().join("stderr")).unwrap()
         );
@@ -185,7 +192,7 @@ impl Drop for Process {
 #[test]
 fn complete_watch_binary_refuses_unframed_output_before_creating_store() {
     for command in ["watch", "index"] {
-        let fixture = Fixture::new(None);
+        let fixture = Fixture::new(None, false);
         let mut invocation = fixture.command(command, "json");
         invocation.env("FSFS_COMPLETE_GENERATIONS", "1");
         if command == "index" {
@@ -212,7 +219,7 @@ fn watch_binary_enforces_background_policy_before_creating_an_index() {
                 ("degraded", false, "pressure.profile"),
                 ("performance", true, "pressure.hard_pause_requested"),
             ] {
-                let fixture = Fixture::new(None);
+                let fixture = Fixture::new(None, false);
                 let mut invocation = fixture.command(command, "jsonl");
                 invocation
                     .env("FSFS_COMPLETE_GENERATIONS", complete)
@@ -254,7 +261,7 @@ fn watch_binary_enforces_background_policy_before_creating_an_index() {
 #[test]
 fn later_no_watch_override_keeps_index_binary_one_shot() {
     for complete in [None, Some("0"), Some("1")] {
-        let fixture = Fixture::new(None);
+        let fixture = Fixture::new(None, false);
         let mut invocation = fixture.command("index", "json");
         if let Some(complete) = complete {
             invocation.env("FSFS_COMPLETE_GENERATIONS", complete);
@@ -293,6 +300,7 @@ fn wait_for_visible_paths(
     fixture: &Fixture,
     watch: &mut Process,
     expected: &[&str],
+    after: Option<&str>,
 ) -> PublishedGeneration {
     let reader_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
@@ -315,7 +323,7 @@ fn wait_for_visible_paths(
             .rfind(|value| value["ok"] == true && value["data"]["publication"] == "durable");
         if let Some(receipt) = receipt {
             let generation = receipt["data"]["generation_id"].as_str().unwrap();
-            if generation != last_generation {
+            if generation != last_generation && after != Some(generation) {
                 // Admit and pin the exact selected image before querying. A
                 // pathname alone is not a reader and cannot fence collection.
                 let store = CompleteGenerationStore::open(&cx, &fixture.store).unwrap();
@@ -325,8 +333,11 @@ fn wait_for_visible_paths(
                     continue;
                 }
                 generation.clone_into(&mut last_generation);
+                // The synthetic lexical marker can have zero model signal;
+                // common words must exercise the actual semantic reader.
                 let output = Process::start(fixture.command("search", "json").args([
-                    "sharedtoken",
+                    "find a relevant document",
+                    "--fast-only",
                     "--no-daemon",
                     "--limit",
                     "10",
@@ -351,9 +362,40 @@ fn wait_for_visible_paths(
                     })
                     && store.is_selected(&cx, &selected).unwrap()
                 {
+                    assert_search_hits(&result["data"], expected, "semantic_rank");
+                    if fixture.quality {
+                        let quality = Process::start(fixture.command("search", "json").args([
+                            "find a relevant document",
+                            "--quality-only",
+                            "--no-daemon",
+                            "--limit",
+                            "10",
+                        ]))
+                        .finish(Duration::from_secs(60));
+                        watch.assert_alive();
+                        assert!(
+                            quality.status.success(),
+                            "quality search while watcher alive failed: {}\n{}",
+                            String::from_utf8_lossy(&quality.stdout),
+                            String::from_utf8_lossy(&quality.stderr)
+                        );
+                        let quality: Value = serde_json::from_slice(&quality.stdout).unwrap();
+                        let payload = &quality["data"];
+                        assert_eq!(payload["skip_reason"], "quality_only");
+                        assert!(payload["vector_generation_id"].is_string());
+                        assert_ne!(
+                            payload["vector_generation_id"],
+                            result["data"]["vector_generation_id"]
+                        );
+                        assert_search_hits(payload, expected, "semantic_rank");
+                        assert!(store.is_selected(&cx, &selected).unwrap());
+                    }
                     assert_eq!(
                         selected.path(),
                         Path::new(receipt["data"]["generation_path"].as_str().unwrap())
+                    );
+                    eprintln!(
+                        "direct readers observed durable generation={generation} after={after:?} paths={expected:?}"
                     );
                     return selected;
                 }
@@ -364,8 +406,169 @@ fn wait_for_visible_paths(
 }
 
 #[cfg(feature = "semantic-support")]
+fn assert_search_hits(payload: &Value, expected: &[&str], rank: &str) {
+    let hits = payload["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), expected.len(), "{payload}");
+    for name in expected {
+        assert!(
+            hits.iter().any(|hit| {
+                hit[rank].is_number()
+                    && Path::new(hit["path"].as_str().unwrap())
+                        .file_name()
+                        .is_some_and(|filename| filename == std::ffi::OsStr::new(name))
+            }),
+            "missing {name} with {rank}: {payload}"
+        );
+    }
+}
+
+#[cfg(feature = "semantic-support")]
+fn daemon_query(
+    fixture: &Fixture,
+    watch: &mut Process,
+    daemon: &mut Process,
+    query: &str,
+    mode: &str,
+) -> Value {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    watch.assert_alive();
+    daemon.assert_alive();
+    let mut peer = UnixStream::connect(fixture.store.join("fsfs-query.sock")).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    peer.set_write_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    serde_json::to_writer(
+        &mut peer,
+        &serde_json::json!({"query": query, "mode": mode, "limit": 10, "rerank": false}),
+    )
+    .unwrap();
+    peer.write_all(b"\n").unwrap();
+    let mut line = String::new();
+    assert_ne!(
+        BufReader::new(peer)
+            .take(1024 * 1024)
+            .read_line(&mut line)
+            .unwrap(),
+        0,
+        "daemon returned premature EOF"
+    );
+    assert!(line.ends_with('\n'), "daemon returned an incomplete frame");
+    watch.assert_alive();
+    daemon.assert_alive();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["query"], query);
+    assert_eq!(response["mode"], mode);
+    assert_eq!(response["payloads"].as_array().unwrap().len(), 1);
+    eprintln!(
+        "daemon query={query} mode={mode} cached={} producer={} hits={}",
+        response["cached"],
+        response["payloads"][0]["vector_generation_id"],
+        response["payloads"][0]["hits"].as_array().unwrap().len()
+    );
+    response
+}
+
+#[cfg(feature = "semantic-support")]
+fn assert_daemon_visible_paths(
+    fixture: &Fixture,
+    watch: &mut Process,
+    daemon: &mut Process,
+    expected: &[&str],
+) {
+    // Use the real socket, so a successful in-process CLI fallback cannot
+    // impersonate a daemon that remains pinned to an old generation.
+    let fast = daemon_query(
+        fixture,
+        watch,
+        daemon,
+        "find a relevant document",
+        "fast_only",
+    );
+    let fast = &fast["payloads"][0];
+    assert_eq!(fast["phase"], "initial");
+    assert!(fast["vector_generation_id"].is_string());
+    assert_ne!(fast["vector_generation_is_hash"], true);
+    assert_search_hits(fast, expected, "semantic_rank");
+    if fixture.quality {
+        let quality = daemon_query(
+            fixture,
+            watch,
+            daemon,
+            "find a relevant document",
+            "quality_only",
+        );
+        let quality = &quality["payloads"][0];
+        assert_eq!(quality["skip_reason"], "quality_only");
+        assert!(quality["vector_generation_id"].is_string());
+        assert_ne!(quality["vector_generation_is_hash"], true);
+        assert_ne!(
+            quality["vector_generation_id"],
+            fast["vector_generation_id"]
+        );
+        assert_search_hits(quality, expected, "semantic_rank");
+    }
+    let lexical = daemon_query(fixture, watch, daemon, "sharedtoken", "lexical_only");
+    assert_search_hits(&lexical["payloads"][0], expected, "lexical_rank");
+}
+
+#[cfg(feature = "semantic-support")]
+fn assert_content_edit_visible(
+    fixture: &Fixture,
+    watch: &mut Process,
+    daemon: &mut Process,
+    previous: &str,
+) -> PublishedGeneration {
+    let original = daemon_query(fixture, watch, daemon, "priorcontenttoken", "lexical_only");
+    assert_search_hits(&original["payloads"][0], &["alpha.md"], "lexical_rank");
+    // Response delivery precedes the concurrent worker's cache merge. Wait
+    // for an observed cache hit before changing the source, rather than
+    // assuming the next connection cannot race that merge.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "daemon never warmed the cache control"
+        );
+        let warm = daemon_query(fixture, watch, daemon, "priorcontenttoken", "lexical_only");
+        assert_search_hits(&warm["payloads"][0], &["alpha.md"], "lexical_rank");
+        if warm["cached"] == true {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    eprintln!("watch source content-edit after={previous}");
+    fs::write(
+        fixture.source.join("alpha.md"),
+        "sharedtoken alpha document replacementcontenttoken",
+    )
+    .unwrap();
+    let edited = wait_for_visible_paths(fixture, watch, &["alpha.md"], Some(previous));
+    assert_daemon_visible_paths(fixture, watch, daemon, &["alpha.md"]);
+    let old = daemon_query(fixture, watch, daemon, "priorcontenttoken", "lexical_only");
+    assert_eq!(
+        old["cached"], false,
+        "old positive cache must be invalidated"
+    );
+    assert_search_hits(&old["payloads"][0], &[], "lexical_rank");
+    let new = daemon_query(
+        fixture,
+        watch,
+        daemon,
+        "replacementcontenttoken",
+        "lexical_only",
+    );
+    assert_search_hits(&new["payloads"][0], &["alpha.md"], "lexical_rank");
+    edited
+}
+
+#[cfg(feature = "semantic-support")]
 #[test]
-#[ignore = "requires FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR with a verified Potion cache"]
+#[ignore = "requires FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR with verified Potion and MiniLM caches"]
 fn complete_watch_binary_keeps_search_available() {
     let models = fs::canonicalize(
         std::env::var_os("FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR")
@@ -373,14 +576,32 @@ fn complete_watch_binary_keeps_search_available() {
     )
     .unwrap();
     for legacy_seed in [false, true] {
-        assert_default_complete_watch_lifecycle(&models, legacy_seed);
+        for index_watch in [false, true] {
+            for quality in [false, true] {
+                assert_default_complete_watch_lifecycle(&models, legacy_seed, index_watch, quality);
+            }
+        }
     }
 }
 
 #[cfg(feature = "semantic-support")]
-fn assert_default_complete_watch_lifecycle(models: &Path, legacy_seed: bool) {
-    eprintln!("default complete-watch lifecycle: legacy_seed={legacy_seed}");
-    let fixture = Fixture::new(Some(models));
+fn assert_default_complete_watch_lifecycle(
+    models: &Path,
+    legacy_seed: bool,
+    index_watch: bool,
+    quality: bool,
+) {
+    eprintln!(
+        "default complete-watch lifecycle: legacy_seed={legacy_seed} index_watch={index_watch} quality={quality}"
+    );
+    let fixture = Fixture::new(Some(models), quality);
+    // Keep cache canaries local to this lifecycle case; refusal probes retain
+    // the shared fixture's original source bytes.
+    fs::write(
+        fixture.source.join("alpha.md"),
+        "sharedtoken alpha document priorcontenttoken",
+    )
+    .unwrap();
     // A completed legacy root must promote on ordinary watch startup, without
     // an opt-in flag. Keep the explicit opt-out's legacy behavior observable.
     if legacy_seed {
@@ -401,20 +622,59 @@ fn assert_default_complete_watch_lifecycle(models: &Path, legacy_seed: bool) {
                 .unwrap();
         assert_eq!(sentinel["generation_complete"], true);
     }
-    let mut watch = Process::start(&mut fixture.command("watch", "jsonl"));
-    let first = wait_for_visible_paths(&fixture, &mut watch, &["alpha.md"]);
+    let mut command = fixture.command(if index_watch { "index" } else { "watch" }, "jsonl");
+    if index_watch {
+        command.arg("--watch");
+    }
+    let mut watch = Process::start(&mut command);
+    let first = wait_for_visible_paths(&fixture, &mut watch, &["alpha.md"], None);
     let original_manifest = fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap();
+    let socket = fixture.store.join("fsfs-query.sock");
+    let mut daemon = Process::start(
+        fixture
+            .command("daemon", "json")
+            .args(["--idle-timeout-ms", "0"]),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !socket.exists() {
+        watch.assert_alive();
+        daemon.assert_alive();
+        assert!(Instant::now() < deadline, "daemon never opened its socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_daemon_visible_paths(&fixture, &mut watch, &mut daemon, &["alpha.md"]);
+    let edited = assert_content_edit_visible(&fixture, &mut watch, &mut daemon, first.id());
     fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
-    let second = wait_for_visible_paths(&fixture, &mut watch, &["alpha.md", "beta.md"]);
+    let second = wait_for_visible_paths(
+        &fixture,
+        &mut watch,
+        &["alpha.md", "beta.md"],
+        Some(edited.id()),
+    );
     assert_ne!(first, second);
+    drop(edited);
+    assert_daemon_visible_paths(&fixture, &mut watch, &mut daemon, &["alpha.md", "beta.md"]);
     fs::rename(
         fixture.source.join("alpha.md"),
         fixture.source.join("renamed.md"),
     )
     .unwrap();
-    wait_for_visible_paths(&fixture, &mut watch, &["renamed.md", "beta.md"]);
+    let renamed = wait_for_visible_paths(
+        &fixture,
+        &mut watch,
+        &["renamed.md", "beta.md"],
+        Some(second.id()),
+    );
+    assert_daemon_visible_paths(
+        &fixture,
+        &mut watch,
+        &mut daemon,
+        &["renamed.md", "beta.md"],
+    );
     fs::remove_file(fixture.source.join("beta.md")).unwrap();
-    wait_for_visible_paths(&fixture, &mut watch, &["renamed.md"]);
+    let deleted = wait_for_visible_paths(&fixture, &mut watch, &["renamed.md"], Some(renamed.id()));
+    drop(renamed);
+    assert_daemon_visible_paths(&fixture, &mut watch, &mut daemon, &["renamed.md"]);
     watch.assert_alive();
     assert_eq!(
         fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap(),
@@ -433,7 +693,18 @@ fn assert_default_complete_watch_lifecycle(models: &Path, legacy_seed: bool) {
         "sharedtoken gamma document",
     )
     .unwrap();
-    let _after_release = wait_for_visible_paths(&fixture, &mut watch, &["renamed.md", "gamma.md"]);
+    let _after_release = wait_for_visible_paths(
+        &fixture,
+        &mut watch,
+        &["renamed.md", "gamma.md"],
+        Some(deleted.id()),
+    );
+    assert_daemon_visible_paths(
+        &fixture,
+        &mut watch,
+        &mut daemon,
+        &["renamed.md", "gamma.md"],
+    );
     for path in [&first_path, &second_path] {
         assert_eq!(
             fs::symlink_metadata(path).unwrap_err().kind(),
@@ -442,7 +713,21 @@ fn assert_default_complete_watch_lifecycle(models: &Path, legacy_seed: bool) {
             path.display()
         );
     }
-    // Drop bounds cleanup; it is not a graceful-SIGINT assertion.
+    let stopped = Process::start(fixture.command("daemon", "json").arg("--stop"))
+        .finish(Duration::from_secs(10));
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let daemon_exit = daemon.finish(Duration::from_secs(10));
+    assert!(
+        daemon_exit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&daemon_exit.stderr)
+    );
+    watch.assert_alive();
+    // Drop bounds watcher cleanup; it is not a graceful-SIGINT assertion.
 }
 
 #[cfg(feature = "semantic-support")]
@@ -506,7 +791,7 @@ fn complete_daemon_binary_serves_and_stops_with_corrupt_selection() {
             .expect("provide a verified semantic model-cache root"),
     )
     .unwrap();
-    let fixture = Fixture::new(Some(&models));
+    let fixture = Fixture::new(Some(&models), false);
     let indexed =
         Process::start(&mut fixture.command("index", "json")).finish(Duration::from_secs(180));
     assert!(

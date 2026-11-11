@@ -1110,12 +1110,12 @@ impl FsfsRuntime {
                 "complete-generation watch requires --format table, jsonl, or toon; a sequence of standalone JSON or CSV documents is not emitted",
             ));
         }
-        self.watch_retained_generations(cx, root, |generation| {
+        Box::pin(self.watch_retained_generations(cx, root, |generation| {
             let retention = self.retire_superseded_generations(cx, root);
             self.emit_complete_generation_receipt(
                 root, generation, "watch", &retention, None, writer,
             )
-        })
+        }))
         .await
     }
 }
@@ -1230,13 +1230,12 @@ mod tests {
                     ..CliInput::default()
                 });
                 let mut delivered = 0;
-                let error = runtime
-                    .watch_retained_generations(&cx, &root, |_| {
-                        delivered += 1;
-                        Ok(())
-                    })
-                    .await
-                    .unwrap_err();
+                let error = Box::pin(runtime.watch_retained_generations(&cx, &root, |_| {
+                    delivered += 1;
+                    Ok(())
+                }))
+                .await
+                .unwrap_err();
                 assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                     if field == expected_field));
                 assert_eq!(delivered, 0);
@@ -2501,13 +2500,14 @@ mod lifecycle_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(directory.path());
             let mut received = None;
-            let error = runtime
-                .watch_retained_generations(&cx, &root, |generation| {
+            let error = Box::pin(
+                runtime.watch_retained_generations(&cx, &root, |generation| {
                     received = Some(generation.clone());
                     Err(complete_cli_error("test_sink", "injected output failure"))
-                })
-                .await
-                .unwrap_err();
+                }),
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(error, SearchError::InvalidConfig { field, .. } if field == "complete_generation.test_sink")
             );
@@ -2527,14 +2527,13 @@ mod lifecycle_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, _, root) = fixture(directory.path());
             let mut delivered = 0;
-            let error = runtime
-                .watch_retained_generations(&cx, &root, |_| {
-                    delivered += 1;
-                    cx.set_cancel_requested(true);
-                    Ok(())
-                })
-                .await
-                .unwrap_err();
+            let error = Box::pin(runtime.watch_retained_generations(&cx, &root, |_| {
+                delivered += 1;
+                cx.set_cancel_requested(true);
+                Ok(())
+            }))
+            .await
+            .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             assert_eq!(delivered, 1);
             cx.set_cancel_requested(false);
@@ -2551,13 +2550,12 @@ mod lifecycle_tests {
             let (runtime, _, root) = fixture(directory.path());
             cx.set_cancel_requested(true);
             let mut delivered = 0;
-            let error = runtime
-                .watch_retained_generations(&cx, &root, |_| {
-                    delivered += 1;
-                    Ok(())
-                })
-                .await
-                .unwrap_err();
+            let error = Box::pin(runtime.watch_retained_generations(&cx, &root, |_| {
+                delivered += 1;
+                Ok(())
+            }))
+            .await
+            .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             assert_eq!(delivered, 0);
             assert!(!root.exists());
@@ -3085,7 +3083,7 @@ mod lifecycle_tests {
                 fast.inputs.lock().unwrap().clear();
                 assert!(
                     watching
-                        .advance(&cx, retry_at - IDLE_POLL)
+                        .advance(&cx, retry_at.checked_sub(IDLE_POLL).unwrap())
                         .await
                         .unwrap()
                         .is_none()
@@ -3108,7 +3106,7 @@ mod lifecycle_tests {
                 fs::write(&beta, "retrytickbetatoken third edit").unwrap();
                 {
                     let mut changes = lock_changes(&watching.changes).unwrap();
-                    changes.record(next_retry - DEBOUNCE, false);
+                    changes.record(next_retry.checked_sub(DEBOUNCE).unwrap(), false);
                     changes.record_path(&beta);
                 }
                 let newest = require_durable_publication(

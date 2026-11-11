@@ -1506,15 +1506,16 @@ mod loader_only {
         assert_eq!(records.len(), 1, "persist one store-owned answer");
         let (cache_path, cache_bytes, original_record) = records.pop().unwrap();
         let assert_generation_binding = |record: &Value, generation: &Path| {
+            use std::fmt::Write as _;
+            assert_eq!(
+                record["complete_generation"]["id"],
+                generation.file_name().unwrap().to_str().unwrap()
+            );
             let mut manifest_sha256 = String::with_capacity(64);
             for byte in sha2::Sha256::digest(fs::read(generation.join("FSFS-BUNDLE.json")).unwrap())
             {
                 write!(manifest_sha256, "{byte:02x}").unwrap();
             }
-            assert_eq!(
-                record["complete_generation"]["id"],
-                generation.file_name().unwrap().to_str().unwrap()
-            );
             assert_eq!(
                 record["complete_generation"]["manifest_sha256"],
                 manifest_sha256

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map:
 use std::fs;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::net::Shutdown;
 #[cfg(unix)]
@@ -8132,10 +8132,7 @@ impl FsfsRuntime {
         shutdown: Option<&ShutdownCoordinator>,
     ) -> SearchResult<()> {
         match self.cli_input.command {
-            CliCommand::Help => {
-                print_cli_help();
-                Ok(())
-            }
+            CliCommand::Help => print_cli_help(),
             CliCommand::Completions => self.run_completions_command(),
             CliCommand::Update => self.run_update_command(),
             CliCommand::Uninstall => self.run_uninstall_command(),
@@ -8153,8 +8150,9 @@ impl FsfsRuntime {
                 value: String::new(),
                 reason: "missing shell argument".into(),
             })?;
-        println!("{}", completion_script(shell));
-        Ok(())
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", completion_script(shell))?;
+        stdout.flush().map_err(SearchError::Io)
     }
 
     fn run_update_command(&self) -> SearchResult<()> {
@@ -8166,8 +8164,9 @@ impl FsfsRuntime {
         let payload = self.collect_update_payload()?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_update_table(&payload, self.cli_input.no_color);
-            print!("{table}");
-            return Ok(());
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(table.as_bytes())?;
+            return stdout.flush().map_err(SearchError::Io);
         }
 
         let meta = meta_for_format("update", self.cli_input.format);
@@ -8175,12 +8174,7 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            stdout
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.update",
-                    source: Box::new(source),
-                })?;
+            stdout.write_all(b"\n").map_err(SearchError::Io)?;
         }
         Ok(())
     }
@@ -8508,18 +8502,20 @@ impl FsfsRuntime {
         // If no version specified and format is table, list available backups.
         if version.is_none() && self.cli_input.update_check_only {
             let backups = list_backups();
+            let mut stdout = std::io::stdout().lock();
             if backups.is_empty() {
-                println!("No backups available for rollback.");
+                writeln!(stdout, "No backups available for rollback.")?;
             } else {
-                println!("Available backups:");
+                writeln!(stdout, "Available backups:")?;
                 for entry in &backups {
-                    println!(
+                    writeln!(
+                        stdout,
                         "  v{} (backed up at epoch {})",
                         entry.version, entry.backed_up_at_epoch
-                    );
+                    )?;
                 }
             }
-            return Ok(());
+            return stdout.flush().map_err(SearchError::Io);
         }
 
         if cfg!(all(
@@ -8561,8 +8557,9 @@ impl FsfsRuntime {
 
         if self.cli_input.format == OutputFormat::Table {
             let table = render_update_table(&payload, self.cli_input.no_color);
-            print!("{table}");
-            return Ok(());
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(table.as_bytes())?;
+            return stdout.flush().map_err(SearchError::Io);
         }
 
         let meta = meta_for_format("update", self.cli_input.format);
@@ -8570,12 +8567,7 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            stdout
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.update.rollback",
-                    source: Box::new(source),
-                })?;
+            stdout.write_all(b"\n").map_err(SearchError::Io)?;
         }
         Ok(())
     }
@@ -8584,8 +8576,9 @@ impl FsfsRuntime {
         let payload = self.collect_uninstall_payload(&UninstallUserDirs::from_environment())?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_uninstall_table(&payload, self.cli_input.no_color);
-            print!("{table}");
-            return Ok(());
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(table.as_bytes())?;
+            return stdout.flush().map_err(SearchError::Io);
         }
 
         let meta = meta_for_format("uninstall", self.cli_input.format);
@@ -8593,12 +8586,7 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            stdout
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.uninstall",
-                    source: Box::new(source),
-                })?;
+            stdout.write_all(b"\n").map_err(SearchError::Io)?;
         }
         Ok(())
     }
@@ -9199,6 +9187,7 @@ impl FsfsRuntime {
             .collect();
 
         if self.cli_input.format == OutputFormat::Table {
+            let mut stdout = std::io::stdout().lock();
             let mode = degraded_search_mode(
                 search_runtime.config.pressure.degradation_override,
                 search_runtime.requested_search_mode(),
@@ -9210,21 +9199,21 @@ impl FsfsRuntime {
                 // stdout both mean plain text.
                 let no_color = self.cli_input.no_color
                     || !crate::adapters::format_emitter::should_use_ansi_color();
-                println!("{}", paint(&mode_hint, "38;5;244", no_color));
+                writeln!(stdout, "{}", paint(&mode_hint, "38;5;244", no_color))?;
             }
             let table = crate::adapters::format_emitter::render_search_table_for_cli(
                 &payload,
                 Some(elapsed_ms),
                 self.cli_input.no_color,
             );
-            print!("{table}");
+            stdout.write_all(table.as_bytes())?;
             for hit in &explained {
-                println!("\n{}", hit.table);
+                writeln!(stdout, "\n{}", hit.table)?;
             }
             for warning in &explain_warnings {
-                println!("warning[{}]: {}", warning.code, warning.message);
+                writeln!(stdout, "warning[{}]: {}", warning.code, warning.message)?;
             }
-            return Ok(());
+            return stdout.flush().map_err(SearchError::Io);
         }
 
         let meta = meta_for_format("search", self.cli_input.format).with_duration_ms(elapsed_ms);
@@ -9233,34 +9222,24 @@ impl FsfsRuntime {
         let envelope =
             OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
         let stdout = std::io::stdout();
-        let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
-        if !(self.cli_input.compact
-            && crate::adapters::format_emitter::emit_compact_search_envelope(
-                &envelope,
+        crate::adapters::format_emitter::with_buffered_output(&mut stdout.lock(), |writer| {
+            if !(self.cli_input.compact
+                && crate::adapters::format_emitter::emit_compact_search_envelope(
+                    &envelope,
+                    self.cli_input.format,
+                    writer,
+                )?)
+            {
+                emit_envelope(&envelope, self.cli_input.format, writer)?;
+            }
+            if !matches!(
                 self.cli_input.format,
-                &mut writer,
-            )?)
-        {
-            emit_envelope(&envelope, self.cli_input.format, &mut writer)?;
-        }
-        if !matches!(
-            self.cli_input.format,
-            OutputFormat::Jsonl | OutputFormat::Csv
-        ) {
-            writer
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.search",
-                    source: Box::new(source),
-                })?;
-        }
-        writer
-            .flush()
-            .map_err(|source| SearchError::SubsystemError {
-                subsystem: "fsfs.search",
-                source: Box::new(source),
-            })?;
-        Ok(())
+                OutputFormat::Jsonl | OutputFormat::Csv
+            ) {
+                writer.write_all(b"\n")?;
+            }
+            Ok(())
+        })
     }
 
     async fn ensure_search_index_ready(&self, cx: &Cx) -> SearchResult<Option<PathBuf>> {
@@ -10751,26 +10730,19 @@ impl FsfsRuntime {
 
     fn emit_search_serve_json_line<T: Serialize>(value: &T) -> SearchResult<()> {
         let stdout = std::io::stdout();
-        let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
-        serde_json::to_writer(&mut writer, value).map_err(|source| {
-            SearchError::SubsystemError {
-                subsystem: "fsfs.search.serve",
-                source: Box::new(source),
-            }
-        })?;
-        writer
-            .write_all(b"\n")
-            .map_err(|source| SearchError::SubsystemError {
-                subsystem: "fsfs.search.serve",
-                source: Box::new(source),
+        crate::adapters::format_emitter::with_buffered_output(&mut stdout.lock(), |writer| {
+            serde_json::to_writer(&mut *writer, value).map_err(|source| {
+                if source.is_io() {
+                    SearchError::Io(source.into())
+                } else {
+                    SearchError::SubsystemError {
+                        subsystem: "fsfs.search.serve",
+                        source: Box::new(source),
+                    }
+                }
             })?;
-        writer
-            .flush()
-            .map_err(|source| SearchError::SubsystemError {
-                subsystem: "fsfs.search.serve",
-                source: Box::new(source),
-            })?;
-        Ok(())
+            writer.write_all(b"\n").map_err(SearchError::Io)
+        })
     }
 
     fn search_serve_error_response(
@@ -12133,12 +12105,7 @@ impl FsfsRuntime {
             OutputEnvelope::success(payload, meta, iso_timestamp_now()).with_warnings(warnings);
         emit_envelope(&envelope, self.cli_input.format, writer)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            writer
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.explain",
-                    source: Box::new(source),
-                })?;
+            writer.write_all(b"\n").map_err(SearchError::Io)?;
         }
 
         writer.flush().map_err(SearchError::Io)
@@ -16371,8 +16338,9 @@ impl FsfsRuntime {
         let payload = self.collect_status_payload()?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_status_table(&payload, self.cli_input.no_color);
-            print!("{table}");
-            return Ok(());
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(table.as_bytes())?;
+            return stdout.flush().map_err(SearchError::Io);
         }
 
         let meta = meta_for_format("status", self.cli_input.format);
@@ -16380,12 +16348,7 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            stdout
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.status",
-                    source: Box::new(source),
-                })?;
+            stdout.write_all(b"\n").map_err(SearchError::Io)?;
         }
         Ok(())
     }
@@ -16394,8 +16357,9 @@ impl FsfsRuntime {
         let payload = self.collect_download_models_payload(cx).await?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_download_models_table(&payload, self.cli_input.no_color);
-            print!("{table}");
-            return Ok(());
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(table.as_bytes())?;
+            return stdout.flush().map_err(SearchError::Io);
         }
 
         let meta = meta_for_format("download-models", self.cli_input.format);
@@ -16403,12 +16367,7 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            stdout
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.download_models",
-                    source: Box::new(source),
-                })?;
+            stdout.write_all(b"\n").map_err(SearchError::Io)?;
         }
         Ok(())
     }
@@ -16769,13 +16728,9 @@ impl FsfsRuntime {
         let failed = matches!(payload.overall, DoctorVerdict::Fail);
         if self.cli_input.format == OutputFormat::Table {
             let table = render_doctor_table(&payload, self.cli_input.no_color);
-            print!("{table}");
-            std::io::stdout()
-                .flush()
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.doctor",
-                    source: Box::new(source),
-                })?;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(table.as_bytes())?;
+            stdout.flush().map_err(SearchError::Io)?;
             if failed {
                 std::process::exit(exit_code::RUNTIME_ERROR);
             }
@@ -16786,19 +16741,9 @@ impl FsfsRuntime {
         let envelope = Self::doctor_envelope(&payload, self.cli_input.format)?;
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            stdout
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.doctor",
-                    source: Box::new(source),
-                })?;
+            stdout.write_all(b"\n").map_err(SearchError::Io)?;
         }
-        stdout
-            .flush()
-            .map_err(|source| SearchError::SubsystemError {
-                subsystem: "fsfs.doctor",
-                source: Box::new(source),
-            })?;
+        stdout.flush().map_err(SearchError::Io)?;
         if failed {
             std::process::exit(exit_code::RUNTIME_ERROR);
         }
@@ -17362,12 +17307,7 @@ impl FsfsRuntime {
             let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
             emit_envelope(&envelope, self.cli_input.format, writer)?;
             if self.cli_input.format != OutputFormat::Jsonl {
-                writer
-                    .write_all(b"\n")
-                    .map_err(|source| SearchError::SubsystemError {
-                        subsystem: "fsfs.append_batch",
-                        source: Box::new(source),
-                    })?;
+                writer.write_all(b"\n").map_err(SearchError::Io)?;
             }
         }
 
@@ -17689,12 +17629,7 @@ impl FsfsRuntime {
             let mut stdout = std::io::stdout();
             emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
             if self.cli_input.format != OutputFormat::Jsonl {
-                stdout
-                    .write_all(b"\n")
-                    .map_err(|source| SearchError::SubsystemError {
-                        subsystem: "fsfs.delete",
-                        source: Box::new(source),
-                    })?;
+                stdout.write_all(b"\n").map_err(SearchError::Io)?;
             }
         }
 
@@ -17815,12 +17750,7 @@ impl FsfsRuntime {
             let mut stdout = std::io::stdout();
             emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
             if self.cli_input.format != OutputFormat::Jsonl {
-                stdout
-                    .write_all(b"\n")
-                    .map_err(|source| SearchError::SubsystemError {
-                        subsystem: "fsfs.compact",
-                        source: Box::new(source),
-                    })?;
+                stdout.write_all(b"\n").map_err(SearchError::Io)?;
             }
         }
 
@@ -24665,20 +24595,16 @@ impl FsfsRuntime {
         payload: serde_json::Value,
     ) -> SearchResult<()> {
         if self.cli_input.format == OutputFormat::Table {
-            println!("{table_line}");
-            return Ok(());
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{table_line}")?;
+            return stdout.flush().map_err(SearchError::Io);
         }
         let meta = meta_for_format(command, self.cli_input.format);
         let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
         let mut stdout = std::io::stdout();
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
         if self.cli_input.format != OutputFormat::Jsonl {
-            stdout
-                .write_all(b"\n")
-                .map_err(|source| SearchError::SubsystemError {
-                    subsystem: command,
-                    source: Box::new(source),
-                })?;
+            stdout.write_all(b"\n").map_err(SearchError::Io)?;
         }
         Ok(())
     }
@@ -28716,78 +28642,49 @@ impl std::error::Error for WatcherShutdownFailure {
     }
 }
 
-fn print_cli_help() {
-    println!("Usage: fsfs <command> [options]");
-    println!();
-    println!("Commands:");
-    println!(
-        "  search <query>            Search indexed corpus (daemon-backed by default on unix)"
-    );
-    println!(
-        "  serve [--daemon] [--idle-timeout-ms <ms>]  Run long-lived query server (stdio by default, socket daemon with --daemon; daemon exits after <ms> idle, 0 = never)"
-    );
-    println!("  index [path]              Build/update index");
-    println!("  watch [path]              Alias for index --watch");
-    println!(
-        "  explain <rank|R-id|path>  Explain one hit of the last search (rank as printed, R0-style id, or path)"
-    );
-    println!("  status                    Show index and runtime status");
-    println!("  flush                     Publish pending lexical writes durably");
-    println!("  config <action>           Manage configuration");
-    println!("  download-models [model]   Download/verify embedding models");
-    println!("  doctor                    Run local health checks");
-    println!("  update [--check]          Check/apply binary updates");
-    println!("  completions <shell>       Generate shell completions");
-    println!("  uninstall [--yes] [--dry-run] [--purge]  Remove local fsfs artifacts");
-    println!("  help                      Show this help");
-    println!("  version                   Show version");
-    println!();
-    println!("Index Management:");
-    println!(
-        "  append-batch [--file <path>]             Append documents to index via WAL (aliases: append, ab)"
-    );
-    println!(
-        "  delete <id>... [--prefix]                Soft-delete documents by ID or prefix (alias: del)"
-    );
-    println!(
-        "  compact                                  Merge WAL into main index and vacuum tombstones"
-    );
-    println!(
-        "  daemon [--poll-ms <ms>] [--idle-timeout-ms <ms>]  Long-running process that auto-compacts when WAL grows"
-    );
-    println!(
-        "  daemon --stop                            Stop the index's compaction daemon and query daemons"
-    );
-    println!();
-    println!(
-        "Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online"
-    );
-    println!(
-        "Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --quality-only --ranking-priors --no-ranking-priors --rerank --expand"
-    );
-    println!(
-        "              --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
-    );
-    println!(
-        "              --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once."
-    );
-    println!(
-        "              Recovery requires installed models; it never downloads, retries automatically, or replaces a newer concurrent publication."
-    );
-    println!(
-        "Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>"
-    );
-    println!("              --upgrade-reuse <same-executable|compatible-contract>");
-    println!(
-        "              Default: same-executable. Compatible-contract admits verified reuse across binary upgrades."
-    );
-    println!("              --full/--force always bypass retained reuse and rebuild from source.");
-    println!(
-        "              --complete-quality --index-dir STORE finishes deferred quality from retained inputs."
-    );
-    println!(
-        "              Quality completion is one-shot and requires no source path or discovery flags."
-    );
+fn print_cli_help() -> SearchResult<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(
+        b"Usage: fsfs <command> [options]
+
+Commands:
+  search <query>            Search indexed corpus (daemon-backed by default on unix)
+  serve [--daemon] [--idle-timeout-ms <ms>]  Run long-lived query server (stdio by default, socket daemon with --daemon; daemon exits after <ms> idle, 0 = never)
+  index [path]              Build/update index
+  watch [path]              Alias for index --watch
+  explain <rank|R-id|path>  Explain one hit of the last search (rank as printed, R0-style id, or path)
+  status                    Show index and runtime status
+  flush                     Publish pending lexical writes durably
+  config <action>           Manage configuration
+  download-models [model]   Download/verify embedding models
+  doctor                    Run local health checks
+  update [--check]          Check/apply binary updates
+  completions <shell>       Generate shell completions
+  uninstall [--yes] [--dry-run] [--purge]  Remove local fsfs artifacts
+  help                      Show this help
+  version                   Show version
+
+Index Management:
+  append-batch [--file <path>]             Append documents to index via WAL (aliases: append, ab)
+  delete <id>... [--prefix]                Soft-delete documents by ID or prefix (alias: del)
+  compact                                  Merge WAL into main index and vacuum tombstones
+  daemon [--poll-ms <ms>] [--idle-timeout-ms <ms>]  Long-running process that auto-compacts when WAL grows
+  daemon --stop                            Stop the index's compaction daemon and query daemons
+
+Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online
+Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --quality-only --ranking-priors --no-ranking-priors --rerank --expand
+              --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>
+              --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once.
+              Recovery requires installed models; it never downloads, retries automatically, or replaces a newer concurrent publication.
+Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>
+              --upgrade-reuse <same-executable|compatible-contract>
+              Default: same-executable. Compatible-contract admits verified reuse across binary upgrades.
+              --full/--force always bypass retained reuse and rebuild from source.
+              --complete-quality --index-dir STORE finishes deferred quality from retained inputs.
+              Quality completion is one-shot and requires no source path or discovery flags.
+",
+    )?;
+    stdout.flush().map_err(SearchError::Io)
 }
 
 /// `pub(crate)` so the advertised-command census (bd-rh0t, `adapters::cli`
@@ -36793,7 +36690,14 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let mut writer = VectorIndex::create(&path, "blend-fast-2", 2).unwrap();
+            let mut writer = VectorIndex::create_with_revision(
+                &path,
+                "blend-fast-2",
+                &test_identity("blend-fast-2", 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
             for row in 0..STALE_ROWS {
                 writer
                     .write_record(&format!("stale-{row}"), &[1.0, 0.0])
@@ -39467,11 +39371,9 @@ mod tests {
         }
         let mut downgraded = header();
         if let SearchServeFrame::Attested { policy, mode, .. } = &mut downgraded {
-            *policy = Box::new(
-                runtime
-                    .search_serve_policy_for_mode(SearchExecutionMode::LexicalOnly)
-                    .unwrap(),
-            );
+            **policy = runtime
+                .search_serve_policy_for_mode(SearchExecutionMode::LexicalOnly)
+                .unwrap();
             "lexical_only".clone_into(mode);
         }
         let error = accept(downgraded, &mut state).unwrap_err();
@@ -41129,7 +41031,7 @@ mod tests {
     #[test]
     fn cancelled_daemon_search_propagates_without_in_process_fallback() {
         run_test_with_cx(|cx| async move {
-            let directory = tempfile::tempdir().expect("daemon cancel tempdir");
+            let directory = tempfile::tempdir_in("/tmp").expect("daemon cancel tempdir");
             let index_root = directory.path().join("index");
             // Satisfies `index_artifacts_exist`, so the pre-daemon path takes
             // its early return and never checkpoints.
@@ -49041,7 +48943,7 @@ mod tests {
                     .unwrap()
                     .live_doc_ids()
                     .unwrap(),
-                vec!["doc.md".to_owned()]
+                super::HashSet::from(["doc.md".to_owned()])
             );
         });
     }
@@ -63581,8 +63483,36 @@ mod tests {
                 "{label} must retain its actionable warning"
             );
         }
-        fs::create_dir_all(&index_root).unwrap();
-        fs::write(index_root.join(super::FSFS_VECTOR_MANIFEST_FILE), b"[]").unwrap();
+
+        let mut full = runtime.clone();
+        full.config.search.fast_only = false;
+        assert_eq!(
+            full.search_readiness_warning_for_payload(
+                "readiness",
+                SearchExecutionMode::Full,
+                &semantic,
+            )
+            .unwrap(),
+            full.search_readiness_warning().unwrap(),
+            "an Initial alone does not establish optional quality readiness"
+        );
+        full.config.pressure.degradation_override = DegradationOverrideMode::ForceEmbedDeferred;
+        let mode = super::degraded_search_mode(
+            full.config.pressure.degradation_override,
+            full.requested_search_mode(),
+        )
+        .unwrap();
+        assert_eq!(mode, SearchExecutionMode::FastOnly);
+        assert!(
+            full.search_readiness_warning_for_payload("readiness", mode, &semantic)
+                .unwrap()
+                .is_none(),
+            "explicit quality deferral retains the admitted fast result"
+        );
+
+        let manifest = index_root.join(super::FSFS_VECTOR_MANIFEST_FILE);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(manifest, b"[]").unwrap();
         let missing_vector = runtime.search_readiness_warning().unwrap();
         assert!(
             missing_vector
@@ -65707,43 +65637,93 @@ mod tests {
                         result,
                         Err(SearchError::UnverifiableRemoteSpace { .. })
                     ));
+                    assert!(
+                        !resources.fast_embedder_attempted,
+                        "a refused producer must remain retryable"
+                    );
                     assert!(resources.fast_embedder.is_none());
-                    assert!(!resources.fast_embedder_attempted);
                     assert_eq!(
                         published, 0,
                         "ambiguous cached metadata cannot bypass primary admission"
                     );
                     assert!(cache.is_empty());
+
+                    // Only a completed admission is retained. The same daemon
+                    // resources must accept a corrected producer next time.
+                    super::set_test_fast_embedder(Some(Arc::new(BlendQueryEmbedder(
+                        "blend-fast-2",
+                    ))));
+                    let retry: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                        "query": query, "mode": "full", "limit": 10, "rerank": false,
+                    }))
+                    .unwrap();
+                    let recovered = runtime
+                        .execute_search_serve_request_with_sink(
+                            &cx,
+                            retry,
+                            &mut resources,
+                            &mut cache,
+                            super::SearchServeOptions {
+                                hot_cache_enabled: true,
+                                persist_explain_session: false,
+                            },
+                            None,
+                        )
+                        .await
+                        .expect("corrected producer must retry admission");
+                    assert!(recovered.ok);
+                    assert!(!recovered.cached);
+                    assert!(resources.fast_embedder_attempted);
+                    assert!(resources.fast_embedder.is_some());
+                    assert!(
+                        recovered.payloads.iter().any(|payload| {
+                            payload.hits.iter().any(|hit| hit.path == "lookup.rs")
+                        })
+                    );
                 }
             }
 
             let key = runtime
                 .search_cache_key("cache_lookup", 10, SearchExecutionMode::Full)
                 .unwrap();
-            for payloads in [
-                Vec::new(),
-                vec![SearchPayload::new(
-                    "cache_lookup",
-                    SearchOutputPhase::Refined,
-                    0,
+            // The successful retry above leaves an admitted producer. Check
+            // incomplete phase layouts with both that warm state and a fresh
+            // cold state; refusing replay must neither clear nor load it.
+            for admitted in [true, false] {
+                if !admitted {
+                    resources.fast_embedder = None;
+                    resources.fast_embedder_attempted = false;
+                }
+                for payloads in [
                     Vec::new(),
-                )],
-            ] {
-                assert!(
-                    !runtime
-                        .admit_cached_search_producers(
-                            &cx,
-                            &mut resources,
-                            SearchExecutionMode::Full,
-                            &key.query,
-                            &payloads,
-                        )
-                        .await
-                        .unwrap(),
-                    "cached answers without Initial must run the live planner"
-                );
-                assert!(resources.fast_embedder.is_none());
-                assert!(!resources.fast_embedder_attempted);
+                    vec![SearchPayload::new(
+                        "cache_lookup",
+                        SearchOutputPhase::Refined,
+                        0,
+                        Vec::new(),
+                    )],
+                ] {
+                    assert!(
+                        !runtime
+                            .admit_cached_search_producers(
+                                &cx,
+                                &mut resources,
+                                SearchExecutionMode::Full,
+                                &key.query,
+                                &payloads,
+                            )
+                            .await
+                            .unwrap(),
+                        "cached answers without Initial must run the live planner"
+                    );
+                    if admitted {
+                        assert!(resources.fast_embedder.is_some());
+                        assert!(resources.fast_embedder_attempted);
+                    } else {
+                        assert!(resources.fast_embedder.is_none());
+                        assert!(!resources.fast_embedder_attempted);
+                    }
+                }
             }
         });
     }

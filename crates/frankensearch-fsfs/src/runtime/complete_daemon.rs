@@ -3022,10 +3022,13 @@ mod generation_tests {
                         quiet: true,
                         ..CliInput::default()
                     });
-                    builder
-                        .rebuild_retained_generation(&cx, &root)
-                        .await
-                        .unwrap();
+                    assert!(matches!(
+                        builder
+                            .rebuild_retained_generation(&cx, &root)
+                            .await
+                            .unwrap(),
+                        GenerationPublication::Durable(_)
+                    ));
                     let mut successor =
                         builder.open_live_retained_search(&cx, &root).await.unwrap();
                     assert_ne!(successor.generation(), replacement.generation());

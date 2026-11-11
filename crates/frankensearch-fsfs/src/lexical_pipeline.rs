@@ -2348,25 +2348,76 @@ mod tests {
                 assert!(witness.parallel_fanout().is_none());
             }
 
-            // 3. Admission refusal inside the accumulation driver retains Aborted witness.
-            let invalid_mutation = [LexicalMutation::upsert(
+            // 3. Replacing an uncommitted revision is a successful upsert,
+            // including publication of the pending revision before replacement.
+            let replacement = [LexicalMutation::upsert(
                 "serial-after-delete",
                 3,
                 IngestionClass::FullSemanticLexical,
-                "duplicate uncommitted document id must fail batch admission",
-                "duplicate_uncommitted_upsert",
+                "replacementtoken",
+                "replace_uncommitted_revision",
             )];
             pipeline
-                .apply_incremental(&invalid_mutation)
-                .expect("plan duplicate uncommitted mutation");
+                .apply_incremental(&replacement)
+                .expect("plan replacement of uncommitted revision");
+            pipeline
+                .backend_mut()
+                .flush(&cx)
+                .await
+                .expect("replace uncommitted revision");
+            let replacement_witnesses = pipeline.backend_mut().take_scaleout_witnesses();
+            assert_eq!(replacement_witnesses.len(), 1);
+            assert!(replacement_witnesses[0].run_seq > barrier_witnesses[1].run_seq);
+            assert_eq!(
+                replacement_witnesses[0].accumulation_terminal,
+                ParallelIngestTerminal::SerialCompleted
+            );
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "replacementtoken", 10)
+                    .expect("query replacement")
+                    .iter()
+                    .map(|hit| hit.document_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["serial-after-delete"]
+            );
+            assert!(
+                index
+                    .search_doc_ids(&cx, r#""short serial text after delete barrier""#, 10)
+                    .expect("query replaced content")
+                    .is_empty()
+            );
+            assert!(!index.has_uncommitted_changes());
+
+            // 4. A genuinely invalid ID reaches the accumulation driver's
+            // rejection through the public backend boundary. The planner
+            // rejects this shape itself, so queue it directly as in the
+            // rejected-suffix regression above.
+            pipeline
+                .backend_mut()
+                .apply(LexicalAction::Upsert {
+                    doc_id: String::new(),
+                    revision: 4,
+                    title: None,
+                    metadata: std::collections::HashMap::new(),
+                    chunks: LexicalChunkPolicy::default().chunk_text("invalid"),
+                })
+                .expect("queue malformed backend action");
             let flush_err = pipeline.backend_mut().flush(&cx).await;
             assert!(
                 flush_err.is_err(),
-                "duplicate uncommitted doc_id must fail Quill admission"
+                "an empty doc_id must fail Quill admission"
+            );
+            assert!(
+                flush_err
+                    .unwrap_err()
+                    .to_string()
+                    .contains("document id must be nonempty")
             );
             let aborted_witnesses = pipeline.backend_mut().take_scaleout_witnesses();
             assert_eq!(aborted_witnesses.len(), 1);
             assert!(aborted_witnesses[0].run_seq > barrier_witnesses[1].run_seq);
+            assert!(aborted_witnesses[0].run_seq > replacement_witnesses[0].run_seq);
             assert_eq!(
                 aborted_witnesses[0].accumulation_terminal,
                 ParallelIngestTerminal::Aborted
@@ -2374,7 +2425,7 @@ mod tests {
             assert!(aborted_witnesses[0].route.is_none());
             assert!(aborted_witnesses[0].parallel_fanout().is_none());
 
-            // 4. Pre-driver cancellation produces no witness.
+            // 5. Pre-driver cancellation produces no witness.
             let cancelled_cx = Cx::for_testing();
             cancelled_cx.set_cancel_requested(true);
             let pre_cancel_err = pipeline.backend_mut().flush(&cancelled_cx).await;

@@ -1987,10 +1987,12 @@ mod tests {
             fast.inputs.lock().unwrap().clear();
             quality.inputs.lock().unwrap().clear();
             let preserved = files(selected.path());
-            resumed
-                .rebuild_retained_generation(&cx, &root)
-                .await
-                .unwrap();
+            drop(durable(
+                resumed
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            ));
             assert_eq!(fast.inputs.lock().unwrap().len(), expected.len());
             assert_eq!(quality.inputs.lock().unwrap().len(), expected.len());
             assert_eq!(files(selected.path()), preserved);
@@ -2005,6 +2007,27 @@ mod tests {
             for changed_configuration in [false, true] {
                 let directory = tempfile::tempdir().unwrap();
                 let expected = source_fixture(directory.path());
+                // Increasing the plan cap enables source-preserving fast
+                // windows. Quality still uses the bounded, code-collapsing
+                // canonicalizer. This fixture fits one fast window in that plan.
+                let statements = (0..40)
+                    .map(|number| format!("let variable_{number} = {number};"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let expected_fast = BTreeMap::from([
+                    ("alpha.md".to_owned(), expected["alpha.md"].clone()),
+                    (
+                        "beta.md".to_owned(),
+                        format!(
+                            "sharedtoken retained code sample [code: rust] {statements} quality tail"
+                        ),
+                    ),
+                ]);
+                assert!(
+                    expected_fast["beta.md"].chars().count()
+                        <= super::super::semantic_windows::WINDOW_CHARS
+                );
+                assert_ne!(expected_fast["beta.md"], expected["beta.md"]);
                 let fast = Arc::new(Producer::new("completion-scope-fast"));
                 let quality = Arc::new(Producer::new("completion-scope-quality"));
                 let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
@@ -2080,16 +2103,18 @@ mod tests {
                 }
                 fast.inputs.lock().unwrap().clear();
                 quality.inputs.lock().unwrap().clear();
-                resumed
-                    .rebuild_retained_generation(&cx, &root)
-                    .await
-                    .unwrap();
-                let expected_inputs = if changed_configuration {
-                    expected.values().cloned().collect::<BTreeSet<_>>()
-                } else {
-                    BTreeSet::from([expected["alpha.md"].clone()])
-                };
-                for producer in [&fast, &quality] {
+                drop(durable(
+                    resumed
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                ));
+                for (producer, source_inputs) in [(&fast, &expected_fast), (&quality, &expected)] {
+                    let expected_inputs = if changed_configuration {
+                        source_inputs.values().cloned().collect::<BTreeSet<_>>()
+                    } else {
+                        BTreeSet::from([source_inputs["alpha.md"].clone()])
+                    };
                     assert_eq!(
                         producer
                             .inputs
@@ -2099,6 +2124,8 @@ mod tests {
                             .cloned()
                             .collect::<BTreeSet<_>>(),
                         expected_inputs,
+                        "producer={} changed_configuration={changed_configuration}",
+                        producer.id(),
                     );
                     assert_eq!(producer.inputs.lock().unwrap().len(), expected_inputs.len());
                 }
