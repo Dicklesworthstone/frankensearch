@@ -1081,9 +1081,12 @@ impl FsfsRuntime {
     where
         F: FnMut(&PublishedGeneration) -> SearchResult<()> + Send,
     {
-        let mut session = CompleteWatchSession::open(self, cx, root)?;
+        // Both on the heap: the session owns a whole FsfsRuntime and each tick's
+        // advance future is nearly as large, which together put this future past
+        // 16 KiB in every caller's frame. One allocation per watch and per tick.
+        let mut session = Box::new(CompleteWatchSession::open(self, cx, root)?);
         loop {
-            if let Some(publication) = session.advance(cx, Instant::now()).await? {
+            if let Some(publication) = Box::pin(session.advance(cx, Instant::now())).await? {
                 let generation = require_durable_publication(publication)?;
                 // Do not insert a cancellation point between a completed rename
                 // and its receipt. Cancellation cannot relabel a visible commit.
