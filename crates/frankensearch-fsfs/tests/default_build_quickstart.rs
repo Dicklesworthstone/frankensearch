@@ -1391,7 +1391,6 @@ mod loader_only {
     #[allow(clippy::too_many_lines)]
     fn default_build_replays_complete_generation_fast_answers_without_loading_weights() {
         use sha2::Digest as _;
-        use std::fmt::Write as _;
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
         log_binary_profile("complete-generation-fast-answer-cache");
