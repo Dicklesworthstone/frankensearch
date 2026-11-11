@@ -12465,6 +12465,8 @@ impl QuillReader {
     /// without changing the scorer tree. Enclosing Boolean branches must match
     /// before their descendants contribute: a term can occur in the document
     /// while the conjunction or exclusion containing it still fails.
+    /// Root evaluation, branch checks, statistics and contributions share one
+    /// query-work allowance, including when a clause is lowered more than once.
     fn explain_document_on(
         &self,
         cx: &Cx,
@@ -12499,17 +12501,16 @@ impl QuillReader {
         if !leaf.is_live_document(global_docid) {
             return Ok(None);
         }
+        // Explanation lowers overlapping subqueries on demand: the work bound
+        // of any one lowering cannot bound the whole request. Always meter
+        // this one shared checkpoint instead of granting each branch and field
+        // a fresh allowance. The ranked prefix and diagnostic-only lookups
+        // must spend the same fuel as the individual score contributions.
+        let checkpoint: QueryCheckpointHandle<'_> =
+            self.query_checkpoint(cx, "explain", self.config.query_fuel_budget, u64::MAX);
         let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
         let lower_explanation = |clause: &Query, topdocs_root| {
             validate_query_lowering(clause, 1.0, self.schema)?;
-            let upper_bound = query_work_upper_bound(
-                clause,
-                snapshot,
-                self.schema,
-                self.config.glob_expansion_limit,
-            )?;
-            let checkpoint: QueryCheckpointHandle<'_> =
-                self.query_checkpoint(cx, "explain", self.config.query_fuel_budget, upper_bound);
             checkpoint.admit(QueryWorkKind::Segment, 1)?;
             lower_query(
                 cx,
@@ -12642,7 +12643,13 @@ impl QuillReader {
                 }
                 QueryNode::Term { fields, text } => {
                     for field in fields {
-                        let doc_freq = snapshot.bm25_doc_freq(field.field_id, text.as_bytes())?;
+                        let doc_freq = checkpointed_snapshot_doc_freq(
+                            &checkpoint,
+                            snapshot,
+                            field.field_id,
+                            text.as_bytes(),
+                            SnapshotDocFreqDeltaAdmission::TailPerGeneration,
+                        )?;
                         let clause = Query::term(vec![*field], text.clone());
                         terms.push(QuillTermScore {
                             text: text.clone(),
@@ -17987,15 +17994,19 @@ fn snapshot_string_range_terms(
             .map_err(|_| invalid_state("dictionary term count does not fit usize"))?;
         let mut cursor = dictionary.range_cursor(field_ord, lower, upper)?;
         let mut admitted_block = None;
+        // The union retains terms from earlier segments. Only this cursor's
+        // visits are bounded by the current dictionary's term count.
+        let mut visited_terms = 0_usize;
         while let Some(current) = cursor.current() {
             let block = cursor.current_block_index();
             if block != admitted_block {
                 checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
                 admitted_block = block;
             }
-            if terms.len() >= limit {
+            if visited_terms >= limit {
                 return Err(TermDictionaryError::MaterializationLimitExceeded { limit }.into());
             }
+            visited_terms += 1;
             terms.insert(current.term.to_vec());
             cursor.next()?;
         }
@@ -18886,7 +18897,7 @@ fn lower_leaf_term<'a>(
 enum SnapshotDocFreqDeltaAdmission {
     /// Ranking keeps its existing no-Delta-admission behavior.
     Ranking,
-    /// Snippet-tail doc-frequency probes pay one unit per Delta generation.
+    /// Snippet and explanation statistics pay one unit per Delta generation.
     TailPerGeneration,
 }
 
@@ -24537,6 +24548,97 @@ mod tests {
                     .expect("explain"),
                 None
             );
+        });
+    }
+
+    #[test]
+    fn explain_document_shares_fuel_across_ranking_statistics_and_contributions() {
+        run_with_cx(|cx| async move {
+            for delta_resident in [false, true] {
+                let mut index =
+                    QuillIndex::in_memory(deterministic_config()).expect("create fuel index");
+                if delta_resident {
+                    let generation = index
+                        .search_snapshot()
+                        .expect("initial snapshot")
+                        .keeper_generation();
+                    let mut delta =
+                        DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta");
+                    apply_tokenized_delta_document(&mut delta, 0, "target", "alpha beta");
+                    apply_tokenized_delta_document(&mut delta, 1, "other", "gamma");
+                    index
+                        .publish_delta_table(vec![Arc::new(delta.freeze(generation))])
+                        .expect("publish Delta");
+                } else {
+                    index
+                        .index_documents(
+                            &cx,
+                            &[
+                                IndexableDocument::new("target", "alpha beta"),
+                                IndexableDocument::new("other", "gamma"),
+                            ],
+                        )
+                        .await
+                        .expect("stage fixture");
+                    index.commit(&cx).await.expect("seal fixture");
+                }
+                let snapshot = index.search_snapshot().expect("pin fixture");
+                for (query, budget) in [
+                    ("content:alpha", if delta_resident { 3 } else { 5 }),
+                    (
+                        "content:alpha OR (content:beta AND content:gamma)",
+                        if delta_resident { 5 } else { 10 },
+                    ),
+                ] {
+                    index.reader.config.query_fuel_budget = budget;
+                    let hit = index
+                        .search_paginated(&cx, query, 10, 0, false)
+                        .expect("ranking alone fits the allowance")
+                        .hits
+                        .iter()
+                        .find(|hit| hit.document_id == "target")
+                        .cloned()
+                        .expect("the target matches");
+                    let first = index
+                        .explain_document(&cx, query, "target")
+                        .expect_err("explanation must not replenish fuel for each subquery");
+                    let retry = index
+                        .explain_document(&cx, query, "target")
+                        .expect_err("retry must enforce the same whole-explanation allowance");
+                    let diagnostics = fuel_diagnostics(&first);
+                    assert_eq!(diagnostics, fuel_diagnostics(&retry));
+                    assert_eq!((diagnostics.0, diagnostics.1), (budget, budget));
+                    if query == "content:alpha" {
+                        // Root evaluation consumes one segment and one posting
+                        // block. The diagnostic DF probe spends the remaining
+                        // unit before another scorer can be constructed.
+                        assert_eq!(diagnostics.2, 1);
+                        assert_eq!(diagnostics.3, if delta_resident { 1 } else { 3 });
+                        assert_eq!(diagnostics.4, 1);
+                    }
+                    assert!(Arc::ptr_eq(
+                        &snapshot,
+                        &index.search_snapshot().expect("snapshot after refusal")
+                    ));
+                    assert_eq!(index.explain_document(&cx, query, "missing").unwrap(), None);
+
+                    index.reader.config.query_fuel_budget = 100;
+                    let explanation = index
+                        .explain_document(&cx, query, "target")
+                        .expect("a larger allowance permits the whole explanation")
+                        .expect("the target still matches");
+                    assert_eq!(explanation.score.to_bits(), hit.score.to_bits());
+                    assert_eq!(
+                        explanation
+                            .terms
+                            .iter()
+                            .find(|term| term.text == "alpha")
+                            .expect("alpha contribution")
+                            .doc_freq,
+                        Some(1)
+                    );
+                }
+            }
         });
     }
 
@@ -35907,6 +36009,78 @@ mod tests {
             (budget, 0, 0, 0, 0, 0),
             "an under-budget range must refuse before any ordered-view work is recorded"
         );
+    }
+
+    #[test]
+    fn public_string_ranges_union_unequal_segment_dictionaries_after_reopen() {
+        run_with_cx(|cx| async move {
+            for wide_segment_first in [false, true] {
+                let directory = tempfile::tempdir().expect("range fixture directory");
+                let config = QuillConfig {
+                    tier_fanout: 32,
+                    max_visibility_lag_ms: u64::MAX,
+                    ..deterministic_config()
+                };
+                let index = QuillIndex::create(&cx, directory.path(), config.clone())
+                    .await
+                    .expect("create range index");
+                let wide = IndexableDocument::new(
+                    "wide",
+                    "alpha delta epsilon eta gamma iota kappa lambda mu theta zeta",
+                );
+                let narrow = IndexableDocument::new("narrow", "beta");
+                let documents = if wide_segment_first {
+                    [wide, narrow]
+                } else {
+                    [narrow, wide]
+                };
+                for document in &documents {
+                    index
+                        .index_documents(&cx, std::slice::from_ref(document))
+                        .await
+                        .expect("stage one independent segment");
+                    index.commit(&cx).await.expect("publish segment");
+                }
+                assert_eq!(index.snapshot().expect("two segments").segments().len(), 2);
+                drop(index);
+                let reader = QuillSearchIndex::open(&cx, directory.path(), config)
+                    .await
+                    .expect("reopen persisted range index");
+                for (query, expected_ids) in [
+                    ("content:[alpha TO zeta]", vec!["narrow", "wide"]),
+                    ("content:{alpha TO *}", vec!["narrow", "wide"]),
+                    ("content:[alpha TO zeta] -content:beta", vec!["wide"]),
+                    ("content:[alpha TO zeta] AND id:narrow", vec!["narrow"]),
+                ] {
+                    for exact_count in [false, true] {
+                        let results = reader
+                            .search_paginated(&cx, query, 10, 0, exact_count)
+                            .expect("range expansion must use each leaf's own traversal bound");
+                        let mut ids = results
+                            .hits
+                            .iter()
+                            .map(|hit| hit.document_id.as_str())
+                            .collect::<Vec<_>>();
+                        ids.sort_unstable();
+                        assert_eq!(
+                            ids, expected_ids,
+                            "query={query}, wide_first={wide_segment_first}"
+                        );
+                        assert_eq!(
+                            results.total_count,
+                            exact_count.then_some(u64::try_from(expected_ids.len()).unwrap())
+                        );
+                    }
+                    assert_eq!(
+                        reader
+                            .collect_docids(&cx, query)
+                            .expect("range DocSet")
+                            .len(),
+                        expected_ids.len()
+                    );
+                }
+            }
+        });
     }
 
     #[test]
