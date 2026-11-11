@@ -5661,7 +5661,9 @@ mod cass_query_tests {
             CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
                 .expect("create ASCII prefix index");
         index.writer.set_merge_policy(Box::new(NoMergePolicy));
-        let padding = "padding ".repeat(CONTENT_PREFIX_MAX_BYTES / 8 + 1);
+        // Independently exceed the 4 KiB prefix window; the assertion below
+        // verifies that the required match really lies outside that column.
+        let padding = "padding ".repeat(700);
         let mut documents = (0_u64..80)
             .map(|ordinal| {
                 let content = format!("sharedmarker {padding}{PREFIX}{ordinal:04}");
