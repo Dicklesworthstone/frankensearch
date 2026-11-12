@@ -7792,6 +7792,11 @@ mod tests {
             .await
             .expect("apply initial catch-up");
         initial.acknowledge_applied().expect("establish authority");
+        let established_authority = lock_or_recover(&watcher.reconciliation)
+            .authority
+            .established()
+            .cloned()
+            .expect("the complete control establishes deletion authority");
         let (original_snapshot, original_completeness) =
             watcher.collect_snapshot().expect("readable control");
         assert!(original_completeness.is_complete());
@@ -7830,6 +7835,16 @@ mod tests {
                 .expect("an incomplete acknowledgement cannot settle authority");
         } else {
             drop(partial);
+        }
+        {
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert_eq!(
+                state.authority.established(),
+                Some(&established_authority),
+                "an incomplete batch must not advance deletion authority"
+            );
+            assert!(state.required, "a complete scan is still owed");
+            drop(state);
         }
 
         fs::rename(&newly_indexed, temp.path().join("held-new.rs"))
