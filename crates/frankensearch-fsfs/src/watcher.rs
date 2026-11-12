@@ -7769,6 +7769,124 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    async fn exercise_incomplete_catchup_mutation_debt(cx: &Cx, acknowledge: bool) {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("visible");
+        let interrupted_root = temp.path().join("interrupted");
+        fs::create_dir_all(&root).expect("create visible root");
+        fs::create_dir_all(&interrupted_root).expect("create interrupted root");
+        fs::write(root.join("baseline.rs"), "fn baseline() {}\n").expect("baseline fixture");
+        let hidden = interrupted_root.join("hidden.rs");
+        fs::write(&hidden, "fn hidden() {}\n").expect("hidden fixture");
+        let pipeline = Arc::new(RecordingPipeline::default());
+        let watcher = FsWatcher::new(
+            vec![root.clone(), interrupted_root.clone()],
+            DiscoveryConfig::default(),
+            Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+        );
+        let initial = watcher
+            .build_catchup_events(&FileSnapshot::new())
+            .expect("initial complete catch-up");
+        apply_catchup_events(cx, &watcher, pipeline.as_ref(), &initial)
+            .await
+            .expect("apply initial catch-up");
+        initial.acknowledge_applied().expect("establish authority");
+        let (original_snapshot, original_completeness) =
+            watcher.collect_snapshot().expect("readable control");
+        assert!(original_completeness.is_complete());
+        assert!(original_snapshot.contains_key(&hidden));
+
+        let newly_indexed = root.join("newly-indexed.rs");
+        fs::write(&newly_indexed, "fn new_file() {}\n").expect("new fixture");
+        let held_root = temp.path().join("held-root");
+        fs::rename(&interrupted_root, &held_root).expect("make one root unresolved");
+        let (short, incomplete) = watcher.collect_snapshot().expect("incomplete scan");
+        assert!(!incomplete.is_complete());
+        assert!(short.contains_key(&newly_indexed));
+        assert!(!short.contains_key(&hidden));
+        let partial = watcher
+            .build_catchup_events(&FileSnapshot::new())
+            .expect("incomplete catch-up still reports visible files");
+        assert!(
+            partial.iter().any(|event| {
+                event.kind == WatchEventKind::Created && event.path == newly_indexed
+            })
+        );
+        assert!(
+            !partial
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted)
+        );
+        apply_catchup_events(cx, &watcher, pipeline.as_ref(), &partial)
+            .await
+            .expect("apply the incomplete batch's visible operations");
+        let new_key = normalize_file_key(&newly_indexed);
+        assert!(pipeline.all_ops().iter().any(|op| matches!(op,
+            WatchIngestOp::Upsert { file_key, .. } if file_key == &new_key)));
+        if acknowledge {
+            partial
+                .acknowledge_applied()
+                .expect("an incomplete acknowledgement cannot settle authority");
+        } else {
+            drop(partial);
+        }
+
+        fs::rename(&newly_indexed, temp.path().join("held-new.rs"))
+            .expect("move the indexed file outside the watched roots");
+        fs::rename(&held_root, &interrupted_root).expect("restore the same root identity");
+        let (current, completeness) = watcher.collect_snapshot().expect("complete retry control");
+        assert!(completeness.is_complete());
+        assert!(current.contains_key(&hidden));
+        assert!(!current.contains_key(&newly_indexed));
+        // Neither complete snapshot contains the transient path. Without the
+        // incomplete batch's mutation debt, their diff cannot remove its row.
+        assert!(
+            !FsWatcher::diff_snapshots(&original_snapshot, &current, 1_000, &completeness)
+                .iter()
+                .any(|event| event.kind == WatchEventKind::Deleted && event.path == newly_indexed)
+        );
+        let retry = watcher
+            .build_catchup_events(&FileSnapshot::new())
+            .expect("complete catch-up after the transient path vanished");
+        assert_eq!(
+            retry
+                .iter()
+                .filter(|event| event.kind == WatchEventKind::Deleted && event.path == newly_indexed)
+                .count(),
+            1,
+            "a file applied by an incomplete batch still owes exactly one delete"
+        );
+        apply_catchup_events(cx, &watcher, pipeline.as_ref(), &retry)
+            .await
+            .expect("remove the incomplete batch's vanished row");
+        retry
+            .acknowledge_applied()
+            .expect("settle the complete retry");
+        assert!(pipeline.all_ops().iter().any(|op| matches!(op,
+            WatchIngestOp::Delete { file_key, .. } if file_key == &new_key)));
+        let state = lock_or_recover(&watcher.reconciliation);
+        assert!(!state.required);
+        assert!(state.affected_paths.is_empty());
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_catchup_drop_retains_vanished_new_path_as_delete_debt() {
+        run_on_local_runtime_task(|cx| async move {
+            exercise_incomplete_catchup_mutation_debt(&cx, false).await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_catchup_ack_retains_vanished_new_path_as_delete_debt() {
+        run_on_local_runtime_task(|cx| async move {
+            exercise_incomplete_catchup_mutation_debt(&cx, true).await;
+        });
+    }
+
     /// A catch-up scan must keep the authority lineage that existed before it
     /// started. Advancing an established generation during the directory walk
     /// is enough to make the returned listing stale, even though no epoch was
