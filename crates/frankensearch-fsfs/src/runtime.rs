@@ -34480,6 +34480,7 @@ mod tests {
         FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, IndexingBatchEmbeddingOutcome,
         InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheRecord, SearchDashboardState,
         SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
+        SearchStreamWriter,
         SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
         VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
         degradation_controller_config_for_profile, detect_context_preview_format,
