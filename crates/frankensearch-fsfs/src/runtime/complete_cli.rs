@@ -4173,44 +4173,59 @@ mod tests {
                     assert_eq!(session.unavailable.is_some(), generate);
                 }
 
-                fs::write(&pointer, &original_selection).unwrap();
-                recorded.lock().unwrap().clear();
-                let mut search = search_runtime(&runtime);
-                search.cli_input.stream = true;
-                search.cli_input.expand = true;
-                search.cli_input.format = format;
-                let mut output = Vec::new();
-                let error = Box::pin(search.run_complete_expanded_search_with_query_expansion(
-                    &cx, &root, query, 10, Instant::now(), &mut output,
-                    async {
-                        assert_eq!(recorded.lock().unwrap().iter().filter(|text| text.as_str() == query).count(), 1);
-                        fs::write(&pointer, &new_selection).unwrap();
-                        // Exercise failure propagation after Initial without
-                        // claiming a live missing-model readiness probe.
-                        Err(SearchError::ModelNotFound { name: "quality-producer".to_owned() })
-                    },
-                ))
-                .await
-                .unwrap_err();
-                let reported = crate::output_schema::reported_output_error(&error)
-                    .expect("the retained stream owns the terminal diagnostic");
-                assert_eq!(reported.code, "model_not_found");
-                assert!(reported.recovery_plan.is_some());
-                let frames = expansion_stream_frames(format, &output);
-                assert!(matches!(frames.first().map(|frame| &frame.event), Some(StreamEvent::Started(_))));
-                assert!(frames.iter().any(|frame| matches!(&frame.event,
-                    StreamEvent::Progress(progress) if progress.reason_code == "query.stream.initial_ready")));
-                assert!(frames.iter().any(|frame| matches!(&frame.event, StreamEvent::Result(_))));
-                assert_eq!(frames.iter().filter(|frame| frame.event.kind() == StreamEventKind::Terminal).count(), 1);
-                let Some(StreamEvent::Terminal(terminal)) = frames.last().map(|frame| &frame.event) else {
-                    panic!("expansion failure must finish with one terminal");
-                };
-                assert_eq!(terminal.status, StreamTerminalStatus::Failed);
-                assert_eq!(terminal.error.as_ref(), Some(reported));
-                assert_eq!(recorded.lock().unwrap().iter().filter(|text| text.as_str() == query).count(), 1);
-                assert_eq!(store.active(&cx).unwrap(), Some(successor.clone()));
-                assert_eq!(sealed_inventory(predecessor.path()), before);
-                assert_eq!(sealed_inventory(successor.path()), successor_before);
+                for failing_model in ["quality-producer", "quality\u{001e}producer"] {
+                    fs::write(&pointer, &original_selection).unwrap();
+                    recorded.lock().unwrap().clear();
+                    let mut search = search_runtime(&runtime);
+                    search.cli_input.stream = true;
+                    search.cli_input.expand = true;
+                    search.cli_input.format = format;
+                    let mut output = Vec::new();
+                    let error = Box::pin(search.run_complete_expanded_search_with_query_expansion(
+                        &cx, &root, query, 10, Instant::now(), &mut output,
+                        async {
+                            assert_eq!(recorded.lock().unwrap().iter().filter(|text| text.as_str() == query).count(), 1);
+                            fs::write(&pointer, &new_selection).unwrap();
+                            // Exercise failure propagation after Initial without
+                            // claiming a live missing-model readiness probe.
+                            Err(SearchError::ModelNotFound { name: failing_model.to_owned() })
+                        },
+                    ))
+                    .await
+                    .unwrap_err();
+                    let reported = crate::output_schema::reported_output_error(&error)
+                        .expect("the retained stream owns the terminal diagnostic");
+                    if format == OutputFormat::Toon && failing_model.contains('\u{001e}') {
+                        assert_eq!(reported.code, "invalid_config");
+                        assert_eq!(reported.exit_code, 2);
+                        assert_eq!(reported.field.as_deref(), Some("stream.toon_payload"));
+                        assert!(reported.recovery_plan.is_none());
+                    } else {
+                        assert_eq!(reported.code, "model_not_found");
+                        assert!(reported.recovery_plan.is_some());
+                        if failing_model.contains('\u{001e}') {
+                            assert!(reported.message.contains(failing_model));
+                        }
+                    }
+                    let frames = expansion_stream_frames(format, &output);
+                    assert!(matches!(frames.first().map(|frame| &frame.event), Some(StreamEvent::Started(_))));
+                    assert!(frames.iter().any(|frame| matches!(&frame.event,
+                        StreamEvent::Progress(progress) if progress.reason_code == "query.stream.initial_ready")));
+                    assert!(frames.iter().any(|frame| matches!(&frame.event, StreamEvent::Result(_))));
+                    assert_eq!(frames.iter().filter(|frame| frame.event.kind() == StreamEventKind::Terminal).count(), 1);
+                    for (sequence, frame) in frames.iter().enumerate() {
+                        assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
+                    }
+                    let Some(StreamEvent::Terminal(terminal)) = frames.last().map(|frame| &frame.event) else {
+                        panic!("expansion failure must finish with one terminal");
+                    };
+                    assert_eq!(terminal.status, StreamTerminalStatus::Failed);
+                    assert_eq!(terminal.error.as_ref(), Some(reported));
+                    assert_eq!(recorded.lock().unwrap().iter().filter(|text| text.as_str() == query).count(), 1);
+                    assert_eq!(store.active(&cx).unwrap(), Some(successor.clone()));
+                    assert_eq!(sealed_inventory(predecessor.path()), before);
+                    assert_eq!(sealed_inventory(successor.path()), successor_before);
+                }
             }
         });
     }

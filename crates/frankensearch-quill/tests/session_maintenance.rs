@@ -20,6 +20,9 @@ type StoredRows = Vec<Vec<Option<Vec<u8>>>>;
 fn config() -> QuillConfig {
     QuillConfig {
         deterministic_ingest: true,
+        // These concat accounting fixtures retain physical tombstoned rows.
+        // Automatic compaction is covered independently below.
+        compaction_tombstone_density: 1.0,
         ..QuillConfig::default()
     }
 }
@@ -40,8 +43,10 @@ fn budget() -> SessionMergeBudget {
     }
 }
 
-async fn fixture(cx: &Cx, directory: &Path) -> QuillIndex {
-    let index = QuillIndex::create(cx, directory, config()).await.unwrap();
+async fn fixture(cx: &Cx, directory: &Path, config: QuillConfig) -> QuillIndex {
+    let index = QuillIndex::create(cx, directory, config.clone())
+        .await
+        .unwrap();
     for batch in 0..6 {
         // One ingest batch per source: a separate call that replaces a
         // published document first publishes the pending rows (the
@@ -76,7 +81,7 @@ async fn fixture(cx: &Cx, directory: &Path) -> QuillIndex {
     // Reopen without a live ingest lease so a publication-failure fixture can
     // target the second manifest generation rather than a lease-retirement step.
     drop(index);
-    QuillIndex::open(cx, directory, config()).await.unwrap()
+    QuillIndex::open(cx, directory, config).await.unwrap()
 }
 
 fn queries(index: &QuillIndex, cx: &Cx) -> Vec<QuillSearchResult> {
@@ -138,7 +143,7 @@ fn output_path(directory: &Path, id: u64) -> PathBuf {
 fn repeated_merges_charge_rewritten_inputs_and_preserve_search_and_ingest() {
     run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();
-        let index = fixture(&cx, directory.path()).await;
+        let index = fixture(&cx, directory.path(), config()).await;
         let initial = load_manifest_pair(directory.path()).unwrap().manifest;
         let expected_queries = queries(&index, &cx);
         let held = index.search_snapshot().unwrap();
@@ -235,7 +240,7 @@ fn cumulative_row_byte_and_publication_caps_stop_before_another_attempt() {
     run_test_with_cx(|cx| async move {
         for case in 0..4 {
             let directory = tempfile::tempdir().unwrap();
-            let index = fixture(&cx, directory.path()).await;
+            let index = fixture(&cx, directory.path(), config()).await;
             let initial = load_manifest_pair(directory.path()).unwrap().manifest;
             let first_four_bytes: u64 = initial.segments[..4].iter().map(|s| s.file_len).sum();
             let (limits, count, stop) = match case {
@@ -299,7 +304,7 @@ fn cumulative_row_byte_and_publication_caps_stop_before_another_attempt() {
 fn failed_second_publication_keeps_first_receipt_and_resumes_after_reconciliation() {
     run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();
-        let index = fixture(&cx, directory.path()).await;
+        let index = fixture(&cx, directory.path(), config()).await;
         let initial = load_manifest_pair(directory.path()).unwrap().manifest;
         let expected_queries = queries(&index, &cx);
         let held = index.search_snapshot().unwrap();
@@ -405,7 +410,7 @@ fn failed_second_publication_keeps_first_receipt_and_resumes_after_reconciliatio
 fn no_op_invalid_sequence_cancellation_and_collision_preserve_authority() {
     run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();
-        let index = fixture(&cx, directory.path()).await;
+        let index = fixture(&cx, directory.path(), config()).await;
         let initial = load_manifest_pair(directory.path()).unwrap().manifest;
         let before = directory_bytes(directory.path());
         let report = index
@@ -456,5 +461,102 @@ fn no_op_invalid_sequence_cancellation_and_collision_preserve_authority() {
             load_manifest_pair(directory.path()).unwrap().manifest,
             initial
         );
+    });
+}
+
+#[test]
+fn automatic_compaction_precedes_session_maintenance_and_preserves_live_rows() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let index = fixture(
+            &cx,
+            directory.path(),
+            QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            },
+        )
+        .await;
+        let initial = load_manifest_pair(directory.path()).unwrap().manifest;
+        // The final replacement tombstones one of the first two rows. With
+        // the shipped compaction policy, commit rewrites that source to one
+        // physical row before session maintenance chooses its row-count tier.
+        assert_eq!(index.snapshot().unwrap().at_seal_doc_count(), 11);
+        assert_eq!(index.snapshot().unwrap().tombstone_count(), 0);
+        let expected_queries = queries(&index, &cx);
+        let held = index.search_snapshot().unwrap();
+        let expected_stored = stored(&held);
+        let report = index
+            .merge_sessions(
+                &cx,
+                SessionMergePolicy {
+                    max_input_docs: 100,
+                    ..policy()
+                },
+                SessionMergeBudget {
+                    max_merges: 4,
+                    ..budget()
+                },
+                0xc500,
+                0,
+            )
+            .await
+            .unwrap();
+        // The one-row first source and two-row last source occupy different
+        // tiers from the final eight-row output. Three merges exhaust the
+        // eligible runs: four plus four plus eight physical input rows.
+        assert_eq!(report.stop, SessionMergeStop::NoEligibleRunWithinBudget);
+        assert_eq!(report.progress.merges.len(), 3);
+        assert_eq!(report.progress.input_docs, 16);
+        for (receipt, sources) in report.progress.merges[..2]
+            .iter()
+            .zip(initial.segments[1..5].chunks(2))
+        {
+            assert_eq!(
+                receipt.plan.source_segment_ids,
+                sources
+                    .iter()
+                    .map(|source| source.segment_id)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(receipt.plan.input_docs, 4);
+        }
+        assert_eq!(
+            report.progress.merges[2].plan.source_segment_ids,
+            [0xc500, 0xc501]
+        );
+        assert_eq!(report.progress.merges[2].plan.input_docs, 8);
+        let source_bytes: u64 = initial.segments[1..5]
+            .iter()
+            .map(|source| {
+                std::fs::metadata(output_path(directory.path(), source.segment_id))
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        let rewritten_bytes: u64 = [0xc500, 0xc501]
+            .iter()
+            .map(|id| {
+                std::fs::metadata(output_path(directory.path(), *id))
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(report.progress.input_bytes, source_bytes + rewritten_bytes);
+        assert_eq!(index.snapshot().unwrap().segments().len(), 3);
+        assert_eq!(index.doc_count().unwrap(), 11);
+        assert_eq!(
+            index
+                .snapshot()
+                .unwrap()
+                .loaded_manifest()
+                .manifest
+                .field_stats,
+            initial.field_stats
+        );
+        assert_eq!(queries(&index, &cx), expected_queries);
+        assert_eq!(stored(&held), expected_stored);
+        assert_eq!(stored(&index.search_snapshot().unwrap()), expected_stored);
+        assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
     });
 }

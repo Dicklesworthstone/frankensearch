@@ -1399,6 +1399,9 @@ fn automatic_tiers_and_resumed_bulk_finish_leave_multiple_representable_segments
                     tier_fanout: 2,
                     merge_max_hole_ratio: 1.0,
                     bulk_load_mode: bulk,
+                    // Keep the tombstoned physical row for this concat proof;
+                    // compaction has its own statistics/publication contract.
+                    compaction_tombstone_density: 1.0,
                     ..config()
                 },
             )
@@ -1543,6 +1546,9 @@ fn interrupted_bounded_bulk_finish_resumes_after_a_group_has_been_published() {
             tier_fanout: 2,
             merge_max_hole_ratio: 1.0,
             bulk_load_mode: true,
+            // The injected second-publication fault targets a concat group,
+            // so no automatic compaction may publish before that group.
+            compaction_tombstone_density: 1.0,
             ..config()
         };
         let index = QuillIndex::open(&cx, directory.path(), bulk_config.clone())

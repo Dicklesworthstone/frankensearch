@@ -9669,33 +9669,46 @@ impl FsfsRuntime {
             }
         }
         .await;
-        match search_result {
-            Ok(payloads) => {
-                let payload = payloads.last().cloned().unwrap_or_else(|| {
-                    SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
-                });
-                self.emit_search_stream_explanations(&payload, stream_id, &mut seq, writer)?;
-                self.emit_search_stream_terminal_completed(stream_id, &mut seq, writer)?;
-                info!(
-                    query = query,
-                    phase = payload.phase.to_string(),
-                    returned_hits = payload.returned_hits,
-                    total_candidates = payload.total_candidates,
-                    stream_id,
-                    frames_emitted = seq,
-                    format = self.cli_input.format.to_string(),
-                    output_format = self.cli_input.format.to_string(),
-                    "fsfs search stream completed"
-                );
-                Ok(())
-            }
+        self.finish_search_stream(query, stream_id, requested_mode, &mut seq, writer, search_result)
+    }
+
+    fn finish_search_stream<W: Write>(
+        &self,
+        query: &str,
+        stream_id: &str,
+        requested_mode: SearchExecutionMode,
+        seq: &mut u64,
+        writer: &mut SearchStreamWriter<'_, W>,
+        search_result: SearchResult<Vec<SearchPayload>>,
+    ) -> SearchResult<()> {
+        let result = search_result.and_then(|payloads| {
+            let payload = payloads.last().cloned().unwrap_or_else(|| {
+                SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
+            });
+            self.emit_search_stream_explanations(&payload, stream_id, seq, writer)?;
+            self.emit_search_stream_terminal_completed(stream_id, seq, writer)?;
+            info!(
+                query = query,
+                phase = payload.phase.to_string(),
+                returned_hits = payload.returned_hits,
+                total_candidates = payload.total_candidates,
+                stream_id,
+                frames_emitted = *seq,
+                format = self.cli_input.format.to_string(),
+                output_format = self.cli_input.format.to_string(),
+                "fsfs search stream completed"
+            );
+            Ok(())
+        });
+        match result {
+            Ok(()) => Ok(()),
             Err(error) => {
                 if !writer.failed {
                     self.emit_search_stream_terminal_error(
                         stream_id,
                         &error,
                         requested_mode,
-                        &mut seq,
+                        seq,
                         writer,
                     )?;
                 }
@@ -11922,14 +11935,28 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let mut terminal = terminal_event_from_error(error, 0, 3);
         terminal.error = Some(self.search_output_error_for_mode(error, requested_mode));
-        let frame = StreamFrame::new(
+        let mut frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
             iso_timestamp_now(),
             "search",
             StreamEvent::<SearchHitPayload>::Terminal(terminal),
         );
-        emit_stream_frame(&frame, self.cli_input.format, writer)?;
+        if let Err(error) = emit_stream_frame(&frame, self.cli_input.format, writer) {
+            if !matches!(&error, SearchError::InvalidConfig { field, value, .. }
+                if field == "stream.toon_payload" && value == "record_separator")
+            {
+                return Err(error);
+            }
+            // The encoder refused before writing a byte. Replace this frame
+            // with its representability error, which contains no rejected data.
+            // A transport error must never take this retry path.
+            let public = crate::output_schema::output_error_from(&error);
+            frame.event = StreamEvent::Terminal(terminal_event_from_error(&error, 0, 3));
+            emit_stream_frame(&frame, self.cli_input.format, writer)?;
+            *seq = seq.saturating_add(1);
+            return Err(crate::output_schema::mark_output_reported(public));
+        }
         *seq = seq.saturating_add(1);
         Ok(())
     }
@@ -56754,6 +56781,78 @@ mod tests {
             .into_iter()
             .filter(|frame| matches!(&frame.event, StreamEvent::Terminal(_)))
             .collect()
+    }
+
+    #[test]
+    fn runtime_stream_finalization_reports_unencodable_explanations_once() {
+        for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                format,
+                stream: true,
+                ..CliInput::default()
+            });
+            let mut payload = SearchPayload::new(
+                "sharedtoken".to_owned(), SearchOutputPhase::Initial, 0, Vec::new(),
+            );
+            payload.explanation_warnings.push(crate::output_schema::OutputWarning::new(
+                OutputWarningCode::EXPLANATION_UNAVAILABLE, "left\u{001e}right",
+            ));
+            let started = StreamFrame::new(
+                "finalize", 0, "2026-11-12T00:00:00Z", "search",
+                StreamEvent::<SearchHitPayload>::Started(
+                    crate::stream_protocol::StreamStartedEvent::new("finalize", "sharedtoken", format.to_string()),
+                ),
+            );
+            let mut bytes = Vec::new();
+            let mut seq = 1;
+            let result = {
+                let mut writer = SearchStreamWriter { inner: &mut bytes, failed: false, wrote: false };
+                crate::adapters::format_emitter::emit_stream_frame(&started, format, &mut writer).unwrap();
+                runtime.finish_search_stream(
+                    "sharedtoken", "finalize", SearchExecutionMode::LexicalOnly,
+                    &mut seq, &mut writer, Ok(vec![payload]),
+                ).map_err(|error| writer.mark_error_if_output_owned(error, |error| {
+                    runtime.search_output_error_for_mode(error, SearchExecutionMode::LexicalOnly)
+                }))
+            };
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let frames: Vec<StreamFrame<SearchHitPayload>> = if format == OutputFormat::Toon {
+                text.split(char::from(TOON_STREAM_RECORD_SEPARATOR_BYTE))
+                    .filter(|record| !record.trim().is_empty())
+                    .map(|record| decode_stream_frame_toon(record).unwrap()).collect()
+            } else {
+                text.lines().map(|record| decode_stream_frame_ndjson(record).unwrap()).collect()
+            };
+            assert_eq!(seq, u64::try_from(frames.len()).unwrap());
+            for (sequence, frame) in frames.iter().enumerate() {
+                assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
+            }
+            assert_eq!(frames.iter().filter(|frame| frame.event.kind() == StreamEventKind::Terminal).count(), 1);
+            let Some(StreamEvent::Terminal(terminal)) = frames.last().map(|frame| &frame.event) else {
+                panic!("finalization must end with exactly one terminal");
+            };
+            if format == OutputFormat::Toon {
+                let error = result.unwrap_err();
+                let reported = crate::output_schema::reported_output_error(&error).unwrap();
+                assert_eq!(frames.len(), 2);
+                assert_eq!(reported.code, "invalid_config");
+                assert_eq!(reported.exit_code, 2);
+                assert_eq!(reported.field.as_deref(), Some("stream.toon_payload"));
+                assert_eq!(terminal.status, StreamTerminalStatus::Failed);
+                assert_eq!(terminal.exit_code, 2);
+                assert_eq!(terminal.failure_category, Some(crate::stream_protocol::StreamFailureCategory::Config));
+                assert_eq!(terminal.retry, crate::stream_protocol::StreamRetryDirective::None);
+                assert_eq!(terminal.error.as_ref(), Some(reported));
+            } else {
+                result.unwrap();
+                assert_eq!(frames.len(), 3);
+                assert!(matches!(&frames[1].event, StreamEvent::Warning(warning)
+                    if warning.warning.message == "left\u{001e}right"));
+                assert_eq!(terminal.status, StreamTerminalStatus::Completed);
+                assert_eq!(terminal.exit_code, 0);
+            }
+        }
     }
 
     #[test]
