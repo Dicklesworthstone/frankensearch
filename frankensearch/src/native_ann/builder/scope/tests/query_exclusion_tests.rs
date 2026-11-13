@@ -239,6 +239,67 @@ fn exclusions_keep_literal_quotes_no_match_ranks_and_positive_reranker_text() {
 }
 
 #[test]
+fn exclusion_census_keeps_boolean_words_literal_when_combining_terms() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let fast = Arc::new(Provider::new("literal-exclusion-fast", 2));
+            let quality = Arc::new(Provider::new("literal-exclusion-quality", 3));
+            let index = NativeIndexBuilder::new(
+                directory.path().join("index"),
+                generation(1),
+                fast.clone(),
+            )
+            .unwrap()
+            .add_documents(
+                ["AND", "OR", "NOT", "private", "public"]
+                    .map(|word| IndexableDocument::new(word, format!("needle {word}"))),
+            )
+            .with_fast_storage(
+                NativeBuildPrecision::F16,
+                if ann {
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams::default(),
+                        seed: 7,
+                    }
+                } else {
+                    NativeBuildRetrieval::Exact
+                },
+            )
+            .with_quality_embedder(quality.clone())
+            .unwrap()
+            .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+            .unwrap()
+            .build_hybrid(&cx)
+            .await
+            .unwrap();
+            assert_eq!(index.search(&cx, "needle", 10).await.unwrap().len(), 5);
+            for word in ["AND", "OR", "NOT"] {
+                let expected: BTreeSet<_> = ["AND", "OR", "NOT", "private", "public"]
+                    .into_iter()
+                    .filter(|id| *id != word)
+                    .collect();
+                for query in [
+                    format!("needle -{word} -absent"),
+                    format!("needle -absent -{word}"),
+                    format!("needle -\"{word}\" -absent"),
+                ] {
+                    for hits in [
+                        index.search(&cx, &query, 10).await.unwrap(),
+                        index.search_refined(&cx, &query, 10).await.unwrap(),
+                        index.search_quality(&cx, &query, 10).await.unwrap(),
+                    ] {
+                        let actual: BTreeSet<_> =
+                            hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+                        assert_eq!(actual, expected, "ann={ann}, query={query}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn exclusion_census_preserves_trailing_terms_when_or_rendering_expands_the_query() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();
