@@ -17,6 +17,7 @@
 //! println!("Indexed {} docs in {:.1}ms", stats.doc_count, stats.total_ms);
 //! ```
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -100,10 +101,12 @@ pub struct IndexBuildStats {
     pub source_count: usize,
     /// Number of documents successfully indexed into the fast vector tier.
     pub doc_count: usize,
-    /// Number of documents whose fast embedding failed (absent from the
-    /// vector tiers; still admitted to the lexical arm when enabled).
+    /// Number of documents whose source admission or fast embedding failed
+    /// (absent from the vector tiers; still attempted by the lexical arm
+    /// when enabled).
     pub error_count: usize,
-    /// Per-document fast-embedding errors (`doc_id`, error message).
+    /// Per-document source-admission or fast-embedding errors
+    /// (`doc_id`, error message).
     pub errors: Vec<(String, String)>,
     /// Documents successfully indexed into the quality vector tier.
     /// Zero when no quality embedder is configured.
@@ -461,6 +464,11 @@ impl IndexBuilder {
     /// content in a successful receipt. Fresh builds retain per-document
     /// lexical error accounting.
     ///
+    /// The first source document with an ID owns that ID for this build,
+    /// even if its embedding fails or its content is empty. Later duplicates
+    /// are not embedded and are reported as vector admission failures; they
+    /// cannot bind another body's vectors to the first lexical document.
+    ///
     /// Publication across vector and lexical arms remains sequential. An
     /// interrupted or failed build can expose different generations; a
     /// successful replacement has completed every selected arm.
@@ -634,6 +642,7 @@ impl IndexBuilder {
         }
 
         let total = self.documents.len();
+        let mut source_ids = HashSet::with_capacity(total);
         let mut errors = Vec::new();
         let mut doc_count = 0usize;
         let mut quality_indexed = 0usize;
@@ -653,17 +662,25 @@ impl IndexBuilder {
             for (batch_idx, batch) in self.documents.chunks(self.batch_size).enumerate() {
                 let batch_start = Instant::now();
                 for doc in batch {
-                    match Self::embed_and_add(
-                        cx,
-                        &fast_embedder,
-                        quality_embedder.as_deref(),
-                        &identities,
-                        &mut index_builder,
-                        doc,
-                        metrics_exporter.as_ref(),
-                    )
-                    .await
-                    {
+                    let outcome = match admit_build_source(&mut source_ids, &doc.id) {
+                        Ok(()) => {
+                            Self::embed_and_add(
+                                cx,
+                                &fast_embedder,
+                                quality_embedder.as_deref(),
+                                &identities,
+                                &mut index_builder,
+                                doc,
+                                metrics_exporter.as_ref(),
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            export_error(metrics_exporter.as_ref(), &error);
+                            Err(error)
+                        }
+                    };
+                    match outcome {
                         // Benchmark arm: pins the exact former residency AND
                         // former admission behavior (embed-gated lexical
                         // staging); quality receipts are not collected here.
@@ -704,6 +721,7 @@ impl IndexBuilder {
                     quality_embedder.as_deref(),
                     &identities,
                     &mut index_builder,
+                    &mut source_ids,
                     &batch,
                     metrics_exporter.as_ref(),
                 )
@@ -757,6 +775,7 @@ impl IndexBuilder {
                     quality_embedder.as_deref(),
                     &identities,
                     &mut index_builder,
+                    &mut source_ids,
                     &batch,
                     metrics_exporter.as_ref(),
                 )
@@ -804,6 +823,7 @@ impl IndexBuilder {
                 quality_embedder.as_deref(),
                 &identities,
                 &mut index_builder,
+                &mut source_ids,
                 batch,
                 metrics_exporter.as_ref(),
             )
@@ -1101,14 +1121,67 @@ impl IndexBuilder {
     /// is embedded as one bound batch, the quality tier only for documents
     /// whose fast embedding succeeded; see [`embed_build_texts`]. When neither
     /// tier batches, every document takes the per-document path unchanged.
+    /// Source IDs are reserved before inference, independently of its outcome,
+    /// so a failed first document cannot be replaced by a later duplicate in
+    /// either vector tier while the lexical arm retains the first body.
     /// A terminal failure (cancellation, identity refusal) is returned as `Err`.
+    #[allow(clippy::too_many_arguments)]
     async fn embed_and_add_batch(
         cx: &Cx,
         fast_embedder: &Arc<dyn Embedder>,
         quality_embedder: Option<&dyn Embedder>,
         identities: &BuildEmbeddingIdentities,
         builder: &mut TwoTierIndexBuilder,
+        source_ids: &mut HashSet<String>,
         docs: &[IndexableDocument],
+        metrics_exporter: Option<&Arc<dyn MetricsExporter>>,
+    ) -> SearchResult<Vec<BatchDocOutcome>> {
+        let mut admitted = Vec::with_capacity(docs.len());
+        let mut admission_errors = Vec::with_capacity(docs.len());
+        for doc in docs {
+            build_checkpoint(cx, "source document admission")?;
+            match admit_build_source(source_ids, &doc.id) {
+                Ok(()) => {
+                    admitted.push(doc);
+                    admission_errors.push(None);
+                }
+                Err(error) => {
+                    export_error(metrics_exporter, &error);
+                    admission_errors.push(Some(error.to_string()));
+                }
+            }
+        }
+        let mut embedded = Self::embed_admitted_batch(
+            cx,
+            fast_embedder,
+            quality_embedder,
+            identities,
+            builder,
+            &admitted,
+            metrics_exporter,
+        )
+        .await?
+        .into_iter();
+        Ok(admission_errors
+            .into_iter()
+            .map(|error| match error {
+                Some(message) => BatchDocOutcome::Failed(message),
+                None => embedded
+                    .next()
+                    .expect("every admitted source document has one embedding outcome"),
+            })
+            .collect())
+    }
+
+    /// Embed only the first occurrence of each source ID. The caller restores
+    /// source order and duplicate failures after this batch completes.
+    async fn embed_admitted_batch(
+        cx: &Cx,
+        fast_embedder: &Arc<dyn Embedder>,
+        quality_embedder: Option<&dyn Embedder>,
+        identities: &BuildEmbeddingIdentities,
+        builder: &mut TwoTierIndexBuilder,
+        docs: &[&IndexableDocument],
         metrics_exporter: Option<&Arc<dyn MetricsExporter>>,
     ) -> SearchResult<Vec<BatchDocOutcome>> {
         let batches_fast = identities.fast.is_some() && fast_embedder.bound_batch_is_native();
@@ -1224,8 +1297,24 @@ enum BatchDocOutcome {
     /// Added to every attempted tier; `Some(message)` when only quality failed
     /// and the document is fast-only.
     Added(Option<String>),
-    /// The fast embedding failed: the document enters no vector tier.
+    /// Source admission or the fast embedding failed: the document enters no
+    /// vector tier.
     Failed(String),
+}
+
+/// Source identity belongs to the first occurrence, before any arm decides
+/// whether its body can be indexed. Failed embeddings must not release it.
+fn admit_build_source(source_ids: &mut HashSet<String>, doc_id: &str) -> SearchResult<()> {
+    if source_ids.insert(doc_id.to_owned()) {
+        return Ok(());
+    }
+    Err(SearchError::InvalidConfig {
+        field: "documents.id".to_owned(),
+        value: doc_id.to_owned(),
+        reason:
+            "duplicate source document ID; the first occurrence owns the ID for every index arm"
+                .to_owned(),
+    })
 }
 
 struct BuildEmbeddingIdentities {
@@ -2042,9 +2131,17 @@ async fn build_lexical_index(
     // receipt, not in an aggregate error.
     let mut indexed = 0usize;
     let mut errors: Vec<(String, String)> = Vec::new();
+    let mut source_ids = HashSet::with_capacity(documents.len());
     let mut documents_iter = documents.iter();
     while let Some(document) = documents_iter.next() {
         build_checkpoint(cx, "Quill lexical document indexing")?;
+        // A failed lexical insertion does not claim a live Quill ID. Reserve
+        // the source ID anyway: later duplicates must not replace that body
+        // beside vectors already accepted for the first source document.
+        if let Err(error) = admit_build_source(&mut source_ids, &document.id) {
+            errors.push((document.id.clone(), error.to_string()));
+            continue;
+        }
         match lexical.index_document(cx, document).await {
             Ok(()) => indexed += 1,
             // Cancellation is a caller contract, not a document defect: abort
@@ -2231,8 +2328,16 @@ async fn build_tantivy_lexical_index(
     }
     let mut indexed = 0usize;
     let mut errors: Vec<(String, String)> = Vec::new();
+    let mut source_ids = HashSet::with_capacity(documents.len());
     for document in documents {
         build_checkpoint(cx, "Tantivy lexical document indexing")?;
+        // Tantivy's lower-level writer upserts. The facade's source ownership
+        // is first-wins, as in Quill: a later duplicate must not replace the
+        // lexical body while the vector arm retains (or failed) the first one.
+        if let Err(error) = admit_build_source(&mut source_ids, &document.id) {
+            errors.push((document.id.clone(), error.to_string()));
+            continue;
+        }
         match lexical
             .index_documents(cx, std::slice::from_ref(document))
             .await
@@ -3648,6 +3753,35 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "quill")]
+    async fn assert_quill_source_body(
+        cx: &Cx,
+        receipt: &LexicalArmReceipt,
+        doc_id: &str,
+        body: &str,
+    ) {
+        let lexical = QuillIndex::open(cx, &receipt.path, QuillConfig::default())
+            .await
+            .unwrap();
+        let hits = lexical.search_doc_ids(cx, "*", 10).unwrap();
+        let hit = hits.iter().find(|hit| hit.document_id == doc_id).unwrap();
+        let content_field = u16::try_from(
+            DEFAULT_SCHEMA
+                .fields
+                .iter()
+                .position(|field| field.name == "content")
+                .unwrap(),
+        )
+        .unwrap();
+        let stored = lexical
+            .search_snapshot()
+            .unwrap()
+            .stored_field_value(content_field, hit.global_docid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, body.as_bytes());
+    }
+
     /// GH #57: a batch-native producer embeds each `batch_size` group in one
     /// bound call per tier — tails and `batch_size` 1 included — and writes
     /// exactly the vectors its single-input path would.
@@ -3776,6 +3910,78 @@ mod tests {
                         let hits = lexical.search_results(&cx, fault, 10).unwrap();
                         assert_eq!(hits.len(), 1, "{case}");
                         assert_eq!(hits[0].doc_id, "bad", "{case}");
+                    }
+                }
+            }
+        });
+    }
+
+    /// A native batch must never embed a later duplicate, including when the
+    /// first occurrence is rejected by batch bisection. Both tiers keep the
+    /// same source owner across batch boundaries.
+    #[test]
+    fn batch_native_build_reserves_failed_source_ids_before_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch_size in [1, 4] {
+                for native in [[true, true], [true, false]] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let (stack, fast, quality) = batch_native_stack(native, "fast");
+                    let stats = IndexBuilder::new(dir.path())
+                        .with_embedder_stack(stack)
+                        .with_batch_size(batch_size)
+                        .add_document("shared", "reject")
+                        .add_document("shared", "rejectedduplicate")
+                        .add_document("other", "survivor")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+
+                    assert_eq!(stats.source_count, 3);
+                    assert_eq!(stats.doc_count, 1);
+                    assert_eq!(stats.error_count, 2);
+                    assert_eq!(stats.quality_indexed, 1);
+                    assert!(stats.quality_errors.is_empty());
+                    assert!(stats.errors.iter().all(|(id, _)| id == "shared"));
+                    assert!(stats.errors[1].1.contains("duplicate source document ID"));
+                    assert_eq!(fast.single_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(
+                        quality.single_calls.load(Ordering::SeqCst),
+                        usize::from(!native[1]),
+                    );
+                    for (name, embedder) in [
+                        (VECTOR_INDEX_FAST_FILENAME, &fast),
+                        (VECTOR_INDEX_QUALITY_FILENAME, &quality),
+                    ] {
+                        assert!(
+                            embedder
+                                .batches
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .flatten()
+                                .all(|text| text != "rejectedduplicate"),
+                            "duplicate bodies must never reach {name} inference",
+                        );
+                        let vectors = indexed_vectors(&dir.path().join(name));
+                        assert_eq!(
+                            vectors.keys().map(String::as_str).collect::<Vec<_>>(),
+                            ["other"]
+                        );
+                        assert_eq!(
+                            vectors["other"],
+                            embedder.inner.embed(&cx, "survivor").await.unwrap()
+                        );
+                    }
+                    #[cfg(feature = "quill")]
+                    {
+                        let receipt = stats.lexical.as_ref().unwrap();
+                        assert_eq!(
+                            (receipt.attempted, receipt.indexed, receipt.errors.len()),
+                            (3, 2, 1)
+                        );
+                        assert_eq!(receipt.errors[0].0, "shared");
+                        assert!(receipt.published);
+                        assert_quill_source_body(&cx, receipt, "shared", "reject").await;
                     }
                 }
             }
@@ -5192,46 +5398,230 @@ mod tests {
     /// Duplicate IDs: pin that the lexical arm reports per-document errors in
     /// the receipt instead of voiding the whole arm, and that accounting
     /// stays exact.
+    /// A failed first source must retain the ID even though it never reached
+    /// the vector writer's own duplicate check.
+    #[test]
+    fn failed_first_source_cannot_be_replaced_by_a_duplicate_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch_size in [1, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let stack = EmbedderStack::from_parts(Arc::new(SelectiveFailEmbedder), None);
+                let first_body = "fail-fast-embedding originalsentinel";
+                let stats = IndexBuilder::new(dir.path())
+                    .with_embedder_stack(stack)
+                    .with_batch_size(batch_size)
+                    .add_document("shared", first_body)
+                    .add_document("shared", "rejectedduplicate")
+                    .add_document("other", "survivor")
+                    .build(&cx)
+                    .await
+                    .unwrap();
+
+                assert_eq!(stats.source_count, 3);
+                assert_eq!(stats.doc_count, 1);
+                assert_eq!(stats.error_count, 2);
+                assert!(stats.errors.iter().all(|(id, _)| id == "shared"));
+                assert!(stats.errors[1].1.contains("duplicate source document ID"));
+                assert_eq!(stats.doc_count + stats.error_count, stats.source_count);
+                assert_eq!(stats.quality_indexed, 0);
+                assert!(!stats.has_quality_index);
+                let reopened = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+                assert_eq!(reopened.doc_count(), 1);
+                assert!(reopened.fast_vector_for_doc_id("shared").unwrap().is_none());
+                assert!(reopened.fast_vector_for_doc_id("other").unwrap().is_some());
+
+                #[cfg(feature = "quill")]
+                {
+                    let receipt = stats.lexical.as_ref().unwrap();
+                    assert_eq!(
+                        (receipt.attempted, receipt.indexed, receipt.errors.len()),
+                        (3, 2, 1)
+                    );
+                    assert_eq!(receipt.errors[0].0, "shared");
+                    assert!(receipt.published);
+                    assert_quill_source_body(&cx, receipt, "shared", first_body).await;
+                }
+            }
+        });
+    }
+
+    /// Legacy vectors accept an empty ID, while Quill rejects it. This gives
+    /// a small real lexical failure after vector success: the next occurrence
+    /// must fail source admission even though Quill never indexed the first.
     #[cfg(feature = "quill")]
     #[test]
-    fn duplicate_ids_land_in_lexical_receipt_not_aggregate_failure() {
+    fn failed_first_lexical_insertion_does_not_release_source_id() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
+            let first_body = "first";
             let stats = IndexBuilder::new(dir.path())
                 .with_embedder_stack(stub_stack())
-                .add_document("doc-dup", "alpha duplicate content")
-                .add_document("doc-dup", "beta duplicate content")
-                .add_document("doc-ok", "gamma unique content")
+                .with_batch_size(1)
+                .add_document("", first_body)
+                .add_document("", "rejectedduplicate")
+                .add_document("other", "survivor")
                 .build(&cx)
                 .await
                 .unwrap();
 
             assert_eq!(stats.source_count, 3);
-            let receipt = stats.lexical.as_ref().expect("lexical arm receipt");
-            assert_eq!(receipt.attempted, 3);
-            assert_eq!(receipt.indexed, 2, "first doc-dup and doc-ok both index");
-            assert_eq!(receipt.errors.len(), 1);
-            assert_eq!(receipt.errors[0].0, "doc-dup");
-            assert!(
-                receipt.errors[0].1.contains("duplicate live document id"),
-                "the receipt carries the typed duplicate rejection: {:?}",
-                receipt.errors[0].1,
+            assert_eq!(stats.doc_count, 2);
+            assert_eq!(stats.error_count, 1);
+            assert_eq!(stats.quality_indexed, 2);
+            assert!(stats.errors[0].1.contains("duplicate source document ID"));
+            for name in [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME] {
+                let vectors = indexed_vectors(&dir.path().join(name));
+                assert_eq!(vectors.len(), 2);
+                assert_eq!(vectors[""], [0.0, 1.0, 0.0, 0.0], "{name}");
+                assert!(vectors.contains_key("other"));
+            }
+            let receipt = stats.lexical.as_ref().unwrap();
+            assert_eq!(
+                (receipt.attempted, receipt.indexed, receipt.errors.len()),
+                (3, 1, 2)
             );
+            assert!(receipt.errors[0].1.contains("document id must be nonempty"));
+            assert!(receipt.errors[1].1.contains("duplicate source document ID"));
             assert!(receipt.published);
+            assert_quill_source_body(&cx, receipt, "other", "survivor").await;
+        });
+    }
 
-            // The clean document AFTER the rejected duplicate survived — the
-            // reconcile-commit recovery keeps one bad document from voiding
-            // the rest of the arm.
-            let lexical = QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
-                .await
-                .unwrap();
-            let gamma_ids = lexical
-                .search_doc_ids(&cx, "gamma", 10)
-                .unwrap()
-                .iter()
-                .map(|hit| hit.document_id.clone())
-                .collect::<Vec<_>>();
-            assert_eq!(gamma_ids, vec!["doc-ok".to_owned()]);
+    /// Empty and whitespace-only first bodies still own their IDs. Both
+    /// persisted vector tiers and lexical content must describe that source,
+    /// and an unrelated document after a duplicate must still be admitted.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn duplicate_ids_land_in_lexical_receipt_not_aggregate_failure() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch_size in [1, 4] {
+                for first_body in ["alpha duplicate content", "", " \t\n"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let stats = IndexBuilder::new(dir.path())
+                        .with_embedder_stack(stub_stack())
+                        .with_batch_size(batch_size)
+                        .add_document("doc-dup", first_body)
+                        .add_document("doc-dup", "rejectedduplicate")
+                        .add_document("doc-ok", "gamma unique content")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+
+                    assert_eq!(stats.source_count, 3);
+                    assert_eq!(stats.doc_count, 2);
+                    assert_eq!(stats.error_count, 1);
+                    assert_eq!(stats.errors[0].0, "doc-dup");
+                    assert!(stats.errors[0].1.contains("duplicate source document ID"));
+                    assert_eq!(stats.quality_indexed, 2);
+                    assert!(stats.quality_errors.is_empty());
+                    for name in [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME] {
+                        let vectors = indexed_vectors(&dir.path().join(name));
+                        assert_eq!(vectors.len(), 2);
+                        let mut first_vector = vec![0.0; 4];
+                        first_vector[first_body.len() % 4] = 1.0;
+                        assert_eq!(vectors["doc-dup"], first_vector, "{name}");
+                        assert!(vectors.contains_key("doc-ok"));
+                    }
+                    let receipt = stats.lexical.as_ref().expect("lexical arm receipt");
+                    assert_eq!(receipt.attempted, 3);
+                    assert_eq!(receipt.indexed, 2, "first doc-dup and doc-ok both index");
+                    assert_eq!(receipt.errors.len(), 1);
+                    assert_eq!(receipt.errors[0].0, "doc-dup");
+                    assert!(
+                        receipt.errors[0].1.contains("duplicate source document ID"),
+                        "the receipt carries the typed duplicate rejection: {:?}",
+                        receipt.errors[0].1,
+                    );
+                    assert!(receipt.published);
+                    assert_quill_source_body(&cx, receipt, "doc-dup", first_body).await;
+
+                    let lexical = QuillIndex::open(&cx, &receipt.path, QuillConfig::default())
+                        .await
+                        .unwrap();
+                    let gamma_ids = lexical
+                        .search_doc_ids(&cx, "gamma", 10)
+                        .unwrap()
+                        .iter()
+                        .map(|hit| hit.document_id.clone())
+                        .collect::<Vec<_>>();
+                    assert_eq!(gamma_ids, vec!["doc-ok".to_owned()]);
+                    assert!(
+                        lexical
+                            .search_doc_ids(&cx, "rejectedduplicate", 10)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+        });
+    }
+
+    /// The explicitly selected Tantivy writer upserts at its lower-level API.
+    /// Facade source admission must prevent that from replacing the lexical
+    /// body independently of the first-wins vector arms.
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn tantivy_build_keeps_first_source_content_when_ids_repeat() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch_size in [1, 4] {
+                for first_fails in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let stack = EmbedderStack::from_parts(Arc::new(SelectiveFailEmbedder), None);
+                    let first_body = if first_fails {
+                        "fail-fast-embedding originalsentinel"
+                    } else {
+                        "originalsentinel"
+                    };
+                    let stats = IndexBuilder::new(dir.path())
+                        .with_embedder_stack(stack)
+                        .with_tantivy_lexical()
+                        .with_batch_size(batch_size)
+                        .add_document("shared", first_body)
+                        .add_document("shared", "rejectedduplicate")
+                        .add_document("other", "survivor")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+
+                    assert_eq!(stats.source_count, 3);
+                    assert_eq!(stats.doc_count, 2 - usize::from(first_fails));
+                    assert_eq!(stats.error_count, 1 + usize::from(first_fails));
+                    assert!(
+                        stats
+                            .errors
+                            .last()
+                            .unwrap()
+                            .1
+                            .contains("duplicate source document ID")
+                    );
+                    let vectors = indexed_vectors(&dir.path().join(VECTOR_INDEX_FAST_FILENAME));
+                    assert_eq!(vectors.contains_key("shared"), !first_fails);
+                    assert!(vectors.contains_key("other"));
+                    let receipt = stats.lexical.as_ref().unwrap();
+                    assert_eq!(receipt.backend, "tantivy");
+                    assert_eq!(
+                        (receipt.attempted, receipt.indexed, receipt.errors.len()),
+                        (3, 2, 1)
+                    );
+                    assert_eq!(receipt.errors[0].0, "shared");
+                    assert!(receipt.errors[0].1.contains("duplicate source document ID"));
+                    assert!(receipt.published);
+                    let lexical = TantivyIndex::open_read_only(&receipt.path).unwrap();
+                    let original = lexical.search(&cx, "originalsentinel", 10).await.unwrap();
+                    assert_eq!(original.len(), 1);
+                    assert_eq!(original[0].doc_id, "shared");
+                    assert!(
+                        lexical
+                            .search(&cx, "rejectedduplicate", 10)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let other = lexical.search(&cx, "survivor", 10).await.unwrap();
+                    assert_eq!(other.len(), 1);
+                    assert_eq!(other[0].doc_id, "other");
+                }
+            }
         });
     }
 
