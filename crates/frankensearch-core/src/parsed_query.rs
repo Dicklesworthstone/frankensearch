@@ -535,7 +535,7 @@ mod tests {
             ("don't -outside", "don't"),
             (r#"say"hello -outside"#, r#"say"hello"#),
             (r#"say\"hello -outside"#, r#"say\"hello"#),
-            (r#"\-literal -outside"#, "-literal"),
+            (r"\-literal -outside", "-literal"),
             (r#"\-"literal -outside"#, r#"-"literal"#),
             (r#"id:part:"literal -outside"#, r#"id:part:"literal"#),
             (r#"foo+bar:"literal -outside"#, r#"foo+bar:"literal"#),

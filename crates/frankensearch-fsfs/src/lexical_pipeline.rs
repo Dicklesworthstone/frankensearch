@@ -1096,8 +1096,8 @@ mod tests {
                 r#"HashMap\:\:new NOT "internal secret""#,
             ),
             (
-                r#"\-literal nOt 'secret phrase'"#,
-                r#"\-literal NOT 'secret phrase'"#,
+                r"\-literal nOt 'secret phrase'",
+                r"\-literal NOT 'secret phrase'",
             ),
             (
                 r#"title:"not \"secret\"" Not "outside secret""#,
@@ -1110,7 +1110,7 @@ mod tests {
             r#"needle NOT "secret""#,
             r#""say not \"secret\"""#,
             r#"title:'not "secret"'"#,
-            r#"\-literal"#,
+            r"\-literal",
             "this is not excluded",
         ] {
             assert!(

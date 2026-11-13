@@ -4426,6 +4426,9 @@ mod tests {
                 .expect("write unchanged vector");
             writer.finish().expect("seal main index");
             let main_bytes = std::fs::read(&path).expect("retain main bytes");
+            let main_generation =
+                crate::VectorIndex::peek_compaction_gen(&path).expect("read main generation");
+            let wal_generation = crate::next_generation(main_generation);
             let wal_path = crate::wal::wal_path_for(&path);
 
             // Reproduce the real log-before-tombstone crash boundary. Both WAL
@@ -4448,12 +4451,18 @@ mod tests {
                     &entries,
                     2,
                     quantization,
-                    crate::next_generation(0),
+                    wal_generation,
                     true,
                 )
                 .expect("persist replacement without tombstoning main");
             }
             let wal_bytes = std::fs::read(&wal_path).expect("retain WAL bytes");
+            assert_eq!(
+                crate::wal::read_wal(&wal_path, 2, quantization)
+                    .expect("read durable WAL header")
+                    .1,
+                wal_generation,
+            );
             let file_index = crate::VectorIndex::open_read_only(&path).expect("open reference");
             assert_eq!(file_index.tombstone_count(), 0);
             assert_eq!(file_index.wal_record_count(), 2);
@@ -4481,6 +4490,71 @@ mod tests {
                     };
                     assert_eq!(signature(&actual), signature(&expected));
                 }
+            }
+            assert_eq!(std::fs::read(&path).expect("main unchanged"), main_bytes);
+            assert_eq!(std::fs::read(&wal_path).expect("WAL unchanged"), wal_bytes);
+        }
+    }
+
+    #[test]
+    fn from_fsvi_rejects_stale_wal_replacements_without_mutating_files() {
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let path = temp_index_path("stale-wal-before-tombstone");
+            let mut writer = crate::VectorIndex::create_with_revision(
+                &path,
+                "test-embedder",
+                "rev-a",
+                2,
+                quantization,
+            )
+            .expect("create main index");
+            writer
+                .write_record("updated", &[1.0, 0.0])
+                .expect("write incumbent vector");
+            writer.finish().expect("seal main index");
+            let main_generation =
+                crate::VectorIndex::peek_compaction_gen(&path).expect("read main generation");
+            assert_ne!(main_generation, crate::next_generation(main_generation));
+            let wal_path = crate::wal::wal_path_for(&path);
+            crate::wal::append_wal_batch(
+                &wal_path,
+                &[
+                    crate::wal::WalEntry {
+                        doc_id: "updated".to_owned(),
+                        doc_id_hash: fnv1a_hash(b"updated"),
+                        embedding: vec![0.0, 1.0],
+                    },
+                    crate::wal::WalEntry {
+                        doc_id: "added".to_owned(),
+                        doc_id_hash: fnv1a_hash(b"added"),
+                        embedding: vec![0.25, 0.75],
+                    },
+                ],
+                2,
+                quantization,
+                main_generation,
+                true,
+            )
+            .expect("persist deliberately stale WAL");
+            let main_bytes = std::fs::read(&path).expect("retain main bytes");
+            let wal_bytes = std::fs::read(&wal_path).expect("retain WAL bytes");
+            let (entries, wal_generation, _) =
+                crate::wal::read_wal(&wal_path, 2, quantization).expect("read stale WAL");
+            assert_eq!(entries.len(), 2, "the control contains real durable rows");
+            assert_eq!(wal_generation, main_generation);
+
+            let reference = crate::VectorIndex::open_read_only(&path).expect("open reference");
+            assert_eq!(reference.wal_record_count(), 0);
+            let memory = InMemoryVectorIndex::from_fsvi(&path).expect("load snapshot");
+            assert_eq!(memory.record_count(), 1);
+            assert!(memory.index_of_doc_id("added").is_none());
+            let updated = memory.index_of_doc_id("updated").expect("incumbent row");
+            assert_eq!(memory.vector_at_f32(updated).unwrap(), vec![1.0, 0.0]);
+            for query in [[1.0, 0.0], [0.0, 1.0]] {
+                assert_eq!(
+                    memory.search_top_k(&query, 10, None).unwrap(),
+                    reference.search_top_k(&query, 10, None).unwrap(),
+                );
             }
             assert_eq!(std::fs::read(&path).expect("main unchanged"), main_bytes);
             assert_eq!(std::fs::read(&wal_path).expect("WAL unchanged"), wal_bytes);
