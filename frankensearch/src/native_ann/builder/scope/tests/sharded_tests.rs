@@ -74,6 +74,113 @@ fn page(hits: &[NativeShardedResult]) -> serde_json::Value {
 }
 
 #[test]
+fn sharded_exclusions_refill_independent_tiers_and_preserve_frozen_scopes() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let fast = Arc::new(Provider::new("excluded-shards-fast", 2));
+            let quality = Arc::new(Provider::new("excluded-shards-quality", 3));
+            let index = partitioned(
+                &cx,
+                &root.path().join("index"),
+                ann,
+                7,
+                &fast,
+                Some(&quality),
+            )
+            .await;
+            for query in ["needle -private", "needle nOt \"needle private\""] {
+                for hits in [
+                    index.search(&cx, query, 3).await.unwrap(),
+                    index.search_quality(&cx, query, 3).await.unwrap(),
+                    index.search_refined(&cx, query, 3).await.unwrap(),
+                ] {
+                    assert_eq!(hits.len(), 3);
+                    assert!(
+                        hits.iter()
+                            .all(|hit| !hit.result.doc_id.starts_with("private-"))
+                    );
+                    rows(&index, &hits);
+                }
+            }
+            let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 2);
+            let pooled = index
+                .search_refined_with_pool(&cx, "needle -private", 3, pool.handle())
+                .await
+                .unwrap();
+            assert_eq!(pooled.len(), 3);
+            assert!(
+                pooled
+                    .iter()
+                    .all(|hit| !hit.result.doc_id.starts_with("private-"))
+            );
+            rows(&index, &pooled);
+            assert!(
+                fast.query_texts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|text| text == "needle")
+            );
+            assert!(
+                quality
+                    .query_texts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|text| text == "needle")
+            );
+
+            let scope = index
+                .scope(&cx, |document| Ok(document.id != "a-fast"))
+                .unwrap();
+            let mut stream = scope
+                .progressive(&cx, "needle -private -middle", 10)
+                .unwrap();
+            for refined in [false, true] {
+                let hits = match stream.next_phase().await.unwrap().unwrap() {
+                    NativeShardedSearchPhase::Initial { results, .. } if !refined => results,
+                    NativeShardedSearchPhase::Refined { results, .. } if refined => results,
+                    other => panic!("unexpected phase: {other:?}"),
+                };
+                assert_eq!(hits.len(), 2);
+                assert!(
+                    hits.iter()
+                        .all(|hit| matches!(hit.result.doc_id.as_str(), "c-near" | "d-quality"))
+                );
+                rows(&index, &hits);
+            }
+            assert!(stream.next_phase().await.unwrap().is_none());
+            let fast_calls = fast.queries.load(Ordering::SeqCst);
+            let quality_calls = quality.queries.load(Ordering::SeqCst);
+            fast.fail.store(true, Ordering::SeqCst);
+            quality.fail.store(true, Ordering::SeqCst);
+            for hits in [
+                index.search_refined(&cx, "-private", 20).await.unwrap(),
+                index
+                    .search_quality_with_pool(&cx, "not \"needle private\"", 20, pool.handle())
+                    .await
+                    .unwrap(),
+            ] {
+                assert_eq!(hits.len(), 4);
+                assert!(
+                    hits.iter()
+                        .all(|hit| !hit.result.doc_id.starts_with("private-")
+                            && hit.fast_row.is_none()
+                            && hit.quality_row.is_none()
+                            && hit.result.fast_score.is_none()
+                            && hit.result.quality_score.is_none())
+                );
+            }
+            assert_eq!(fast.queries.load(Ordering::SeqCst), fast_calls);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), quality_calls);
+            quality.advertise_foreign.store(true, Ordering::SeqCst);
+            assert!(index.search_refined(&cx, "-private", 0).await.is_err());
+        }
+    });
+}
+
+#[test]
 fn selective_scopes_fill_each_lane_before_global_sharded_fusion() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         for ann in [false, true] {

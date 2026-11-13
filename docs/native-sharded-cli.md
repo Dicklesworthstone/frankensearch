@@ -52,6 +52,12 @@ hydration; restrictive scopes refill candidate windows instead of dropping an
 already-truncated output page. Empty scopes skip inference but not identity or
 required-tier admission. Reranking uses only the eligible retained source text.
 
+Query exclusions use the [native query contract](native-search-cli.md#query-exclusions):
+the global immutable Quill population supplies one complete excluded-ID set,
+shared by every partition and both tiers. Explicit scopes and exclusions are
+intersected before candidate cutoffs. Models receive positive text only;
+exclusion-only queries use lexical complement results without inference.
+
 Buffered queries require all requested phases to complete successfully.
 Streaming reuses the ordinary command framing and deadline code: Initial is
 flushed before quality inference, and Refined before reranking. One absolute

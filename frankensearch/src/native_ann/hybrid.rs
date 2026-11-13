@@ -16,11 +16,30 @@ use super::{NativeAnnIndex, checkpoint, invalid};
 use crate::{Cx, Embedder, ScoreSource, ScoredResult, SearchResult};
 
 mod progressive;
+mod query;
 mod refinement;
 mod sharded;
 
 pub use progressive::{NativePhaseCandidates, NativeProgressiveSearch, NativeSearchPhase};
 pub use sharded::{NativeShardedProgressiveSearch, NativeShardedResult, NativeShardedSearchPhase};
+
+/// Keyword-only counterpart for complete retained cohorts. The caller must own
+/// the same immutable lexical population through preparation and hydration.
+#[cfg(feature = "quill")]
+pub(in crate::native_ann) async fn immutable_candidates(
+    cx: &Cx,
+    lexical: &dyn LexicalRead,
+    text: &str,
+    limit: usize,
+) -> SearchResult<LexicalCandidateBatch> {
+    match query::ImmutableTextQuery::new(lexical, text) {
+        Some(mut query) => {
+            query.prepare(cx, lexical).await?;
+            query.candidates(cx, lexical, limit).await
+        }
+        None => refinement::checked_lexical(cx, lexical, text, limit).await,
+    }
+}
 
 impl NativeAnnIndex {
     /// Execute native hybrid retrieval and return hydrated final winners.

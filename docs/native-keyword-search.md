@@ -46,6 +46,12 @@ there is no vector normalization, RRF, cross-encoder scoring, or shard-local BM2
 merge. Only IDs belonging to the selected source may become results. Physical
 vector `index` values are null because no vector image was admitted.
 
+The [native exclusion syntax](native-search-cli.md#query-exclusions) also applies
+here: term and phrase exclusions constrain every Boolean branch, and
+case-insensitive phrase `NOT` is normalized without changing quoted literals.
+Excluded IDs come from the same immutable Quill reader before selecting the
+eligible page. A query containing only exclusions returns its lexical complement.
+
 The existing exact-ID, ID-prefix and metadata filter syntax is supported. Scope
 membership is evaluated against retained source records before candidate cutoff
 and hydration. To avoid post-filter underfill, a selective scope requests the

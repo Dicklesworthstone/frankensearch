@@ -10,6 +10,7 @@ use frankensearch_core::traits::Reranker;
 use frankensearch_fusion::{blend_two_tier, rrf_fuse_for_vector_lane};
 
 use super::progressive::rerank::{RerankRequest, RerankTextSource};
+use super::query::ImmutableTextQuery;
 use super::refinement::{admit_pair, checked_lexical};
 use super::{NativePhaseCandidates, checkpoint, hydrate_winners, invalid, join_sources};
 use crate::native_ann::{NativeShardHit, NativeShardRow, NativeShardSet};
@@ -367,6 +368,7 @@ impl NativeShardSet {
             pool: None,
             lexical,
             text,
+            immutable_query: None,
             k,
             budget: candidate_budget(k)?,
             policy: QueryPolicy::default(),
@@ -404,6 +406,7 @@ impl NativeShardSet {
             pool: Some(pool),
             lexical,
             text,
+            immutable_query: None,
             k,
             budget: candidate_budget(k)?,
             policy: QueryPolicy::default(),
@@ -447,6 +450,7 @@ pub struct NativeShardedProgressiveSearch<'a> {
     pool: Option<BlockingPoolHandle>,
     lexical: &'a dyn LexicalRead,
     text: &'a str,
+    immutable_query: Option<ImmutableTextQuery>,
     k: usize,
     budget: usize,
     policy: QueryPolicy,
@@ -456,6 +460,63 @@ pub struct NativeShardedProgressiveSearch<'a> {
 }
 
 impl<'a> NativeShardedProgressiveSearch<'a> {
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) async fn collect(mut self) -> SearchResult<Vec<NativeShardedResult>> {
+        let mut page = Vec::new();
+        while let Some(phase) = self.next_phase().await? {
+            page = match phase {
+                NativeShardedSearchPhase::Initial { results, .. }
+                | NativeShardedSearchPhase::Refined { results, .. }
+                | NativeShardedSearchPhase::Reranked { results, .. } => results,
+                NativeShardedSearchPhase::RefinementFailed { error, .. }
+                | NativeShardedSearchPhase::RerankFailed { error, .. } => return Err(error),
+            };
+        }
+        Ok(page)
+    }
+
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) async fn collect_quality(
+        self,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        let cx = self.cx;
+        let mut results = self.collect().await?;
+        for hit in &mut results {
+            checkpoint(cx, "native_ann.shards.quality_result")?;
+            hit.quality_row = hit.fast_row.take();
+            hit.result.quality_score = hit.result.fast_score.take();
+            if hit.result.source == ScoreSource::SemanticFast {
+                hit.result.source = ScoreSource::SemanticQuality;
+            }
+        }
+        Ok(results)
+    }
+
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_immutable_query(mut self) -> Self {
+        self.immutable_query = ImmutableTextQuery::new(self.lexical, self.text);
+        self
+    }
+
+    fn semantic_text(&self) -> &str {
+        self.immutable_query
+            .as_ref()
+            .map_or(self.text, |query| query.semantic.as_str())
+    }
+
+    async fn lexical_candidates(&self) -> SearchResult<LexicalCandidateBatch> {
+        match &self.immutable_query {
+            Some(query) => query.candidates(self.cx, self.lexical, self.budget).await,
+            None => checked_lexical(self.cx, self.lexical, self.text, self.budget).await,
+        }
+    }
+
+    fn exclusion_only(&self) -> bool {
+        self.immutable_query
+            .as_ref()
+            .is_some_and(|query| query.semantic.trim().is_empty())
+    }
+
     // Only a complete source-scoped owner supplies this frozen membership and
     // its equally scoped immutable lexical adapter. Public raw readers cannot
     // attach a vector-only filter and silently leave the keyword lane unscoped.
@@ -478,7 +539,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
             ));
         }
         self.allowed_documents = Some(allowed);
-        Ok(self)
+        Ok(self.with_immutable_query())
     }
 
     fn owned_shards(&self, shards: &NativeShardSet) -> Option<NativeShardSet> {
@@ -496,60 +557,52 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         embedder: &dyn Embedder,
         ef: Option<usize>,
     ) -> SearchResult<Vec<NativeShardHit>> {
-        match self.allowed_documents.as_ref() {
-            Some(allowed) => {
-                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_shards(shards)) {
-                    let first = owner.shard(0).ok_or_else(|| {
-                        invalid(
-                            "shards.inventory",
-                            "empty",
-                            "missing admitted progressive shard identity",
-                        )
-                    })?;
-                    let query = first.embed_query(self.cx, embedder, self.text).await?;
-                    let allowed = std::sync::Arc::clone(allowed);
-                    owner
-                        .search_filtered_with_pool(
-                            self.cx,
-                            query,
-                            self.budget.min(allowed.len()),
-                            ef,
-                            pool,
-                            move |id| allowed.contains(id),
-                        )
-                        .await
-                } else {
-                    shards
-                        .search_text_filtered(
-                            self.cx,
-                            embedder,
-                            self.text,
-                            self.budget.min(allowed.len()),
-                            ef,
-                            |id| allowed.contains(id),
-                        )
-                        .await
-                }
+        if self.exclusion_only() {
+            return Ok(Vec::new());
+        }
+        let allowed = self.allowed_documents.clone();
+        let excluded = self
+            .immutable_query
+            .as_ref()
+            .map(|query| std::sync::Arc::clone(&query.excluded))
+            .filter(|ids| !ids.is_empty());
+        let budget = allowed
+            .as_ref()
+            .map_or(self.budget, |ids| self.budget.min(ids.len()));
+        if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_shards(shards)) {
+            let first = owner.shard(0).ok_or_else(|| {
+                invalid(
+                    "shards.inventory",
+                    "empty",
+                    "missing admitted progressive shard identity",
+                )
+            })?;
+            let query = first
+                .embed_query(self.cx, embedder, self.semantic_text())
+                .await?;
+            if allowed.is_some() || excluded.is_some() {
+                owner
+                    .search_filtered_with_pool(self.cx, query, budget, ef, pool, move |id| {
+                        allowed.as_ref().is_none_or(|ids| ids.contains(id))
+                            && excluded.as_ref().is_none_or(|ids| !ids.contains(id))
+                    })
+                    .await
+            } else {
+                owner
+                    .search_with_pool(self.cx, query, budget, ef, pool)
+                    .await
             }
-            None => {
-                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_shards(shards)) {
-                    let first = owner.shard(0).ok_or_else(|| {
-                        invalid(
-                            "shards.inventory",
-                            "empty",
-                            "missing admitted progressive shard identity",
-                        )
-                    })?;
-                    let query = first.embed_query(self.cx, embedder, self.text).await?;
-                    owner
-                        .search_with_pool(self.cx, query, self.budget, ef, pool)
-                        .await
-                } else {
-                    shards
-                        .search_text(self.cx, embedder, self.text, self.budget, ef)
-                        .await
-                }
-            }
+        } else if allowed.is_some() || excluded.is_some() {
+            shards
+                .search_text_filtered(self.cx, embedder, self.semantic_text(), budget, ef, |id| {
+                    allowed.as_ref().is_none_or(|ids| ids.contains(id))
+                        && excluded.as_ref().is_none_or(|ids| !ids.contains(id))
+                })
+                .await
+        } else {
+            shards
+                .search_text(self.cx, embedder, self.semantic_text(), budget, ef)
+                .await
         }
     }
 
@@ -663,10 +716,13 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
                 candidates: NativePhaseCandidates::default(),
             });
         }
+        if let Some(query) = &mut self.immutable_query {
+            query.prepare(self.cx, self.lexical).await?;
+        }
         let (fast, batch) = join_sources(
             self.cx,
             self.vector_candidates(self.fast, self.fast_embedder, self.policy.fast_ef),
-            checked_lexical(self.cx, self.lexical, self.text, self.budget),
+            self.lexical_candidates(),
         )
         .await?;
         if let Some(allowed) = self.allowed_documents.as_ref() {
@@ -756,7 +812,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         candidates: NativePhaseCandidates,
         batch: LexicalCandidateBatch,
     ) -> Vec<NativeShardedResult> {
-        if self.reranker.is_some() && !results.is_empty() {
+        if self.reranker.is_some() && !results.is_empty() && !self.exclusion_only() {
             let displayed = results.iter().take(self.k).cloned().collect();
             self.state = State::Rerank(PendingRerank {
                 results,
@@ -784,7 +840,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         match request
             .plan(
                 self.cx,
-                self.text,
+                self.semantic_text(),
                 pending.results.iter().map(|hit| &hit.result),
             )
             .await

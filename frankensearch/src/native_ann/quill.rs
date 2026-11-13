@@ -4,6 +4,7 @@
 //! oracle. Expected receipts must come from the caller's trusted generation
 //! selection. Matching document IDs alone does not attest common source text.
 
+use frankensearch_core::ParsedQuery;
 use std::sync::Arc;
 
 use frankensearch_core::generation::{
@@ -199,6 +200,16 @@ impl NativeQuillSnapshot {
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.quill.quality_search")?;
         self.lexical.check_current()?;
+        if ParsedQuery::parse(text).has_negations() {
+            let mut results = self
+                .quality_index()?
+                .search_hybrid_progressive(cx, embedder, None, &self.lexical, text, k)?
+                .with_immutable_query()
+                .collect()
+                .await?;
+            super::builder::scope::quality_provenance(cx, &mut results)?;
+            return Ok(results);
+        }
         self.quality_index()?
             .search_hybrid_quality_text(cx, embedder, &self.lexical, text, k)
             .await
@@ -224,6 +235,12 @@ impl NativeQuillSnapshot {
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.quill.refined_search")?;
         self.lexical.check_current()?;
+        if ParsedQuery::parse(text).has_negations() {
+            return self
+                .search_progressive_with_quality(cx, fast_embedder, quality_embedder, text, k)?
+                .collect()
+                .await;
+        }
         self.fast
             .search_hybrid_refined_text(
                 cx,
@@ -258,14 +275,16 @@ impl NativeQuillSnapshot {
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         checkpoint(cx, "native_ann.quill.quality_progressive")?;
         self.lexical.check_current()?;
-        self.fast.search_hybrid_progressive(
-            cx,
-            fast_embedder,
-            Some((self.quality_index()?, quality_embedder)),
-            &self.lexical,
-            text,
-            k,
-        )
+        self.fast
+            .search_hybrid_progressive(
+                cx,
+                fast_embedder,
+                Some((self.quality_index()?, quality_embedder)),
+                &self.lexical,
+                text,
+                k,
+            )
+            .map(NativeProgressiveSearch::with_immutable_query)
     }
 
     /// The authenticated vector component, derived from retained native rows.
@@ -303,6 +322,12 @@ impl NativeQuillSnapshot {
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.quill.search")?;
         self.lexical.check_current()?;
+        if ParsedQuery::parse(text).has_negations() {
+            return self
+                .search_progressive(cx, embedder, text, k)?
+                .collect()
+                .await;
+        }
         self.fast
             .search_hybrid_text(cx, embedder, &self.lexical, text, k)
             .await
@@ -329,6 +354,7 @@ impl NativeQuillSnapshot {
         self.lexical.check_current()?;
         self.fast
             .search_hybrid_progressive(cx, embedder, None, &self.lexical, text, k)
+            .map(NativeProgressiveSearch::with_immutable_query)
     }
 }
 

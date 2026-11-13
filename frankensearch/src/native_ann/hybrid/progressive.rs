@@ -10,6 +10,7 @@ use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::traits::Reranker;
 use frankensearch_fusion::{RrfConfig, rrf_fuse_for_vector_lane};
 
+use super::query::ImmutableTextQuery;
 use super::refinement::{RefinementFusion, admit_pair, checked_lexical, refined_winners};
 use super::{NativeAnnIndex, checkpoint, hydrate_winners, invalid, join_sources};
 use crate::{Cx, Embedder, LexicalRead, ScoredResult, SearchError, SearchResult, VectorHit};
@@ -57,6 +58,7 @@ impl NativeAnnIndex {
             pool: None,
             lexical,
             text,
+            immutable_query: None,
             k,
             reranker: None,
             allowed_documents: None,
@@ -111,6 +113,7 @@ impl NativeAnnIndex {
             pool: Some(pool),
             lexical,
             text,
+            immutable_query: None,
             k,
             reranker: None,
             allowed_documents: None,
@@ -233,6 +236,7 @@ pub struct NativeProgressiveSearch<'a> {
     pool: Option<BlockingPoolHandle>,
     lexical: &'a dyn LexicalRead,
     text: &'a str,
+    immutable_query: Option<ImmutableTextQuery>,
     k: usize,
     budget: usize,
     candidate_multiplier: usize,
@@ -252,13 +256,40 @@ pub struct NativeProgressiveSearch<'a> {
 }
 
 impl<'a> NativeProgressiveSearch<'a> {
+    // Only complete immutable source wrappers may opt in. A generic lexical
+    // reader cannot promise the same membership through multiple searches.
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_immutable_query(mut self) -> Self {
+        self.immutable_query = ImmutableTextQuery::new(self.lexical, self.text);
+        self
+    }
+
+    fn semantic_text(&self) -> &str {
+        self.immutable_query
+            .as_ref()
+            .map_or(self.text, |query| query.semantic.as_str())
+    }
+
+    async fn lexical_candidates(&self) -> SearchResult<LexicalCandidateBatch> {
+        match &self.immutable_query {
+            Some(query) => query.candidates(self.cx, self.lexical, self.budget).await,
+            None => checked_lexical(self.cx, self.lexical, self.text, self.budget).await,
+        }
+    }
+
+    fn exclusion_only(&self) -> bool {
+        self.immutable_query
+            .as_ref()
+            .is_some_and(|query| query.semantic.trim().is_empty())
+    }
+
     #[cfg(feature = "quill")]
     pub(in crate::native_ann) fn with_retained_metadata(
         mut self,
         source: &'a crate::native_ann::generation::CompositeReaders,
     ) -> Self {
         self.retained_metadata = Some(source);
-        self
+        self.with_immutable_query()
     }
 
     /// Set the fusion policy for BOTH Initial and Refined before either starts.
@@ -408,7 +439,7 @@ impl<'a> NativeProgressiveSearch<'a> {
             ));
         }
         self.allowed_documents = Some(allowed);
-        Ok(self)
+        Ok(self.with_immutable_query())
     }
 
     fn owned_index(&self, index: &NativeAnnIndex) -> Option<Arc<NativeAnnIndex>> {
@@ -430,46 +461,53 @@ impl<'a> NativeProgressiveSearch<'a> {
         embedder: &dyn Embedder,
         ef: Option<usize>,
     ) -> SearchResult<Vec<VectorHit>> {
-        match self.allowed_documents.as_ref() {
-            Some(allowed) => {
-                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
-                    let query = owner.embed_query(self.cx, embedder, self.text).await?;
-                    let allowed = Arc::clone(allowed);
-                    owner
-                        .search_filtered_with_pool(
-                            self.cx,
-                            query,
-                            self.budget.min(allowed.len()),
-                            ef,
-                            pool,
-                            move |id| allowed.contains(id),
-                        )
-                        .await
-                } else {
-                    index
-                        .search_text_filtered(
-                            self.cx,
-                            embedder,
-                            self.text,
-                            self.budget.min(allowed.len()),
-                            ef,
-                            |id| allowed.contains(id),
-                        )
-                        .await
-                }
+        if self.exclusion_only() {
+            return Ok(Vec::new());
+        }
+        let allowed = self.allowed_documents.clone();
+        let excluded = self
+            .immutable_query
+            .as_ref()
+            .map(|query| Arc::clone(&query.excluded))
+            .filter(|ids| !ids.is_empty());
+        let budget = allowed
+            .as_ref()
+            .map_or(self.budget, |ids| self.budget.min(ids.len()));
+        if allowed.is_some() || excluded.is_some() {
+            let accept = move |id: &str| {
+                allowed.as_ref().is_none_or(|ids| ids.contains(id))
+                    && excluded.as_ref().is_none_or(|ids| !ids.contains(id))
+            };
+            if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
+                let query = owner
+                    .embed_query(self.cx, embedder, self.semantic_text())
+                    .await?;
+                owner
+                    .search_filtered_with_pool(self.cx, query, budget, ef, pool, accept)
+                    .await
+            } else {
+                index
+                    .search_text_filtered(
+                        self.cx,
+                        embedder,
+                        self.semantic_text(),
+                        budget,
+                        ef,
+                        accept,
+                    )
+                    .await
             }
-            None => {
-                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
-                    let query = owner.embed_query(self.cx, embedder, self.text).await?;
-                    owner
-                        .search_with_pool(self.cx, query, self.budget, ef, pool)
-                        .await
-                } else {
-                    index
-                        .search_text(self.cx, embedder, self.text, self.budget, ef)
-                        .await
-                }
-            }
+        } else if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
+            let query = owner
+                .embed_query(self.cx, embedder, self.semantic_text())
+                .await?;
+            owner
+                .search_with_pool(self.cx, query, self.budget, ef, pool)
+                .await
+        } else {
+            index
+                .search_text(self.cx, embedder, self.semantic_text(), self.budget, ef)
+                .await
         }
     }
 
@@ -658,16 +696,24 @@ impl<'a> NativeProgressiveSearch<'a> {
 
     async fn initial(&mut self) -> SearchResult<NativeSearchPhase> {
         let is_hash = self.admit()?;
-        if self.k == 0 {
+        if self.k == 0
+            || self
+                .allowed_documents
+                .as_ref()
+                .is_some_and(|allowed| allowed.is_empty())
+        {
             return Ok(NativeSearchPhase::Initial {
                 results: Vec::new(),
                 candidates: NativePhaseCandidates::default(),
             });
         }
+        if let Some(query) = &mut self.immutable_query {
+            query.prepare(self.cx, self.lexical).await?;
+        }
         let (fast, batch) = join_sources(
             self.cx,
             self.search_tier(self.fast, self.fast_embedder, self.fast_ef),
-            checked_lexical(self.cx, self.lexical, self.text, self.budget),
+            self.lexical_candidates(),
         )
         .await?;
         let candidates = NativePhaseCandidates {
@@ -789,7 +835,7 @@ impl<'a> NativeProgressiveSearch<'a> {
         candidates: NativePhaseCandidates,
         batch: LexicalCandidateBatch,
     ) -> Vec<ScoredResult> {
-        if self.reranker.is_some() && !results.is_empty() {
+        if self.reranker.is_some() && !results.is_empty() && !self.exclusion_only() {
             let displayed = results.iter().take(self.k).cloned().collect();
             self.state = State::Rerank(PendingRerank {
                 results,
@@ -811,7 +857,10 @@ impl<'a> NativeProgressiveSearch<'a> {
                 "a queued rerank must retain its provider",
             )
         })?;
-        match request.plan(self.cx, self.text, &pending.results).await {
+        match request
+            .plan(self.cx, self.semantic_text(), &pending.results)
+            .await
+        {
             Ok(Some(plan)) => {
                 let evaluated = plan.evaluated;
                 let mut results = plan.apply(pending.results, |result| result);

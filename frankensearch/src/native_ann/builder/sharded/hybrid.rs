@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use frankensearch_core::ParsedQuery;
 use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
 use frankensearch_quill::{QuillConfig, QuillSearchIndex};
 use serde::{Deserialize, Serialize};
@@ -306,6 +307,22 @@ impl NativeBuiltShardedHybridIndex {
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<NativeShardedResult>> {
+        if ParsedQuery::parse(text).has_negations() {
+            return self
+                .vectors
+                .fast
+                .search_hybrid_progressive(
+                    cx,
+                    self.vectors.partitions[0].fast.embedder(),
+                    None,
+                    &self.lexical,
+                    text,
+                    k,
+                )?
+                .with_immutable_query()
+                .collect()
+                .await;
+        }
         self.vectors
             .fast
             .search_hybrid_text(
@@ -330,6 +347,23 @@ impl NativeBuiltShardedHybridIndex {
         k: usize,
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<NativeShardedResult>> {
+        if ParsedQuery::parse(text).has_negations() {
+            return self
+                .vectors
+                .fast
+                .search_hybrid_progressive_with_pool(
+                    cx,
+                    self.vectors.partitions[0].fast.embedder(),
+                    None,
+                    &self.lexical,
+                    text,
+                    k,
+                    pool,
+                )?
+                .with_immutable_query()
+                .collect()
+                .await;
+        }
         self.vectors
             .fast
             .search_hybrid_text_with_pool(
@@ -355,6 +389,9 @@ impl NativeBuiltShardedHybridIndex {
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<NativeShardedResult>> {
+        if ParsedQuery::parse(text).has_negations() {
+            return self.progressive(cx, text, k)?.collect().await;
+        }
         let first = &self.vectors.partitions[0];
         match (&self.vectors.quality, &first.quality) {
             (Some(shards), Some(tier)) => {
@@ -390,6 +427,12 @@ impl NativeBuiltShardedHybridIndex {
         k: usize,
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<NativeShardedResult>> {
+        if ParsedQuery::parse(text).has_negations() {
+            return self
+                .progressive_with_pool(cx, text, k, pool)?
+                .collect()
+                .await;
+        }
         let first = &self.vectors.partitions[0];
         match (&self.vectors.quality, &first.quality) {
             (Some(shards), Some(tier)) => {
@@ -434,6 +477,13 @@ impl NativeBuiltShardedHybridIndex {
             .quality
             .as_ref()
             .ok_or_else(|| rejected("quality", "quality provider was not configured"))?;
+        if ParsedQuery::parse(text).has_negations() {
+            return shards
+                .search_hybrid_progressive(cx, tier.embedder(), None, &self.lexical, text, k)?
+                .with_immutable_query()
+                .collect_quality()
+                .await;
+        }
         shards
             .search_hybrid_quality_text(cx, tier.embedder(), &self.lexical, text, k)
             .await
@@ -460,6 +510,21 @@ impl NativeBuiltShardedHybridIndex {
             .quality
             .as_ref()
             .ok_or_else(|| rejected("quality", "quality provider was not configured"))?;
+        if ParsedQuery::parse(text).has_negations() {
+            return shards
+                .search_hybrid_progressive_with_pool(
+                    cx,
+                    tier.embedder(),
+                    None,
+                    &self.lexical,
+                    text,
+                    k,
+                    pool,
+                )?
+                .with_immutable_query()
+                .collect_quality()
+                .await;
+        }
         shards
             .search_hybrid_quality_text_with_pool(cx, tier.embedder(), &self.lexical, text, k, pool)
             .await
@@ -482,14 +547,10 @@ impl NativeBuiltShardedHybridIndex {
             .as_ref()
             .zip(first.quality.as_ref())
             .map(|(shards, tier)| (shards, tier.embedder()));
-        self.vectors.fast.search_hybrid_progressive(
-            cx,
-            first.fast.embedder(),
-            quality,
-            &self.lexical,
-            text,
-            k,
-        )
+        self.vectors
+            .fast
+            .search_hybrid_progressive(cx, first.fast.embedder(), quality, &self.lexical, text, k)
+            .map(NativeShardedProgressiveSearch::with_immutable_query)
     }
 
     /// Prepare progressive sharded retrieval with retained inventory traversal
@@ -511,15 +572,18 @@ impl NativeBuiltShardedHybridIndex {
             .as_ref()
             .zip(first.quality.as_ref())
             .map(|(shards, tier)| (shards, tier.embedder()));
-        self.vectors.fast.search_hybrid_progressive_with_pool(
-            cx,
-            first.fast.embedder(),
-            quality,
-            &self.lexical,
-            text,
-            k,
-            pool,
-        )
+        self.vectors
+            .fast
+            .search_hybrid_progressive_with_pool(
+                cx,
+                first.fast.embedder(),
+                quality,
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )
+            .map(NativeShardedProgressiveSearch::with_immutable_query)
     }
 
     /// Add lazy cross-encoder ordering of source text from this exact cohort.
