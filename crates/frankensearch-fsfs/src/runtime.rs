@@ -25333,32 +25333,20 @@ impl FsfsRuntime {
                 (Some(observer), Some(sampler))
             });
 
-        // A daemon keeps both tiers warm, including when a lexical request
-        // triggers a generation rebind. A finished lexical generation may
-        // still have deferred semantic rows, so do not try to admit its
-        // incomplete window mapping merely to serve explicit lexical work.
-        // Semantic requests retain their admission fence before cache lookup;
-        // the next completed generation rebinds all resources normally.
-        let semantic_generation_ready = if matches!(
-            admission_mode,
-            SearchExecutionMode::LexicalOnly
-        ) && lexical_index.is_some()
+        // Serving starts before the first client chooses a retrieval mode.
+        // A usable lexical reader must not depend on an unrequested vector
+        // file or window mapping, including after a generation change. Record
+        // the narrower resource mode so a later semantic request admits its
+        // own tiers through rebind before consulting any cached answer.
+        // Vector-only stores still open their available tiers at startup.
+        let resource_mode = if matches!(admission_mode, SearchExecutionMode::LexicalOnly)
+            && lexical_index.is_some()
         {
-            match Self::validate_search_generation_at_root(index_root, SearchExecutionMode::Full) {
-                Ok(()) => true,
-                Err(SearchError::InvalidConfig { field, value, .. })
-                    if field == "semantic.index_generation"
-                        && matches!(value.as_str(), "incomplete" | "deferred_rows") =>
-                {
-                    false
-                }
-                Err(error) => return Err(error),
-            }
+            SearchExecutionMode::LexicalOnly
         } else {
-            true
+            resource_mode
         };
-        let should_open_vector = semantic_generation_ready
-            && !matches!(resource_mode, SearchExecutionMode::QualityOnly)
+        let should_open_vector = !matches!(resource_mode, SearchExecutionMode::QualityOnly)
             && (!matches!(resource_mode, SearchExecutionMode::LexicalOnly)
                 || lexical_index.is_none());
         let degradation_advice = Vec::new();
@@ -53916,8 +53904,14 @@ mod tests {
             }
             for (path, text) in [
                 ("src/operator-only.rs", "not".to_owned()),
-                ("src/first.RS", format!("needle {}", "irrelevant ".repeat(20))),
-                ("src/second.rs", format!("needle {}", "irrelevant ".repeat(40))),
+                (
+                    "src/first.RS",
+                    format!("needle {}", "irrelevant ".repeat(20)),
+                ),
+                (
+                    "src/second.rs",
+                    format!("needle {}", "irrelevant ".repeat(40)),
+                ),
             ] {
                 writer
                     .index_document(&cx, &IndexableDocument::new(path, text))
@@ -53998,7 +53992,8 @@ mod tests {
                                     limit.min(66)
                                 };
                                 assert_eq!(
-                                    paths.len(), expected,
+                                    paths.len(),
+                                    expected,
                                     "{query}, limit={limit}, snippets={include_snippets}",
                                 );
                             }
@@ -55881,6 +55876,215 @@ mod tests {
                 payload.degradation_advice.is_empty(),
                 "LexicalOnly is an explicit mode, not a semantic degradation"
             );
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn search_serve_lexical_admission_survives_unrequested_semantic_corruption() {
+        run_test_with_cx(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            for warmed in [false, true] {
+                for damaged in ["fast", "quality", "windows"] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let mut runtime = append_batch_fixture(&cx, temp.path()).await;
+                    runtime.config.search.quality_timeout_ms = 10_000;
+                    let root = runtime.cli_input.index_dir.as_ref().unwrap();
+                    let mut sentinel = super::IndexSentinel {
+                        schema_version: 1,
+                        generation_complete: true,
+                        generated_at_ms: 1,
+                        command: "index".to_owned(),
+                        target_root: root.display().to_string(),
+                        index_root: root.display().to_string(),
+                        discovered_files: 1,
+                        indexed_files: 1,
+                        skipped_files: 0,
+                        reason_codes: Vec::new(),
+                        total_canonical_bytes: 30,
+                        source_hash_hex: "serve-recovery-fixture".to_owned(),
+                        fast_window_max_per_file: 1,
+                    };
+                    runtime.write_index_sentinel(root, &sentinel).unwrap();
+                    let request = |mode: &str| {
+                        FsfsRuntime::parse_search_serve_request(
+                            &serde_json::json!({
+                                "query": if mode == "lexical_only" {
+                                    "preservedlexical"
+                                } else {
+                                    "how can I recover the content in this document"
+                                },
+                                "mode": mode,
+                                "limit": 5,
+                                "rerank": false,
+                            })
+                            .to_string(),
+                        )
+                        .unwrap()
+                    };
+                    let semantic_mode = if damaged == "quality" {
+                        "quality_only"
+                    } else {
+                        "fast_only"
+                    };
+                    let mut hot_cache = HashMap::new();
+                    let opened = if warmed {
+                        let mut resources =
+                            runtime.prepare_search_serve_resources(&cx).await.unwrap();
+                        let response = runtime
+                            .execute_search_serve_request(
+                                &cx,
+                                request(semantic_mode),
+                                &mut resources,
+                                &mut hot_cache,
+                                true,
+                            )
+                            .await
+                            .unwrap();
+                        assert!(response.ok && !response.cached);
+                        assert!(response.payloads.iter().any(|payload| {
+                            payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
+                        }));
+                        assert!(!hot_cache.is_empty());
+                        Some(resources)
+                    } else {
+                        None
+                    };
+
+                    let vector_path = root.join(if damaged == "quality" {
+                        super::FSFS_VECTOR_QUALITY_INDEX_FILE
+                    } else {
+                        super::FSFS_VECTOR_INDEX_FILE
+                    });
+                    let original = fs::read(&vector_path).unwrap();
+                    if damaged == "windows" {
+                        // The FSVI itself is valid, but no source manifests
+                        // justify the claimed multi-window generation.
+                        sentinel.fast_window_max_per_file = 2;
+                        runtime.write_index_sentinel(root, &sentinel).unwrap();
+                    } else {
+                        // Replace the inode rather than modify a mapped file:
+                        // warmed requests retain their original valid reader.
+                        let replacement = root.join("corrupt-vector.fsvi");
+                        fs::write(&replacement, b"not an FSVI generation").unwrap();
+                        fs::rename(replacement, &vector_path).unwrap();
+                    }
+                    let mut resources = if let Some(resources) = opened {
+                        resources
+                    } else {
+                        runtime
+                            .prepare_search_serve_resources(&cx)
+                            .await
+                            .expect("unrequested semantic damage cannot prevent lexical serving")
+                    };
+                    let lexical = runtime
+                        .execute_search_serve_request(
+                            &cx,
+                            request("lexical_only"),
+                            &mut resources,
+                            &mut hot_cache,
+                            true,
+                        )
+                        .await
+                        .expect("a lexical request must admit its own usable generation");
+                    assert!(lexical.ok && !lexical.cached, "{damaged}, warm={warmed}");
+                    assert_eq!(lexical.payloads[0].hits[0].path, "existing.md");
+                    assert_eq!(
+                        lexical.payloads[0].skip_reason.as_deref(),
+                        Some("lexical_only")
+                    );
+                    assert!(lexical.payloads[0].vector_generation_id.is_none());
+                    assert_eq!(resources.resource_mode, SearchExecutionMode::LexicalOnly);
+                    assert!(resources.vector_index.is_none());
+                    assert!(resources.fast_window_mapping.is_none());
+                    assert!(resources.quality_vector_index.is_none());
+                    assert!(!resources.fast_embedder_attempted);
+                    assert!(!resources.quality_embedder_attempted);
+                    assert_eq!(hot_cache.len(), 1, "old semantic answers must be evicted");
+                    let fingerprint = resources.generation_fingerprint.clone();
+
+                    let refused_modes: &[&str] = if damaged == "quality" {
+                        &["quality_only"]
+                    } else {
+                        &["fast_only", "full"]
+                    };
+                    for mode in refused_modes {
+                        let mut emitted = 0;
+                        let error = runtime
+                            .execute_search_serve_request_with_sink(
+                                &cx,
+                                request(mode),
+                                &mut resources,
+                                &mut hot_cache,
+                                super::SearchServeOptions {
+                                    hot_cache_enabled: true,
+                                    persist_explain_session: false,
+                                },
+                                Some(&mut |_| {
+                                    emitted += 1;
+                                    Ok(())
+                                }),
+                            )
+                            .await
+                            .expect_err("requesting the damaged tier must still fail closed");
+                        if damaged == "windows" {
+                            assert!(
+                                matches!(&error, SearchError::InvalidConfig { field, .. }
+                                if field == "index.fast_windows"),
+                                "{error:?}"
+                            );
+                        } else {
+                            assert!(
+                                matches!(error, SearchError::IndexCorrupted { .. }),
+                                "{error:?}"
+                            );
+                        }
+                        assert_eq!(emitted, 0, "failed admission cannot attest or emit results");
+                    }
+                    assert_eq!(resources.generation_fingerprint, fingerprint);
+                    assert_eq!(resources.resource_mode, SearchExecutionMode::LexicalOnly);
+                    let cached = runtime
+                        .execute_search_serve_request(
+                            &cx,
+                            request("lexical_only"),
+                            &mut resources,
+                            &mut hot_cache,
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        cached.cached,
+                        "refused semantic requests preserve lexical service"
+                    );
+                    assert_eq!(cached.payloads, lexical.payloads);
+
+                    if damaged == "windows" {
+                        sentinel.fast_window_max_per_file = 1;
+                        sentinel.generated_at_ms += 1;
+                        runtime.write_index_sentinel(root, &sentinel).unwrap();
+                    } else {
+                        let replacement = root.join("repaired-vector.fsvi");
+                        fs::write(&replacement, original).unwrap();
+                        fs::rename(replacement, &vector_path).unwrap();
+                    }
+                    let repaired = runtime
+                        .execute_search_serve_request(
+                            &cx,
+                            request(semantic_mode),
+                            &mut resources,
+                            &mut hot_cache,
+                            true,
+                        )
+                        .await
+                        .expect("a repaired successor must become usable without restarting");
+                    assert!(repaired.ok && !repaired.cached);
+                    assert_ne!(resources.generation_fingerprint, fingerprint);
+                    assert!(repaired.payloads.iter().any(|payload| {
+                        payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
+                    }));
+                }
+            }
         });
     }
 
@@ -67679,14 +67883,11 @@ mod tests {
                 "generation rebind must clear the old hot cache before lookup"
             );
             assert_eq!(resources.generation_fingerprint, repaired_fingerprint);
-            assert_eq!(
-                resources
-                    .vector_index
-                    .as_ref()
-                    .expect("lexical-only-triggered rebind retains full resources")
-                    .record_count(),
-                1
-            );
+            assert_eq!(resources.resource_mode, SearchExecutionMode::LexicalOnly);
+            assert!(resources.vector_index.is_none());
+            assert!(resources.quality_vector_index.is_none());
+            assert!(!resources.fast_embedder_attempted);
+            assert!(!resources.quality_embedder_attempted);
             assert!(
                 !hot_cache.contains_key(&full_key) && !hot_cache.contains_key(&fast_key),
                 "rebind must evict stale semantic-mode cache entries"
@@ -67715,6 +67916,15 @@ mod tests {
                 .await
                 .expect("full request against repaired generation");
             assert!(!full_after_repair.cached);
+            assert_eq!(resources.resource_mode, SearchExecutionMode::Full);
+            assert_eq!(
+                resources
+                    .vector_index
+                    .as_ref()
+                    .expect("semantic request admits the repaired vector tier")
+                    .record_count(),
+                1
+            );
             assert!(resources.fast_embedder_attempted);
             // Serve-time auto-detect without models is HashEmbedder, so the
             // repaired FSVI is a hash-control generation. The witness must

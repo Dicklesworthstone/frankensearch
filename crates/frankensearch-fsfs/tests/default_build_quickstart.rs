@@ -1293,6 +1293,7 @@ mod loader_only {
         assert_eq!(ready["ok"], true, "{ready}");
         assert_eq!(ready["pid"], owner.child.id(), "{ready}");
         assert_eq!(ready["semantic_admitted"], false);
+        assert!(ready["vector_generation_id"].is_null(), "{ready}");
         let message = serde_json::json!({
             "query": query, "limit": 3, "mode": "fast_only", "fast_only": true,
         })
@@ -1302,6 +1303,11 @@ mod loader_only {
         assert_eq!(cold["cached"], false, "{cold}");
         assert_eq!(cold["payloads"].as_array().unwrap().len(), 1);
         assert_eq!(cold["payloads"][0]["hits"], original["data"]["hits"]);
+        assert!(cold["payloads"][0]["vector_generation_id"].is_string());
+        assert_eq!(
+            cold["payloads"][0]["vector_generation_id"],
+            original["data"]["vector_generation_id"]
+        );
         let warm = request(&message);
         assert_eq!(warm["ok"], true, "{warm}");
         assert_eq!(warm["cached"], true, "{warm}");
@@ -1322,7 +1328,11 @@ mod loader_only {
         assert_eq!(still_ready["semantic_admitted"], true);
         assert_eq!(
             still_ready["vector_generation_id"],
-            ready["vector_generation_id"]
+            cold["payloads"][0]["vector_generation_id"]
+        );
+        assert_eq!(
+            still_ready["vector_generation_id"],
+            original["data"]["vector_generation_id"]
         );
         assert_eq!(still_ready["pid"], ready["pid"]);
         assert_fresh_cli_refused();
@@ -2417,6 +2427,14 @@ mod loader_only {
     fn verify_real_progressive_daemon(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
         use std::io::{BufRead as _, Read as _, Write as _};
         use std::os::unix::net::UnixStream;
+        assert!(
+            !is_complete_store(index),
+            "the raw progressive protocol fixture requires a legacy generation"
+        );
+        let expected_generation_id = VectorIndex::open_read_only(&index.join("vector/index.fsvi"))
+            .expect("read the selected fast generation before daemon startup")
+            .embedder_id()
+            .to_owned();
         struct Owner {
             child: std::process::Child,
             socket: PathBuf,
@@ -2497,6 +2515,7 @@ mod loader_only {
         // Readiness precedes lazy model initialization; admission is checked
         // again after distinct real queries have loaded and used the model.
         assert_eq!(ready["semantic_admitted"], false);
+        assert!(ready["vector_generation_id"].is_null(), "{ready}");
         eprintln!(
             "[default-build-e2e] stage=progressive-daemon pid={} ready_ms={} fast_id={}",
             owner.child.id(),
@@ -2541,10 +2560,7 @@ mod loader_only {
                 frames[0]["cached"], false,
                 "distinct queries must execute against the same model owner"
             );
-            assert_eq!(
-                frames[0]["vector_generation_id"],
-                ready["vector_generation_id"]
-            );
+            assert_eq!(frames[0]["vector_generation_id"], expected_generation_id);
             assert_eq!(frames[1]["payload"]["phase"], "initial");
             assert_eq!(frames[2]["payload"]["phase"], "refined");
             assert_eq!(frames[3]["event"], "terminal");
@@ -2569,6 +2585,29 @@ mod loader_only {
             );
             let direct = parse_success_envelope("progressive direct reference", &direct);
             assert_eq!(frames[2]["payload"]["hits"], direct["data"]["hits"]);
+            assert_eq!(
+                direct["data"]["vector_generation_id"],
+                expected_generation_id
+            );
+            let mut ready_socket = UnixStream::connect(&owner.socket).unwrap();
+            ready_socket
+                .set_read_timeout(Some(QUICKSTART_TIMEOUT))
+                .unwrap();
+            ready_socket.write_all(b"ready").unwrap();
+            ready_socket.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut ready_raw = String::new();
+            ready_socket.read_to_string(&mut ready_raw).unwrap();
+            let admitted_ready: Value = serde_json::from_str(&ready_raw).unwrap();
+            assert_eq!(admitted_ready["pid"], ready["pid"]);
+            assert_eq!(admitted_ready["semantic_admitted"], true);
+            assert_eq!(
+                admitted_ready["vector_generation_id"],
+                frames[0]["vector_generation_id"]
+            );
+            assert_eq!(
+                admitted_ready["vector_generation_id"],
+                expected_generation_id
+            );
             for format in ["jsonl", "toon"] {
                 let stream = fsfs.run(
                     root,
