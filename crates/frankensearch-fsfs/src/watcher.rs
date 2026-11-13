@@ -751,11 +751,18 @@ pub struct CatchupEvents {
     commitment: Option<CatchupCommitment>,
 }
 
-struct CatchupCommitment {
-    reconciliation: ReconciliationTracker,
-    plan: PassPlan,
-    snapshot: FileSnapshot,
-    identities: BTreeMap<PathBuf, RootIdentity>,
+enum CatchupCommitment {
+    Complete {
+        reconciliation: ReconciliationTracker,
+        plan: PassPlan,
+        snapshot: FileSnapshot,
+        identities: BTreeMap<PathBuf, RootIdentity>,
+    },
+    // No authority conclusion is available, but these operations may still
+    // reach the sink and must remain part of a future complete pass.
+    Unresolved {
+        reconciliation: ReconciliationTracker,
+    },
 }
 
 impl CatchupEvents {
@@ -767,22 +774,32 @@ impl CatchupEvents {
     }
 
     /// Commit the authority conclusion after every returned operation applied.
+    /// An incomplete or stale scan cannot commit authority; its affected paths
+    /// remain reconciliation debt even after successful application.
     ///
     /// # Errors
     ///
-    /// Returns an error when another reconciliation writer changed the state
-    /// while the caller was applying this batch. The batch is then retained as
-    /// reconciliation debt and must be derived again from a fresh scan.
+    /// Returns an error when the reconciliation lineage is exhausted or another
+    /// writer changed the state while the caller was applying this batch. The
+    /// batch remains reconciliation debt for a fresh scan.
     pub fn acknowledge_applied(mut self) -> SearchResult<()> {
         let Some(commitment) = self.commitment.take() else {
             return Ok(());
         };
-        let mut state = lock_or_recover(&commitment.reconciliation);
-        let result = match state.commit_complete_pass(
-            &commitment.plan,
-            commitment.snapshot,
-            commitment.identities,
-        ) {
+        let (reconciliation, plan, snapshot, identities) = match commitment {
+            CatchupCommitment::Complete {
+                reconciliation,
+                plan,
+                snapshot,
+                identities,
+            } => (reconciliation, plan, snapshot, identities),
+            CatchupCommitment::Unresolved { reconciliation } => {
+                let mut state = lock_or_recover(&reconciliation);
+                return state.require_for_events(&self.events);
+            }
+        };
+        let mut state = lock_or_recover(&reconciliation);
+        let result = match state.commit_complete_pass(&plan, snapshot, identities) {
             Ok(true) => Ok(()),
             Ok(false) => {
                 // The sink may already have applied some or all returned events.
@@ -826,12 +843,16 @@ impl std::fmt::Debug for CatchupEvents {
 impl Drop for CatchupEvents {
     fn drop(&mut self) {
         if let Some(commitment) = self.commitment.take() {
+            let reconciliation = match commitment {
+                CatchupCommitment::Complete { reconciliation, .. }
+                | CatchupCommitment::Unresolved { reconciliation } => reconciliation,
+            };
             // The caller either discarded the operations or its apply failed.
-            // The plan has not committed authority or cleared retained legacy.
+            // The batch has not committed authority or cleared retained legacy.
             // Preserve the actual batch too: a newly indexed path may vanish
             // before the retry, in which case its delete is owed even when it
             // was not part of the last established authority snapshot.
-            let _ = lock_or_recover(&commitment.reconciliation).require_for_events(&self.events);
+            let _ = lock_or_recover(&reconciliation).require_for_events(&self.events);
         }
     }
 }
@@ -2058,7 +2079,9 @@ impl FsWatcher {
                         now_millis(),
                         &completeness,
                     ),
-                    commitment: None,
+                    commitment: Some(CatchupCommitment::Unresolved {
+                        reconciliation: Arc::clone(&self.reconciliation),
+                    }),
                 });
             }
             if let Some(authority) = state.established_authority(&self.roots) {
@@ -2078,7 +2101,9 @@ impl FsWatcher {
                             now_millis(),
                             &completeness,
                         ),
-                        commitment: None,
+                        commitment: Some(CatchupCommitment::Unresolved {
+                            reconciliation: Arc::clone(&self.reconciliation),
+                        }),
                     });
                 };
                 let mut baseline = plan.deletion_baseline.clone().unwrap_or_default();
@@ -2090,7 +2115,12 @@ impl FsWatcher {
                     // delete. Preserve baseline timestamps where available:
                     // they carry the normal modify detection for old names.
                     for path in &state.affected_paths {
-                        baseline.entry(path.clone()).or_insert(0);
+                        // An unknown path also owes an upsert if it still
+                        // exists. A fixed stamp can equal its real timestamp
+                        // (including zero), silently losing that retry.
+                        baseline.entry(path.clone()).or_insert_with(|| {
+                            current.get(path).map_or(0, |stamp| stamp.wrapping_add(1))
+                        });
                     }
                 }
                 drop(state);
@@ -2099,7 +2129,7 @@ impl FsWatcher {
                 // the batch or its sink fails partway through it.
                 (
                     baseline,
-                    Some(CatchupCommitment {
+                    Some(CatchupCommitment::Complete {
                         reconciliation: Arc::clone(&self.reconciliation),
                         plan,
                         snapshot: current.clone(),
@@ -2111,7 +2141,12 @@ impl FsWatcher {
                 // nothing, and leave a complete pass owed.
                 state.require_full_scan()?;
                 drop(state);
-                (FileSnapshot::new(), None)
+                (
+                    FileSnapshot::new(),
+                    Some(CatchupCommitment::Unresolved {
+                        reconciliation: Arc::clone(&self.reconciliation),
+                    }),
+                )
             }
         };
         Ok(CatchupEvents {
@@ -7899,6 +7934,86 @@ mod tests {
     fn incomplete_catchup_ack_retains_vanished_new_path_as_delete_debt() {
         run_on_local_runtime_task(|cx| async move {
             exercise_incomplete_catchup_mutation_debt(&cx, true).await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_catchup_retries_new_file_with_zero_timestamp() {
+        run_on_local_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("root");
+            fs::create_dir_all(&root).expect("create watched root");
+            fs::write(root.join("baseline.rs"), "fn baseline() {}\n").expect("baseline fixture");
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+            let initial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("initial complete catch-up");
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &initial)
+                .await
+                .expect("apply initial catch-up");
+            initial.acknowledge_applied().expect("establish authority");
+
+            let new_file = root.join("epoch.rs");
+            fs::write(&new_file, "fn epoch() {}\n").expect("epoch fixture");
+            fs::File::open(&new_file)
+                .expect("open epoch fixture")
+                .set_modified(std::time::UNIX_EPOCH)
+                .expect("set actual modification time to the epoch");
+            let (snapshot, completeness) = watcher.collect_snapshot().expect("epoch control");
+            assert!(completeness.is_complete());
+            assert_eq!(snapshot.get(&new_file), Some(&0));
+            let discarded = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("propose the new epoch file");
+            assert!(
+                discarded.iter().any(|event| {
+                    event.kind == WatchEventKind::Created && event.path == new_file
+                })
+            );
+            // Discard before applying anything: the sink has never seen this
+            // file, so a retry must still upsert it even though its stamp is 0.
+            drop(discarded);
+            let new_key = normalize_file_key(&new_file);
+            assert!(!pipeline.all_ops().iter().any(|op| matches!(op,
+                WatchIngestOp::Upsert { file_key, .. } if file_key == &new_key)));
+            assert!(
+                lock_or_recover(&watcher.reconciliation)
+                    .affected_paths
+                    .contains(&new_file)
+            );
+
+            let retry = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("retry the discarded epoch file");
+            assert_eq!(
+                retry
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.kind,
+                            WatchEventKind::Created | WatchEventKind::Modified
+                        ) && event.path == new_file
+                    })
+                    .count(),
+                1,
+                "a discarded batch still owes the epoch file's upsert"
+            );
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &retry)
+                .await
+                .expect("apply the epoch retry");
+            retry.acknowledge_applied().expect("settle the epoch retry");
+            assert!(pipeline.all_ops().iter().any(|op| matches!(op,
+                WatchIngestOp::Upsert { file_key, .. } if file_key == &new_key)));
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert!(!state.required);
+            assert!(state.affected_paths.is_empty());
+            drop(state);
         });
     }
 
