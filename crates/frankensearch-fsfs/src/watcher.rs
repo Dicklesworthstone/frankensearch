@@ -2108,19 +2108,17 @@ impl FsWatcher {
                 };
                 let mut baseline = plan.deletion_baseline.clone().unwrap_or_default();
                 if plan.adjudicates() {
-                    // A returned catch-up operation can have reached a sink
-                    // before that sink reported failure. Its path is not in
-                    // the last established snapshot, but if it has vanished
-                    // since then, the next authorized pass still owes its
-                    // delete. Preserve baseline timestamps where available:
-                    // they carry the normal modify detection for old names.
+                    // Any affected path may have reached the sink before a
+                    // failed apply. Retry present paths even if their stamps
+                    // match the established snapshot; absent paths still owe
+                    // deletes. Leave unaffected baseline stamps unchanged.
                     for path in &state.affected_paths {
-                        // An unknown path also owes an upsert if it still
-                        // exists. A fixed stamp can equal its real timestamp
-                        // (including zero), silently losing that retry.
-                        baseline.entry(path.clone()).or_insert_with(|| {
-                            current.get(path).map_or(0, |stamp| stamp.wrapping_add(1))
-                        });
+                        // A deliberately unequal marker also handles zero
+                        // and u64::MAX without losing a required upsert.
+                        baseline.insert(
+                            path.clone(),
+                            current.get(path).map_or(0, |stamp| stamp.wrapping_add(1)),
+                        );
                     }
                 }
                 drop(state);
@@ -8011,6 +8009,195 @@ mod tests {
             retry.acknowledge_applied().expect("settle the epoch retry");
             assert!(pipeline.all_ops().iter().any(|op| matches!(op,
                 WatchIngestOp::Upsert { file_key, .. } if file_key == &new_key)));
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert!(!state.required);
+            assert!(state.affected_paths.is_empty());
+            drop(state);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_catchup_retries_known_path_after_timestamp_restoration() {
+        run_on_local_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("root");
+            fs::create_dir_all(&root).expect("create watched root");
+            let changed = root.join("changed.rs");
+            let untouched = root.join("untouched.rs");
+            fs::write(&changed, "fn original() {}\n").expect("initial fixture");
+            fs::write(&untouched, "fn untouched() {}\n").expect("untouched control");
+            let original_time = std::time::UNIX_EPOCH + Duration::from_secs(1);
+            fs::File::open(&changed)
+                .expect("open initial fixture")
+                .set_modified(original_time)
+                .expect("set initial timestamp");
+            let pipeline = Arc::new(PartialMutationPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+            let initial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("initial catch-up");
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &initial)
+                .await
+                .expect("apply initial catch-up");
+            initial.acknowledge_applied().expect("establish authority");
+            let (original, complete) = watcher.collect_snapshot().expect("initial control");
+            assert!(complete.is_complete());
+            assert_eq!(original.get(&changed), Some(&1_000));
+
+            fs::write(&changed, "fn partially_indexed() {}\n").expect("changed fixture");
+            fs::File::open(&changed)
+                .expect("open changed fixture")
+                .set_modified(original_time + Duration::from_secs(1))
+                .expect("set changed timestamp");
+            let partial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("propose known-path modification");
+            assert_eq!(partial.len(), 1);
+            assert_eq!(partial[0].kind, WatchEventKind::Modified);
+            assert_eq!(partial[0].path, changed);
+            pipeline.fail_after_first.store(true, Ordering::Release);
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &partial)
+                .await
+                .expect_err("the sink mutates the known path before failing");
+            let changed_key = normalize_file_key(&changed);
+            assert_eq!(
+                lock_or_recover(&pipeline.applied)
+                    .iter()
+                    .filter(|op| matches!(op,
+                        WatchIngestOp::Upsert { file_key, .. } if file_key == &changed_key))
+                    .count(),
+                2,
+                "both the original and partial upserts must have reached the sink"
+            );
+            drop(partial);
+
+            fs::write(&changed, "fn restored_timestamp_new_content() {}\n")
+                .expect("change content again");
+            fs::File::open(&changed)
+                .expect("open restored fixture")
+                .set_modified(original_time)
+                .expect("restore the established timestamp");
+            let (current, complete) = watcher.collect_snapshot().expect("restored control");
+            assert!(complete.is_complete());
+            assert_eq!(current, original);
+            assert!(FsWatcher::diff_snapshots(&original, &current, 1_000, &complete).is_empty());
+            let retry = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("retry after timestamp restoration");
+            assert_eq!(
+                retry.len(),
+                1,
+                "known-path mutation debt still owes an upsert"
+            );
+            assert_eq!(retry[0].kind, WatchEventKind::Modified);
+            assert_eq!(retry[0].path, changed);
+            assert!(!retry.iter().any(|event| event.path == untouched));
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &retry)
+                .await
+                .expect("apply repaired known path");
+            retry.acknowledge_applied().expect("settle the retry");
+            assert_eq!(
+                lock_or_recover(&pipeline.applied)
+                    .iter()
+                    .filter(|op| matches!(op,
+                        WatchIngestOp::Upsert { file_key, .. } if file_key == &changed_key))
+                    .count(),
+                3,
+                "the retry must actually reach the sink"
+            );
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert!(!state.required);
+            assert!(state.affected_paths.is_empty());
+            drop(state);
+            let quiet = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("no work after successful acknowledgement");
+            assert!(quiet.is_empty(), "settled paths must not be replayed");
+            quiet.acknowledge_applied().expect("acknowledge quiet pass");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_catchup_reindexes_recreated_known_path_with_restored_timestamp() {
+        run_on_local_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("root");
+            fs::create_dir_all(&root).expect("create watched root");
+            let changed = root.join("recreated.rs");
+            fs::write(&changed, "fn original() {}\n").expect("initial fixture");
+            let original_time = std::time::UNIX_EPOCH + Duration::from_secs(1);
+            fs::File::open(&changed)
+                .expect("open initial fixture")
+                .set_modified(original_time)
+                .expect("set initial timestamp");
+            let pipeline = Arc::new(PartialMutationPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root],
+                DiscoveryConfig::default(),
+                Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
+            );
+            let initial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("initial catch-up");
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &initial)
+                .await
+                .expect("apply initial catch-up");
+            initial.acknowledge_applied().expect("establish authority");
+            let (original, complete) = watcher.collect_snapshot().expect("initial control");
+            assert!(complete.is_complete());
+            assert_eq!(original.get(&changed), Some(&1_000));
+
+            fs::rename(&changed, temp.path().join("held-original.rs"))
+                .expect("move the known file outside the watched root");
+            let partial = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("propose known-path deletion");
+            assert_eq!(partial.len(), 1);
+            assert_eq!(partial[0].kind, WatchEventKind::Deleted);
+            assert_eq!(partial[0].path, changed);
+            pipeline.fail_after_first.store(true, Ordering::Release);
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &partial)
+                .await
+                .expect_err("the sink deletes the known path before failing");
+            let changed_key = normalize_file_key(&changed);
+            assert!(matches!(
+                lock_or_recover(&pipeline.applied).last(),
+                Some(WatchIngestOp::Delete { file_key, .. }) if file_key == &changed_key
+            ));
+            drop(partial);
+
+            fs::write(&changed, "fn recreated() {}\n").expect("recreate the known path");
+            fs::File::open(&changed)
+                .expect("open recreated fixture")
+                .set_modified(original_time)
+                .expect("restore the established timestamp");
+            let (current, complete) = watcher.collect_snapshot().expect("recreated control");
+            assert!(complete.is_complete());
+            assert_eq!(current, original);
+            let retry = watcher
+                .build_catchup_events(&FileSnapshot::new())
+                .expect("retry after recreation");
+            assert_eq!(
+                retry.len(),
+                1,
+                "a recreated path must repair the failed delete"
+            );
+            assert_eq!(retry[0].kind, WatchEventKind::Modified);
+            assert_eq!(retry[0].path, changed);
+            apply_catchup_events(&cx, &watcher, pipeline.as_ref(), &retry)
+                .await
+                .expect("apply recreated file");
+            retry.acknowledge_applied().expect("settle the retry");
+            assert!(matches!(
+                lock_or_recover(&pipeline.applied).last(),
+                Some(WatchIngestOp::Upsert { file_key, .. }) if file_key == &changed_key
+            ));
             let state = lock_or_recover(&watcher.reconciliation);
             assert!(!state.required);
             assert!(state.affected_paths.is_empty());

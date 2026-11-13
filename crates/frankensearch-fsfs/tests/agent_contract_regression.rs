@@ -891,7 +891,7 @@ fn compact_envelope_success_has_expected_shape() {
             hits: vec![],
             ms: Some(42),
             phase: Some("fast".to_string()),
-            recovery_plans: Default::default(),
+            recovery_plans: std::collections::BTreeMap::new(),
         }),
         err: None,
         w: vec![],
