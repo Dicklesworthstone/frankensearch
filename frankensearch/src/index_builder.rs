@@ -1164,11 +1164,15 @@ impl IndexBuilder {
         .into_iter();
         Ok(admission_errors
             .into_iter()
-            .map(|error| match error {
-                Some(message) => BatchDocOutcome::Failed(message),
-                None => embedded
-                    .next()
-                    .expect("every admitted source document has one embedding outcome"),
+            .map(|error| {
+                error.map_or_else(
+                    || {
+                        embedded
+                            .next()
+                            .expect("every admitted source document has one embedding outcome")
+                    },
+                    BatchDocOutcome::Failed,
+                )
             })
             .collect())
     }
