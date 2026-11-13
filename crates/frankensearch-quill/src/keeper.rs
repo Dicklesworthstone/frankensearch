@@ -18420,7 +18420,7 @@ pub fn resolve_current(lexical_root: &Path) -> Result<ResolvedCurrent, CurrentPo
     }
 }
 
-/// Classification of a CURRENT-selected child without following symlinks.
+/// Classification of a lexical root or CURRENT-selected child without following symlinks.
 ///
 /// A `CURRENT` name is syntactically one component, but that alone is not a
 /// root boundary: `Path::is_dir` would follow a symlinked child outside the
@@ -18433,15 +18433,67 @@ enum EngineDirectoryKind {
 
 fn engine_directory_kind(path: &Path) -> Result<EngineDirectoryKind, CurrentPointerError> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(EngineDirectoryKind::Directory),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            #[cfg(windows)]
+            if windows_path_is_reparse_point(&metadata) {
+                return Ok(EngineDirectoryKind::Unsafe);
+            }
+            Ok(EngineDirectoryKind::Directory)
+        }
         Ok(_) => Ok(EngineDirectoryKind::Unsafe),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(EngineDirectoryKind::Missing),
         Err(source) => Err(CurrentPointerError::Io {
-            operation: "stat CURRENT engine directory",
+            operation: "stat lexical directory",
             path: path.to_path_buf(),
             source,
         }),
     }
+}
+
+/// A marker's absence is different from an unreadable, redirected or malformed
+/// entry. Never turn those failures into permission to initialize a new index.
+fn engine_marker_file_present(path: &Path) -> Result<bool, CurrentPointerError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(CurrentPointerError::Io {
+                operation: "stat lexical engine marker",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let regular = metadata.file_type().is_file();
+    #[cfg(windows)]
+    let regular = regular && !windows_path_is_reparse_point(&metadata);
+    if !regular {
+        return Err(CurrentPointerError::Io {
+            operation: "inspect lexical engine marker",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lexical engine marker is not a regular non-symlink file",
+            ),
+        });
+    }
+    Ok(true)
+}
+
+fn engine_marker_present(
+    directory: &Path,
+    engine: BlueGreenEngine,
+) -> Result<bool, CurrentPointerError> {
+    if engine_marker_file_present(&directory.join(engine.adoption_marker()))? {
+        return Ok(true);
+    }
+    // Quill's reader recovers from the retained previous slot when MANIFEST
+    // is absent. Layout discovery must not discard that readable lexical arm
+    // or let a builder initialize over it; the reader still validates bytes.
+    if engine == BlueGreenEngine::Quill {
+        return engine_marker_file_present(&directory.join("MANIFEST.prev"));
+    }
+    Ok(false)
 }
 
 /// Read a CURRENT file with a no-follow open and a bounded buffer.
@@ -18490,31 +18542,19 @@ fn scan_adoption_candidates(
             path: lexical_root.to_path_buf(),
             source,
         })?;
-        let file_type = entry
-            .file_type()
-            .map_err(|source| CurrentPointerError::Io {
-                operation: "stat lexical root entry",
-                path: entry.path(),
-                source,
-            })?;
-        if !file_type.is_dir() {
+        if !matches!(
+            engine_directory_kind(&entry.path())?,
+            EngineDirectoryKind::Directory
+        ) {
             continue;
         }
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
         // MANIFEST wins when both markers exist: quill is the forward format.
-        let engine = if entry
-            .path()
-            .join(BlueGreenEngine::Quill.adoption_marker())
-            .is_file()
-        {
+        let engine = if engine_marker_present(&entry.path(), BlueGreenEngine::Quill)? {
             Some(BlueGreenEngine::Quill)
-        } else if entry
-            .path()
-            .join(BlueGreenEngine::Tantivy.adoption_marker())
-            .is_file()
-        {
+        } else if engine_marker_present(&entry.path(), BlueGreenEngine::Tantivy)? {
             Some(BlueGreenEngine::Tantivy)
         } else {
             None
@@ -18558,7 +18598,8 @@ pub enum LexicalLayout {
     /// No lexical content: the root is missing, or holds no engine markers,
     /// no CURRENT, and no adoptable children.
     Empty,
-    /// A Quill index lives directly at the root (MANIFEST, no CURRENT).
+    /// A Quill index lives directly at the root (MANIFEST or its recoverable
+    /// previous slot, no CURRENT).
     DirectQuill,
     /// A tantivy index lives directly at the root (meta.json, no CURRENT).
     DirectTantivy,
@@ -18625,22 +18666,26 @@ impl LexicalLayout {
 ///
 /// # Errors
 ///
-/// Returns [`CurrentPointerError`] only for I/O failures (permissions, a
+/// Returns [`CurrentPointerError`] for I/O failures (permissions, a
 /// symlinked CURRENT rejected by the no-follow open, unreadable directory
-/// entries). Every attributable on-disk shape — including an undecodable
-/// CURRENT or conflicting markers — is a successful classification, not an
+/// entries) or non-regular engine markers. A non-directory or symlink at the
+/// root is [`LexicalLayout::Ambiguous`], never free space for a writer. Other
+/// attributable shapes — including an undecodable CURRENT or conflicting
+/// markers — are successful classifications, not an
 /// error, so callers can act on the shape instead of guessing from error
 /// strings.
 pub fn inspect_lexical_layout(lexical_root: &Path) -> Result<LexicalLayout, CurrentPointerError> {
-    if !lexical_root.is_dir() {
-        return Ok(LexicalLayout::Empty);
+    match engine_directory_kind(lexical_root)? {
+        EngineDirectoryKind::Directory => {}
+        EngineDirectoryKind::Missing => return Ok(LexicalLayout::Empty),
+        EngineDirectoryKind::Unsafe => {
+            return Ok(LexicalLayout::Ambiguous {
+                detail: "lexical root is a non-directory or symlink entry".to_owned(),
+            });
+        }
     }
-    let root_quill = lexical_root
-        .join(BlueGreenEngine::Quill.adoption_marker())
-        .is_file();
-    let root_tantivy = lexical_root
-        .join(BlueGreenEngine::Tantivy.adoption_marker())
-        .is_file();
+    let root_quill = engine_marker_present(lexical_root, BlueGreenEngine::Quill)?;
+    let root_tantivy = engine_marker_present(lexical_root, BlueGreenEngine::Tantivy)?;
     let current_path = lexical_root.join(CURRENT_FILE_NAME);
 
     if let Some(bytes) = read_current_file(&current_path)? {
@@ -18648,7 +18693,7 @@ pub fn inspect_lexical_layout(lexical_root: &Path) -> Result<LexicalLayout, Curr
             return Ok(LexicalLayout::Mixed {
                 detail: format!(
                     "CURRENT coexists with direct engine markers at the root \
-                     (MANIFEST: {root_quill}, meta.json: {root_tantivy})"
+                     (Quill manifest slot: {root_quill}, meta.json: {root_tantivy})"
                 ),
             });
         }
@@ -18681,7 +18726,7 @@ pub fn inspect_lexical_layout(lexical_root: &Path) -> Result<LexicalLayout, Curr
                 )));
             }
         }
-        if !engine_dir.join(marker).is_file() {
+        if !engine_marker_present(&engine_dir, pointer.engine())? {
             return Ok(corrupt(format!(
                 "engine dir {:?} lacks its {marker} marker",
                 pointer.dir_name()
@@ -18696,7 +18741,7 @@ pub fn inspect_lexical_layout(lexical_root: &Path) -> Result<LexicalLayout, Curr
     match (root_quill, root_tantivy) {
         (true, true) => {
             return Ok(LexicalLayout::Mixed {
-                detail: "MANIFEST and meta.json coexist at the root".to_owned(),
+                detail: "Quill manifest slot and meta.json coexist at the root".to_owned(),
             });
         }
         (true, false) => return Ok(LexicalLayout::DirectQuill),
@@ -30069,6 +30114,171 @@ mod tests {
             "ambiguity must not trigger any tie-breaking write"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_lexical_layout_refuses_non_directory_root_without_mutating() -> TestResult {
+        let root = tempdir()?;
+        let lexical = root.path().join("lexical");
+        let original = b"existing lexical artifact must remain intact";
+        std::fs::write(&lexical, original)?;
+
+        let layout = inspect_lexical_layout(&lexical)?;
+        assert!(matches!(layout, LexicalLayout::Ambiguous { .. }));
+        assert!(!layout.is_safe_for_quill_init());
+        assert_eq!(std::fs::read(&lexical)?, original);
+        assert_eq!(std::fs::read_dir(root.path())?.count(), 1);
+
+        // A file in a parent component is an I/O failure, not a missing root.
+        // Windows may instead report ERROR_PATH_NOT_FOUND for this shape.
+        #[cfg(unix)]
+        assert!(matches!(
+            inspect_lexical_layout(&lexical.join("child")),
+            Err(CurrentPointerError::Io { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_lexical_layout_refuses_symlink_roots_without_following() -> TestResult {
+        let root = tempdir()?;
+        let outside = tempdir()?;
+        let manifest = outside.path().join("MANIFEST");
+        std::fs::write(&manifest, b"retained outside manifest")?;
+
+        for (name, target) in [
+            ("directory", outside.path().to_path_buf()),
+            ("file", manifest.clone()),
+            ("dangling", outside.path().join("absent")),
+        ] {
+            let lexical = root.path().join(name);
+            std::os::unix::fs::symlink(&target, &lexical)?;
+            let layout = inspect_lexical_layout(&lexical)?;
+            assert!(matches!(layout, LexicalLayout::Ambiguous { .. }), "{name}");
+            assert!(!layout.is_safe_for_quill_init(), "{name}");
+            assert_eq!(std::fs::read_link(&lexical)?, target);
+        }
+        assert_eq!(std::fs::read(&manifest)?, b"retained outside manifest");
+        assert_eq!(std::fs::read_dir(outside.path())?.count(), 1);
+        assert_eq!(std::fs::read_dir(root.path())?.count(), 3);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_lexical_layout_propagates_unreadable_root() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir()?;
+        let lexical = root.path().join("lexical");
+        std::fs::create_dir(&lexical)?;
+        let original_permissions = std::fs::metadata(&lexical)?.permissions();
+        std::fs::set_permissions(&lexical, std::fs::Permissions::from_mode(0o000))?;
+        let inaccessible = std::fs::read_dir(&lexical).is_err();
+        let observed = inspect_lexical_layout(&lexical);
+        std::fs::set_permissions(&lexical, original_permissions)?;
+        // Privileged test runners may bypass Unix directory permissions.
+        if inaccessible {
+            assert!(matches!(observed, Err(CurrentPointerError::Io { .. })));
+        }
+        assert_eq!(std::fs::read_dir(&lexical)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_lexical_layout_preserves_previous_manifest_recovery() -> TestResult {
+        let direct = tempdir()?;
+        let previous = direct.path().join("MANIFEST.prev");
+        std::fs::write(&previous, b"retained manifest slot")?;
+        assert_eq!(
+            inspect_lexical_layout(direct.path())?,
+            LexicalLayout::DirectQuill
+        );
+        assert!(!direct.path().join("MANIFEST").exists());
+        assert_eq!(std::fs::read(&previous)?, b"retained manifest slot");
+
+        let root = tempdir()?;
+        let child = root.path().join("quill-v1");
+        std::fs::create_dir(&child)?;
+        std::fs::write(child.join("MANIFEST.prev"), b"retained child slot")?;
+        assert_eq!(
+            inspect_lexical_layout(root.path())?,
+            LexicalLayout::BlueGreen {
+                pointer: quill_v1_pointer(),
+                pointer_on_disk: false,
+            }
+        );
+        assert!(!root.path().join(CURRENT_FILE_NAME).exists());
+        publish_current(root.path(), &quill_v1_pointer())?;
+        assert_eq!(
+            inspect_lexical_layout(root.path())?,
+            LexicalLayout::BlueGreen {
+                pointer: quill_v1_pointer(),
+                pointer_on_disk: true,
+            }
+        );
+        assert!(!child.join("MANIFEST").exists());
+        assert_eq!(
+            std::fs::read(child.join("MANIFEST.prev"))?,
+            b"retained child slot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_lexical_layout_refuses_non_regular_engine_markers() -> TestResult {
+        for marker in ["MANIFEST", "MANIFEST.prev", "meta.json"] {
+            let direct = tempdir()?;
+            std::fs::create_dir(direct.path().join(marker))?;
+            assert!(matches!(
+                inspect_lexical_layout(direct.path()),
+                Err(CurrentPointerError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::InvalidData
+            ));
+            assert!(direct.path().join(marker).is_dir());
+            assert_eq!(std::fs::read_dir(direct.path())?.count(), 1);
+
+            let root = tempdir()?;
+            let child = root.path().join("candidate");
+            std::fs::create_dir(&child)?;
+            std::fs::create_dir(child.join(marker))?;
+            assert!(inspect_lexical_layout(root.path()).is_err());
+            assert!(resolve_current(root.path()).is_err());
+            assert!(!root.path().join(CURRENT_FILE_NAME).exists());
+            assert_eq!(std::fs::read_dir(&child)?.count(), 1);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_lexical_layout_refuses_symlinked_engine_markers() -> TestResult {
+        for marker in ["MANIFEST", "MANIFEST.prev", "meta.json"] {
+            for dangling in [false, true] {
+                let root = tempdir()?;
+                let outside = tempdir()?;
+                let target = outside.path().join("target");
+                if !dangling {
+                    std::fs::write(&target, b"external marker bytes")?;
+                }
+                let marker_path = root.path().join(marker);
+                std::os::unix::fs::symlink(&target, &marker_path)?;
+                assert!(matches!(
+                    inspect_lexical_layout(root.path()),
+                    Err(CurrentPointerError::Io { source, .. })
+                        if source.kind() == io::ErrorKind::InvalidData
+                ));
+                assert_eq!(std::fs::read_link(&marker_path)?, target);
+                assert_eq!(std::fs::read_dir(root.path())?.count(), 1);
+                if dangling {
+                    assert!(!target.exists());
+                } else {
+                    assert_eq!(std::fs::read(&target)?, b"external marker bytes");
+                }
+            }
+        }
         Ok(())
     }
 

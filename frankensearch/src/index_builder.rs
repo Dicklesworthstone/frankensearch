@@ -1598,6 +1598,25 @@ fn is_hash_generation_id(embedder_id: &str) -> bool {
     frankensearch_core::is_hash_generation_id(embedder_id)
 }
 
+/// Requires metadata obtained without following the lexical path's last component.
+fn is_plain_lexical_directory(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        // Junctions are directory reparse points even when FileType does not
+        // classify them as symlinks. Keep the same no-follow root policy as Quill.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Open every arm of an index directory produced by [`IndexBuilder`].
 ///
 /// The advertised hybrid flow used to build lexical data and then construct
@@ -1618,19 +1637,47 @@ fn is_hash_generation_id(embedder_id: &str) -> bool {
 /// tier carries a hash-embedder identity (that generation is not a hybrid
 /// semantic product), or when a lexical directory exists but its index
 /// fails to open (a corrupt lexical arm is reported, never silently
-/// dropped). A missing lexical directory
-/// yields `lexical: None` and `lexical_backend: None`, as does a build without
+/// dropped). With a lexical backend compiled in, an existing non-directory
+/// or symlink/reparse point at the lexical path is refused before opening the
+/// vector tier; filesystem inspection errors are propagated. A missing lexical
+/// directory yields `lexical: None` and `lexical_backend: None`, as does a build without
 /// a lexical backend compiled in. When the arm is present,
 /// `lexical_backend` records whether it is the default Quill reader or an
 /// explicit Tantivy oracle/rollback reader. Direct Tantivy indexes require
 /// `lexical-tantivy` (also enabled by `cass-compat`); blue-green lexical roots
 /// require `quill` for layout selection. Readers acquire no lexical writer lock.
+/// Cancellation is checked before filesystem access and before returning the
+/// opened arms.
 pub async fn open_hybrid(
     cx: &Cx,
     data_dir: impl AsRef<Path>,
     config: TwoTierConfig,
 ) -> SearchResult<HybridIndexParts> {
+    build_checkpoint(cx, "hybrid index open")?;
     let data_dir = data_dir.as_ref();
+    let lexical_dir = data_dir.join("lexical");
+    // `is_dir` folds unreadable paths, dangling links and file obstructions
+    // into the same false result as a genuinely absent arm. Inspect without
+    // following links before vector opening, which can recover legacy WALs.
+    // A profile with no lexical backend deliberately does not inspect this arm.
+    let has_lexical_directory = if cfg!(any(feature = "quill", feature = "lexical-tantivy")) {
+        match std::fs::symlink_metadata(&lexical_dir) {
+            Ok(metadata) if is_plain_lexical_directory(&metadata) => true,
+            Ok(_) => {
+                return Err(SearchError::InvalidConfig {
+                    field: "data_dir/lexical".to_owned(),
+                    value: "non-directory".to_owned(),
+                    reason:
+                        "the lexical path must be a directory without a symlink or reparse point"
+                            .to_owned(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        false
+    };
     let vectors = Arc::new(TwoTierIndex::open(data_dir, config)?);
     if is_hash_generation_id(vectors.fast_embedder_id()) {
         return Err(SearchError::EmbedderUnavailable {
@@ -1641,12 +1688,12 @@ pub async fn open_hybrid(
         });
     }
 
-    let lexical_dir = data_dir.join("lexical");
-    let (lexical, lexical_backend) = if lexical_dir.is_dir() {
+    let (lexical, lexical_backend) = if has_lexical_directory {
         open_lexical_reader(cx, &lexical_dir).await?
     } else {
         (None, None)
     };
+    build_checkpoint(cx, "hybrid index opened")?;
 
     Ok(HybridIndexParts {
         vectors,
@@ -5398,6 +5445,180 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "quill")]
+    #[test]
+    fn open_hybrid_recovers_the_previous_lexical_manifest_without_mutating() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("retained-doc", "previousmanifest recovery sentinel")
+                .build(&cx)
+                .await
+                .expect("build a real searchable Quill fixture");
+
+            let lexical_dir = dir.path().join("lexical");
+            let manifest = lexical_dir.join("MANIFEST");
+            let previous = lexical_dir.join("MANIFEST.prev");
+            if previous.exists() {
+                std::fs::rename(&previous, lexical_dir.join("retained-older-manifest"))
+                    .expect("preserve the older manifest fixture");
+            }
+            std::fs::copy(&manifest, &previous)
+                .expect("retain the valid manifest in the fallback slot");
+            std::fs::rename(&manifest, lexical_dir.join("retained-current-manifest"))
+                .expect("preserve the primary bytes outside the live marker names");
+            let snapshot = || {
+                std::fs::read_dir(&lexical_dir)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = snapshot();
+
+            let parts = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .expect("a valid previous manifest remains a readable lexical arm");
+            assert_eq!(parts.lexical_backend, Some(LexicalReaderBackend::Quill));
+            let lexical = parts
+                .lexical
+                .expect("the recoverable arm must not disappear");
+            let hits = lexical.search(&cx, "previousmanifest", 5).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id.as_str(), "retained-doc");
+            drop(lexical);
+            assert_eq!(
+                snapshot(),
+                before,
+                "reader recovery must not publish or repair files"
+            );
+            assert!(!manifest.exists());
+        });
+    }
+
+    fn hybrid_open_vector_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create vector-only hybrid fixture");
+        let mut builder = TwoTierIndex::create(dir.path(), TwoTierConfig::default())
+            .expect("create vector builder");
+        builder.set_fast_embedder_id("stub-fast");
+        builder
+            .add_fast_record("doc-1", &[1.0, 0.0, 0.0, 0.0])
+            .expect("add vector fixture");
+        drop(builder.finish().expect("publish vector fixture"));
+        dir
+    }
+
+    #[test]
+    fn open_hybrid_keeps_a_missing_lexical_arm_optional() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = hybrid_open_vector_fixture();
+            let parts = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .expect("a genuinely absent lexical arm remains optional");
+            assert_eq!(parts.vectors.doc_count(), 1);
+            assert!(parts.lexical.is_none());
+            assert!(parts.lexical_backend.is_none());
+            assert!(!dir.path().join("lexical").exists());
+        });
+    }
+
+    #[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+    #[test]
+    fn open_hybrid_refuses_a_file_obstructing_the_lexical_arm() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = hybrid_open_vector_fixture();
+            let lexical_path = dir.path().join("lexical");
+            let vector_path = dir.path().join(VECTOR_INDEX_FAST_FILENAME);
+            let vector_bytes = std::fs::read(&vector_path).expect("read vector fixture");
+            std::fs::write(&lexical_path, b"retained lexical obstruction")
+                .expect("write the lexical obstruction");
+
+            let error = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .expect_err("a malformed lexical arm cannot become vector-only success");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "data_dir/lexical" && value == "non-directory"
+            ));
+            assert_eq!(
+                std::fs::read(&lexical_path).expect("read retained obstruction"),
+                b"retained lexical obstruction"
+            );
+            assert_eq!(std::fs::read(&vector_path).unwrap(), vector_bytes);
+        });
+    }
+
+    #[cfg(all(unix, any(feature = "quill", feature = "lexical-tantivy")))]
+    #[test]
+    fn open_hybrid_refuses_lexical_symlinks_without_following_them() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for target_kind in ["missing", "file", "directory", "loop"] {
+                let dir = hybrid_open_vector_fixture();
+                let lexical_path = dir.path().join("lexical");
+                let vector_path = dir.path().join(VECTOR_INDEX_FAST_FILENAME);
+                let vector_bytes = std::fs::read(&vector_path).unwrap();
+                let target = if target_kind == "loop" {
+                    lexical_path.clone()
+                } else {
+                    dir.path().join("lexical-target")
+                };
+                match target_kind {
+                    "file" => std::fs::write(&target, b"retained target").unwrap(),
+                    "directory" => std::fs::create_dir(&target).unwrap(),
+                    _ => {}
+                }
+                std::os::unix::fs::symlink(&target, &lexical_path)
+                    .expect("create lexical symlink fixture");
+
+                let error = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                    .await
+                    .expect_err("an existing link is not an absent lexical arm");
+                assert!(
+                    matches!(
+                        error,
+                        SearchError::InvalidConfig { field, value, .. }
+                            if field == "data_dir/lexical" && value == "non-directory"
+                    ),
+                    "target kind: {target_kind}"
+                );
+                assert_eq!(std::fs::read_link(&lexical_path).unwrap(), target);
+                assert_eq!(std::fs::read(&vector_path).unwrap(), vector_bytes);
+                if target_kind == "file" {
+                    assert_eq!(std::fs::read(&target).unwrap(), b"retained target");
+                } else if target_kind == "missing" {
+                    assert!(!target.exists());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn open_hybrid_observes_cancellation_before_opening_any_arm() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = hybrid_open_vector_fixture();
+            let vector_path = dir.path().join(VECTOR_INDEX_FAST_FILENAME);
+            let vector_bytes = std::fs::read(&vector_path).unwrap();
+            let missing = dir.path().join("absent-index");
+            cx.set_cancel_requested(true);
+
+            for path in [dir.path(), missing.as_path()] {
+                let error = open_hybrid(&cx, path, TwoTierConfig::default())
+                    .await
+                    .expect_err("cancellation must precede index access");
+                assert!(matches!(
+                    error,
+                    SearchError::Cancelled { phase, .. } if phase == "hybrid index open"
+                ));
+            }
+            assert_eq!(std::fs::read(&vector_path).unwrap(), vector_bytes);
+            assert!(!missing.exists());
+        });
+    }
+
     /// Without a lexical backend compiled in, `open_hybrid` still opens the
     /// vector arms and reports the lexical arm as absent rather than erroring.
     #[cfg(not(any(feature = "quill", feature = "lexical-tantivy")))]
@@ -5412,12 +5633,18 @@ mod tests {
                 .await
                 .unwrap();
 
+            let lexical_path = dir.path().join("lexical");
+            std::fs::write(&lexical_path, b"unselected lexical artifact").unwrap();
             let parts = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
                 .await
                 .unwrap();
             assert_eq!(parts.vectors.doc_count(), 1);
             assert!(parts.lexical.is_none());
             assert!(parts.lexical_backend.is_none());
+            assert_eq!(
+                std::fs::read(&lexical_path).unwrap(),
+                b"unselected lexical artifact"
+            );
         });
     }
 
