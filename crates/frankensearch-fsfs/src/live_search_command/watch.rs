@@ -16,12 +16,12 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::adapters::live_search_session::LiveSearchRefreshConfig;
-use frankensearch_fsfs::adapters::retained_live_search::{
-    RetainedLiveSearchFrame, RetainedLiveSearchSession,
-};
+use frankensearch_fsfs::adapters::retained_live_search::RetainedLiveSearchFrame;
+use frankensearch_fsfs::config::DegradationOverrideMode;
 use frankensearch_fsfs::generation_store::{CompleteGenerationStore, PublishedGeneration};
 use frankensearch_fsfs::{CliCommand, CliInput, FsfsRuntime, OutputFormat};
 
+use super::hybrid::Subscription;
 use super::terminal::QueryControl;
 use super::{Budget, GuardedOutput, Options, hybrid};
 
@@ -143,9 +143,17 @@ fn publication_runtime(runtime: &FsfsRuntime, options: &Options) -> SearchResult
         .watch_source
         .as_ref()
         .ok_or_else(|| watch_error("an explicit --watch-source is required before indexing"))?;
-    if !options.hybrid || !runtime.config().indexing.offline {
+    if !runtime.config().indexing.offline {
         return Err(watch_error(
-            "source watching requires the explicit offline hybrid runtime",
+            "source watching requires an explicitly admitted offline runtime",
+        ));
+    }
+    if !options.hybrid
+        && runtime.config().pressure.degradation_override
+            != DegradationOverrideMode::ForceLexicalOnly
+    {
+        return Err(watch_error(
+            "lexical source watching requires forced lexical-only indexing",
         ));
     }
     if options.max_updates.is_none_or(|maximum| maximum == 0) {
@@ -186,7 +194,7 @@ pub(super) async fn execute<W: Write + Send>(
 
 fn update_query(
     cx: &Cx,
-    subscriber: &mut RetainedLiveSearchSession,
+    subscriber: &mut Subscription,
     mut requested: Option<String>,
     control: &mut Option<&mut dyn QueryControl>,
 ) -> SearchResult<bool> {
@@ -217,7 +225,7 @@ pub(super) async fn execute_controlled<W: Write + Send>(
     mut control: Option<&mut dyn QueryControl>,
 ) -> SearchResult<u64> {
     budget.check(cx)?;
-    let runtime = runtime.ok_or_else(|| watch_error("hybrid runtime was not initialized"))?;
+    let runtime = runtime.ok_or_else(|| watch_error("source-watch runtime was not initialized"))?;
     let publisher = publication_runtime(&runtime, options)?;
     let receipts = ReceiptSlot::default();
     // Registering, scanning and creating a store are done by this existing
@@ -228,7 +236,7 @@ pub(super) async fn execute_controlled<W: Write + Send>(
         |generation| receipts.offer(generation),
     ));
     let mut store: Option<CompleteGenerationStore> = None;
-    let mut subscriber: Option<RetainedLiveSearchSession> = None;
+    let mut subscriber: Option<Subscription> = None;
     let mut current: Option<PublishedGeneration> = None;
     let mut delivered = 0_u64;
     loop {
@@ -269,16 +277,16 @@ pub(super) async fn execute_controlled<W: Write + Send>(
             ));
         }
         if subscriber.is_none() {
-            subscriber = Some(RetainedLiveSearchSession::new(
-                runtime.clone(),
+            let mut subscription_options = options.clone();
+            // The watcher has already debounced source publications.
+            subscription_options.refresh = LiveSearchRefreshConfig {
+                debounce: Duration::ZERO,
+                max_wait: Duration::from_millis(1),
+            };
+            subscriber = Some(Subscription::new(
                 store.clone(),
-                options.query.clone(),
-                options.limits,
-                // The watcher has already debounced source publications.
-                LiveSearchRefreshConfig {
-                    debounce: Duration::ZERO,
-                    max_wait: Duration::from_millis(1),
-                },
+                &subscription_options,
+                options.hybrid.then(|| runtime.clone()),
             )?);
         }
         let subscriber = subscriber
@@ -294,16 +302,25 @@ pub(super) async fn execute_controlled<W: Write + Send>(
                 cx,
                 budget,
             };
-            let mut sink = |frame: &RetainedLiveSearchFrame| {
-                emit_receipted_frame(&generation, frame, &mut output)
-            };
-            subscriber
-                .poll_with_sink(cx, Instant::now(), &mut sink)
-                .await
+            match subscriber {
+                Subscription::Lexical(session) => session
+                    .poll_receipted_ndjson(cx, Instant::now(), &generation, &mut output)
+                    .await
+                    .map(|frame| frame.is_some()),
+                Subscription::Hybrid(session) => {
+                    let mut sink = |frame: &RetainedLiveSearchFrame| {
+                        emit_receipted_frame(&generation, frame, &mut output)
+                    };
+                    session
+                        .poll_with_sink(cx, Instant::now(), &mut sink)
+                        .await
+                        .map(|phases| phases != 0)
+                }
+            }
         };
         // Preserve typed cancellation and never replay a partial delivery.
         budget.check(cx)?;
-        if result? == 0 {
+        if !result? {
             return Err(watch_error(
                 "a due publication or query produced no query phases",
             ));
@@ -545,6 +562,12 @@ mod tests {
         config.indexing.offline = true;
         config.search.shadow_mode = true;
         assert!(publication_runtime(&FsfsRuntime::new(config), &options).is_err());
+
+        let mut lexical = options;
+        lexical.hybrid = false;
+        assert!(publication_runtime(&offline_runtime(), &lexical).is_err());
+        let runtime = hybrid::configured_runtime(&lexical).unwrap().unwrap();
+        assert!(publication_runtime(&runtime, &lexical).is_ok());
     }
 
     #[derive(Default)]
@@ -630,40 +653,36 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
             let generation = publish(&cx, &store, "one");
-            let mut subscriber = RetainedLiveSearchSession::new(
-                offline_runtime(),
-                store.clone(),
-                "alpha",
-                super::super::Options::parse(vec![
-                    "--index-dir".into(),
-                    root.path().as_os_str().to_owned(),
-                    "--query".into(),
-                    "alpha".into(),
-                ])
-                .unwrap()
-                .limits,
-                LiveSearchRefreshConfig::default(),
-            )
-            .unwrap();
-            let mut queries = Queries {
-                pending: Some("beta".to_owned()),
-                ..Queries::default()
-            };
-            {
-                let mut control: Option<&mut dyn QueryControl> = Some(&mut queries);
-                assert!(update_query(&cx, &mut subscriber, None, &mut control).unwrap());
-                assert!(
-                    !update_query(&cx, &mut subscriber, Some("beta".to_owned()), &mut control,)
-                        .unwrap()
-                );
-                assert!(
-                    update_query(&cx, &mut subscriber, Some("  ".to_owned()), &mut control,)
-                        .is_err()
-                );
+            for hybrid in [false, true] {
+                let mut options = options(root.path(), root.path());
+                options.hybrid = hybrid;
+                let mut subscriber =
+                    Subscription::new(store.clone(), &options, hybrid.then(offline_runtime))
+                        .unwrap();
+                let mut queries = Queries {
+                    pending: Some("beta".to_owned()),
+                    ..Queries::default()
+                };
+                {
+                    let mut control: Option<&mut dyn QueryControl> = Some(&mut queries);
+                    assert!(update_query(&cx, &mut subscriber, None, &mut control).unwrap());
+                    assert!(
+                        !update_query(&cx, &mut subscriber, Some("beta".to_owned()), &mut control,)
+                            .unwrap()
+                    );
+                    assert!(
+                        update_query(&cx, &mut subscriber, Some("  ".to_owned()), &mut control,)
+                            .is_err()
+                    );
+                }
+                let query = match &subscriber {
+                    Subscription::Lexical(session) => session.query(),
+                    Subscription::Hybrid(session) => session.query(),
+                };
+                assert_eq!(query, "beta");
+                assert_eq!(queries.resets, ["beta"]);
+                assert_eq!(store.active(&cx).unwrap(), Some(generation.clone()));
             }
-            assert_eq!(subscriber.query(), "beta");
-            assert_eq!(queries.resets, ["beta"]);
-            assert_eq!(store.active(&cx).unwrap(), Some(generation));
         });
     }
 

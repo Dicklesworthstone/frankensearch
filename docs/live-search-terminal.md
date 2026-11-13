@@ -32,9 +32,10 @@ cannot be combined. Omit `--tui` for the unchanged NDJSON protocol.
 `--once`, `--max-updates` and `--timeout-ms` retain their existing stopping
 semantics: reaching one exits and restores the terminal, not an indefinitely
 held final screen. For an ongoing read-only view, omit those stopping limits.
-`--watch-source` can be combined with `--tui`; its explicit `--hybrid` and
-finite update-limit requirements remain unchanged, as do the source/store
-separation, offline model, publication and retention policies.
+`--watch-source` can be combined with `--tui` in lexical or hybrid mode. Lexical
+watching needs no models or configuration. Both modes require a finite update
+limit and retain the source/store separation, offline publication and retention
+policies. Hybrid models must already be installed.
 
 The renderer consumes the same complete records as a machine client. It checks
 query, schema, sequence, previous revision, physical generation, phase ordering,

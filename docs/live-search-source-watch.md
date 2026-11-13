@@ -1,7 +1,15 @@
 # Index, watch, and stream one query
 
 The explicitly mutating form of `fsfs live-search` runs the existing
-complete-generation watcher and the progressive query subscriber in one process:
+complete-generation watcher and query subscriber in one process. Default lexical
+watching works without installed models or configuration:
+
+```sh
+fsfs live-search --watch-source /path/to/source \
+  --index-dir /path/to/separate-store --query 'connection pool' --max-updates 20
+```
+
+Add `--hybrid` to use the progressive pipeline and already installed models:
 
 ```sh
 fsfs live-search --watch-source /path/to/source \
@@ -14,18 +22,23 @@ hidden directory, whose writes the watcher ignores. A new store can be
 bootstrapped when its parent exists. An existing store is handled by the same complete-generation
 writer admission and source checks as `fsfs watch`. Discovery, owner/privacy,
 pressure, producer identity, and checkpoint-proven reuse policies remain in the
-ordinary indexer. Models must already be installed; this command stays offline.
+ordinary indexer. Lexical watching uses the built-in discovery/privacy policies
+with lexical-only indexing forced; it does not load configuration or resolve
+either embedding model. Hybrid watching loads normal fsfs configuration (or
+`--config`) and requires already installed models. Both modes stay offline.
 It never edits source files, rewrites sealed predecessors, or deletes artifacts.
-`--watch-source` requires `--hybrid` and is currently Unix-only. Without that flag,
-`live-search` remains a read-only subscriber.
+`--watch-source` is currently Unix-only. Without this explicit flag, `live-search`
+remains a read-only subscriber; `--config` still requires `--hybrid`.
 
 The command registers native notifications before its initial build. After each
-durable publication it queries through the existing retained hybrid pipeline,
-flushes Initial, and then delivers the refinement outcome when configured. The
-output remains `fsfs.stream.live_search.hybrid.v1`; the receipt in every phase is
-checked against the watcher's just-published generation. A competing publisher
-cannot silently substitute its query results. A failed refinement preserves the
-Initial window, with the ordinary failure annotations and no removal delta.
+durable publication, lexical mode admits the immutable Quill reader and emits
+the usual `fsfs.stream.live_search.v1` snapshot or delta. Created files, changed
+matches, and removed source files become visible after publication. Hybrid mode
+uses the retained pipeline, flushing Initial before its configured refinement
+outcome in `fsfs.stream.live_search.hybrid.v1` records. Both modes check the
+admitted generation ID and manifest digest against the watcher's receipt before
+output. A competing publisher cannot silently substitute its results. Failed
+hybrid refinement preserves the Initial window with its failure annotations.
 
 Query and output backpressure suspend the owned watcher future, rather than queue
 up completed generations or start another indexer. The native registration stays
@@ -56,8 +69,8 @@ successful publication**. It does not undo that publication. Runtime errors on
 stderr use the `watch_subscription` phase; stdout contains query frames only.
 Inspect the selected store after an error rather than assuming the build aborted.
 
-This adds the combined workflow through `live-search --watch-source`. It does not
-add a `watch --stream-search` spelling or a TUI subscription.
+Add `--tui` for the existing terminal view and query editor in either mode. Query
+edits reuse the same watcher and reader and do not consume the publication limit.
 
 ## Regression commands
 
@@ -68,7 +81,9 @@ FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR=/verified/model-cache \
   cargo test -p frankensearch-fsfs --test live_search_watch -- --ignored
 ```
 
-The ignored process test uses the production binary and a real installed Potion
+Ordinary process tests bootstrap and watch a lexical store without models,
+verify create/update/removal deltas, and check the publication limit. The ignored
+process test uses the production binary and a real installed Potion
 model. It bootstraps a store, waits for its initial streamed snapshot, renames a
 source file, verifies the successor delta, and checks that the publisher stops
 at the requested cycle limit. Ordinary tests require no model download.

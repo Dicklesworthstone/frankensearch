@@ -123,6 +123,41 @@ impl QuillLiveSearchSession {
         self.session.source_mut().refresh(cx).await?;
         self.session.poll_ndjson(cx, now, writer)
     }
+
+    /// Deliver only the immutable generation named by an owned publisher's
+    /// durable receipt. A competing selection must not be relabeled as that
+    /// publication, including when it changes while the reader is opening.
+    ///
+    /// The receipt is checked against the admitted reader before searching or
+    /// emitting bytes. The synchronous query retains that reader even if the
+    /// store selection subsequently changes. As with `poll_ndjson`, only a
+    /// successfully flushed frame advances the delivered baseline.
+    ///
+    /// # Errors
+    /// Returns admission/output errors, or rejects an absent or different
+    /// admitted generation without emitting a frame or advancing the baseline.
+    pub async fn poll_receipted_ndjson<W: Write + Send>(
+        &mut self,
+        cx: &Cx,
+        now: Instant,
+        expected: &PublishedGeneration,
+        writer: &mut W,
+    ) -> SearchResult<Option<QuillLiveSearchFrame>> {
+        let source = self.session.source_mut();
+        source.refresh(cx).await?;
+        if source.admitted.as_ref().is_none_or(|admitted| {
+            admitted.generation.id() != expected.id()
+                || admitted.generation.manifest_sha256() != expected.manifest_sha256()
+        }) {
+            return Err(SearchError::InvalidConfig {
+                field: "live_search.watch".to_owned(),
+                value: expected.id().to_owned(),
+                reason: "query admission selected a different publication; the watched generation remains published"
+                    .to_owned(),
+            });
+        }
+        self.session.poll_ndjson(cx, now, writer)
+    }
 }
 
 #[derive(Clone)]
@@ -536,6 +571,73 @@ mod tests {
             let decoded: QuillLiveSearchFrame = serde_json::from_slice(&output).unwrap();
             assert_eq!(frame, decoded);
             assert_eq!(session.tracker().sequence(), 1);
+        });
+    }
+
+    #[test]
+    fn native_receipted_poll_fences_reloads_before_output_and_preserves_failed_baselines() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let first = publish(&cx, &store, &[IndexableDocument::new("a", "alpha")]).await;
+            let mut session = session(store.clone());
+            let mut initial_output = Vec::new();
+            let initial = session
+                .poll_receipted_ndjson(&cx, Instant::now(), &first, &mut initial_output)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                initial.generation,
+                format!("{}@{}", first.id(), first.manifest_sha256()),
+            );
+            assert!(matches!(initial.event, LiveSearchEvent::Snapshot { .. }));
+
+            let second = publish(&cx, &store, &[IndexableDocument::new("b", "alpha")]).await;
+            let mut foreign_output = Vec::new();
+            let error = session
+                .poll_receipted_ndjson(&cx, Instant::now(), &first, &mut foreign_output)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "live_search.watch"));
+            assert!(foreign_output.is_empty());
+            assert_eq!(session.tracker().sequence(), 1);
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "a");
+            assert_eq!(store.active(&cx).unwrap(), Some(second.clone()));
+
+            assert!(matches!(
+                session
+                    .poll_receipted_ndjson(&cx, Instant::now(), &second, &mut BrokenTransport)
+                    .await,
+                Err(SearchError::Io(_))
+            ));
+            assert_eq!(session.tracker().sequence(), 1);
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "a");
+
+            let mut output = Vec::new();
+            let successor = session
+                .poll_receipted_ndjson(&cx, Instant::now(), &second, &mut output)
+                .await
+                .unwrap()
+                .unwrap();
+            let decoded: QuillLiveSearchFrame = serde_json::from_slice(&output).unwrap();
+            assert_eq!(successor, decoded);
+            assert_eq!(successor.sequence, 2);
+            assert_eq!(successor.previous_generation, Some(initial.generation));
+            assert_eq!(
+                successor.generation,
+                format!("{}@{}", second.id(), second.manifest_sha256()),
+            );
+            let LiveSearchEvent::Delta { changes } = successor.event else {
+                panic!("a receipted successor must produce a delta");
+            };
+            assert!(changes.iter().any(|change| matches!(
+                change, LiveSearchChange::Removed { doc_id, .. } if doc_id == "a"
+            )));
+            assert!(changes.iter().any(|change| matches!(
+                change, LiveSearchChange::Added { result } if result.hit.doc_id == "b"
+            )));
         });
     }
 

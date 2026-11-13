@@ -13,11 +13,12 @@ use frankensearch_fsfs::adapters::quill_live_search::QuillLiveSearchSession;
 use frankensearch_fsfs::adapters::retained_live_search::{
     RetainedLiveSearchFrame, RetainedLiveSearchSession,
 };
+use frankensearch_fsfs::config::DegradationOverrideMode;
 use frankensearch_fsfs::generation_store::CompleteGenerationStore;
 use frankensearch_fsfs::{
-    CliCommand, CliInput, CliOverrides, FsfsRuntime, OutputFormat, current_unicode_environment,
-    default_project_config_file_path, default_user_config_file_path, load_from_layered_sources,
-    load_from_sources,
+    CliCommand, CliInput, CliOverrides, FsfsConfig, FsfsRuntime, OutputFormat,
+    current_unicode_environment, default_project_config_file_path, default_user_config_file_path,
+    load_from_layered_sources, load_from_sources,
 };
 use frankensearch_quill::QuillConfig;
 use serde::Serialize;
@@ -59,6 +60,14 @@ impl Subscription {
         }
     }
 
+    #[cfg(unix)]
+    pub(super) fn set_query(&mut self, cx: &Cx, query: &str) -> SearchResult<bool> {
+        match self {
+            Self::Lexical(session) => session.set_query(cx, query),
+            Self::Hybrid(session) => session.set_query(cx, query),
+        }
+    }
+
     /// One update is one physical generation's complete phase sequence, not one
     /// phase frame. A max-update limit cannot turn Initial into a final result by
     /// cutting off refinement. Cancellation or failed output still stops promptly.
@@ -78,13 +87,20 @@ impl Subscription {
     }
 }
 
-/// Lexical mode returns before inspecting environment/configuration. Hybrid mode
-/// uses the standard policy loader but explicitly disables model downloads and
-/// indexing. This does not certify semantic readiness: the real pipeline must
-/// admit each producer and preserve any typed degradation/failure annotations.
+/// Lexical mode never loads environment/configuration. Read-only subscriptions
+/// need no runtime; an explicit source watch gets the default discovery/privacy
+/// policy with lexical-only indexing forced, so neither embedding tier resolves
+/// a model. Hybrid mode uses the standard policy loader with downloads disabled.
+/// The real pipeline still admits every semantic producer and preserves typed
+/// degradation/failure annotations.
 pub(super) fn configured_runtime(options: &Options) -> SearchResult<Option<FsfsRuntime>> {
     if !options.hybrid {
-        return Ok(None);
+        return Ok(options.watch_source.as_ref().map(|_| {
+            let mut config = FsfsConfig::default();
+            config.indexing.offline = true;
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            FsfsRuntime::new(config)
+        }));
     }
     let home = frankensearch_core::platform_dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let env = current_unicode_environment();
@@ -352,6 +368,25 @@ mod tests {
         // if options were constructed directly by an internal caller.
         options.config_path = Some(root.path().join("does-not-exist"));
         assert!(configured_runtime(&options).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn lexical_watch_uses_default_offline_policy_without_opening_configuration_or_models() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = options(root.path());
+        options.hybrid = false;
+        options.watch_source = Some(root.path().join("source-not-opened"));
+        options.config_path = Some(root.path().join("config-not-opened"));
+        let runtime = configured_runtime(&options).unwrap().unwrap();
+        assert!(runtime.config().indexing.offline);
+        assert!(!runtime.config().indexing.watch_mode);
+        assert_eq!(
+            runtime.config().pressure.degradation_override,
+            DegradationOverrideMode::ForceLexicalOnly,
+        );
+        assert_eq!(runtime.config().discovery, FsfsConfig::default().discovery);
+        assert_eq!(runtime.config().privacy, FsfsConfig::default().privacy);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 

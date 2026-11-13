@@ -42,7 +42,7 @@ Run a publisher separately, or explicitly opt into indexing with --watch-source.
   --hybrid                Use the retained progressive hybrid pipeline and local models
   --config FILE           Hybrid configuration/model policy; requires --hybrid
   --tui                   Live terminal view and query editor (Unix terminals required)
-  --watch-source DIR      Index and watch DIR, publishing successors; requires --hybrid
+  --watch-source DIR      Index and watch DIR, publishing successors (Unix)
   --limit N               Result window, 1..=10000 (default 20)
   --poll-ms N             Selection probe interval, 10..=60000 (default 100)
   --debounce-ms N         Quiet period before a refresh, 0..=60000 (default 100)
@@ -98,8 +98,10 @@ fixed-query subscription. Existing limits restore the terminal when they stop it
 
 --watch-source is supported on Unix and requires disjoint source/store trees.
 It builds the initial generation, then streams each durable publication through
-the same hybrid pipeline. Models must already be available. Because complete
-generations are retained, --once or --max-updates is REQUIRED in this mode.
+the selected query pipeline. Default lexical watching needs no models and uses
+built-in discovery/privacy policies without loading configuration. --hybrid uses
+configured policies and already available models. Because complete generations
+are retained, --once or --max-updates is REQUIRED in this mode.
 --once builds and queries once; --max-updates counts published generations, not
 phases. These limits are not a disk quota or automatic garbage collection.
 The native watcher owns source debounce/reconciliation; --poll-ms, --debounce-ms
@@ -248,11 +250,6 @@ impl Options {
             if !cfg!(unix) {
                 return Err(invalid(
                     "--watch-source requires a Unix complete-generation watcher",
-                ));
-            }
-            if !hybrid {
-                return Err(invalid(
-                    "--watch-source requires --hybrid and already available models",
                 ));
             }
             if !once && max_updates.is_none() {
@@ -584,9 +581,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn watch_requires_explicit_indexing_and_model_policy() {
+    fn watch_requires_explicit_indexing_and_finite_limits_in_both_search_modes() {
         assert!(Options::parse(args(&["--watch-source", "/source"])).is_err());
         assert!(Options::parse(args(&["--watch-source", "/source", "--hybrid"])).is_err());
+        let lexical = Options::parse(args(&["--watch-source", "/source", "--once"])).unwrap();
+        assert!(!lexical.hybrid);
+        assert_eq!(lexical.watch_source, Some(PathBuf::from("/source")));
+        assert_eq!(lexical.max_updates, Some(1));
         let options =
             Options::parse(args(&["--watch-source", "/source", "--hybrid", "--once"])).unwrap();
         assert_eq!(options.watch_source, Some(PathBuf::from("/source")));

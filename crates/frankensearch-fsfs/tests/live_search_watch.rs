@@ -44,6 +44,12 @@ impl Fixture {
     }
 
     fn command(&self, source: &Path, store: &Path) -> Command {
+        let mut command = self.lexical_command(source, store);
+        command.args(["--hybrid", "--config"]).arg(&self.config);
+        command
+    }
+
+    fn lexical_command(&self, source: &Path, store: &Path) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs"));
         for (name, _) in std::env::vars_os() {
             let text = name.to_string_lossy();
@@ -58,14 +64,7 @@ impl Fixture {
             .env("XDG_DATA_HOME", self.directory.path().join("data"))
             .env("XDG_CACHE_HOME", self.directory.path().join("cache"))
             .env("FRANKENSEARCH_CHECK_UPDATES", "0")
-            .args([
-                "live-search",
-                "--hybrid",
-                "--query",
-                "sharedtoken",
-                "--config",
-            ])
-            .arg(&self.config)
+            .args(["live-search", "--query", "sharedtoken"])
             .arg("--watch-source")
             .arg(source)
             .arg("--index-dir")
@@ -110,14 +109,14 @@ impl Process {
         }
     }
 
-    #[cfg(feature = "semantic-support")]
-    fn wait_for_first_frame(&mut self) -> Value {
+    fn wait_for_frame(&mut self, index: usize) -> Value {
         let started = Instant::now();
         loop {
             let bytes = fs::read(self.capture.path().join("stdout")).unwrap();
             if let Some(line) = bytes
                 .split_inclusive(|byte| *byte == b'\n')
-                .find(|line| line.ends_with(b"\n"))
+                .filter(|line| line.ends_with(b"\n"))
+                .nth(index)
             {
                 return serde_json::from_slice(line).expect("a complete live NDJSON frame");
             }
@@ -128,7 +127,7 @@ impl Process {
             );
             assert!(
                 started.elapsed() < Duration::from_secs(180),
-                "initial publication timed out"
+                "publication {index} timed out"
             );
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -197,15 +196,10 @@ fn shadow_policy_is_rejected_before_a_store_is_created() {
 }
 
 #[test]
-fn watch_cannot_be_enabled_by_a_lexical_only_invocation() {
+fn lexical_watch_requires_an_explicit_finite_publication_limit() {
     let fixture = Fixture::new(None, false);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs"));
-    command
-        .args(["live-search", "--query", "sharedtoken", "--watch-source"])
-        .arg(&fixture.source)
-        .arg("--index-dir")
-        .arg(&fixture.store);
-    let output = Process::start(&mut command).finish(Duration::from_secs(15));
+    let output = Process::start(&mut fixture.lexical_command(&fixture.source, &fixture.store))
+        .finish(Duration::from_secs(15));
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
@@ -214,9 +208,146 @@ fn watch_cannot_be_enabled_by_a_lexical_only_invocation() {
         error["message"]
             .as_str()
             .unwrap()
-            .contains("requires --hybrid")
+            .contains("requires --once or --max-updates")
     );
     assert!(!fixture.store.exists());
+}
+
+#[test]
+fn lexical_watch_bootstraps_without_models_or_configuration_and_stops_after_once() {
+    let fixture = Fixture::new(None, false);
+    let project_config = fixture.directory.path().join(".frankensearch");
+    fs::create_dir(&project_config).unwrap();
+    fs::write(project_config.join("config.toml"), "not valid TOML").unwrap();
+    let output = Process::start(
+        fixture
+            .lexical_command(&fixture.source, &fixture.store)
+            .env("FSFS_PRESSURE_DEGRADATION_OVERRIDE", "not-a-policy")
+            .env(
+                "FSFS_MODEL_DIR",
+                fixture.directory.path().join("missing-models"),
+            )
+            .args(["--once", "--timeout-ms", "60000"]),
+    )
+    .finish(Duration::from_secs(75));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frame: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(frame["schema_version"], "fsfs.stream.live_search.v1");
+    assert_eq!(frame["event"], "snapshot");
+    assert_eq!(frame["sequence"], 1);
+    assert_eq!(frame["result_count"], 1);
+    assert_eq!(frame["results"].as_array().unwrap().len(), 1);
+    assert!(frame.get("phase").is_none());
+    assert!(frame["results"][0].get("semantic_rank").is_none());
+    let (generation, _) = frame["generation"]
+        .as_str()
+        .unwrap()
+        .split_once('@')
+        .unwrap();
+    let root = fixture.store.join("generations").join(generation);
+    assert!(root.join("FSFS-BUNDLE.json").is_file());
+    assert!(!root.join("vector/index.fsvi").exists());
+    assert!(!root.join("vector/quality.fsvi").exists());
+    assert!(!fixture.directory.path().join("missing-models").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.source.join("alpha.md")).unwrap(),
+        "sharedtoken alpha document"
+    );
+}
+
+#[test]
+fn lexical_native_watch_streams_creates_updates_and_removals_at_the_publication_limit() {
+    let fixture = Fixture::new(None, false);
+    let mut process = Process::start(
+        fixture
+            .lexical_command(&fixture.source, &fixture.store)
+            .args(["--max-updates", "4", "--timeout-ms", "60000"]),
+    );
+    let first = process.wait_for_frame(0);
+    assert_eq!(first["schema_version"], "fsfs.stream.live_search.v1");
+    assert_eq!(first["event"], "snapshot");
+    let old_id = first["results"][0]["doc_id"].as_str().unwrap();
+    assert_eq!(Path::new(old_id).file_name().unwrap(), "alpha.md");
+
+    fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
+    let created = process.wait_for_frame(1);
+    assert_eq!(created["result_count"], 2);
+    let addition = created["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["change"] == "added")
+        .unwrap();
+    let new_id = addition["result"]["doc_id"].as_str().unwrap();
+    assert_eq!(Path::new(new_id).file_name().unwrap(), "beta.md");
+
+    fs::write(fixture.source.join("alpha.md"), "different updated content").unwrap();
+    let updated = process.wait_for_frame(2);
+    assert_eq!(updated["result_count"], 1);
+    assert!(
+        updated["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| { change["change"] == "removed" && change["doc_id"] == old_id })
+    );
+
+    // Leaving the watched tree removes source membership without changing a
+    // predecessor or fabricating a publication from the test itself.
+    fs::rename(
+        fixture.source.join("beta.md"),
+        fixture.directory.path().join("removed-beta.md"),
+    )
+    .unwrap();
+    let output = process.finish(Duration::from_secs(75));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frames: Vec<Value> = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(frames.len(), 4);
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(frame["schema_version"], "fsfs.stream.live_search.v1");
+        assert_eq!(frame["sequence"], index + 1);
+        if index != 0 {
+            assert_eq!(frame["event"], "delta");
+            assert_eq!(
+                frame["previous_generation"],
+                frames[index - 1]["generation"]
+            );
+            assert_ne!(frame["generation"], frames[index - 1]["generation"]);
+        }
+    }
+    let removed = &frames[3];
+    assert_eq!(removed["result_count"], 0);
+    assert!(
+        removed["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| { change["change"] == "removed" && change["doc_id"] == new_id })
+    );
+    let selected = fs::read(fixture.store.join("FSFS-CURRENT")).unwrap();
+    fs::write(
+        fixture.source.join("after-exit.md"),
+        "sharedtoken after exit",
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(),
+        selected
+    );
 }
 
 #[cfg(feature = "semantic-support")]
@@ -235,7 +366,7 @@ fn native_watcher_publishes_and_streams_a_renamed_file_then_stops_at_the_limit()
         "--timeout-ms",
         "300000",
     ]));
-    let first = process.wait_for_first_frame();
+    let first = process.wait_for_frame(0);
     assert_eq!(first["schema_version"], "fsfs.stream.live_search.hybrid.v1");
     assert_eq!(first["phase"], "initial");
     assert_eq!(first["update"]["event"], "snapshot");
