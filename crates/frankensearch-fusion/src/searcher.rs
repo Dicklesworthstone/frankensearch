@@ -40,7 +40,8 @@ use frankensearch_core::generation::{
 use frankensearch_core::host_adapter::{AdapterLifecycleEvent, HostAdapter};
 use frankensearch_core::query_class::QueryClass;
 use frankensearch_core::traits::{
-    Embedder, LexicalHydrationContext, LexicalRead, ModelCategory, Reranker, SearchFuture,
+    Embedder, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead, ModelCategory, Reranker,
+    SearchFuture,
 };
 use frankensearch_core::types::{
     BoundQueryEmbedding, EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics,
@@ -2042,19 +2043,38 @@ impl TwoTierSearcher {
                 lex.search(cx, &lexical_query, lexical_budget),
             )
             .await;
+            let lex_res = match (lex_res, normalized_exclusions) {
+                (Ok(results), Some(exclusions)) => {
+                    refill_lexical_after_exclusions(
+                        cx,
+                        lex.as_ref(),
+                        &lexical_query,
+                        lexical_budget,
+                        LexicalCandidateBatch::eager(results),
+                        exclusions,
+                        text_fn,
+                    )
+                    .await
+                }
+                (Ok(results), None) => Ok(LexicalCandidateBatch::eager(results)),
+                (Err(error), _) => Err(error),
+            };
             match lex_res {
-                Ok(results) => {
+                Ok(batch) => {
                     metrics.lexical_search_ms = start_lex.elapsed().as_secs_f64() * 1000.0;
-                    metrics.lexical_candidates = results.len();
-                    let results = if let Some(exclusions) = normalized_exclusions {
-                        let filtered = filter_scored_results_by_negations(
-                            results, exclusions, text_fn, "lexical",
-                        );
-                        metrics.lexical_candidates = filtered.len();
-                        filtered
+                    let (results, context) = batch.into_parts();
+                    let results = if context.is_some() {
+                        self.lexical_results_for_direct_return(
+                            cx,
+                            &results,
+                            context.as_ref(),
+                            metrics,
+                        )
+                        .await?
                     } else {
                         results
                     };
+                    metrics.lexical_candidates = results.len();
                     metrics.skip_reason =
                         Some("non_semantic_fast_embedder_lexical_short_circuit".to_owned());
                     metrics.semantic_candidates = 0;
@@ -2223,11 +2243,33 @@ impl TwoTierSearcher {
             _ => None,
         };
 
+        // Exclusions must fill an eligible candidate budget, not just remove
+        // matches from one fixed prefix. Do this after embedding admission so
+        // terminal identity errors still precede text/filter callbacks. Each
+        // widened search replaces both its candidates and its snapshot pin.
+        let lexical_timed = match (lexical_timed, normalized_exclusions, self.lexical.as_ref()) {
+            ((Some(Ok(batch)), elapsed), Some(exclusions), Some(lexical)) => {
+                let start = Instant::now();
+                let result = refill_lexical_after_exclusions(
+                    cx,
+                    lexical.as_ref(),
+                    &lexical_query,
+                    lexical_budget,
+                    batch,
+                    exclusions,
+                    text_fn,
+                )
+                .await;
+                (Some(result), elapsed + start.elapsed())
+            }
+            (timed, _, _) => timed,
+        };
+
         // bd-8nqz.1: the candidate batch's hydration context pins the exact
         // snapshot that scored these candidates; it travels alongside the
         // results so hydration can never read a newer generation.
         let mut lexical_context: Option<LexicalHydrationContext> = None;
-        let mut lexical_results: Option<Vec<ScoredResult>> = match lexical_timed {
+        let lexical_results: Option<Vec<ScoredResult>> = match lexical_timed {
             (Some(Ok(batch)), elapsed) => {
                 metrics.lexical_search_ms = elapsed.as_secs_f64() * 1000.0;
                 let (results, context) = batch.into_parts();
@@ -2250,14 +2292,6 @@ impl TwoTierSearcher {
             }
             (None, _) => None,
         };
-        if let Some(exclusions) = normalized_exclusions {
-            lexical_results = lexical_results.map(|results| {
-                let filtered =
-                    filter_scored_results_by_negations(results, exclusions, text_fn, "lexical");
-                metrics.lexical_candidates = filtered.len();
-                filtered
-            });
-        }
 
         if lexical_short_circuit
             && let Some(lexical) = lexical_results.as_ref()
@@ -4485,6 +4519,60 @@ fn vector_hits_to_scored_results(
         .collect()
 }
 
+/// Fill a lexical budget after exclusions while retaining one scoring snapshot.
+/// A short batch establishes exhaustion; geometric widening also terminates
+/// when the request limit saturates, even for a backend with no finite count.
+async fn refill_lexical_after_exclusions(
+    cx: &Cx,
+    lexical: &dyn LexicalRead,
+    query: &str,
+    target: usize,
+    mut batch: LexicalCandidateBatch,
+    exclusions: &NormalizedExclusions,
+    text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+) -> SearchResult<LexicalCandidateBatch> {
+    let mut limit = target;
+    loop {
+        cancellation_checkpoint(cx, "lexical_candidates_to_exclusions")?;
+        let (mut results, context) = batch.into_parts();
+        let exhausted = results.len() < limit;
+        let mut retained = 0;
+        for rank in 0..results.len() {
+            if retained == target {
+                break;
+            }
+            cancellation_checkpoint(cx, "lexical_candidates_to_exclusions")?;
+            let include =
+                !should_exclude_document(&results[rank].doc_id, exclusions, text_fn, "lexical");
+            cancellation_checkpoint(cx, "lexical_exclusions_to_search")?;
+            if include {
+                // Compact in rank order without allocating a second candidate
+                // pool. Rejected rows are dropped after the bounded scan.
+                results.swap(retained, rank);
+                retained += 1;
+            }
+        }
+        results.truncate(retained);
+        let next_limit = limit.saturating_mul(2);
+        if results.len() == target || exhausted || next_limit == limit {
+            return Ok(match context {
+                Some(context) => LexicalCandidateBatch::deferred(results, context),
+                None => LexicalCandidateBatch::eager(results),
+            });
+        }
+        // Replacing the full batch keeps its hydration context paired with
+        // every retained score, even if the backend publishes between calls.
+        limit = next_limit;
+        batch = frankensearch_core::with_cancellation(
+            cx,
+            "lexical_candidates",
+            lexical.search_candidates(cx, query, limit),
+        )
+        .await?;
+    }
+}
+
+#[cfg(any(feature = "graph", test))]
 fn filter_scored_results_by_negations(
     mut results: Vec<ScoredResult>,
     exclusions: &NormalizedExclusions,
@@ -11761,6 +11849,212 @@ mod tests {
 
             assert!(!results.is_empty());
             assert!(!results.iter().any(|r| r.doc_id == "doc-0"));
+        });
+    }
+
+    #[test]
+    fn lexical_exclusion_widening_retains_scoring_snapshot_for_refinement() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = build_test_index_with_quality(4);
+            let lexical = Arc::new(RetainedMetadataLexical::default());
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+            .with_lexical(lexical.clone());
+            let mut phases = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "needle -blocked",
+                    1,
+                    |id| {
+                        Some(
+                            if id == "doc-quality-only" {
+                                "needle"
+                            } else {
+                                "blocked"
+                            }
+                            .to_owned(),
+                        )
+                    },
+                    |phase| {
+                        if matches!(&phase, SearchPhase::Initial { .. }) {
+                            lexical.epoch.store(99, Ordering::Relaxed);
+                        }
+                        phases.push(phase);
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(lexical.searches.load(Ordering::Relaxed) > 1);
+            assert_eq!(metrics.lexical_candidates, 1);
+            assert_eq!(phases.len(), 2);
+            for phase in phases {
+                let results = match phase {
+                    SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+                        results
+                    }
+                    other => panic!("unexpected phase: {other:?}"),
+                };
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].doc_id, "doc-quality-only");
+                assert_eq!(results[0].metadata.as_ref().unwrap()["epoch"], 0);
+                assert_eq!(results[0].source, ScoreSource::Lexical);
+                assert!(results[0].fast_score.is_none());
+                assert!(results[0].quality_score.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn lexical_exclusion_widening_observes_filter_cancellation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = build_test_index(4);
+            let lexical = Arc::new(RetainedMetadataLexical::default());
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_lexical(lexical.clone());
+            let mut phases = 0;
+            let filter_calls = AtomicU64::new(0);
+            let error = searcher
+                .search(
+                    &cx,
+                    "needle -blocked",
+                    1,
+                    |_| {
+                        filter_calls.fetch_add(1, Ordering::Relaxed);
+                        cx.set_cancel_requested(true);
+                        Some("blocked".to_owned())
+                    },
+                    |_| phases += 1,
+                )
+                .await
+                .expect_err("filter cancellation must stop before any refill or publication");
+            assert!(
+                matches!(error, SearchError::Cancelled { ref phase, .. } if phase == "lexical_exclusions_to_search")
+            );
+            assert_eq!(lexical.searches.load(Ordering::Relaxed), 1);
+            assert_eq!(filter_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(phases, 0);
+            assert!(lexical.hydrated.lock().unwrap().is_empty());
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_exclusions_retrieve_lexical_only_tail_in_all_search_modes() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_core::traits::LexicalWrite;
+        use frankensearch_quill::{QuillConfig, QuillIndex};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let quill = QuillIndex::create(
+                &cx,
+                directory.path(),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut docs: Vec<_> = (0..64)
+                .map(|rank| {
+                    IndexableDocument::new(
+                        format!("excluded-{rank:02}"),
+                        if rank < 32 {
+                            "needle RUST"
+                        } else {
+                            "needle DaNgEr ZoNe"
+                        },
+                    )
+                    .with_title("needle")
+                })
+                .collect();
+            for id in ["tail-a", "tail-b"] {
+                docs.push(
+                    IndexableDocument::new(id, "needle with some extra surrounding context")
+                        .with_metadata("path", format!("src/{id}.rs")),
+                );
+            }
+            LexicalWrite::index_documents(&quill, &cx, &docs)
+                .await
+                .unwrap();
+            LexicalWrite::commit(&quill, &cx).await.unwrap();
+            let lexical: Arc<dyn LexicalRead> = Arc::new(quill);
+            let prefix = lexical.search(&cx, "needle", 64).await.unwrap();
+            assert_eq!(prefix.len(), 64);
+            assert!(prefix.iter().all(|hit| hit.doc_id.starts_with("excluded-")));
+            let (_index_dir, index) = build_test_index_with_quality(4);
+            let text = |id: &str| {
+                Some(
+                    docs.iter()
+                        .find(|doc| doc.id == id)
+                        .map_or("RUST", |doc| doc.content.as_str())
+                        .to_owned(),
+                )
+            };
+            for (fast_only, hash_only) in [(false, false), (true, false), (false, true)] {
+                let fast: Arc<dyn Embedder> = if hash_only {
+                    Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4))
+                } else {
+                    Arc::new(StubEmbedder::new("fast", 4))
+                };
+                let searcher = TwoTierSearcher::new(
+                    Arc::clone(&index),
+                    fast,
+                    TwoTierConfig {
+                        fast_only,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+                .with_lexical(Arc::clone(&lexical));
+                let query = r#"needle -RuSt nOt "danger zone""#;
+                let (collected, metrics) = searcher
+                    .search_collect_with_text(&cx, query, 2, text)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    collected.len(),
+                    2,
+                    "fast_only={fast_only}, hash_only={hash_only}"
+                );
+                assert_eq!(metrics.lexical_candidates, 2);
+                assert_eq!(metrics.semantic_candidates, 0);
+                assert!(collected.iter().all(|hit| hit.doc_id.starts_with("tail-")
+                    && hit.source == ScoreSource::Lexical
+                    && hit.fast_score.is_none()
+                    && hit.quality_score.is_none()));
+                assert!(collected.iter().all(|hit| {
+                    hit.metadata.as_ref().unwrap()["path"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("src/")
+                }));
+                let mut phases = Vec::new();
+                searcher
+                    .search(&cx, query, 2, text, |phase| phases.push(phase))
+                    .await
+                    .unwrap();
+                assert_eq!(phases.len(), if fast_only || hash_only { 1 } else { 2 });
+                for phase in phases {
+                    let results = match phase {
+                        SearchPhase::Initial { results, .. }
+                        | SearchPhase::Refined { results, .. } => results,
+                        other => panic!("unexpected phase: {other:?}"),
+                    };
+                    assert_eq!(results.len(), 2);
+                    assert!(results.iter().all(|hit| hit.doc_id.starts_with("tail-")));
+                }
+            }
         });
     }
 
