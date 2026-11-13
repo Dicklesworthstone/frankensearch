@@ -373,8 +373,12 @@ fn filter_language_extensions(value: &str) -> Vec<String> {
     extensions
 }
 
+/// The shared fsfs path and file-type predicate used by ordinary and live search.
+///
+/// Path clauses intersect; extension, type and language selections form one
+/// union. Matching uses document identities, which fsfs stores as file paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SearchFilterExpr {
+pub struct SearchFilterExpr {
     clauses: Vec<SearchFilterClause>,
     /// True iff any clause is `PathContains` — precomputed so `matches_doc_id`
     /// only pays the per-candidate `to_ascii_lowercase` alloc when a path clause
@@ -383,7 +387,13 @@ struct SearchFilterExpr {
 }
 
 impl SearchFilterExpr {
-    fn parse(raw: &str) -> SearchResult<Option<Self>> {
+    /// Parse the ordinary fsfs `--filter` grammar without performing any I/O.
+    /// Blank input has no predicate. Bare terms behave as `path:` clauses;
+    /// `type:` and `lang:` expand the same language aliases as ordinary search.
+    ///
+    /// # Errors
+    /// Rejects unsupported keys and empty path, extension or language values.
+    pub fn parse(raw: &str) -> SearchResult<Option<Self>> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Ok(None);
@@ -460,7 +470,9 @@ impl SearchFilterExpr {
         }))
     }
 
-    fn matches_doc_id(&self, doc_id: &str) -> bool {
+    /// Test a document path with the ordinary case-insensitive filter semantics.
+    #[must_use]
+    pub fn matches_doc_id(&self, doc_id: &str) -> bool {
         // Only pay the lowercase allocation when a PathContains clause reads it;
         // extension-only filters test `doc_id` directly and allocate nothing
         // (~1.7× on ext-only filters, `filter_match_ab` bench). PathContains keeps
@@ -7591,6 +7603,19 @@ impl FsfsRuntime {
     pub fn with_cli_input(mut self, cli_input: CliInput) -> Self {
         self.cli_input = cli_input;
         self
+    }
+
+    /// Set a fixed search scope while retaining every other configured policy.
+    ///
+    /// The predicate is validated before any reader, source or model is opened.
+    /// Retained readers inherit it across progressive phases and publications.
+    ///
+    /// # Errors
+    /// Rejects invalid ordinary fsfs filter syntax.
+    pub fn with_search_filter(mut self, filter: Option<String>) -> SearchResult<Self> {
+        SearchFilterExpr::parse(filter.as_deref().unwrap_or_default())?;
+        self.cli_input.filter = filter;
+        Ok(self)
     }
 
     #[must_use]
@@ -14878,7 +14903,7 @@ impl FsfsRuntime {
     /// factor cannot preserve recall for arbitrarily selective CLI filters.
     /// Keep the original ranking here for the lexical tail and shadow oracle;
     /// select the eligible fusion head only after gathering has completed.
-    fn gather_lexical_candidates(
+    pub(crate) fn gather_lexical_candidates(
         cx: &Cx,
         lexical: &QuillSearchIndex,
         query: &str,

@@ -24,12 +24,13 @@ use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::adapters::live_search::LiveSearchConfig;
 use frankensearch_fsfs::adapters::live_search_session::LiveSearchRefreshConfig;
 use frankensearch_fsfs::generation_store::CompleteGenerationStore;
-use frankensearch_fsfs::runtime::SearchBlockingPool;
+use frankensearch_fsfs::runtime::{SearchBlockingPool, SearchFilterExpr};
 use frankensearch_fsfs::{FsfsRuntime, ShutdownCoordinator, exit_code, exit_code_for};
 #[cfg(all(test, unix))]
 use frankensearch_quill::QuillConfig;
 
 const MAX_QUERY_BYTES: usize = 64 * 1024;
+const MAX_FILTER_BYTES: usize = 64 * 1024;
 const HELP: &str = "fsfs live-search --index-dir STORE --query TEXT [OPTIONS]
 
 Subscribe to committed complete generations; native Quill lexical search is default.
@@ -39,6 +40,7 @@ Run a publisher separately, or explicitly opt into indexing with --watch-source.
 
   --index-dir STORE       Explicit complete-generation store root (required)
   --query TEXT            Nonblank UTF-8 query, at most 64 KiB (required)
+  --filter EXPR           Fixed path/type/lang/ext scope, at most 64 KiB
   --hybrid                Use the retained progressive hybrid pipeline and local models
   --config FILE           Hybrid configuration/model policy; requires --hybrid
   --tui                   Live terminal view and query editor (Unix terminals required)
@@ -75,7 +77,14 @@ Refined and RefinementFailed annotations and a generation-pinned result delta.
 Initial is flushed before refinement. A failed refinement preserves its Initial
 window; it is not a successful Refined update. --once/--max-updates never split
 that phase sequence. Each hybrid record is bounded to 16 MiB before output.
---filter, --rerank, and --semantic CLI flags are refused rather than ignored.
+--filter uses ordinary fsfs search syntax: path:src/ lang:rust ext:md selects
+Rust or Markdown files under src/. Path terms all apply; type/lang/ext selections
+form a union. Bare terms are path terms. Matching is case-insensitive. The scope
+applies to every phase and publication and remains fixed while editing the query.
+Selective lexical queries widen candidates to fill the eligible result window;
+this can require searching the full admitted corpus. Filters do not restrict
+which source files --watch-source indexes. --rerank and --semantic CLI flags are
+refused rather than ignored.
 
 --tui displays this same subscription in an alternate-screen terminal view.
 Up/Down or j/k select results; PgUp/PgDn move ten rows; Home/End jump; q/Esc quit.
@@ -114,6 +123,7 @@ can follow a successful publication: they never roll it back or delete its files
 struct Options {
     root: PathBuf,
     query: String,
+    filter: Option<String>,
     limits: LiveSearchConfig,
     refresh: LiveSearchRefreshConfig,
     poll_interval: Duration,
@@ -131,6 +141,7 @@ impl Options {
     fn parse(args: Vec<OsString>) -> SearchResult<Self> {
         let mut root = None;
         let mut query = None;
+        let mut filter = None;
         let mut limits = LiveSearchConfig::default();
         let mut refresh = LiveSearchRefreshConfig::default();
         let mut poll_interval = Duration::from_millis(100);
@@ -149,6 +160,7 @@ impl Options {
                 flag.as_str(),
                 "--index-dir"
                     | "--query"
+                    | "--filter"
                     | "--limit"
                     | "--poll-ms"
                     | "--debounce-ms"
@@ -182,13 +194,14 @@ impl Options {
             }
             let value = args
                 .next()
-                .filter(|value| !value.is_empty())
+                .filter(|value| !value.is_empty() || flag == "--filter")
                 .ok_or_else(|| invalid(format!("missing or empty value for {flag}")))?;
             match flag.as_str() {
                 "--index-dir" => root = Some(PathBuf::from(value)),
                 "--config" => config_path = Some(PathBuf::from(value)),
                 "--watch-source" => watch_source = Some(PathBuf::from(value)),
                 "--query" => query = Some(text(value)?),
+                "--filter" => filter = Some(text(value)?),
                 "--limit" => {
                     limits.max_results = usize::try_from(number(value, &flag, 1, 10_000)?)
                         .map_err(|_| invalid("result limit does not fit this platform"))?;
@@ -226,6 +239,14 @@ impl Options {
         let query = query.ok_or_else(|| invalid("--query is required"))?;
         if query.trim().is_empty() || query.len() > MAX_QUERY_BYTES {
             return Err(invalid("query must be nonblank and at most 64 KiB"));
+        }
+        if let Some(raw) = filter.as_deref() {
+            if raw.len() > MAX_FILTER_BYTES {
+                return Err(invalid("filter must be at most 64 KiB"));
+            }
+            if SearchFilterExpr::parse(raw)?.is_none() {
+                filter = None;
+            }
         }
         if refresh.max_wait < refresh.debounce {
             return Err(invalid("--max-wait-ms must be at least --debounce-ms"));
@@ -269,6 +290,7 @@ impl Options {
         Ok(Self {
             root: root.ok_or_else(|| invalid("--index-dir is required; no store is guessed"))?,
             query,
+            filter,
             limits,
             refresh,
             poll_interval,
@@ -702,19 +724,63 @@ mod tests {
 
     #[test]
     fn flags_cannot_silently_enable_unsupported_search_modes() {
-        for flag in [
-            "--rerank",
-            "--filter",
-            "--semantic",
-            "--daemon",
-            "--config",
-            "--watch",
-        ] {
+        for flag in ["--rerank", "--semantic", "--daemon", "--config", "--watch"] {
             assert!(Options::parse(args(&[flag])).is_err(), "{flag}");
         }
         for format in ["json", "table", "csv", "toon"] {
             assert!(Options::parse(args(&["--format", format])).is_err());
         }
+    }
+
+    #[test]
+    fn scoped_options_use_the_ordinary_filter_grammar_in_every_mode() {
+        let raw = "path:SRC/ parser lang:rust type:python ext:md";
+        for mode in [Vec::new(), vec!["--hybrid"], vec!["--tui"]] {
+            if mode.contains(&"--tui") && !cfg!(unix) {
+                continue;
+            }
+            let mut extra = mode;
+            extra.extend(["--filter", raw]);
+            let options = Options::parse(args(&extra)).unwrap();
+            assert_eq!(options.filter.as_deref(), Some(raw));
+            let filter = SearchFilterExpr::parse(options.filter.as_deref().unwrap())
+                .unwrap()
+                .unwrap();
+            for path in ["src/parser.rs", "SRC/parser.PY", "src/parser.md"] {
+                assert!(filter.matches_doc_id(path), "{path}");
+            }
+            for path in ["src/other.rs", "docs/parser.rs", "src/parser.txt"] {
+                assert!(!filter.matches_doc_id(path), "{path}");
+            }
+        }
+        for raw in ["", " \t "] {
+            assert!(
+                Options::parse(args(&["--filter", raw]))
+                    .unwrap()
+                    .filter
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_unbounded_filters_are_rejected_during_argument_parsing() {
+        for raw in ["owner:me", "path:", "lang:.", "ext:"] {
+            let error = Options::parse(args(&[
+                "--hybrid",
+                "--config",
+                "/must-not-be-opened",
+                "--filter",
+                raw,
+            ]))
+            .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == "cli.search.filter")
+            );
+        }
+        assert!(Options::parse(args(&["--filter"])).is_err());
+        assert!(Options::parse(args(&["--filter", "ext:rs", "--filter", "ext:md"])).is_err());
+        assert!(Options::parse(args(&["--filter", &"x".repeat(MAX_FILTER_BYTES + 1)])).is_err());
     }
 
     #[test]

@@ -85,6 +85,16 @@ fn argument_errors_never_pollute_stdout_or_initialize_a_store() {
         vec!["--limit", "0"],
         vec!["--format", "table"],
         vec!["--rerank"],
+        vec!["--filter", "owner:me"],
+        vec!["--filter", "path:"],
+        vec!["--filter", "ext:rs", "--filter", "ext:md"],
+        vec![
+            "--hybrid",
+            "--config",
+            "not-opened.toml",
+            "--filter",
+            "lang:.",
+        ],
         vec!["--once", "--max-updates", "2"],
     ] {
         let mut args = strings(&["--index-dir", "not-created", "--query", "alpha"]);
@@ -132,8 +142,12 @@ mod native {
             let index = QuillIndex::create(&cx, &build.path().join("lexical"), config)
                 .await
                 .unwrap();
-            let documents = [IndexableDocument::new("doc-a", "alpha searchable body")
-                .with_metadata("path", "/fixture/doc-a.rs")];
+            let documents = [
+                IndexableDocument::new("src/parser.rs", "alpha searchable body")
+                    .with_metadata("path", "/fixture/doc-a.rs"),
+                IndexableDocument::new("docs/readme.md", "alpha searchable body")
+                    .with_title("alpha alpha"),
+            ];
             LexicalWrite::index_documents(&index, &cx, &documents)
                 .await
                 .unwrap();
@@ -156,9 +170,30 @@ mod native {
         assert_eq!(frame["schema_version"], "fsfs.stream.live_search.v1");
         assert_eq!(frame["event"], "snapshot");
         assert_eq!(frame["sequence"], 1);
-        assert_eq!(frame["result_count"], 1);
-        assert_eq!(frame["results"][0]["doc_id"], "doc-a");
-        assert_eq!(frame["results"][0]["item"]["path"], "/fixture/doc-a.rs");
+        assert_eq!(frame["result_count"], 2);
+        let rust = frame["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["doc_id"] == "src/parser.rs")
+            .unwrap();
+        assert_eq!(rust["item"]["path"], "/fixture/doc-a.rs");
+        for (scope, expected) in [("path:src/ lang:rust", 1), ("ext:cpp", 0)] {
+            let output = run(
+                root.path(),
+                &live_args(&store_root, &["--once", "--limit", "1", "--filter", scope]),
+            )
+            .unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            let scoped: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(scoped["schema_version"], "fsfs.stream.live_search.v1");
+            assert_eq!(scoped["event"], "snapshot");
+            assert_eq!(scoped["result_count"], expected);
+            if expected != 0 {
+                assert_eq!(scoped["results"][0]["doc_id"], "src/parser.rs");
+                assert_eq!(scoped["results"][0]["item"]["path"], "/fixture/doc-a.rs");
+            }
+        }
         assert_eq!(std::fs::read(&pointer).unwrap(), before);
         for directory in ["no-models", "data", "cache", "config"] {
             assert!(

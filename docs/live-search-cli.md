@@ -29,7 +29,43 @@ fsfs live-search --index-dir /path/to/complete-store --query alpha \
 # Coalesce frequent publications without postponing query refresh forever.
 fsfs live-search --index-dir /path/to/complete-store --query alpha \
   --poll-ms 50 --debounce-ms 100 --max-wait-ms 1000 --min-score-delta 0.001
+
+# Keep the live window scoped to Rust or Markdown files beneath src/.
+fsfs live-search --index-dir /path/to/complete-store --query 'connection pool' \
+  --filter 'path:src/ lang:rust ext:md' --limit 20
 ```
+
+## Fixed query scopes
+
+`--filter EXPR` uses the same parser as ordinary `fsfs search`. The expression is
+UTF-8 and at most 64 KiB; unsupported keys or empty clause values fail argument
+validation before configuration, models, source paths or stores are opened.
+Blank expressions impose no additional scope.
+
+| Clause | Meaning |
+| --- | --- |
+| `path:src/` or bare `src/` | Case-insensitive substring of the document path |
+| `lang:rust` or `type:rust` | Ordinary fsfs language aliases, including `.rs` |
+| `ext:rs` or `extension:rs` | Literal file extension, ignoring case and a leading dot |
+
+Every path clause must match. Extension, language and type selections form one
+union, so `path:src/ lang:rust ext:md` selects Rust **or** Markdown beneath
+`src/`. Matching uses document identities, not a separate display path in stored
+metadata. Multiple `--filter` flags are rejected; put clauses in one expression.
+
+The scope stays fixed for the subscription. It applies after every publication,
+to all hybrid retrieval phases, and after interactive `--tui` query edits. A file
+that leaves the scope is removed from the visible window. A valid scope with no
+matches delivers an empty snapshot or the corresponding removals.
+
+Lexical retrieval widens its ranked candidate prefix until enough eligible hits
+fill `--limit` or the admitted corpus is exhausted. This avoids losing matching
+files behind an arbitrary oversampling cutoff, but a highly selective scope can
+require searching the full corpus. Metadata is read only for the selected
+winners from the same admitted immutable reader. Hybrid search reuses the
+ordinary filtered retrieval pipeline and its producer and degradation policy.
+With `--watch-source`, filtering restricts the query results; the publisher still
+indexes the source under its discovery and privacy policies.
 
 ## Output contract
 
@@ -61,10 +97,11 @@ error-to-exit-code mapping. Cancellation and timeouts are cooperative: they
 cannot preempt a running synchronous query or a blocked filesystem/output
 syscall. Cancellation is checked between polls and before output operations.
 
-This is **lexical-only**, not a hybrid or reranked stream. Unsupported semantic,
-reranking, filtering, and output-format flags are rejected instead of ignored.
-`fsfs watch --stream-search` and TUI subscriptions are not introduced by this
-command. See `fsfs live-search --help` for all options.
+The default stream is **lexical-only**. Unsupported semantic, reranking and
+output-format flags are rejected instead of ignored. Use `--hybrid` for the
+configured progressive pipeline, `--tui` for the interactive terminal view, and
+`--watch-source` to opt into publishing source changes. See
+`fsfs live-search --help` for all options.
 
 ## Progressive hybrid subscriptions
 

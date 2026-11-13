@@ -24,6 +24,7 @@ use super::live_search_session::{
     CommittedLiveSearchSnapshot, LiveSearchRefreshConfig, LiveSearchSession, LiveSearchSource,
 };
 use crate::generation_store::{CompleteGenerationStore, PublishedGeneration};
+use crate::runtime::{FsfsRuntime, SearchFilterExpr};
 
 /// Live BM25 result payloads contain stored metadata, when the document has it.
 /// Stable document identity, score, and rank are carried by the surrounding hit.
@@ -51,10 +52,32 @@ impl QuillLiveSearchSession {
         refresh: LiveSearchRefreshConfig,
         quill: QuillConfig,
     ) -> SearchResult<Self> {
+        Self::new_filtered(store, query, None, limits, refresh, quill)
+    }
+
+    /// Bind a fixed scope using the ordinary fsfs path/type/lang/ext grammar.
+    ///
+    /// The scope survives query edits and generation changes. Selective filters
+    /// widen the lexical candidate prefix until the eligible window is full or
+    /// the admitted corpus is exhausted. Only selected results are hydrated.
+    /// Construction performs no I/O and creates no files.
+    ///
+    /// # Errors
+    /// Rejects invalid filter, Quill, result-window or refresh configuration.
+    pub fn new_filtered(
+        store: CompleteGenerationStore,
+        query: impl Into<String>,
+        filter: Option<&str>,
+        limits: LiveSearchConfig,
+        refresh: LiveSearchRefreshConfig,
+        quill: QuillConfig,
+    ) -> SearchResult<Self> {
+        let filter = SearchFilterExpr::parse(filter.unwrap_or_default())?;
         quill.validate()?;
         let source = QuillSource {
             store,
             config: quill,
+            filter,
             admitted: None,
         };
         Ok(Self {
@@ -169,6 +192,7 @@ struct AdmittedQuill {
 struct QuillSource {
     store: CompleteGenerationStore,
     config: QuillConfig,
+    filter: Option<SearchFilterExpr>,
     admitted: Option<AdmittedQuill>,
 }
 
@@ -228,6 +252,38 @@ impl LiveSearchSource for QuillSource {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<LiveSearchHit<Option<Value>>>> {
+        if let Some(filter) = &self.filter {
+            let live_docs = usize::try_from(snapshot.reader.doc_count()?).unwrap_or(usize::MAX);
+            let candidates = FsfsRuntime::gather_lexical_candidates(
+                cx,
+                &snapshot.reader,
+                query,
+                limit,
+                Some(filter),
+                live_docs,
+            )?;
+            let selected = candidates
+                .into_iter()
+                .filter(|hit| filter.matches_doc_id(&hit.doc_id))
+                .take(limit)
+                .collect::<Vec<_>>();
+            let ids = selected
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>();
+            // This source never refreshes an admitted reader in place. Both
+            // candidate gathering and hydration retain this exact bundle.
+            let metadata = snapshot.reader.metadata_for_documents(cx, &ids)?;
+            return Ok(selected
+                .into_iter()
+                .zip(metadata)
+                .map(|(hit, metadata)| LiveSearchHit {
+                    doc_id: hit.doc_id,
+                    score: f64::from(hit.score),
+                    item: metadata.as_deref().cloned(),
+                })
+                .collect());
+        }
         let results = snapshot.reader.search_results(
             cx,
             &crate::lexical_pipeline::lexical_query_text(query),
@@ -395,6 +451,174 @@ mod tests {
                 change, LiveSearchChange::Added { result } if result.hit.doc_id == "b"
             )));
             assert_eq!(session.tracker().results()[0].hit.doc_id, "b");
+        });
+    }
+
+    #[test]
+    fn scoped_search_fills_the_tail_and_keeps_scope_through_edits_and_publications() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let mut documents = (0..96)
+                .map(|index| {
+                    IndexableDocument::new(format!("src/excluded-{index:03}.txt"), "alpha beta")
+                        .with_title("alpha beta alpha beta")
+                })
+                .collect::<Vec<_>>();
+            let body = format!("alpha beta {}", "padding ".repeat(64));
+            documents.extend([
+                IndexableDocument::new("src/parser.rs", body.clone())
+                    .with_metadata("revision", "first")
+                    .with_metadata("path", "stored-display-path"),
+                IndexableDocument::new("src/parser.md", "alpha long reference notes")
+                    .with_metadata("revision", "markdown"),
+                IndexableDocument::new("elsewhere/parser.rs", "alpha beta")
+                    .with_title("alpha beta"),
+                IndexableDocument::new("src/unrelated.rs", "alpha beta").with_title("alpha beta"),
+                IndexableDocument::new("src/parser.py", "alpha beta").with_title("alpha beta"),
+            ]);
+            let first = publish(&cx, &store, &documents).await;
+            let raw_filter = "path:SRC/ parser lang:rust ext:md";
+            let mut session = QuillLiveSearchSession::new_filtered(
+                store.clone(),
+                "alpha",
+                Some(raw_filter),
+                LiveSearchConfig {
+                    max_results: 2,
+                    ..LiveSearchConfig::default()
+                },
+                LiveSearchRefreshConfig {
+                    debounce: Duration::ZERO,
+                    max_wait: Duration::from_millis(100),
+                },
+                config(),
+            )
+            .unwrap();
+            let frame = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
+            assert!(frame.generation.starts_with(first.id()));
+            let results = session.tracker().results();
+            assert_eq!(results.len(), 2, "eligible tail must fill the window");
+            let rust = results
+                .iter()
+                .find(|hit| hit.hit.doc_id == "src/parser.rs")
+                .unwrap();
+            assert_eq!(rust.hit.item.as_ref().unwrap()["revision"], "first");
+            assert_eq!(
+                rust.hit.item.as_ref().unwrap()["path"],
+                "stored-display-path"
+            );
+            assert!(results.iter().any(|hit| hit.hit.doc_id == "src/parser.md"));
+
+            let reader = Arc::clone(
+                &session
+                    .session
+                    .source_mut()
+                    .admitted
+                    .as_ref()
+                    .unwrap()
+                    .reader,
+            );
+            let filter = SearchFilterExpr::parse(raw_filter).unwrap().unwrap();
+            let prefix = reader.search_doc_ids(&cx, "alpha", 64).unwrap();
+            assert_eq!(prefix.len(), 64);
+            assert!(
+                prefix
+                    .iter()
+                    .all(|hit| !filter.matches_doc_id(&hit.document_id)),
+                "fixture must place eligible winners beyond a fixed oversampling prefix"
+            );
+
+            assert!(session.set_query(&cx, "beta").unwrap());
+            let edited = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
+            assert_eq!(edited.sequence, 1);
+            assert_eq!(edited.previous_generation, None);
+            assert_eq!(session.tracker().results().len(), 1);
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "src/parser.rs");
+            assert!(Arc::ptr_eq(
+                &reader,
+                &session
+                    .session
+                    .source_mut()
+                    .admitted
+                    .as_ref()
+                    .unwrap()
+                    .reader,
+            ));
+
+            let second = publish(
+                &cx,
+                &store,
+                &[
+                    IndexableDocument::new("src/parser.rs", body)
+                        .with_metadata("revision", "second"),
+                    IndexableDocument::new("src/parser-new.md", "beta")
+                        .with_metadata("revision", "new"),
+                    IndexableDocument::new("src/parser.py", "beta beta").with_title("beta beta"),
+                ],
+            )
+            .await;
+            let updated = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
+            assert_eq!(updated.sequence, 2);
+            assert!(updated.generation.starts_with(second.id()));
+            assert_eq!(
+                updated.previous_generation.as_deref(),
+                Some(edited.generation.as_str())
+            );
+            assert!(matches!(updated.event, LiveSearchEvent::Delta { .. }));
+            assert_eq!(session.tracker().results().len(), 2);
+            assert!(
+                session
+                    .tracker()
+                    .results()
+                    .iter()
+                    .all(|hit| filter.matches_doc_id(&hit.hit.doc_id))
+            );
+            let rust = session
+                .tracker()
+                .results()
+                .iter()
+                .find(|hit| hit.hit.doc_id == "src/parser.rs")
+                .unwrap();
+            assert_eq!(rust.hit.item.as_ref().unwrap()["revision"], "second");
+
+            publish(
+                &cx,
+                &store,
+                &[IndexableDocument::new("src/parser.py", "beta")],
+            )
+            .await;
+            let empty = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
+            assert_eq!(empty.sequence, 3);
+            assert!(session.tracker().results().is_empty());
+            let LiveSearchEvent::Delta { changes } = empty.event else {
+                panic!("scope becoming empty must remove the delivered eligible window");
+            };
+            assert_eq!(changes.len(), 2);
+            assert!(
+                changes
+                    .iter()
+                    .all(|change| matches!(change, LiveSearchChange::Removed { .. }))
+            );
+        });
+    }
+
+    #[test]
+    fn invalid_scope_is_rejected_before_admitting_or_creating_a_generation() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            assert!(matches!(
+                QuillLiveSearchSession::new_filtered(
+                    store,
+                    "alpha",
+                    Some("owner:unknown"),
+                    LiveSearchConfig::default(),
+                    LiveSearchRefreshConfig::default(),
+                    config(),
+                ),
+                Err(SearchError::InvalidConfig { field, .. }) if field == "cli.search.filter"
+            ));
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         });
     }
 
