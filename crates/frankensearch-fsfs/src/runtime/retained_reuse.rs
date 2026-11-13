@@ -1865,7 +1865,7 @@ mod copy_tests {
 
 #[cfg(all(test, unix, not(feature = "embedded-models")))]
 mod generation_tests {
-    use super::super::{CheckpointReuse, IndexCandidate, checkpoint_entry_reuse};
+    use super::super::{CheckpointReuse, IndexCandidate, checkpoint_entry_reuse, source_stamp};
     use super::*;
     use crate::config::{IngestionClass, UpgradeReusePolicy};
     use crate::generation_store::{GenerationPublication, PublishedGeneration};
@@ -2236,6 +2236,8 @@ mod generation_tests {
                     byte_len: fs::metadata(source.join("doc-0.md")).unwrap().len(),
                     modified_ms: u64::try_from(entry.revision).unwrap(),
                     ingestion_class: IngestionClass::FullSemanticLexical,
+                    follow_symlinks: false,
+                    observed_stamp: source_stamp(&fs::metadata(source.join("doc-0.md")).unwrap()),
                     stamp: None,
                 };
                 let mut live = plan.row_ids("doc-0.md").into_iter().collect::<HashSet<_>>();
@@ -3558,6 +3560,8 @@ mod generation_tests {
                 byte_len: fs::metadata(&path).unwrap().len(),
                 modified_ms: u64::try_from(entry.revision).unwrap(),
                 ingestion_class: IngestionClass::FullSemanticLexical,
+                follow_symlinks: false,
+                observed_stamp: source_stamp(&fs::metadata(&path).unwrap()),
                 stamp: None,
             };
             let live_ids = HashSet::from([key.clone()]);

@@ -21,7 +21,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::concurrency::{BudgetSchedulerMode, RuntimeWorkloadScheduler, WorkloadClass};
 use asupersync::Cx;
-use asupersync::fs::read as async_file_read;
 #[cfg(unix)]
 use asupersync::fs::remove_file as async_file_remove;
 #[cfg(unix)]
@@ -2580,6 +2579,10 @@ struct IndexCandidate {
     byte_len: u64,
     modified_ms: u64,
     ingestion_class: IngestionClass,
+    follow_symlinks: bool,
+    /// The full discovery observation admits the later read even when it is
+    /// too recent to authorize reuse without reading the source's bytes.
+    observed_stamp: Option<SourceStamp>,
     /// What discovery saw, if settled before the walk began (see
     /// [`SourceStamp::settled_before`]); `None` where the platform reports no
     /// change time or the file changed too recently to trust its stamp.
@@ -2635,7 +2638,7 @@ impl std::fmt::Display for IndexSourceChanged {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "source {} grew after discovery; retry indexing the current source instead of exceeding its admitted byte bound",
+            "source {} changed after admission; retry indexing the current regular file within its discovered byte bound",
             self.file_key,
         )
     }
@@ -2643,37 +2646,162 @@ impl std::fmt::Display for IndexSourceChanged {
 
 impl std::error::Error for IndexSourceChanged {}
 
-/// Pure preparation on a bounded worker: no index, checkpoint or manifest writes.
-fn prepare_index_source(cx: &Cx, candidate: &IndexCandidate) -> SearchResult<PreparedIndexSource> {
-    FsfsRuntime::semantic_retry_checkpoint(cx, "index.source_prepare")?;
-    if candidate.ingestion_class == IngestionClass::Skip {
-        return Err(SearchError::InvalidConfig {
-            field: "index.source_prepare".to_owned(),
-            value: candidate.file_key.clone(),
-            reason: "an excluded source cannot be admitted for reading".to_owned(),
-        });
+fn index_source_changed(candidate: &IndexCandidate) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "fsfs.index.source_changed",
+        source: Box::new(IndexSourceChanged {
+            file_key: candidate.file_key.clone(),
+        }),
     }
-    let canonicalizer = DefaultCanonicalizer::default();
-    if candidate.ingestion_class == IngestionClass::MetadataOnly {
-        if !fs::metadata(&candidate.file_path)?.is_file() {
+}
+
+fn source_changed_io(path: &Path) -> std::io::Error {
+    std::io::Error::other(IndexSourceChanged {
+        file_key: path.display().to_string(),
+    })
+}
+
+fn index_source_io(candidate: &IndexCandidate, error: std::io::Error) -> SearchError {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<IndexSourceChanged>())
+    {
+        index_source_changed(candidate)
+    } else {
+        error.into()
+    }
+}
+
+#[cfg_attr(
+    unix,
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "the portable signature must represent platforms without inode/change-time stamps"
+    )
+)]
+fn source_stamp(metadata: &fs::Metadata) -> Option<SourceStamp> {
+    #[cfg(unix)]
+    {
+        Some(SourceStamp::from_metadata(metadata))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn source_metadata_unchanged(expected: &fs::Metadata, current: &fs::Metadata) -> bool {
+    if !expected.is_file() || !current.is_file() || expected.len() != current.len() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        SourceStamp::from_metadata(expected) == SourceStamp::from_metadata(current)
+    }
+    #[cfg(not(unix))]
+    {
+        expected
+            .modified()
+            .ok()
+            .zip(current.modified().ok())
+            .is_some_and(|(expected, current)| expected == current)
+    }
+}
+
+/// Path-only admission also serves metadata-only files without opening their
+/// payload. A forbidden link or special file is a changed source, not input.
+fn regular_source_metadata(path: &Path, follow_symlinks: bool) -> std::io::Result<fs::Metadata> {
+    let metadata = if follow_symlinks {
+        fs::metadata(path)?
+    } else {
+        fs::symlink_metadata(path)?
+    };
+    if !metadata.is_file() {
+        if metadata.is_dir() {
             return Err(std::io::Error::new(
                 ErrorKind::IsADirectory,
-                "metadata-only source is no longer a regular file",
-            )
-            .into());
+                IndexSourceChanged {
+                    file_key: path.display().to_string(),
+                },
+            ));
         }
-        return Ok(PreparedIndexSource {
-            content_hash_hex: String::new(),
-            classification: None,
-            text: Some((
-                canonicalizer.canonicalize(&candidate.file_key),
-                String::new(),
-            )),
-        });
+        return Err(source_changed_io(path));
     }
+    Ok(metadata)
+}
 
-    let mut source =
-        fs::File::open(&candidate.file_path)?.take(candidate.byte_len.saturating_add(1));
+/// Never block opening a substituted FIFO, and bind the descriptor to the
+/// regular file observed at its path before any payload is read. Unix can
+/// enforce the leaf symlink policy atomically at open as well as at each stat.
+fn open_regular_source(
+    path: &Path,
+    follow_symlinks: bool,
+) -> std::io::Result<(fs::File, fs::Metadata)> {
+    let observed = regular_source_metadata(path, follow_symlinks)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | if follow_symlinks { 0 } else { libc::O_NOFOLLOW });
+    }
+    let file = options.open(path).map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return source_changed_io(path);
+        }
+        error
+    })?;
+    let opened = file.metadata()?;
+    if !source_metadata_unchanged(&observed, &opened) {
+        return Err(source_changed_io(path));
+    }
+    recheck_regular_source(path, follow_symlinks, &file, &opened)?;
+    Ok((file, opened))
+}
+
+fn recheck_regular_source(
+    path: &Path,
+    follow_symlinks: bool,
+    file: &fs::File,
+    opened: &fs::Metadata,
+) -> std::io::Result<()> {
+    let current = regular_source_metadata(path, follow_symlinks)?;
+    if !source_metadata_unchanged(opened, &file.metadata()?)
+        || !source_metadata_unchanged(opened, &current)
+    {
+        return Err(source_changed_io(path));
+    }
+    Ok(())
+}
+
+fn validate_index_source_metadata(
+    candidate: &IndexCandidate,
+    metadata: &fs::Metadata,
+) -> SearchResult<()> {
+    if !metadata.is_file()
+        || candidate
+            .observed_stamp
+            .as_ref()
+            .is_some_and(|expected| source_stamp(metadata).as_ref() != Some(expected))
+        || (candidate.ingestion_class != IngestionClass::MetadataOnly
+            && metadata.len() != candidate.byte_len)
+    {
+        return Err(index_source_changed(candidate));
+    }
+    Ok(())
+}
+
+/// The same discovery-bound read proves both new input and resumed digests.
+/// Keep the descriptor for the final check; reopening the path could validate
+/// a different file from the one whose bytes were hashed or indexed.
+fn read_index_source(cx: &Cx, candidate: &IndexCandidate) -> SearchResult<Vec<u8>> {
+    FsfsRuntime::semantic_retry_checkpoint(cx, "index.source_read")?;
+    let (mut file, opened) = open_regular_source(&candidate.file_path, candidate.follow_symlinks)
+        .map_err(|error| index_source_io(candidate, error))?;
+    validate_index_source_metadata(candidate, &opened)?;
+    let mut source = (&mut file).take(candidate.byte_len.saturating_add(1));
     let mut bytes = Vec::new();
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
@@ -2687,14 +2815,49 @@ fn prepare_index_source(cx: &Cx, candidate: &IndexCandidate) -> SearchResult<Pre
         }
         bytes.extend_from_slice(&buffer[..read]);
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > candidate.byte_len {
-            return Err(SearchError::SubsystemError {
-                subsystem: "fsfs.index.source_changed",
-                source: Box::new(IndexSourceChanged {
-                    file_key: candidate.file_key.clone(),
-                }),
-            });
+            return Err(index_source_changed(candidate));
         }
     }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != candidate.byte_len {
+        return Err(index_source_changed(candidate));
+    }
+    recheck_regular_source(
+        &candidate.file_path,
+        candidate.follow_symlinks,
+        &file,
+        &opened,
+    )
+    .map_err(|error| index_source_io(candidate, error))?;
+    FsfsRuntime::semantic_retry_checkpoint(cx, "index.source_read")?;
+    Ok(bytes)
+}
+
+/// Pure preparation on a bounded worker: no index, checkpoint or manifest writes.
+fn prepare_index_source(cx: &Cx, candidate: &IndexCandidate) -> SearchResult<PreparedIndexSource> {
+    FsfsRuntime::semantic_retry_checkpoint(cx, "index.source_prepare")?;
+    if candidate.ingestion_class == IngestionClass::Skip {
+        return Err(SearchError::InvalidConfig {
+            field: "index.source_prepare".to_owned(),
+            value: candidate.file_key.clone(),
+            reason: "an excluded source cannot be admitted for reading".to_owned(),
+        });
+    }
+    let canonicalizer = DefaultCanonicalizer::default();
+    if candidate.ingestion_class == IngestionClass::MetadataOnly {
+        let metadata = regular_source_metadata(&candidate.file_path, candidate.follow_symlinks)
+            .map_err(|error| index_source_io(candidate, error))?;
+        validate_index_source_metadata(candidate, &metadata)?;
+        return Ok(PreparedIndexSource {
+            content_hash_hex: String::new(),
+            classification: None,
+            text: Some((
+                canonicalizer.canonicalize(&candidate.file_key),
+                String::new(),
+            )),
+        });
+    }
+
+    let bytes = read_index_source(cx, candidate)?;
     let content_hash_hex = content_sha256_hex(&bytes);
     let mut classification = None;
     let text = if is_pdf_file(&candidate.file_path) {
@@ -3023,31 +3186,33 @@ fn validate_index_directory_rules(
 /// Whether `path` still holds the bytes `recorded` digests.
 async fn file_matches_digest(
     cx: &Cx,
-    path: &Path,
+    candidate: &IndexCandidate,
     recorded: Option<&str>,
     policy: IndexSourcePolicy,
 ) -> SearchResult<bool> {
     let Some(recorded) = recorded else {
         return Ok(false);
     };
-    Ok(read_source_for_reuse(cx, path, policy)
+    Ok(read_source_for_reuse(cx, candidate, policy)
         .await?
         .is_some_and(|bytes| content_sha256_hex(&bytes) == recorded))
 }
 
 async fn read_source_for_reuse(
     cx: &Cx,
-    path: &Path,
+    candidate: &IndexCandidate,
     policy: IndexSourcePolicy,
 ) -> SearchResult<Option<Vec<u8>>> {
     FsfsRuntime::semantic_retry_checkpoint(cx, "index.resume_validation")?;
-    let result = async_file_read(path).await;
+    let read_cx = cx.clone();
+    let candidate = candidate.clone();
+    let result = spawn_blocking(move || read_index_source(&read_cx, &candidate)).await;
     // An interrupted/cancelled read is never evidence of source deletion.
     FsfsRuntime::semantic_retry_checkpoint(cx, "index.resume_validation")?;
     match result {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if policy.can_skip(&error) => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(SearchError::Io(error)) if policy.can_skip(&error) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -4167,6 +4332,8 @@ struct StorageBatchContext {
 struct PrefetchedSource {
     bytes: std::io::Result<Vec<u8>>,
     modified_ms: u64,
+    path: PathBuf,
+    metadata: Option<fs::Metadata>,
 }
 
 /// A larger source is read by its own operation instead of being prefetched.
@@ -4174,9 +4341,28 @@ const WATCH_PREFETCH_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// Bound on the source bytes one batch holds prefetched at once.
 const WATCH_PREFETCH_MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The stat is only an admission hint: a source can grow before or during its
-/// read. Read one extra byte to detect growth, then leave that source to its
-/// own operation without retaining a truncated payload or spending the budget.
+/// Read a watched regular file within the descriptor's admitted size, then
+/// prove the path and descriptor still describe the bytes read. Watch paths
+/// have already been canonicalized within their root: a new leaf link must
+/// not redirect this read after that check.
+fn read_opened_watch_source(
+    path: &Path,
+    mut file: fs::File,
+    opened: &fs::Metadata,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(opened.len().saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != opened.len() {
+        return Err(source_changed_io(path));
+    }
+    recheck_regular_source(path, false, &file, opened)?;
+    Ok(bytes)
+}
+
+/// A source that already exceeds prefetch admission belongs to its own
+/// bounded read. A changed source during the read never yields partial bytes.
 fn prefetch_watch_source(
     path: &Path,
     observed_len: u64,
@@ -4185,25 +4371,27 @@ fn prefetch_watch_source(
     if observed_len > WATCH_PREFETCH_MAX_FILE_BYTES || observed_len > *budget {
         return None;
     }
-    let bytes = fs::File::open(path).and_then(|file| {
-        let mut bytes = Vec::new();
-        // Admission above bounds this addition to 8 MiB plus one byte.
-        file.take(observed_len + 1).read_to_end(&mut bytes)?;
-        Ok(bytes)
-    });
-    if bytes
-        .as_ref()
-        .is_ok_and(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX) > observed_len)
-    {
-        return None;
-    }
+    let (bytes, metadata) = match open_regular_source(path, false) {
+        Ok((file, opened)) => {
+            if opened.len() > observed_len {
+                return None;
+            }
+            (read_opened_watch_source(path, file, &opened), Some(opened))
+        }
+        Err(error) => (Err(error), None),
+    };
     *budget -= observed_len;
-    let modified_ms = fs::metadata(path)
-        .ok()
+    let modified_ms = metadata
+        .as_ref()
         .and_then(|metadata| metadata.modified().ok())
         .map(system_time_to_ms)
         .unwrap_or_default();
-    Some(PrefetchedSource { bytes, modified_ms })
+    Some(PrefetchedSource {
+        bytes,
+        modified_ms,
+        path: path.to_path_buf(),
+        metadata,
+    })
 }
 
 /// Read and stat every upserted source of a watch batch in one blocking-pool
@@ -4269,25 +4457,56 @@ async fn read_ingestion_source(
     retained_search_checkpoint(cx)?;
     let source = if ingestion_class == IngestionClass::MetadataOnly {
         let path = path.to_path_buf();
-        spawn_blocking(move || match fs::metadata(path) {
-            Ok(metadata) if metadata.is_file() => (
+        spawn_blocking(move || match regular_source_metadata(&path, false) {
+            Ok(metadata) => (
                 Ok(Vec::new()),
                 metadata.modified().ok().map(system_time_to_ms),
-            ),
-            Ok(_) => (
-                Err(std::io::Error::new(
-                    ErrorKind::IsADirectory,
-                    "metadata-only source is no longer a regular file",
-                )),
-                None,
             ),
             Err(error) => (Err(error), None),
         })
         .await
     } else {
+        // A missing source can reappear before application. Its current
+        // admission, not a stale prefetch error, decides whether to delete
+        // the existing row.
+        let prefetched = prefetched.filter(|source| {
+            !source
+                .bytes
+                .as_ref()
+                .is_err_and(|error| error.kind() == ErrorKind::NotFound)
+        });
         match prefetched {
-            Some(source) => (source.bytes, Some(source.modified_ms)),
-            None => (async_file_read(path).await, None),
+            Some(source) => {
+                // The key may now resolve to a different in-root target, or
+                // an atomic save may have replaced its inode. Keep this small
+                // path check beside the caller's canonicalization so a batch
+                // does not regain one blocking-pool hop per prefetched file.
+                let read = source.bytes.and_then(|bytes| {
+                    let current = regular_source_metadata(path, false)?;
+                    if source.path == path
+                        && source
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|opened| source_metadata_unchanged(opened, &current))
+                    {
+                        Ok(bytes)
+                    } else {
+                        Err(source_changed_io(path))
+                    }
+                });
+                (read, Some(source.modified_ms))
+            }
+            None => {
+                let path = path.to_path_buf();
+                spawn_blocking(move || match open_regular_source(&path, false) {
+                    Ok((file, opened)) => {
+                        let modified_ms = opened.modified().ok().map(system_time_to_ms);
+                        (read_opened_watch_source(&path, file, &opened), modified_ms)
+                    }
+                    Err(error) => (Err(error), None),
+                })
+                .await
+            }
         }
     };
     retained_search_checkpoint(cx)?;
@@ -21738,7 +21957,7 @@ impl FsfsRuntime {
                             unchanged_skips.insert(candidate.file_key.clone());
                         } else if file_matches_digest(
                             cx,
-                            &candidate.file_path,
+                            candidate,
                             skipped.content_hash_hex.as_deref(),
                             source_policy,
                         )
@@ -21771,8 +21990,7 @@ impl FsfsRuntime {
                     // the settled stamp they were read under.
                     entry.content_hash_hex.clone()
                 } else {
-                    let Some(bytes) =
-                        read_source_for_reuse(cx, &candidate.file_path, source_policy).await?
+                    let Some(bytes) = read_source_for_reuse(cx, candidate, source_policy).await?
                     else {
                         continue;
                     };
@@ -26919,8 +27137,10 @@ impl FsfsRuntime {
                 .ok()
                 .map(system_time_to_ms)
                 .unwrap_or_default();
+            let observed_stamp = source_stamp(&metadata);
             #[cfg(unix)]
-            let stamp = Some(SourceStamp::from_metadata(&metadata))
+            let stamp = observed_stamp
+                .clone()
                 .filter(|stamp| stamp.settled_before(walk_started));
             // Without a change time no stamp proves a file unchanged; its
             // digest does.
@@ -26933,6 +27153,8 @@ impl FsfsRuntime {
                 byte_len: metadata.len(),
                 modified_ms,
                 ingestion_class: decision.ingestion_class,
+                follow_symlinks: self.config.discovery.follow_symlinks,
+                observed_stamp,
                 stamp,
             });
         }
@@ -29436,13 +29658,18 @@ impl HitLineLocator {
     }
 }
 
-fn read_hit_line_source(path: &Path) -> Option<String> {
+/// Search decorations retain their prefix limits and historical support for
+/// indexed symlinks, but never read a special file or accept a changed source.
+fn read_regular_source_prefix(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let (mut file, opened) = open_regular_source(path, true)?;
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(FSFS_HIT_LINE_READ_LIMIT)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    (&mut file).take(limit).read_to_end(&mut bytes)?;
+    recheck_regular_source(path, true, &file, &opened)?;
+    Ok(bytes)
+}
+
+fn read_hit_line_source(path: &Path) -> Option<String> {
+    let bytes = read_regular_source_prefix(path, FSFS_HIT_LINE_READ_LIMIT).ok()?;
     Some(
         String::from_utf8(bytes)
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
@@ -29503,31 +29730,17 @@ fn alphanumeric_words(text: &str) -> impl Iterator<Item = &str> {
 /// Reads at most [`FSFS_RERANK_DOCUMENT_READ_LIMIT`] bytes and selects a single
 /// bounded passage. PDFs use the same extraction path as indexing.
 fn read_rerank_document_text(path: &Path, query: &str) -> Option<String> {
-    use std::io::Read as _;
-
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
+    let bytes = match read_regular_source_prefix(path, FSFS_RERANK_DOCUMENT_READ_LIMIT) {
+        Ok(bytes) => bytes,
         Err(error) => {
             debug!(
                 path = %path.display(),
                 error = %error,
-                "fsfs rerank stage: candidate file unreadable; it keeps its fused rank"
+                "fsfs rerank stage: candidate source unavailable or changed; it keeps its fused rank"
             );
             return None;
         }
     };
-    let mut bytes = Vec::new();
-    if let Err(error) = file
-        .take(FSFS_RERANK_DOCUMENT_READ_LIMIT)
-        .read_to_end(&mut bytes)
-    {
-        debug!(
-            path = %path.display(),
-            error = %error,
-            "fsfs rerank stage: candidate read failed; it keeps its fused rank"
-        );
-        return None;
-    }
     let raw_text = if is_pdf_file(path) {
         try_extract_pdf_text(&bytes, path)?
     } else {
@@ -34305,15 +34518,22 @@ mod tests {
             Some("cancel source scan"),
         );
         let directory = tempfile::tempdir().unwrap();
+        let candidate = super::IndexCandidate {
+            file_path: directory.path().join("absent.md"),
+            file_key: "absent.md".to_owned(),
+            byte_len: 0,
+            modified_ms: 0,
+            ingestion_class: IngestionClass::FullSemanticLexical,
+            follow_symlinks: false,
+            observed_stamp: None,
+            stamp: None,
+        };
         for policy in [
             super::IndexSourcePolicy::BestEffort,
             super::IndexSourcePolicy::RequireReadable,
         ] {
-            let result = futures_lite_block_on(super::read_source_for_reuse(
-                &cx,
-                &directory.path().join("absent.md"),
-                policy,
-            ));
+            let result =
+                futures_lite_block_on(super::read_source_for_reuse(&cx, &candidate, policy));
             assert!(matches!(result, Err(SearchError::Cancelled { .. })));
         }
     }
@@ -38918,6 +39138,8 @@ mod tests {
                             file_path: path,
                             modified_ms: 0,
                             ingestion_class: IngestionClass::FullSemanticLexical,
+                            follow_symlinks: false,
+                            observed_stamp: None,
                             stamp: None,
                         }
                     })
@@ -39034,6 +39256,8 @@ mod tests {
                     file_path: path,
                     modified_ms: 0,
                     ingestion_class: IngestionClass::FullSemanticLexical,
+                    follow_symlinks: false,
+                    observed_stamp: None,
                     stamp: None,
                 }
             });
@@ -39090,6 +39314,8 @@ mod tests {
                 file_key: "source.md".to_owned(),
                 modified_ms: 0,
                 ingestion_class: IngestionClass::FullSemanticLexical,
+                follow_symlinks: false,
+                observed_stamp: None,
                 stamp: None,
             };
             let sources = [&candidate];
@@ -39228,6 +39454,215 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    fn discovered_source_candidate(
+        root: &Path,
+        key: &str,
+        follow_symlinks: bool,
+    ) -> super::IndexCandidate {
+        let mut config = FsfsConfig::default();
+        config.discovery.follow_symlinks = follow_symlinks;
+        let mut control = super::IndexRunControl::new(&config).unwrap();
+        let runtime = FsfsRuntime::new(config);
+        let mut candidates = Vec::new();
+        runtime
+            .collect_index_candidates(
+                &Cx::for_testing(),
+                &mut control,
+                root,
+                &root.join(".frankensearch"),
+                super::IndexSourcePolicy::RequireReadable,
+                &mut candidates,
+            )
+            .unwrap();
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.file_key == key)
+            .expect("the source is admitted by normal discovery")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_preparation_and_resume_refuse_post_discovery_substitution() {
+        run_test_with_cx(|cx| async move {
+            for symlink_replacement in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("source.md");
+                fs::write(&path, b"original payload\n").unwrap();
+                let candidate = discovered_source_candidate(temp.path(), "source.md", false);
+                assert!(!candidate.follow_symlinks);
+                assert_eq!(
+                    candidate.observed_stamp,
+                    super::source_stamp(&fs::metadata(&path).unwrap()),
+                    "even a newly written, unsettled source keeps its full admission stamp"
+                );
+                let prepared = super::prepare_index_source(&cx, &candidate).unwrap();
+                assert_eq!(
+                    prepared.content_hash_hex,
+                    super::content_sha256_hex(b"original payload\n")
+                );
+
+                let saved = temp.path().join("saved.md");
+                fs::rename(&path, &saved).unwrap();
+                if symlink_replacement {
+                    // Even a link to the original bytes violates no-follow
+                    // admission; a same-size replacement defeats len-only checks.
+                    std::os::unix::fs::symlink(&saved, &path).unwrap();
+                } else {
+                    fs::write(&path, b"switched payload\n").unwrap();
+                    assert_eq!(fs::metadata(&path).unwrap().len(), candidate.byte_len);
+                }
+                let error = super::prepare_index_source(&cx, &candidate).unwrap_err();
+                assert!(matches!(error,
+                    SearchError::SubsystemError { source, .. }
+                        if source.is::<super::IndexSourceChanged>()));
+                for policy in [
+                    super::IndexSourcePolicy::BestEffort,
+                    super::IndexSourcePolicy::RequireReadable,
+                ] {
+                    let error = super::read_source_for_reuse(&cx, &candidate, policy)
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(error,
+                        SearchError::SubsystemError { source, .. }
+                            if source.is::<super::IndexSourceChanged>()));
+                }
+                let metadata_only = super::IndexCandidate {
+                    ingestion_class: IngestionClass::MetadataOnly,
+                    ..candidate
+                };
+                assert!(matches!(super::prepare_index_source(&cx, &metadata_only),
+                    Err(SearchError::SubsystemError { source, .. })
+                        if source.is::<super::IndexSourceChanged>()));
+
+                if !symlink_replacement {
+                    let fresh = discovered_source_candidate(temp.path(), "source.md", false);
+                    let prepared = super::prepare_index_source(&cx, &fresh).unwrap();
+                    assert_eq!(
+                        prepared.content_hash_hex,
+                        super::content_sha256_hex(b"switched payload\n"),
+                        "rediscovery admits the current source without weakening the old read"
+                    );
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_preparation_honors_explicit_symlink_following_and_metadata_only_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.md");
+        fs::write(&target, b"original payload\n").unwrap();
+        std::os::unix::fs::symlink(&target, temp.path().join("source.md")).unwrap();
+        let candidate = discovered_source_candidate(temp.path(), "source.md", true);
+        assert!(candidate.follow_symlinks);
+        let cx = Cx::for_testing();
+        let prepared = super::prepare_index_source(&cx, &candidate).unwrap();
+        assert_eq!(
+            prepared.content_hash_hex,
+            super::content_sha256_hex(b"original payload\n")
+        );
+        let metadata_only = super::IndexCandidate {
+            ingestion_class: IngestionClass::MetadataOnly,
+            // No source body is admitted or allocated for path-only rows.
+            byte_len: 0,
+            ..candidate.clone()
+        };
+        let prepared = super::prepare_index_source(&cx, &metadata_only).unwrap();
+        assert!(prepared.content_hash_hex.is_empty());
+        assert_eq!(
+            prepared.text.unwrap(),
+            ("source.md".to_owned(), String::new())
+        );
+
+        fs::rename(&target, temp.path().join("saved.md")).unwrap();
+        fs::write(&target, b"switched payload\n").unwrap();
+        for candidate in [&candidate, &metadata_only] {
+            assert!(matches!(super::prepare_index_source(&cx, candidate),
+                Err(SearchError::SubsystemError { source, .. })
+                    if source.is::<super::IndexSourceChanged>()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_reads_recheck_descriptor_and_path_after_open() {
+        for replace_path in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("source.md");
+            fs::write(&path, b"original payload\n").unwrap();
+            let (file, opened) = super::open_regular_source(&path, false).unwrap();
+            if replace_path {
+                fs::rename(&path, temp.path().join("saved.md")).unwrap();
+                fs::write(&path, b"switched payload\n").unwrap();
+            } else {
+                // A shrinking descriptor must not silently turn an admitted
+                // source into a truncated, apparently successful document.
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(opened.len() - 1)
+                    .unwrap();
+            }
+            let error = super::read_opened_watch_source(&path, file, &opened).unwrap_err();
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|source| source.is::<super::IndexSourceChanged>())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_preparation_refuses_fifo_substitution_without_waiting_for_a_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.md");
+        fs::write(&path, b"original payload\n").unwrap();
+        let candidate = discovered_source_candidate(temp.path(), "source.md", false);
+        fs::rename(&path, temp.path().join("saved.md")).unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let admitted_len = candidate.byte_len;
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sent.send(super::prepare_index_source(&Cx::for_testing(), &candidate))
+                .unwrap();
+        });
+        let (result, needed_rescue) = match received.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => (result, false),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Keep a regressed blocking open finite: Linux RDWR opens a
+                // FIFO immediately, and one extra byte drains its bounded read.
+                let mut writer = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                std::io::Write::write_all(
+                    &mut writer,
+                    &vec![b'x'; usize::try_from(admitted_len + 1).unwrap()],
+                )
+                .unwrap();
+                let result = received.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(writer);
+                (result, true)
+            }
+            Err(error) => panic!("source worker disconnected: {error}"),
+        };
+        worker.join().unwrap();
+        assert!(!needed_rescue, "source admission waited for a FIFO writer");
+        assert!(matches!(result,
+            Err(SearchError::SubsystemError { source, .. })
+                if source.is::<super::IndexSourceChanged>()));
+    }
+
     #[test]
     fn source_preparation_bounds_staging_and_refuses_growth_without_reading_metadata_bodies() {
         let temp = tempfile::tempdir().unwrap();
@@ -39239,6 +39674,8 @@ mod tests {
             byte_len: 1,
             modified_ms: 0,
             ingestion_class: IngestionClass::FullSemanticLexical,
+            follow_symlinks: false,
+            observed_stamp: None,
             stamp: None,
         };
         let cx = Cx::for_testing();
@@ -44432,16 +44869,15 @@ mod tests {
         assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
     }
 
-    #[test]
     #[cfg(feature = "rerank")]
-    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
-    fn rerank_deadline_fixture_busy_pool_times_out_then_retries_real_ranking() {
+    fn rerank_deadline_busy_pool_recovers(cancel: bool) {
         let scheduler = RuntimeBuilder::current_thread()
             .blocking_threads(0, 1)
             .build()
             .unwrap();
         let pool = scheduler.blocking_handle().unwrap();
         let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let fresh = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
         let temp = tempfile::tempdir().unwrap();
         let (runtime, _) = cold_reranker_fixture(pool.clone(), temp.path());
         let fused = rerank_deadline_documents(temp.path());
@@ -44468,42 +44904,94 @@ mod tests {
             let mut stage = super::StageDirective {
                 enabled: true,
                 candidate_budget: 2,
-                timeout_ms: 50,
+                timeout_ms: if cancel { 30_000 } else { 50 },
                 reason_code: "query.stage.rerank.enabled",
             };
-            let outcome = runtime
-                .apply_rerank_stage(
+            if cancel {
+                let mut pending = Box::pin(runtime.apply_rerank_stage(
                     &cx,
                     Some(model.as_ref()),
                     &stage,
                     temp.path(),
                     "How do I recover from a network failure?",
                     fused.clone(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(outcome.payload.reason_code, "query.stage.rerank.timeout");
-            assert_eq!(
-                outcome.payload.status,
-                crate::output_schema::RerankStageStatus::Failed
-            );
-            assert_eq!(outcome.payload.reranked_hits, 0);
-            assert_eq!(outcome.fused, fused);
-            assert!(outcome.payload.scores.is_empty());
-            assert!(
-                !completed.load(Ordering::SeqCst),
-                "the original pool blocker must still be running"
-            );
-            assert_eq!(
-                pool.busy_threads(),
-                1,
-                "timeout must return before the occupied worker drains"
-            );
-            blocker.join(&cx).await.unwrap();
+                ));
+                let admitted = Instant::now();
+                loop {
+                    std::future::poll_fn(|task_cx| {
+                        assert!(
+                            pending.as_mut().poll(task_cx).is_pending(),
+                            "accepted rerank work must wait for the occupied worker"
+                        );
+                        Poll::Ready(())
+                    })
+                    .await;
+                    assert!(
+                        !completed.load(Ordering::SeqCst),
+                        "cancellation must be requested while document work is queued"
+                    );
+                    assert_eq!(pool.busy_threads(), 1);
+                    if pool.pending_count() == 1 {
+                        break;
+                    }
+                    assert!(admitted.elapsed() < Duration::from_secs(5));
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                cx.cancel_fast(asupersync::CancelKind::User);
+                assert!(
+                    matches!(pending.await, Err(SearchError::Cancelled { .. })),
+                    "post-start caller cancellation must not publish a rerank outcome"
+                );
+                assert!(
+                    !completed.load(Ordering::SeqCst),
+                    "cancellation must return before the original blocker finishes"
+                );
+                assert_eq!(
+                    pool.busy_threads(),
+                    1,
+                    "cancellation must return before the occupied worker drains"
+                );
+            } else {
+                let outcome = runtime
+                    .apply_rerank_stage(
+                        &cx,
+                        Some(model.as_ref()),
+                        &stage,
+                        temp.path(),
+                        "How do I recover from a network failure?",
+                        fused.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.payload.reason_code, "query.stage.rerank.timeout");
+                assert_eq!(
+                    outcome.payload.status,
+                    crate::output_schema::RerankStageStatus::Failed
+                );
+                assert_eq!(outcome.payload.reranked_hits, 0);
+                assert_eq!(outcome.fused, fused);
+                assert!(outcome.payload.scores.is_empty());
+                assert!(
+                    !completed.load(Ordering::SeqCst),
+                    "the original pool blocker must still be running"
+                );
+                assert_eq!(
+                    pool.busy_threads(),
+                    1,
+                    "timeout must return before the occupied worker drains"
+                );
+            }
+            let retry_cx = if cancel { &fresh } else { &cx };
+            blocker.join(retry_cx).await.unwrap();
+            let drained = Instant::now();
+            while pool.busy_threads() != 0 || pool.pending_count() != 0 {
+                assert!(drained.elapsed() < Duration::from_secs(5));
+                asupersync::time::sleep(retry_cx.now(), Duration::from_millis(1)).await;
+            }
             stage.timeout_ms = 300;
             let recovered = runtime
                 .apply_rerank_stage(
-                    &cx,
+                    retry_cx,
                     Some(model.as_ref()),
                     &stage,
                     temp.path(),
@@ -44531,8 +45019,22 @@ mod tests {
         assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
     }
 
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn rerank_deadline_fixture_busy_pool_times_out_then_retries_real_ranking() {
+        rerank_deadline_busy_pool_recovers(false);
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
+    #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
+    fn rerank_deadline_fixture_busy_pool_cancels_after_start_then_retries_real_ranking() {
+        rerank_deadline_busy_pool_recovers(true);
+    }
+
     #[cfg(all(feature = "rerank", target_os = "linux"))]
-    fn rerank_deadline_blocked_file(cancel: bool) {
+    fn rerank_deadline_unsupported_source(cancel: bool) {
         let scheduler = RuntimeBuilder::current_thread()
             .blocking_threads(0, 1)
             .build()
@@ -44550,8 +45052,8 @@ mod tests {
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         )
         .unwrap();
-        // Linux opens RDWR without waiting for another endpoint. Keeping this
-        // descriptor alive makes the actual candidate read block until EOF.
+        // Linux opens RDWR without waiting for another endpoint. A regressed
+        // reader would block on this FIFO until the bounded rescue closes it.
         let mut writer = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -44561,9 +45063,8 @@ mod tests {
             rustix::fs::inotify::CreateFlags::NONBLOCK | rustix::fs::inotify::CreateFlags::CLOEXEC,
         )
         .unwrap();
-        let watch =
-            rustix::fs::inotify::add_watch(&watcher, &fifo, rustix::fs::inotify::WatchFlags::OPEN)
-                .unwrap();
+        rustix::fs::inotify::add_watch(&watcher, &fifo, rustix::fs::inotify::WatchFlags::OPEN)
+            .unwrap();
         let mut events = [std::mem::MaybeUninit::uninit(); 512];
         let mut reader = rustix::fs::inotify::Reader::new(&watcher, &mut events);
         thread::scope(|scope| {
@@ -44582,71 +45083,44 @@ mod tests {
                     std::io::Write::write_all(&mut writer, b"Mix flour and bake bread.").unwrap();
                     drop(writer);
                 });
-                let mut delayed = fused.clone();
+                let mut delayed = vec![fused[0].clone()];
                 delayed[0].doc_id = "delayed.fifo".to_owned();
                 let stage = super::StageDirective {
                     enabled: true,
                     candidate_budget: 2,
-                    timeout_ms: if cancel { 300 } else { 50 },
+                    timeout_ms: 300,
                     reason_code: "query.stage.rerank.enabled",
                 };
-                let mut pending = Box::pin(runtime.apply_rerank_stage(
-                    &cx,
-                    Some(model.as_ref()),
-                    &stage,
-                    temp.path(),
-                    "How do I recover from a network failure?",
-                    delayed.clone(),
-                ));
-                let admitted = Instant::now();
-                loop {
-                    std::future::poll_fn(|task_cx| {
-                        assert!(pending.as_mut().poll(task_cx).is_pending());
-                        Poll::Ready(())
-                    })
-                    .await;
-                    assert!(
-                        !released.load(Ordering::SeqCst),
-                        "candidate reads must yield before the blocked file is released"
-                    );
-                    match reader.next() {
-                        Ok(event) => {
-                            assert_eq!(event.wd(), watch);
-                            assert!(
-                                event
-                                    .events()
-                                    .contains(rustix::fs::inotify::ReadFlags::OPEN)
-                            );
-                            break;
-                        }
-                        Err(rustix::io::Errno::AGAIN) => {}
-                        Err(error) => panic!("observe actual candidate reader opening: {error}"),
-                    }
-                    assert!(admitted.elapsed() < Duration::from_secs(5));
-                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-                }
                 if cancel {
                     cx.cancel_fast(asupersync::CancelKind::User);
                 }
-                let result = pending.await;
+                let result = runtime
+                    .apply_rerank_stage(
+                        &cx,
+                        Some(model.as_ref()),
+                        &stage,
+                        temp.path(),
+                        "How do I recover from a network failure?",
+                        delayed.clone(),
+                    )
+                    .await;
                 if cancel {
                     assert!(matches!(result, Err(SearchError::Cancelled { .. })));
                 } else {
                     let outcome = result.unwrap();
-                    assert_eq!(outcome.payload.reason_code, "query.stage.rerank.timeout");
+                    assert_eq!(outcome.payload.reason_code, super::REASON_RERANK_NO_TEXT);
                     assert_eq!(
                         outcome.payload.status,
-                        crate::output_schema::RerankStageStatus::Failed
+                        crate::output_schema::RerankStageStatus::Skipped
                     );
                     assert_eq!(outcome.payload.reranked_hits, 0);
                     assert_eq!(outcome.fused, delayed);
                     assert!(outcome.payload.scores.is_empty());
                 }
                 assert!(!released.load(Ordering::SeqCst));
-                assert_eq!(
-                    pool.busy_threads(),
-                    1,
-                    "notification must precede completion of the real blocked read"
+                assert!(
+                    matches!(reader.next(), Err(rustix::io::Errno::AGAIN)),
+                    "unsupported or cancelled source admission never opens the FIFO body"
                 );
                 let drained = Instant::now();
                 while !released.load(Ordering::SeqCst)
@@ -44693,15 +45167,15 @@ mod tests {
     #[test]
     #[cfg(all(feature = "rerank", target_os = "linux"))]
     #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
-    fn rerank_deadline_fixture_blocked_file_times_out_and_drains() {
-        rerank_deadline_blocked_file(false);
+    fn rerank_deadline_fixture_refuses_fifo_and_retries_regular_sources() {
+        rerank_deadline_unsupported_source(false);
     }
 
     #[test]
     #[cfg(all(feature = "rerank", target_os = "linux"))]
     #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
-    fn rerank_deadline_fixture_cancelled_file_read_drains_and_retries() {
-        rerank_deadline_blocked_file(true);
+    fn rerank_deadline_fixture_cancelled_source_admission_never_reads() {
+        rerank_deadline_unsupported_source(true);
     }
 
     #[test]
@@ -60111,6 +60585,197 @@ mod tests {
             .expect("a root listed in discovery.roots is opted in");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn watch_source_admission_binds_prefetch_to_its_path_and_current_identity() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("source.md");
+            let other = temp.path().join("other.md");
+            fs::write(&path, b"first source\n").unwrap();
+            fs::write(&other, b"other source\n").unwrap();
+            let prefetch = |path: &Path| {
+                let mut budget = super::WATCH_PREFETCH_MAX_BATCH_BYTES;
+                super::prefetch_watch_source(path, fs::metadata(path).unwrap().len(), &mut budget)
+                    .unwrap()
+            };
+            let (read, modified) = super::read_ingestion_source(
+                &cx,
+                &path,
+                IngestionClass::LexicalOnly,
+                Some(prefetch(&path)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(read.unwrap(), b"first source\n");
+            assert!(modified.is_some());
+
+            // A watched symlink key may resolve to a new in-root target after
+            // prefetch. Its old target's bytes must not be relabeled as B.
+            let (read, _) = super::read_ingestion_source(
+                &cx,
+                &other,
+                IngestionClass::LexicalOnly,
+                Some(prefetch(&path)),
+            )
+            .await
+            .unwrap();
+            assert!(
+                read.unwrap_err()
+                    .get_ref()
+                    .is_some_and(|source| { source.is::<super::IndexSourceChanged>() })
+            );
+
+            let before_save = prefetch(&path);
+            fs::rename(&path, temp.path().join("saved.md")).unwrap();
+            fs::write(&path, b"other source\n").unwrap();
+            let (read, _) = super::read_ingestion_source(
+                &cx,
+                &path,
+                IngestionClass::LexicalOnly,
+                Some(before_save),
+            )
+            .await
+            .unwrap();
+            assert!(
+                read.unwrap_err()
+                    .get_ref()
+                    .is_some_and(|source| { source.is::<super::IndexSourceChanged>() })
+            );
+            let (read, modified) =
+                super::read_ingestion_source(&cx, &path, IngestionClass::LexicalOnly, None)
+                    .await
+                    .unwrap();
+            assert_eq!(read.unwrap(), b"other source\n");
+            assert!(modified.is_some());
+
+            let missing = temp.path().join("reappeared.md");
+            let cached_missing = super::prefetch_watch_source(&missing, 1, &mut 1).unwrap();
+            assert_eq!(
+                cached_missing.bytes.as_ref().unwrap_err().kind(),
+                ErrorKind::NotFound
+            );
+            fs::write(&missing, b"newly available source\n").unwrap();
+            let (read, _) = super::read_ingestion_source(
+                &cx,
+                &missing,
+                IngestionClass::LexicalOnly,
+                Some(cached_missing),
+            )
+            .await
+            .unwrap();
+            assert_eq!(read.unwrap(), b"newly available source\n");
+
+            let link = temp.path().join("redirected.md");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            for class in [IngestionClass::LexicalOnly, IngestionClass::MetadataOnly] {
+                let (read, _) = super::read_ingestion_source(&cx, &link, class, None)
+                    .await
+                    .unwrap();
+                assert!(
+                    read.is_err(),
+                    "a raced leaf link is not a canonical watched source"
+                );
+            }
+            let (resolved, _) = super::resolve_watched_paths(temp.path(), "redirected.md").unwrap();
+            let (read, _) =
+                super::read_ingestion_source(&cx, &resolved, IngestionClass::LexicalOnly, None)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                read.unwrap(),
+                b"other source\n",
+                "in-root link resolution still works"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_source_admission_preserves_regular_prefixes_and_indexed_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.md");
+        let body = "ordinary heading\nRecovery retries after backoff.\n";
+        fs::write(&path, body).unwrap();
+        let link = temp.path().join("indexed-link.md");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        for path in [&path, &link] {
+            assert_eq!(
+                super::read_regular_source_prefix(path, 8).unwrap(),
+                b"ordinary"
+            );
+            assert_eq!(super::read_hit_line_source(path).unwrap(), body);
+            assert!(
+                super::read_rerank_document_text(path, "recovery")
+                    .unwrap()
+                    .contains("Recovery retries")
+            );
+        }
+        assert!(super::read_hit_line_source(temp.path()).is_none());
+        assert!(super::read_rerank_document_text(temp.path(), "recovery").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_and_search_source_admission_refuse_fifo_payloads_without_waiting() {
+        for lane in ["prefetch", "watch", "metadata", "hit_line", "rerank"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("source.md");
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                &path,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .unwrap();
+            // An open writer with no data also exposes accidental body reads,
+            // not only an accidental blocking FIFO open. Rescue remains finite
+            // against the old reader by supplying bytes and closing this end.
+            let mut writer = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let (sent, received) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let refused = match lane {
+                    "prefetch" => super::prefetch_watch_source(&path, 64, &mut 64)
+                        .unwrap()
+                        .bytes
+                        .is_err(),
+                    "watch" | "metadata" => futures_lite_block_on(super::read_ingestion_source(
+                        &Cx::for_testing(),
+                        &path,
+                        if lane == "metadata" {
+                            IngestionClass::MetadataOnly
+                        } else {
+                            IngestionClass::LexicalOnly
+                        },
+                        None,
+                    ))
+                    .unwrap()
+                    .0
+                    .is_err(),
+                    "hit_line" => super::read_hit_line_source(&path).is_none(),
+                    "rerank" => super::read_rerank_document_text(&path, "recovery").is_none(),
+                    _ => unreachable!(),
+                };
+                sent.send(refused).unwrap();
+            });
+            let (refused, needed_rescue) = match received.recv_timeout(Duration::from_secs(2)) {
+                Ok(refused) => (refused, false),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    std::io::Write::write_all(&mut writer, b"recovery source payload\n").unwrap();
+                    drop(writer);
+                    (received.recv_timeout(Duration::from_secs(5)).unwrap(), true)
+                }
+                Err(error) => panic!("source worker disconnected: {error}"),
+            };
+            worker.join().unwrap();
+            assert!(!needed_rescue, "{lane} waited for an unsupported FIFO body");
+            assert!(refused, "{lane} accepted a FIFO as source content");
+        }
+    }
+
     #[test]
     fn watch_prefetch_rejects_growth_after_size_admission_without_truncating() {
         let temp = tempfile::tempdir().unwrap();
@@ -68226,6 +68891,8 @@ mod tests {
             byte_len: 1_024,
             modified_ms: 42,
             ingestion_class: IngestionClass::FullSemanticLexical,
+            follow_symlinks: false,
+            observed_stamp: None,
             stamp: None,
         };
         let manifest = super::IndexManifestEntry {
