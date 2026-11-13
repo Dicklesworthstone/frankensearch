@@ -908,7 +908,7 @@ impl IndexBuilder {
                 .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?;
         }
         build_checkpoint(cx, "vector index producer admission")?;
-        let _index = match index_builder.finish() {
+        let built_index = match index_builder.finish() {
             Ok(index) => index,
             Err(error) => {
                 export_error(metrics_exporter.as_ref(), &error);
@@ -978,7 +978,7 @@ impl IndexBuilder {
         }
 
         build_checkpoint(cx, "index build completion")?;
-        let has_quality = quality_embedder.is_some();
+        let has_quality = built_index.has_quality_index();
         let size_bytes = compute_size_breakdown(&self.data_dir);
         export_index_updated(
             metrics_exporter.as_ref(),
@@ -5078,6 +5078,58 @@ mod tests {
             assert_eq!(stats.quality_indexed, 1);
             assert_eq!(stats.quality_errors.len(), 1);
             assert_eq!(stats.quality_errors[0].0, "doc-marked");
+        });
+    }
+
+    #[test]
+    fn all_quality_failures_report_fast_only_for_fresh_and_rebuilt_corpora() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for rebuild in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                if rebuild {
+                    let initial = IndexBuilder::new(dir.path())
+                        .with_embedder_stack(stub_stack())
+                        .add_document("doc-shared", "oldsentinel")
+                        .add_document("doc-removed", "removedsentinel")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+                    assert!(initial.has_quality_index);
+                }
+                let stats = IndexBuilder::new(dir.path())
+                    .with_embedder_stack(EmbedderStack::from_parts(
+                        Arc::new(StubEmbedder {
+                            id: "stub-fast",
+                            dim: 4,
+                        }),
+                        Some(Arc::new(SelectiveFailEmbedder)),
+                    ))
+                    .add_document("doc-shared", "fail-fast-embedding updatedsentinel")
+                    .add_document("doc-new", "fail-fast-embedding newsentinel")
+                    .build(&cx)
+                    .await
+                    .expect("quality failures preserve a usable fast-only corpus");
+                assert_eq!(stats.source_count, 2);
+                assert_eq!(stats.doc_count, 2);
+                assert_eq!(stats.error_count, 0);
+                assert_eq!(stats.quality_indexed, 0);
+                assert_eq!(stats.quality_errors.len(), 2);
+                assert!(!stats.has_quality_index);
+
+                let vectors = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+                assert!(!vectors.has_quality_index());
+                for id in ["doc-shared", "doc-new"] {
+                    assert!(vectors.fast_vector_for_doc_id(id).unwrap().is_some());
+                    assert!(vectors.quality_vector_for_doc_id(id).unwrap().is_none());
+                }
+                assert!(vectors.fast_vector_for_doc_id("doc-removed").unwrap().is_none());
+                assert!(
+                    vectors
+                        .quality_vector_for_doc_id("doc-removed")
+                        .unwrap()
+                        .is_none()
+                );
+            }
         });
     }
 

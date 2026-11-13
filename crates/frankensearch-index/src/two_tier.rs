@@ -2684,7 +2684,9 @@ impl TwoTierIndexBuilder {
     /// Both tiers are fully prepared before either is published, so record,
     /// header or staging-I/O failures preserve the existing generation. The
     /// final two-file installation is still sequential; its shared publication
-    /// nonce detects an interruption between installations.
+    /// nonce differs from both incumbent tiers, including a fallback fast
+    /// artifact, so an interruption cannot admit stale quality vectors.
+    /// Incumbent header errors are returned before either tier is published.
     pub fn finish(self) -> SearchResult<TwoTierIndex> {
         let fast_dimension = self
             .fast_dimension
@@ -2708,8 +2710,8 @@ impl TwoTierIndexBuilder {
         // destination's WAL sidecar adoptable by the fresh generation
         // (bd-zhjv8 finding 1 — acknowledged appends from the superseded
         // generation resurrected inside the rebuild). Both tiers carry ONE
-        // publication nonce, the successor of the destination pair's, so a
-        // crash between the two installs is detectable at open time
+        // publication nonce distinct from both incumbent tiers, so a crash
+        // between the two installs is detectable at open time
         // (bd-miio8).
         let fast_path = self.dir.join(VECTOR_INDEX_FAST_FILENAME);
         // `create(path, id, dim)` is `create_with_revision(path, id, "", dim,
@@ -2722,11 +2724,28 @@ impl TwoTierIndexBuilder {
         // atomically invalidates any surviving destination sidecar
         // (bd-zhjv8, bd-miio8; supersedes the r3 retire-before-publish
         // ordering — see `stage_tier`).
-        let publication_nonce = crate::next_publication_nonce(if fast_path.exists() {
-            VectorIndex::peek_publication_nonce(&fast_path)?
+        // The incumbent fast authority may still use the fallback name.
+        // Advancing only the dedicated destination would reset its nonce and
+        // could admit quality vectors from the old corpus after migration.
+        let incumbent_fast_nonce = match resolve_fast_path(&self.dir) {
+            Ok(path) => VectorIndex::peek_publication_nonce(&path)?,
+            Err(SearchError::IndexCandidatesNotFound { .. }) => 0,
+            Err(error) => return Err(error),
+        };
+        let quality_path = self.dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let incumbent_quality_nonce = if quality_path.exists() {
+            Some(VectorIndex::peek_publication_nonce(&quality_path)?)
         } else {
-            0
-        });
+            None
+        };
+        let mut publication_nonce = crate::next_publication_nonce(incumbent_fast_nonce);
+        // A retained quality artifact can outlive many fast-only rebuilds.
+        // Exclude its nonce even across wrap and previously split pairs. This
+        // also applies when replacing BOTH tiers: a crash after fast install
+        // must never make the still-incumbent quality tier look current.
+        if incumbent_quality_nonce == Some(publication_nonce) {
+            publication_nonce = crate::next_publication_nonce(publication_nonce);
+        }
         let staged_fast = stage_tier(
             &fast_path,
             &self.fast_embedder_id,
@@ -2737,7 +2756,6 @@ impl TwoTierIndexBuilder {
         )?;
 
         let staged_quality = if let Some(quality_dimension) = self.quality_dimension {
-            let quality_path = self.dir.join(VECTOR_INDEX_QUALITY_FILENAME);
             Some(stage_tier(
                 &quality_path,
                 &self.quality_embedder_id,
@@ -4133,6 +4151,149 @@ mod tests {
             !matches!(error, SearchError::IndexNotFound { .. }),
             "the corrupt explicit path must not be reported as absent: {error:?}"
         );
+    }
+
+    #[test]
+    fn finish_fast_only_from_fallback_excludes_incumbent_quality() {
+        let dir = temp_index_dir("fallback-quality-publication");
+        let mut first = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        first
+            .add_record("shared", &[1.0, 0.0], Some(&[0.0, 1.0]))
+            .expect("add original row");
+        drop(first.finish().expect("publish original pair"));
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let fallback_path = dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        fs::rename(&fast_path, &fallback_path).expect("move to legacy fallback layout");
+        let quality_before = fs::read(&quality_path).expect("read incumbent quality");
+        let incumbent_nonce =
+            VectorIndex::peek_publication_nonce(&fallback_path).expect("fallback nonce");
+        assert_eq!(
+            incumbent_nonce,
+            VectorIndex::peek_publication_nonce(&quality_path).expect("quality nonce")
+        );
+
+        let mut replacement =
+            TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("replacement builder");
+        replacement
+            .add_fast_record("shared", &[-1.0, 0.0])
+            .expect("add changed row");
+        let built = replacement.finish().expect("publish fast-only replacement");
+        assert!(!built.has_quality_index());
+        assert_eq!(
+            built.fast_vector_for_doc_id("shared").unwrap(),
+            Some(vec![-1.0, 0.0])
+        );
+        assert!(built.quality_vector_for_doc_id("shared").unwrap().is_none());
+        assert_ne!(
+            VectorIndex::peek_publication_nonce(&fast_path).unwrap(),
+            incumbent_nonce
+        );
+        assert_eq!(fs::read(&quality_path).unwrap(), quality_before);
+        drop(built);
+
+        let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
+        assert!(!reopened.has_quality_index());
+        assert!(reopened.quality_vector_for_doc_id("shared").unwrap().is_none());
+    }
+
+    #[test]
+    fn finish_avoids_quality_nonce_collisions_across_wrap_and_split_pairs() {
+        for (fast_nonce, quality_nonce, expected_nonce) in [(u16::MAX, 1, 2), (7, 8, 9)] {
+            for write_quality in [false, true] {
+                let dir = temp_index_dir("quality-publication-collision");
+                fs::create_dir_all(&dir).expect("create collision fixture");
+                let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+                let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+                for (path, nonce, vector) in [
+                    (&fast_path, fast_nonce, [1.0, 0.0]),
+                    (&quality_path, quality_nonce, [0.0, 1.0]),
+                ] {
+                    let mut writer = VectorIndex::create(path, "incumbent", 2)
+                        .expect("fixture writer")
+                        .with_publication_nonce(nonce);
+                    writer.write_record("shared", &vector).expect("fixture row");
+                    writer.finish().expect("publish fixture");
+                }
+
+                let mut replacement =
+                    TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+                let quality = [1.0, 0.0];
+                replacement
+                    .add_record(
+                        "shared",
+                        &[0.0, 1.0],
+                        write_quality.then_some(quality.as_slice()),
+                    )
+                    .expect("replacement row");
+                let built = replacement.finish().expect("publish replacement");
+                assert_eq!(built.has_quality_index(), write_quality);
+                assert_eq!(
+                    VectorIndex::peek_publication_nonce(&fast_path).unwrap(),
+                    expected_nonce
+                );
+                assert_eq!(
+                    built.quality_vector_for_doc_id("shared").unwrap(),
+                    write_quality.then(|| quality.to_vec())
+                );
+                if write_quality {
+                    // The new fast nonce must differ from OLD quality even
+                    // when a new quality tier follows: interruption between
+                    // these installs must keep the old tier inadmissible.
+                    assert_ne!(expected_nonce, quality_nonce);
+                    assert_eq!(
+                        VectorIndex::peek_publication_nonce(&quality_path).unwrap(),
+                        expected_nonce
+                    );
+                }
+                drop(built);
+                let reopened =
+                    TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
+                assert_eq!(reopened.has_quality_index(), write_quality);
+                assert_eq!(
+                    reopened.quality_vector_for_doc_id("shared").unwrap(),
+                    write_quality.then(|| quality.to_vec())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finish_rejects_unreadable_quality_header_before_replacing_fast_or_wal() {
+        let dir = temp_index_dir("quality-nonce-header-failure");
+        let mut first = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        first
+            .add_record("retained", &[1.0, 0.0], Some(&[0.0, 1.0]))
+            .expect("original row");
+        drop(first.finish().expect("publish original pair"));
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let wal_path = crate::wal::wal_path_for(&fast_path);
+        let mut fast = VectorIndex::open(&fast_path).expect("open incumbent fast");
+        fast.append("retained-wal", &[0.0, 1.0]).expect("append");
+        drop(fast);
+        fs::write(&quality_path, b"retained malformed quality header").expect("corrupt fixture");
+        let fast_before = fs::read(&fast_path).unwrap();
+        let wal_before = fs::read(&wal_path).unwrap();
+        let quality_before = fs::read(&quality_path).unwrap();
+
+        let mut replacement =
+            TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("replacement builder");
+        replacement
+            .add_fast_record("replacement", &[-1.0, 0.0])
+            .expect("replacement row");
+        assert!(matches!(
+            replacement.finish(),
+            Err(SearchError::IndexCorrupted { .. })
+        ));
+        assert_eq!(fs::read(&fast_path).unwrap(), fast_before);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
+        assert_eq!(fs::read(&quality_path).unwrap(), quality_before);
+        let retained = VectorIndex::open_read_only(&fast_path).expect("preserved fast generation");
+        let ids = retained.live_doc_ids().unwrap();
+        assert!(ids.contains("retained"));
+        assert!(ids.contains("retained-wal"));
+        assert!(!ids.contains("replacement"));
     }
 
     #[test]
