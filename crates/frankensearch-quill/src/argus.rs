@@ -29,6 +29,8 @@ pub use crate::query::Occur;
 /// Delta postings are not encoded in blocks, so this is the accounting unit
 /// that keeps a Delta scan's fuel comparable with a sealed scan's.
 const DELTA_LOGICAL_BLOCK_POSTINGS: u32 = 128;
+/// Match-all's implicit postings use the same coarse unit as a Delta scan.
+pub(crate) const ALL_LOGICAL_BLOCK_DOCIDS: u64 = 128;
 const UNION_HORIZON: usize = 4_096;
 const UNION_HORIZON_U64: u64 = 4_096;
 pub(crate) const MAX_SCORE_MAX_CLAUSES: usize = 8;
@@ -293,7 +295,7 @@ pub enum QueryWorkKind {
     Segment,
     /// Entering one prefix-compressed term-dictionary block.
     DictionaryBlock,
-    /// Decoding or entering one posting block.
+    /// Decoding or entering one posting block, including a match-all logical block.
     PostingBlock,
     /// Per-document phrase-position verification or snippet enrichment.
     PositionDocument,
@@ -3897,7 +3899,7 @@ impl<'a> ScorerClause<'a> {
 
 enum ScorerNode<'a> {
     Empty,
-    All(AllScorer),
+    All(AllScorer<'a>),
     Term(TermScorer<'a>),
     Phrase(PhraseScorer<'a>),
     NumericRange(NumericRangeScorer),
@@ -4071,7 +4073,18 @@ impl<'a> ReferenceScorer<'a> {
         segment_num_docs: u32,
         boost: f32,
     ) -> Result<Self, ArgusError> {
-        let all = AllScorer::new(docid_lo, docid_hi, segment_num_docs, boost)?;
+        Self::all_with_boost_and_checkpoint(docid_lo, docid_hi, segment_num_docs, boost, None)
+    }
+
+    /// Lower a match-all leaf with the query's cancellation and work boundary.
+    pub(crate) fn all_with_boost_and_checkpoint(
+        docid_lo: u64,
+        docid_hi: u64,
+        segment_num_docs: u32,
+        boost: f32,
+        checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
+    ) -> Result<Self, ArgusError> {
+        let all = AllScorer::new(docid_lo, docid_hi, segment_num_docs, boost, checkpoint)?;
         if all.doc().is_none() {
             Ok(Self::empty())
         } else {
@@ -4818,7 +4831,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn next(&mut self) -> Result<Option<u32>, ArgusError> {
         match &mut self.node {
             ScorerNode::Empty => Ok(None),
-            ScorerNode::All(scorer) => Ok(scorer.next()),
+            ScorerNode::All(scorer) => scorer.next(),
             ScorerNode::Term(scorer) => scorer.next(),
             ScorerNode::Phrase(scorer) => scorer.next(),
             ScorerNode::NumericRange(scorer) => Ok(scorer.next()),
@@ -4839,7 +4852,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         match &mut self.node {
             ScorerNode::Empty => Ok(None),
-            ScorerNode::All(scorer) => Ok(scorer.seek(target)),
+            ScorerNode::All(scorer) => scorer.seek(target),
             ScorerNode::Term(scorer) => scorer.seek(target),
             ScorerNode::Phrase(scorer) => scorer.seek(target),
             ScorerNode::NumericRange(scorer) => Ok(scorer.seek(target)),
@@ -4855,7 +4868,7 @@ impl<'a> ReferenceScorer<'a> {
     fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
         match &mut self.node {
             ScorerNode::Empty => Ok(SeekDangerResult::SeekLowerBound(None)),
-            ScorerNode::All(scorer) => classify_seek_result(target, scorer.seek(target)),
+            ScorerNode::All(scorer) => classify_seek_result(target, scorer.seek(target)?),
             ScorerNode::Term(scorer) => {
                 let result = if scorer.doc().is_some_and(|doc| doc < target) {
                     scorer.seek(target)?
@@ -5157,20 +5170,24 @@ fn scorer_union_unscored(
 ///
 /// Unlike Tantivy's local-docid `AllScorer`, this cursor retains global bounds
 /// and an explicit exhausted state so `u32::MAX` remains a real match.
-struct AllScorer {
+struct AllScorer<'a> {
     current: Option<u32>,
+    docid_lo: u64,
     docid_hi: u64,
     span: u64,
     segment_num_docs: u32,
     score: f32,
+    checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
+    refused: Option<RefusedAdmission>,
 }
 
-impl AllScorer {
+impl<'a> AllScorer<'a> {
     fn new(
         docid_lo: u64,
         docid_hi: u64,
         segment_num_docs: u32,
         boost: f32,
+        checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
     ) -> Result<Self, ArgusError> {
         if !boost.is_finite() {
             return Err(ArgusError::InvalidAllBoost {
@@ -5201,12 +5218,18 @@ impl AllScorer {
                     invalid("the non-empty lower bound exceeds the u32 payload domain")
                 })?)
             };
+        if let Some(checkpoint) = &checkpoint {
+            checkpoint.admit(QueryWorkKind::PostingBlock, u64::from(current.is_some()))?;
+        }
         Ok(Self {
             current,
+            docid_lo,
             docid_hi,
             span,
             segment_num_docs,
             score: boost,
+            checkpoint,
+            refused: None,
         })
     }
 
@@ -5226,24 +5249,48 @@ impl AllScorer {
         self.score.to_bits() == 1.0_f32.to_bits()
     }
 
-    fn next(&mut self) -> Option<u32> {
-        let current = self.current?;
-        let next = u64::from(current) + 1;
-        self.current = if next < self.docid_hi {
-            u32::try_from(next).ok()
-        } else {
-            None
-        };
-        self.current
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        let next = self.current.and_then(|current| {
+            let next = u64::from(current) + 1;
+            if next < self.docid_hi {
+                u32::try_from(next).ok()
+            } else {
+                None
+            }
+        });
+        self.move_to(next)
     }
 
-    fn seek(&mut self, target: u32) -> Option<u32> {
-        let current = self.current?;
-        if current >= target {
-            return Some(current);
+    fn seek(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        let next = self.current.and_then(|current| {
+            let target = current.max(target);
+            (u64::from(target) < self.docid_hi).then_some(target)
+        });
+        self.move_to(next)
+    }
+
+    fn move_to(&mut self, next: Option<u32>) -> Result<Option<u32>, ArgusError> {
+        if let Some(refusal) = self.refused {
+            return Err(refusal.error());
         }
-        self.current = (u64::from(target) < self.docid_hi).then_some(target);
-        self.current
+        if let Some(checkpoint) = &self.checkpoint {
+            // Seeking over a gap is constant work. Charge only the destination
+            // block; a sequential scan pays for every physical block it enters,
+            // even when all its rows are holes or tombstones. Zero-unit moves
+            // still poll cancellation, including no-op seeks and exhaustion.
+            let block = |doc| (u64::from(doc) - self.docid_lo) / ALL_LOGICAL_BLOCK_DOCIDS;
+            let enters_block = next
+                .zip(self.current)
+                .is_some_and(|(next, current)| block(next) != block(current));
+            if let Err(error) =
+                checkpoint.admit(QueryWorkKind::PostingBlock, u64::from(enters_block))
+            {
+                self.refused = RefusedAdmission::capture(&error);
+                return Err(error);
+            }
+        }
+        self.current = next;
+        Ok(self.current)
     }
 
     fn score(&self) -> Result<f32, ArgusError> {
@@ -10075,6 +10122,140 @@ mod tests {
         assert_eq!(full_domain.segment_num_docs(), u32::MAX);
         assert_eq!(full_domain.advance(u32::MAX)?, Some(u32::MAX));
         assert_eq!(full_domain.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn all_scorer_checkpoint_charges_physical_blocks_and_destination_seeks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let checkpoint = Arc::new(CountingCheckpoint::default());
+        let mut all = ReferenceScorer::all_with_boost_and_checkpoint(
+            7,
+            264,
+            2,
+            2.5,
+            Some(checkpoint.clone()),
+        )?;
+        assert_eq!(all.score()?.to_bits(), 2.5_f32.to_bits());
+        assert_eq!(
+            all.collect_doc_set(&|doc| doc == 7 || doc == 263)?,
+            vec![7, 263]
+        );
+        assert_eq!(
+            checkpoint
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a sparse physical span still enters three logical blocks"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            258,
+            "construction and every movement, including exhaustion, poll cancellation"
+        );
+
+        let checkpoint = Arc::new(CountingCheckpoint::default());
+        let mut full_domain = ReferenceScorer::all_with_boost_and_checkpoint(
+            0,
+            MAX_GLOBAL_DOCID_EXCLUSIVE,
+            2,
+            1.0,
+            Some(checkpoint.clone()),
+        )?;
+        assert_eq!(full_domain.advance(u32::MAX)?, Some(u32::MAX));
+        assert_eq!(full_domain.advance(u32::MAX)?, Some(u32::MAX));
+        assert_eq!(full_domain.next()?, None);
+        assert_eq!(
+            checkpoint
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a constant-time seek pays only for its destination block"
+        );
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            4
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_scorer_checkpoint_refusal_preserves_position_and_is_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (docid_lo, docid_hi) in [(7, 264), (u64::from(u32::MAX), MAX_GLOBAL_DOCID_EXCLUSIVE)] {
+            let checkpoint = Arc::new(CancelOnNthAdmission::new(2));
+            let mut all = ReferenceScorer::all_with_boost_and_checkpoint(
+                docid_lo,
+                docid_hi,
+                1,
+                1.0,
+                Some(checkpoint.clone()),
+            )?;
+            let before = all.doc();
+            for result in [all.next(), all.advance(u32::MAX), all.next()] {
+                assert!(matches!(
+                    result,
+                    Err(ArgusError::QueryCancelled {
+                        phase: "checkpoint_cursor_unit_test"
+                    })
+                ));
+            }
+            assert_eq!(
+                all.doc(),
+                before,
+                "a refused in-block or final move must not advance"
+            );
+            assert_eq!(
+                checkpoint
+                    .admissions
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                2
+            );
+            assert_eq!(
+                checkpoint
+                    .units_at_fire
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+        }
+
+        let checkpoint = Arc::new(ArmedRefusalCheckpoint::default());
+        let mut all = ReferenceScorer::all_with_boost_and_checkpoint(
+            7,
+            264,
+            2,
+            1.0,
+            Some(checkpoint.clone()),
+        )?;
+        assert_eq!(all.advance(134)?, Some(134));
+        checkpoint.arm();
+        for result in [all.next(), all.advance(263), all.next()] {
+            assert!(matches!(
+                result,
+                Err(ArgusError::QueryFuelExhausted {
+                    budget: 11,
+                    consumed: 13,
+                    segments_touched: 17,
+                    dictionary_blocks: 19,
+                    posting_blocks: 23,
+                    position_docs: 29,
+                })
+            ));
+        }
+        assert_eq!(
+            all.doc(),
+            Some(134),
+            "fuel refusal must precede entering the next block"
+        );
+        assert_eq!(
+            checkpoint.admissions(),
+            3,
+            "a latched refusal must not charge again"
+        );
         Ok(())
     }
 

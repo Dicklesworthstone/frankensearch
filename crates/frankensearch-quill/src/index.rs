@@ -58,11 +58,12 @@ use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::argus::{
-    ArgusError, BMW_MIN_CLAUSES, Bm25FieldSnapshot, CheckpointPostingCursor, DeltaFieldNorms,
-    DeltaPostingCursor, DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer,
-    PhraseTerm, PositionsHandle, PositionsReader, PostingCursor, PruningTelemetry,
-    QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer, ScorerClause, SealedPostingCursor,
-    TermRecordOption, TermScorer, TopDocsCollector, ValidatedArrivalCursor,
+    ALL_LOGICAL_BLOCK_DOCIDS, ArgusError, BMW_MIN_CLAUSES, Bm25FieldSnapshot,
+    CheckpointPostingCursor, DeltaFieldNorms, DeltaPostingCursor, DocSetCollector, FieldNormReader,
+    MAX_SCORE_MAX_CLAUSES, PhraseScorer, PhraseTerm, PositionsHandle, PositionsReader,
+    PostingCursor, PruningTelemetry, QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer,
+    ScorerClause, SealedPostingCursor, TermRecordOption, TermScorer, TopDocsCollector,
+    ValidatedArrivalCursor,
 };
 #[cfg(feature = "pruning-conformance")]
 use crate::argus::{
@@ -4933,6 +4934,7 @@ fn clone_query_checkpoint_for_argus<'a>(
 
 #[derive(Default)]
 struct QueryWorkShape {
+    all_streams: u64,
     posting_streams: u64,
     dictionary_scans: u64,
     string_range_expansions: u64,
@@ -4991,7 +4993,8 @@ impl QueryWorkShape {
         pending.push(query.root_id());
         while let Some(node_id) = pending.pop() {
             match query.node(node_id) {
-                QueryNode::Empty | QueryNode::All => {}
+                QueryNode::Empty => {}
+                QueryNode::All => self.all_streams = self.all_streams.saturating_add(1),
                 QueryNode::AllocationFailure { requested } => {
                     return Err(ArgusError::Allocation {
                         resource: "query arena",
@@ -15901,6 +15904,7 @@ fn query_work_upper_bound(
     let keeper_count = u64::try_from(keeper.segments().len()).unwrap_or(u64::MAX);
 
     let mut physical_docs = 0_u64;
+    let mut all_blocks_per_stream = 0_u64;
     let mut posting_blocks_per_stream = 0_u64;
     let mut dictionary_blocks = 0_u64;
     let mut string_range_term_ceiling = 0_u64;
@@ -15912,6 +15916,12 @@ fn query_work_upper_bound(
         // dictionary admission retains a wire-derived per-term block bound.
         let docs = u64::from(segment.at_seal_doc_count());
         physical_docs = physical_docs.saturating_add(docs);
+        let (docid_lo, docid_hi) = QueryLeaf::Sealed(segment).docid_range();
+        all_blocks_per_stream = all_blocks_per_stream.saturating_add(
+            docid_hi
+                .saturating_sub(docid_lo)
+                .div_ceil(ALL_LOGICAL_BLOCK_DOCIDS),
+        );
         posting_blocks_per_stream =
             posting_blocks_per_stream.saturating_add(segment.max_posting_blocks_per_term());
         let bytes = required_section(segment, SectionKind::TERMDICT)?;
@@ -15937,6 +15947,12 @@ fn query_work_upper_bound(
         // exhaust a budget that was sized for a fraction of the work.
         let docs = u64::try_from(delta.segment().physical_document_count()).unwrap_or(u64::MAX);
         physical_docs = physical_docs.saturating_add(docs);
+        let (docid_lo, docid_hi) = QueryLeaf::Delta(delta).docid_range();
+        all_blocks_per_stream = all_blocks_per_stream.saturating_add(
+            docid_hi
+                .saturating_sub(docid_lo)
+                .div_ceil(ALL_LOGICAL_BLOCK_DOCIDS),
+        );
         posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
         let terms = u64::try_from(delta.segment().term_count()).unwrap_or(u64::MAX);
         dictionary_blocks = dictionary_blocks.saturating_add(terms.div_ceil(16));
@@ -15996,7 +16012,14 @@ fn query_work_upper_bound(
         .saturating_add(shape.phrase_fields)
         .saturating_mul(physical_docs);
 
+    // Match-all walks the physical document-id domain, including holes between
+    // occupied rows. Neither live counts nor stored row counts bound that walk.
+    // A negative-only query uses the same All anchor, so it needs this ceiling
+    // even when none of its excluded posting streams matches a document.
+    let all_blocks = shape.all_streams.saturating_mul(all_blocks_per_stream);
+
     Ok(segment_count
+        .saturating_add(all_blocks)
         .saturating_add(posting_blocks)
         .saturating_add(scanned_dictionary_blocks)
         .saturating_add(indexed_dictionary_blocks)
@@ -17914,11 +17937,12 @@ fn lower_query_with_mode<'a>(
             }
             QueryNode::All => {
                 let (docid_lo, docid_hi) = leaf.docid_range();
-                ReferenceScorer::all_with_boost(
+                ReferenceScorer::all_with_boost_and_checkpoint(
                     docid_lo,
                     docid_hi,
                     leaf.live_document_count()?,
                     inherited_boost,
+                    Some(clone_query_checkpoint_for_argus(checkpoint)),
                 )?
             }
             QueryNode::Term { fields, text } => {
@@ -21789,6 +21813,159 @@ mod tests {
             *posting_blocks,
             *position_docs,
         )
+    }
+
+    fn sparse_match_all_index(sealed: bool, budget: u64) -> QuillIndex {
+        let mut delta =
+            DeltaSegment::new(DELTA_PARITY_SCHEMA, 0, usize::MAX).expect("sparse match-all Delta");
+        for (docid, id, content) in [
+            (7, "first", "alpha"),
+            (70, "deleted", "ghost"),
+            (135, "excluded", "blocked"),
+            (2_055, "empty", ""),
+        ] {
+            apply_typed_delta_document(&mut delta, docid, id, content, 1);
+        }
+        assert_eq!(delta.delete_delta_id("deleted"), Some(70));
+        let source = Arc::new(delta.freeze(0));
+        let config = QuillConfig {
+            query_fuel_budget: budget,
+            ..deterministic_config()
+        };
+        if sealed {
+            typed_residency_index(&[source], &[], config)
+        } else {
+            typed_residency_index(&[], &[source], config)
+        }
+    }
+
+    #[test]
+    fn sparse_match_all_public_queries_enforce_fuel_and_preserve_results() {
+        run_with_cx(|cx| async move {
+            for sealed in [false, true] {
+                let mut index = sparse_match_all_index(sealed, 8);
+                for query in ["*", "-content:blocked"] {
+                    let ranked = index
+                        .search_paginated(&cx, query, 10, 0, true)
+                        .expect_err("a sparse match-all scan must enforce its work budget");
+                    let docids = index
+                        .collect_docids(&cx, query)
+                        .expect_err("scoreless collection must enforce the same work budget");
+                    for error in [&ranked, &docids] {
+                        let (budget, consumed, segments, dictionary, postings, positions) =
+                            fuel_diagnostics(error);
+                        assert_eq!((budget, consumed, segments, positions), (8, 8, 1, 0));
+                        assert!(postings >= 3, "refusal must occur during the physical scan");
+                        if query == "*" {
+                            assert_eq!((dictionary, postings), (0, 7));
+                        }
+                    }
+                }
+
+                index.reader.config.query_fuel_budget = 100;
+                for (query, expected) in [
+                    ("*", vec![7, 135, 2_055]),
+                    ("-content:blocked", vec![7, 2_055]),
+                ] {
+                    let ranked = index
+                        .search_paginated(&cx, query, 10, 0, true)
+                        .expect("sufficient fuel must retain all live matches");
+                    assert_eq!(
+                        ranked.total_count,
+                        Some(u64::try_from(expected.len()).unwrap())
+                    );
+                    assert_eq!(
+                        ranked
+                            .hits
+                            .iter()
+                            .map(|hit| hit.global_docid)
+                            .collect::<Vec<_>>(),
+                        expected,
+                    );
+                    assert!(
+                        ranked
+                            .hits
+                            .iter()
+                            .all(|hit| hit.score.to_bits() == 1.0_f32.to_bits())
+                    );
+                    assert_eq!(
+                        index.collect_docids(&cx, query).expect("complete docids"),
+                        expected
+                    );
+                    let page = index
+                        .search_paginated(&cx, query, 1, 1, false)
+                        .expect("count-free pagination remains exact");
+                    assert_eq!(page.total_count, None);
+                    assert_eq!(page.hits.len(), 1);
+                    assert_eq!(page.hits[0].global_docid, expected[1]);
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn sparse_match_all_public_queries_cancel_mid_scan_and_at_exhaustion() {
+        run_with_cx(|cx| async move {
+            for sealed in [false, true] {
+                let index = sparse_match_all_index(sealed, 100);
+                let snapshot = index.search_snapshot().expect("sparse query snapshot");
+                let controller = index.conformance_cancellation_controller();
+                for query in ["*", "-content:blocked"] {
+                    for ranked in [false, true] {
+                        let invoke = || {
+                            if ranked {
+                                index
+                                    .search_paginated(&cx, query, 10, 0, true)
+                                    .map(|result| {
+                                        result
+                                            .hits
+                                            .iter()
+                                            .map(|hit| hit.global_docid)
+                                            .collect::<Vec<_>>()
+                                    })
+                            } else {
+                                index.collect_docids(&cx, query)
+                            }
+                        };
+                        controller
+                            .arm(ConformanceCancellationStage::QueryCollection, u64::MAX)
+                            .expect("discover match-all collection checkpoints");
+                        let expected = invoke().expect("uninterrupted match-all scan");
+                        let checkpoints = controller.observed_checkpoints();
+                        assert!(
+                            checkpoints > 2_049,
+                            "every physical step must poll cancellation"
+                        );
+                        assert!(!controller.fired());
+                        controller.disarm();
+
+                        for trigger in [checkpoints / 2, checkpoints] {
+                            controller
+                                .arm(ConformanceCancellationStage::QueryCollection, trigger)
+                                .expect("cancel inside the physical match-all scan");
+                            let error = invoke()
+                                .expect_err("cancelled scans must not return partial success");
+                            assert!(matches!(
+                                error,
+                                QuillIndexError::Cancelled { phase }
+                                    if phase == if ranked { "search" } else { "collect_docids" }
+                            ));
+                            assert!(controller.fired());
+                            assert_eq!(controller.observed_checkpoints(), trigger);
+                            assert!(cx.is_cancel_requested());
+                            assert!(Arc::ptr_eq(&snapshot, &index.search_snapshot().unwrap()));
+                            controller.disarm();
+                            cx.set_cancel_requested(false);
+                            assert_eq!(
+                                invoke().expect("fresh retry must retain complete results"),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+        });
     }
 
     #[cfg(feature = "conformance-internals")]
