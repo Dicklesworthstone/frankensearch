@@ -14019,7 +14019,10 @@ mod tests {
             let parsed = ParsedQuery::parse(query);
             let exclusions = to_exclusions(&parsed);
             assert_eq!(
-                find_negative_match(r#"say -unsafe NOT "danger zone" remains useful"#, &exclusions),
+                find_negative_match(
+                    r#"say -unsafe NOT "danger zone" remains useful"#,
+                    &exclusions
+                ),
                 None,
                 "{query}"
             );
@@ -14045,19 +14048,14 @@ mod tests {
             assert_eq!(quoted_results.len(), 10);
 
             let (results, metrics) = searcher
-                .search_collect_with_text(
-                    &cx,
-                    r#""rust -unsafe syntax" -blocked"#,
-                    10,
-                    |doc_id| {
-                        let text = if doc_id == "doc-0" {
-                            "rust -unsafe syntax blocked"
-                        } else {
-                            "rust -unsafe syntax remains useful"
-                        };
-                        Some(text.to_owned())
-                    },
-                )
+                .search_collect_with_text(&cx, r#""rust -unsafe syntax" -blocked"#, 10, |doc_id| {
+                    let text = if doc_id == "doc-0" {
+                        "rust -unsafe syntax blocked"
+                    } else {
+                        "rust -unsafe syntax remains useful"
+                    };
+                    Some(text.to_owned())
+                })
                 .await
                 .expect("quoted syntax must not create extra exclusions");
 

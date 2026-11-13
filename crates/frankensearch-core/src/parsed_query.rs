@@ -381,7 +381,10 @@ mod tests {
     #[test]
     fn normalize_phrase_negations_preserves_positive_source_and_unicode_offsets() {
         for (raw, expected) in [
-            (r#"needle nOt "internal secret""#, r#"needle NOT "internal secret""#),
+            (
+                r#"needle nOt "internal secret""#,
+                r#"needle NOT "internal secret""#,
+            ),
             (r#"\-literal not "secret""#, r#"\-literal NOT "secret""#),
             (
                 r#"title:"not \"secret\"" Not 'outside secret'"#,
@@ -489,10 +492,16 @@ mod tests {
     fn positive_quoted_fragments_do_not_create_exclusions() {
         for (raw, positive) in [
             (r#""alpha -banned" -outside"#, r#""alpha -banned""#),
-            (r#"title:"alpha -banned" -outside"#, r#"title:"alpha -banned""#),
+            (
+                r#"title:"alpha -banned" -outside"#,
+                r#"title:"alpha -banned""#,
+            ),
             ("'alpha -banned' -outside", "'alpha -banned'"),
             ("title:'alpha -banned' -outside", "title:'alpha -banned'"),
-            (r#"title : "alpha -banned" -outside"#, r#"title : "alpha -banned""#),
+            (
+                r#"title : "alpha -banned" -outside"#,
+                r#"title : "alpha -banned""#,
+            ),
             (r#"+("alpha -banned") -outside"#, r#"+("alpha -banned")"#),
             (
                 r#""alpha NOT \"secret\" -banned" -outside"#,

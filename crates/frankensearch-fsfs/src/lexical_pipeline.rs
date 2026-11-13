@@ -39,8 +39,7 @@ pub fn lexical_query_text(query: &str) -> Cow<'_, str> {
             frankensearch_quill::escape_unknown_field_colons(query, DEFAULT_SCHEMA)
         }
         Cow::Owned(query) => Cow::Owned(
-            frankensearch_quill::escape_unknown_field_colons(&query, DEFAULT_SCHEMA)
-                .into_owned(),
+            frankensearch_quill::escape_unknown_field_colons(&query, DEFAULT_SCHEMA).into_owned(),
         ),
     }
 }

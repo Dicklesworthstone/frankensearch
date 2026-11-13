@@ -5122,7 +5122,12 @@ mod tests {
                     assert!(vectors.fast_vector_for_doc_id(id).unwrap().is_some());
                     assert!(vectors.quality_vector_for_doc_id(id).unwrap().is_none());
                 }
-                assert!(vectors.fast_vector_for_doc_id("doc-removed").unwrap().is_none());
+                assert!(
+                    vectors
+                        .fast_vector_for_doc_id("doc-removed")
+                        .unwrap()
+                        .is_none()
+                );
                 assert!(
                     vectors
                         .quality_vector_for_doc_id("doc-removed")
@@ -5464,13 +5469,10 @@ mod tests {
                 assert!(receipt.errors.is_empty());
                 assert!(receipt.published);
 
-                let lexical = QuillIndex::open(
-                    &cx,
-                    dir.path().join("lexical"),
-                    QuillConfig::default(),
-                )
-                .await
-                .expect("reopen replaced index");
+                let lexical =
+                    QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
+                        .await
+                        .expect("reopen replaced index");
                 assert_eq!(LexicalRead::doc_count(&lexical).unwrap(), 2);
                 let mut ids: Vec<_> = lexical
                     .search_doc_ids(&cx, "*", 10)
@@ -5560,13 +5562,10 @@ mod tests {
                 for (path, before) in vector_paths.iter().zip(&original_vectors) {
                     assert_eq!(&std::fs::read(path).unwrap(), before);
                 }
-                let lexical = QuillIndex::open(
-                    &cx,
-                    dir.path().join("lexical"),
-                    QuillConfig::default(),
-                )
-                .await
-                .unwrap();
+                let lexical =
+                    QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
+                        .await
+                        .unwrap();
                 assert_eq!(LexicalRead::doc_count(&lexical).unwrap(), 1);
                 let hits = lexical.search_doc_ids(&cx, "originalsentinel", 10).unwrap();
                 assert_eq!(hits.len(), 1);
@@ -5609,13 +5608,9 @@ mod tests {
             let receipt = stats.lexical.unwrap();
             assert_eq!(receipt.indexed, 2);
             assert!(receipt.errors.is_empty());
-            let lexical = QuillIndex::open(
-                &cx,
-                dir.path().join("lexical"),
-                QuillConfig::default(),
-            )
-            .await
-            .unwrap();
+            let lexical = QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
+                .await
+                .unwrap();
             assert_eq!(LexicalRead::doc_count(&lexical).unwrap(), 2);
             let hits = lexical.search_doc_ids(&cx, "fallbacksentry", 10).unwrap();
             assert_eq!(hits.len(), 1);

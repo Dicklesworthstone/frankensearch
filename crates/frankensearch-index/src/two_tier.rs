@@ -4194,7 +4194,12 @@ mod tests {
 
         let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
         assert!(!reopened.has_quality_index());
-        assert!(reopened.quality_vector_for_doc_id("shared").unwrap().is_none());
+        assert!(
+            reopened
+                .quality_vector_for_doc_id("shared")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4247,8 +4252,7 @@ mod tests {
                     );
                 }
                 drop(built);
-                let reopened =
-                    TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
+                let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
                 assert_eq!(reopened.has_quality_index(), write_quality);
                 assert_eq!(
                     reopened.quality_vector_for_doc_id("shared").unwrap(),
