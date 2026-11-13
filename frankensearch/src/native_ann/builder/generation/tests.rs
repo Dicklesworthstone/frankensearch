@@ -1119,7 +1119,13 @@ fn candidate_preview_scopes_widen_before_fusion_and_never_accept_noop_validation
             );
             assert_eq!(predicates.load(Ordering::SeqCst), 26);
             let before = provider.queries.load(Ordering::SeqCst);
-            for (query, limit) in [("", 1), (" \n\t", 1), ("vertical", 0)] {
+            for (query, limit) in [
+                ("", 1),
+                (" \n\t", 1),
+                ("vertical", 0),
+                ("-private", 1),
+                ("not \"private source\"", 1),
+            ] {
                 assert!(
                     preview
                         .search_text(&cx, provider.as_ref(), query, limit)

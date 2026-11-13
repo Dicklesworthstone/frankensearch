@@ -32,6 +32,7 @@ async fn fixture(cx: &Cx, partitioned: bool, graphs: bool) -> Fixture {
         quality,
     } = update::sharded_tests::fixture(cx, graphs, true).await;
     let weak = Arc::downgrade(&fast);
+    let weak_quality = quality.as_ref().map(Arc::downgrade);
     let paths = |partition: &frankensearch::native_ann::builder::NativeBuiltIndex| {
         let mut paths = Vec::new();
         for tier in std::iter::once(partition.fast()).chain(partition.quality()) {
@@ -79,6 +80,10 @@ async fn fixture(cx: &Cx, partitioned: bool, graphs: bool) -> Fixture {
     assert!(
         weak.upgrade().is_none(),
         "the command fixture owns no models"
+    );
+    assert!(
+        weak_quality.is_none_or(|model| model.upgrade().is_none()),
+        "the command fixture owns no quality model"
     );
     let receipt = root.path().join("keyword.json");
     save_selection(&selection, &receipt).unwrap();
@@ -286,6 +291,150 @@ fn keyword_scope_collects_before_cutoff_and_preserves_raw_scores_and_metadata() 
                 .unwrap();
             assert_eq!(empty["scope"]["eligible_documents"], 0);
             assert!(empty["results"].as_array().unwrap().is_empty());
+        }
+    });
+}
+
+#[test]
+fn keyword_exclusions_normalize_phrases_and_fill_boolean_tails_without_models() {
+    run_test_with_cx(|cx| async move {
+        for partitioned in [false, true] {
+            let f = fixture(&cx, partitioned, false).await;
+            hide_semantic_files(&f);
+            let index = Opened::open(&cx, &f.selection).await.unwrap();
+            let phrase = index
+                .reader
+                .search_results(&cx, r#"common NOT "common stable""#, 100)
+                .unwrap();
+            assert_eq!(phrase.len(), 1);
+            assert_eq!(phrase[0].doc_id, "c");
+            let exclusion_only = index
+                .reader
+                .search_results(&cx, r#"NOT "common stable""#, 100)
+                .unwrap();
+            assert_eq!(exclusion_only.len(), 1);
+            assert_eq!(exclusion_only[0].doc_id, "c");
+
+            let boolean_query = "obsolete OR common AND -obsolete";
+            let raw = index
+                .reader
+                .search_results(&cx, boolean_query, 100)
+                .unwrap();
+            assert_eq!(raw.len(), f.expected.len());
+            assert_eq!(
+                raw[0].doc_id, "c",
+                "the excluded OR branch must lead the unfiltered window"
+            );
+            let eligible = raw
+                .into_iter()
+                .filter(|hit| hit.doc_id != "c")
+                .collect::<Vec<_>>();
+            assert!(!eligible.is_empty());
+
+            for (text, expected, limit) in [
+                (r#"common not "common stable""#, phrase, 100),
+                (r#"not "common stable""#, exclusion_only, 100),
+                (boolean_query, eligible[..1].to_vec(), 1),
+                ("common -neverpresent", f.expected.clone(), 100),
+                ("-common", Vec::new(), 100),
+            ] {
+                for stream in [false, true] {
+                    let mut options = options(&f.receipt, &[]);
+                    options.query = Some(text.to_owned());
+                    options.limit = limit;
+                    options.stream = stream;
+                    let mut output = Vec::new();
+                    // Both providers have been dropped, vector files are absent,
+                    // and no model-loading pool is supplied to the real dispatcher.
+                    Box::pin(crate::execute(&cx, options, &mut output, None))
+                        .await
+                        .unwrap();
+                    let records = frames(&output);
+                    let page = &records[usize::from(stream)];
+                    assert_eq!(page["phase"], "lexical");
+                    assert_eq!(page["semantic_components_verified"], false);
+                    assert_eq!(
+                        page["source_layout"],
+                        if partitioned { "sharded" } else { "single" }
+                    );
+                    assert_eq!(
+                        results(&page["results"]),
+                        serde_json::to_value(&expected).unwrap(),
+                        "{text}"
+                    );
+                    if stream {
+                        assert_eq!(records.len(), 3);
+                        assert_eq!(records[0]["event"], "started");
+                        assert_eq!(records[2]["status"], "complete");
+                    }
+                }
+            }
+            assert!(f.derived.iter().all(|path| !path.exists()));
+        }
+    });
+}
+
+#[test]
+fn keyword_server_intersects_fixed_and_request_scopes_with_global_exclusions() {
+    run_test_with_cx(|cx| async move {
+        for partitioned in [false, true] {
+            let f = fixture(&cx, partitioned, false).await;
+            hide_semantic_files(&f);
+            let index = Opened::open(&cx, &f.selection).await.unwrap();
+            let text = "obsolete OR common AND -obsolete";
+            let raw = index.reader.search_results(&cx, text, 100).unwrap();
+            assert_eq!(raw[0].doc_id, "c");
+            let target = raw.last().unwrap();
+            assert_ne!(target.doc_id, "c");
+            let outside = raw
+                .iter()
+                .find(|hit| hit.doc_id != "c" && hit.doc_id != target.doc_id)
+                .unwrap();
+            let mut options = server_options(&f.receipt);
+            options.limit = 1;
+            options.filter = Some(
+                filter::Filter::parse(
+                    &serde_json::json!({
+                        "ids": ["c", target.doc_id], "metadata": {"version": "old"},
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            );
+            let mut output = Vec::new();
+            serve_with_io(&cx, &options, &mut keyword_input(&[
+                serde_json::json!({"id":"inherited", "query":text}),
+                serde_json::json!({"id":"wide", "query":text, "filter":{"ids":["c",target.doc_id,outside.doc_id]}}),
+                serde_json::json!({"id":"excluded", "query":text, "filter":{"ids":["c"]}}),
+                serde_json::json!({"id":"outside", "query":text, "filter":{"ids":[outside.doc_id]}}),
+            ]), &mut output).await.unwrap();
+            let records = frames(&output);
+            let pages = records
+                .iter()
+                .filter(|record| record["event"] == "results")
+                .collect::<Vec<_>>();
+            assert_eq!(pages.len(), 4);
+            for page in &pages[..2] {
+                assert_eq!(
+                    results(&page["results"]),
+                    serde_json::to_value([target]).unwrap()
+                );
+                // Scope counts remain source-policy membership. Query exclusions
+                // narrow the matching page without relabeling the fixed scope.
+                assert_eq!(page["scope"]["eligible_documents"], 2);
+                assert_eq!(page["semantic_components_verified"], false);
+            }
+            assert_eq!(pages[2]["scope"]["eligible_documents"], 1);
+            assert_eq!(pages[3]["scope"]["eligible_documents"], 0);
+            for page in &pages[2..] {
+                assert!(page["results"].as_array().unwrap().is_empty());
+            }
+            let completions = records
+                .iter()
+                .filter(|record| record["status"] == "complete")
+                .count();
+            assert_eq!(completions, 4);
+            assert!(f.derived.iter().all(|path| !path.exists()));
         }
     });
 }

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use frankensearch_core::ParsedQuery;
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 
 use super::super::{checkpoint, invalid};
@@ -179,6 +180,14 @@ impl NativeBuiltHybridIndex {
     /// Propagates native hybrid admission, inference, lexical and cancellation errors.
     pub async fn search(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
         let fast = self.vectors.fast();
+        if ParsedQuery::parse(text).has_negations() {
+            return fast
+                .index()
+                .search_hybrid_progressive(cx, fast.embedder(), None, &self.lexical, text, k)?
+                .with_immutable_query()
+                .collect()
+                .await;
+        }
         fast.index()
             .search_hybrid_text(cx, fast.embedder(), &self.lexical, text, k)
             .await
@@ -199,6 +208,22 @@ impl NativeBuiltHybridIndex {
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<ScoredResult>> {
         let fast = self.vectors.fast();
+        if ParsedQuery::parse(text).has_negations() {
+            return fast
+                .index
+                .search_hybrid_progressive_with_pool(
+                    cx,
+                    fast.embedder(),
+                    None,
+                    &self.lexical,
+                    text,
+                    k,
+                    pool,
+                )?
+                .with_immutable_query()
+                .collect()
+                .await;
+        }
         fast.index
             .search_hybrid_text_with_pool(cx, fast.embedder(), &self.lexical, text, k, pool)
             .await
@@ -216,6 +241,9 @@ impl NativeBuiltHybridIndex {
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
+        if ParsedQuery::parse(text).has_negations() {
+            return self.progressive(cx, text, k)?.collect().await;
+        }
         let fast = self.vectors.fast();
         match self.vectors.quality() {
             Some(quality) => {
@@ -245,6 +273,12 @@ impl NativeBuiltHybridIndex {
         k: usize,
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<ScoredResult>> {
+        if ParsedQuery::parse(text).has_negations() {
+            return self
+                .progressive_with_pool(cx, text, k, pool)?
+                .collect()
+                .await;
+        }
         let fast = self.vectors.fast();
         match self.vectors.quality() {
             Some(quality) => {
@@ -282,6 +316,16 @@ impl NativeBuiltHybridIndex {
                 "quality-primary search requires a built quality tier",
             )
         })?;
+        if ParsedQuery::parse(text).has_negations() {
+            let mut results = quality
+                .index()
+                .search_hybrid_progressive(cx, quality.embedder(), None, &self.lexical, text, k)?
+                .with_immutable_query()
+                .collect()
+                .await?;
+            super::scope::quality_provenance(cx, &mut results)?;
+            return Ok(results);
+        }
         quality
             .index()
             .search_hybrid_quality_text(cx, quality.embedder(), &self.lexical, text, k)
@@ -307,6 +351,24 @@ impl NativeBuiltHybridIndex {
                 "quality-primary search requires a built quality tier",
             )
         })?;
+        if ParsedQuery::parse(text).has_negations() {
+            let mut results = quality
+                .index
+                .search_hybrid_progressive_with_pool(
+                    cx,
+                    quality.embedder(),
+                    None,
+                    &self.lexical,
+                    text,
+                    k,
+                    pool,
+                )?
+                .with_immutable_query()
+                .collect()
+                .await?;
+            super::scope::quality_provenance(cx, &mut results)?;
+            return Ok(results);
+        }
         quality
             .index
             .search_hybrid_quality_text_with_pool(
@@ -331,16 +393,18 @@ impl NativeBuiltHybridIndex {
         k: usize,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         let fast = self.vectors.fast();
-        fast.index().search_hybrid_progressive(
-            cx,
-            fast.embedder(),
-            self.vectors
-                .quality()
-                .map(|quality| (quality.index(), quality.embedder())),
-            &self.lexical,
-            text,
-            k,
-        )
+        fast.index()
+            .search_hybrid_progressive(
+                cx,
+                fast.embedder(),
+                self.vectors
+                    .quality()
+                    .map(|quality| (quality.index(), quality.embedder())),
+                &self.lexical,
+                text,
+                k,
+            )
+            .map(NativeProgressiveSearch::with_immutable_query)
     }
 
     /// Prepare progressive native retrieval with retained vector traversal on
@@ -356,17 +420,19 @@ impl NativeBuiltHybridIndex {
         pool: BlockingPoolHandle,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         let fast = self.vectors.fast();
-        fast.index.search_hybrid_progressive_with_pool(
-            cx,
-            fast.embedder(),
-            self.vectors
-                .quality()
-                .map(|quality| (&quality.index, quality.embedder())),
-            &self.lexical,
-            text,
-            k,
-            pool,
-        )
+        fast.index
+            .search_hybrid_progressive_with_pool(
+                cx,
+                fast.embedder(),
+                self.vectors
+                    .quality()
+                    .map(|quality| (&quality.index, quality.embedder())),
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )
+            .map(NativeProgressiveSearch::with_immutable_query)
     }
 
     /// Prepare lazy native retrieval and cross-encoder reranking using the EXACT

@@ -11,6 +11,50 @@ new indexing engine, runtime library, or model download service. The retrieval
 engines are native; the standard quality embedder uses ONNX Runtime. The explicit
 `hybrid-native` profile below uses the existing native transformer instead.
 
+## Query exclusions
+
+Native search supports `-term`, `-"exact phrase"`, and `NOT "exact phrase"`.
+Phrase exclusions also accept single quotes and case-insensitive `NOT`.
+Quoted positive text and escaped literal dashes retain their original lexical
+syntax. For example, `"alpha -beta" -deprecated` searches for the positive
+phrase while excluding documents that match `deprecated`.
+
+Recognized exclusions constrain the whole query, including every Boolean
+branch: `alpha OR beta AND -deprecated` cannot return a document matching
+`deprecated` through either its lexical or vector score. Quill still receives
+the original query, with recognized phrase-negation keywords normalized, so
+its positive clauses, fields, phrases, boosts and relative lexical scores keep
+their usual meaning. Exclusion membership uses that same reader's term and
+phrase matching rules, including its indexed fields; it is not a substring
+check against a newly opened source file.
+
+Before the first retrieval phase, the query captures all matching excluded IDs
+from the retained immutable cohort, bounded by its document count. Explicit
+ID, prefix and metadata scopes remain conjunctive. Both vector tiers use the
+existing filtered candidate widening; lexical retrieval widens the original
+ranked window until enough eligible candidates remain or the matching corpus
+is exhausted. Initial, Refined and Reranked retain the same excluded IDs and
+source generation. Query exclusions do not change the persistent scope count
+reported as `scope.eligible_documents`.
+
+Embedding and cross-encoder inference receive only the positive query text.
+A query containing only exclusions, such as `-deprecated`, returns the lexical
+complement without invoking either embedding model or the reranker. Semantic
+entry points still validate every required tier and producer identity; this
+does not grant a fallback from failed semantic admission. Unpublished candidate
+previews reject exclusion-only queries because lexical results cannot prove
+that a replacement producer executed successfully.
+
+These rules apply to ordinary and sharded native search, retained-authority
+queries, streaming, serving, and explicit model-free keyword modes. The library
+entry points on `NativeBuiltHybridIndex`, `NativeBuiltShardedHybridIndex`,
+`NativeGenerationSnapshot`, their source scopes, and the fenced
+`NativeQuillSnapshot` share this preparation. The lower-level
+`NativeAnnIndex::search_hybrid_*` and `NativeShardSet::search_hybrid_*` operations
+accept independently supplied readers and text; they do not infer an immutable
+source cohort or add global exclusion handling. Direct `LexicalRead` access
+continues to expose the underlying lexical query grammar.
+
 ## Build and index
 
 ```sh

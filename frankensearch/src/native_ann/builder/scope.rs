@@ -495,7 +495,10 @@ impl NativeScopedGenerationPreview {
     }
 }
 
-fn quality_provenance(cx: &Cx, results: &mut [ScoredResult]) -> SearchResult<()> {
+pub(in crate::native_ann) fn quality_provenance(
+    cx: &Cx,
+    results: &mut [ScoredResult],
+) -> SearchResult<()> {
     for result in results {
         checkpoint(cx, "native_ann.generation_scope.quality_result")?;
         if let Some(score) = result.fast_score.take() {
@@ -1374,6 +1377,7 @@ impl LexicalRead for ScopedLexical<'_> {
 
 #[cfg(test)]
 mod tests {
+    mod query_exclusion_tests;
     mod sharded_tests;
 
     use super::*;
@@ -1400,6 +1404,7 @@ mod tests {
         foreign: EmbeddingIdentityBundleV1,
         advertise_foreign: AtomicBool,
         queries: AtomicUsize,
+        query_texts: Mutex<Vec<String>>,
         drops: AtomicUsize,
         hold: AtomicBool,
         fail: AtomicBool,
@@ -1425,6 +1430,7 @@ mod tests {
                 foreign,
                 advertise_foreign: AtomicBool::new(false),
                 queries: AtomicUsize::new(0),
+                query_texts: Mutex::new(Vec::new()),
                 drops: AtomicUsize::new(0),
                 hold: AtomicBool::new(false),
                 fail: AtomicBool::new(false),
@@ -1486,10 +1492,11 @@ mod tests {
         fn embed_bound<'a>(
             &'a self,
             _cx: &'a Cx,
-            _text: &'a str,
+            text: &'a str,
         ) -> SearchFuture<'a, IdentityBoundEmbedding> {
             Box::pin(async move {
                 self.queries.fetch_add(1, Ordering::SeqCst);
+                self.query_texts.lock().unwrap().push(text.to_owned());
                 let _drop = DropCount(&self.drops);
                 if self.hold.load(Ordering::SeqCst) {
                     return std::future::pending().await;

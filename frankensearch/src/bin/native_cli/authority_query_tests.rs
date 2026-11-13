@@ -13,6 +13,7 @@ struct Model {
     identity: EmbeddingIdentityBundleV1,
     quality: bool,
     calls: AtomicUsize,
+    queries: Mutex<Vec<String>>,
     delay_ns: AtomicU64,
     clock: Arc<VirtualClock>,
 }
@@ -24,6 +25,7 @@ impl Embedder for Model {
     fn embed<'a>(&'a self, _: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.queries.lock().unwrap().push(text.to_owned());
             self.clock.advance(self.delay_ns.load(Ordering::SeqCst));
             Ok(match text {
                 "needle" => vec![1.0, 0.0],
@@ -55,6 +57,7 @@ struct Scorer {
     calls: AtomicUsize,
     drops: AtomicUsize,
     mode: AtomicUsize,
+    queries: Mutex<Vec<String>>,
     seen: Mutex<Vec<Vec<(String, String)>>>,
 }
 
@@ -76,11 +79,12 @@ impl Reranker for Scorer {
     fn rerank<'a>(
         &'a self,
         _: &'a Cx,
-        _: &'a str,
+        query: &'a str,
         documents: &'a [RerankDocument],
     ) -> SearchFuture<'a, Vec<RerankScore>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.queries.lock().unwrap().push(query.to_owned());
             let _owned_work = ScorerDrop(&self.drops);
             self.seen.lock().unwrap().push(
                 documents
@@ -143,6 +147,7 @@ async fn fixture(cx: &Cx, full: bool, ann: bool) -> Fixture {
             identity,
             quality,
             calls: AtomicUsize::new(0),
+            queries: Mutex::new(Vec::new()),
             delay_ns: AtomicU64::new(0),
             clock: Arc::clone(&clock),
         })
@@ -237,6 +242,7 @@ async fn fixture(cx: &Cx, full: bool, ann: bool) -> Fixture {
         calls: AtomicUsize::new(0),
         drops: AtomicUsize::new(0),
         mode: AtomicUsize::new(0),
+        queries: Mutex::new(Vec::new()),
         seen: Mutex::new(Vec::new()),
     });
     Fixture {
@@ -271,6 +277,162 @@ fn parsed(extra: &[&str]) -> Result<Option<Options>> {
     ];
     arguments.extend_from_slice(extra);
     parse(&arguments)
+}
+
+const EXCLUSIONS: &str =
+    r#"not "vector source" nOt "quality source" -excluded -"outside source budget""#;
+
+fn exclusion_phases(mode: &str, stream: bool) -> &'static [&'static str] {
+    match (mode, stream) {
+        ("full", true) => &["initial", "refined"],
+        ("full", false) => &["refined"],
+        ("quality", _) => &["quality"],
+        ("lexical", _) => &["lexical"],
+        ("fast", _) => &["initial"],
+        _ => panic!("unexpected exclusion test mode"),
+    }
+}
+
+fn assert_keyword_exclusion_results(output: &[serde_json::Value], phases: &[&str]) {
+    assert_eq!(output[0]["event"], "ready");
+    assert_eq!(output.len(), phases.len() + 1, "{output:?}");
+    for (frame, phase) in output[1..].iter().zip(phases) {
+        assert_eq!(frame["event"], "results", "{frame:?}");
+        assert_eq!(frame["phase"], *phase);
+        let results = frame["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "{frame:?}");
+        assert_eq!(results[0]["doc_id"], "keyword", "{frame:?}");
+        assert_eq!(results[0]["metadata"]["source_id"], "keyword");
+    }
+}
+
+#[test]
+fn authority_exclusions_filter_semantic_winners_and_embed_only_positive_text() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            for scoped in [false, true] {
+                let mut f = fixture(&cx, true, ann).await;
+                if !scoped {
+                    f.session.scope = None;
+                    f.session.fixed_filter = None;
+                }
+                let retained = Arc::clone(&f.session.snapshot);
+                let identity = f.session.receipt.identity.clone();
+                let text = format!("needle {EXCLUSIONS}");
+                for mode in ["fast", "quality", "full", "lexical"] {
+                    for stream in [false, true] {
+                        f.fast.queries.lock().unwrap().clear();
+                        f.quality.queries.lock().unwrap().clear();
+                        let output = exchange(
+                            &cx,
+                            &mut f.session,
+                            &[serde_json::json!({
+                                "query": text, "mode": mode, "limit": 1, "stream": stream,
+                            })],
+                        )
+                        .await;
+                        assert_keyword_exclusion_results(&output, exclusion_phases(mode, stream));
+                        for (model, expected) in [
+                            (&f.fast, usize::from(matches!(mode, "fast" | "full"))),
+                            (&f.quality, usize::from(matches!(mode, "quality" | "full"))),
+                        ] {
+                            let queries = model.queries.lock().unwrap();
+                            assert_eq!(queries.len(), expected, "{mode}/{stream}/{scoped}");
+                            assert!(queries.iter().all(|query| query == "needle"), "{queries:?}");
+                        }
+                        if scoped {
+                            assert_eq!(output.last().unwrap()["scope"]["eligible_documents"], 3);
+                        }
+                    }
+                }
+                assert!(Arc::ptr_eq(&retained, &f.session.snapshot));
+                assert_eq!(f.session.receipt.identity, identity);
+            }
+        }
+    });
+}
+
+#[test]
+fn negative_only_authority_queries_skip_both_models_and_configured_reranking() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            for scoped in [false, true] {
+                let mut f = fixture(&cx, true, ann).await;
+                if !scoped {
+                    f.session.scope = None;
+                    f.session.fixed_filter = None;
+                }
+                install(&mut f, false, true);
+                let before = [
+                    f.fast.calls.load(Ordering::SeqCst),
+                    f.quality.calls.load(Ordering::SeqCst),
+                    f.scorer.calls.load(Ordering::SeqCst),
+                ];
+                for mode in ["fast", "quality", "full", "lexical"] {
+                    for stream in [false, true] {
+                        let output = exchange(
+                            &cx,
+                            &mut f.session,
+                            &[serde_json::json!({
+                                "query": EXCLUSIONS, "mode": mode, "limit": 1, "stream": stream,
+                            })],
+                        )
+                        .await;
+                        assert_keyword_exclusion_results(&output, exclusion_phases(mode, stream));
+                        for frame in &output[1..] {
+                            let result = &frame["results"][0];
+                            assert_eq!(result["source"], "Lexical");
+                            assert!(result["index"].is_null());
+                            assert!(result["fast_score"].is_null());
+                            assert!(result["quality_score"].is_null());
+                            assert!(result["rerank_score"].is_null());
+                        }
+                    }
+                }
+                assert_eq!(f.fast.calls.load(Ordering::SeqCst), before[0]);
+                assert_eq!(f.quality.calls.load(Ordering::SeqCst), before[1]);
+                assert_eq!(f.scorer.calls.load(Ordering::SeqCst), before[2]);
+            }
+        }
+    });
+}
+
+#[test]
+fn authority_exclusions_and_request_scope_constrain_retained_rerank_sources() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let mut f = fixture(&cx, true, true).await;
+        install(&mut f, false, true);
+        let retained = Arc::clone(&f.session.snapshot);
+        let identity = f.session.receipt.identity.clone();
+        for stream in [false, true] {
+            let output = exchange(
+                &cx,
+                &mut f.session,
+                &[serde_json::json!({
+                    "query": r#"needle not "vector source" nOt "quality source""#,
+                    "mode": "full", "limit": 1, "stream": stream,
+                    "filter": {"ids": ["keyword", "excluded"]},
+                })],
+            )
+            .await;
+            assert_keyword_exclusion_results(
+                &output,
+                if stream {
+                    &["initial", "refined", "reranked"]
+                } else {
+                    &["reranked"]
+                },
+            );
+            assert_eq!(output.last().unwrap()["scope"]["eligible_documents"], 1);
+            assert_eq!(
+                f.scorer.seen.lock().unwrap().last().unwrap(),
+                &vec![("keyword".to_owned(), "needle keyword".to_owned())],
+            );
+        }
+        assert_eq!(*f.scorer.queries.lock().unwrap(), ["needle", "needle"]);
+        assert!(Arc::ptr_eq(&retained, &f.session.snapshot));
+        assert_eq!(f.session.receipt.identity, identity);
+    });
 }
 
 #[test]
@@ -759,8 +921,7 @@ fn caller_pool_reaches_every_authority_query_mode_and_preserves_retained_results
                 // run a retained exact scan or graph traversal on the executor.
                 assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
                 for request in &requests {
-                    let output =
-                        exchange(&cx, &mut f.session, std::slice::from_ref(request)).await;
+                    let output = exchange(&cx, &mut f.session, std::slice::from_ref(request)).await;
                     assert_eq!(output.len(), 2, "{output:?}");
                     assert_eq!(output[1]["event"], "failed");
                     assert_eq!(output[1]["code"], "query_or_activation_refused");

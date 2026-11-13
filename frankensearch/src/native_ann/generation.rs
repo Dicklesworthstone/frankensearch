@@ -17,7 +17,7 @@ use frankensearch_core::generation::{
     GenerationRootSecurityProfileV1, InvariantKind, SourceCheckpointV1, resolve_authority_slots_v1,
     validate_manifest,
 };
-use frankensearch_core::with_cancellation;
+use frankensearch_core::{ParsedQuery, with_cancellation};
 use frankensearch_index::ann_cohort::NativeAnnCohortV1;
 use frankensearch_index::exact_component_adapters::{
     ann_component_receipt, vector_component_receipt,
@@ -322,7 +322,12 @@ impl NativeGenerationPreview {
         eligible: usize,
     ) -> SearchResult<()> {
         checkpoint(cx, "native_ann.generation.preview")?;
-        if text.trim().is_empty() || k == 0 || eligible == 0 {
+        let parsed = ParsedQuery::parse(text);
+        if text.trim().is_empty()
+            || (parsed.has_negations() && parsed.is_positive_empty())
+            || k == 0
+            || eligible == 0
+        {
             return Err(refused("preview", "nonempty-semantic-query-required"));
         }
         Ok(())
@@ -1319,6 +1324,42 @@ impl CompositeReaders {
         requested.min(usize::try_from(self.vector.owner_witness().live_count).unwrap_or(usize::MAX))
     }
 
+    fn primary_query<'a>(
+        &'a self,
+        cx: &'a Cx,
+        embedder: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        quality_only: bool,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let index = if quality_only && self.tier != EmbedderTierTag::Quality {
+            self.full_quality()?
+        } else {
+            &self.vector
+        };
+        let search = match pool {
+            Some(pool) => index.search_hybrid_progressive_with_pool(
+                cx,
+                embedder,
+                None,
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+                pool,
+            )?,
+            None => index.search_hybrid_progressive(
+                cx,
+                embedder,
+                None,
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+            )?,
+        };
+        Ok(search.with_retained_metadata(self))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn scoped_progressive<'a>(
         &'a self,
@@ -1372,9 +1413,8 @@ impl CompositeReaders {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let query = lexical.query_text(text);
         let response = with_cancellation(cx, "native_ann.generation.lexical_response", async {
-            lexical.search_candidates(cx, &query, k).await
+            super::hybrid::immutable_candidates(cx, lexical, text, k).await
         })
         .await;
         checkpoint(cx, "native_ann.generation.lexical_response")?;
@@ -1699,6 +1739,16 @@ impl CompositeReaders {
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.search")?;
         let k = self.bounded_limit(k);
+        if ParsedQuery::parse(text).has_negations() {
+            let mut results = self
+                .primary_query(cx, embedder, text, k, false, None)?
+                .collect()
+                .await?;
+            if self.tier == EmbedderTierTag::Quality {
+                super::builder::scope::quality_provenance(cx, &mut results)?;
+            }
+            return Ok(results);
+        }
         let mut results = match self.tier {
             EmbedderTierTag::Fast => {
                 self.vector
@@ -1725,6 +1775,16 @@ impl CompositeReaders {
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.search")?;
         let k = self.bounded_limit(k);
+        if ParsedQuery::parse(text).has_negations() {
+            let mut results = self
+                .primary_query(cx, embedder, text, k, false, Some(pool))?
+                .collect()
+                .await?;
+            if self.tier == EmbedderTierTag::Quality {
+                super::builder::scope::quality_provenance(cx, &mut results)?;
+            }
+            return Ok(results);
+        }
         let mut results = match self.tier {
             EmbedderTierTag::Fast => {
                 self.vector
@@ -1756,6 +1816,14 @@ impl CompositeReaders {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.quality_search")?;
+        if ParsedQuery::parse(text).has_negations() {
+            let mut results = self
+                .primary_query(cx, embedder, text, k, true, None)?
+                .collect()
+                .await?;
+            super::builder::scope::quality_provenance(cx, &mut results)?;
+            return Ok(results);
+        }
         let quality = if self.tier == EmbedderTierTag::Quality {
             &self.vector
         } else {
@@ -1777,6 +1845,14 @@ impl CompositeReaders {
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.quality_search")?;
+        if ParsedQuery::parse(text).has_negations() {
+            let mut results = self
+                .primary_query(cx, embedder, text, k, true, Some(pool))?
+                .collect()
+                .await?;
+            super::builder::scope::quality_provenance(cx, &mut results)?;
+            return Ok(results);
+        }
         let quality = if self.tier == EmbedderTierTag::Quality {
             &self.vector
         } else {
@@ -1805,6 +1881,12 @@ impl CompositeReaders {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.refined_search")?;
+        if ParsedQuery::parse(text).has_negations() {
+            return self
+                .search_progressive_with_quality(cx, fast, quality, text, k)?
+                .collect()
+                .await;
+        }
         let mut results = self
             .vector
             .search_hybrid_refined_text(
@@ -1830,6 +1912,12 @@ impl CompositeReaders {
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.refined_search")?;
+        if ParsedQuery::parse(text).has_negations() {
+            return self
+                .search_progressive_with_quality_and_pool(cx, fast, quality, text, k, pool)?
+                .collect()
+                .await;
+        }
         let mut results = self
             .vector
             .search_hybrid_refined_text_with_pool(

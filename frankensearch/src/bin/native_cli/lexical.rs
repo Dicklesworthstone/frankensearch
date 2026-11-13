@@ -10,6 +10,8 @@ use frankensearch::native_ann::builder::sharded::{
     NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits,
 };
 use frankensearch::{LexicalRead, SearchError};
+use frankensearch_core::ParsedQuery;
+use frankensearch_core::parsed_query::{normalize_phrase_negation_keywords, quote_query_phrase};
 use frankensearch_quill::QuillSearchIndex;
 
 use super::{
@@ -117,6 +119,38 @@ impl Opened {
         for filter in filters.iter().flatten() {
             filter.validate()?;
         }
+        let parsed = ParsedQuery::parse(text);
+        let mut excluded = BTreeSet::new();
+        if parsed.has_negations() && !self.documents.is_empty() {
+            // This reader is private to this admitted immutable source cohort.
+            // Match the same term/phrase normalization as native hybrid search,
+            // collecting complete membership before any candidate cutoff.
+            let query = parsed
+                .negative_terms
+                .iter()
+                .map(|term| self.reader.query_text(term).into_owned())
+                .chain(
+                    parsed
+                        .negative_phrases
+                        .iter()
+                        .map(|phrase| quote_query_phrase(phrase)),
+                )
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let hits = self
+                .reader
+                .search_doc_ids(cx, &query, self.documents.len())?;
+            for hit in hits.iter() {
+                checkpoint(cx)?;
+                if self.document(&hit.document_id).is_none()
+                    || !excluded.insert(hit.document_id.clone())
+                {
+                    return Err(bad(
+                        "keyword exclusion membership is not a unique retained source set",
+                    ));
+                }
+            }
+        }
         let allowed = if filters.iter().any(Option::is_some) {
             let mut allowed = BTreeSet::new();
             for document in &self.documents {
@@ -143,12 +177,13 @@ impl Opened {
             // cutoff/hydration, rather than underfilling an unfiltered top-k.
             // This deliberately trades candidate memory for a simple exact
             // scope contract; the already-admitted source ceiling bounds it.
-            let width = if eligible == self.documents.len() {
+            let width = if eligible == self.documents.len() && excluded.is_empty() {
                 target
             } else {
                 self.documents.len()
             };
-            let query_text = self.reader.query_text(text);
+            let normalized = normalize_phrase_negation_keywords(text);
+            let query_text = self.reader.query_text(&normalized);
             let batch = self
                 .reader
                 .search_candidates(cx, &query_text, width)
@@ -176,6 +211,7 @@ impl Opened {
             for candidate in candidates {
                 checkpoint(cx)?;
                 if results.len() < target
+                    && !excluded.contains(candidate.doc_id.as_str())
                     && allowed
                         .as_ref()
                         .is_none_or(|ids| ids.contains(candidate.doc_id.as_str()))
