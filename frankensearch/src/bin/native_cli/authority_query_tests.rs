@@ -339,6 +339,7 @@ fn authority_exclusions_filter_semantic_winners_and_embed_only_positive_text() {
                             let queries = model.queries.lock().unwrap();
                             assert_eq!(queries.len(), expected, "{mode}/{stream}/{scoped}");
                             assert!(queries.iter().all(|query| query == "needle"), "{queries:?}");
+                            drop(queries);
                         }
                         if scoped {
                             assert_eq!(output.last().unwrap()["scope"]["eligible_documents"], 3);
