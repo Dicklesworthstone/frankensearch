@@ -3254,7 +3254,19 @@ impl TantivyIndex {
     /// Returns `SearchError::SubsystemError` if the writer lock is poisoned
     /// or cancelled.
     pub async fn delete_document(&self, cx: &Cx, doc_id: &str) -> SearchResult<()> {
-        let term = Term::from_field_text(self.fields.id, doc_id);
+        self.delete_documents(cx, &[doc_id]).await
+    }
+
+    /// Delete a batch of document IDs with one commit and reader refresh.
+    ///
+    /// Missing or repeated IDs are harmless. A successful return makes every
+    /// deletion visible before releasing the writer lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if writer admission, commit, or reader refresh
+    /// fails, including attempts to mutate a read-only index.
+    pub async fn delete_documents(&self, cx: &Cx, doc_ids: &[&str]) -> SearchResult<()> {
         let mut writer_guard = self
             .writer
             .lock(cx)
@@ -3263,7 +3275,9 @@ impl TantivyIndex {
         let Some(writer) = writer_guard.as_mut() else {
             return Err(Self::read_only_writer_error("delete"));
         };
-        writer.delete_term(term);
+        for doc_id in doc_ids {
+            writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
+        }
         writer
             .commit()
             .map_err(|error| SearchError::SubsystemError {
@@ -3281,7 +3295,11 @@ impl TantivyIndex {
         let actual = Self::checked_searcher_doc_count(&self.reader.searcher())?;
         self.doc_count.store(actual, Ordering::Relaxed);
 
-        debug!(doc_count = actual, %doc_id, "tantivy delete committed and reloaded");
+        debug!(
+            doc_count = actual,
+            requested = doc_ids.len(),
+            "tantivy delete committed and reloaded"
+        );
         Ok(())
     }
 
@@ -6217,6 +6235,48 @@ mod tests {
                 LexicalRead::doc_count(&idx).expect("count refreshed readable generation"),
                 1
             );
+        });
+    }
+
+    #[test]
+    fn delete_documents_publishes_one_batch_and_survives_reopen() {
+        run_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let index = TantivyIndex::create(dir.path()).expect("create");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("retained", "batch visibility sentinel"),
+                        IndexableDocument::new("deleted-a", "batch visibility sentinel"),
+                        IndexableDocument::new("deleted-b", "batch visibility sentinel"),
+                    ],
+                )
+                .await
+                .expect("index");
+            index.commit(&cx).await.expect("publish source corpus");
+            index
+                .delete_documents(&cx, &["deleted-a", "missing", "deleted-b", "deleted-a"])
+                .await
+                .expect("publish batch deletion");
+
+            let hits = index
+                .search(&cx, "batch visibility sentinel", 10)
+                .await
+                .expect("read refreshed generation");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "retained");
+            assert_eq!(index.doc_count().unwrap(), 1);
+            drop(index);
+
+            let reopened = TantivyIndex::open_read_only(dir.path()).expect("reopen");
+            let hits = reopened
+                .search(&cx, "batch visibility sentinel", 10)
+                .await
+                .expect("read persisted generation");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "retained");
+            assert_eq!(reopened.doc_count().unwrap(), 1);
         });
     }
 

@@ -451,9 +451,21 @@ impl IndexBuilder {
         self
     }
 
-    /// Build the index, embedding all documents and writing FSVI files.
+    /// Build the supplied corpus, embedding documents and writing FSVI files.
     ///
-    /// Returns build statistics including per-document errors.
+    /// Rebuilding an existing index replaces its corpus: supplied IDs are
+    /// updated, and omitted IDs are removed from both vector and lexical
+    /// results. Use the incremental APIs to retain documents not supplied here.
+    /// A nonempty lexical corpus requires unique, nonempty replacement IDs;
+    /// lexical replacement errors abort the build instead of retaining stale
+    /// content in a successful receipt. Fresh builds retain per-document
+    /// lexical error accounting.
+    ///
+    /// Publication across vector and lexical arms remains sequential. An
+    /// interrupted or failed build can expose different generations; a
+    /// successful replacement has completed every selected arm.
+    ///
+    /// Returns build statistics including per-document embedding errors.
     ///
     /// # Errors
     ///
@@ -491,6 +503,7 @@ impl IndexBuilder {
                 cx,
                 &self.data_dir.join("lexical"),
                 false,
+                &self.documents,
             ))
             .await
             .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?
@@ -501,7 +514,10 @@ impl IndexBuilder {
         #[cfg(feature = "lexical-tantivy")]
         let tantivy_lexical = if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy))
         {
-            match prepare_existing_tantivy_lexical_index(&self.data_dir.join("lexical")) {
+            match prepare_existing_tantivy_lexical_index(
+                &self.data_dir.join("lexical"),
+                &self.documents,
+            ) {
                 Ok(index) => index,
                 Err(error) => {
                     export_error(metrics_exporter.as_ref(), &error);
@@ -831,6 +847,13 @@ impl IndexBuilder {
             return Err(error);
         }
 
+        // The Tantivy-only lane borrows the input documents; Quill moves
+        // every input into lexical staging, including failed embeddings.
+        #[cfg(all(feature = "lexical-tantivy", not(feature = "quill")))]
+        let lexical_docs = self.documents.as_slice();
+        #[cfg(feature = "quill")]
+        let lexical_docs = lexical_docs.as_slice();
+
         // Admit a new writer only after embedding/cancellation succeeds, but
         // still before replacing vector generations. Recheck an initially
         // empty path in case another builder populated it while we embedded.
@@ -842,6 +865,7 @@ impl IndexBuilder {
                 cx,
                 &self.data_dir.join("lexical"),
                 true,
+                lexical_docs,
             ))
             .await
             .inspect_err(|error| export_error(metrics_exporter.as_ref(), error))?
@@ -853,15 +877,13 @@ impl IndexBuilder {
             && tantivy_lexical.is_none()
         {
             let lexical_path = self.data_dir.join("lexical");
-            let prepared =
-                prepare_existing_tantivy_lexical_index(&lexical_path).and_then(|existing| {
-                    match existing {
-                        Some(index) => Ok(index),
-                        None => {
-                            let index = TantivyIndex::create(&lexical_path)?;
-                            validate_tantivy_adapter_schema(&index, &lexical_path)?;
-                            Ok(index)
-                        }
+            let prepared = prepare_existing_tantivy_lexical_index(&lexical_path, lexical_docs)
+                .and_then(|existing| match existing {
+                    Some(index) => Ok(index),
+                    None => {
+                        let index = TantivyIndex::create(&lexical_path)?;
+                        validate_tantivy_adapter_schema(&index, &lexical_path)?;
+                        PreparedLexicalIndex::new(index, Vec::new(), lexical_docs)
                     }
                 });
             match prepared {
@@ -897,13 +919,6 @@ impl IndexBuilder {
 
         #[cfg(not(any(feature = "quill", feature = "lexical-tantivy")))]
         let (lexical_receipt, lexical_ms): (Option<LexicalArmReceipt>, f64) = (None, 0.0);
-        // The Tantivy-only feature lane retains the existing borrowed embedding
-        // loop and its input ownership. An explicit writer can use those same
-        // documents without a staging clone, including failed embeddings.
-        #[cfg(all(feature = "lexical-tantivy", not(feature = "quill")))]
-        let lexical_docs = self.documents.as_slice();
-        #[cfg(feature = "quill")]
-        let lexical_docs = lexical_docs.as_slice();
         #[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
         let (lexical_receipt, lexical_ms) = if let Some(backend) =
             self.lexical_backend.filter(|_| !lexical_docs.is_empty())
@@ -940,8 +955,9 @@ impl IndexBuilder {
                 ),
                 // Publication failure (create/seal/commit) stays fatal: a
                 // half-written lexical index is worse than an absent arm.
-                // Per-document indexing errors are NOT fatal; they are
-                // reported in the receipt.
+                // Fresh-build document errors are reported in the receipt.
+                // Rebuild document errors are fatal because retaining an old
+                // lexical body beside a new vector would misreport success.
                 Err(error) => {
                     export_error(metrics_exporter.as_ref(), &error);
                     return Err(error);
@@ -1842,12 +1858,83 @@ async fn open_lexical_reader(
     Ok((None, None))
 }
 
+#[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+struct PreparedLexicalIndex<I> {
+    index: I,
+    replacement: bool,
+    stale_ids: Vec<String>,
+}
+
+#[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+impl<I> PreparedLexicalIndex<I> {
+    fn new(
+        index: I,
+        mut previous_ids: Vec<String>,
+        documents: &[IndexableDocument],
+    ) -> SearchResult<Self> {
+        let replacement = !previous_ids.is_empty();
+        if replacement {
+            let mut incoming_ids = std::collections::HashSet::with_capacity(documents.len());
+            for document in documents {
+                if document.id.is_empty() || !incoming_ids.insert(document.id.as_str()) {
+                    return Err(SearchError::InvalidConfig {
+                        field: "documents.id".to_owned(),
+                        value: document.id.clone(),
+                        reason: "corpus replacement requires unique, nonempty document IDs"
+                            .to_owned(),
+                    });
+                }
+            }
+            previous_ids.retain(|id| !incoming_ids.contains(id.as_str()));
+        }
+        Ok(Self {
+            index,
+            replacement,
+            stale_ids: previous_ids,
+        })
+    }
+}
+
+#[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+fn lexical_replacement_error(detail: String) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "facade.lexical.replacement",
+        source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, detail)),
+    }
+}
+
+#[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+fn lexical_replacement_receipt(
+    index: &dyn LexicalRead,
+    backend: &'static str,
+    data_dir: &Path,
+    attempted: usize,
+) -> SearchResult<LexicalArmReceipt> {
+    let actual = index.doc_count()?;
+    if actual != attempted {
+        return Err(lexical_replacement_error(format!(
+            "{} contains {actual} documents after replacement with {attempted}",
+            data_dir.display()
+        )));
+    }
+    Ok(LexicalArmReceipt {
+        backend,
+        path: data_dir.to_path_buf(),
+        attempted,
+        indexed: attempted,
+        errors: Vec::new(),
+        generation: None,
+        published: true,
+    })
+}
+
 #[cfg(feature = "quill")]
 async fn prepare_quill_lexical_index(
     cx: &Cx,
     data_dir: &Path,
     create_if_empty: bool,
-) -> SearchResult<Option<QuillIndex>> {
+    documents: &[IndexableDocument],
+) -> SearchResult<Option<PreparedLexicalIndex<QuillIndex>>> {
     build_checkpoint(cx, "Quill lexical index initialization")?;
     // bd-8nqz.2: never initialize Quill on top of a foreign, damaged,
     // blue-green, or ambiguous layout — MANIFEST absence is NOT emptiness.
@@ -1896,7 +1983,30 @@ async fn prepare_quill_lexical_index(
         QuillIndex::create(cx, data_dir, config).await?
     };
     build_checkpoint(cx, "Quill lexical writer admission")?;
-    Ok(Some(lexical))
+    // Enumerate the complete live corpus while retaining the admitted writer,
+    // before any vector publication. Match-all includes documents with no
+    // indexed terms and skips sparse global-ID holes and tombstones.
+    let snapshot = lexical.search_snapshot()?;
+    let mut previous_ids = Vec::new();
+    for global_id in lexical.collect_docids(cx, "*")? {
+        build_checkpoint(cx, "Quill lexical replacement admission")?;
+        let id = snapshot.materialize_document_id(global_id).ok_or_else(|| {
+            lexical_replacement_error(format!(
+                "cannot materialize incumbent Quill document {global_id}"
+            ))
+        })?;
+        previous_ids.push(id.to_string());
+    }
+    if u64::try_from(previous_ids.len()).ok() != Some(snapshot.live_doc_count()) {
+        return Err(lexical_replacement_error(
+            "Quill incumbent enumeration does not match the admitted live corpus".to_owned(),
+        ));
+    }
+    Ok(Some(PreparedLexicalIndex::new(
+        lexical,
+        previous_ids,
+        documents,
+    )?))
 }
 
 #[cfg(feature = "quill")]
@@ -1904,9 +2014,28 @@ async fn build_lexical_index(
     cx: &Cx,
     data_dir: &Path,
     documents: &[IndexableDocument],
-    lexical: QuillIndex,
+    prepared: PreparedLexicalIndex<QuillIndex>,
 ) -> SearchResult<LexicalArmReceipt> {
     build_checkpoint(cx, "Quill lexical document indexing")?;
+    let PreparedLexicalIndex {
+        index: lexical,
+        replacement,
+        stale_ids,
+    } = prepared;
+
+    if replacement {
+        // The whole batch must succeed: an updated vector must never be
+        // reported as successfully rebuilt beside a rejected old lexical body.
+        lexical.upsert_documents(cx, documents).await?;
+        build_checkpoint(cx, "Quill lexical replacement publication")?;
+        let _ = lexical.finish_bulk_load(cx).await?;
+        if !stale_ids.is_empty() {
+            let stale_ids: Vec<&str> = stale_ids.iter().map(String::as_str).collect();
+            lexical.delete_documents(cx, &stale_ids).await?;
+        }
+        build_checkpoint(cx, "Quill lexical replacement complete")?;
+        return lexical_replacement_receipt(&lexical, "quill", data_dir, documents.len());
+    }
 
     // Per-document indexing so one rejected document (duplicate id, oversized
     // field) cannot silently void the whole arm; failures land in the
@@ -1978,7 +2107,10 @@ async fn build_lexical_index(
 }
 
 #[cfg(feature = "lexical-tantivy")]
-fn prepare_existing_tantivy_lexical_index(data_dir: &Path) -> SearchResult<Option<TantivyIndex>> {
+fn prepare_existing_tantivy_lexical_index(
+    data_dir: &Path,
+    documents: &[IndexableDocument],
+) -> SearchResult<Option<PreparedLexicalIndex<TantivyIndex>>> {
     let map_io_error = |source| SearchError::SubsystemError {
         subsystem: "tantivy",
         source: Box::new(source),
@@ -2013,7 +2145,16 @@ fn prepare_existing_tantivy_lexical_index(data_dir: &Path) -> SearchResult<Optio
     // would admit an existing writer conflict until after vector publication.
     let writer = TantivyIndex::open(data_dir)?;
     validate_tantivy_adapter_schema(&writer, data_dir)?;
-    Ok(Some(writer))
+    let previous_ids = writer
+        .all_doc_ids()?
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect();
+    Ok(Some(PreparedLexicalIndex::new(
+        writer,
+        previous_ids,
+        documents,
+    )?))
 }
 
 #[cfg(feature = "lexical-tantivy")]
@@ -2067,11 +2208,27 @@ async fn build_tantivy_lexical_index(
     cx: &Cx,
     data_dir: &Path,
     documents: &[IndexableDocument],
-    lexical: TantivyIndex,
+    prepared: PreparedLexicalIndex<TantivyIndex>,
 ) -> SearchResult<LexicalArmReceipt> {
     use frankensearch_core::traits::LexicalWrite;
 
     build_checkpoint(cx, "Tantivy lexical index initialization")?;
+    let PreparedLexicalIndex {
+        index: lexical,
+        replacement,
+        stale_ids,
+    } = prepared;
+    if replacement {
+        lexical.index_documents(cx, documents).await?;
+        build_checkpoint(cx, "Tantivy lexical replacement publication")?;
+        lexical.commit(cx).await?;
+        if !stale_ids.is_empty() {
+            let stale_ids: Vec<&str> = stale_ids.iter().map(String::as_str).collect();
+            lexical.delete_documents(cx, &stale_ids).await?;
+        }
+        build_checkpoint(cx, "Tantivy lexical replacement complete")?;
+        return lexical_replacement_receipt(&lexical, "tantivy", data_dir, documents.len());
+    }
     let mut indexed = 0usize;
     let mut errors: Vec<(String, String)> = Vec::new();
     for document in documents {
@@ -3956,63 +4113,73 @@ mod tests {
         });
     }
 
-    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[cfg(feature = "lexical-tantivy")]
     #[test]
-    fn tantivy_builder_reopens_existing_tantivy_and_preserves_upserts() {
+    fn tantivy_builder_replaces_existing_corpus_and_upserts_once() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = retained_tantivy_builder_dir();
-            let lexical_path = dir.join("lexical");
-            let existing = TantivyIndex::create(&lexical_path).expect("create existing Tantivy");
-            frankensearch_core::traits::LexicalWrite::index_documents(
-                &existing,
-                &cx,
-                &[
-                    IndexableDocument::new("doc-upsert", "oldsentinel"),
-                    IndexableDocument::new("doc-retained", "retainedsentinel"),
-                ],
-            )
-            .await
-            .expect("index existing documents");
-            frankensearch_core::traits::LexicalWrite::commit(&existing, &cx)
-                .await
-                .expect("commit existing Tantivy");
-            drop(existing);
-
-            let stats = IndexBuilder::new(&dir)
-                .with_embedder_stack(tantivy_hash_stack())
+            IndexBuilder::new(&dir)
+                .with_embedder_stack(stub_stack())
                 .with_tantivy_lexical()
-                .add_document("doc-upsert", "newsentinel")
+                .add_document("doc-upsert", "oldsentinel")
+                .add_document("doc-removed", "removedsentinel")
+                .add_document("doc-empty", "")
                 .build(&cx)
                 .await
-                .expect("reopen and update the existing Tantivy generation");
-            let receipt = stats.lexical.expect("updated lexical receipt");
-            assert_eq!(receipt.attempted, 1);
-            assert_eq!(receipt.indexed, 1);
-            assert!(receipt.errors.is_empty());
-            assert!(receipt.published);
-            let lexical =
-                TantivyIndex::open_read_only(&lexical_path).expect("reopen updated index");
-            assert_eq!(
-                LexicalRead::doc_count(&lexical).expect("count documents"),
-                2
-            );
-            assert!(
-                lexical
-                    .search(&cx, "oldsentinel", 10)
+                .expect("publish original corpus");
+
+            // Repeating the replacement must neither duplicate supplied IDs
+            // nor resurrect documents omitted from the requested corpus.
+            for _ in 0..2 {
+                let stats = IndexBuilder::new(&dir)
+                    .with_embedder_stack(stub_stack())
+                    .with_tantivy_lexical()
+                    .add_document("doc-upsert", "newsentinel improved")
+                    .add_document("doc-added", "addedsentinel")
+                    .build(&cx)
                     .await
-                    .expect("query replaced content")
-                    .is_empty()
-            );
-            for (query, expected) in [
-                ("newsentinel", "doc-upsert"),
-                ("retainedsentinel", "doc-retained"),
-            ] {
-                let hits = lexical
-                    .search(&cx, query, 10)
-                    .await
-                    .expect("query existing index");
-                assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].doc_id, expected);
+                    .expect("replace the existing Tantivy corpus");
+                assert_eq!(stats.source_count, 2);
+                assert_eq!(stats.doc_count, 2);
+                assert_eq!(stats.quality_indexed, 2);
+                let receipt = stats.lexical.expect("replacement receipt");
+                assert_eq!(receipt.attempted, 2);
+                assert_eq!(receipt.indexed, 2);
+                assert!(receipt.errors.is_empty());
+                assert!(receipt.published);
+
+                let lexical = TantivyIndex::open_read_only(&dir.join("lexical"))
+                    .expect("reopen replaced index");
+                assert_eq!(LexicalRead::doc_count(&lexical).unwrap(), 2);
+                let ids: Vec<_> = lexical
+                    .all_doc_ids()
+                    .unwrap()
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect();
+                assert_eq!(ids, vec!["doc-added", "doc-upsert"]);
+                for query in ["oldsentinel", "removedsentinel"] {
+                    assert!(lexical.search(&cx, query, 10).await.unwrap().is_empty());
+                }
+                for (query, expected) in [
+                    ("newsentinel", "doc-upsert"),
+                    ("addedsentinel", "doc-added"),
+                ] {
+                    let hits = lexical.search(&cx, query, 10).await.unwrap();
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].doc_id, expected);
+                }
+
+                let vectors = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+                assert_eq!(vectors.doc_count(), 2);
+                for id in ["doc-upsert", "doc-added"] {
+                    assert!(vectors.fast_vector_for_doc_id(id).unwrap().is_some());
+                    assert!(vectors.quality_vector_for_doc_id(id).unwrap().is_some());
+                }
+                for id in ["doc-removed", "doc-empty"] {
+                    assert!(vectors.fast_vector_for_doc_id(id).unwrap().is_none());
+                    assert!(vectors.quality_vector_for_doc_id(id).unwrap().is_none());
+                }
             }
         });
     }
@@ -5194,13 +5361,221 @@ mod tests {
             let lexical = QuillIndex::open(&cx, &lexical_path, QuillConfig::default())
                 .await
                 .expect("the successful build releases its writer");
-            for (query, id) in [
-                ("retainedadmissionsentinel", "doc-retained"),
-                ("newadmissionsentinel", "doc-new"),
+            assert!(
+                lexical
+                    .search_doc_ids(&cx, "retainedadmissionsentinel", 10)
+                    .unwrap()
+                    .is_empty(),
+                "the prior corpus must be replaced while retaining writer admission",
+            );
+            let hits = lexical
+                .search_doc_ids(&cx, "newadmissionsentinel", 10)
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].document_id, "doc-new");
+            assert_eq!(LexicalRead::doc_count(&lexical).unwrap(), 1);
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_builder_replaces_existing_corpus_and_upserts_once() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-upsert", "oldsentinel")
+                .add_document("doc-removed", "removedsentinel")
+                .add_document("doc-empty", "")
+                .build(&cx)
+                .await
+                .expect("publish original corpus");
+            let original = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+            let old_fast = original.fast_vector_for_doc_id("doc-upsert").unwrap();
+            let old_quality = original.quality_vector_for_doc_id("doc-upsert").unwrap();
+            drop(original);
+
+            for _ in 0..2 {
+                let stats = IndexBuilder::new(dir.path())
+                    .with_embedder_stack(stub_stack())
+                    .add_document("doc-upsert", "newsentinel improved")
+                    .add_document("doc-added", "addedsentinel")
+                    .build(&cx)
+                    .await
+                    .expect("replace the existing Quill corpus");
+                assert_eq!(stats.source_count, 2);
+                assert_eq!(stats.doc_count, 2);
+                assert_eq!(stats.quality_indexed, 2);
+                let receipt = stats.lexical.expect("replacement receipt");
+                assert_eq!(receipt.attempted, 2);
+                assert_eq!(receipt.indexed, 2);
+                assert!(receipt.errors.is_empty());
+                assert!(receipt.published);
+
+                let lexical = QuillIndex::open(
+                    &cx,
+                    dir.path().join("lexical"),
+                    QuillConfig::default(),
+                )
+                .await
+                .expect("reopen replaced index");
+                assert_eq!(LexicalRead::doc_count(&lexical).unwrap(), 2);
+                let mut ids: Vec<_> = lexical
+                    .search_doc_ids(&cx, "*", 10)
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit.document_id.clone())
+                    .collect();
+                ids.sort_unstable();
+                assert_eq!(ids, vec!["doc-added", "doc-upsert"]);
+                for query in ["oldsentinel", "removedsentinel"] {
+                    assert!(lexical.search_doc_ids(&cx, query, 10).unwrap().is_empty());
+                }
+                for (query, expected) in [
+                    ("newsentinel", "doc-upsert"),
+                    ("addedsentinel", "doc-added"),
+                ] {
+                    let hits = lexical.search_doc_ids(&cx, query, 10).unwrap();
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].document_id, expected);
+                }
+
+                let vectors = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+                assert_eq!(vectors.doc_count(), 2);
+                for id in ["doc-upsert", "doc-added"] {
+                    assert!(vectors.fast_vector_for_doc_id(id).unwrap().is_some());
+                    assert!(vectors.quality_vector_for_doc_id(id).unwrap().is_some());
+                }
+                for id in ["doc-removed", "doc-empty"] {
+                    assert!(vectors.fast_vector_for_doc_id(id).unwrap().is_none());
+                    assert!(vectors.quality_vector_for_doc_id(id).unwrap().is_none());
+                }
+                assert_ne!(
+                    vectors.fast_vector_for_doc_id("doc-upsert").unwrap(),
+                    old_fast
+                );
+                assert_ne!(
+                    vectors.quality_vector_for_doc_id("doc-upsert").unwrap(),
+                    old_quality
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_rebuild_rejects_ambiguous_ids_and_empty_input_before_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-original", "originalsentinel")
+                .build(&cx)
+                .await
+                .unwrap();
+            let vector_paths = [
+                dir.path().join(VECTOR_INDEX_FAST_FILENAME),
+                dir.path().join(VECTOR_INDEX_QUALITY_FILENAME),
+            ];
+            let original_vectors: Vec<_> = vector_paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            for documents in [
+                Vec::new(),
+                vec![
+                    IndexableDocument::new("doc-original", "first replacement"),
+                    IndexableDocument::new("doc-original", "second replacement"),
+                ],
+                vec![
+                    IndexableDocument::new("", "invalid replacement"),
+                    IndexableDocument::new("doc-new", "new replacement"),
+                ],
             ] {
-                let hits = lexical.search_doc_ids(&cx, query, 10).unwrap();
+                let progress = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&progress);
+                let error = IndexBuilder::new(dir.path())
+                    .with_embedder_stack(stub_stack())
+                    .with_progress(move |_| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .add_documents(documents)
+                    .build(&cx)
+                    .await
+                    .expect_err("ambiguous replacement must not publish");
+                assert!(matches!(error, SearchError::InvalidConfig { .. }));
+                assert_eq!(progress.load(Ordering::SeqCst), 0);
+                for (path, before) in vector_paths.iter().zip(&original_vectors) {
+                    assert_eq!(&std::fs::read(path).unwrap(), before);
+                }
+                let lexical = QuillIndex::open(
+                    &cx,
+                    dir.path().join("lexical"),
+                    QuillConfig::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(LexicalRead::doc_count(&lexical).unwrap(), 1);
+                let hits = lexical.search_doc_ids(&cx, "originalsentinel", 10).unwrap();
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].document_id, id);
+                assert_eq!(hits[0].document_id, "doc-original");
+            }
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_rebuild_keeps_lexical_fallback_for_failed_embeddings() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-upsert", "oldsentinel")
+                .add_document("doc-removed", "removedsentinel")
+                .build(&cx)
+                .await
+                .unwrap();
+            let quality = Arc::new(StubEmbedder {
+                id: "stub-quality",
+                dim: 4,
+            });
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(EmbedderStack::from_parts(
+                    Arc::new(SelectiveFailEmbedder),
+                    Some(quality),
+                ))
+                .add_document("doc-upsert", "fail-fast-embedding fallbacksentry")
+                .add_document("doc-added", "addedsentinel")
+                .build(&cx)
+                .await
+                .expect("lexical replacement remains independent of embedding success");
+            assert_eq!(stats.source_count, 2);
+            assert_eq!(stats.doc_count, 1);
+            assert_eq!(stats.error_count, 1);
+            assert_eq!(stats.errors[0].0, "doc-upsert");
+            assert_eq!(stats.quality_indexed, 1);
+            let receipt = stats.lexical.unwrap();
+            assert_eq!(receipt.indexed, 2);
+            assert!(receipt.errors.is_empty());
+            let lexical = QuillIndex::open(
+                &cx,
+                dir.path().join("lexical"),
+                QuillConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(LexicalRead::doc_count(&lexical).unwrap(), 2);
+            let hits = lexical.search_doc_ids(&cx, "fallbacksentry", 10).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].document_id, "doc-upsert");
+            for query in ["oldsentinel", "removedsentinel"] {
+                assert!(lexical.search_doc_ids(&cx, query, 10).unwrap().is_empty());
+            }
+            let vectors = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+            assert_eq!(vectors.doc_count(), 1);
+            for id in ["doc-upsert", "doc-removed"] {
+                assert!(vectors.fast_vector_for_doc_id(id).unwrap().is_none());
+                assert!(vectors.quality_vector_for_doc_id(id).unwrap().is_none());
             }
         });
     }
