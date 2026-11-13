@@ -4406,6 +4406,94 @@ mod tests {
 
     #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
     #[test]
+    fn tantivy_builder_refuses_unidentifiable_corpus_before_replacing_vectors() {
+        use frankensearch_lexical::{
+            Count, DocAddress, Index, IndexReader, IndexRecordOption, IndexWriter, TantivyDocument,
+            Term, TermQuery,
+        };
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let lexical_path = dir.join("lexical");
+            std::fs::create_dir(&lexical_path).unwrap();
+            let template = TantivyIndex::in_memory().unwrap();
+            let schema = template.index_handle().schema();
+            let tokenizers = template.index_handle().tokenizers().clone();
+            let id = schema.get_field("id").unwrap();
+            let content = schema.get_field("content").unwrap();
+            drop(template);
+            let mut incumbent = Index::create_in_dir(&lexical_path, schema).unwrap();
+            incumbent.set_tokenizers(tokenizers);
+            let mut writer: IndexWriter = incumbent.writer(50_000_000).unwrap();
+            let mut damaged = TantivyDocument::default();
+            damaged.add_text(content, "orphansentinel");
+            writer.add_document(damaged).unwrap();
+            writer.commit().unwrap();
+            drop(writer);
+
+            // This is the exact adapter schema and one real searchable,
+            // committed row, but its stored identifier cannot be enumerated.
+            let reader: IndexReader = incumbent.reader().unwrap();
+            let query = TermQuery::new(
+                Term::from_field_text(content, "orphansentinel"),
+                IndexRecordOption::Basic,
+            );
+            assert_eq!(reader.searcher().search(&query, &Count).unwrap(), 1);
+            let stored: TantivyDocument = reader
+                .searcher()
+                .doc(DocAddress::new(0, 0))
+                .expect("read the actual stored fixture");
+            assert!(stored.get_first(id).is_none());
+            let admitted = TantivyIndex::open_read_only(&lexical_path).unwrap();
+            assert_eq!(LexicalRead::doc_count(&admitted).unwrap(), 1);
+            drop(admitted);
+
+            let mut vectors = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+            vectors
+                .add_record("retained", &[1.0, 0.0], Some(&[0.0, 1.0]))
+                .unwrap();
+            drop(vectors.finish().unwrap());
+            let vector_paths = [
+                dir.join(VECTOR_INDEX_FAST_FILENAME),
+                dir.join(VECTOR_INDEX_QUALITY_FILENAME),
+            ];
+            let before_vectors: Vec<_> = vector_paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            let before_meta = std::fs::read(lexical_path.join("meta.json")).unwrap();
+            let progress = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&progress);
+            let error = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .with_progress(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })
+                .add_document("replacement", "replacementsentinel")
+                .build(&cx)
+                .await
+                .expect_err("unidentifiable incumbent rows must refuse before publication");
+            assert!(matches!(
+                error,
+                SearchError::SubsystemError {
+                    subsystem: "tantivy.document_id",
+                    ..
+                }
+            ));
+            assert_eq!(progress.load(Ordering::SeqCst), 0);
+            for (path, before) in vector_paths.iter().zip(&before_vectors) {
+                assert_eq!(&std::fs::read(path).unwrap(), before);
+            }
+            assert_eq!(
+                std::fs::read(lexical_path.join("meta.json")).unwrap(),
+                before_meta,
+            );
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
     fn tantivy_builder_preserves_legacy_schema_without_ordinal_field() {
         use frankensearch_lexical::{Index, Schema};
 

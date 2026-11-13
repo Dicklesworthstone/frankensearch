@@ -713,9 +713,9 @@ mod tests {
         )
     }
 
-    fn assert_refusal(error: SearchError, field: &str) {
+    fn assert_refusal(error: &SearchError, field: &str) {
         assert!(
-            matches!(&error, SearchError::InvalidConfig { field: actual, .. }
+            matches!(error, SearchError::InvalidConfig { field: actual, .. }
             if actual == field),
             "expected {field}, got {error:?}"
         );
@@ -833,7 +833,7 @@ mod tests {
             .unwrap();
             let current = live.install(&cx, &update).await.unwrap();
             assert_refusal(
-                live.install(&cx, &stale).await.unwrap_err(),
+                &live.install(&cx, &stale).await.unwrap_err(),
                 "native_ann.live.expected_current",
             );
             assert!(Arc::ptr_eq(
@@ -972,7 +972,7 @@ mod tests {
             let current = live.install(&cx, &first).await.unwrap();
             for candidate in [&late, &first] {
                 assert_refusal(
-                    live.install(&cx, candidate).await.unwrap_err(),
+                    &live.install(&cx, candidate).await.unwrap_err(),
                     "native_ann.live.expected_current",
                 );
             }
@@ -1020,7 +1020,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_refusal(
-                other.install(&cx, &candidate).await.unwrap_err(),
+                &other.install(&cx, &candidate).await.unwrap_err(),
                 "native_ann.live.expected_current",
             );
             assert!(Arc::ptr_eq(
@@ -1177,7 +1177,7 @@ mod tests {
                 .build(&cx)
                 .await
                 .unwrap_err();
-            assert_refusal(error, "native_ann.live.test_provider");
+            assert_refusal(&error, "native_ann.live.test_provider");
             quality.fail_batches.store(false, Ordering::SeqCst);
             assert!(Arc::ptr_eq(
                 &live.snapshot(&cx).await.unwrap().index,
@@ -1255,7 +1255,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert_refusal(rollback, "native_ann.live.generation");
+            assert_refusal(&rollback, "native_ann.live.generation");
             assert!(Arc::ptr_eq(
                 &live.snapshot(&cx).await.unwrap().index,
                 &installed.index

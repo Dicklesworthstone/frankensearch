@@ -4577,7 +4577,8 @@ async fn refill_lexical_after_exclusions(
     }
 }
 
-#[cfg(any(feature = "graph", test))]
+// The optional graph-pool filter is compiled even without graph support.
+// Keep its helper available in every build, including non-test libraries.
 fn filter_scored_results_by_negations(
     mut results: Vec<ScoredResult>,
     exclusions: &NormalizedExclusions,

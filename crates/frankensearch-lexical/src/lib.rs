@@ -3645,6 +3645,23 @@ impl TantivyIndex {
         self.collect_id_hits(&searcher, hits)
     }
 
+    fn require_stored_document_id<'a>(
+        &self,
+        document: &'a TantivyDocument,
+        address: DocAddress,
+    ) -> SearchResult<&'a str> {
+        document
+            .get_first(self.fields.id)
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| SearchError::SubsystemError {
+                subsystem: "tantivy.document_id",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("live Tantivy document {address:?} has no stored string ID"),
+                )),
+            })
+    }
+
     /// Enumerate every live document identifier in the committed index.
     ///
     /// This is intended for generation reconciliation and repair paths that
@@ -3654,8 +3671,9 @@ impl TantivyIndex {
     ///
     /// # Errors
     ///
-    /// Returns `SearchError` if a live stored document cannot be loaded or the
-    /// segment ordinal cannot be represented by Tantivy's address type.
+    /// Returns `SearchError` if a live stored document cannot be loaded, has no
+    /// stored string ID, or the segment ordinal cannot be represented by
+    /// Tantivy's address type.
     pub fn all_doc_ids(&self) -> SearchResult<Vec<DocId>> {
         let searcher = self.reader.searcher();
         let mut ids = Vec::with_capacity(self.doc_count.load(Ordering::Relaxed));
@@ -3670,13 +3688,9 @@ impl TantivyIndex {
                 if segment.is_deleted(doc_id) {
                     continue;
                 }
-                let doc = load_doc(&searcher, DocAddress::new(segment_ord, doc_id))?;
-                if let Some(doc_id) = doc
-                    .get_first(self.fields.id)
-                    .and_then(|value| value.as_str())
-                {
-                    ids.push(DocId::from(doc_id));
-                }
+                let address = DocAddress::new(segment_ord, doc_id);
+                let doc = load_doc(&searcher, address)?;
+                ids.push(DocId::from(self.require_stored_document_id(&doc, address)?));
             }
         }
         ids.sort_unstable();
@@ -3691,8 +3705,8 @@ impl TantivyIndex {
     ///
     /// # Errors
     ///
-    /// Returns `SearchError` if a stored live document cannot be loaded or its
-    /// metadata payload is malformed.
+    /// Returns `SearchError` if a stored live document cannot be loaded, has no
+    /// stored string ID, or its metadata payload is malformed.
     pub fn all_documents(&self) -> SearchResult<Vec<IndexableDocument>> {
         let searcher = self.reader.searcher();
         let mut documents = std::collections::BTreeMap::new();
@@ -3707,13 +3721,9 @@ impl TantivyIndex {
                 if segment.is_deleted(doc_id) {
                     continue;
                 }
-                let doc = load_doc(&searcher, DocAddress::new(segment_ord, doc_id))?;
-                let Some(id) = doc
-                    .get_first(self.fields.id)
-                    .and_then(|value| value.as_str())
-                else {
-                    continue;
-                };
+                let address = DocAddress::new(segment_ord, doc_id);
+                let doc = load_doc(&searcher, address)?;
+                let id = self.require_stored_document_id(&doc, address)?;
                 let content = doc
                     .get_first(self.fields.content)
                     .and_then(|value| value.as_str())
@@ -6537,6 +6547,73 @@ mod tests {
             assert_eq!(exported[0].content, "alpha");
             assert_eq!(exported[1].content, "gamma");
         });
+    }
+
+    #[test]
+    fn reconciliation_exports_refuse_live_documents_without_stored_ids() {
+        for include_known in [false, true] {
+            let idx = TantivyIndex::in_memory().expect("create real Tantivy index");
+            run_with_cx(|cx| async move {
+                if include_known {
+                    idx.index_documents(
+                        &cx,
+                        &[IndexableDocument::new("retained", "knownsentinel")],
+                    )
+                    .await
+                    .expect("index known document");
+                }
+                let mut damaged = TantivyDocument::default();
+                damaged.add_text(idx.fields.content, "orphansentinel");
+                assert!(damaged.get_first(idx.fields.id).is_none());
+                {
+                    let writer = idx.writer.lock(&cx).await.expect("lock real writer");
+                    writer
+                        .as_ref()
+                        .expect("writable index")
+                        .add_document(damaged)
+                        .expect("persist document without a stored ID");
+                }
+                idx.commit(&cx).await.expect("publish fixture");
+                assert_eq!(idx.doc_count().unwrap(), usize::from(include_known) + 1);
+
+                let id_error = idx
+                    .all_doc_ids()
+                    .expect_err("authoritative enumeration must not silently omit a live row");
+                let export_error = idx
+                    .all_documents()
+                    .expect_err("shadow export must not silently omit a live row");
+                for error in [id_error, export_error] {
+                    assert!(matches!(
+                        error,
+                        SearchError::SubsystemError {
+                            subsystem: "tantivy.document_id",
+                            ..
+                        }
+                    ));
+                }
+
+                // A deleted malformed row is no longer part of the corpus.
+                {
+                    let writer = idx.writer.lock(&cx).await.expect("lock real writer");
+                    writer
+                        .as_ref()
+                        .expect("writable index")
+                        .delete_term(Term::from_field_text(idx.fields.content, "orphansentinel"));
+                }
+                idx.commit(&cx).await.expect("publish deletion");
+                let expected = if include_known {
+                    vec![DocId::from("retained")]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(idx.all_doc_ids().unwrap(), expected);
+                let exported = idx.all_documents().expect("export remaining live corpus");
+                assert_eq!(exported.len(), usize::from(include_known));
+                if include_known {
+                    assert_eq!(exported[0].id, "retained");
+                }
+            });
+        }
     }
 
     #[test]

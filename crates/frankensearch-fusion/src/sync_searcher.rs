@@ -2835,6 +2835,7 @@ mod tests {
                         reason: "cancelled while widening".to_owned(),
                     });
                 }
+                drop(limits);
                 Ok((0..limit.min(72))
                     .map(|rank| lexical_result(&format!("lex-{rank:02}"), (72 - rank) as f32))
                     .collect())
