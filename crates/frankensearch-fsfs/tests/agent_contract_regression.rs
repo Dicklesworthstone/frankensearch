@@ -891,6 +891,7 @@ fn compact_envelope_success_has_expected_shape() {
             hits: vec![],
             ms: Some(42),
             phase: Some("fast".to_string()),
+            recovery_plans: Default::default(),
         }),
         err: None,
         w: vec![],

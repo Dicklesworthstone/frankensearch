@@ -92,6 +92,10 @@ pub struct CompactSearchResponse {
     /// Search phase of these hits: `initial`, `refined` or `refinement_failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// Observed stage failures remain actionable in compact and minimal output.
+    /// These serialized plans are diagnostic data, never recovery authority.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recovery_plans: BTreeMap<String, serde_json::Value>,
 }
 
 /// A compact error response.
@@ -452,6 +456,10 @@ pub fn compactify(
                 .data
                 .as_ref()
                 .map(|payload| payload.phase.to_string()),
+            recovery_plans: envelope
+                .data
+                .as_ref()
+                .map_or_else(BTreeMap::new, |payload| payload.recovery_plans.clone()),
         }),
         err: None,
         w: compact_warnings(&envelope.warnings),
@@ -682,6 +690,81 @@ mod tests {
     }
 
     #[test]
+    fn compact_search_preserves_stage_recovery_in_machine_formats() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            SemanticReadiness,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        let plans = [
+            ("retrieve.fast.unavailable", RetrievalTopology::FastOnly),
+            (
+                "retrieve.quality.unavailable",
+                RetrievalTopology::QualityOnly,
+            ),
+        ]
+        .into_iter()
+        .map(|(key, requested_topology)| {
+            let plan = crate::degradation_advisor::recovery_plan_for_readiness(
+                &SemanticReadiness::ReadinessUnproven,
+                RecoveryRequest {
+                    mode: RequestMode::Hybrid,
+                    requested_topology,
+                },
+                &policy,
+                None,
+                0,
+            )
+            .unwrap();
+            (key.to_owned(), serde_json::to_value(plan).unwrap())
+        })
+        .collect::<BTreeMap<_, _>>();
+        let mut env = search_envelope(
+            &[("retained.rs", 0.95, Some("lexical match"), Some(7))],
+            OutputMeta::new("search", "json").with_duration_ms(42),
+        );
+        let payload = env.data.as_mut().unwrap();
+        payload.phase = SearchOutputPhase::RefinementFailed;
+        payload.recovery_plans.clone_from(&plans);
+
+        for format in [
+            crate::OutputFormat::Json,
+            crate::OutputFormat::Jsonl,
+            crate::OutputFormat::Toon,
+        ] {
+            let mut bytes = Vec::new();
+            assert!(
+                crate::adapters::format_emitter::emit_compact_search_envelope(
+                    &env, format, &mut bytes,
+                )
+                .unwrap()
+            );
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let decoded: CompactEnvelope = if format == crate::OutputFormat::Toon {
+                let value = toon_format::decode_default::<serde_json::Value>(text).unwrap();
+                serde_json::from_value(value).unwrap()
+            } else {
+                serde_json::from_str(text).unwrap()
+            };
+            let data = decoded.data.unwrap();
+            assert_eq!(data.phase.as_deref(), Some("refinement_failed"));
+            assert_eq!(data.recovery_plans, plans);
+            assert_eq!(data.hits[0].doc, "retained.rs");
+            assert_eq!(data.hits[0].line, Some(7));
+        }
+        let minimal = compactify(&env, CompactLevel::Minimal).data.unwrap();
+        assert_eq!(minimal.recovery_plans, plans);
+        assert!(minimal.ms.is_none());
+        assert!(minimal.hits[0].snip.is_none());
+    }
+
+    #[test]
     fn compactify_error_envelope() {
         let err = OutputError::new(OutputErrorCode::SEARCH_TIMEOUT, "timeout after 50ms", 1);
         let env: OutputEnvelope<SearchPayload> =
@@ -788,6 +871,7 @@ mod tests {
                 }],
                 ms: Some(15),
                 phase: Some("initial".into()),
+                recovery_plans: BTreeMap::new(),
             }),
             err: None,
             w: Vec::new(),
@@ -797,7 +881,10 @@ mod tests {
         // Error and warnings should be omitted when absent/empty
         assert!(!json.contains("\"err\""));
         assert!(!json.contains("\"w\""));
+        assert!(!json.contains("recovery_plans"));
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"id\":\"R0\""));
+        let legacy: CompactEnvelope = serde_json::from_str(&json).unwrap();
+        assert!(legacy.data.unwrap().recovery_plans.is_empty());
     }
 }

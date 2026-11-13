@@ -3,6 +3,7 @@
 //! This module defines machine-stable streaming frames emitted in `--stream`
 //! mode for NDJSON and TOON outputs.
 
+use std::collections::BTreeMap;
 use std::io;
 
 use frankensearch_core::{SearchError, SearchResult};
@@ -103,6 +104,11 @@ pub struct StreamProgressEvent {
     pub reason_code: String,
     /// Human-readable message.
     pub message: String,
+    /// Canonical lane-scoped recovery advice attached to the search phase.
+    /// Forwarders preserve this diagnostic JSON without granting it execution
+    /// authority or replacing aggregate coverage. Ordinary progress omits it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recovery_plans: BTreeMap<String, serde_json::Value>,
 }
 
 /// Result event payload.
@@ -926,6 +932,7 @@ mod tests {
                 total_units: Some(2),
                 reason_code: "query.phase.initial".into(),
                 message: "phase 1 complete".into(),
+                recovery_plans: BTreeMap::new(),
             })
             .kind(),
             StreamEventKind::Progress
@@ -1182,6 +1189,7 @@ mod tests {
                 total_units: Some(100),
                 reason_code: "query.phase.initial".into(),
                 message: "fast retrieval complete".into(),
+                recovery_plans: BTreeMap::new(),
             }),
             StreamEvent::Result(StreamResultEvent {
                 rank: 1,
@@ -1669,9 +1677,15 @@ mod tests {
             total_units: None,
             reason_code: "query.phase.initial".into(),
             message: "in progress".into(),
+            recovery_plans: BTreeMap::new(),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("total_units"));
+        assert!(!json.contains("recovery_plans"));
+        assert_eq!(
+            serde_json::from_str::<StreamProgressEvent>(&json).unwrap(),
+            event
+        );
     }
 
     #[test]

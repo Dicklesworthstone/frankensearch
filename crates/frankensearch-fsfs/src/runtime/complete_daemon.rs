@@ -129,7 +129,10 @@ fn stop_after_peer(cx: &Cx, result: SearchResult<PeerOutcome>) -> SearchResult<b
         Ok(PeerOutcome::Search) => Ok(false),
         Err(error) => {
             retained_search_checkpoint(cx)?;
-            tracing::debug!(%error, "complete-generation daemon client ended");
+            tracing::debug!(
+                error_code = error.diagnostic_code(),
+                "complete-generation daemon client ended"
+            );
             Ok(false)
         }
     }
@@ -598,6 +601,7 @@ impl FsfsRuntime {
                         // shared admission failure never authorizes stale retrieval.
                         return serve_peer_bytes(
                             cx,
+                            self,
                             &mut peer,
                             peer_timeout,
                             &bytes,
@@ -632,6 +636,7 @@ impl FsfsRuntime {
                     let cache = &mut cache;
                     Box::pin(serve_peer_bytes(
                         cx,
+                        self,
                         &mut peer,
                         peer_timeout,
                         &bytes,
@@ -980,11 +985,13 @@ where
     Fut: Future<Output = SearchResult<Option<T>>>,
 {
     let bytes = read_request(cx, peer, timeout).await?;
-    serve_peer_bytes(cx, peer, timeout, &bytes, |_| timeout, execute).await
+    let runtime = FsfsRuntime::new(crate::FsfsConfig::default());
+    serve_peer_bytes(cx, &runtime, peer, timeout, &bytes, |_| timeout, execute).await
 }
 
 async fn serve_peer_bytes<T, F, Fut>(
     cx: &Cx,
+    runtime: &FsfsRuntime,
     peer: &mut UnixStream,
     timeout: Duration,
     bytes: &[u8],
@@ -1007,9 +1014,7 @@ where
         Ok(false) => {}
         Err(error) => {
             let response = encode_response(&FsfsRuntime::search_serve_error_response(
-                "",
-                "full",
-                error.to_string(),
+                "", "full", &error, None,
             ))?;
             write_response(cx, peer, &response, timeout).await?;
             return Ok(PeerOutcome::Search);
@@ -1018,12 +1023,11 @@ where
     let request = parse_request(bytes);
     let response = match request {
         Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
-            "",
-            "full",
-            error.to_string(),
+            "", "full", &error, None,
         ))?,
         Ok((request, stream)) => {
             let search_timeout = execution_budget(&request);
+            let recovery = runtime.search_serve_recovery_context(&request);
             let query = request.query.clone();
             let mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
             if stream {
@@ -1031,7 +1035,8 @@ where
                     encode_response(&FsfsRuntime::search_serve_error_response(
                         query,
                         mode,
-                        error.to_string(),
+                        &error,
+                        recovery.as_ref(),
                     ))?
                 } else {
                     let output = streaming::PhaseWriter::new(peer)?;
@@ -1056,7 +1061,8 @@ where
                         Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
                             query,
                             mode,
-                            error.to_string(),
+                            &error,
+                            recovery.as_ref(),
                         ))?,
                     }
                 }
@@ -1079,7 +1085,8 @@ where
                         Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
                             query,
                             mode,
-                            error.to_string(),
+                            &error,
+                            recovery.as_ref(),
                         ))?,
                     },
                     Ok(None) => {
@@ -1092,7 +1099,8 @@ where
                     Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
                         query,
                         mode,
-                        error.to_string(),
+                        &error,
+                        recovery.as_ref(),
                     ))?,
                 }
             }
@@ -1378,7 +1386,13 @@ mod tests {
             assert_eq!(result, PeerOutcome::Search);
             let failure = response(client);
             assert_eq!(failure["ok"], false);
-            assert!(failure.to_string().contains("search deadline exceeded"));
+            assert_eq!(failure["error"]["code"], "io_error");
+            assert!(
+                failure["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("TimedOut")
+            );
 
             let (client, mut server) = pair(b"{\"query\":\"healthy\"}\n");
             serve_peer(&cx, &mut server, Duration::from_secs(1), |_, _| async {
@@ -1427,6 +1441,7 @@ mod tests {
                 .unwrap();
             serve_peer_bytes(
                 &cx,
+                &runtime,
                 &mut server,
                 transport_timeout,
                 &bytes,
@@ -1820,6 +1835,68 @@ mod tests {
     }
 
     #[test]
+    fn socket_failure_is_typed_safe_and_has_request_recovery_before_delivery() {
+        #[derive(Debug)]
+        struct PrivateSource;
+
+        impl std::fmt::Display for PrivateSource {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("daemon responses must not render a provider body"); // ubs:ignore — negative control proves opaque Display is never invoked.
+            }
+        }
+
+        impl std::error::Error for PrivateSource {}
+
+        run_test_with_cx(|cx| async move {
+            for streamed in [false, true] {
+                for mode in ["full", "fast_only", "quality_only", "lexical_only"] {
+                    let raw =
+                        format!("{{\"query\":\"q\",\"stream\":{streamed},\"mode\":\"{mode}\"}}\n");
+                    let (client, mut server) = pair(raw.as_bytes());
+                    serve_peer::<serde_json::Value, _, _>(
+                        &cx,
+                        &mut server,
+                        Duration::from_secs(2),
+                        |_, _| async {
+                            Err(SearchError::ModelLoadFailed {
+                                path: PathBuf::from("/private/provider-artifacts"),
+                                source: Box::new(PrivateSource),
+                            })
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let failure = response(client);
+                    assert_eq!(
+                        failure["schema_version"],
+                        super::super::super::FSFS_SEARCH_SERVE_SCHEMA_VERSION
+                    );
+                    assert_eq!(failure["ok"], false);
+                    assert_eq!(failure["mode"], mode);
+                    assert_eq!(failure["error"]["code"], "model_load_failed");
+                    assert_eq!(
+                        failure["error"]["exit_code"],
+                        crate::adapters::cli::exit_code::MODEL_UNAVAILABLE
+                    );
+                    assert!(!failure.to_string().contains("/private/"));
+                    assert!(failure.get("event").is_none());
+                    if mode == "lexical_only"
+                        || (!super::super::super::SEMANTIC_LOADERS_COMPILED
+                            && mode != "quality_only")
+                    {
+                        assert!(failure["error"]["recovery_plan"].is_null());
+                    } else {
+                        let plan = &failure["error"]["recovery_plan"];
+                        assert_eq!(plan["policy"]["interaction"], "non_interactive");
+                        assert_eq!(plan["semantic_available"], false);
+                        assert!(plan["policy"]["acquisition_authorization"].is_null());
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn socket_bad_input_and_unsupported_stream_options_do_not_execute_search() {
         run_test_with_cx(|cx| async move {
             for raw in [
@@ -1930,8 +2007,10 @@ mod tests {
                 let released = Arc::new(AtomicBool::new(false));
                 let owned = MarkReleased(Arc::clone(&released));
                 let bytes = format!("{{\"query\":\"abandoned\",\"stream\":{streamed}}}\n");
+                let runtime = FsfsRuntime::new(crate::FsfsConfig::default());
                 let mut request = Box::pin(serve_peer_bytes::<serde_json::Value, _, _>(
                     &cx,
+                    &runtime,
                     &mut server,
                     Duration::from_secs(60),
                     bytes.as_bytes(),
@@ -2090,8 +2169,10 @@ mod tests {
             let polls = Cell::new(0);
             let released = Arc::new(AtomicBool::new(false));
             let owned = MarkReleased(Arc::clone(&released));
+            let runtime = FsfsRuntime::new(crate::FsfsConfig::default());
             let mut request = Box::pin(serve_peer_bytes::<serde_json::Value, _, _>(
                 &cx,
+                &runtime,
                 &mut server,
                 Duration::from_secs(60),
                 b"{\"query\":\"pending\"}\n",
@@ -2192,6 +2273,7 @@ mod tests {
                     cx.set_cancel_requested(cancel);
                     let result = serve_peer_bytes(
                         &cx,
+                        &FsfsRuntime::new(crate::FsfsConfig::default()),
                         &mut server,
                         Duration::from_secs(1),
                         bytes.as_bytes(),
@@ -2218,7 +2300,13 @@ mod tests {
                             .unwrap();
                         let failure = response(client);
                         assert_eq!(failure["ok"], false);
-                        assert!(failure.to_string().contains("search deadline exceeded"));
+                        assert_eq!(failure["error"]["code"], "io_error");
+                        assert!(
+                            failure["error"]["message"]
+                                .as_str()
+                                .unwrap()
+                                .contains("TimedOut")
+                        );
                     }
                 }
             }

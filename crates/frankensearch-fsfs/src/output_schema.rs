@@ -435,6 +435,14 @@ pub struct SearchPayload {
     pub hits: Vec<SearchHitPayload>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub degradation_advice: BTreeMap<String, DegradationAdvice>,
+    /// Canonical recovery plans for observed stage failures, keyed by stage
+    /// and stable reason code. Each plan describes the keyed lane, not the
+    /// aggregate response's semantic coverage. Independent fast/quality
+    /// failures remain separate when progressive or expanded results combine.
+    /// Values are serialized core `RecoveryPlan`s; decoded wire/cache JSON
+    /// remains diagnostic data, never an executable recovery capability.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub recovery_plans: BTreeMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub index_freshness: Option<IndexFreshnessPayload>,
     /// Why the semantic lane did not fully participate, when that is known.
@@ -594,6 +602,7 @@ impl SearchPayload {
             returned_hits,
             hits,
             degradation_advice: BTreeMap::new(),
+            recovery_plans: BTreeMap::new(),
             index_freshness: None,
             skip_reason: None,
             vector_generation_id: None,
@@ -1625,6 +1634,11 @@ mod tests {
         assert!(
             !json.contains("skip_reason") && !json.contains("vector_generation"),
             "absent generation/skip fields must stay omitted: {json}"
+        );
+        assert!(!json.contains("recovery_plans"));
+        assert!(
+            decoded.recovery_plans.is_empty(),
+            "older payloads default to an empty map"
         );
     }
 

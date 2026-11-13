@@ -257,6 +257,7 @@ async fn serve_cached_search(
                             total_units: Some(1),
                             reason_code: "daemon_cache_hit".to_owned(),
                             message: "Replaying complete cached search phases".to_owned(),
+                            recovery_plans: std::collections::BTreeMap::new(),
                         }),
                     );
                     emit_stream_frame(&frame, OutputFormat::Jsonl, writer)?;
@@ -793,6 +794,7 @@ mod tests {
                 total_units: Some(0),
                 reason_code: "query.stream.initial_ready".to_owned(),
                 message: "original results ready".to_owned(),
+                recovery_plans: std::collections::BTreeMap::new(),
             }),
         )
     }
@@ -1153,18 +1155,63 @@ mod tests {
     }
 
     #[test]
-    fn successful_stream_reaches_both_jsonl_and_toon_presentations() {
+    fn degraded_success_stream_preserves_recovery_in_jsonl_and_toon() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let request = request();
-            let bytes = frames_bytes(&[started(&request), completed(&request)]);
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let reason = frankensearch_core::config::ZeroSignalReason::NoUsableVectors;
+            let plan = crate::degradation_advisor::recovery_plan_for_zero_signal(
+                reason,
+                FsfsRuntime::runtime_recovery_request(
+                    crate::runtime::SearchExecutionMode::FastOnly,
+                    false,
+                ),
+                &runtime.runtime_recovery_policy(),
+                0,
+            )
+            .unwrap();
+            let mut degraded = initial(&request);
+            let StreamEvent::Progress(progress) = &mut degraded.event else {
+                panic!("expected initial progress");
+            };
+            progress.recovery_plans.insert(
+                format!("retrieve.fast.{}", reason.reason_code()),
+                serde_json::to_value(plan).unwrap(),
+            );
+            let expected = progress.recovery_plans.clone();
+            let bytes = frames_bytes(&[
+                started(&request),
+                degraded,
+                Frame {
+                    seq: 2,
+                    ..completed(&request)
+                },
+            ]);
             let (json, result) = read(&cx, &request, &bytes, OutputFormat::Jsonl).await;
             result.unwrap();
             assert_eq!(json, bytes);
             let (toon, result) = read(&cx, &request, &bytes, OutputFormat::Toon).await;
             result.unwrap();
             let toon = String::from_utf8(toon).unwrap();
-            assert_eq!(toon.matches('\u{001e}').count(), 2);
-            assert!(toon.contains("toon"));
+            let frames = toon
+                .split('\u{001e}')
+                .filter(|record| !record.trim().is_empty())
+                .map(|record| {
+                    crate::stream_protocol::decode_stream_frame_toon::<SearchHitPayload>(
+                        record.trim(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 3);
+            let StreamEvent::Progress(progress) = &frames[1].event else {
+                panic!("expected forwarded progress");
+            };
+            assert_eq!(progress.recovery_plans, expected);
+            assert!(matches!(
+                &frames[2].event,
+                StreamEvent::Terminal(terminal) if terminal.status == StreamTerminalStatus::Completed
+            ));
         });
     }
 
@@ -1747,8 +1794,10 @@ mod tests {
                 } else {
                     let error = result.unwrap_err();
                     assert!(output.is_empty(), "no partial TOON prefix");
-                    assert!(matches!(&error, SearchError::InvalidConfig { field, value, .. }
-                        if field == "stream.toon_payload" && value == "record_separator"));
+                    assert!(
+                        matches!(&error, SearchError::InvalidConfig { field, value, .. }
+                        if field == "stream.toon_payload" && value == "record_separator")
+                    );
                     assert!(reported_error(&error).is_none());
                     assert!(!FsfsRuntime::forwarded_search_error_was_emitted(&error));
                 }
@@ -1801,7 +1850,10 @@ mod tests {
                     };
                     assert_eq!(terminal.status, StreamTerminalStatus::Failed);
                     assert_eq!(terminal.exit_code, 2);
-                    assert_eq!(terminal.failure_category, Some(StreamFailureCategory::Config));
+                    assert_eq!(
+                        terminal.failure_category,
+                        Some(StreamFailureCategory::Config)
+                    );
                     assert_eq!(terminal.retry, StreamRetryDirective::None);
                     assert_eq!(terminal.error.as_ref(), Some(public));
                 }

@@ -27,9 +27,11 @@ use asupersync::fs::remove_file as async_file_remove;
 #[cfg(unix)]
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
+use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::filter::{ExcludeDocIdsFilter, PredicateFilter, SearchFilter};
 use frankensearch_core::parsed_query::ParsedQuery;
 use frankensearch_core::platform_dirs::home_dir;
+use frankensearch_core::traits::ModelTier;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
     HitExplanation, IdentityBoundEmbedding, IndexableDocument, LexicalTermScore, ModelCategory,
@@ -292,6 +294,12 @@ struct SearchPhaseArtifact {
     phase: SearchOutputPhase,
     fused: Vec<FusedCandidate>,
     payload: SearchPayload,
+}
+
+#[derive(Default)]
+struct QualityCandidateBatch {
+    candidates: Vec<SemanticCandidate>,
+    zero_signal: Option<ZeroSignalReason>,
 }
 
 type SearchPhaseSink<'a> = &'a mut (dyn FnMut(&SearchPayload) -> SearchResult<()> + Send);
@@ -654,7 +662,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v20: explicit ranking-prior policy separates cached result orders.
 // v21: exact JSON number parsing; older cache hops could change score bits.
 // v22: registered reranker inputs and execution policy bind reranked answers.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v22";
+// v23: successful degraded phases retain canonical lane recovery diagnostics.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v23";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -673,8 +682,10 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v17 / stream v15: carry and attest explicit code-navigation ranking priors.
 // v18 / stream v16: exact JSON score transport and cache parsing.
 // v19 / stream v17: registered reranking cannot load unverified shadow weights.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v19";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v17";
+// v20 / stream v18: failures retain typed error codes, exit status and recovery.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v20";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v18";
+const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -1913,7 +1924,7 @@ struct SearchServeResponse {
     cached: bool,
     payloads: Vec<SearchPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    error: Option<OutputError>,
 }
 
 /// Socket framing is opt-in; stdio still returns one response per input line.
@@ -1937,26 +1948,41 @@ enum SearchServeFrame {
     },
     Terminal {
         ok: bool,
-        error: Option<String>,
+        error: Option<OutputError>,
     },
 }
 
 #[cfg(unix)]
 impl SearchServeFrame {
-    fn terminal(result: SearchResult<()>) -> Self {
+    fn terminal(
+        result: SearchResult<()>,
+        recovery: Option<&crate::degradation_advisor::SearchRecoveryContext>,
+    ) -> Self {
         Self::Terminal {
             ok: result.is_ok(),
-            error: result.err().map(|error| {
-                let message = error.to_string();
-                let mut bounded = message.chars().take(512).collect::<String>();
-                if bounded.len() < message.len() {
-                    bounded.push_str(" [error detail truncated]");
-                }
-                bounded
-            }),
+            error: result
+                .err()
+                .map(|error| FsfsRuntime::search_serve_output_error(&error, recovery)),
         }
     }
 }
+
+/// A validated raw daemon refusal remains the original structured failure at
+/// the CLI boundary. Its wire recovery plan is diagnostic data, never authority
+/// to retry a request or perform recovery in the client.
+#[cfg(unix)]
+#[derive(Debug)]
+struct SearchServeRemoteError(OutputError);
+
+#[cfg(unix)]
+impl std::fmt::Display for SearchServeRemoteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("query daemon refused search")
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for SearchServeRemoteError {}
 
 type SearchServeFrameSink<'a> = &'a mut (dyn FnMut(SearchServeFrame) -> SearchResult<()> + Send);
 type SearchDaemonPhaseSink<'a> =
@@ -9631,6 +9657,7 @@ impl FsfsRuntime {
                                 total_units: Some(1),
                                 reason_code: "daemon_cache_hit".to_owned(),
                                 message: "Replaying complete cached search phases".to_owned(),
+                                recovery_plans: BTreeMap::new(),
                             }),
                         );
                         emit_stream_frame(&frame, self.cli_input.format, writer)?;
@@ -9669,7 +9696,14 @@ impl FsfsRuntime {
             }
         }
         .await;
-        self.finish_search_stream(query, stream_id, requested_mode, &mut seq, writer, search_result)
+        self.finish_search_stream(
+            query,
+            stream_id,
+            requested_mode,
+            &mut seq,
+            writer,
+            search_result,
+        )
     }
 
     fn finish_search_stream<W: Write>(
@@ -9761,13 +9795,14 @@ impl FsfsRuntime {
                 Ok(request) => request,
                 Err(error) => {
                     let response =
-                        Self::search_serve_error_response(String::new(), "full", error.to_string());
+                        Self::search_serve_error_response(String::new(), "full", &error, None);
                     Self::emit_search_serve_json_line(&response)?;
                     continue;
                 }
             };
             let request_query = request.query.clone();
             let request_mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
+            let recovery = self.search_serve_recovery_context(&request);
             let response = match self
                 .execute_search_serve_request(
                     cx,
@@ -9782,7 +9817,8 @@ impl FsfsRuntime {
                 Err(error) => Self::search_serve_error_response(
                     request_query,
                     request_mode,
-                    error.to_string(),
+                    &error,
+                    recovery.as_ref(),
                 ),
             };
             Self::emit_search_serve_json_line(&response)?;
@@ -9956,12 +9992,13 @@ impl FsfsRuntime {
                     // is still a failed connection, never a successful search.
                     let mut stream = stream;
                     let _ = stream.set_nonblocking(true);
-                    if let Ok(bytes) =
-                        Self::encode_search_serve_frame(&SearchServeFrame::Terminal {
-                            ok: false,
-                            error: Some("daemon client capacity exhausted".to_owned()),
-                        })
-                    {
+                    if let Ok(bytes) = Self::encode_search_serve_frame(&SearchServeFrame::terminal(
+                        Err(SearchError::QueueFull {
+                            capacity: FSFS_DAEMON_MAX_CLIENTS,
+                            pending: in_flight.load(std::sync::atomic::Ordering::Acquire),
+                        }),
+                        None,
+                    )) {
                         let _ = stream.write(&bytes);
                     }
                     continue;
@@ -10008,7 +10045,7 @@ impl FsfsRuntime {
             Ok(None) => return,
             Err(error) => {
                 let response =
-                    Self::search_serve_error_response(String::new(), "full", error.to_string());
+                    Self::search_serve_error_response(String::new(), "full", &error, None);
                 if let Err(write_error) =
                     Self::write_search_serve_socket_response(&mut stream, &response)
                 {
@@ -10049,8 +10086,12 @@ impl FsfsRuntime {
                 }
                 Some(serde_json::Value::Bool(false)) | None => {}
                 Some(_) => {
-                    let response =
-                        Self::search_serve_error_response("", "full", "stream must be a boolean");
+                    let response = Self::search_serve_error_response(
+                        "",
+                        "full",
+                        &Self::search_daemon_error("stream must be a boolean"),
+                        None,
+                    );
                     let _ = Self::write_search_serve_socket_response(&mut stream, &response);
                     return;
                 }
@@ -10066,6 +10107,7 @@ impl FsfsRuntime {
             Ok(request) => {
                 let request_query = request.query.clone();
                 let request_mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
+                let recovery = runtime.search_serve_recovery_context(&request);
                 let scheduler = match RuntimeBuilder::current_thread()
                     .blocking_threads(0, pool_handle.current_max_threads())
                     .build()
@@ -10103,13 +10145,12 @@ impl FsfsRuntime {
                     Err(error) => Self::search_serve_error_response(
                         request_query,
                         request_mode,
-                        error.to_string(),
+                        &error,
+                        recovery.as_ref(),
                     ),
                 }
             }
-            Err(error) => {
-                Self::search_serve_error_response(String::new(), "full", error.to_string())
-            }
+            Err(error) => Self::search_serve_error_response(String::new(), "full", &error, None),
         };
         if let Err(error) = Self::write_search_serve_socket_response(&mut stream, &response) {
             warn!(
@@ -10175,11 +10216,12 @@ impl FsfsRuntime {
             Err(error) => {
                 let _ = Self::write_search_serve_socket_json(
                     &mut stream,
-                    &SearchServeFrame::terminal(Err(error)),
+                    &SearchServeFrame::terminal(Err(error), None),
                 );
                 return;
             }
         };
+        let recovery = runtime.search_serve_recovery_context(&request);
         let (blocking_pool, pool_handle) = runtime.search_blocking_capacity();
         let request_context = Arc::new(asupersync::sync::OnceCell::<Cx>::new());
         let task_context = Arc::clone(&request_context);
@@ -10296,7 +10338,7 @@ impl FsfsRuntime {
                 Err(Self::search_daemon_error("daemon search worker panicked"))
             });
             let result = transport.and(result);
-            let terminal = SearchServeFrame::terminal(result);
+            let terminal = SearchServeFrame::terminal(result, recovery.as_ref());
             let _ = Self::write_search_serve_socket_json(&mut stream, &terminal);
             let _ = stream.shutdown(Shutdown::Write);
         });
@@ -10310,8 +10352,13 @@ impl FsfsRuntime {
             serde_json::from_str::<SearchServeRequest>(raw).map_err(|source| {
                 SearchError::InvalidConfig {
                     field: "cli.serve.request".to_owned(),
-                    value: raw.to_owned(),
-                    reason: format!("invalid serve request json: {source}"),
+                    value: format!("{} bytes", raw.len()),
+                    reason: format!(
+                        "invalid serve request JSON ({:?}) at line {}, column {}",
+                        source.classify(),
+                        source.line(),
+                        source.column(),
+                    ),
                 }
             })
         } else {
@@ -10800,10 +10847,46 @@ impl FsfsRuntime {
         })
     }
 
+    /// Raw serve requests are machine clients. Resolve their effective tier
+    /// policy before execution consumes the request; a malformed request has
+    /// no semantic recovery context and never grants acquisition authority.
+    fn search_serve_recovery_context(
+        &self,
+        request: &SearchServeRequest,
+    ) -> Option<crate::degradation_advisor::SearchRecoveryContext> {
+        let mode = parse_search_execution_mode(request.mode.as_deref()).ok()?;
+        let mut runtime = self.with_search_serve_request_policy(request).ok()?;
+        runtime.cli_input.format = OutputFormat::Jsonl;
+        runtime.search_recovery_context_for_mode(mode)
+    }
+
+    fn search_serve_output_error(
+        error: &SearchError,
+        recovery: Option<&crate::degradation_advisor::SearchRecoveryContext>,
+    ) -> OutputError {
+        // Canonical projection never formats opaque provider/source bodies.
+        // Bound structured local diagnostics too, without changing the stable
+        // error code, exit status, or recovery evidence carried on the wire.
+        let mut output = recovery.map_or_else(
+            || crate::output_schema::output_error_from(error),
+            |context| context.output_error(error),
+        );
+        if let Some((end, _)) = output
+            .message
+            .char_indices()
+            .nth(FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS)
+        {
+            output.message.truncate(end);
+            output.message.push_str(" [error detail truncated]");
+        }
+        output
+    }
+
     fn search_serve_error_response(
         query: impl Into<String>,
         mode: impl Into<String>,
-        error: impl Into<String>,
+        error: &SearchError,
+        recovery: Option<&crate::degradation_advisor::SearchRecoveryContext>,
     ) -> SearchServeResponse {
         SearchServeResponse {
             schema_version: FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
@@ -10813,7 +10896,7 @@ impl FsfsRuntime {
             mode: mode.into(),
             cached: false,
             payloads: Vec::new(),
-            error: Some(error.into()),
+            error: Some(Self::search_serve_output_error(error, recovery)),
         }
     }
 
@@ -11001,7 +11084,7 @@ impl FsfsRuntime {
             }
             Err(error) => {
                 let response =
-                    Self::search_serve_error_response(String::new(), "full", error.to_string());
+                    Self::search_serve_error_response(String::new(), "full", &error, None);
                 if let Err(write_error) =
                     Self::write_search_serve_socket_response(stream, &response)
                 {
@@ -11178,7 +11261,8 @@ impl FsfsRuntime {
                 }
                 let frame = serde_json::from_slice(&bytes).map_err(|error| {
                     Self::search_daemon_error(format!(
-                        "invalid daemon frame: {error}; stop the query daemon with `fsfs daemon --stop` (the next search starts a fresh one) or use --no-daemon"
+                        "invalid daemon frame ({:?}) at line {}, column {}; stop the query daemon with `fsfs daemon --stop` (the next search starts a fresh one) or use --no-daemon",
+                        error.classify(), error.line(), error.column(),
                     ))
                 })?;
                 if let Some(payload) = self.accept_search_serve_frame(
@@ -11382,9 +11466,15 @@ impl FsfsRuntime {
             }
             SearchServeFrame::Terminal { ok, error } => {
                 if !ok {
-                    return Err(Self::search_daemon_error(
-                        error.unwrap_or_else(|| "daemon search failed".to_owned()),
-                    ));
+                    let Some(error) = error.filter(|error| (1..=255).contains(&error.exit_code))
+                    else {
+                        return Err(Self::search_daemon_error("invalid daemon failure terminal"));
+                    };
+                    state.terminal = true;
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "fsfs.search.serve.remote_search",
+                        source: Box::new(SearchServeRemoteError(error)),
+                    });
                 }
                 if !state.attested || state.phase.is_none() || error.is_some() {
                     return Err(Self::search_daemon_error("invalid daemon success terminal"));
@@ -11788,6 +11878,7 @@ impl FsfsRuntime {
                 total_units: Some(u64::try_from(payload.total_candidates).unwrap_or(u64::MAX)),
                 reason_code: reason_code.to_owned(),
                 message: timeout_message.unwrap_or_else(|| message.to_owned()),
+                recovery_plans: payload.recovery_plans.clone(),
             }),
         );
         emit_stream_frame(&progress_frame, self.cli_input.format, writer)?;
@@ -11837,6 +11928,7 @@ impl FsfsRuntime {
                     total_units: Some(u64::try_from(rerank.candidate_budget).unwrap_or(u64::MAX)),
                     reason_code: rerank.reason_code.clone(),
                     message,
+                    recovery_plans: BTreeMap::new(),
                 }),
             );
             emit_stream_frame(&rerank_frame, self.cli_input.format, writer)?;
@@ -11933,8 +12025,11 @@ impl FsfsRuntime {
         seq: &mut u64,
         writer: &mut W,
     ) -> SearchResult<()> {
-        let mut terminal = terminal_event_from_error(error, 0, 3);
-        terminal.error = Some(self.search_output_error_for_mode(error, requested_mode));
+        let terminal = crate::stream_protocol::terminal_event_from_output_error(
+            self.search_output_error_for_mode(error, requested_mode),
+            0,
+            3,
+        );
         let mut frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
@@ -13630,6 +13725,12 @@ impl FsfsRuntime {
             SearchOutputPhase::Initial
         };
         for source in sources {
+            for (reason, plan) in &source.recovery_plans {
+                payload
+                    .recovery_plans
+                    .entry(reason.clone())
+                    .or_insert_with(|| plan.clone());
+            }
             for (reason, advice) in &source.degradation_advice {
                 payload
                     .degradation_advice
@@ -14399,8 +14500,7 @@ impl FsfsRuntime {
                 };
                 // Initial has already escaped. Preserve its admitted scores
                 // without replaying stale Refined or delivering Initial twice.
-                let failed =
-                    Self::cached_refinement_failure(initial, &resources.index_root, &error);
+                let failed = self.cached_refinement_failure(initial, &resources.index_root, &error);
                 Self::validate_cached_primary_producer(cx, resources, mode, payloads)?;
                 if let Some(sink) = phase_sink.as_deref_mut() {
                     sink(&failed)?;
@@ -14419,6 +14519,7 @@ impl FsfsRuntime {
     }
 
     fn cached_refinement_failure(
+        &self,
         initial: &SearchPayload,
         index_root: &Path,
         error: &SearchError,
@@ -14438,6 +14539,7 @@ impl FsfsRuntime {
         failed
             .degradation_advice
             .insert(advice.reason_code.clone(), advice);
+        self.attach_quality_failure_recovery(&mut failed, error);
         if let SearchError::SearchTimeout {
             elapsed_ms,
             budget_ms,
@@ -14451,6 +14553,79 @@ impl FsfsRuntime {
             });
         }
         failed
+    }
+
+    /// Recovery diagnostics describe the observed lane failure, not an
+    /// authorization to mutate an index. Reuse the terminal planner's
+    /// conservative error projection so an unavailable loader cannot invent
+    /// a missing artifact, a producer identity, or an exact rebuild target.
+    fn attach_quality_failure_recovery(&self, payload: &mut SearchPayload, error: &SearchError) {
+        if payload.vector_generation_is_hash
+            || matches!(
+                error,
+                SearchError::Cancelled { .. }
+                    | SearchError::QueryParseError { .. }
+                    | SearchError::RerankerUnavailable { .. }
+                    | SearchError::RerankFailed { .. }
+            )
+        {
+            return;
+        }
+        let recovery = self
+            .search_output_error_for_mode(error, SearchExecutionMode::QualityOnly)
+            .recovery_plan
+            .or_else(|| self.unproven_quality_recovery_plan());
+        if let Some(plan) = recovery {
+            payload
+                .recovery_plans
+                .insert(format!("retrieve.quality.{}", error_code_for(error)), plan);
+        }
+    }
+
+    fn unproven_quality_recovery_plan(&self) -> Option<serde_json::Value> {
+        recovery_plan_for_readiness(
+            &frankensearch_core::recovery_plan::SemanticReadiness::ReadinessUnproven,
+            Self::runtime_recovery_request(SearchExecutionMode::QualityOnly, false),
+            &self.runtime_recovery_policy(),
+            None,
+            0,
+        )
+        .ok()
+        .and_then(|plan| serde_json::to_value(plan).ok())
+    }
+
+    fn attach_zero_signal_recovery(
+        &self,
+        payload: &mut SearchPayload,
+        mode: SearchExecutionMode,
+        tier: ModelTier,
+        reason: Option<ZeroSignalReason>,
+    ) {
+        let Some(reason) = reason.filter(|reason| reason.is_availability_failure()) else {
+            return;
+        };
+        if mode == SearchExecutionMode::LexicalOnly || payload.vector_generation_is_hash {
+            return;
+        }
+        // This plan describes the keyed lane. A broken quality lane must not
+        // claim that healthy fast scores in the aggregate response vanished.
+        let lane_mode = match tier {
+            ModelTier::Fast => SearchExecutionMode::FastOnly,
+            ModelTier::Quality => SearchExecutionMode::QualityOnly,
+        };
+        if let Some(plan) = recovery_plan_for_zero_signal(
+            reason,
+            Self::runtime_recovery_request(lane_mode, false),
+            &self.runtime_recovery_policy(),
+            0,
+        )
+        .ok()
+        .and_then(|plan| serde_json::to_value(plan).ok())
+        {
+            payload
+                .recovery_plans
+                .insert(format!("retrieve.{tier}.{}", reason.reason_code()), plan);
+        }
     }
 
     #[cfg(test)]
@@ -15812,6 +15987,7 @@ impl FsfsRuntime {
         );
         let mut winning_windows = HashMap::new();
         let mut fast_query_embedding = None;
+        let mut fast_zero_signal = None;
         let semantic_candidates = if plan.semantic_stage.enabled && semantic_decision.run_semantic {
             if let (Some(index), Some(embedder)) = (
                 resources.vector_index.as_ref(),
@@ -15836,6 +16012,7 @@ impl FsfsRuntime {
                             Ok(windowed) => {
                                 winning_windows = windowed.winning_windows;
                                 let classified = windowed.classified;
+                                fast_zero_signal = classified.zero_signal;
                                 if let Some(reason) = classified.zero_signal {
                                     let recovery_state_code = recovery_plan_for_zero_signal(
                                         reason,
@@ -15988,6 +16165,7 @@ impl FsfsRuntime {
             resources,
             mode,
         );
+        self.attach_zero_signal_recovery(&mut payload, mode, ModelTier::Fast, fast_zero_signal);
         hit_lines.annotate(&mut payload);
         // A planner downgrade outranks the requested fast_only (it removed the
         // semantic lane that mode promised), but not a missing or hash-control
@@ -16071,7 +16249,10 @@ impl FsfsRuntime {
                     // and no Refined/RefinementFailed artifact follows it.
                     return Err(error);
                 }
-                Ok(Some(quality_candidates)) => {
+                Ok(Some(QualityCandidateBatch {
+                    candidates: quality_candidates,
+                    zero_signal: quality_zero_signal,
+                })) => {
                     let fast_candidates = Self::complete_fast_candidates(
                         cx,
                         resources,
@@ -16165,6 +16346,15 @@ impl FsfsRuntime {
                         resources,
                         mode,
                     );
+                    refined_payload
+                        .recovery_plans
+                        .clone_from(&payload.recovery_plans);
+                    self.attach_zero_signal_recovery(
+                        &mut refined_payload,
+                        mode,
+                        ModelTier::Quality,
+                        quality_zero_signal,
+                    );
                     hit_lines.annotate(&mut refined_payload);
                     if self.config.search.rerank {
                         refined_payload.rerank = Some(rerank_payload);
@@ -16205,36 +16395,29 @@ impl FsfsRuntime {
                 Err(error) => {
                     let error_code = error_code_for(&error);
                     let reason = Self::semantic_runtime_failure_summary(&error);
-                    let recovery_state_code = recovery_plan_for_search_error(
-                        &error,
-                        Self::runtime_recovery_request(
-                            mode,
-                            Self::vector_generation_is_hash_control(resources),
-                        ),
-                        &self.runtime_recovery_policy(),
-                        None,
-                        0,
-                    )
-                    .ok()
-                    .map(|plan| plan.state_code().to_owned());
+                    let recovery_plan = self
+                        .search_output_error_for_mode(&error, mode)
+                        .recovery_plan;
+                    let recovery_state_code = recovery_plan
+                        .as_ref()
+                        .and_then(|plan| plan.get("state_code"))
+                        .and_then(serde_json::Value::as_str);
                     if let SearchError::DimensionMismatch { .. } = error {
                         resources.quality_embedder = None;
                         resources.quality_embedder_attempted = true;
                         info!(
                             error_code,
                             reason,
-                            recovery_state_code = recovery_state_code
-                                .as_deref()
-                                .unwrap_or("recovery.state.identity_mismatch"),
+                            recovery_state_code =
+                                recovery_state_code.unwrap_or("recovery.state.identity_mismatch"),
                             "fsfs quality refinement disabled for this session after embedder/index dimension mismatch"
                         );
                     } else {
                         info!(
                             error_code,
                             reason,
-                            recovery_state_code = recovery_state_code
-                                .as_deref()
-                                .unwrap_or("recovery.state.partial_quality_coverage"),
+                            recovery_state_code =
+                                recovery_state_code.unwrap_or("recovery.state.readiness_unproven"),
                             "fsfs quality refinement failed; falling back to initial phase payload"
                         );
                     }
@@ -16261,6 +16444,10 @@ impl FsfsRuntime {
                         resources,
                         mode,
                     );
+                    failed_payload
+                        .recovery_plans
+                        .clone_from(&payload.recovery_plans);
+                    self.attach_quality_failure_recovery(&mut failed_payload, &error);
                     hit_lines.annotate(&mut failed_payload);
                     if let SearchError::SearchTimeout {
                         elapsed_ms,
@@ -16311,6 +16498,16 @@ impl FsfsRuntime {
                         resources,
                         mode,
                     );
+                    failed_payload
+                        .recovery_plans
+                        .clone_from(&payload.recovery_plans);
+                    if !failed_payload.vector_generation_is_hash
+                        && let Some(plan) = self.unproven_quality_recovery_plan()
+                    {
+                        failed_payload
+                            .recovery_plans
+                            .insert("retrieve.quality.unavailable".to_owned(), plan);
+                    }
                     hit_lines.annotate(&mut failed_payload);
                     let failed_artifact = SearchPhaseArtifact {
                         phase: SearchOutputPhase::RefinementFailed,
@@ -18716,6 +18913,10 @@ impl FsfsRuntime {
         error: &SearchError,
         requested_mode: SearchExecutionMode,
     ) -> OutputError {
+        #[cfg(unix)]
+        if let Some(remote) = Self::forwarded_search_error(error) {
+            return remote.clone();
+        }
         self.search_recovery_context_for_mode(requested_mode)
             .map_or_else(
                 || crate::output_schema::output_error_from(error),
@@ -25683,11 +25884,14 @@ impl FsfsRuntime {
         } else {
             normalized_query.clone()
         };
-        let candidates = self
+        let QualityCandidateBatch {
+            candidates,
+            zero_signal,
+        } = self
             .with_quality_deadline(cx, async {
                 self.admit_required_quality(cx, resources).await?;
                 if normalized_query.is_empty() || output_limit == 0 {
-                    return Ok(Vec::new());
+                    return Ok(QualityCandidateBatch::default());
                 }
                 let excluded = Self::query_exclusions(
                     cx,
@@ -25771,6 +25975,12 @@ impl FsfsRuntime {
             resources,
             SearchExecutionMode::QualityOnly,
         );
+        self.attach_zero_signal_recovery(
+            &mut payload,
+            SearchExecutionMode::QualityOnly,
+            ModelTier::Quality,
+            zero_signal,
+        );
         HitLineLocator::new(&resources.index_root).annotate(&mut payload);
         if self.config.search.rerank {
             payload.rerank = Some(rerank_payload);
@@ -25822,7 +26032,7 @@ impl FsfsRuntime {
         filter_expr: Option<&SearchFilterExpr>,
         excluded_doc_ids: Option<Arc<HashSet<String>>>,
         fast_candidates: &[SemanticCandidate],
-    ) -> SearchResult<Option<Vec<SemanticCandidate>>> {
+    ) -> SearchResult<Option<QualityCandidateBatch>> {
         self.maybe_prepare_quality_embedder(cx, resources).await?;
         let (Some(index), Some(embedder)) =
             (&resources.quality_vector_index, &resources.quality_embedder)
@@ -25837,7 +26047,7 @@ impl FsfsRuntime {
             .map(|candidate| candidate.doc_id.clone())
             .collect::<HashSet<_>>();
         let work_cx = cx.clone();
-        let hits = Self::search_blocking(cx, move || {
+        let (hits, zero_signal) = Self::search_blocking(cx, move || {
             let path_filter = filter_expr
                 .as_ref()
                 .map(|filter| filter as &dyn SearchFilter);
@@ -25847,15 +26057,15 @@ impl FsfsRuntime {
             // Match the fast lane's query classification: a zero-norm query
             // has no semantic signal and must not assign arbitrary ranks to
             // every document, including during a recovery preview.
-            let mut hits = index
-                .search_top_k_classified(
-                    &query_embedding,
-                    budget,
-                    exclusion
-                        .as_ref()
-                        .map_or(path_filter, |filter| Some(filter as &dyn SearchFilter)),
-                )?
-                .hits;
+            let classified = index.search_top_k_classified(
+                &query_embedding,
+                budget,
+                exclusion
+                    .as_ref()
+                    .map_or(path_filter, |filter| Some(filter as &dyn SearchFilter)),
+            )?;
+            let zero_signal = classified.zero_signal;
+            let mut hits = classified.hits;
             // Independent top-k retrieval admits quality-only documents, but
             // omission from that bounded pool does not prove a fast candidate
             // lacks a quality vector. Score those exact eligible IDs too, with
@@ -25890,14 +26100,16 @@ impl FsfsRuntime {
                         .then_with(|| left.doc_id.cmp(&right.doc_id))
                 });
             }
-            Ok::<_, SearchError>(hits)
+            Ok::<_, SearchError>((hits, zero_signal))
         })
         .await??;
-        Ok(Some(
-            hits.into_iter()
+        Ok(Some(QualityCandidateBatch {
+            candidates: hits
+                .into_iter()
                 .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
                 .collect(),
-        ))
+            zero_signal,
+        }))
     }
 
     /// Exclusion clauses need document-text evidence even when retrieval uses
@@ -34507,9 +34719,8 @@ mod tests {
         FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, IndexingBatchEmbeddingOutcome,
         InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheRecord, SearchDashboardState,
         SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
-        SearchStreamWriter,
-        SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
-        VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
+        SearchStreamWriter, SemanticGateDecisionInput, SemanticRecallDecisionInput,
+        VectorIndexWriteAction, VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
         degradation_controller_config_for_profile, detect_context_preview_format,
         is_likely_html_fragment, normalize_html_fragment_for_markdown,
         payload_has_admitted_semantic_hits, payload_has_hash_control_hits, read_durable_json,
@@ -36231,6 +36442,144 @@ mod tests {
             fast_embedder_attempted: true,
             quality_embedder_attempted: true,
             degradation_advice: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn semantic_search_recovery_plans_cover_unusable_vector_lanes() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let index = resources.quality_vector_index.take().unwrap();
+            let offset = usize::try_from(index.metadata().vectors_offset).unwrap();
+            let byte_len = index.record_count() * 2 * std::mem::size_of::<u16>();
+            drop(index);
+            // Writers reject zero vectors. Corrupt only the persisted vector
+            // region after a valid write, preserving live IDs and identity.
+            let path = temp.path().join("quality.fsvi");
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[offset..offset + byte_len].fill(0);
+            fs::write(&path, bytes).unwrap();
+            resources.quality_vector_index =
+                Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 10_000;
+            let runtime = FsfsRuntime::new(config);
+            let reason = frankensearch_core::config::ZeroSignalReason::NoUsableVectors;
+            let expected = crate::degradation_advisor::recovery_plan_for_zero_signal(
+                reason,
+                FsfsRuntime::runtime_recovery_request(SearchExecutionMode::QualityOnly, false),
+                &runtime.runtime_recovery_policy(),
+                0,
+            )
+            .unwrap();
+            let expected = serde_json::to_value(expected).unwrap();
+            for mode in [SearchExecutionMode::Full, SearchExecutionMode::QualityOnly] {
+                let artifacts = runtime
+                    .execute_search_phase_artifacts_with_mode_using_resources(
+                        &cx,
+                        "semantic recovery",
+                        3,
+                        mode,
+                        &mut resources,
+                        SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let payloads = artifacts
+                    .into_iter()
+                    .map(|artifact| artifact.payload)
+                    .collect::<Vec<_>>();
+                let last = payloads.last().unwrap();
+                assert_eq!(last.recovery_plans.len(), 1, "{mode:?}");
+                assert_eq!(
+                    last.recovery_plans
+                        .get(&format!("retrieve.quality.{}", reason.reason_code())),
+                    Some(&expected)
+                );
+                if mode == SearchExecutionMode::Full {
+                    assert_eq!(last.phase, SearchOutputPhase::Refined);
+                    assert!(!last.hits.is_empty(), "healthy fast results must survive");
+                } else {
+                    assert!(last.hits.is_empty());
+                }
+                let generation = resources.generation_fingerprint.clone();
+                let replayed = runtime
+                    .replay_cached_search_payloads(
+                        &cx,
+                        &mut resources,
+                        mode,
+                        &generation,
+                        &payloads,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(replayed, payloads, "cache replay must retain degradation");
+            }
+        });
+    }
+
+    #[test]
+    fn semantic_recovery_omits_expected_empty_and_control_outcomes() {
+        use frankensearch_core::config::ZeroSignalReason;
+        use frankensearch_core::traits::ModelTier;
+
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let mut payload =
+            SearchPayload::new("ordinary query", SearchOutputPhase::Initial, 0, vec![]);
+        for reason in [
+            ZeroSignalReason::CallerRequestedZeroK,
+            ZeroSignalReason::FilterEliminatedAll,
+            ZeroSignalReason::NonFiniteQuery,
+            ZeroSignalReason::ZeroNormQuery,
+            ZeroSignalReason::NewlyCreatedEmpty,
+            ZeroSignalReason::AllTombstoned,
+            ZeroSignalReason::WalOnlyNoLiveRecords,
+        ] {
+            runtime.attach_zero_signal_recovery(
+                &mut payload,
+                SearchExecutionMode::Full,
+                ModelTier::Fast,
+                Some(reason),
+            );
+            assert!(payload.recovery_plans.is_empty(), "{reason:?}");
+        }
+        for (mode, hash_control) in [
+            (SearchExecutionMode::LexicalOnly, false),
+            (SearchExecutionMode::FastOnly, true),
+        ] {
+            payload.vector_generation_is_hash = hash_control;
+            runtime.attach_zero_signal_recovery(
+                &mut payload,
+                mode,
+                ModelTier::Fast,
+                Some(ZeroSignalReason::NoUsableVectors),
+            );
+            assert!(payload.recovery_plans.is_empty());
+        }
+        payload.vector_generation_is_hash = false;
+        for error in [
+            SearchError::Cancelled {
+                phase: "query".into(),
+                reason: "cancelled".into(),
+            },
+            SearchError::QueryParseError {
+                query: "(".into(),
+                detail: "unclosed".into(),
+            },
+            SearchError::RerankerUnavailable {
+                model: "optional reranker".into(),
+            },
+        ] {
+            runtime.attach_quality_failure_recovery(&mut payload, &error);
+            assert!(payload.recovery_plans.is_empty());
         }
     }
 
@@ -39464,6 +39813,8 @@ mod tests {
         // weight; v3 blends quality discoveries without fast scores; v2
         // predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v17",
+            "fsfs.search.serve.stream.v16",
             "fsfs.search.serve.stream.v15",
             "fsfs.search.serve.stream.v14",
             "fsfs.search.serve.stream.v13",
@@ -39621,6 +39972,168 @@ mod tests {
         assert!(
             serde_json::from_str::<SearchServeFrame>(
                 r#"{"event":"terminal","ok":true,"error":null,"unknown":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progressive_daemon_failure_retains_remote_code_exit_and_recovery() {
+        use super::{SearchServeFrame, SearchServeStreamState};
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            format: OutputFormat::Jsonl,
+            ..CliInput::default()
+        });
+        let request = FsfsRuntime::parse_search_serve_request(
+            r#"{"query":"quality query","mode":"quality_only"}"#,
+        )
+        .unwrap();
+        let recovery = runtime.search_serve_recovery_context(&request).unwrap();
+        let failure = SearchError::ModelNotFound {
+            name: "quality-model".to_owned(),
+        };
+        let expected = FsfsRuntime::search_serve_output_error(&failure, Some(&recovery));
+        let terminal = SearchServeFrame::terminal(Err(failure), Some(&recovery));
+        let bytes = FsfsRuntime::encode_search_serve_frame(&terminal).unwrap();
+        let terminal = serde_json::from_slice(&bytes).unwrap();
+        let mut state = SearchServeStreamState::default();
+        let error = runtime
+            .accept_search_serve_frame(terminal, &mut state, &request, temp.path(), "unadmitted")
+            .unwrap_err();
+        assert_eq!(FsfsRuntime::forwarded_search_error(&error), Some(&expected));
+        assert_eq!(expected.code, "model_not_found");
+        assert_eq!(
+            expected.exit_code,
+            crate::adapters::cli::exit_code::MODEL_UNAVAILABLE
+        );
+        assert!(expected.recovery_plan.is_some());
+        assert!(state.terminal);
+        assert!(
+            !state.attested,
+            "admission failure needs no successful attestation"
+        );
+        assert!(!FsfsRuntime::forwarded_search_error_was_emitted(&error));
+        assert!(!FsfsRuntime::is_stale_daemon_refusal(&error));
+        assert_eq!(
+            runtime.search_output_error_for_mode(&error, SearchExecutionMode::QualityOnly),
+            expected
+        );
+        let mut bytes = Vec::new();
+        let mut seq = 0;
+        let result = runtime.finish_search_stream(
+            &request.query,
+            "raw-daemon-failure",
+            SearchExecutionMode::QualityOnly,
+            &mut seq,
+            &mut SearchStreamWriter {
+                inner: &mut bytes,
+                failed: false,
+                wrote: false,
+            },
+            Err(error),
+        );
+        assert_eq!(
+            FsfsRuntime::forwarded_search_error(&result.unwrap_err()),
+            Some(&expected)
+        );
+        assert_eq!(seq, 1);
+        let frame: StreamFrame<SearchHitPayload> = serde_json::from_slice(&bytes).unwrap();
+        let StreamEvent::Terminal(terminal) = frame.event else {
+            panic!("raw daemon failure must emit one terminal"); // ubs:ignore — negative control verifies the stream boundary.
+        };
+        assert_eq!(terminal.error.as_ref(), Some(&expected));
+        assert_eq!(terminal.exit_code, expected.exit_code);
+        assert_eq!(terminal.status, StreamTerminalStatus::Failed);
+        assert_eq!(
+            terminal.failure_category,
+            Some(crate::stream_protocol::StreamFailureCategory::Model)
+        );
+        assert_eq!(
+            terminal.retry,
+            crate::stream_protocol::StreamRetryDirective::None
+        );
+
+        let cancelled = SearchError::Cancelled {
+            phase: "search".to_owned(),
+            reason: "caller cancelled the request".to_owned(),
+        };
+        let expected_cancelled = crate::output_schema::output_error_from(&cancelled);
+        let error = runtime
+            .accept_search_serve_frame(
+                SearchServeFrame::terminal(Err(cancelled), None),
+                &mut SearchServeStreamState::default(),
+                &request,
+                temp.path(),
+                "unadmitted",
+            )
+            .unwrap_err();
+        let mut bytes = Vec::new();
+        runtime
+            .emit_search_stream_terminal_error(
+                "raw-daemon-cancelled",
+                &error,
+                SearchExecutionMode::QualityOnly,
+                &mut 0,
+                &mut bytes,
+            )
+            .unwrap();
+        let frame: StreamFrame<SearchHitPayload> = serde_json::from_slice(&bytes).unwrap();
+        let StreamEvent::Terminal(terminal) = frame.event else {
+            panic!("raw daemon cancellation must emit one terminal"); // ubs:ignore — negative control verifies the stream boundary.
+        };
+        assert_eq!(terminal.error.as_ref(), Some(&expected_cancelled));
+        assert_eq!(
+            terminal.exit_code,
+            crate::adapters::cli::exit_code::INTERRUPTED
+        );
+        assert_eq!(terminal.status, StreamTerminalStatus::Cancelled);
+        assert_eq!(
+            terminal.failure_category,
+            Some(crate::stream_protocol::StreamFailureCategory::Resource)
+        );
+        assert_eq!(
+            terminal.retry,
+            crate::stream_protocol::StreamRetryDirective::None
+        );
+
+        for exit_code in [0, -1, 256] {
+            let mut invalid = expected.clone();
+            invalid.exit_code = exit_code;
+            let frame = SearchServeFrame::Terminal {
+                ok: false,
+                error: Some(invalid),
+            };
+            let error = runtime
+                .accept_search_serve_frame(
+                    frame,
+                    &mut SearchServeStreamState::default(),
+                    &request,
+                    temp.path(),
+                    "unadmitted",
+                )
+                .unwrap_err();
+            assert!(FsfsRuntime::forwarded_search_error(&error).is_none());
+            assert!(matches!(error, SearchError::InvalidConfig { .. }));
+        }
+        let error = runtime
+            .accept_search_serve_frame(
+                SearchServeFrame::Terminal {
+                    ok: false,
+                    error: None,
+                },
+                &mut SearchServeStreamState::default(),
+                &request,
+                temp.path(),
+                "unadmitted",
+            )
+            .unwrap_err();
+        assert!(FsfsRuntime::forwarded_search_error(&error).is_none());
+        assert!(
+            serde_json::from_str::<SearchServeFrame>(
+                r#"{"event":"terminal","ok":false,"error":"legacy string failure"}"#,
             )
             .is_err()
         );
@@ -42452,15 +42965,157 @@ mod tests {
     }
 
     #[test]
-    fn search_serve_error_response_marks_failed_reply_with_message() {
-        let response =
-            FsfsRuntime::search_serve_error_response("query text", "full", "parse failure");
+    fn search_serve_error_response_preserves_typed_failure_and_bounds_diagnostics() {
+        let error = SearchError::InvalidConfig {
+            field: "cli.serve.request".to_owned(),
+            value: "invalid".to_owned(),
+            reason: "診断".repeat(1_000),
+        };
+        let response = FsfsRuntime::search_serve_error_response("query text", "full", &error, None);
         assert!(!response.ok);
         assert_eq!(response.query, "query text");
         assert_eq!(response.mode, "full");
         assert!(!response.cached);
         assert!(response.payloads.is_empty());
-        assert_eq!(response.error.as_deref(), Some("parse failure"));
+        let output = response.error.as_ref().unwrap();
+        assert_eq!(output.code, "invalid_config");
+        assert_eq!(
+            output.exit_code,
+            crate::adapters::cli::exit_code::USAGE_ERROR
+        );
+        assert_eq!(output.field.as_deref(), Some("cli.serve.request"));
+        assert!(output.message.ends_with(" [error detail truncated]"));
+        assert_eq!(
+            output.message.chars().count(),
+            super::FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS + " [error detail truncated]".len()
+        );
+        assert!(output.recovery_plan.is_none());
+        let encoded = serde_json::to_value(response).unwrap();
+        let decoded: super::SearchServeResponse = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        let mut untyped = encoded;
+        untyped["error"] = serde_json::json!("legacy string failure");
+        assert!(serde_json::from_value::<super::SearchServeResponse>(untyped).is_err());
+    }
+
+    #[test]
+    fn search_serve_failure_never_formats_opaque_sources_or_echoes_invalid_json() {
+        #[derive(Debug)]
+        struct PrivateSource;
+
+        impl std::fmt::Display for PrivateSource {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("public serve diagnostics must not format a provider body"); // ubs:ignore — negative control proves opaque Display is never invoked.
+            }
+        }
+
+        impl std::error::Error for PrivateSource {}
+
+        for error in [
+            SearchError::EmbeddingFailed {
+                model: "potion-multilingual-128".to_owned(),
+                source: Box::new(PrivateSource),
+            },
+            SearchError::ModelLoadFailed {
+                path: PathBuf::from("/private/provider-artifacts"),
+                source: Box::new(PrivateSource),
+            },
+            SearchError::SubsystemError {
+                subsystem: "private-provider",
+                source: Box::new(PrivateSource),
+            },
+            SearchError::Io(std::io::Error::other(PrivateSource)),
+        ] {
+            let expected = crate::output_schema::output_error_from(&error);
+            let response = FsfsRuntime::search_serve_error_response("query", "full", &error, None);
+            assert_eq!(response.error, Some(expected.clone()));
+            #[cfg(unix)]
+            {
+                let frame = super::SearchServeFrame::terminal(Err(error), None);
+                let super::SearchServeFrame::Terminal { ok, error } = frame else {
+                    unreachable!("terminal constructor must create a terminal");
+                };
+                assert!(!ok);
+                assert_eq!(error, Some(expected));
+            }
+        }
+        let error = FsfsRuntime::parse_search_serve_request(
+            r#"{"query":"private-query-canary","limit":"private-token-canary"}"#,
+        )
+        .unwrap_err();
+        let response = FsfsRuntime::search_serve_error_response("", "full", &error, None);
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(!encoded.contains("private-query-canary"));
+        assert!(!encoded.contains("private-token-canary"));
+        assert!(encoded.contains("line 1"));
+    }
+
+    #[test]
+    fn search_serve_recovery_uses_request_tier_and_noninteractive_policy() {
+        use frankensearch_core::types::RetrievalTopology;
+
+        let mut config = FsfsConfig::default();
+        config.indexing.offline = true;
+        let runtime = FsfsRuntime::new(config);
+        assert_eq!(runtime.cli_input.format, OutputFormat::Table);
+        let failure = SearchError::ModelNotFound {
+            name: "unobserved-tier".to_owned(),
+        };
+        for (raw, topology, mode) in [
+            (
+                r#"{"query":"q","mode":"full"}"#,
+                RetrievalTopology::FullProgressive,
+                "hybrid",
+            ),
+            (
+                r#"{"query":"q","mode":"fast_only"}"#,
+                RetrievalTopology::FastOnly,
+                "hybrid",
+            ),
+            (
+                r#"{"query":"q","mode":"full","fast_only":true}"#,
+                RetrievalTopology::FastOnly,
+                "hybrid",
+            ),
+            (
+                r#"{"query":"q","mode":"quality_only"}"#,
+                RetrievalTopology::QualityOnly,
+                "explicit_semantic",
+            ),
+        ] {
+            let request = FsfsRuntime::parse_search_serve_request(raw).unwrap();
+            if !super::SEMANTIC_LOADERS_COMPILED && topology != RetrievalTopology::QualityOnly {
+                assert!(runtime.search_serve_recovery_context(&request).is_none());
+                continue;
+            }
+            let context = runtime.search_serve_recovery_context(&request).unwrap();
+            let response =
+                FsfsRuntime::search_serve_error_response("q", "full", &failure, Some(&context));
+            let output = response.error.unwrap();
+            assert_eq!(output.code, "model_not_found");
+            assert_eq!(
+                output.exit_code,
+                crate::adapters::cli::exit_code::MODEL_UNAVAILABLE
+            );
+            let plan = output.recovery_plan.unwrap();
+            assert_eq!(plan["mode"], mode);
+            assert_eq!(
+                plan["requested_topology"],
+                serde_json::to_value(topology).unwrap()
+            );
+            assert_eq!(plan["policy"]["interaction"], "non_interactive");
+            assert_eq!(plan["policy"]["network"], "offline");
+            assert!(plan["policy"]["acquisition_authorization"].is_null());
+            assert_eq!(plan["semantic_available"], false);
+        }
+        for raw in [
+            r#"{"query":"q","mode":"lexical_only"}"#,
+            r#"{"query":"q","mode":"unknown"}"#,
+            r#"{"query":"q","quality_timeout_ms":1}"#,
+        ] {
+            let request = FsfsRuntime::parse_search_serve_request(raw).unwrap();
+            assert!(runtime.search_serve_recovery_context(&request).is_none());
+        }
     }
 
     #[test]
@@ -45252,6 +45907,7 @@ mod tests {
         };
         use crate::output_schema::{OutputWarning, OutputWarningCode, QualityTimeoutPayload};
 
+        let recovery_runtime = FsfsRuntime::new(FsfsConfig::default());
         let advice = |failure| {
             DegradationAdvice::from_input(DegradationAdviceInput {
                 failure,
@@ -45273,6 +45929,13 @@ mod tests {
             reason_code: "query.quality.timeout".to_owned(),
         });
         short.explanation_warnings.push(warning.clone());
+        recovery_runtime.attach_quality_failure_recovery(
+            &mut short,
+            &SearchError::SearchTimeout {
+                elapsed_ms: 75,
+                budget_ms: 50,
+            },
+        );
         let mut long = SearchPayload::new("long", SearchOutputPhase::RefinementFailed, 0, vec![])
             .with_degradation_advice([advice(DegradationFailureKind::MissingQualityModel)]);
         long.quality_timeout = Some(QualityTimeoutPayload {
@@ -45281,6 +45944,13 @@ mod tests {
             reason_code: "query.quality.timeout".to_owned(),
         });
         long.explanation_warnings.push(warning.clone());
+        recovery_runtime.attach_quality_failure_recovery(
+            &mut long,
+            &SearchError::EmbedderUnavailable {
+                model: "quality".into(),
+                reason: "unavailable".into(),
+            },
+        );
         let refined = SearchPayload::new("healthy", SearchOutputPhase::Refined, 0, vec![]);
         let fused = FsfsRuntime::fuse_expanded_payloads(
             "original",
@@ -45292,7 +45962,11 @@ mod tests {
         assert_eq!(fused.skip_reason.as_deref(), Some("quality_timeout"));
         assert_eq!(fused.quality_timeout, long.quality_timeout);
         assert_eq!(fused.degradation_advice.len(), 2);
+        assert_eq!(fused.recovery_plans.len(), 2);
         for source in [&short, &long] {
+            for (reason, plan) in &source.recovery_plans {
+                assert_eq!(fused.recovery_plans.get(reason), Some(plan));
+            }
             for (reason, advice) in &source.degradation_advice {
                 assert_eq!(fused.degradation_advice.get(reason), Some(advice));
             }
@@ -45335,6 +46009,7 @@ mod tests {
         };
         assert_eq!(progress.stage, "retrieve.expansion");
         assert_eq!(progress.reason_code, "query.stream.expanded_degraded");
+        assert_eq!(progress.recovery_plans, fused.recovery_plans);
         assert!(progress.message.contains("100ms (observed 125ms)"));
         assert!(
             progress
@@ -56605,6 +57280,58 @@ mod tests {
             assert_eq!(artifacts[0].phase, SearchOutputPhase::Initial);
             assert_eq!(artifacts[1].phase, SearchOutputPhase::RefinementFailed);
             assert_eq!(artifacts[0].payload.hits, artifacts[1].payload.hits);
+            assert!(artifacts[0].payload.recovery_plans.is_empty());
+            let failed = &artifacts[1].payload;
+            let expected = crate::degradation_advisor::recovery_plan_for_readiness(
+                &frankensearch_core::recovery_plan::SemanticReadiness::ReadinessUnproven,
+                FsfsRuntime::runtime_recovery_request(SearchExecutionMode::QualityOnly, false),
+                &runtime.runtime_recovery_policy(),
+                None,
+                0,
+            )
+            .unwrap();
+            assert_eq!(failed.recovery_plans.len(), 1);
+            assert_eq!(
+                failed
+                    .recovery_plans
+                    .get("retrieve.quality.embedder_unavailable"),
+                Some(&serde_json::to_value(expected).unwrap())
+            );
+            let envelope = crate::output_schema::OutputEnvelope::success(
+                failed.clone(),
+                crate::output_schema::OutputMeta::new("search", "json"),
+                "2026-09-21T00:00:00Z",
+            );
+            crate::adapters::format_emitter::verify_json_toon_parity(&envelope).unwrap();
+            for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+                let stream_runtime = runtime.clone().with_cli_input(CliInput {
+                    format,
+                    ..CliInput::default()
+                });
+                let mut bytes = Vec::new();
+                let mut seq = 0;
+                stream_runtime
+                    .emit_search_stream_payload_with_stage(
+                        failed, "degraded", &mut seq, &mut bytes, None,
+                    )
+                    .unwrap();
+                let text = String::from_utf8(bytes).unwrap();
+                let first: StreamFrame<SearchHitPayload> = if format == OutputFormat::Jsonl {
+                    decode_stream_frame_ndjson(text.lines().next().unwrap()).unwrap()
+                } else {
+                    decode_stream_frame_toon(
+                        text.split('\u{001e}')
+                            .find(|record| !record.trim().is_empty())
+                            .unwrap()
+                            .trim(),
+                    )
+                    .unwrap()
+                };
+                let StreamEvent::Progress(progress) = first.event else {
+                    panic!("recovery must precede degraded result frames");
+                };
+                assert_eq!(progress.recovery_plans, failed.recovery_plans);
+            }
             assert!(
                 artifacts[1]
                     .payload
@@ -56793,43 +57520,82 @@ mod tests {
                 ..CliInput::default()
             });
             let mut payload = SearchPayload::new(
-                "sharedtoken".to_owned(), SearchOutputPhase::Initial, 0, Vec::new(),
+                "sharedtoken".to_owned(),
+                SearchOutputPhase::Initial,
+                0,
+                Vec::new(),
             );
-            payload.explanation_warnings.push(crate::output_schema::OutputWarning::new(
-                OutputWarningCode::EXPLANATION_UNAVAILABLE, "left\u{001e}right",
-            ));
+            payload
+                .explanation_warnings
+                .push(crate::output_schema::OutputWarning::new(
+                    OutputWarningCode::EXPLANATION_UNAVAILABLE,
+                    "left\u{001e}right",
+                ));
             let started = StreamFrame::new(
-                "finalize", 0, "2026-11-12T00:00:00Z", "search",
+                "finalize",
+                0,
+                "2026-11-12T00:00:00Z",
+                "search",
                 StreamEvent::<SearchHitPayload>::Started(
-                    crate::stream_protocol::StreamStartedEvent::new("finalize", "sharedtoken", format.to_string()),
+                    crate::stream_protocol::StreamStartedEvent::new(
+                        "finalize",
+                        "sharedtoken",
+                        format.to_string(),
+                    ),
                 ),
             );
             let mut bytes = Vec::new();
             let mut seq = 1;
             let result = {
-                let mut writer = SearchStreamWriter { inner: &mut bytes, failed: false, wrote: false };
-                crate::adapters::format_emitter::emit_stream_frame(&started, format, &mut writer).unwrap();
-                runtime.finish_search_stream(
-                    "sharedtoken", "finalize", SearchExecutionMode::LexicalOnly,
-                    &mut seq, &mut writer, Ok(vec![payload]),
-                ).map_err(|error| writer.mark_error_if_output_owned(error, |error| {
-                    runtime.search_output_error_for_mode(error, SearchExecutionMode::LexicalOnly)
-                }))
+                let mut writer = SearchStreamWriter {
+                    inner: &mut bytes,
+                    failed: false,
+                    wrote: false,
+                };
+                crate::adapters::format_emitter::emit_stream_frame(&started, format, &mut writer)
+                    .unwrap();
+                runtime
+                    .finish_search_stream(
+                        "sharedtoken",
+                        "finalize",
+                        SearchExecutionMode::LexicalOnly,
+                        &mut seq,
+                        &mut writer,
+                        Ok(vec![payload]),
+                    )
+                    .map_err(|error| {
+                        writer.mark_error_if_output_owned(error, |error| {
+                            runtime.search_output_error_for_mode(
+                                error,
+                                SearchExecutionMode::LexicalOnly,
+                            )
+                        })
+                    })
             };
             let text = std::str::from_utf8(&bytes).unwrap();
             let frames: Vec<StreamFrame<SearchHitPayload>> = if format == OutputFormat::Toon {
                 text.split(char::from(TOON_STREAM_RECORD_SEPARATOR_BYTE))
                     .filter(|record| !record.trim().is_empty())
-                    .map(|record| decode_stream_frame_toon(record).unwrap()).collect()
+                    .map(|record| decode_stream_frame_toon(record).unwrap())
+                    .collect()
             } else {
-                text.lines().map(|record| decode_stream_frame_ndjson(record).unwrap()).collect()
+                text.lines()
+                    .map(|record| decode_stream_frame_ndjson(record).unwrap())
+                    .collect()
             };
             assert_eq!(seq, u64::try_from(frames.len()).unwrap());
             for (sequence, frame) in frames.iter().enumerate() {
                 assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
             }
-            assert_eq!(frames.iter().filter(|frame| frame.event.kind() == StreamEventKind::Terminal).count(), 1);
-            let Some(StreamEvent::Terminal(terminal)) = frames.last().map(|frame| &frame.event) else {
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.event.kind() == StreamEventKind::Terminal)
+                    .count(),
+                1
+            );
+            let Some(StreamEvent::Terminal(terminal)) = frames.last().map(|frame| &frame.event)
+            else {
                 panic!("finalization must end with exactly one terminal");
             };
             if format == OutputFormat::Toon {
@@ -56841,8 +57607,14 @@ mod tests {
                 assert_eq!(reported.field.as_deref(), Some("stream.toon_payload"));
                 assert_eq!(terminal.status, StreamTerminalStatus::Failed);
                 assert_eq!(terminal.exit_code, 2);
-                assert_eq!(terminal.failure_category, Some(crate::stream_protocol::StreamFailureCategory::Config));
-                assert_eq!(terminal.retry, crate::stream_protocol::StreamRetryDirective::None);
+                assert_eq!(
+                    terminal.failure_category,
+                    Some(crate::stream_protocol::StreamFailureCategory::Config)
+                );
+                assert_eq!(
+                    terminal.retry,
+                    crate::stream_protocol::StreamRetryDirective::None
+                );
                 assert_eq!(terminal.error.as_ref(), Some(reported));
             } else {
                 result.unwrap();
@@ -64394,6 +65166,10 @@ mod tests {
                 "fsfs.search.cache.v19",
                 // Could lose score bits while parsing a cached JSON answer.
                 "fsfs.search.cache.v20",
+                // Did not bind the registered reranker contract.
+                "fsfs.search.cache.v21",
+                // Dropped canonical recovery from successful degraded phases.
+                "fsfs.search.cache.v22",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

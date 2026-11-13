@@ -54,7 +54,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 17: exact JSON score parsing, including replies loaded from a cache.
 // 18: client-owned expansion exchange over one retained daemon request.
 // 19: registered reranking cannot load unverified shadow weights.
-const VERSION: u32 = 19;
+// 20: degraded search phases carry canonical per-lane recovery diagnostics.
+const VERSION: u32 = 20;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -417,6 +418,13 @@ impl FsfsRuntime {
             return Some(error);
         }
         match error {
+            SearchError::SubsystemError { subsystem, source }
+                if *subsystem == "fsfs.search.serve.remote_search" =>
+            {
+                source
+                    .downcast_ref::<super::super::super::SearchServeRemoteError>()
+                    .map(|failure| &failure.0)
+            }
             SearchError::SubsystemError { subsystem, source }
                 if *subsystem == "fsfs.complete_generation.remote_search" =>
             {

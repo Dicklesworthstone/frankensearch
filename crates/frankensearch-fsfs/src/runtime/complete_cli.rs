@@ -1272,7 +1272,9 @@ impl FsfsRuntime {
                 .await
                 .map_err(|error| {
                     tracked.mark_error_if_output_owned(error, |error| {
-                        reader.runtime.search_output_error_for_mode(error, requested_mode)
+                        reader
+                            .runtime
+                            .search_output_error_for_mode(error, requested_mode)
                     })
                 });
         }
@@ -1493,7 +1495,9 @@ impl FsfsRuntime {
             .await
             .map_err(|error| {
                 tracked.mark_error_if_output_owned(error, |error| {
-                    reader.runtime.search_output_error_for_mode(error, requested_mode)
+                    reader
+                        .runtime
+                        .search_output_error_for_mode(error, requested_mode)
                 })
             })
     }
@@ -1674,7 +1678,12 @@ impl FsfsRuntime {
                 Ok(raw) => raw.trim(),
                 Err(_) => {
                     emit_complete_serve_line(
-                        &Self::search_serve_error_response("", "full", "request is not UTF-8"),
+                        &Self::search_serve_error_response(
+                            "",
+                            "full",
+                            &complete_cli_error("serve_request", "request is not UTF-8"),
+                            None,
+                        ),
                         output,
                     )?;
                     continue;
@@ -1690,7 +1699,7 @@ impl FsfsRuntime {
                 Ok(request) => request,
                 Err(error) => {
                     emit_complete_serve_line(
-                        &Self::search_serve_error_response("", "full", error.to_string()),
+                        &Self::search_serve_error_response("", "full", &error, None),
                         output,
                     )?;
                     continue;
@@ -1698,6 +1707,7 @@ impl FsfsRuntime {
             };
             let query = request.query.clone();
             let mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
+            let recovery = self.search_serve_recovery_context(&request);
             let result = async {
                 if session.refresh(cx).await? {
                     cache.clear();
@@ -1720,7 +1730,9 @@ impl FsfsRuntime {
             .await;
             let response = match result {
                 Ok(response) => response,
-                Err(error) => Self::search_serve_error_response(query, mode, error.to_string()),
+                Err(error) => {
+                    Self::search_serve_error_response(query, mode, &error, recovery.as_ref())
+                }
             };
             emit_complete_serve_line(&response, output)?;
         }
@@ -4516,6 +4528,15 @@ mod tests {
             assert_eq!(lines.len(), 4);
             assert_eq!(lines[1]["ok"], false);
             assert_eq!(lines[2]["ok"], false);
+            for line in &lines[1..=2] {
+                assert_eq!(line["error"]["code"], "invalid_config");
+                assert_eq!(
+                    line["error"]["exit_code"],
+                    crate::adapters::cli::exit_code::USAGE_ERROR
+                );
+                assert!(line["error"]["message"].is_string());
+                assert!(line["error"]["recovery_plan"].is_null());
+            }
             assert_eq!(lines[3]["ok"], true);
             assert_eq!(lines[3]["cached"], false);
         });
