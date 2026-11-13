@@ -19,6 +19,8 @@
 //! assert_eq!(q.negative_phrases, vec!["deep learning"]);
 //! ```
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// A parsed query with positive content and optional negations.
@@ -49,6 +51,10 @@ impl ParsedQuery {
     /// [`quote_query_phrase`] when rendering them into another query.
     #[must_use]
     pub fn parse(raw: &str) -> Self {
+        Self::parse_with_not_positions(raw, None)
+    }
+
+    fn parse_with_not_positions(raw: &str, mut not_positions: Option<&mut Vec<usize>>) -> Self {
         // Without syntax characters, only whitespace normalization is needed.
         if !raw
             .bytes()
@@ -90,6 +96,11 @@ impl ParsedQuery {
                 if quote < len && matches!(chars[quote], '"' | '\'') {
                     let (phrase, next) = parse_quoted_phrase(&chars, quote);
                     if !phrase.trim().is_empty() {
+                        if (chars[i] != 'N' || chars[i + 1] != 'O' || chars[i + 2] != 'T')
+                            && let Some(positions) = not_positions.as_deref_mut()
+                        {
+                            positions.push(i);
+                        }
                         negative_phrases.push(phrase);
                     }
                     i = next;
@@ -170,6 +181,35 @@ impl ParsedQuery {
     pub const fn negation_count(&self) -> usize {
         self.negative_terms.len() + self.negative_phrases.len()
     }
+}
+
+/// Normalize recognized phrase-negation keywords for a lexical parser.
+///
+/// Only case-insensitive `NOT` keywords that the exclusion parser accepts
+/// before a quoted phrase are uppercased. All other source text, including
+/// quoted literals, escaped dashes, fields, and whitespace, is preserved.
+#[must_use]
+pub fn normalize_phrase_negation_keywords(raw: &str) -> Cow<'_, str> {
+    if !raw
+        .as_bytes()
+        .windows(3)
+        .any(|word| word != b"NOT" && word.eq_ignore_ascii_case(b"NOT"))
+    {
+        return Cow::Borrowed(raw);
+    }
+    let mut positions = Vec::new();
+    let _ = ParsedQuery::parse_with_not_positions(raw, Some(&mut positions));
+    if positions.is_empty() {
+        return Cow::Borrowed(raw);
+    }
+
+    let mut chars: Vec<char> = raw.chars().collect();
+    for position in positions {
+        chars[position] = 'N';
+        chars[position + 1] = 'O';
+        chars[position + 2] = 'T';
+    }
+    Cow::Owned(chars.into_iter().collect())
 }
 
 /// Render decoded text as one double-quoted query phrase.
@@ -337,6 +377,58 @@ mod tests {
     use super::*;
 
     // ── Basic parsing ──────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_phrase_negations_preserves_positive_source_and_unicode_offsets() {
+        for (raw, expected) in [
+            (r#"needle nOt "internal secret""#, r#"needle NOT "internal secret""#),
+            (r#"\-literal not "secret""#, r#"\-literal NOT "secret""#),
+            (
+                r#"title:"not \"secret\"" Not 'outside secret'"#,
+                r#"title:"not \"secret\"" NOT 'outside secret'"#,
+            ),
+            (
+                r#"雪猫 not "éclair" αβγ nOt 'another phrase'"#,
+                r#"雪猫 NOT "éclair" αβγ NOT 'another phrase'"#,
+            ),
+            (
+                "needle\tNoT\t\"secret\"\u{2003}not 'other'",
+                "needle\tNOT\t\"secret\"\u{2003}NOT 'other'",
+            ),
+            (
+                r#"needle not "quote \"inside\" and path\\" NOT "other""#,
+                r#"needle NOT "quote \"inside\" and path\\" NOT "other""#,
+            ),
+        ] {
+            let normalized = normalize_phrase_negation_keywords(raw);
+            assert_eq!(normalized, expected, "{raw}");
+            assert_eq!(ParsedQuery::parse(&normalized), ParsedQuery::parse(raw));
+        }
+    }
+
+    #[test]
+    fn normalize_phrase_negations_borrows_unchanged_source() {
+        for raw in [
+            "plain query",
+            r#"needle NOT "secret""#,
+            "this is not excluded",
+            r#""say not \"secret\"""#,
+            "'say not \"secret\"'",
+            r#"title : "not \"secret\"""#,
+            r#"\not "secret""#,
+            r#"cannot "be excluded""#,
+            r#"needle -"say not \"secret\"""#,
+            r#"(not "secret")"#,
+        ] {
+            assert!(
+                matches!(
+                    normalize_phrase_negation_keywords(raw),
+                    Cow::Borrowed(value) if value == raw
+                ),
+                "{raw}",
+            );
+        }
+    }
 
     #[test]
     fn parse_no_negations() {

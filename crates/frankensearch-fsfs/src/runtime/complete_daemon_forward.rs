@@ -55,7 +55,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 18: client-owned expansion exchange over one retained daemon request.
 // 19: registered reranking cannot load unverified shadow weights.
 // 20: degraded search phases carry canonical per-lane recovery diagnostics.
-const VERSION: u32 = 20;
+// 21: quoted literals and case-insensitive phrase exclusions agree across lanes.
+const VERSION: u32 = 21;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]

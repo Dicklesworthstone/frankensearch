@@ -663,7 +663,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v21: exact JSON number parsing; older cache hops could change score bits.
 // v22: registered reranker inputs and execution policy bind reranked answers.
 // v23: successful degraded phases retain canonical lane recovery diagnostics.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v23";
+// v24: quoted literals and case-insensitive phrase exclusions agree across lanes.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v24";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -683,8 +684,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v18 / stream v16: exact JSON score transport and cache parsing.
 // v19 / stream v17: registered reranking cannot load unverified shadow weights.
 // v20 / stream v18: failures retain typed error codes, exit status and recovery.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v20";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v18";
+// v21 / stream v19: quoted literals and phrase exclusions agree across lanes.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v21";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v19";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -53871,6 +53873,119 @@ mod tests {
     }
 
     #[test]
+    fn runtime_search_phrase_exclusions_fill_selective_lexical_limit_in_every_case() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("phrase exclusion fixture");
+            let lexical_path = temp.path().join("lexical");
+            let writer = create_test_quill(&cx, &lexical_path).await;
+            for index in 0..64 {
+                for (path, text) in [
+                    (format!("docs/outside-{index}.md"), "needle"),
+                    (format!("src/blocked-{index}.rs"), "needle internal secret"),
+                ] {
+                    writer
+                        .index_document(&cx, &IndexableDocument::new(path, text))
+                        .await
+                        .unwrap();
+                }
+            }
+            for (path, text) in [
+                ("src/operator-only.rs", "not".to_owned()),
+                ("src/first.RS", format!("needle {}", "irrelevant ".repeat(20))),
+                ("src/second.rs", format!("needle {}", "irrelevant ".repeat(40))),
+            ] {
+                writer
+                    .index_document(&cx, &IndexableDocument::new(path, text))
+                    .await
+                    .unwrap();
+            }
+            writer.commit(&cx).await.unwrap();
+
+            // Native exclusions remove blocked documents before top-k, but
+            // the CLI path predicate still needs to reach a late lexical tail.
+            let native = writer
+                .search_doc_ids(&cx, r#"needle NOT "internal secret""#, 131)
+                .unwrap();
+            assert_eq!(native.len(), 66);
+            assert!(
+                native
+                    .iter()
+                    .take(64)
+                    .all(|hit| hit.document_id.starts_with("docs/")),
+                "eligible source files must lie beyond the first 64 native matches",
+            );
+            drop(writer);
+
+            let mut runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(&cx, SearchExecutionMode::LexicalOnly)
+                .await
+                .unwrap();
+            for filter in [Some("path:src/ ext:rs"), None] {
+                runtime.cli_input.filter = filter.map(str::to_owned);
+                for keyword in ["not", "Not", "nOt", "NOT"] {
+                    let query = format!(r#"needle {keyword} "internal secret""#);
+                    for include_snippets in [false, true] {
+                        for limit in [1, 2, 10, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL] {
+                            let phases = runtime
+                                .execute_search_payloads_with_mode_using_resources(
+                                    &cx,
+                                    &query,
+                                    limit,
+                                    SearchExecutionMode::LexicalOnly,
+                                    &mut resources,
+                                    SearchExecutionFlags {
+                                        include_snippets,
+                                        persist_explain_session: false,
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                            let paths = phases[0]
+                                .hits
+                                .iter()
+                                .map(|hit| hit.path.as_str())
+                                .collect::<Vec<_>>();
+                            assert!(
+                                paths.iter().all(|path| {
+                                    !path.starts_with("src/blocked-")
+                                        && *path != "src/operator-only.rs"
+                                }),
+                                "{query}, filter={filter:?}, snips={include_snippets}: {paths:?}",
+                            );
+                            if filter.is_some() {
+                                let expected = if limit == 1 {
+                                    vec!["src/first.RS"]
+                                } else {
+                                    vec!["src/first.RS", "src/second.rs"]
+                                };
+                                assert_eq!(
+                                    paths, expected,
+                                    "{query}, limit={limit}, snippets={include_snippets}",
+                                );
+                            } else {
+                                let expected = if limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
+                                    66
+                                } else {
+                                    limit.min(66)
+                                };
+                                assert_eq!(
+                                    paths.len(), expected,
+                                    "{query}, limit={limit}, snippets={include_snippets}",
+                                );
+                            }
+                            assert_eq!(phases[0].hits[0].lexical_rank, Some(0));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn runtime_search_selective_filter_reaches_both_vector_tiers() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("vector filter fixture");
@@ -54262,6 +54377,9 @@ mod tests {
                 "NOT \"banned\"",
                 "-\"banned\"",
                 "NOT \"internal secret\"",
+                "not \"internal secret\"",
+                "Not \"internal secret\"",
+                "nOt \"internal secret\"",
             ] {
                 let query = format!("how do alpha documents rank {exclusion}");
                 let phases = runtime

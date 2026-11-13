@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use asupersync::Cx;
 use compact_str::CompactString;
+use frankensearch_core::parsed_query::normalize_phrase_negation_keywords;
 use frankensearch_core::{IndexableDocument, LexicalWrite, SearchError, SearchResult};
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillIndex, indexable_document_content_hash};
 pub use frankensearch_quill::{
@@ -29,10 +30,19 @@ use flush_queue::FlushProgress;
 /// drops the fragment when no such field exists, so `HashMap::new`, `std::io`,
 /// `https://…` or `TODO:` matched nothing at all. Every colon is escaped except
 /// one that ends a real field name at the start of a term (`title:rust`);
-/// quoted phrases are already literal.
+/// quoted phrases are already literal. Case-insensitive phrase-negation
+/// keywords use Quill's uppercase spelling without changing positive text.
 #[must_use]
 pub fn lexical_query_text(query: &str) -> Cow<'_, str> {
-    frankensearch_quill::escape_unknown_field_colons(query, DEFAULT_SCHEMA)
+    match normalize_phrase_negation_keywords(query) {
+        Cow::Borrowed(query) => {
+            frankensearch_quill::escape_unknown_field_colons(query, DEFAULT_SCHEMA)
+        }
+        Cow::Owned(query) => Cow::Owned(
+            frankensearch_quill::escape_unknown_field_colons(&query, DEFAULT_SCHEMA)
+                .into_owned(),
+        ),
+    }
 }
 
 /// Default expected throughput for initial lexical indexing (docs/sec).
@@ -1077,6 +1087,41 @@ mod tests {
             super::lexical_query_text("plain query"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn lexical_query_text_normalizes_phrase_exclusions_without_rewriting_positives() {
+        for (query, expected) in [
+            (
+                r#"HashMap::new not "internal secret""#,
+                r#"HashMap\:\:new NOT "internal secret""#,
+            ),
+            (
+                r#"\-literal nOt 'secret phrase'"#,
+                r#"\-literal NOT 'secret phrase'"#,
+            ),
+            (
+                r#"title:"not \"secret\"" Not "outside secret""#,
+                r#"title:"not \"secret\"" NOT "outside secret""#,
+            ),
+        ] {
+            assert_eq!(super::lexical_query_text(query), expected, "{query}");
+        }
+        for query in [
+            r#"needle NOT "secret""#,
+            r#""say not \"secret\"""#,
+            r#"title:'not "secret"'"#,
+            r#"\-literal"#,
+            "this is not excluded",
+        ] {
+            assert!(
+                matches!(
+                    super::lexical_query_text(query),
+                    std::borrow::Cow::Borrowed(value) if value == query
+                ),
+                "{query}",
+            );
+        }
     }
 
     #[test]
