@@ -158,6 +158,36 @@ fn assert_preflight_failure(output: &Output, expected: &str) {
 }
 
 #[test]
+fn invalid_watch_scope_is_refused_before_source_store_or_hybrid_configuration_io() {
+    let fixture = Fixture::new(None, false);
+    let output = Process::start(
+        fixture
+            .lexical_command(&fixture.source, &fixture.store)
+            .args([
+                "--hybrid",
+                "--config",
+                "not-opened.toml",
+                "--filter",
+                "owner:unknown",
+                "--once",
+            ]),
+    )
+    .finish(Duration::from_secs(15));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["phase"], "arguments");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported filter key")
+    );
+    assert!(!fixture.store.exists());
+    assert_eq!(fs::read_dir(&fixture.source).unwrap().count(), 1);
+}
+
+#[test]
 fn overlap_refusal_is_dispatched_before_indexing_and_preserves_source() {
     let fixture = Fixture::new(None, false);
     let overlap = fixture.source.join("must-not-be-created");
@@ -348,6 +378,102 @@ fn lexical_native_watch_streams_creates_updates_and_removals_at_the_publication_
         fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(),
         selected
     );
+}
+
+#[test]
+fn scoped_lexical_watch_tracks_membership_without_restricting_source_indexing() {
+    let fixture = Fixture::new(None, false);
+    fs::write(
+        fixture.source.join("parser.rs"),
+        "sharedtoken eligible Rust document",
+    )
+    .unwrap();
+    let mut process = Process::start(
+        fixture
+            .lexical_command(&fixture.source, &fixture.store)
+            .args([
+                "--filter",
+                "path:source/ lang:rust",
+                "--limit",
+                "1",
+                "--max-updates",
+                "2",
+                "--timeout-ms",
+                "60000",
+            ]),
+    );
+    let first = process.wait_for_frame(0);
+    assert_eq!(first["schema_version"], "fsfs.stream.live_search.v1");
+    assert_eq!(first["event"], "snapshot");
+    assert_eq!(first["result_count"], 1);
+    let selected = first["results"][0]["doc_id"].as_str().unwrap();
+    assert_eq!(Path::new(selected).file_name().unwrap(), "parser.rs");
+
+    // Source membership remains, but changing its extension leaves this scope.
+    fs::rename(
+        fixture.source.join("parser.rs"),
+        fixture.source.join("parser.txt"),
+    )
+    .unwrap();
+    let output = process.finish(Duration::from_secs(75));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frames = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 2);
+    let second = &frames[1];
+    assert_eq!(second["sequence"], 2);
+    assert_eq!(second["previous_generation"], first["generation"]);
+    assert_ne!(second["generation"], first["generation"]);
+    assert_eq!(second["result_count"], 0);
+    assert!(
+        second["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| { change["change"] == "removed" && change["doc_id"] == selected })
+    );
+
+    let store_root = fixture.store.clone();
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        use frankensearch_fsfs::adapters::live_search::LiveSearchConfig;
+        use frankensearch_fsfs::adapters::live_search_session::LiveSearchRefreshConfig;
+        use frankensearch_fsfs::adapters::quill_live_search::QuillLiveSearchSession;
+        use frankensearch_fsfs::generation_store::CompleteGenerationStore;
+        use frankensearch_quill::QuillConfig;
+
+        let store = CompleteGenerationStore::open(&cx, &store_root).unwrap();
+        let mut unscoped = QuillLiveSearchSession::new(
+            store,
+            "sharedtoken",
+            LiveSearchConfig::default(),
+            LiveSearchRefreshConfig::default(),
+            QuillConfig::default(),
+        )
+        .unwrap();
+        unscoped.poll(&cx, Instant::now()).await.unwrap().unwrap();
+        let names = unscoped
+            .tracker()
+            .results()
+            .iter()
+            .map(|result| {
+                Path::new(&result.hit.doc_id)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"alpha.md".to_owned()));
+        assert!(names.contains(&"parser.txt".to_owned()));
+    });
 }
 
 #[cfg(feature = "semantic-support")]

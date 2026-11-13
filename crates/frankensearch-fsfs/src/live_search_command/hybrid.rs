@@ -40,20 +40,30 @@ impl Subscription {
         runtime: Option<FsfsRuntime>,
     ) -> SearchResult<Self> {
         match (options.hybrid, runtime) {
-            (true, Some(runtime)) => Ok(Self::Hybrid(Box::new(RetainedLiveSearchSession::new(
-                runtime,
-                store,
-                options.query.clone(),
-                options.limits,
-                options.refresh,
-            )?))),
-            (false, None) => Ok(Self::Lexical(Box::new(QuillLiveSearchSession::new(
-                store,
-                options.query.clone(),
-                options.limits,
-                options.refresh,
-                QuillConfig::default(),
-            )?))),
+            (true, Some(runtime)) => {
+                let runtime = if options.filter.is_some() {
+                    runtime.with_search_filter(options.filter.clone())?
+                } else {
+                    runtime
+                };
+                Ok(Self::Hybrid(Box::new(RetainedLiveSearchSession::new(
+                    runtime,
+                    store,
+                    options.query.clone(),
+                    options.limits,
+                    options.refresh,
+                )?)))
+            }
+            (false, None) => Ok(Self::Lexical(Box::new(
+                QuillLiveSearchSession::new_filtered(
+                    store,
+                    options.query.clone(),
+                    options.filter.as_deref(),
+                    options.limits,
+                    options.refresh,
+                    QuillConfig::default(),
+                )?,
+            ))),
             _ => Err(invalid(
                 "subscription mode does not match its admitted runtime",
             )),
@@ -122,6 +132,7 @@ pub(super) fn configured_runtime(options: &Options) -> SearchResult<Option<FsfsR
     Ok(Some(FsfsRuntime::new(config).with_cli_input(CliInput {
         command: CliCommand::Search,
         index_dir: Some(options.root.clone()),
+        filter: options.filter.clone(),
         format: OutputFormat::Jsonl,
         quiet: true,
         no_color: true,
@@ -406,6 +417,104 @@ mod tests {
         assert!(runtime.config().indexing.offline);
         assert!(!runtime.config().indexing.watch_mode);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hybrid_filter_reaches_configured_reads_and_survives_query_edits() {
+        use frankensearch_core::{IndexableDocument, LexicalWrite};
+        use frankensearch_fsfs::generation_store::GenerationPublication;
+        use frankensearch_quill::QuillIndex;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store_root = root.path().join("store");
+            let store = CompleteGenerationStore::create(&cx, &store_root).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let index = QuillIndex::create(
+                &cx,
+                &build.path().join("lexical"),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[
+                    IndexableDocument::new("src/alpha.rs", "alpha beta"),
+                    IndexableDocument::new("src/alpha.py", "alpha beta").with_title("alpha beta"),
+                    IndexableDocument::new("docs/alpha.md", "alpha beta").with_title("alpha beta"),
+                ],
+            )
+            .await
+            .unwrap();
+            LexicalWrite::commit(&index, &cx).await.unwrap();
+            drop(index);
+            assert!(matches!(
+                build.publish(&cx, |_, _| Ok(())).unwrap(),
+                GenerationPublication::Durable(_)
+            ));
+
+            let mut config = FsfsConfig::default();
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            config.search.fast_only = true;
+            config.search.rerank = false;
+            let config_path = root.path().join("fsfs.toml");
+            std::fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+            let mut options = options(&store_root);
+            options.config_path = Some(config_path);
+            options.filter = Some("lang:rust".to_owned());
+            options.limits.max_results = 1;
+            let runtime = configured_runtime(&options).unwrap().unwrap();
+            let mut reader = runtime
+                .open_retained_search(&cx, &store_root)
+                .await
+                .unwrap();
+            let phases = reader.search(&cx, "alpha", 1).await.unwrap();
+            assert!(!phases.is_empty());
+            for phase in &phases {
+                assert_eq!(phase.hits.len(), 1);
+                assert_eq!(phase.hits[0].path, "src/alpha.rs");
+            }
+
+            // An absent CLI scope retains an existing runtime scope. An explicit
+            // CLI scope replaces it without replacing unrelated runtime policy.
+            for (filter, expected) in [(None, "docs/alpha.md"), (Some("lang:rust"), "src/alpha.rs")]
+            {
+                options.filter = filter.map(str::to_owned);
+                let supplied = runtime
+                    .clone()
+                    .with_search_filter(Some("ext:md".to_owned()))
+                    .unwrap();
+                let mut session =
+                    Subscription::new(store.clone(), &options, Some(supplied)).unwrap();
+                for query in ["alpha", "beta"] {
+                    session.set_query(&cx, query).unwrap();
+                    let mut bytes = Vec::new();
+                    assert!(
+                        session
+                            .poll_ndjson(&cx, Instant::now(), &mut bytes)
+                            .await
+                            .unwrap()
+                    );
+                    let Subscription::Hybrid(retained) = &session else {
+                        panic!("hybrid subscription must retain its pipeline");
+                    };
+                    assert_eq!(retained.tracker().results().len(), 1);
+                    assert_eq!(retained.tracker().results()[0].hit.doc_id, expected);
+                    let frame: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(frame["schema_version"], HYBRID_SCHEMA_VERSION);
+                    assert_eq!(frame["phase"], "initial");
+                    assert_eq!(frame["update"]["sequence"], 1);
+                    assert_eq!(frame["update"]["results"][0]["doc_id"], expected);
+                }
+            }
+        });
     }
 
     #[test]

@@ -13548,6 +13548,42 @@ impl QuillSearchIndex {
         self.reader.search_doc_ids(cx, query, limit)
     }
 
+    /// Hydrate only the chosen document identities from one pinned publication.
+    ///
+    /// Results follow the input order, including repeated identities. Missing
+    /// documents and documents without stored metadata produce `None`. Every
+    /// lookup in a call uses the same snapshot even if this reader is refreshed
+    /// concurrently. Consumers combining this with a separate scoring call must
+    /// retain an immutable reader, or use [`LexicalRead::search_candidates`] and
+    /// its hydration context to pin across a concurrent refresh.
+    ///
+    /// # Errors
+    /// Returns typed cancellation, publication-state, dictionary, metadata or
+    /// allocation failures. No partially hydrated batch is returned on error.
+    pub fn metadata_for_documents(
+        &self,
+        cx: &Cx,
+        document_ids: &[&str],
+    ) -> Result<Vec<Option<Arc<serde_json::Value>>>, QuillIndexError> {
+        check_cancel(cx, "selected metadata hydration")?;
+        let snapshot = self.reader.checked_published_snapshot()?;
+        let mut metadata = Vec::new();
+        metadata
+            .try_reserve(document_ids.len())
+            .map_err(|_| invalid_state("could not reserve selected metadata batch"))?;
+        for document_id in document_ids {
+            check_cancel(cx, "selected metadata hydration")?;
+            metadata.push(
+                snapshot
+                    .resolve_document_id(document_id)?
+                    .map(|global_docid| snapshot.materialize_metadata(global_docid))
+                    .transpose()?
+                    .flatten(),
+            );
+        }
+        Ok(metadata)
+    }
+
     /// Search the pinned publication and generate snippets from stored content.
     ///
     /// # Errors
@@ -35439,6 +35475,73 @@ mod tests {
                     ),
                     other => panic!("unexpected document id {other}"), // ubs:ignore -- Wrong identity must fail this hydration test.
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn selected_metadata_preserves_order_absence_and_admitted_reader_generation() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("metadata directory");
+            let config = deterministic_config();
+            let writer = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("metadata writer");
+            writer
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("bare", "alpha"),
+                        IndexableDocument::new("annotated", "alpha")
+                            .with_metadata("revision", "first"),
+                    ],
+                )
+                .await
+                .expect("index metadata fixtures");
+            writer.commit(&cx).await.expect("publish first metadata");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("admit first metadata");
+            let ids = ["annotated", "missing", "bare", "annotated"];
+            let metadata = reader.metadata_for_documents(&cx, &ids).unwrap();
+            assert_eq!(metadata.len(), ids.len());
+            assert_eq!(
+                metadata[0].as_deref(),
+                Some(&serde_json::json!({"revision": "first"}))
+            );
+            assert!(metadata[1].is_none());
+            assert!(metadata[2].is_none());
+            assert_eq!(metadata[0], metadata[3]);
+            assert!(reader.metadata_for_documents(&cx, &[]).unwrap().is_empty());
+
+            writer
+                .upsert_documents(
+                    &cx,
+                    &[IndexableDocument::new("annotated", "alpha")
+                        .with_metadata("revision", "second")],
+                )
+                .await
+                .expect("replace annotated metadata");
+            writer.commit(&cx).await.expect("publish second metadata");
+            assert_eq!(reader.metadata_for_documents(&cx, &ids).unwrap(), metadata);
+            assert!(reader.refresh(&cx).await.unwrap());
+            let updated = reader.metadata_for_documents(&cx, &ids).unwrap();
+            assert_eq!(
+                updated[0].as_deref(),
+                Some(&serde_json::json!({"revision": "second"}))
+            );
+            assert_eq!(updated[0], updated[3]);
+            assert!(updated[1].is_none());
+            assert!(updated[2].is_none());
+
+            cx.set_cancel_requested(true);
+            for ids in [&ids[..], &[][..]] {
+                assert!(matches!(
+                    reader.metadata_for_documents(&cx, ids),
+                    Err(QuillIndexError::Cancelled {
+                        phase: "selected metadata hydration"
+                    }),
+                ));
             }
         });
     }
