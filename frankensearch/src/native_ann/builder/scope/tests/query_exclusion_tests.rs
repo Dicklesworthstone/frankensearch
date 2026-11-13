@@ -239,6 +239,97 @@ fn exclusions_keep_literal_quotes_no_match_ranks_and_positive_reranker_text() {
 }
 
 #[test]
+fn exclusion_census_preserves_trailing_terms_when_or_rendering_expands_the_query() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fast = Arc::new(Provider::new("long-exclusion-fast", 2));
+        let quality = Arc::new(Provider::new("long-exclusion-quality", 3));
+        let index = build(
+            &cx,
+            &directory.path().join("index"),
+            false,
+            &fast,
+            Some(&quality),
+        )
+        .await;
+        let mut query = String::from("needle ");
+        for term in 0..800 {
+            use std::fmt::Write;
+            write!(query, "-absent{term:03} ").unwrap();
+        }
+        query.push_str("-private");
+        assert!(query.chars().count() < frankensearch_quill::query::MAX_QUERY_LENGTH);
+        let expanded = frankensearch_core::ParsedQuery::parse(&query)
+            .negative_terms
+            .join(" OR ");
+        assert!(expanded.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH);
+        for hits in [
+            index.search(&cx, &query, 28).await.unwrap(),
+            index.search_refined(&cx, &query, 28).await.unwrap(),
+            index.search_quality(&cx, &query, 28).await.unwrap(),
+        ] {
+            assert_eq!(hits.len(), 4);
+            assert!(hits.iter().all(|hit| !hit.doc_id.starts_with("private-")));
+        }
+        // Matching the same ID in both census groups is valid membership,
+        // rather than a duplicate candidate returned within one batch.
+        let overlapping = format!("-private {query}");
+        let hits = index.search(&cx, &overlapping, 28).await.unwrap();
+        assert_eq!(hits.len(), 4);
+        assert!(hits.iter().all(|hit| !hit.doc_id.starts_with("private-")));
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 3);
+        assert_eq!(quality.queries.load(Ordering::SeqCst), 2);
+        assert!(
+            fast.query_texts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|text| text == "needle")
+        );
+        assert!(
+            quality
+                .query_texts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|text| text == "needle")
+        );
+    });
+}
+
+#[test]
+fn exclusion_census_refuses_one_oversized_escaped_phrase_before_inference() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fast = Arc::new(Provider::new("escaped-exclusion-fast", 2));
+        let index = build(&cx, &directory.path().join("index"), false, &fast, None).await;
+        let query = format!(
+            "needle -'{}'",
+            "\"".repeat(frankensearch_quill::query::MAX_QUERY_LENGTH / 2 + 1)
+        );
+        assert!(query.chars().count() < frankensearch_quill::query::MAX_QUERY_LENGTH);
+        let error = index.search(&cx, &query, 28).await.unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { field, value, .. }
+            if field == "query.exclusions" && value == "oversized-clause")
+        );
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+
+        // The parser bound counts Unicode scalars, not UTF-8 bytes. A long
+        // unmatched Unicode phrase still fits and must remain searchable.
+        let unicode_query = format!(
+            "needle -'{}'",
+            "é".repeat(frankensearch_quill::query::MAX_QUERY_LENGTH / 2 + 1)
+        );
+        assert!(unicode_query.len() > frankensearch_quill::query::MAX_QUERY_LENGTH);
+        assert!(unicode_query.chars().count() < frankensearch_quill::query::MAX_QUERY_LENGTH);
+        let hits = index.search(&cx, &unicode_query, 28).await.unwrap();
+        assert_eq!(hits.len(), 28);
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
 fn global_exclusions_widen_mixed_boolean_lexical_branches() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();

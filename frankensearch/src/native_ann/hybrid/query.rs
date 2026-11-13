@@ -18,7 +18,7 @@ use crate::{Cx, LexicalCandidateBatch, LexicalRead, SearchResult};
 pub(super) struct ImmutableTextQuery {
     pub(super) semantic: String,
     pub(super) lexical: String,
-    exclusion_query: String,
+    exclusion_queries: Vec<String>,
     pub(super) excluded: Arc<BTreeSet<String>>,
     ceiling: usize,
 }
@@ -33,7 +33,7 @@ impl ImmutableTextQuery {
         // Match the lexical engine's own analyzer, fields, and phrase rules.
         // Decode and requote phrases so escapes cannot become query syntax;
         // prepare bare terms exactly as the ordinary user-query boundary does.
-        let exclusion_query = parsed
+        let clauses = parsed
             .negative_terms
             .iter()
             .map(|term| lexical.query_text(term).into_owned())
@@ -42,13 +42,36 @@ impl ImmutableTextQuery {
                     .negative_phrases
                     .iter()
                     .map(|phrase| quote_query_phrase(phrase)),
-            )
-            .collect::<Vec<_>>()
-            .join(" OR ");
+            );
+        // OR separators and phrase escaping can expand a valid user query
+        // past Quill's parser bound. Census every bounded group instead of
+        // silently losing the trailing constraints to parser truncation.
+        let mut exclusion_queries = Vec::new();
+        let mut query = String::new();
+        let mut query_chars = 0usize;
+        for clause in clauses {
+            let clause_chars = clause.chars().count();
+            if !query.is_empty()
+                && query_chars.saturating_add(4).saturating_add(clause_chars)
+                    > frankensearch_quill::query::MAX_QUERY_LENGTH
+            {
+                exclusion_queries.push(std::mem::take(&mut query));
+                query_chars = 0;
+            }
+            if !query.is_empty() {
+                query.push_str(" OR ");
+                query_chars += 4;
+            }
+            query.push_str(&clause);
+            query_chars += clause_chars;
+        }
+        if !query.is_empty() {
+            exclusion_queries.push(query);
+        }
         Some(Self {
             semantic: parsed.positive,
             lexical: normalize_phrase_negation_keywords(text).into_owned(),
-            exclusion_query,
+            exclusion_queries,
             excluded: Arc::default(),
             ceiling: 0,
         })
@@ -64,30 +87,43 @@ impl ImmutableTextQuery {
         // This is a complete membership census, not a top-k sample. Existing
         // source scopes widen their immutable reader before returning this
         // many eligible candidates, so explicit filters remain conjunctive.
-        let batch = frankensearch_core::with_cancellation(
-            cx,
-            "native_ann.exclusions.membership",
-            lexical.search_candidates(cx, &self.exclusion_query, ceiling),
-        )
-        .await?;
-        checkpoint(cx, "native_ann.exclusions.response")?;
-        validate_lexical(cx, &batch)?;
-        if batch.results().len() > ceiling {
-            return Err(invalid(
-                "query.exclusions",
-                "overfull",
-                "exclusion membership exceeds the retained lexical document count",
-            ));
-        }
         let mut excluded = BTreeSet::new();
-        for result in batch.results() {
-            checkpoint(cx, "native_ann.exclusions.document")?;
-            if !excluded.insert(result.doc_id.to_string()) {
+        for query in &self.exclusion_queries {
+            #[cfg(feature = "quill")]
+            if query.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH {
                 return Err(invalid(
                     "query.exclusions",
-                    "duplicate-id",
-                    "exclusion membership must contain unique document IDs",
+                    "oversized-clause",
+                    "one exclusion exceeds the lexical parser's query length bound",
                 ));
+            }
+            let batch = frankensearch_core::with_cancellation(
+                cx,
+                "native_ann.exclusions.membership",
+                lexical.search_candidates(cx, query, ceiling),
+            )
+            .await?;
+            checkpoint(cx, "native_ann.exclusions.response")?;
+            validate_lexical(cx, &batch)?;
+            if batch.results().len() > ceiling {
+                return Err(invalid(
+                    "query.exclusions",
+                    "overfull",
+                    "exclusion membership exceeds the retained lexical document count",
+                ));
+            }
+            let mut batch_ids = BTreeSet::new();
+            for result in batch.results() {
+                checkpoint(cx, "native_ann.exclusions.document")?;
+                if !batch_ids.insert(result.doc_id.as_str()) {
+                    return Err(invalid(
+                        "query.exclusions",
+                        "duplicate-id",
+                        "exclusion membership must contain unique document IDs",
+                    ));
+                }
+                // One document may match clauses in more than one group.
+                excluded.insert(result.doc_id.to_string());
             }
         }
         checkpoint(cx, "native_ann.exclusions.complete")?;
