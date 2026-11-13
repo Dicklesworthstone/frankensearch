@@ -6514,10 +6514,25 @@ meta:
         }
         let model_root = configured_model_root();
         verify_pinned_model_cache(&model_root)?;
-        let temp = tempfile::tempdir().expect("complete watch fixture");
+        // Keep the store's default socket in range even when the build runner
+        // supplies a long TMPDIR. Preserve default socket discovery rather
+        // than overriding the daemon address in the requests below.
+        let fixture_root = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = tempfile::Builder::new()
+            .prefix("fsfs-watch-")
+            .tempdir_in(fixture_root)
+            .expect("complete watch fixture");
         let fsfs = IsolatedFsfs::new(temp.path(), model_root);
         let corpus = temp.path().join("corpus");
         let index = temp.path().join("index");
+        assert!(
+            index.join("fsfs-query.sock").as_os_str().len() < 100,
+            "complete watch requires a short default socket path; set XDG_RUNTIME_DIR or TMPDIR to a short directory: {}",
+            index.display()
+        );
         fs::create_dir_all(&corpus).expect("watch corpus");
         fs::write(corpus.join("database.md"), "Oldquartz database transactions preserve atomicity using rollback and durable journals.").unwrap();
         fs::write(
