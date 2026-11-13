@@ -49,6 +49,7 @@ pub use tantivy::{
 };
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "bench-internals")]
 use std::sync::Arc;
@@ -1911,11 +1912,10 @@ pub struct TantivyIndex {
     read_only: bool,
     doc_count: AtomicUsize,
     /// Append-only `ordinal -> doc_id` table backing the fast id-materialization
-    /// path. Index `i` holds the `doc_id` of the document assigned ordinal `i`.
-    /// Grows by one per indexed document (including re-upserts); ordinals are
-    /// monotonic and never reused, so it stays correct across deletes/merges
-    /// (a deleted doc's ordinal simply never appears in search results).
-    ord_table: RwLock<Vec<DocId>>,
+    /// path. Entries reconstructed at open are bound to their source segments;
+    /// locally assigned entries grow by one per indexed document (including
+    /// re-upserts) and are never reused during this writer's lifetime.
+    ord_table: RwLock<OrdinalTable>,
     path: Option<PathBuf>,
     /// Exact writer-pool width accepted by Tantivy's benchmark constructor.
     #[cfg(feature = "bench-internals")]
@@ -1941,6 +1941,25 @@ pub struct TantivyIndex {
     /// deliberately not a global counter — parallel tests would race one.
     #[cfg(test)]
     observed_writer_call: WriterCall,
+}
+
+/// Authoritative identifiers reconstructed at open, followed by locally
+/// assigned append-only ordinals. Restored entries are valid only for the
+/// immutable segments that supplied them: a read-only reader may later reload
+/// a generation written by another process that reused an ordinal.
+struct OrdinalTable {
+    ids: Vec<DocId>,
+    restored_len: usize,
+    restored_segments: HashSet<tantivy::SegmentId>,
+}
+
+impl OrdinalTable {
+    fn resolve(&self, ordinal: usize, segment_id: tantivy::SegmentId) -> Option<&DocId> {
+        self.ids.get(ordinal).filter(|id| {
+            !id.is_empty()
+                && (ordinal >= self.restored_len || self.restored_segments.contains(&segment_id))
+        })
+    }
 }
 
 /// The Tantivy writer constructor a `TantivyIndex` actually invoked.
@@ -2939,15 +2958,6 @@ impl TantivyIndex {
         let tokenizer_manager = index.tokenizers().clone();
         tokenizer_manager.register(TOKENIZER_NAME, build_tokenizer());
 
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .map_err(|e| SearchError::SubsystemError {
-                subsystem: "tantivy",
-                source: Box::new(e),
-            })?;
-
         // The selection branch is the single source of both the writer and its
         // receipt seed. Nothing downstream can relabel a `writer_with_num_threads`
         // construction as shipping-auto, or vice versa, because the mode is
@@ -3036,44 +3046,27 @@ impl TantivyIndex {
         })?;
         let read_only = writer.is_none();
 
+        // A writable handle must acquire its writer lock before taking the
+        // snapshot that establishes the next ordinal. Otherwise a previous
+        // writer could publish between reader creation and lock acquisition,
+        // leaving this handle free to reuse an unseen document's ordinal.
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .map_err(|e| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(e),
+            })?;
+
         // Count existing documents.
         let searcher = reader.searcher();
         let doc_count = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
 
-        // Restore the ordinal→doc_id table for a reopened on-disk index from its
-        // sidecar so id materialization keeps the fast path instead of falling
-        // back to the docstore. The sidecar is best-effort: if it is absent,
-        // corrupt, or stale the table is left short and those ordinals resolve
-        // via the docstore (correct, just unaccelerated).
-        let mut ord_table = match (path.as_deref(), fields.ord) {
-            (Some(dir), Some(_)) => Self::load_ord_table_sidecar(dir).unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        if fields.ord.is_some() {
-            // Guard against a stale-short sidecar (e.g. a persist that failed on
-            // the last commit): `Column::max_value` is O(1) columnar metadata, so
-            // padding the table to cover the highest existing ordinal keeps the
-            // next assigned ordinal (`ord_table.len()`) collision-free, and the
-            // padded empty slots fall back to the docstore on read.
-            let mut max_ord = 0u64;
-            let mut saw_ord = false;
-            for sr in searcher.segment_readers() {
-                if let Ok(col) = sr.fast_fields().u64("ord")
-                    && col.num_docs() > 0
-                {
-                    max_ord = max_ord.max(col.max_value());
-                    saw_ord = true;
-                }
-            }
-            if saw_ord {
-                let needed = usize::try_from(max_ord)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(1);
-                if ord_table.len() < needed {
-                    ord_table.resize(needed, DocId::default());
-                }
-            }
-        }
+        // A parseable sidecar is only a cache, never identifier authority.
+        // Reconstruct its mappings from the exact stored documents and retain
+        // its length solely to avoid reusing previously assigned ordinals.
+        let ord_table = Self::restore_ord_table(&searcher, fields, path.as_deref())?;
 
         Ok(Self {
             index,
@@ -3105,19 +3098,110 @@ impl TantivyIndex {
         })
     }
 
-    /// Load the persisted `ordinal → doc_id` table sidecar (`ord_table.json`)
-    /// from an on-disk index directory. Returns `None` on any error or absence
-    /// so the caller can fall back to docstore materialization.
+    /// Load untrusted ordinal hints. Missing, stale, or malformed sidecars never
+    /// prevent authoritative reconstruction from the stored documents.
     fn load_ord_table_sidecar(dir: &Path) -> Option<Vec<DocId>> {
         let file = std::fs::File::open(dir.join("ord_table.json")).ok()?;
         serde_json::from_reader(std::io::BufReader::new(file)).ok()
     }
 
+    fn restore_ord_table(
+        searcher: &Searcher,
+        fields: SchemaFields,
+        path: Option<&Path>,
+    ) -> SearchResult<OrdinalTable> {
+        let mut ids = if fields.ord.is_some() {
+            path.and_then(Self::load_ord_table_sidecar)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Clear every hint, including deleted-document and uncommitted suffix
+        // slots. None may become readable merely because a future reload
+        // happens to contain its ordinal.
+        ids.fill(DocId::default());
+        let mut restored_segments = HashSet::new();
+        let mut conflicts = HashSet::new();
+        if fields.ord.is_some() {
+            for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+                let Ok(column) = segment.fast_fields().u64("ord") else {
+                    // A legacy segment without the accelerator remains readable
+                    // through its stored IDs.
+                    continue;
+                };
+                if column.num_docs() == 0 {
+                    continue;
+                }
+                let needed = usize::try_from(column.max_value())
+                    .ok()
+                    .and_then(|ordinal| ordinal.checked_add(1))
+                    .ok_or_else(|| SearchError::InvalidConfig {
+                        field: "tantivy.ordinal".to_owned(),
+                        value: column.max_value().to_string(),
+                        reason: "ordinal table length must fit usize".to_owned(),
+                    })?;
+                if needed > ids.len() {
+                    ids.try_reserve_exact(needed - ids.len()).map_err(|error| {
+                        SearchError::SubsystemError {
+                            subsystem: "tantivy.ordinal",
+                            source: Box::new(error),
+                        }
+                    })?;
+                    ids.resize(needed, DocId::default());
+                }
+                let segment_ord =
+                    u32::try_from(segment_ord).map_err(|_| SearchError::InvalidConfig {
+                        field: "tantivy.segment_ord".to_owned(),
+                        value: segment_ord.to_string(),
+                        reason: "segment ordinal must fit in u32".to_owned(),
+                    })?;
+                for doc_id in 0..segment.max_doc() {
+                    if segment.is_deleted(doc_id) {
+                        continue;
+                    }
+                    let Some(ordinal) = column.first(doc_id) else {
+                        continue;
+                    };
+                    let ordinal =
+                        usize::try_from(ordinal).map_err(|_| SearchError::InvalidConfig {
+                            field: "tantivy.ordinal".to_owned(),
+                            value: ordinal.to_string(),
+                            reason: "document ordinal must fit usize".to_owned(),
+                        })?;
+                    let address = DocAddress::new(segment_ord, doc_id);
+                    let document = load_doc(searcher, address)?;
+                    let id = Self::stored_document_id(&document, fields.id, address)?;
+                    if conflicts.contains(&ordinal) {
+                        continue;
+                    }
+                    let entry = &mut ids[ordinal];
+                    if id.is_empty() || (!entry.is_empty() && entry.as_str() != id) {
+                        // Foreign writers may have reused an ordinal. Keep
+                        // serving those documents through their own stored IDs
+                        // instead of allowing one row to alias another.
+                        *entry = DocId::default();
+                        conflicts.insert(ordinal);
+                    } else {
+                        *entry = DocId::from(id);
+                    }
+                }
+                restored_segments.insert(segment.segment_id());
+            }
+        }
+        Ok(OrdinalTable {
+            restored_len: ids.len(),
+            ids,
+            restored_segments,
+        })
+    }
+
     /// Persist the `ordinal → doc_id` table to the index directory sidecar so a
-    /// later `open` can restore the fast id-materialization path. Best-effort:
+    /// later `open` retains its ordinal reservation watermark. Mapping values
+    /// are reconstructed from authoritative stored documents. Best-effort:
     /// errors are logged and swallowed (the in-memory fast path is unaffected;
-    /// only a future reopen would fall back to the docstore). Written atomically
-    /// via a temp file + rename. No-op for in-memory indexes / pre-`ord` schemas.
+    /// a future open still reconstructs all retained ordinals). Written
+    /// atomically via a temp file + rename. No-op for in-memory indexes /
+    /// pre-`ord` schemas.
     fn persist_ord_table(&self) {
         let Some(dir) = self.path.as_ref() else {
             return;
@@ -3132,7 +3216,7 @@ impl TantivyIndex {
         let final_path = dir.join("ord_table.json");
         let write = std::fs::File::create(&tmp).and_then(|file| {
             let mut writer = std::io::BufWriter::new(file);
-            serde_json::to_writer(&mut writer, &*table).map_err(std::io::Error::other)?;
+            serde_json::to_writer(&mut writer, &table.ids).map_err(std::io::Error::other)?;
             std::io::Write::flush(&mut writer)
         });
         match write {
@@ -3177,8 +3261,8 @@ impl TantivyIndex {
         if let Some(ord_field) = self.fields.ord
             && let Ok(mut table) = self.ord_table.write()
         {
-            let ord = u64::try_from(table.len()).unwrap_or(u64::MAX);
-            table.push(DocId::from(doc_id));
+            let ord = u64::try_from(table.ids.len()).unwrap_or(u64::MAX);
+            table.ids.push(DocId::from(doc_id));
             tantivy_doc.add_u64(ord_field, ord);
         }
     }
@@ -3645,13 +3729,13 @@ impl TantivyIndex {
         self.collect_id_hits(&searcher, hits)
     }
 
-    fn require_stored_document_id<'a>(
-        &self,
-        document: &'a TantivyDocument,
+    fn stored_document_id(
+        document: &TantivyDocument,
+        id_field: Field,
         address: DocAddress,
-    ) -> SearchResult<&'a str> {
+    ) -> SearchResult<&str> {
         document
-            .get_first(self.fields.id)
+            .get_first(id_field)
             .and_then(|value| value.as_str())
             .ok_or_else(|| SearchError::SubsystemError {
                 subsystem: "tantivy.document_id",
@@ -3690,7 +3774,11 @@ impl TantivyIndex {
                 }
                 let address = DocAddress::new(segment_ord, doc_id);
                 let doc = load_doc(&searcher, address)?;
-                ids.push(DocId::from(self.require_stored_document_id(&doc, address)?));
+                ids.push(DocId::from(Self::stored_document_id(
+                    &doc,
+                    self.fields.id,
+                    address,
+                )?));
             }
         }
         ids.sort_unstable();
@@ -3723,7 +3811,7 @@ impl TantivyIndex {
                 }
                 let address = DocAddress::new(segment_ord, doc_id);
                 let doc = load_doc(&searcher, address)?;
-                let id = self.require_stored_document_id(&doc, address)?;
+                let id = Self::stored_document_id(&doc, self.fields.id, address)?;
                 let content = doc
                     .get_first(self.fields.content)
                     .and_then(|value| value.as_str())
@@ -3820,14 +3908,11 @@ impl TantivyIndex {
     /// fallback path: decompresses the stored block to read the `id` field).
     fn docstore_id(&self, searcher: &Searcher, addr: DocAddress) -> SearchResult<DocId> {
         let doc = load_doc(searcher, addr)?;
-        Ok(DocId::from(
-            doc.get_first(self.fields.id)
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| {
-                    debug!("tantivy document missing id field, using empty doc_id");
-                    ""
-                }),
-        ))
+        Ok(DocId::from(Self::stored_document_id(
+            &doc,
+            self.fields.id,
+            addr,
+        )?))
     }
 
     /// Materialize ranked Tantivy hits into [`LexicalIdHit`] rows.
@@ -3836,8 +3921,9 @@ impl TantivyIndex {
     /// (a flat bit-packed read — no stored-document decompress, no dictionary
     /// seek) and resolve it through the in-memory `ord_table`. Falls back
     /// per-hit to [`Self::docstore_id`] for any ordinal the table cannot resolve
-    /// (documents written before `ord` existed, a reopened-but-not-rebuilt
-    /// table, or a poisoned lock), so results are identical either way.
+    /// (documents written before `ord` existed, conflicting or unverified
+    /// ordinals, later foreign segments, or a poisoned lock), so results are
+    /// identical either way.
     // The `ord_table` read guard is intentionally held across the whole hit
     // loop — it is the once-per-call snapshot every hit resolves against.
     #[allow(clippy::significant_drop_tightening)]
@@ -3854,7 +3940,11 @@ impl TantivyIndex {
         // avoid paying for segments no hit lands in).
         let table = self.fields.ord.and_then(|_| {
             let table = self.ord_table.read().ok()?;
-            if table.is_empty() { None } else { Some(table) }
+            if table.ids.is_empty() {
+                None
+            } else {
+                Some(table)
+            }
         });
         // Cache the opened `ord` column per segment in a flat Vec indexed by
         // `segment_ord` — O(1), no per-hit hash — while still opening each
@@ -3881,10 +3971,9 @@ impl TantivyIndex {
                     .as_ref()
                     .and_then(|c| c.first(addr.doc_id))
                     .and_then(|ord| usize::try_from(ord).ok())
-                    .and_then(|ord| table.get(ord))
-                    // Empty = a padded/stale slot (sidecar didn't cover this
-                    // ordinal) → fall back to the docstore for the real id.
-                    .filter(|id| !id.is_empty())
+                    .and_then(|ord| {
+                        table.resolve(ord, searcher.segment_reader(addr.segment_ord).segment_id())
+                    })
                     .cloned()
             }) {
                 Some(id) => id,
@@ -5434,6 +5523,239 @@ mod tests {
             assert_eq!(
                 ids_before, ids_after,
                 "reopened index must return identical ranked doc_ids"
+            );
+        });
+    }
+
+    #[test]
+    fn ordinal_sidecar_rebuilds_authoritative_ids_without_read_only_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        run_with_cx(|cx| async move {
+            let writer = TantivyIndex::create(&path).expect("create");
+            writer
+                .writer
+                .lock(&cx)
+                .await
+                .expect("lock writer")
+                .as_mut()
+                .expect("writable fixture")
+                .set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            for batch in [["first", "deleted-first"], ["second", "deleted-second"]] {
+                let documents = batch
+                    .into_iter()
+                    .map(|id| {
+                        IndexableDocument::new(id, "shared ordinal content")
+                            .with_metadata("owner", id)
+                    })
+                    .collect::<Vec<_>>();
+                writer
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index batch");
+                writer.commit(&cx).await.expect("commit batch");
+            }
+            writer
+                .delete_documents(&cx, &["deleted-first", "deleted-second"])
+                .await
+                .expect("delete one document per batch");
+            assert!(writer.reader.searcher().segment_readers().len() >= 2);
+            drop(writer);
+
+            let sidecar = path.join("ord_table.json");
+            std::fs::rename(&sidecar, path.join("saved_ordinal_table.json"))
+                .expect("retain original sidecar while exercising its absence");
+            let cases: [(&str, Option<&[u8]>); 6] = [
+                ("missing", None),
+                (
+                    "swapped",
+                    Some(br#"["second","deleted-first","first","deleted-second"]"#),
+                ),
+                (
+                    "foreign",
+                    Some(br#"["foreign-a","foreign-b","foreign-c","foreign-d"]"#),
+                ),
+                ("short", Some(br#"["first"]"#)),
+                ("malformed", Some(b"not valid JSON")),
+                (
+                    "uncommitted suffix",
+                    Some(br#"["first","deleted-first","second","deleted-second","future"]"#),
+                ),
+            ];
+            for (label, bytes) in cases {
+                if let Some(bytes) = bytes {
+                    std::fs::write(&sidecar, bytes).expect("write sidecar fixture");
+                }
+                let before = exact_file_tree_snapshot(&path);
+                let reader = TantivyIndex::open_read_only(&path)
+                    .unwrap_or_else(|error| panic!("open {label} sidecar: {error}"));
+                assert!(reader.is_read_only());
+                assert_live_lexical_contract(&reader, &cx, "shared", 10, 2).await;
+                let mut identifiers = reader
+                    .search_doc_ids(&cx, "shared", 10)
+                    .expect("authoritative identifiers")
+                    .into_iter()
+                    .map(|hit| hit.doc_id)
+                    .collect::<Vec<_>>();
+                identifiers.sort_unstable();
+                assert_eq!(
+                    identifiers,
+                    vec![DocId::from("first"), DocId::from("second")]
+                );
+                drop(reader);
+                assert_eq!(
+                    exact_file_tree_snapshot(&path),
+                    before,
+                    "read-only {label} open"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn ordinal_sidecar_repair_keeps_new_assignments_distinct_and_persistent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        run_with_cx(|cx| async move {
+            let writer = TantivyIndex::create(&path).expect("create");
+            writer
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("first", "shared content")
+                            .with_metadata("owner", "first"),
+                        IndexableDocument::new("second", "shared content")
+                            .with_metadata("owner", "second"),
+                    ],
+                )
+                .await
+                .expect("index");
+            writer.commit(&cx).await.expect("commit");
+            drop(writer);
+            std::fs::write(
+                path.join("ord_table.json"),
+                br#"["second","first","uncommitted"]"#,
+            )
+            .expect("replace sidecar with foreign mappings and an uncommitted reservation");
+
+            let reopened = TantivyIndex::open(&path).expect("open for writing");
+            assert_live_lexical_contract(&reopened, &cx, "shared", 10, 2).await;
+            reopened
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("third", "shared content")
+                        .with_metadata("owner", "third"),
+                )
+                .await
+                .expect("append after repair");
+            reopened.commit(&cx).await.expect("commit repaired table");
+            assert_live_lexical_contract(&reopened, &cx, "shared", 10, 3).await;
+            let persisted: Vec<String> = serde_json::from_slice(
+                &std::fs::read(path.join("ord_table.json")).expect("read repaired sidecar"),
+            )
+            .expect("parse repaired sidecar");
+            assert_eq!(persisted, ["first", "second", "", "third"]);
+            drop(reopened);
+            let reader = TantivyIndex::open_read_only(&path).expect("reopen repaired generation");
+            assert_live_lexical_contract(&reader, &cx, "shared", 10, 3).await;
+        });
+    }
+
+    #[test]
+    fn ordinal_sidecar_validation_does_not_authorize_later_foreign_segments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        run_with_cx(|cx| async move {
+            let writer = TantivyIndex::create(&path).expect("create");
+            writer
+                .index_document(&cx, &IndexableDocument::new("original", "old content"))
+                .await
+                .expect("index original");
+            writer.commit(&cx).await.expect("commit original");
+            let reader = TantivyIndex::open_read_only(&path).expect("open original generation");
+
+            // Simulate an independent writer that reused the cache ordinal for
+            // a new immutable segment. The original reader must not let its
+            // previously validated mapping rename this document.
+            let mut foreign = writer.to_tantivy_doc(
+                &IndexableDocument::new("foreign", "new content").with_metadata("owner", "foreign"),
+            );
+            foreign.add_u64(writer.fields.ord.expect("ordinal field"), 0);
+            writer
+                .writer
+                .lock(&cx)
+                .await
+                .expect("lock writer")
+                .as_ref()
+                .expect("writable fixture")
+                .add_document(foreign)
+                .expect("insert reused ordinal");
+            writer.commit(&cx).await.expect("publish foreign segment");
+            reader
+                .reader
+                .reload()
+                .expect("reload independently published segment");
+            assert_live_lexical_contract(&reader, &cx, "new", 10, 1).await;
+            assert_eq!(
+                reader.search_doc_ids(&cx, "new", 10).expect("new document")[0].doc_id,
+                "foreign"
+            );
+            assert_live_lexical_contract(&reader, &cx, "content", 10, 2).await;
+
+            // A fresh open sees both meanings of ordinal zero and must keep
+            // using each stored ID instead of choosing a winner for the slot.
+            let fresh = TantivyIndex::open_read_only(&path).expect("open conflicting ordinals");
+            assert_live_lexical_contract(&fresh, &cx, "content", 10, 2).await;
+        });
+    }
+
+    #[test]
+    fn ordinal_sidecar_cannot_supply_a_missing_authoritative_document_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        run_with_cx(|cx| async move {
+            let writer = TantivyIndex::create(&path).expect("create");
+            let mut malformed = TantivyDocument::new();
+            malformed.add_text(writer.fields.content, "malformed sentinel");
+            malformed.add_u64(writer.fields.ord.expect("ordinal field"), 0);
+            writer
+                .writer
+                .lock(&cx)
+                .await
+                .expect("lock writer")
+                .as_ref()
+                .expect("writable fixture")
+                .add_document(malformed)
+                .expect("insert malformed fixture");
+            writer.commit(&cx).await.expect("commit malformed fixture");
+            std::fs::write(path.join("ord_table.json"), br#"["invented-id"]"#)
+                .expect("supply an untrustworthy cached ID");
+            let error = TantivyIndex::open_read_only(&path)
+                .expect_err("a sidecar cannot repair missing source identity");
+            assert!(matches!(
+                error,
+                SearchError::SubsystemError {
+                    subsystem: "tantivy.document_id",
+                    ..
+                }
+            ));
+
+            writer
+                .writer
+                .lock(&cx)
+                .await
+                .expect("lock writer")
+                .as_ref()
+                .expect("writable fixture")
+                .delete_term(Term::from_field_text(writer.fields.content, "malformed"));
+            writer.commit(&cx).await.expect("delete malformed document");
+            let reader = TantivyIndex::open_read_only(&path)
+                .expect("deleted documents cannot prevent a valid open");
+            assert!(
+                reader
+                    .search_doc_ids(&cx, "sentinel", 10)
+                    .unwrap()
+                    .is_empty()
             );
         });
     }
