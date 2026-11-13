@@ -184,17 +184,31 @@ fn quality_completion_preserves_fast_cache_and_updates_bypass_both_query_caches(
                 .as_ref()
                 .unwrap(),
         );
-        let output = exchange(
+        // This full-mode stream emits two phases. The primary-tier exchange
+        // helper requires one response per request, so inspect the real wire
+        // frames here without discarding either progressive phase.
+        let mut input = Vec::new();
+        for request in [
+            serde_json::json!({"query":CACHED_QUERY, "stream":true}),
+            serde_json::json!({"query":CACHED_QUERY}),
+            serde_json::json!({"query":CACHED_QUERY, "mode":"quality"}),
+            serde_json::json!({"query":CACHED_QUERY, "mode":"lexical"}),
+        ] {
+            serde_json::to_writer(&mut input, &request).unwrap();
+            input.push(b'\n');
+        }
+        let mut bytes = Vec::new();
+        serve_session(
             &cx,
             &mut fixture.session,
-            &[
-                serde_json::json!({"query":CACHED_QUERY, "stream":true}),
-                serde_json::json!({"query":CACHED_QUERY}),
-                serde_json::json!({"query":CACHED_QUERY, "mode":"quality"}),
-                serde_json::json!({"query":CACHED_QUERY, "mode":"lexical"}),
-            ],
+            &mut Cursor::new(input),
+            &mut bytes,
         )
-        .await;
+        .await
+        .unwrap();
+        let output = frames(&bytes);
+        assert_eq!(output.len(), 6);
+        assert_eq!(output[0]["event"], "ready");
         assert_eq!(output[1]["phase"], "initial");
         assert_eq!(output[2]["phase"], "refined");
         assert_eq!(output[3]["phase"], "refined");

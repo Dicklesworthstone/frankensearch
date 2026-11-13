@@ -531,6 +531,7 @@ fn one_shot_search_times_pending_inference_after_startup_and_before_final_delive
                 &quality
             };
             let before = pending.drops.load(Ordering::SeqCst);
+            let before_calls = pending.calls.load(Ordering::SeqCst);
             pending.pending_once.store(true, Ordering::SeqCst);
             let loads = AtomicUsize::new(0);
             let mut output = Vec::new();
@@ -556,6 +557,21 @@ fn one_shot_search_times_pending_inference_after_startup_and_before_final_delive
                 loads.load(Ordering::SeqCst),
                 if mode == QueryMode::Full { 2 } else { 1 }
             );
+            // Full mode can first wait for fast-tier vector work on the
+            // caller's pool. Drive that real work before timing the pending
+            // quality provider; a pending query alone does not prove inference
+            // has started. Keep the original absolute virtual-time budget.
+            std::future::poll_fn(|task| {
+                assert!(searching.as_mut().poll(task).is_pending());
+                if pending.calls.load(Ordering::SeqCst) > before_calls {
+                    std::task::Poll::Ready(())
+                } else {
+                    task.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            assert_eq!(pending.calls.load(Ordering::SeqCst), before_calls + 1);
             assert_eq!(timer.pending_count(), 1);
             clock.advance(10_000_000);
             let _ = timer.process_timers();

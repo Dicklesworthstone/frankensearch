@@ -613,7 +613,7 @@ impl NativeWorker {
                 self.checkpoint(&request, &child, &abandoned)?;
                 result
             })
-            .map_err(|_| self.error(format!("cannot admit native {} work", self.kind)))?;
+            .map_err(|error| self.error(error))?;
         // A direct caller cancellation must also abort the child: task joins
         // themselves are uninterruptible. Keep ownership of the handle after
         // interruption while running native kernels stop at their checkpoints.
@@ -830,6 +830,38 @@ mod tests {
             ("gamma", [0.4, 0.6, 0.0, 0.0], true),
             ("delta", [0.0, 1.0, 0.0, 0.0], true),
         ]
+    }
+
+    #[test]
+    fn worker_admission_preserves_the_runtime_spawn_error_without_running_work() {
+        asupersync::test_utils::run_test_with_cx(|detached| async move {
+            let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+            for worker in [NativeWorker::QUERY, NativeWorker::BUILD] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&calls);
+                // Deliberately retain the helper's detached context: a pool
+                // handle alone must not grant authority to spawn runtime work.
+                let error = worker
+                    .run(&detached, pool.handle(), move |_| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+                    .unwrap_err();
+                match error {
+                    SearchError::SubsystemError { subsystem, source } => {
+                        assert_eq!(subsystem, worker.subsystem);
+                        assert_eq!(
+                            source.downcast_ref::<asupersync::runtime::SpawnError>(),
+                            Some(&asupersync::runtime::SpawnError::RuntimeUnavailable),
+                            "retain the actual admission error: {source}"
+                        );
+                    }
+                    other => panic!("unexpected admission error: {other:?}"),
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+        });
     }
 
     #[test]

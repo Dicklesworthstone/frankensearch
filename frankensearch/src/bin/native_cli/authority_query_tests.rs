@@ -870,7 +870,9 @@ fn caller_pool_reaches_every_authority_query_mode_and_preserves_retained_results
     use asupersync::runtime::blocking_pool::BlockingPool;
     use std::time::Duration;
 
-    asupersync::test_utils::run_test_with_cx(|cx| async move {
+    asupersync::test_utils::run_test_with_cx(|_| async move {
+        // Native pool admission requires the host runtime's spawn authority.
+        let cx = Cx::current().expect("active test runtime");
         for ann in [false, true] {
             for scoped in [false, true] {
                 let mut f = fixture(&cx, true, ann).await;
@@ -968,7 +970,9 @@ fn authority_deadline_expires_while_vector_work_is_queued_and_session_stays_usab
     use std::sync::mpsc;
     use std::time::Duration;
 
-    asupersync::test_utils::run_test_with_cx(|cx| async move {
+    asupersync::test_utils::run_test_with_cx(|_| async move {
+        // Keep the real runtime authority while the session owns virtual time.
+        let cx = Cx::current().expect("active test runtime");
         let mut f = fixture(&cx, true, true).await;
         let pool = BlockingPool::new(0, 1);
         let (started, entered) = mpsc::channel();

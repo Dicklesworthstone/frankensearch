@@ -75,7 +75,10 @@ fn page(hits: &[NativeShardedResult]) -> serde_json::Value {
 
 #[test]
 fn sharded_exclusions_refill_independent_tiers_and_preserve_frozen_scopes() {
-    asupersync::test_utils::run_test_with_cx(|cx| async move {
+    asupersync::test_utils::run_test_with_cx(|_| async move {
+        // Pool execution needs spawn authority from the actual host runtime;
+        // the helper's detached testing context only carries budget/cancellation.
+        let cx = Cx::current().expect("active test runtime");
         for ann in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("excluded-shards-fast", 2));

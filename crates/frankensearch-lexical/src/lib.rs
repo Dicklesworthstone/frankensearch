@@ -73,6 +73,7 @@ use tantivy::directory::error::{
 use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
+use tantivy::index::SegmentId;
 use tantivy::query::QueryParser;
 use tantivy::schema::{FAST, STORED, STRING, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream, Tokenizer};
@@ -1950,11 +1951,11 @@ pub struct TantivyIndex {
 struct OrdinalTable {
     ids: Vec<DocId>,
     restored_len: usize,
-    restored_segments: HashSet<tantivy::SegmentId>,
+    restored_segments: HashSet<SegmentId>,
 }
 
 impl OrdinalTable {
-    fn resolve(&self, ordinal: usize, segment_id: tantivy::SegmentId) -> Option<&DocId> {
+    fn resolve(&self, ordinal: usize, segment_id: SegmentId) -> Option<&DocId> {
         self.ids.get(ordinal).filter(|id| {
             !id.is_empty()
                 && (ordinal >= self.restored_len || self.restored_segments.contains(&segment_id))

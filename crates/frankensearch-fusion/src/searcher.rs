@@ -12729,11 +12729,11 @@ mod tests {
                 assert!(metrics.fast_embedder_id.is_none());
                 assert!(metrics.quality_embedder_id.is_none());
                 assert!(metrics.coverage.is_none());
-                let searches = exporter.search.lock().unwrap();
-                assert_eq!(searches.len(), 1);
-                assert_eq!(searches[0].mode, SearchMode::Lexical);
-                assert!(!searches[0].refined);
-                drop(searches);
+                let telemetry = exporter.search.lock().unwrap();
+                assert_eq!(telemetry.len(), 1);
+                assert_eq!(telemetry[0].mode, SearchMode::Lexical);
+                assert!(!telemetry[0].refined);
+                drop(telemetry);
                 assert!(exporter.embedding.lock().unwrap().is_empty());
                 assert!(
                     !adapter

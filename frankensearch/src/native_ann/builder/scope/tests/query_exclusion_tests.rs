@@ -310,8 +310,9 @@ fn exclusion_census_refuses_one_oversized_escaped_phrase_before_inference() {
         assert!(query.chars().count() < frankensearch_quill::query::MAX_QUERY_LENGTH);
         let error = index.search(&cx, &query, 28).await.unwrap_err();
         assert!(
-            matches!(error, SearchError::InvalidConfig { field, value, .. }
-            if field == "query.exclusions" && value == "oversized-clause")
+            matches!(&error, SearchError::InvalidConfig { field, value, .. }
+            if field == "native_ann.query.exclusions" && value == "oversized-clause"),
+            "unexpected oversized-clause refusal: {error:?}"
         );
         assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
 

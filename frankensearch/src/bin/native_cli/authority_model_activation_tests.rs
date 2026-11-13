@@ -1095,6 +1095,10 @@ fn quality_completion_activation_requires_its_explicit_operation_and_grant() {
         let mut ordinary = message.clone();
         ordinary["op"] = serde_json::json!("activate_model");
         ordinary["model_dir"] = serde_json::json!(fixture.parent.join("unloaded-fast"));
+        // Supply valid fast-only options so the attempted topology change,
+        // rather than irrelevant quality-model options, causes the refusal.
+        ordinary["quality_backend"] = serde_json::Value::Null;
+        ordinary["quality_model_dir"] = serde_json::Value::Null;
         let error = fixture
             .session
             .activate_model_with_loader(&cx, &activation_request(&ordinary), |_, _, _, _| {
@@ -1104,7 +1108,8 @@ fn quality_completion_activation_requires_its_explicit_operation_and_grant() {
         assert!(
             error
                 .to_string()
-                .contains("model_activation_topology_mismatch")
+                .contains("model_activation_topology_mismatch"),
+            "unexpected topology refusal: {error}"
         );
         let ordinary: AuthorityActivateRequest = serde_json::from_value(serde_json::json!({
             "op":"activate", "receipt":fixture.parent.join("completed.json"),
