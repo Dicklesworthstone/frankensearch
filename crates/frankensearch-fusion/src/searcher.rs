@@ -13959,6 +13959,116 @@ mod tests {
     }
 
     #[test]
+    fn exclusion_matching_decodes_escaped_phrase_quotes() {
+        for query in [
+            r#"query NOT "say \"no\" now""#,
+            r#"query -"say \"no\" now""#,
+        ] {
+            let parsed = ParsedQuery::parse(query);
+            let exclusions = to_exclusions(&parsed);
+            assert_eq!(
+                find_negative_match(r#"They say "NO" now."#, &exclusions),
+                Some(r#"say "no" now"#.to_owned()),
+                "{query}"
+            );
+            assert_eq!(
+                find_negative_match("They say no now.", &exclusions),
+                None,
+                "{query}"
+            );
+            assert_eq!(
+                find_negative_match(r#"They say "no" later."#, &exclusions),
+                None,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusion_matching_decodes_escaped_phrase_backslashes() {
+        for query in [
+            r#"query NOT "C:\\work\\cache""#,
+            r#"query -"C:\\work\\cache""#,
+        ] {
+            let parsed = ParsedQuery::parse(query);
+            let exclusions = to_exclusions(&parsed);
+            assert_eq!(
+                find_negative_match(r"stored at C:\work\cache today", &exclusions),
+                Some(r"c:\work\cache".to_owned()),
+                "{query}"
+            );
+            assert_eq!(
+                find_negative_match(r"stored at C:\work\other today", &exclusions),
+                None,
+                "{query}"
+            );
+            assert_eq!(
+                find_negative_match("stored at C:workcache today", &exclusions),
+                None,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusion_matching_keeps_negation_markers_inside_positive_quotes() {
+        for query in [
+            r#""say -unsafe NOT \"danger zone\"" -blocked"#,
+            r#"content:"say -unsafe NOT \"danger zone\"" -blocked"#,
+        ] {
+            let parsed = ParsedQuery::parse(query);
+            let exclusions = to_exclusions(&parsed);
+            assert_eq!(
+                find_negative_match(r#"say -unsafe NOT "danger zone" remains useful"#, &exclusions),
+                None,
+                "{query}"
+            );
+            assert_eq!(
+                find_negative_match("this document is blocked", &exclusions),
+                Some("blocked".to_owned()),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_negation_markers_keep_semantic_candidates_while_real_exclusions_apply() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+
+            let (quoted_results, _) = searcher
+                .search_collect(&cx, r#""rust -unsafe syntax""#, 10)
+                .await
+                .expect("a positive phrase must not require an exclusion text provider");
+            assert_eq!(quoted_results.len(), 10);
+
+            let (results, metrics) = searcher
+                .search_collect_with_text(
+                    &cx,
+                    r#""rust -unsafe syntax" -blocked"#,
+                    10,
+                    |doc_id| {
+                        let text = if doc_id == "doc-0" {
+                            "rust -unsafe syntax blocked"
+                        } else {
+                            "rust -unsafe syntax remains useful"
+                        };
+                        Some(text.to_owned())
+                    },
+                )
+                .await
+                .expect("quoted syntax must not create extra exclusions");
+
+            assert_eq!(metrics.phase1_vectors_searched, 10);
+            assert_eq!(results.len(), 9);
+            assert!(!results.iter().any(|result| result.doc_id == "doc-0"));
+            assert!(results.iter().any(|result| result.doc_id == "doc-1"));
+        });
+    }
+
+    #[test]
     fn find_negative_match_phrase_not_found() {
         let parsed = ParsedQuery::parse(r#"query NOT "exact phrase""#);
         let exclusions = to_exclusions(&parsed);

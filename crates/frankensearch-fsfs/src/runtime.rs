@@ -29,7 +29,7 @@ use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::filter::{ExcludeDocIdsFilter, PredicateFilter, SearchFilter};
-use frankensearch_core::parsed_query::ParsedQuery;
+use frankensearch_core::parsed_query::{ParsedQuery, quote_query_phrase};
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::traits::ModelTier;
 use frankensearch_core::{
@@ -13567,7 +13567,7 @@ impl FsfsRuntime {
                 original
                     .negative_phrases
                     .iter()
-                    .map(|phrase| format!("-\"{phrase}\"")),
+                    .map(|phrase| format!("-{}", quote_query_phrase(phrase))),
             )
             .collect::<Vec<_>>()
             .join(" ");
@@ -26162,7 +26162,7 @@ impl FsfsRuntime {
                 parsed
                     .negative_phrases
                     .iter()
-                    .map(|phrase| format!("\"{phrase}\"")),
+                    .map(|phrase| quote_query_phrase(phrase)),
             )
             .collect::<Vec<_>>()
             .join(" OR ");
@@ -45611,6 +45611,71 @@ mod tests {
     }
 
     #[test]
+    fn escaped_phrase_exclusions_preserve_quill_matches_through_query_expansion() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("lexical");
+            let writer = create_test_quill(&cx, &path).await;
+            for (id, text) in [
+                ("exact-quote.md", r#"alpha "quoted" beta"#),
+                ("gapped-quote.md", r#"alpha middle "quoted" beta"#),
+                ("short-quote.md", "alpha"),
+                ("exact-backslash.md", r"gamma path\"),
+                ("gapped-backslash.md", r"gamma middle path\"),
+                ("short-backslash.md", "gamma"),
+                ("clean.md", "ordinary unrelated document"),
+            ] {
+                writer
+                    .index_document(&cx, &IndexableDocument::new(id, text))
+                    .await
+                    .unwrap();
+            }
+            writer.commit(&cx).await.unwrap();
+            let lexical = QuillSearchIndex::open(&cx, &path, QuillConfig::default())
+                .await
+                .unwrap();
+            let original = super::ParsedQuery::parse(
+                r#"documents NOT "alpha \"quoted\" beta" NOT "gamma path\\""#,
+            );
+            assert!(original.negative_terms.is_empty());
+            assert_eq!(
+                original.negative_phrases,
+                [r#"alpha "quoted" beta"#, r"gamma path\"],
+            );
+            let excluded = FsfsRuntime::query_exclusions(&cx, Some(&lexical), &original, 7)
+                .unwrap()
+                .expect("two explicit phrase exclusions");
+            assert_eq!(excluded.len(), 2, "{excluded:?}");
+            assert!(excluded.contains("exact-quote.md"));
+            assert!(excluded.contains("exact-backslash.md"));
+            for allowed in [
+                "gapped-quote.md",
+                "short-quote.md",
+                "gapped-backslash.md",
+                "short-backslash.md",
+                "clean.md",
+            ] {
+                assert!(!excluded.contains(allowed), "{allowed}: {excluded:?}");
+            }
+
+            // Expansion must retain decoded phrase values and their exact
+            // lexical meaning, including a backslash before a closing quote.
+            let positive = r#""how do -literal documents rank""#;
+            let expanded =
+                FsfsRuntime::expanded_query_with_exclusions(&original, positive).unwrap();
+            let reparsed = super::ParsedQuery::parse(&expanded);
+            assert_eq!(reparsed.positive, positive);
+            assert_eq!(reparsed.negative_terms, original.negative_terms);
+            assert_eq!(reparsed.negative_phrases, original.negative_phrases);
+            let expanded_excluded =
+                FsfsRuntime::query_exclusions(&cx, Some(&lexical), &reparsed, 7)
+                    .unwrap()
+                    .expect("expanded query keeps its exclusions");
+            assert_eq!(expanded_excluded, excluded);
+        });
+    }
+
+    #[test]
     fn expanded_query_variants_reject_cross_generation_fusion() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("index root");
@@ -54312,6 +54377,47 @@ mod tests {
                     assert_eq!(fused.hits[0].path, "a.rs");
                 }
             }
+            // The dash inside a positive phrase is literal. Quill already
+            // keeps b.rs as a lexical hit, so require its vector contribution
+            // too; the real outside exclusion must still remove c.rs.
+            let quoted = r#"how do "alpha -banned" documents rank -gamma"#;
+            for mode in [SearchExecutionMode::Full, SearchExecutionMode::FastOnly] {
+                let phases = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        &cx,
+                        quoted,
+                        10,
+                        mode,
+                        &mut resources,
+                        flags,
+                    )
+                    .await
+                    .unwrap();
+                let initial = phases
+                    .iter()
+                    .find(|phase| phase.phase == SearchOutputPhase::Initial)
+                    .expect("quoted query returns Initial");
+                let positive = initial
+                    .hits
+                    .iter()
+                    .find(|hit| hit.path == "b.rs")
+                    .expect("quoted negative-looking text remains positive");
+                assert!(
+                    positive.semantic_rank.is_some(),
+                    "{mode:?}: a lexical hit cannot hide an incorrect vector exclusion",
+                );
+                assert!(
+                    phases
+                        .iter()
+                        .flat_map(|phase| &phase.hits)
+                        .all(|hit| hit.path != "c.rs"),
+                    "{mode:?}: the outside exclusion must still apply",
+                );
+                if mode == SearchExecutionMode::Full {
+                    assert_eq!(phases.last().unwrap().phase, SearchOutputPhase::Refined);
+                }
+            }
+
             // Without an exclusion b.rs is an ordinary hit.
             let plain = runtime
                 .execute_search_payloads_with_mode_using_resources(
@@ -54454,23 +54560,33 @@ mod tests {
             // queries; the refusal is specific to unprovable exclusions.
             config.search.rerank = false;
             let runtime = FsfsRuntime::new(config);
-            for mode in [SearchExecutionMode::Full, SearchExecutionMode::FastOnly] {
-                let phases = runtime
-                    .execute_search_payloads_with_mode_using_resources(
-                        &cx,
-                        "how do alpha documents rank",
-                        10,
-                        mode,
-                        &mut positive_resources,
-                        flags,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    phases.iter().any(|phase| !phase.hits.is_empty()),
-                    super::SEMANTIC_LOADERS_COMPILED,
-                    "vector-only positive queries require a semantic-capable build",
-                );
+            for query in [
+                "how do alpha documents rank",
+                r#""how do alpha -banned documents rank""#,
+                "'how do alpha -banned documents rank'",
+                r#"title:"how do alpha -banned documents rank""#,
+                "title:'how do alpha -banned documents rank'",
+                r#""how do alpha \"quoted\" -banned documents rank""#,
+                r#""how do alpha NOT " documents rank"#,
+            ] {
+                for mode in [SearchExecutionMode::Full, SearchExecutionMode::FastOnly] {
+                    let phases = runtime
+                        .execute_search_payloads_with_mode_using_resources(
+                            &cx,
+                            query,
+                            10,
+                            mode,
+                            &mut positive_resources,
+                            flags,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        phases.iter().any(|phase| !phase.hits.is_empty()),
+                        super::SEMANTIC_LOADERS_COMPILED,
+                        "{query}, {mode:?}: vector-only positive queries require a semantic-capable build",
+                    );
+                }
             }
         });
     }

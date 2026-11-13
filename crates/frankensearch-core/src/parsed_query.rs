@@ -38,17 +38,22 @@ impl ParsedQuery {
     /// # Syntax
     ///
     /// - `-term` : exclude documents containing "term"
-    /// - `NOT "exact phrase"` : exclude documents containing exact phrase
+    /// - `NOT "exact phrase"` or `-"exact phrase"` : exclude a quoted phrase
+    /// - Single quotes also delimit phrases; a backslash escapes the next character
     /// - `\-term` : literal dash (escaped, not negation)
     /// - Multiple exclusions are supported: `query -foo -bar`
+    ///
+    /// Positive quoted fragments retain their delimiters, escapes, and internal
+    /// whitespace for the lexical parser. Exclusion operators inside them are
+    /// literal text. Negative phrases contain decoded text; use
+    /// [`quote_query_phrase`] when rendering them into another query.
     #[must_use]
     pub fn parse(raw: &str) -> Self {
-        // Fast path: negation syntax requires one of `-` `"` `\`. With none of
-        // them present (the common query), there are no negations and the positive
-        // part is just the whitespace-normalized input — skip the `Vec<char>`
-        // materialization and the char-by-char parser. Byte-identical: the full
-        // parser would collect the same whitespace-split words and `join(" ")` them.
-        if !raw.bytes().any(|b| matches!(b, b'-' | b'"' | b'\\')) {
+        // Without syntax characters, only whitespace normalization is needed.
+        if !raw
+            .bytes()
+            .any(|b| matches!(b, b'-' | b'"' | b'\'' | b'\\'))
+        {
             let mut positive = String::with_capacity(raw.len());
             for word in raw.split_whitespace() {
                 if !positive.is_empty() {
@@ -72,72 +77,45 @@ impl ParsedQuery {
         let mut i = 0;
 
         while i < len {
-            // Skip whitespace.
             if chars[i].is_whitespace() {
                 i += 1;
                 continue;
             }
 
-            // Check for NOT keyword followed by quoted phrase.
             if i + 3 < len && matches_not_keyword(&chars, i) {
-                // Advance past "NOT".
-                let after_not = i + 3;
-                // Skip whitespace between NOT and the quote.
-                let mut j = after_not;
-                while j < len && chars[j].is_whitespace() {
-                    j += 1;
+                let mut quote = i + 3;
+                while quote < len && chars[quote].is_whitespace() {
+                    quote += 1;
                 }
-                if j < len && chars[j] == '"' {
-                    // Parse quoted phrase.
-                    j += 1; // skip opening quote
-                    let start = j;
-                    while j < len && chars[j] != '"' {
-                        j += 1;
-                    }
-                    let phrase: String = chars[start..j].iter().collect();
-                    if !phrase.is_empty() {
+                if quote < len && matches!(chars[quote], '"' | '\'') {
+                    let (phrase, next) = parse_quoted_phrase(&chars, quote);
+                    if !phrase.trim().is_empty() {
                         negative_phrases.push(phrase);
                     }
-                    if j < len {
-                        j += 1; // skip closing quote
-                    }
-                    i = j;
+                    i = next;
                     continue;
                 }
-                // NOT without a following quote — treat as regular word.
+                // NOT without a following quote remains a regular word.
             }
 
-            // Check for escaped dash: \-
             if chars[i] == '\\' && i + 1 < len && chars[i + 1] == '-' {
-                // Collect the rest of the token as a literal word starting with dash.
-                i += 1; // skip backslash
-                let start = i;
-                while i < len && !chars[i].is_whitespace() {
-                    i += 1;
-                }
-                let word: String = chars[start..i].iter().collect();
-                positive_parts.push(word);
+                // Retain the established literal-dash representation.
+                let start = i + 1;
+                i = positive_fragment_end(&chars, i);
+                positive_parts.push(chars[start..i].iter().collect::<String>());
                 continue;
             }
 
-            // Check for negation dash: -term
-            // Must be preceded by whitespace or be at start of string.
             if chars[i] == '-'
                 && (i == 0 || chars[i - 1].is_whitespace())
                 && i + 1 < len
-                && chars[i + 1] == '"'
+                && matches!(chars[i + 1], '"' | '\'')
             {
-                // -"exact phrase" excludes the phrase, as NOT "exact phrase".
-                let start = i + 2;
-                let mut j = start;
-                while j < len && chars[j] != '"' {
-                    j += 1;
-                }
-                let phrase: String = chars[start..j].iter().collect();
+                let (phrase, next) = parse_quoted_phrase(&chars, i + 1);
                 if !phrase.trim().is_empty() {
                     negative_phrases.push(phrase);
                 }
-                i = (j + 1).min(len);
+                i = next;
                 continue;
             }
             if chars[i] == '-'
@@ -146,7 +124,7 @@ impl ParsedQuery {
                 && chars[i + 1] != '-'
                 && !chars[i + 1].is_whitespace()
             {
-                i += 1; // skip dash
+                i += 1;
                 let start = i;
                 while i < len && !chars[i].is_whitespace() {
                     i += 1;
@@ -158,19 +136,16 @@ impl ParsedQuery {
                 continue;
             }
 
-            // Regular word: collect until whitespace.
+            // Scan the complete positive fragment, including any quoted field
+            // value or operand. Whitespace inside a phrase cannot start a new
+            // exclusion, and escaped quotes cannot end that phrase.
             let start = i;
-            while i < len && !chars[i].is_whitespace() {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            positive_parts.push(word);
+            i = positive_fragment_end(&chars, start);
+            positive_parts.push(chars[start..i].iter().collect::<String>());
         }
 
-        let positive = positive_parts.join(" ");
-
         Self {
-            positive,
+            positive: positive_parts.join(" "),
             negative_terms,
             negative_phrases,
         }
@@ -195,6 +170,121 @@ impl ParsedQuery {
     pub const fn negation_count(&self) -> usize {
         self.negative_terms.len() + self.negative_phrases.len()
     }
+}
+
+/// Render decoded text as one double-quoted query phrase.
+///
+/// Escapes both backslashes and quote delimiters so literal phrase content
+/// cannot become query syntax. This is the inverse of quoted-phrase decoding,
+/// including for Unicode text and a trailing backslash.
+#[must_use]
+pub fn quote_query_phrase(phrase: &str) -> String {
+    let mut quoted = String::with_capacity(phrase.len().saturating_add(2));
+    quoted.push('"');
+    for ch in phrase.chars() {
+        if matches!(ch, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Decode a phrase using the lexical parser's backslash rules.
+fn parse_quoted_phrase(chars: &[char], quote: usize) -> (String, usize) {
+    let delimiter = chars[quote];
+    let mut phrase = String::new();
+    let mut cursor = quote + 1;
+    while cursor < chars.len() {
+        let ch = chars[cursor];
+        cursor += 1;
+        if ch == delimiter {
+            break;
+        }
+        if ch == '\\' && cursor < chars.len() {
+            phrase.push(chars[cursor]);
+            cursor += 1;
+        } else {
+            // An unterminated phrase includes the remaining text, including
+            // a backslash at end of input.
+            phrase.push(ch);
+        }
+    }
+    (phrase, cursor)
+}
+
+/// Preserve the source spelling of positive phrases without interpreting
+/// apostrophes or embedded quotes in ordinary words as phrase delimiters.
+fn positive_fragment_end(chars: &[char], start: usize) -> usize {
+    let mut cursor = start;
+    let mut quote = None;
+    let mut operand_start = true;
+    let mut field_start = Some(start);
+    while cursor < chars.len() {
+        let ch = chars[cursor];
+        if ch == '\\' {
+            cursor += 1;
+            if cursor < chars.len() {
+                cursor += 1;
+            }
+            operand_start = false;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else {
+            if ch.is_whitespace() {
+                // A field separator may follow whitespace after its name.
+                // Preserve that complete operand before inspecting exclusions.
+                let mut next = cursor;
+                while next < chars.len() && chars[next].is_whitespace() {
+                    next += 1;
+                }
+                if next < chars.len()
+                    && chars[next] == ':'
+                    && field_start.is_some_and(|start| cursor > start)
+                {
+                    cursor = next;
+                    continue;
+                }
+                break;
+            }
+            match ch {
+                '"' | '\'' if operand_start => {
+                    quote = Some(ch);
+                    operand_start = false;
+                    field_start = None;
+                }
+                '(' | ')' => {
+                    operand_start = true;
+                    field_start = Some(cursor + 1);
+                }
+                '+' | '-' if operand_start && field_start.is_some() => {
+                    field_start = Some(cursor + 1);
+                }
+                ':' if field_start.is_some_and(|start| cursor > start) => {
+                    operand_start = true;
+                    // A colon in the resulting bare value is ordinary text;
+                    // it cannot start a second field-qualified phrase.
+                    field_start = None;
+                }
+                _ => {
+                    operand_start = false;
+                    if matches!(
+                        ch,
+                        '+' | '^' | '`' | '{' | '}' | '"' | '\'' | '[' | ']' | '!' | '*' | ':'
+                    ) {
+                        field_start = None;
+                    }
+                }
+            }
+        }
+        cursor += 1;
+    }
+    cursor
 }
 
 /// Check if the characters at position `i` match "NOT" (case-insensitive)
@@ -235,7 +325,7 @@ impl std::fmt::Display for ParsedQuery {
             if wrote_any {
                 write!(f, " ")?;
             }
-            write!(f, "NOT \"{phrase}\"")?;
+            write!(f, "NOT {}", quote_query_phrase(phrase))?;
             wrote_any = true;
         }
         Ok(())
@@ -301,6 +391,124 @@ mod tests {
         assert_eq!(q.positive, "rust web framework");
         assert_eq!(q.negative_terms, vec!["actix"]);
         assert_eq!(q.negative_phrases, vec!["rocket framework"]);
+    }
+
+    #[test]
+    fn positive_quoted_fragments_do_not_create_exclusions() {
+        for (raw, positive) in [
+            (r#""alpha -banned" -outside"#, r#""alpha -banned""#),
+            (r#"title:"alpha -banned" -outside"#, r#"title:"alpha -banned""#),
+            ("'alpha -banned' -outside", "'alpha -banned'"),
+            ("title:'alpha -banned' -outside", "title:'alpha -banned'"),
+            (r#"title : "alpha -banned" -outside"#, r#"title : "alpha -banned""#),
+            (r#"+("alpha -banned") -outside"#, r#"+("alpha -banned")"#),
+            (
+                r#""alpha NOT \"secret\" -banned" -outside"#,
+                r#""alpha NOT \"secret\" -banned""#,
+            ),
+            (r#""alpha   -banned" -outside"#, r#""alpha   -banned""#),
+        ] {
+            let parsed = ParsedQuery::parse(raw);
+            assert_eq!(parsed.positive, positive, "{raw}");
+            assert_eq!(parsed.negative_terms, ["outside"], "{raw}");
+            assert!(parsed.negative_phrases.is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn positive_unterminated_phrases_protect_the_remaining_text() {
+        for raw in [
+            r#""alpha -banned NOT \"secret\""#,
+            r#"title:"alpha -banned"#,
+            "'alpha -banned",
+        ] {
+            let parsed = ParsedQuery::parse(raw);
+            assert_eq!(parsed.positive, raw);
+            assert!(!parsed.has_negations(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn quotes_inside_bare_words_do_not_hide_real_exclusions() {
+        for (raw, positive) in [
+            ("don't -outside", "don't"),
+            (r#"say"hello -outside"#, r#"say"hello"#),
+            (r#"say\"hello -outside"#, r#"say\"hello"#),
+            (r#"\-literal -outside"#, "-literal"),
+            (r#"\-"literal -outside"#, r#"-"literal"#),
+            (r#"id:part:"literal -outside"#, r#"id:part:"literal"#),
+            (r#"foo+bar:"literal -outside"#, r#"foo+bar:"literal"#),
+            (r#"id:+"literal -outside"#, r#"id:+"literal"#),
+            (r#":"literal -outside"#, r#":"literal"#),
+        ] {
+            let parsed = ParsedQuery::parse(raw);
+            assert_eq!(parsed.positive, positive, "{raw}");
+            assert_eq!(parsed.negative_terms, ["outside"], "{raw}");
+            assert!(parsed.negative_phrases.is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn negative_phrases_decode_quotes_backslashes_and_single_delimiters() {
+        for raw in [
+            r#"query NOT "alpha \"beta\" \\ path" -outside"#,
+            r#"query -"alpha \"beta\" \\ path" -outside"#,
+            r#"query not 'alpha "beta" \\ path' -outside"#,
+            r#"query -'alpha "beta" \\ path' -outside"#,
+        ] {
+            let parsed = ParsedQuery::parse(raw);
+            assert_eq!(parsed.positive, "query", "{raw}");
+            assert_eq!(parsed.negative_terms, ["outside"], "{raw}");
+            assert_eq!(parsed.negative_phrases, [r#"alpha "beta" \ path"#], "{raw}");
+        }
+        let parsed = ParsedQuery::parse(r"query NOT 'it\'s -literal'");
+        assert_eq!(parsed.negative_phrases, ["it's -literal"]);
+        assert!(parsed.negative_terms.is_empty());
+    }
+
+    #[test]
+    fn quoted_phrase_boundaries_distinguish_odd_and_even_backslashes() {
+        let even = ParsedQuery::parse(r#"query NOT "alpha \\" -outside"#);
+        assert_eq!(even.negative_phrases, ["alpha \\"]);
+        assert_eq!(even.negative_terms, ["outside"]);
+        assert_eq!(even.positive, "query");
+
+        let odd = ParsedQuery::parse(r#"query NOT "alpha \\\" -inside" -outside"#);
+        assert_eq!(odd.negative_phrases, [r#"alpha \" -inside"#]);
+        assert_eq!(odd.negative_terms, ["outside"]);
+        assert_eq!(odd.positive, "query");
+
+        let positive = ParsedQuery::parse(r#""alpha \\\" -inside" -outside"#);
+        assert_eq!(positive.positive, r#""alpha \\\" -inside""#);
+        assert_eq!(positive.negative_terms, ["outside"]);
+    }
+
+    #[test]
+    fn unterminated_negative_phrase_preserves_trailing_backslash() {
+        for raw in [r#"query NOT "path\"#, r#"query -"path\"#] {
+            let parsed = ParsedQuery::parse(raw);
+            assert_eq!(parsed.positive, "query");
+            assert_eq!(parsed.negative_phrases, ["path\\"]);
+            assert!(parsed.negative_terms.is_empty());
+        }
+    }
+
+    #[test]
+    fn phrase_rendering_preserves_decoded_content_on_display_roundtrip() {
+        assert_eq!(quote_query_phrase("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(quote_query_phrase(""), r#""""#);
+        let parsed = ParsedQuery {
+            positive: r#""positive -literal""#.to_owned(),
+            negative_terms: vec!["outside".to_owned()],
+            negative_phrases: vec![
+                r#"alpha "quoted" beta"#.to_owned(),
+                r"C:\work\cache".to_owned(),
+                "café 日本語".to_owned(),
+                "trailing\\".to_owned(),
+                "line one\nline two".to_owned(),
+            ],
+        };
+        assert_eq!(ParsedQuery::parse(&parsed.to_string()), parsed);
     }
 
     // ── Edge cases ─────────────────────────────────────────────────────
