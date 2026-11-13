@@ -234,6 +234,7 @@ fn exclusions_keep_literal_quotes_no_match_ranks_and_positive_reranker_text() {
         let docs = probe.documents.lock().unwrap();
         assert_eq!(docs.len(), 4);
         assert!(docs.iter().all(|doc| !doc.doc_id.starts_with("private-")));
+        drop(docs);
     });
 }
 
