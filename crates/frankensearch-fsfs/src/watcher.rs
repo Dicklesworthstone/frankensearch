@@ -5077,7 +5077,7 @@ mod tests {
         }
     }
 
-    /// Exercise the public catch-up handoff against a real sink. The caller
+    /// Exercise the public catch-up handoff against a test pipeline. The caller
     /// still owns acknowledgement, which deliberately makes a dropped or
     /// rejected capability fail closed through `CatchupEvents::Drop`.
     /// Classify events within the same roots that produced the snapshot.
