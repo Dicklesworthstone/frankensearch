@@ -711,6 +711,7 @@ mod tests {
             let mut source = QuillSource {
                 store: store.clone(),
                 config: config(),
+                filter: None,
                 admitted: None,
             };
             source.refresh(&cx).await.unwrap();
