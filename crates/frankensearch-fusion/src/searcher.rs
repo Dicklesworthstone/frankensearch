@@ -2372,31 +2372,29 @@ impl TwoTierSearcher {
                 // check before any backend can manufacture tied zero scores.
                 let search_start = Instant::now();
                 let zero_fast_query = query_vec.iter().all(|&value| value == 0.0);
-                let (mut fast_hits, index_zero_signal) =
-                    match (self.search_params, native_embeddings.as_ref()) {
+                let retrieve_fast = |limit| -> SearchResult<_> {
+                    Ok(match (self.search_params, native_embeddings.as_ref()) {
                         _ if zero_fast_query => {
-                            let classified = self
-                                .index
-                                .search_fast_classified(&query_vec, semantic_budget)?;
+                            let classified =
+                                self.index.search_fast_classified(&query_vec, limit)?;
                             (classified.hits, classified.zero_signal)
                         }
                         (None, Some(embeddings)) => {
                             let hits = self
                                 .index
                                 .activate_owner_backed_search(cx, embeddings)?
-                                .search_fast(semantic_budget)?;
+                                .search_fast(limit)?;
                             cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
                             let zero_signal = if hits.is_empty() {
-                                self.classify_fast_empty(&query_vec, semantic_budget)
+                                self.classify_fast_empty(&query_vec, limit)
                             } else {
                                 None
                             };
                             (hits, zero_signal)
                         }
                         (None, None) => {
-                            let classified = self
-                                .index
-                                .search_fast_classified(&query_vec, semantic_budget)?;
+                            let classified =
+                                self.index.search_fast_classified(&query_vec, limit)?;
                             (classified.hits, classified.zero_signal)
                         }
                         (Some(params), embeddings) => {
@@ -2411,37 +2409,38 @@ impl TwoTierSearcher {
                                             "exact native override requires the admitted fast tier"
                                                 .to_owned(),
                                     })?;
-                                let hits =
-                                    fast.search_top_k_with_params(semantic_budget, params)?;
+                                let hits = fast.search_top_k_with_params(limit, params)?;
                                 cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
                                 hits
                             } else {
                                 self.index.search_fast_with_params(
                                     &query_vec,
-                                    semantic_budget,
+                                    limit,
                                     Some(params),
                                 )?
                             };
                             let zero_signal = if hits.is_empty() {
-                                self.classify_fast_empty(&query_vec, semantic_budget)
+                                self.classify_fast_empty(&query_vec, limit)
                             } else {
                                 None
                             };
                             (hits, zero_signal)
                         }
-                    };
-                let prefilter_empty = fast_hits.is_empty();
-                self.apply_score_calibration_to_hits(&mut fast_hits);
-                let fast_hits = if let Some(exclusions) = normalized_exclusions {
-                    filter_vector_hits_by_negations(
-                        fast_hits,
-                        exclusions,
-                        text_fn,
-                        vector_exclusion_source(self.fast_embedder.as_ref()),
-                    )
-                } else {
-                    fast_hits
+                    })
                 };
+                let (fast_hits, index_zero_signal) = retrieve_fast(semantic_budget)?;
+                let prefilter_empty = fast_hits.is_empty();
+                let (mut fast_hits, fast_retrieval_limit) = refill_vector_after_exclusions(
+                    cx,
+                    fast_hits,
+                    semantic_budget,
+                    self.index.fast_candidate_upper_bound(),
+                    normalized_exclusions,
+                    text_fn,
+                    vector_exclusion_source(self.fast_embedder.as_ref()),
+                    |limit| retrieve_fast(limit).map(|(hits, _)| hits),
+                )?;
+                self.apply_score_calibration_to_hits(&mut fast_hits);
                 // Dense-score corrections (hubness demotion, k-NN diffusion) over the semantic
                 // pool. Both off by default, in which case the pool is returned by move and this
                 // costs nothing. Timed inside `vector_search_ms` — they are part of producing the
@@ -2453,7 +2452,7 @@ impl TwoTierSearcher {
                 {
                     cancellation_checkpoint(cx, "native_fast_filter_to_coverage")?;
                     let activated = self.index.activate_owner_backed_search(cx, embeddings)?;
-                    metrics.coverage = Some(activated.coverage(&fast_hits, semantic_budget)?);
+                    metrics.coverage = Some(activated.coverage(&fast_hits, fast_retrieval_limit)?);
                     cancellation_checkpoint(cx, "native_fast_coverage_to_fusion")?;
                 }
 
@@ -2916,6 +2915,16 @@ impl TwoTierSearcher {
                 let activated = self.index.activate_owner_backed_search(cx, &embeddings)?;
                 cancellation_checkpoint(cx, "quality_activation_to_search")?;
                 let hits = activated.search_quality(quality_budget)?;
+                let (hits, retrieval_limit) = refill_vector_after_exclusions(
+                    cx,
+                    hits,
+                    quality_budget,
+                    self.index.quality_candidate_upper_bound().unwrap_or(0),
+                    exclusions,
+                    text_fn,
+                    "semantic_quality",
+                    |limit| activated.search_quality(limit),
+                )?;
                 cancellation_checkpoint(cx, "quality_search_to_coverage")?;
                 // bd-ctzo C4: the coverage receipt is built from the retained
                 // owner's witness and the candidates this tier ACTUALLY
@@ -2923,7 +2932,10 @@ impl TwoTierSearcher {
                 // it. It is assembled after retrieval on purpose — a
                 // contribution count taken before the results exist would be
                 // a prediction, not a measurement.
-                let coverage = activated.coverage(&hits, quality_budget)?;
+                // Coverage replays the owner's raw candidate window. Use the
+                // final widened limit so eligible tail hits remain attributed
+                // to the tier that actually retrieved them.
+                let coverage = activated.coverage(&hits, retrieval_limit)?;
                 tracing::debug!(
                     coverage = %coverage.redacted_summary(),
                     "quality tier served under owner-backed activation"
@@ -2951,6 +2963,16 @@ impl TwoTierSearcher {
                 let hits = self
                     .index
                     .search_quality_with_producer(&bound, quality_budget)?;
+                let (hits, _) = refill_vector_after_exclusions(
+                    cx,
+                    hits,
+                    quality_budget,
+                    self.index.quality_candidate_upper_bound().unwrap_or(0),
+                    exclusions,
+                    text_fn,
+                    "semantic_quality",
+                    |limit| self.index.search_quality_with_producer(&bound, limit),
+                )?;
                 cancellation_checkpoint(cx, "quality_search_to_calibration")?;
                 QualityPool::Retrieved(hits)
             }
@@ -2963,24 +2985,7 @@ impl TwoTierSearcher {
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         cancellation_checkpoint(cx, "quality_search_to_calibration")?;
-        let quality_pool = match (quality_pool, exclusions) {
-            (QualityPool::Retrieved(hits), Some(exclusions)) => QualityPool::Retrieved(
-                filter_vector_hits_by_negations(hits, exclusions, text_fn, "semantic_quality"),
-            ),
-            (pool, _) => pool,
-        };
         let completed_coverage = quality_coverage.map(|mut coverage| {
-            if let QualityPool::Retrieved(hits) = &quality_pool
-                && let frankensearch_core::TierQueryCoverageV1::Witnessed {
-                    contributed_candidates,
-                    ..
-                } = &mut coverage.quality
-            {
-                // Excluded candidates did not participate in refinement. The
-                // retained pool is the measured contribution; it must not be
-                // reconstructed by another search with different filters.
-                *contributed_candidates = hits.len() as u64;
-            }
             if let Some(previous) = metrics.coverage.as_ref()
                 && matches!(
                     previous.fast,
@@ -4585,6 +4590,63 @@ fn filter_scored_results_by_negations(
     results
 }
 
+/// Fill an eligible semantic pool from one retained tier without changing its
+/// retrieval policy. Public IDs may be deduplicated after physical top-k, so a
+/// short candidate batch is not evidence of exhaustion. Only the retained
+/// main/WAL row bound can stop widening before the target has been satisfied.
+// Keep the admitted retrieval closure and its filter/limit contract explicit.
+#[allow(clippy::too_many_arguments)]
+fn refill_vector_after_exclusions(
+    cx: &Cx,
+    mut hits: Vec<VectorHit>,
+    target: usize,
+    physical_upper_bound: usize,
+    exclusions: Option<&NormalizedExclusions>,
+    text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    source: &'static str,
+    mut retrieve: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
+) -> SearchResult<(Vec<VectorHit>, usize)> {
+    let Some(exclusions) = exclusions else {
+        return Ok((hits, target));
+    };
+    // Preserve the classified empty/zero-query outcome without scanning or
+    // invoking callbacks. There are no physical winners to filter or refill.
+    if hits.is_empty() {
+        return Ok((hits, target));
+    }
+    let mut limit = target;
+    loop {
+        let returned = hits.len();
+        let mut retained = 0;
+        for rank in 0..hits.len() {
+            if retained == target {
+                break;
+            }
+            cancellation_checkpoint(cx, "vector_candidates_to_exclusions")?;
+            let include = !should_exclude_document(&hits[rank].doc_id, exclusions, text_fn, source);
+            cancellation_checkpoint(cx, "vector_exclusions_to_search")?;
+            if include {
+                hits.swap(retained, rank);
+                retained += 1;
+            }
+        }
+        hits.truncate(retained);
+        let next_limit = limit.saturating_mul(2).min(physical_upper_bound);
+        // If the original physical window lost no hits to these exclusions,
+        // preserve its existing public-ID resolution contract. A negative
+        // clause that matches nothing must not silently backfill duplicates.
+        if hits.len() == target || (limit == target && retained == returned) || next_limit <= limit
+        {
+            return Ok((hits, limit));
+        }
+        cancellation_checkpoint(cx, "vector_exclusions_to_search")?;
+        limit = next_limit;
+        hits = retrieve(limit)?;
+        cancellation_checkpoint(cx, "vector_search_to_exclusions")?;
+    }
+}
+
+#[cfg(test)]
 fn filter_vector_hits_by_negations(
     mut hits: Vec<VectorHit>,
     exclusions: &NormalizedExclusions,
@@ -6626,6 +6688,597 @@ mod tests {
                 query_admission_identity("response-quality", 6),
                 vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             )
+        }
+    }
+
+    fn semantic_exclusion_index(layout: &str) -> (OwnerBackedDir, Arc<TwoTierIndex>) {
+        let dir = owner_backed_dir("semantic-exclusion-tail");
+        let config = TwoTierConfig {
+            candidate_multiplier: 1,
+            ..TwoTierConfig::default()
+        };
+        let mut bindings = Vec::new();
+        for (tier, model, dimension, axis) in [
+            ("fast", "response-fast", 4, 0),
+            ("quality", "response-quality", 6, 1),
+        ] {
+            let identity = query_admission_identity(model, dimension);
+            let path = dir.join(format!("vector.{tier}.idx"));
+            let mut artifact = identity.clone();
+            "fsvi-v2".clone_into(&mut artifact.storage.format);
+            artifact.storage.quantization = QuantizationFormat::F16;
+            "little-endian".clone_into(&mut artifact.storage.endianness);
+            let binding = FsviV2IdentityBinding::new(
+                ArtifactGenerationIdentityV1::new(83, [0x5c; 16]).unwrap(),
+                artifact.freeze().unwrap(),
+            )
+            .unwrap();
+            let mut writer = if layout == "stamped-v1" {
+                frankensearch_index::VectorIndex::create_with_revision(
+                    &path,
+                    model,
+                    &identity.fingerprint(),
+                    dimension as usize,
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap()
+            } else {
+                frankensearch_index::VectorIndex::create_v2(&path, binding.clone()).unwrap()
+            };
+            let mut vector = vec![0.0; dimension as usize];
+            vector[axis] = 1.0;
+            for rank in 0..64 {
+                writer
+                    .write_record(&format!("{tier}-blocked-{rank:02}"), &vector)
+                    .unwrap();
+            }
+            for (name, score) in [("a", 0.75), ("b", 0.5)] {
+                vector[axis] = score;
+                writer
+                    .write_record(&format!("{tier}-tail-{name}"), &vector)
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            bindings.push(binding);
+        }
+        let mut index = if layout == "stamped-v1" {
+            TwoTierIndex::open(&dir, config).unwrap()
+        } else {
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &frankensearch_index::TwoTierIndexPaths::new(dir.join("vector.fast.idx"))
+                    .with_quality_index(dir.join("vector.quality.idx")),
+                config,
+                &bindings[0],
+                Some(&bindings[1]),
+            )
+            .unwrap()
+        };
+        if layout == "native-v2" {
+            let cx = Cx::for_testing();
+            let params = frankensearch_index::native_hnsw::HnswParams::default();
+            index.enable_native_fast_hnsw(&cx, params, 43).unwrap();
+            index.enable_native_quality_hnsw(&cx, params, 47).unwrap();
+        }
+        (dir, Arc::new(index))
+    }
+
+    #[test]
+    fn semantic_exclusions_retrieve_eligible_tail_from_fast_and_quality_tiers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_directory, index) = semantic_exclusion_index(layout);
+                assert_eq!(index.fast_candidate_upper_bound(), 66);
+                assert_eq!(index.quality_candidate_upper_bound(), Some(66));
+                let fast_query = BoundQueryEmbedding::new(
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    query_admission_identity("response-fast", 4),
+                )
+                .unwrap();
+                let quality_query = BoundQueryEmbedding::new(
+                    vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    query_admission_identity("response-quality", 6),
+                )
+                .unwrap();
+                let (fast_prefix, quality_prefix) = if layout == "stamped-v1" {
+                    (
+                        index.search_fast(fast_query.vector(), 64).unwrap(),
+                        index
+                            .search_quality_with_producer(&quality_query, 64)
+                            .unwrap(),
+                    )
+                } else {
+                    let queries = TieredQueryEmbeddings::progressive(fast_query, quality_query);
+                    let activated = index.activate_owner_backed_search(&cx, &queries).unwrap();
+                    (
+                        activated.search_fast(64).unwrap(),
+                        activated.search_quality(64).unwrap(),
+                    )
+                };
+                for prefix in [&fast_prefix, &quality_prefix] {
+                    assert_eq!(prefix.len(), 64);
+                    assert!(
+                        prefix.iter().all(|hit| hit.doc_id.contains("blocked")),
+                        "{layout} must exhaust its rejected prefix before reaching an eligible tail"
+                    );
+                }
+                for exact_override in [false, true] {
+                    for fast_only in [false, true] {
+                        let fast = Arc::new(query_admission_embedder("fast"));
+                        let quality = Arc::new(query_admission_embedder("quality"));
+                        let mut searcher = TwoTierSearcher::new(
+                            Arc::clone(&index),
+                            fast.clone(),
+                            TwoTierConfig {
+                                candidate_multiplier: 1,
+                                fast_only,
+                                ..TwoTierConfig::default()
+                            },
+                        )
+                        .with_quality_embedder(quality.clone());
+                        if exact_override {
+                            searcher = searcher.with_search_params(SearchParams {
+                                parallel_enabled: false,
+                                parallel_threshold: usize::MAX,
+                                parallel_chunk_size: 1,
+                            });
+                        }
+                        let mut phases = Vec::new();
+                        let metrics = searcher
+                            .search(
+                                &cx,
+                                "find related records -blocked",
+                                4,
+                                |id| {
+                                    Some(
+                                        if id.contains("blocked") {
+                                            "BLOCKED"
+                                        } else {
+                                            "eligible"
+                                        }
+                                        .to_owned(),
+                                    )
+                                },
+                                |phase| phases.push(phase),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(phases.len(), if fast_only { 1 } else { 2 }, "{layout}");
+                        let SearchPhase::Initial {
+                            results: initial, ..
+                        } = &phases[0]
+                        else {
+                            panic!("missing Initial phase");
+                        };
+                        assert_eq!(initial.len(), 2, "{layout}, exact={exact_override}");
+                        assert!(
+                            initial
+                                .iter()
+                                .all(|hit| hit.doc_id.starts_with("fast-tail-"))
+                        );
+                        assert_eq!(metrics.semantic_candidates, 2);
+                        assert_eq!(metrics.zero_signal, None);
+                        if !fast_only {
+                            let SearchPhase::Refined { results, .. } = &phases[1] else {
+                                panic!("missing Refined phase: {:?}", phases[1]);
+                            };
+                            assert_eq!(results.len(), 4);
+                            assert!(results.iter().all(|hit| hit.doc_id.contains("-tail-")));
+                            let quality_only: Vec<_> = results
+                                .iter()
+                                .filter(|hit| hit.doc_id.starts_with("quality-tail-"))
+                                .collect();
+                            assert_eq!(quality_only.len(), 2);
+                            assert!(
+                                quality_only
+                                    .iter()
+                                    .all(|hit| hit.fast_score.is_none()
+                                        && hit.quality_score.is_some())
+                            );
+                            assert_eq!(metrics.phase2_vectors_searched, 2);
+                        }
+                        assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 1);
+                        assert_eq!(
+                            quality.bound_embeds.load(Ordering::Relaxed),
+                            u64::from(!fast_only)
+                        );
+                        if let Some(coverage) = &metrics.coverage {
+                            if layout == "native-v2" && !exact_override {
+                                assert!(
+                                    matches!(
+                                        coverage.fast,
+                                        frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                            live_count: 66,
+                                            contributed_candidates: 2,
+                                            ..
+                                        }
+                                    ),
+                                    "{coverage:?}"
+                                );
+                            } else {
+                                assert_eq!(
+                                    coverage.fast,
+                                    frankensearch_core::TierQueryCoverageV1::NotRequested
+                                );
+                            }
+                            if fast_only {
+                                assert_eq!(
+                                    coverage.quality,
+                                    frankensearch_core::TierQueryCoverageV1::NotRequested
+                                );
+                            } else {
+                                assert!(
+                                    matches!(
+                                        coverage.quality,
+                                        frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                            live_count: 66,
+                                            contributed_candidates: 2,
+                                            ..
+                                        }
+                                    ),
+                                    "{coverage:?}"
+                                );
+                            }
+                        } else {
+                            assert!(
+                                layout == "stamped-v1"
+                                    || (fast_only && (layout != "native-v2" || exact_override))
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn semantic_exclusion_widening_reaches_duplicate_and_wal_tails() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = owner_backed_dir("semantic-exclusion-duplicate-wal");
+            for (tier, model, dimension, axis) in [
+                ("fast", "response-fast", 4, 0),
+                ("quality", "response-quality", 6, 1),
+            ] {
+                let path = directory.join(format!("vector.{tier}.idx"));
+                let identity = query_admission_identity(model, dimension);
+                let mut writer = frankensearch_index::VectorIndex::create_with_revision(
+                    &path,
+                    model,
+                    &identity.fingerprint(),
+                    dimension as usize,
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap();
+                let mut vector = vec![0.0; dimension as usize];
+                vector[axis] = 1.0;
+                for _ in 0..64 {
+                    writer
+                        .write_record(&format!("{tier}-blocked"), &vector)
+                        .unwrap();
+                }
+                vector[axis] = 0.75;
+                writer
+                    .write_record(&format!("{tier}-main-tail"), &vector)
+                    .unwrap();
+                writer.finish().unwrap();
+                let mut opened = frankensearch_index::VectorIndex::open(&path).unwrap();
+                for (name, score) in [("a", 0.5), ("b", 0.25)] {
+                    vector[axis] = score;
+                    opened
+                        .append(&format!("{tier}-wal-{name}"), &vector)
+                        .unwrap();
+                }
+                assert_eq!(opened.record_count(), 65);
+                assert_eq!(opened.wal_record_count(), 2);
+            }
+            let index = Arc::new(TwoTierIndex::open(&directory, TwoTierConfig::default()).unwrap());
+            assert_eq!(index.fast_candidate_upper_bound(), 67);
+            assert_eq!(index.quality_candidate_upper_bound(), Some(67));
+            assert_eq!(
+                index.search_fast(&[1.0, 0.0, 0.0, 0.0], 4).unwrap().len(),
+                1,
+                "duplicate physical winners make a short public-ID prefix, not an exhausted corpus"
+            );
+            let quality_query = BoundQueryEmbedding::new(
+                vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                query_admission_identity("response-quality", 6),
+            )
+            .unwrap();
+            assert_eq!(
+                index
+                    .search_quality_with_producer(&quality_query, 4)
+                    .unwrap()
+                    .len(),
+                1,
+                "the quality prefix also resolves duplicate physical IDs before exclusions"
+            );
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(query_admission_embedder("fast")),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+            let mut phases = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "find related records -blocked",
+                    6,
+                    |id| {
+                        Some(
+                            if id.ends_with("blocked") {
+                                "blocked"
+                            } else {
+                                "eligible"
+                            }
+                            .to_owned(),
+                        )
+                    },
+                    |phase| phases.push(phase),
+                )
+                .await
+                .unwrap();
+            assert_eq!(phases.len(), 2);
+            for (refined, phase) in [false, true].into_iter().zip(phases) {
+                let results = match phase {
+                    SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+                        results
+                    }
+                    other => panic!("unexpected phase {other:?}"),
+                };
+                let mut ids = results
+                    .iter()
+                    .map(|hit| hit.doc_id.to_string())
+                    .collect::<Vec<_>>();
+                ids.sort();
+                let tiers: &[&str] = if refined {
+                    &["fast", "quality"]
+                } else {
+                    &["fast"]
+                };
+                let mut expected = Vec::new();
+                for tier in tiers {
+                    expected.extend([
+                        format!("{tier}-main-tail"),
+                        format!("{tier}-wal-a"),
+                        format!("{tier}-wal-b"),
+                    ]);
+                }
+                expected.sort();
+                assert_eq!(ids, expected);
+            }
+            assert_eq!(metrics.semantic_candidates, 3);
+            assert_eq!(metrics.phase2_vectors_searched, 3);
+            assert!(
+                metrics.coverage.is_none(),
+                "v1 does not mint owner coverage"
+            );
+            let (unfiltered, _) = searcher
+                .search_collect(&cx, "find related records", 6)
+                .await
+                .unwrap();
+            let (no_exclusions_matched, _) = searcher
+                .search_collect_with_text(&cx, "find related records -absent", 6, |_| {
+                    Some("eligible".to_owned())
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(no_exclusions_matched).unwrap(),
+                serde_json::to_value(unfiltered).unwrap(),
+                "an ineffective negative clause preserves physical top-k duplicate resolution"
+            );
+        });
+    }
+
+    #[test]
+    fn semantic_exclusion_widening_preserves_zero_signal_without_callbacks() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_directory, index) = query_admission_index(layout);
+                for exact_override in [false, true] {
+                    let fast = Arc::new(
+                        query_admission_embedder("fast").with_bound_response_values(vec![0.0; 4]),
+                    );
+                    let mut searcher = TwoTierSearcher::new(
+                        Arc::clone(&index),
+                        fast.clone(),
+                        TwoTierConfig::default(),
+                    );
+                    if exact_override {
+                        searcher = searcher.with_search_params(SearchParams {
+                            parallel_enabled: false,
+                            parallel_threshold: usize::MAX,
+                            parallel_chunk_size: 1,
+                        });
+                    }
+                    let (results, metrics) = searcher
+                        .search_collect_with_text(&cx, "find records -blocked", 2, |_| {
+                            panic!("zero signal must not invoke an exclusion callback")
+                        })
+                        .await
+                        .unwrap();
+                    assert!(results.is_empty());
+                    assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
+                    assert_eq!(metrics.phase1_vectors_searched, 0);
+                    assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 1);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn semantic_exclusion_widening_allows_quality_to_recover_an_empty_fast_pool() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, index) = semantic_exclusion_index("native-v2");
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(query_admission_embedder("fast")),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+            let mut phases = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "find related records -blocked",
+                    2,
+                    |id| {
+                        Some(
+                            if id.starts_with("fast-") || id.contains("blocked") {
+                                "blocked"
+                            } else {
+                                "eligible"
+                            }
+                            .to_owned(),
+                        )
+                    },
+                    |phase| phases.push(phase),
+                )
+                .await
+                .unwrap();
+            let [
+                SearchPhase::Initial {
+                    results: initial, ..
+                },
+                SearchPhase::Refined { results, .. },
+            ] = phases.as_slice()
+            else {
+                panic!("independent quality must follow the empty Initial phase");
+            };
+            assert!(initial.is_empty());
+            assert_eq!(results.len(), 2);
+            assert!(
+                results
+                    .iter()
+                    .all(|hit| hit.doc_id.starts_with("quality-tail-")
+                        && hit.fast_score.is_none()
+                        && hit.quality_score.is_some())
+            );
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(metrics.zero_signal, None);
+            let coverage = metrics.coverage.unwrap();
+            assert!(matches!(
+                coverage.fast,
+                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                    contributed_candidates: 0,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                coverage.quality,
+                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                    contributed_candidates: 2,
+                    ..
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn semantic_exclusion_widening_keeps_legacy_quality_as_rescoring() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = owner_backed_dir("semantic-exclusion-legacy-quality");
+            let mut builder = TwoTierIndex::create(&directory, TwoTierConfig::default()).unwrap();
+            builder
+                .set_fast_embedder_id("stub-fast")
+                .set_quality_embedder_id("stub-quality");
+            for rank in 0..64 {
+                builder
+                    .add_fast_record(format!("blocked-{rank}"), &[1.0, 0.0, 0.0, 0.0])
+                    .unwrap();
+            }
+            builder
+                .add_fast_record("eligible", &[0.5, 0.0, 0.0, 0.0])
+                .unwrap();
+            builder
+                .add_quality_record("eligible", &[0.5, 0.0, 0.0, 0.0])
+                .unwrap();
+            builder
+                .add_quality_record("quality-only", &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+            let index = Arc::new(builder.finish().unwrap());
+            assert!(index.quality_embedder_revision().is_some_and(str::is_empty));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)));
+            let mut phases = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "find related records -blocked",
+                    2,
+                    |id| {
+                        Some(
+                            if id.starts_with("blocked") {
+                                "blocked"
+                            } else {
+                                "eligible"
+                            }
+                            .to_owned(),
+                        )
+                    },
+                    |phase| phases.push(phase),
+                )
+                .await
+                .unwrap();
+            assert_eq!(phases.len(), 2);
+            for phase in phases {
+                let results = match phase {
+                    SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+                        results
+                    }
+                    other => panic!("unexpected phase {other:?}"),
+                };
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].doc_id, "eligible");
+            }
+            assert_eq!(metrics.semantic_candidates, 1);
+            assert_eq!(metrics.phase2_vectors_searched, 1);
+            assert!(metrics.coverage.is_none());
+        });
+    }
+
+    #[test]
+    fn semantic_exclusion_widening_cancels_before_quality_publication() {
+        for layout in ["stamped-v1", "native-v2"] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_directory, index) = query_admission_index(layout);
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(query_admission_embedder("fast")),
+                    TwoTierConfig::default(),
+                )
+                .with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+                let quality_callbacks = AtomicU64::new(0);
+                let mut phases = Vec::new();
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find related records -blocked",
+                        2,
+                        |id| {
+                            if id == "doc-quality-only" {
+                                quality_callbacks.fetch_add(1, Ordering::Relaxed);
+                                cx.set_cancel_requested(true);
+                            }
+                            Some("eligible".to_owned())
+                        },
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .expect_err("quality filtering cancellation remains terminal");
+                assert!(
+                    matches!(error, SearchError::Cancelled { ref phase, .. } if phase == "vector_exclusions_to_search")
+                );
+                assert_eq!(quality_callbacks.load(Ordering::Relaxed), 1);
+                assert!(matches!(phases.as_slice(), [SearchPhase::Initial { .. }]));
+            });
         }
     }
 
@@ -9002,10 +9655,10 @@ mod tests {
                 )
                 .await
                 .expect_err("native exact override must not publish after cancellation");
-            assert!(text_reads.load(Ordering::Relaxed) > 0);
+            assert_eq!(text_reads.load(Ordering::Relaxed), 1);
             assert!(matches!(error, SearchError::Cancelled { phase, .. }
-                if phase == "fast_result_to_publish"));
-            assert_single_cancelled_session_stop(&adapter, "fast_result_to_publish");
+                if phase == "vector_exclusions_to_search"));
+            assert_single_cancelled_session_stop(&adapter, "vector_exclusions_to_search");
         });
     }
 

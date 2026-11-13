@@ -2066,6 +2066,33 @@ impl TwoTierIndex {
         self.fast_tier().record_count()
     }
 
+    /// Upper bound on physical fast-tier candidates in this retained index.
+    ///
+    /// Includes main-file rows (including tombstones and duplicate public IDs)
+    /// and resident WAL rows. This bounds retrieval widening before public-ID
+    /// resolution; it is not a live-document count or a coverage witness. It
+    /// reads the retained source's metadata without reopening any pathname.
+    #[must_use]
+    pub fn fast_candidate_upper_bound(&self) -> usize {
+        let index = self.fast_tier();
+        index
+            .record_count()
+            .saturating_add(index.wal_record_count())
+    }
+
+    /// Quality-tier counterpart of [`Self::fast_candidate_upper_bound`].
+    ///
+    /// `None` means the retained index has no quality tier. Reading this bound
+    /// does not activate a query or weaken its producer/owner admission.
+    #[must_use]
+    pub fn quality_candidate_upper_bound(&self) -> Option<usize> {
+        self.quality_tier().map(|index| {
+            index
+                .record_count()
+                .saturating_add(index.wal_record_count())
+        })
+    }
+
     /// Whether the retained fast tier contains main-file rows or active WAL rows.
     ///
     /// Tombstoned main-file rows still count. This is a conservative content
@@ -4389,6 +4416,54 @@ mod tests {
         assert!(index.has_quality_index());
         assert!(index.has_quality_for_index(0));
         assert!(!index.has_quality_for_index(1));
+    }
+
+    #[test]
+    fn retained_candidate_bounds_include_duplicate_tombstone_and_wal_rows() {
+        let dir = temp_index_dir("candidate-bound-physical-rows");
+        fs::create_dir_all(&dir).unwrap();
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("duplicate", &[1.0, 0.0]),
+                ("duplicate", &[0.9, 0.1]),
+                ("deleted", &[0.8, 0.2]),
+            ],
+        )
+        .unwrap();
+        {
+            let mut fast = VectorIndex::open(&fast_path).unwrap();
+            assert!(fast.soft_delete("deleted").unwrap());
+            fast.append("wal-a", &[0.7, 0.3]).unwrap();
+            fast.append("wal-b", &[0.6, 0.4]).unwrap();
+        }
+        let fast_only = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+        assert_eq!(fast_only.doc_count(), 3);
+        assert_eq!(fast_only.fast_candidate_upper_bound(), 5);
+        assert_eq!(fast_only.quality_candidate_upper_bound(), None);
+
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        write_index_file(&quality_path, &[("quality-main", &[1.0, 0.0])]).unwrap();
+        {
+            let mut quality = VectorIndex::open(&quality_path).unwrap();
+            quality.append("quality-wal", &[0.5, 0.5]).unwrap();
+        }
+        let both = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+        assert_eq!(both.fast_candidate_upper_bound(), 5);
+        assert_eq!(both.quality_candidate_upper_bound(), Some(2));
+        assert_eq!(
+            both.search_fast(&[1.0, 0.0], both.fast_candidate_upper_bound())
+                .unwrap()
+                .len(),
+            3,
+            "physical bounds retain tombstones and duplicate IDs instead of claiming live coverage",
+        );
+        assert_eq!(
+            fast_only.quality_candidate_upper_bound(),
+            None,
+            "an already retained handle must not inspect newly published pathnames"
+        );
     }
 
     #[test]
