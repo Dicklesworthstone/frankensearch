@@ -1286,11 +1286,18 @@ impl TwoTierSearcher {
     ///   not contain exclusions (`-term`, `NOT "phrase"`).
     /// * `on_phase` — Callback invoked once per search phase.
     ///
+    /// A query containing only exclusions returns the lexical complement in
+    /// one `Initial` phase. It requires a lexical backend with match-all query
+    /// support and document text for every candidate examined. No embedding
+    /// identity, vector tier, quality model or reranker participates.
+    ///
     /// # Errors
     ///
     /// Returns `SearchError::Cancelled` if the operation is cancelled via `cx`.
     /// Returns `SearchError::EmbeddingFailed` if fast embedding fails and no
     /// lexical backend is available as fallback.
+    /// Returns `SearchError::QueryParseError` for an exclusion-only query
+    /// without a lexical backend or text for an examined lexical candidate.
     /// Returns `SearchError::InvalidConfig` before retrieval or model work if
     /// the enabled MMR candidate pool exceeds 1,000.
     #[instrument(skip_all, fields(query_len = query.len(), k))]
@@ -1339,6 +1346,8 @@ impl TwoTierSearcher {
         } else {
             None
         };
+        let lexical_complement =
+            parsed_query.is_positive_empty() && normalized_exclusions.is_some();
         let semantic_query = if parsed_query.is_positive_empty() {
             canon_query.as_str()
         } else {
@@ -1354,25 +1363,37 @@ impl TwoTierSearcher {
 
         let query_class = QueryClass::classify(semantic_query);
         metrics.query_class = Some(query_class);
-        metrics.fast_embedder_id = Some(self.fast_embedder.id().to_owned());
+        if !lexical_complement {
+            metrics.fast_embedder_id = Some(self.fast_embedder.id().to_owned());
+        }
 
         // bd-ctzo C1: the identity join happens HERE -- before the fast
         // embedder is invoked, before any embedding cache is consulted, and
         // before a single vector or ANN node is read. A refusal therefore
         // costs a fingerprint comparison, and the work it would have
         // authorized never starts.
-        let admission = self.admit_semantic_query();
-        cancellation_checkpoint(cx, "query_identity_admission")?;
-        let (admission, identities) = admission?;
-        match admission {
-            SemanticAdmission::OwnerBacked { quality } => tracing::debug!(
-                quality_owner_backed = quality,
-                "query admitted against retained per-tier index identity"
-            ),
-            SemanticAdmission::LegacyUnidentified => tracing::debug!(
-                "index retains no admitted FSVI v2 owner; searching a legacy-unidentified \
-                 artifact with no space identity to join against"
-            ),
+        // A lexical complement has no semantic query to admit. An unrelated
+        // missing, stale or foreign vector producer cannot prevent browsing
+        // the lexical corpus, nor may it contribute candidates to that corpus.
+        let admitted = if lexical_complement {
+            cancellation_checkpoint(cx, "lexical_complement_admission")?;
+            None
+        } else {
+            let admission = self.admit_semantic_query();
+            cancellation_checkpoint(cx, "query_identity_admission")?;
+            Some(admission?)
+        };
+        if let Some((admission, _)) = admitted.as_ref() {
+            match admission {
+                SemanticAdmission::OwnerBacked { quality } => tracing::debug!(
+                    quality_owner_backed = quality,
+                    "query admitted against retained per-tier index identity"
+                ),
+                SemanticAdmission::LegacyUnidentified => tracing::debug!(
+                    "index retains no admitted FSVI v2 owner; searching a legacy-unidentified \
+                     artifact with no space identity to join against"
+                ),
+            }
         }
         let telemetry_root_request_id = self
             .host_adapter
@@ -1401,30 +1422,46 @@ impl TwoTierSearcher {
         // limit. Request it once up front so later stages can promote an
         // undisplayed candidate without re-querying a changing lexical index.
         // Fast-only and absent-quality paths keep their existing work policy.
-        let candidate_target = if self.should_run_quality() {
+        let quality_enabled = !lexical_complement && self.should_run_quality();
+        let candidate_target = if quality_enabled {
             self.final_candidate_target(k)
         } else {
             k
         };
         let phase1_start = Instant::now();
-        let initial = self
-            .run_phase1(
+        let initial = if lexical_complement {
+            self.run_lexical_complement(
+                cx,
+                query,
+                k,
+                normalized_exclusions
+                    .as_ref()
+                    .expect("a lexical complement contains exclusions"),
+                &text_fn,
+                &mut metrics,
+            )
+            .await
+        } else {
+            self.run_phase1(
                 cx,
                 semantic_query,
                 &parsed_query,
                 normalized_exclusions.as_ref(),
                 candidate_target,
                 query_class,
-                identities.fast.as_ref(),
+                admitted
+                    .as_ref()
+                    .and_then(|(_, identities)| identities.fast.as_ref()),
                 &text_fn,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
             )
             .await
-            .and_then(|outcome| {
-                cancellation_checkpoint(cx, "fast_result_to_publish")?;
-                Ok(outcome)
-            });
+        };
+        let initial = initial.and_then(|outcome| {
+            cancellation_checkpoint(cx, "fast_result_to_publish")?;
+            Ok(outcome)
+        });
         metrics.phase1_total_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
         let (initial_hits, refinement_pools) = match initial {
@@ -1484,7 +1521,7 @@ impl TwoTierSearcher {
             results: display_hits.clone(),
             latency: initial_latency,
             metrics: PhaseMetrics {
-                embedder_id: self.fast_embedder.id().to_owned(),
+                embedder_id: metrics.fast_embedder_id.clone().unwrap_or_default(),
                 vectors_searched: metrics.phase1_vectors_searched,
                 lexical_candidates: metrics.lexical_candidates,
                 fused_count: display_hits.len(),
@@ -1518,38 +1555,49 @@ impl TwoTierSearcher {
             }
             return Err(cancellation);
         }
-        self.export_search_metrics(query_class, &metrics, display_hits.len(), false);
+        self.export_search_metrics(
+            if lexical_complement {
+                SearchMode::Lexical
+            } else {
+                SearchMode::TwoTier
+            },
+            query_class,
+            &metrics,
+            display_hits.len(),
+            false,
+        );
 
         // Phase 2: Quality refinement (optional).
         // Independent quality retrieval can answer a successful but empty fast
         // phase. Retained pools distinguish that case from failed embedding or
         // a policy short circuit; a work counter cannot make that distinction.
         // An unidentified legacy tier still needs candidates to rescore.
-        let independent_quality = match admission {
-            SemanticAdmission::OwnerBacked { quality } => quality,
-            SemanticAdmission::LegacyUnidentified => self
+        let quality_enabled = !lexical_complement && self.should_run_quality();
+        let independent_quality = match admitted.as_ref().map(|(admission, _)| admission) {
+            Some(SemanticAdmission::OwnerBacked { quality }) => *quality,
+            Some(SemanticAdmission::LegacyUnidentified) => self
                 .index
                 .quality_embedder_revision()
                 .is_some_and(|revision| !revision.is_empty()),
+            None => false,
         };
         let has_quality_work = refinement_pools.is_some()
             && (independent_quality
                 || (!initial_hits.is_empty() && metrics.phase1_vectors_searched > 0));
-        let quality_circuit_open = if self.should_run_quality()
-            && let Some(circuit_breaker) = self.circuit_breaker.as_ref()
-        {
-            let (skip, _evidence) = circuit_breaker.should_skip_quality();
-            skip
-        } else {
-            false
-        };
-        let quality_phase_gate_skip =
-            self.should_run_quality() && self.phase_gate_should_skip_quality();
+        let quality_circuit_open =
+            if quality_enabled && let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
+                let (skip, _evidence) = circuit_breaker.should_skip_quality();
+                skip
+            } else {
+                false
+            };
+        let quality_phase_gate_skip = quality_enabled && self.phase_gate_should_skip_quality();
 
-        if self.should_run_quality()
+        if quality_enabled
             && !quality_circuit_open
             && !quality_phase_gate_skip
             && has_quality_work
+            && let Some((admission, identities)) = admitted.as_ref()
         {
             let phase2_start = Instant::now();
             metrics.quality_embedder_id = self.quality_embedder.as_ref().map(|e| e.id().to_owned());
@@ -1563,7 +1611,7 @@ impl TwoTierSearcher {
                 refinement_pools.as_ref(),
                 &text_fn,
                 normalized_exclusions.as_ref(),
-                admission,
+                *admission,
                 identities.quality.as_ref(),
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
@@ -1689,7 +1737,13 @@ impl TwoTierSearcher {
                                 search_started_at.elapsed(),
                             );
                         }
-                        self.export_search_metrics(query_class, &metrics, refined_count, true);
+                        self.export_search_metrics(
+                            SearchMode::TwoTier,
+                            query_class,
+                            &metrics,
+                            refined_count,
+                            true,
+                        );
                         on_phase(SearchPhase::Refined {
                             results: refined_display,
                             latency: phase2_latency,
@@ -1879,7 +1933,7 @@ impl TwoTierSearcher {
         } else if metrics.skip_reason.is_none() {
             if is_shipped_hash_embedder(self.fast_embedder.as_ref()) {
                 metrics.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
-            } else if self.should_run_quality() {
+            } else if quality_enabled {
                 if quality_circuit_open {
                     metrics.skip_reason = Some("circuit_breaker_open".to_owned());
                 } else if quality_phase_gate_skip {
@@ -1988,6 +2042,48 @@ impl TwoTierSearcher {
             })
             .await?;
         Ok((best_results, metrics))
+    }
+
+    /// Browse only the lexical corpus, keeping the scoring pin through winner
+    /// hydration. A missing text value cannot prove that a row is outside the
+    /// excluded set, so it refuses the request before any phase is published.
+    async fn run_lexical_complement(
+        &self,
+        cx: &Cx,
+        query: &str,
+        k: usize,
+        exclusions: &NormalizedExclusions,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        metrics: &mut TwoTierMetrics,
+    ) -> SearchResult<Phase1Outcome> {
+        let lexical = self.lexical.as_deref().ok_or_else(|| SearchError::QueryParseError {
+            query: query.to_owned(),
+            detail: "queries containing only exclusions require a lexical backend with match-all support".to_owned(),
+        })?;
+        let started = Instant::now();
+        // `*` is intentional backend query syntax, not user free text. Do not
+        // rewrite it through query_text or search the excluded words instead.
+        let batch = frankensearch_core::with_cancellation(
+            cx,
+            "lexical_complement",
+            lexical.search_candidates(cx, "*", k),
+        )
+        .await?;
+        let batch = refill_lexical_candidates(cx, lexical, "*", k, batch, |doc_id| {
+            let text = text_fn(doc_id).ok_or_else(|| SearchError::QueryParseError {
+                query: query.to_owned(),
+                detail: "queries containing only exclusions require document text for every examined lexical candidate".to_owned(),
+            })?;
+            Ok(find_negative_match(&text, exclusions).is_none())
+        })
+        .await?;
+        metrics.lexical_search_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let (results, context) = batch.into_parts();
+        let results = self
+            .lexical_results_for_direct_return(cx, &results, context.as_ref(), metrics)
+            .await?;
+        metrics.skip_reason = Some("lexical_complement".to_owned());
+        Ok(Phase1Outcome::without_pools(results))
     }
 
     /// Run Phase 1: fast embedding + optional lexical + RRF fusion.
@@ -3574,6 +3670,7 @@ impl TwoTierSearcher {
 
     fn export_search_metrics(
         &self,
+        mode: SearchMode,
         query_class: QueryClass,
         metrics: &TwoTierMetrics,
         result_count: usize,
@@ -3583,7 +3680,7 @@ impl TwoTierSearcher {
             return;
         };
         let payload = SearchMetrics {
-            mode: SearchMode::TwoTier,
+            mode,
             query_class: Some(query_class),
             total_latency_ms: metrics.phase1_total_ms
                 + if refined {
@@ -4532,9 +4629,28 @@ async fn refill_lexical_after_exclusions(
     lexical: &dyn LexicalRead,
     query: &str,
     target: usize,
-    mut batch: LexicalCandidateBatch,
+    batch: LexicalCandidateBatch,
     exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+) -> SearchResult<LexicalCandidateBatch> {
+    refill_lexical_candidates(cx, lexical, query, target, batch, |doc_id| {
+        Ok(!should_exclude_document(
+            doc_id, exclusions, text_fn, "lexical",
+        ))
+    })
+    .await
+}
+
+/// Replace the whole scored batch on widening, including its hydration pin.
+/// The predicate may refuse incomplete evidence without publishing a partial
+/// page; cancellation from that predicate still wins over its returned error.
+async fn refill_lexical_candidates(
+    cx: &Cx,
+    lexical: &dyn LexicalRead,
+    query: &str,
+    target: usize,
+    mut batch: LexicalCandidateBatch,
+    include: impl Fn(&str) -> SearchResult<bool>,
 ) -> SearchResult<LexicalCandidateBatch> {
     let mut limit = target;
     loop {
@@ -4547,10 +4663,9 @@ async fn refill_lexical_after_exclusions(
                 break;
             }
             cancellation_checkpoint(cx, "lexical_candidates_to_exclusions")?;
-            let include =
-                !should_exclude_document(&results[rank].doc_id, exclusions, text_fn, "lexical");
+            let included = include(&results[rank].doc_id);
             cancellation_checkpoint(cx, "lexical_exclusions_to_search")?;
-            if include {
+            if included? {
                 // Compact in rank order without allocating a second candidate
                 // pool. Rejected rows are dropped after the bounded scan.
                 results.swap(retained, rank);
@@ -5321,6 +5436,7 @@ mod tests {
     struct RetainedMetadataLexical {
         epoch: AtomicU64,
         searches: AtomicU64,
+        queries: Mutex<Vec<String>>,
         hydrated: Mutex<Vec<Vec<String>>>,
     }
 
@@ -5337,11 +5453,12 @@ mod tests {
         fn search_candidates<'a>(
             &'a self,
             _cx: &'a Cx,
-            _query: &'a str,
+            query: &'a str,
             limit: usize,
         ) -> SearchFuture<'a, frankensearch_core::LexicalCandidateBatch> {
             Box::pin(async move {
                 self.searches.fetch_add(1, Ordering::Relaxed);
+                self.queries.lock().unwrap().push(query.to_owned());
                 let epoch = self.epoch.load(Ordering::Relaxed);
                 let results = (0..limit.min(18))
                     .map(|rank| {
@@ -12507,6 +12624,368 @@ mod tests {
     }
 
     #[test]
+    fn pure_negative_complement_retains_winners_without_admitting_any_model() {
+        for (query, excluded_text) in [
+            ("-blocked", "BLOCKED"),
+            (r#" NOT "danger \"zone\"" "#, r#"DANGER "ZONE""#),
+            ("-src/main.rs", "path src/main.rs"),
+        ] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_index_dir, index) = build_test_index_with_quality(4);
+                let lexical = Arc::new(RetainedMetadataLexical::default());
+                let mut fast = IdentityCountingEmbedder::new(
+                    "unrelated-fast",
+                    query_admission_identity("unrelated-fast", 2),
+                    vec![1.0, 0.0],
+                );
+                fast.identity_refusal = Some("test.unavailable_fast_identity");
+                let fast = Arc::new(fast);
+                let quality = Arc::new(IdentityCountingEmbedder::new(
+                    "unrelated-quality",
+                    query_admission_identity("unrelated-quality", 3),
+                    vec![1.0, 0.0, 0.0],
+                ));
+                let adapter = Arc::new(RecordingHostAdapter::new("complement"));
+                let exporter = Arc::new(RecordingExporter::default());
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    fast.clone(),
+                    TwoTierConfig::default().with_metrics_exporter(exporter.clone()),
+                )
+                .with_quality_embedder(quality.clone())
+                .with_lexical(lexical.clone())
+                .with_host_adapter(adapter.clone());
+                #[cfg(feature = "rerank")]
+                let rerank_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                #[cfg(feature = "rerank")]
+                let searcher =
+                    searcher.with_reranker(Arc::new(CountingReranker::new(rerank_calls.clone())));
+
+                let mut phases = Vec::new();
+                let metrics = searcher
+                    .search(
+                        &cx,
+                        query,
+                        1,
+                        |id| {
+                            let survives = id == "doc-quality-only";
+                            lexical
+                                .epoch
+                                .store(if survives { 100 } else { 99 }, Ordering::Relaxed);
+                            Some(if survives { "safe" } else { excluded_text }.to_owned())
+                        },
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(phases.len(), 1);
+                let SearchPhase::Initial {
+                    results,
+                    metrics: phase,
+                    ..
+                } = &phases[0]
+                else {
+                    panic!("a lexical complement has only an Initial phase");
+                };
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].doc_id, "doc-quality-only");
+                assert_eq!(results[0].source, ScoreSource::Lexical);
+                assert!(results[0].fast_score.is_none());
+                assert!(results[0].quality_score.is_none());
+                assert!(results[0].rerank_score.is_none());
+                assert_eq!(results[0].metadata.as_ref().unwrap()["epoch"], 99);
+                assert!(phase.embedder_id.is_empty());
+                assert_eq!(phase.vectors_searched, 0);
+                assert_eq!(phase.skip_reason.as_deref(), Some("lexical_complement"));
+                assert!(lexical.searches.load(Ordering::Relaxed) > 1);
+                assert!(
+                    lexical
+                        .queries
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|query| query == "*")
+                );
+                assert_eq!(
+                    lexical.hydrated.lock().unwrap().as_slice(),
+                    &[vec!["doc-quality-only".to_owned()]]
+                );
+                assert_eq!(fast.identity_count(), 0);
+                assert_eq!(fast.embed_count(), 0);
+                assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 0);
+                assert_eq!(quality.identity_count(), 0);
+                assert_eq!(quality.embed_count(), 0);
+                assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 0);
+                #[cfg(feature = "rerank")]
+                assert_eq!(rerank_calls.load(Ordering::Relaxed), 0);
+                assert_eq!(metrics.lexical_candidates, 1);
+                assert_eq!(metrics.semantic_candidates, 0);
+                assert_eq!(metrics.hash_control_candidates, 0);
+                assert_eq!(metrics.phase1_vectors_searched, 0);
+                assert_eq!(metrics.phase2_vectors_searched, 0);
+                assert_eq!(metrics.fast_embed_ms, 0.0);
+                assert_eq!(metrics.quality_embed_ms, 0.0);
+                assert_eq!(metrics.rerank_ms, 0.0);
+                assert!(metrics.fast_embedder_id.is_none());
+                assert!(metrics.quality_embedder_id.is_none());
+                assert!(metrics.coverage.is_none());
+                let searches = exporter.search.lock().unwrap();
+                assert_eq!(searches.len(), 1);
+                assert_eq!(searches[0].mode, SearchMode::Lexical);
+                assert!(!searches[0].refined);
+                drop(searches);
+                assert!(exporter.embedding.lock().unwrap().is_empty());
+                assert!(
+                    !adapter
+                        .telemetry_events()
+                        .iter()
+                        .any(|event| matches!(event.event, TelemetryEvent::Embedding { .. }))
+                );
+                let hooks = adapter.lifecycle_events();
+                assert_eq!(
+                    hooks
+                        .iter()
+                        .filter(|event| matches!(event, AdapterLifecycleEvent::SessionStart { .. }))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    hooks
+                        .iter()
+                        .filter(|event| matches!(event, AdapterLifecycleEvent::SessionStop { .. }))
+                        .count(),
+                    1
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn pure_negative_complement_refuses_missing_backend_text_and_failed_match_all() {
+        for failure in ["backend", "text", "query"] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_index_dir, index) = build_test_index_with_quality(4);
+                let adapter = Arc::new(RecordingHostAdapter::new("complement-refusal"));
+                let lexical = Arc::new(RetainedMetadataLexical::default());
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(FailingEmbedder),
+                    TwoTierConfig::default(),
+                )
+                .with_host_adapter(adapter.clone());
+                let searcher = match failure {
+                    "backend" => searcher,
+                    "text" => searcher.with_lexical(lexical.clone()),
+                    _ => searcher.with_lexical(Arc::new(YieldingLexical {
+                        failure: Some(false),
+                        ..YieldingLexical::default()
+                    })),
+                };
+                let mut phases = 0;
+                let error = searcher
+                    .search(&cx, "-blocked", 2, |_| None, |_| phases += 1)
+                    .await
+                    .expect_err("incomplete lexical evidence cannot produce a complement");
+                match failure {
+                    "backend" => assert!(
+                        matches!(error, SearchError::QueryParseError { ref detail, .. } if detail.contains("lexical backend"))
+                    ),
+                    "text" => assert!(
+                        matches!(error, SearchError::QueryParseError { ref detail, .. } if detail.contains("document text"))
+                    ),
+                    _ => assert!(matches!(
+                        error,
+                        SearchError::SubsystemError {
+                            subsystem: "yielding_lexical",
+                            ..
+                        }
+                    )),
+                }
+                assert_eq!(phases, 0);
+                assert!(lexical.hydrated.lock().unwrap().is_empty());
+                let hooks = adapter.lifecycle_events();
+                assert_eq!(
+                    hooks
+                        .iter()
+                        .filter(|event| matches!(event, AdapterLifecycleEvent::SessionStart { .. }))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    hooks
+                        .iter()
+                        .filter(|event| matches!(event, AdapterLifecycleEvent::SessionStop { .. }))
+                        .count(),
+                    1
+                );
+                assert!(!adapter.telemetry_events().iter().any(|event| matches!(
+                    event.event,
+                    TelemetryEvent::Search { .. } | TelemetryEvent::Embedding { .. }
+                )));
+            });
+        }
+    }
+
+    #[test]
+    fn pure_negative_complement_observes_filter_and_initial_cancellation() {
+        for at_filter in [true, false] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_index_dir, index) = build_test_index_with_quality(4);
+                let lexical = Arc::new(RetainedMetadataLexical::default());
+                let adapter = Arc::new(RecordingHostAdapter::new("complement-cancel"));
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(FailingEmbedder),
+                    TwoTierConfig::default(),
+                )
+                .with_lexical(lexical.clone())
+                .with_host_adapter(adapter.clone());
+                let mut phases = 0;
+                let error = searcher
+                    .search(
+                        &cx,
+                        "-blocked",
+                        1,
+                        |_| {
+                            if at_filter {
+                                cx.set_cancel_requested(true);
+                                None
+                            } else {
+                                Some("safe".to_owned())
+                            }
+                        },
+                        |_| {
+                            phases += 1;
+                            cx.set_cancel_requested(true);
+                        },
+                    )
+                    .await
+                    .expect_err("cancellation must beat a text refusal or normal completion");
+                assert!(matches!(error, SearchError::Cancelled { .. }));
+                assert_eq!(phases, usize::from(!at_filter));
+                assert_eq!(lexical.searches.load(Ordering::Relaxed), 1);
+                assert_eq!(
+                    lexical.hydrated.lock().unwrap().len(),
+                    usize::from(!at_filter)
+                );
+                assert_single_cancelled_session_stop(&adapter, "lexical complement");
+            });
+        }
+    }
+
+    #[cfg(any(feature = "quill", feature = "tantivy-bench"))]
+    fn complement_fixture_documents() -> Vec<frankensearch_core::IndexableDocument> {
+        use frankensearch_core::IndexableDocument;
+
+        let mut docs: Vec<_> = (0..32)
+            .map(|rank| {
+                IndexableDocument::new(
+                    format!("excluded-{rank:02}"),
+                    match rank % 3 {
+                        0 => "common BLOCKED",
+                        1 => r#"common danger "zone""#,
+                        _ => "common src/main.rs",
+                    },
+                )
+            })
+            .collect();
+        for (id, content) in [("tail-a", "common river"), ("tail-b", "common mountain")] {
+            docs.push(
+                IndexableDocument::new(id, content).with_metadata("path", format!("src/{id}.rs")),
+            );
+        }
+        docs
+    }
+
+    #[cfg(any(feature = "quill", feature = "tantivy-bench"))]
+    async fn verify_backend_lexical_complement(
+        cx: &Cx,
+        lexical: Arc<dyn LexicalRead>,
+        docs: &[frankensearch_core::IndexableDocument],
+    ) {
+        let (_index_dir, index) = build_test_index_with_quality(4);
+        let searcher =
+            TwoTierSearcher::new(index, Arc::new(FailingEmbedder), TwoTierConfig::default())
+                .with_quality_embedder(Arc::new(FailingEmbedder))
+                .with_lexical(lexical);
+        let text = |id: &str| {
+            docs.iter()
+                .find(|doc| doc.id == id)
+                .map(|doc| doc.content.clone())
+        };
+        let query = r#"-blocked NOT "danger \"zone\"" -src/main.rs"#;
+        let (results, metrics) = searcher
+            .search_collect_with_text(cx, query, 2, text)
+            .await
+            .unwrap();
+        let mut ids: Vec<_> = results.iter().map(|hit| hit.doc_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["tail-a", "tail-b"]);
+        assert!(results.iter().all(|hit| hit.source == ScoreSource::Lexical
+            && hit.fast_score.is_none()
+            && hit.quality_score.is_none()
+            && hit.metadata.as_ref().unwrap()["path"] == format!("src/{}.rs", hit.doc_id)));
+        assert_eq!(metrics.skip_reason.as_deref(), Some("lexical_complement"));
+        assert_eq!(metrics.semantic_candidates, 0);
+        assert!(metrics.coverage.is_none());
+
+        let (empty, _) = searcher
+            .search_collect_with_text(cx, "-common", 2, text)
+            .await
+            .unwrap();
+        assert!(
+            empty.is_empty(),
+            "exclusions cover the entire lexical corpus"
+        );
+        let (all, _) = searcher
+            .search_collect_with_text(cx, "-nonexistent", docs.len() + 1, text)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), docs.len());
+        assert!(
+            all.iter().all(|hit| !hit.doc_id.starts_with("doc-")),
+            "unrelated vector-only records must never enter the complement"
+        );
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_pure_negative_complement_finds_lexical_tail_and_exhausts_corpus() {
+        use frankensearch_core::traits::LexicalWrite;
+        use frankensearch_quill::{QuillConfig, QuillIndex};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let quill = QuillIndex::create(&cx, directory.path(), QuillConfig::default())
+                .await
+                .unwrap();
+            let docs = complement_fixture_documents();
+            LexicalWrite::index_documents(&quill, &cx, &docs)
+                .await
+                .unwrap();
+            LexicalWrite::commit(&quill, &cx).await.unwrap();
+            verify_backend_lexical_complement(&cx, Arc::new(quill), &docs).await;
+        });
+    }
+
+    #[cfg(feature = "tantivy-bench")]
+    #[test]
+    fn tantivy_pure_negative_complement_finds_lexical_tail_and_exhausts_corpus() {
+        use frankensearch_core::traits::LexicalWrite;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let tantivy = frankensearch_lexical::TantivyIndex::create(directory.path()).unwrap();
+            let docs = complement_fixture_documents();
+            LexicalWrite::index_documents(&tantivy, &cx, &docs)
+                .await
+                .unwrap();
+            LexicalWrite::commit(&tantivy, &cx).await.unwrap();
+            verify_backend_lexical_complement(&cx, Arc::new(tantivy), &docs).await;
+        });
+    }
+
+    #[test]
     fn lexical_exclusion_widening_retains_scoring_snapshot_for_refinement() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_index_dir, index) = build_test_index_with_quality(4);
@@ -12795,7 +13274,8 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
-            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_lexical(Arc::new(StubLexical));
 
             let mut initial_results = Vec::new();
             let metrics = searcher
