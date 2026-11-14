@@ -201,7 +201,22 @@ fn configuration_digest(runtime: &FsfsRuntime) -> SearchResult<String> {
 }
 
 fn indexing_contract_digest(runtime: &FsfsRuntime) -> SearchResult<String> {
-    configuration::contract_digest(runtime.config())
+    let contract = configuration::contract_digest(runtime.config())?;
+    if matches!(
+        runtime.indexing_primary_tier,
+        super::IndexingPrimaryTier::Quality
+    ) {
+        // This topology is explicit recovery intent, not a query tuning knob
+        // or a configuration field. Bind it into both incomplete-build and
+        // completed-input receipts so a resume cannot reinterpret quality as
+        // fast (or inherit it as a full indexing generation). Ordinary
+        // indexing retains its historical contract bytes.
+        Ok(content_sha256_hex(
+            format!("fsfs.indexing_primary.quality.v1\0{contract}").as_bytes(),
+        ))
+    } else {
+        Ok(contract)
+    }
 }
 
 fn open_regular(path: &Path) -> SearchResult<File> {
@@ -428,7 +443,7 @@ impl FsfsRuntime {
             false,
         ))
         .await?;
-        Self::validate_search_generation_at_root(candidate_root, SearchExecutionMode::Full)?;
+        Self::validate_search_generation_at_root(candidate_root, self.indexing_search_mode())?;
         let receipt = completed_receipt(self, candidate_root, &payload)?;
         write_receipt(cx, candidate_root, &receipt)?;
         Ok(payload)
@@ -442,7 +457,20 @@ fn completed_receipt(
 ) -> SearchResult<ReuseReceipt> {
     let checkpoint = &payload.input_checkpoint;
     let final_state = &payload.generation;
-    let (vector_id, vector_dimension) = payload.vector_generation.as_ref().map_or(
+    let primary = if matches!(
+        runtime.indexing_primary_tier,
+        super::IndexingPrimaryTier::Quality
+    ) {
+        if payload.vector_generation.is_some() || payload.quality_generation.is_none() {
+            return Err(reuse_error(
+                "quality-only source receipt requires a standalone quality generation",
+            ));
+        }
+        payload.quality_generation.as_ref()
+    } else {
+        payload.vector_generation.as_ref()
+    };
+    let (vector_id, vector_dimension) = primary.map_or(
         (super::LEXICAL_ONLY_GENERATION_EMBEDDER_ID, 0),
         |generation| (generation.id.as_str(), generation.dimension),
     );

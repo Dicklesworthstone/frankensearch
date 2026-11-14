@@ -603,6 +603,7 @@ mod tests {
         struct RecoveryProducer {
             identity: EmbeddingIdentityBundleV1,
             category: ModelCategory,
+            calls: AtomicUsize,
             queries: AtomicUsize,
             on_query: Mutex<Option<QueryHook>>,
         }
@@ -614,6 +615,7 @@ mod tests {
 
             fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
                 Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::Relaxed);
                     if text == QUERY {
                         self.queries.fetch_add(1, Ordering::Relaxed);
                         let hook = self.on_query.lock().unwrap().take();
@@ -659,6 +661,7 @@ mod tests {
                     Arc::new(RecoveryProducer {
                         identity: EmbeddingIdentityBundleV1::explicit_test_model(name, 3),
                         category,
+                        calls: AtomicUsize::new(0),
                         queries: AtomicUsize::new(0),
                         on_query: Mutex::new(None),
                     })
@@ -704,6 +707,10 @@ mod tests {
                     let mut search = recovery_runtime(&runtime, &source);
                     search.config.search.fast_only = mode == "fast";
                     search.cli_input.quality_only = mode == "quality";
+                    if mode == "quality" {
+                        "unused-invalid-fast-producer"
+                            .clone_into(&mut search.config.indexing.fast_model);
+                    }
                     let mut output = Vec::new();
                     Box::pin(search.run_complete_generation_search_with_writer(
                         &cx,
@@ -738,6 +745,16 @@ mod tests {
                         "one preview and one public replay: {mode}"
                     );
                     assert_eq!(generation_count(&root), 1);
+                    if mode == "quality" {
+                        assert_eq!(models.fast.calls.load(Ordering::Relaxed), 0);
+                        let active = CompleteGenerationStore::open(&cx, &root)
+                            .unwrap()
+                            .active(&cx)
+                            .unwrap()
+                            .unwrap();
+                        assert!(!active.path().join("vector/index.fsvi").exists());
+                        assert!(active.path().join("vector/quality.fsvi").is_file());
+                    }
                     assert!(!directory.path().join("missing-models").exists());
                 }
             });

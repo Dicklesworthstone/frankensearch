@@ -612,11 +612,7 @@ impl FsfsRuntime {
         // An indexing command can return success with deferred semantic rows.
         // Apply the same full-generation admission used by actual search, then
         // open its real lexical/vector/producer resources before sealing.
-        let candidate_mode = if candidate.lexical_only_indexing {
-            SearchExecutionMode::LexicalOnly
-        } else {
-            SearchExecutionMode::Full
-        };
+        let candidate_mode = candidate.indexing_search_mode();
         Self::validate_search_generation_at_root(build.path(), candidate_mode)?;
         if candidate.config.pressure.degradation_override
             == crate::config::DegradationOverrideMode::ForceMetadataOnly

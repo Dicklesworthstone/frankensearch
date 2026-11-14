@@ -643,6 +643,160 @@ fn confirmation_rejects_corrupt_selection_and_forged_digest_without_repair() {
     });
 }
 
+#[cfg(all(feature = "semantic-loaders", not(feature = "embedded-models")))]
+#[test]
+#[ignore = "requires FRANKENSEARCH_RECOVERY_E2E_MODEL_DIR with a verified MiniLM cache; no fast model required"]
+fn genuine_quality_only_source_rebuild_resumes_and_searches_without_fast_or_sources() {
+    use frankensearch_fsfs::FsfsConfig;
+
+    let models = std::env::var_os("FRANKENSEARCH_RECOVERY_E2E_MODEL_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("provide a verified MiniLM cache; no mock or skip fallback");
+    let models = fs::canonicalize(models).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let root = directory.path().join("store");
+    let receipt = directory.path().join("prepared-quality.json");
+    let config_path = directory.path().join("quality-recovery.toml");
+    fs::create_dir(&source).unwrap();
+    fs::write(
+        source.join("alpha.md"),
+        "recoverytoken preserves durable searchable generations and the original documents",
+    )
+    .unwrap();
+    fs::write(
+        source.join("beta.md"),
+        "recoverytoken excluded secondary document",
+    )
+    .unwrap();
+    let mut config = FsfsConfig::default();
+    config.indexing.offline = true;
+    config.indexing.model_dir = models.display().to_string();
+    "unused-invalid-fast-producer".clone_into(&mut config.indexing.fast_model);
+    "all-minilm-l6-v2".clone_into(&mut config.indexing.quality_model);
+    config.indexing.fast_window_max_per_file = 4;
+    config.search.fast_only = false;
+    config.search.rerank = false;
+    config.search.quality_timeout_ms = 10_000;
+    "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+    fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+    let configure = |command: &mut Command| {
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("FSFS_") || name.starts_with("FRANKENSEARCH_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .current_dir(directory.path())
+            .arg("--index-dir")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path)
+            .env("HOME", directory.path())
+            .env("XDG_CONFIG_HOME", directory.path().join("empty-config"))
+            .env("FRANKENSEARCH_MODEL_DIR", &models)
+            .env("FRANKENSEARCH_CHECK_UPDATES", "0");
+    };
+    let query = "how does recoverytoken preserve durable search generations";
+    let mut prepare = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    configure(&mut prepare);
+    prepare
+        .arg("--rebuild-source")
+        .arg(&source)
+        .args([
+            "--prepare",
+            "--query",
+            query,
+            "--search-mode",
+            "quality",
+            "--filter",
+            "path:alpha.md",
+            "--no-rerank",
+        ])
+        .arg("--save-preparation")
+        .arg(&receipt);
+    let output = run(&mut prepare, directory.path(), Duration::from_secs(180));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let prepared = body(&output)["data"].clone();
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["source_rebuild_performed"], true);
+    assert_eq!(prepared["preview"].as_array().unwrap().len(), 1);
+    assert_eq!(prepared["preview"][0]["hits"][0]["path"], "alpha.md");
+    let target = root
+        .join("generations")
+        .join(prepared["generation_id"].as_str().unwrap());
+    assert!(target.join("vector/quality.fsvi").is_file());
+    assert!(!target.join("vector/index.fsvi").exists());
+    assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
+    let sealed = files(&target);
+    fs::rename(&source, directory.path().join("source-unavailable")).unwrap();
+
+    let mut apply = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    configure(&mut apply);
+    apply.arg("--resume-file").arg(&receipt).args([
+        "--apply",
+        "--query",
+        query,
+        "--search-mode",
+        "quality",
+        "--filter",
+        "path:alpha.md",
+        "--no-rerank",
+    ]);
+    let output = run(&mut apply, directory.path(), Duration::from_secs(180));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let restored = body(&output)["data"].clone();
+    assert_eq!(restored["state"], "restored_durable");
+    assert_eq!(restored["generation_id"], prepared["generation_id"]);
+    assert_eq!(restored["source_rebuild_performed"], false);
+    assert_eq!(restored["selection_write_performed"], true);
+
+    for quality in [true, false] {
+        let mut search = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+        search.args(["search", if quality { query } else { "recoverytoken" }]);
+        configure(&mut search);
+        search.args([
+            "--format",
+            "json",
+            "--quiet",
+            "--no-daemon",
+            "--no-rerank",
+            "--filter",
+            "path:alpha.md",
+        ]);
+        if quality {
+            search.arg("--quality-only");
+        } else {
+            search.env(
+                "FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE",
+                "force_lexical_only",
+            );
+        }
+        let output = run(&mut search, directory.path(), Duration::from_secs(180));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let payload = body(&output)["data"].clone();
+        assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["hits"][0]["path"], "alpha.md");
+        assert_eq!(payload["hits"][0]["semantic_rank"].is_number(), quality);
+        assert_eq!(files(&target), sealed);
+    }
+    assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 1);
+    assert!(!source.exists());
+}
+
 #[cfg(feature = "semantic-loaders")]
 #[test]
 #[ignore = "requires FRANKENSEARCH_RECOVERY_E2E_MODEL_DIR with verified Potion and MiniLM models"]

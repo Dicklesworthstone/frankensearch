@@ -237,7 +237,10 @@ fn artifact_repair_refuses_missing_changed_sidecars_and_untrusted_lexical_select
                     corrupt(&sidecar);
                 }
                 "selection" => {
-                    corrupt(&original.path().join("lexical/CURRENT"));
+                    let path = original.path().join("lexical/CURRENT");
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes[0] ^= 0x5a;
+                    fs::write(path, bytes).unwrap();
                 }
                 "unreceipted" => {
                     fs::write(original.path().join("extra.fslx"), b"unreceipted").unwrap();

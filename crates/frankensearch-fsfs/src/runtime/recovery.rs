@@ -313,6 +313,10 @@ impl FsfsRuntime {
     /// CLI input and configuration. Every document is reindexed with locally
     /// available producers; this never downloads models or relabels old vector
     /// bytes. It uses the ordinary source indexer and complete-generation seal.
+    /// Explicit quality-only requests build Quill and a standalone required
+    /// quality tier, with no fast producer or fast vector artifact. Its durable
+    /// checkpoints bind the quality primary, and required producer failures
+    /// abort preparation rather than publishing a skipped or partial tier.
     /// The store must be outside the source and the catalog generation-local.
     /// A malformed selection or damaged old bundle is captured only as bounded
     /// expected-old evidence; no old artifact is admitted or reused. Ordinary
@@ -434,6 +438,13 @@ impl FsfsRuntime {
         let mut runtime = self.clone();
         runtime.config.indexing.offline = true;
         runtime.cli_input.full_reindex = true;
+        runtime.indexing_primary_tier = if runtime.cli_input.quality_only {
+            runtime.indexing_quality_deferral = None;
+            IndexingPrimaryTier::Quality
+        } else {
+            IndexingPrimaryTier::Fast
+        };
+        runtime.validate_semantic_model_selection(runtime.indexing_search_mode())?;
         let (build, _, candidate_mode) = runtime
             .build_retained_generation_with_progress(
                 cx,
@@ -707,7 +718,7 @@ impl FsfsRuntime {
             runtime.prepare_search_execution_resources_at_root_with_modes(
                 cx,
                 generation.path(),
-                SearchExecutionMode::Full,
+                runtime.requested_search_mode(),
                 SearchExecutionMode::Full,
             ),
         )
@@ -810,6 +821,7 @@ mod retained_recovery_tests {
         changed_identity: EmbeddingIdentityBundleV1,
         changed: AtomicBool,
         zero_signal: AtomicBool,
+        fail_documents: AtomicBool,
         embedded_documents: std::sync::atomic::AtomicUsize,
         category: ModelCategory,
     }
@@ -827,6 +839,7 @@ mod retained_recovery_tests {
                 changed_identity,
                 changed: AtomicBool::new(false),
                 zero_signal: AtomicBool::new(false),
+                fail_documents: AtomicBool::new(false),
                 embedded_documents: std::sync::atomic::AtomicUsize::new(0),
                 category,
             }
@@ -850,6 +863,15 @@ mod retained_recovery_tests {
             Box::pin(async move {
                 if text != "probe" {
                     self.embedded_documents.fetch_add(1, Ordering::Relaxed);
+                    if self.fail_documents.load(Ordering::Relaxed) {
+                        return Err(SearchError::EmbeddingFailed {
+                            model: self.id().to_owned(),
+                            source: Box::new(std::io::Error::new(
+                                ErrorKind::TimedOut,
+                                "required quality document inference timed out",
+                            )),
+                        });
+                    }
                 }
                 Ok(if self.zero_signal.load(Ordering::Relaxed) {
                     vec![0.0; 3]
@@ -1929,6 +1951,34 @@ mod retained_recovery_tests {
         });
     }
 
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn receipt_reader_quality_preview_still_admits_every_actually_stored_tier() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            let generation = publish(&runtime, &cx, &root).await;
+            runtime.cli_input.quality_only = true;
+            let before = file_bytes(&root);
+            for producer in [&models.fast, &models.quality] {
+                producer.changed.store(true, Ordering::Relaxed);
+                let error = fresh_runtime(&runtime)
+                    .open_retained_search_from_receipt(
+                        &cx,
+                        &root,
+                        generation.id(),
+                        generation.manifest_sha256(),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+                producer.changed.store(false, Ordering::Relaxed);
+                assert_eq!(file_bytes(&root), before);
+            }
+        });
+    }
+
     #[test]
     fn recovery_rejects_a_sealed_but_unreadable_quality_artifact_instead_of_degrading() {
         on_runtime(|cx| async move {
@@ -2639,10 +2689,34 @@ mod retained_recovery_tests {
             fs::write(source.join("beta.md"), "sharedtoken excluded beta document").unwrap();
             runtime.cli_input.quality_only = true;
             runtime.cli_input.filter = Some("path:alpha.md".to_owned());
-            let mut prepared = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
-            // Both stored producers were admitted; only the requested quality
-            // producer may supply query vectors for this direct preview.
+            "unused-invalid-fast-producer".clone_into(&mut runtime.config.indexing.fast_model);
+            runtime.config.indexing.fast_window_max_per_file = 4;
+            // Even probing the unrequested fast producer would fail. A missing
+            // or invalid fast configuration cannot obstruct this source build.
             models.fast.zero_signal.store(true, Ordering::Relaxed);
+            let mut prepared = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            let target = prepared.generation().clone();
+            assert!(!target.path().join(FSFS_VECTOR_INDEX_FILE).exists());
+            assert!(target.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).is_file());
+            assert!(prepared.reader.resources.vector_index.is_none());
+            assert!(prepared.reader.resources.fast_embedder.is_none());
+            assert!(prepared.reader.resources.quality_vector_index.is_some());
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(target.path().join("FSFS-REUSE.json")).unwrap())
+                    .unwrap();
+            assert_eq!(receipt["checkpoint"]["embedder_id"], models.quality.id());
+            assert_eq!(receipt["checkpoint"]["fast_window_max_per_file"], 1);
+            let sentinel = FsfsRuntime::read_index_sentinel(target.path())
+                .unwrap()
+                .unwrap();
+            assert!(sentinel.generation_complete);
+            assert_eq!(sentinel.fast_window_max_per_file, 1);
+            assert!(
+                sentinel
+                    .reason_codes
+                    .iter()
+                    .any(|reason| { reason == REASON_VECTOR_FAST_TIER_SKIPPED_QUALITY_ONLY })
+            );
             let phases = prepared.search(&cx, REBUILD_QUERY, 10).await.unwrap();
             assert_eq!(phases.len(), 1);
             assert_eq!(phases[0].hits.len(), 1);
@@ -2654,9 +2728,168 @@ mod retained_recovery_tests {
                     .iter()
                     .all(|hit| hit.fast.is_none() && hit.quality.is_some())
             );
-            assert!(prepared.expected_selection_sha256(&cx).is_ok());
+            let guard = prepared.expected_selection_sha256(&cx).unwrap();
             assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
-            models.fast.zero_signal.store(false, Ordering::Relaxed);
+            assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+            let target_bytes = file_bytes(target.path());
+            drop(prepared);
+            fs::rename(source, directory.path().join("source-unavailable")).unwrap();
+
+            // A new runtime reconstructs only the sealed reader; it admits the
+            // actual quality producer and needs neither sources nor fast.
+            let mut resumed = fresh_runtime(&runtime)
+                .resume_retained_recovery(&cx, &root, target.id(), target.manifest_sha256(), &guard)
+                .await
+                .unwrap()
+                .with_required_searchable_preview();
+            assert!(resumed.expected_selection_sha256(&cx).is_err());
+            let phases = resumed.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            assert_eq!(phases.len(), 1);
+            assert_eq!(phases[0].hits[0].path, "alpha.md");
+            assert!(matches!(resumed.restore(&cx).unwrap().0,
+                GenerationPublication::Durable(ref value) if value == &target));
+            assert_eq!(file_bytes(target.path()), target_bytes);
+            assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn quality_only_rebuild_resume_reuses_quality_rows_under_the_original_guard() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            runtime.cli_input.quality_only = true;
+            runtime.config.indexing.embedding_batch_size = 1;
+            runtime.config.indexing.fast_window_max_per_file = 4;
+            models.fast.zero_signal.store(true, Ordering::Relaxed);
+            let total = add_resume_sources(&source);
+            let (saved, path, checkpoint) = interrupt_inactive_rebuild(&runtime, &cx, &root).await;
+            assert_eq!(checkpoint.embedder_id, models.quality.id());
+            assert_eq!(checkpoint.fast_window_max_per_file, 1);
+            assert!(
+                checkpoint
+                    .files
+                    .values()
+                    .all(|entry| { entry.semantic_indexed && entry.fast_windows.is_none() })
+            );
+            assert!(!path.join(FSFS_VECTOR_INDEX_FILE).exists());
+            assert!(path.join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists());
+            reset_document_counts(&models);
+
+            let mut resumed = fresh_runtime(&runtime)
+                .resume_retained_rebuild(&cx, &root, &saved)
+                .await
+                .unwrap();
+            assert_eq!(resumed.generation().path(), path);
+            assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                models.quality.embedded_documents.load(Ordering::Relaxed),
+                total - checkpoint.files.len(),
+                "only source rows outside the durable quality checkpoint are re-embedded"
+            );
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                selected
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+            resumed.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            let target = resumed.generation().clone();
+            assert!(matches!(resumed.restore(&cx).unwrap().0,
+                GenerationPublication::Durable(ref value) if value == &target));
+            assert_eq!(file_bytes(old.path()), old_bytes);
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn inactive_rebuild_receipts_refuse_switching_the_required_primary_tier() {
+        on_runtime(|cx| async move {
+            for quality_only in [false, true] {
+                let models = RecoveryModels::install();
+                let directory = tempfile::tempdir().unwrap();
+                let (mut runtime, source, root) = fixture(directory.path());
+                runtime.cli_input.quality_only = quality_only;
+                runtime.config.indexing.embedding_batch_size = 1;
+                add_resume_sources(&source);
+                let (saved, path, _) = interrupt_inactive_rebuild(&runtime, &cx, &root).await;
+                let before = file_bytes(&path);
+                reset_document_counts(&models);
+                let mut changed = fresh_runtime(&runtime);
+                changed.cli_input.quality_only = !quality_only;
+                let error = changed
+                    .resume_retained_rebuild(&cx, &root, &saved)
+                    .await
+                    .expect_err("a source build cannot switch primary spaces at resume");
+                assert!(error.to_string().contains("indexing contract changed"));
+                assert_eq!(file_bytes(&path), before);
+                assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+                assert_eq!(models.quality.embedded_documents.load(Ordering::Relaxed), 0);
+                assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
+            }
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn quality_only_rebuild_refuses_missing_invalid_and_failed_required_quality() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            for failure in ["missing", "zero_signal", "document_inference"] {
+                let mut required = fresh_runtime(&runtime);
+                required.cli_input.quality_only = true;
+                "unused-invalid-fast-producer".clone_into(&mut required.config.indexing.fast_model);
+                set_test_quality_embedder(if failure == "missing" {
+                    None
+                } else {
+                    Some(models.quality.clone())
+                });
+                models
+                    .quality
+                    .zero_signal
+                    .store(failure == "zero_signal", Ordering::Relaxed);
+                models
+                    .quality
+                    .fail_documents
+                    .store(failure == "document_inference", Ordering::Relaxed);
+                reset_document_counts(&models);
+                let error = required
+                    .prepare_retained_rebuild(&cx, &root)
+                    .await
+                    .expect_err("required quality cannot degrade into a skipped tier");
+                match failure {
+                    "missing" => assert!(matches!(error, SearchError::EmbedderUnavailable { .. })),
+                    "zero_signal" => {
+                        assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
+                        if field == "semantic.embedding_output"));
+                    }
+                    _ => assert!(
+                        matches!(error, SearchError::EmbeddingFailed { ref model, .. }
+                        if model == models.quality.id())
+                    ),
+                }
+                assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    selected
+                );
+                assert_eq!(file_bytes(old.path()), old_bytes);
+                for candidate in fs::read_dir(root.join("generations")).unwrap() {
+                    let candidate = candidate.unwrap().path();
+                    if candidate != old.path() {
+                        assert!(!candidate.join("FSFS-BUNDLE.json").exists(), "{failure}");
+                    }
+                }
+            }
         });
     }
 

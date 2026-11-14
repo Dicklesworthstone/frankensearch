@@ -160,6 +160,25 @@ tier directly. Every stored tier still needs producer admission before any
 restoration, even when the preview requests only one tier. These options require
 `--query`, and filters apply to each returned phase.
 
+With `--rebuild-source --search-mode quality`, the new generation contains Quill
+keyword data and a standalone `vector/quality.fsvi`. The quality producer is
+required for construction and preview; the fast model is never selected, loaded
+or probed. This permits recovery with only a verified quality model installed.
+The same topology applies to `fsfs search QUERY --quality-only --recover-source
+SOURCE --index-dir STORE`: it builds and previews the quality generation, checks
+the original selection, then runs the original quality query once against the
+published reader. There is no fast vector artifact, and quality inference failure
+leaves the old selection intact.
+
+Quality-only source builds use one canonical input per semantic document;
+the fast passage-window setting does not expand those rows. Saved incomplete
+builds bind this primary tier as part of their indexing contract, so resume must
+keep the same quality-only mode and configuration. A Full build cannot resume a
+quality checkpoint or treat its vectors as fast vectors. After preparation, the
+saved sealed target can be restored without source files, using the same required
+quality preview. Ordinary full indexing continues to build its fast primary and
+optional quality tier.
+
 Failed indexing, producer admission, cancellation or a failed preview leaves
 the previous generation selected. A successful source-rebuild preview must
 return at least one hit from the sealed candidate before exporting its selection
