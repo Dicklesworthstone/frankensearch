@@ -2415,7 +2415,10 @@ mod tests {
                 "backup NOT *abc東京",
             ] {
                 let parsed = parser.parse(raw, &filters);
-                assert!(parsed.query.is_empty(), "unsupported mixed wildcard {raw:?}");
+                assert!(
+                    parsed.query.is_empty(),
+                    "unsupported mixed wildcard {raw:?}"
+                );
                 assert!(!parsed.diagnostics.is_empty(), "refused query {raw:?}");
             }
         });

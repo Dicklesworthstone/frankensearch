@@ -2621,8 +2621,7 @@ fn cass_normalize_phrase_terms(raw: &str) -> SearchResult<(CassIndexedFragments,
             ));
         }
     }
-    if cass_needs_indexed_fragments(raw)
-        || parts.iter().any(|part| cass_has_mixed_ascii_cjk(part))
+    if cass_needs_indexed_fragments(raw) || parts.iter().any(|part| cass_has_mixed_ascii_cjk(part))
     {
         return Ok((cass_analyzed_fragments(&parts.join(" "))?, true));
     }
