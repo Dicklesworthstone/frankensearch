@@ -1025,6 +1025,9 @@ fn rebuild_query_requires_explicit_migration_and_a_distinct_compensation_receipt
             vec!["--limit", "4"],
             vec!["--stream"],
             vec!["--filter", "{\"ids\":[\"a\"]}"],
+            vec!["--timeout-ms", "10"],
+            vec!["--full-query", "{\"quality_weight\":0.2}"],
+            vec!["--reranker-dir", "local-reranker"],
         ] {
             let mut arguments = base.clone();
             arguments.extend(extra);
@@ -1044,6 +1047,14 @@ fn rebuild_query_requires_explicit_migration_and_a_distinct_compensation_receipt
             "--stream",
             "--max-source-bytes",
             "4096",
+            "--timeout-ms",
+            "1000",
+            "--full-query",
+            "{\"candidate_multiplier\":5,\"rrf_k\":0,\"quality_weight\":0.2}",
+            "--reranker-dir",
+            "local-reranker",
+            "--rerank-window",
+            "4",
         ]);
         let options = parse(&arguments).unwrap().unwrap();
         assert_eq!(options.query.as_deref(), Some("retry requests"));
@@ -1055,12 +1066,22 @@ fn rebuild_query_requires_explicit_migration_and_a_distinct_compensation_receipt
         assert!(options.migrate_model && options.stream);
         assert_eq!(options.limit, 4);
         assert_eq!(options.max_source_bytes, 4096);
+        assert_eq!(options.timeout_ms, Some(1000));
+        assert!(options.full_query.is_some());
+        assert_eq!(
+            options.reranker_dir.as_deref(),
+            Some(Path::new("local-reranker"))
+        );
+        assert_eq!(options.rerank_window, 4);
         assert!(options.mode.is_none());
         for extra in [
             vec!["--mode", "lexical"],
             vec!["--query", "second request"],
             vec!["--rollback-receipt", "other.json"],
             vec!["--allow-model-activation"],
+            vec!["--timeout-ms", "20"],
+            vec!["--full-query", "{}"],
+            vec!["--reranker-dir", "other-reranker"],
         ] {
             let mut duplicate = arguments.clone();
             duplicate.extend(extra);

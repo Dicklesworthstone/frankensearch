@@ -22,9 +22,9 @@ use super::{
     SavedAttempt, ScoredResult, SearchError, Sha256, Write, WriterIdentityV1,
     activation_manifest_path_v1, annotate_execution, annotate_scope, annotate_selection,
     annotate_snapshot_retrieval, bad, checkpoint, emit, encode, new_generation, new_path,
-    prepare_publication, publication_error, publish_and_admit_with_reconciliation, query_admitted,
-    rebuild_identity, same_security_object, save_receipt, separate_destinations,
-    stage_prepared_and_publish, validate_query,
+    prepare_publication, publication_error, publish_and_admit_with_reconciliation, query,
+    query_admitted, query_controls, rebuild_identity, same_security_object, save_receipt,
+    separate_destinations, stage_prepared_and_publish, validate_query,
 };
 
 type Phases = Vec<(&'static str, Vec<ScoredResult>)>;
@@ -38,6 +38,7 @@ struct Inputs<'a> {
     loaded: &'a Models,
     text: &'a str,
     mode: QueryMode,
+    query_policy: &'a query::Policy,
 }
 
 /// Called only after the normal rebuild path has prepared the complete corpus.
@@ -51,6 +52,25 @@ pub(super) async fn execute(
     previous: &NativeGenerationSnapshot,
     built: &NativeBuiltExactGeneration,
     loaded: &Models,
+    output: &mut impl Write,
+) -> Result<()> {
+    let policy = query_controls::load_policy(cx, options)?;
+    Box::pin(execute_with_policy(
+        cx, options, root, selected, previous, built, loaded, &policy, output,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn execute_with_policy(
+    cx: &Cx,
+    options: &Options,
+    root: &QualifiedGenerationRoot,
+    selected: &Receipt,
+    previous: &NativeGenerationSnapshot,
+    built: &NativeBuiltExactGeneration,
+    loaded: &Models,
+    policy: &query::Policy,
     output: &mut impl Write,
 ) -> Result<()> {
     checkpoint(cx)?;
@@ -75,6 +95,19 @@ pub(super) async fn execute(
     if let Some(filter) = &options.filter {
         filter.validate()?;
     }
+    query_controls::validate_startup(options, selected.query_mode(None)?)?;
+    if policy.maximum_ms() != options.timeout_ms
+        || policy.full_query != options.full_query
+        || policy.rerank.is_some() != options.reranker_dir.is_some()
+        || policy
+            .rerank
+            .as_ref()
+            .is_some_and(|rerank| rerank.window != options.rerank_window)
+    {
+        return Err(bad(
+            "reindex query policy differs from its authorized options",
+        ));
+    }
     let receipt_path = new_path(&options.receipt)?;
     let rollback_path = new_path(
         options
@@ -92,12 +125,13 @@ pub(super) async fn execute(
         loaded,
         text,
         mode: selected.query_mode(None)?,
+        query_policy: policy,
     };
     let prepared = prepare_publication(built, Some(previous), options.max_image_bytes)?;
     let binding = inputs
         .binding(&prepared)
         .map_err(|_| bad("reindex binding admission refused"))?;
-    let policy = RecoveryPolicy {
+    let recovery_policy = RecoveryPolicy {
         interaction: InteractionPolicy::NonInteractive,
         network: NetworkPolicy::Offline,
         acquisition_authorization: None,
@@ -108,7 +142,7 @@ pub(super) async fn execute(
             mode: RequestMode::Hybrid,
             requested_topology: binding.topology()?,
         },
-        &policy,
+        &recovery_policy,
         None,
         0,
     ))?
@@ -128,6 +162,8 @@ pub(super) async fn execute(
                 "previous_retained",
                 if cancelled(cx, error.as_ref()) {
                     "preview_cancelled"
+                } else if timed_out(error.as_ref()) {
+                    "preview_timed_out"
                 } else {
                     "preview_refused"
                 },
@@ -186,29 +222,36 @@ pub(super) async fn execute(
     // Buffer the requested answer until every required replay phase succeeds.
     // Full mode always consumes refinement, even for a nonstreaming response.
     let mut phases = Phases::new();
-    let replay = Box::pin(query_admitted(
-        cx,
-        &published.snapshot,
-        published.scope.as_ref(),
-        loaded,
-        QueryPlan {
-            text,
-            limit: options.limit,
-            mode: inputs.mode,
-            stream: inputs.mode == QueryMode::Full,
-            deadline: None,
-            policy: None,
-            max_source_bytes: options.max_source_bytes,
-        },
-        |phase, results| {
-            validate_results(phase, results)?;
-            phases.push((phase, results.to_vec()));
-            Ok(())
-        },
-    ))
-    .await
-    .and_then(|()| validate_phases(inputs.mode, &phases))
-    .and_then(|()| checkpoint(cx));
+    let replay = async {
+        // Publication work does not spend the original query's time budget.
+        // Replay receives one fresh budget of exactly the authorized duration;
+        // every phase shares it and an expiry follows the normal rollback path.
+        let deadline = policy.start(cx, None)?;
+        Box::pin(query_admitted(
+            cx,
+            &published.snapshot,
+            published.scope.as_ref(),
+            loaded,
+            QueryPlan {
+                text,
+                limit: options.limit,
+                mode: inputs.mode,
+                stream: inputs.mode == QueryMode::Full,
+                deadline: deadline.as_ref(),
+                policy: Some(policy),
+                max_source_bytes: options.max_source_bytes,
+            },
+            |phase, results| {
+                validate_results(phase, results)?;
+                phases.push((phase, results.to_vec()));
+                Ok(())
+            },
+        ))
+        .await?;
+        validate_phases(inputs.mode, policy.rerank.is_some(), &phases)?;
+        checkpoint(cx)
+    }
+    .await;
     if replay.is_err() {
         let mut failure = inputs.failure(
             &recovery,
@@ -220,6 +263,12 @@ pub(super) async fn execute(
                 .is_some_and(|error| cancelled(cx, error.as_ref()))
             {
                 "replay_cancelled"
+            } else if replay
+                .as_ref()
+                .err()
+                .is_some_and(|error| timed_out(error.as_ref()))
+            {
+                "replay_timed_out"
             } else {
                 "replay_refused"
             },
@@ -277,7 +326,7 @@ pub(super) async fn execute(
                 NativeGenerationTopology::FullProgressive => RetrievalTopology::FullProgressive,
             },
         },
-        &policy,
+        &recovery_policy,
         None,
         0,
     ))
@@ -317,6 +366,8 @@ pub(super) async fn execute(
             published.scope.as_ref().map(|scope| scope.len()),
         );
         annotate_execution(&mut response, inputs.mode);
+        query_controls::annotate(policy, inputs.mode, &mut response);
+        response["timeout_ms"] = serde_json::json!(policy.maximum_ms());
         emit(output, &response).map_err(|_| {
             let mut error = publication_error(
                 &published.receipt,
@@ -412,18 +463,26 @@ impl Inputs<'_> {
         let policy = serde_json::to_vec(&serde_json::json!({
             "mode": self.mode.as_str(), "limit": self.options.limit,
             "filter": self.options.filter, "stream": self.options.stream,
+            "timeout_ms": self.query_policy.maximum_ms(),
+            "full_query": self.query_policy.full_query,
+            "reranker": self.query_policy.rerank.as_ref().map(|rerank| {
+                serde_json::json!({
+                    "id": rerank.model.id(), "window": rerank.window,
+                    "source": self.options.reranker_dir,
+                })
+            }),
             "max_source_bytes": self.options.max_source_bytes,
             "max_image_bytes": self.options.max_image_bytes,
             "primary_retrieval": retrieval_policy(self.built.retrieval_configuration()),
             "quality_retrieval": self.built.quality_retrieval_configuration().map(retrieval_policy),
         }))?;
         let mut request = Sha256::new();
-        request.update(b"frankensearch.native.immutable-reindex.request.v1\0");
+        request.update(b"frankensearch.native.immutable-reindex.request.v2\0");
         request.update(u64::try_from(self.text.len())?.to_le_bytes());
         request.update(self.text.as_bytes());
         request.update(&policy);
         let mut query_policy = Sha256::new();
-        query_policy.update(b"frankensearch.native.immutable-reindex.policy.v1\0");
+        query_policy.update(b"frankensearch.native.immutable-reindex.policy.v2\0");
         query_policy.update(&policy);
         let (fast, quality) = if self.previous.topology() == NativeGenerationTopology::QualityOnly {
             (None, Some(primary))
@@ -455,6 +514,16 @@ impl Inputs<'_> {
     }
 
     async fn preview(&self, cx: &Cx, prepared: &PreparedPublication) -> Result<()> {
+        let deadline = self.query_policy.start(cx, None)?;
+        Box::pin(query::within(
+            cx,
+            deadline.as_ref(),
+            self.preview_candidate(cx, prepared),
+        ))
+        .await
+    }
+
+    async fn preview_candidate(&self, cx: &Cx, prepared: &PreparedPublication) -> Result<()> {
         let preview = Arc::new(self.built.preview_candidate(cx, &prepared.candidate)?);
         let scope = self
             .options
@@ -473,15 +542,31 @@ impl Inputs<'_> {
                 .quality
                 .as_deref()
                 .ok_or_else(|| bad("quality provider missing"))?;
-            let mut query = match &scope {
-                Some(scope) => scope.search_progressive_with_quality(
+            let query = match (&scope, self.query_policy.query_pool()) {
+                (Some(scope), Some(pool)) => scope.search_progressive_with_quality_and_pool(
+                    cx,
+                    self.loaded.fast.as_ref(),
+                    quality,
+                    self.text,
+                    self.options.limit,
+                    pool,
+                )?,
+                (None, Some(pool)) => preview.search_progressive_with_quality_and_pool(
+                    cx,
+                    self.loaded.fast.as_ref(),
+                    quality,
+                    self.text,
+                    self.options.limit,
+                    pool,
+                )?,
+                (Some(scope), None) => scope.search_progressive_with_quality(
                     cx,
                     self.loaded.fast.as_ref(),
                     quality,
                     self.text,
                     self.options.limit,
                 )?,
-                None => preview.search_progressive_with_quality(
+                (None, None) => preview.search_progressive_with_quality(
                     cx,
                     self.loaded.fast.as_ref(),
                     quality,
@@ -489,15 +574,15 @@ impl Inputs<'_> {
                     self.options.limit,
                 )?,
             };
+            let mut query =
+                query_controls::configure(query, self.query_policy, self.options.max_source_bytes)?;
             while let Some(phase) = query.next_phase().await? {
                 let (name, results) = match phase {
                     NativeSearchPhase::Initial { results, .. } => ("initial", results),
                     NativeSearchPhase::Refined { results, .. } => ("refined", results),
                     NativeSearchPhase::RefinementFailed { error, .. }
                     | NativeSearchPhase::RerankFailed { error, .. } => return Err(error.into()),
-                    NativeSearchPhase::Reranked { .. } => {
-                        return Err(bad("unexpected reindex preview phase"));
-                    }
+                    NativeSearchPhase::Reranked { results, .. } => ("reranked", results),
                 };
                 validate_results(name, &results)?;
                 phases.push((name, results));
@@ -506,8 +591,30 @@ impl Inputs<'_> {
             let (phase, results) = if self.mode == QueryMode::Quality {
                 (
                     "quality",
-                    match &scope {
-                        Some(scope) => {
+                    match (&scope, self.query_policy.query_pool()) {
+                        (Some(scope), Some(pool)) => {
+                            scope
+                                .search_quality_text_with_pool(
+                                    cx,
+                                    self.loaded.fast.as_ref(),
+                                    self.text,
+                                    self.options.limit,
+                                    pool,
+                                )
+                                .await?
+                        }
+                        (None, Some(pool)) => {
+                            preview
+                                .search_quality_text_with_pool(
+                                    cx,
+                                    self.loaded.fast.as_ref(),
+                                    self.text,
+                                    self.options.limit,
+                                    pool,
+                                )
+                                .await?
+                        }
+                        (Some(scope), None) => {
                             scope
                                 .search_quality_text(
                                     cx,
@@ -517,7 +624,7 @@ impl Inputs<'_> {
                                 )
                                 .await?
                         }
-                        None => {
+                        (None, None) => {
                             preview
                                 .search_quality_text(
                                     cx,
@@ -532,8 +639,30 @@ impl Inputs<'_> {
             } else {
                 (
                     "initial",
-                    match &scope {
-                        Some(scope) => {
+                    match (&scope, self.query_policy.query_pool()) {
+                        (Some(scope), Some(pool)) => {
+                            scope
+                                .search_text_with_pool(
+                                    cx,
+                                    self.loaded.fast.as_ref(),
+                                    self.text,
+                                    self.options.limit,
+                                    pool,
+                                )
+                                .await?
+                        }
+                        (None, Some(pool)) => {
+                            preview
+                                .search_text_with_pool(
+                                    cx,
+                                    self.loaded.fast.as_ref(),
+                                    self.text,
+                                    self.options.limit,
+                                    pool,
+                                )
+                                .await?
+                        }
+                        (Some(scope), None) => {
                             scope
                                 .search_text(
                                     cx,
@@ -543,7 +672,7 @@ impl Inputs<'_> {
                                 )
                                 .await?
                         }
-                        None => {
+                        (None, None) => {
                             preview
                                 .search_text(
                                     cx,
@@ -559,7 +688,7 @@ impl Inputs<'_> {
             validate_results(phase, &results)?;
             phases.push((phase, results));
         }
-        validate_phases(self.mode, &phases)
+        validate_phases(self.mode, self.query_policy.rerank.is_some(), &phases)
     }
 
     fn failure(
@@ -668,6 +797,12 @@ fn cancelled(cx: &Cx, error: &(dyn Error + 'static)) -> bool {
             .is_some_and(|error| matches!(error, SearchError::Cancelled { .. }))
 }
 
+fn timed_out(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<SearchError>()
+        .is_some_and(|error| matches!(error, SearchError::SearchTimeout { .. }))
+}
+
 fn retrieval_policy(retrieval: NativeBuildRetrieval) -> serde_json::Value {
     match retrieval {
         NativeBuildRetrieval::Exact => serde_json::json!({"kind": "exact"}),
@@ -680,10 +815,10 @@ fn retrieval_policy(retrieval: NativeBuildRetrieval) -> serde_json::Value {
 
 fn validate_results(phase: &str, results: &[ScoredResult]) -> Result<()> {
     let semantic = results.iter().any(|hit| {
-        if phase == "initial" {
-            hit.fast_score
-        } else {
-            hit.quality_score
+        match phase {
+            "initial" => hit.fast_score,
+            "reranked" => hit.rerank_score,
+            _ => hit.quality_score,
         }
         .is_some_and(f32::is_finite)
     });
@@ -695,10 +830,11 @@ fn validate_results(phase: &str, results: &[ScoredResult]) -> Result<()> {
     Ok(())
 }
 
-fn validate_phases(mode: QueryMode, phases: &Phases) -> Result<()> {
+fn validate_phases(mode: QueryMode, rerank: bool, phases: &Phases) -> Result<()> {
     let expected: &[&str] = match mode {
         QueryMode::Fast => &["initial"],
         QueryMode::Quality => &["quality"],
+        QueryMode::Full if rerank => &["initial", "refined", "reranked"],
         QueryMode::Full => &["initial", "refined"],
         QueryMode::Lexical => return Err(bad("lexical queries cannot prove semantic recovery")),
     };
