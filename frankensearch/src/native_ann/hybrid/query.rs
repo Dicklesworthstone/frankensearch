@@ -97,12 +97,16 @@ impl ImmutableTextQuery {
         if ceiling == 0 {
             return Ok(());
         }
+        // The reader can expand unknown-field colons after core negation
+        // normalization. Check the same rendering candidates() will search.
         #[cfg(feature = "quill")]
-        if self.lexical.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH {
+        if lexical.query_text(&self.lexical).chars().count()
+            > frankensearch_quill::query::MAX_QUERY_LENGTH
+        {
             return Err(invalid(
                 "query.exclusions",
                 "oversized-lexical-query",
-                "normalized exclusion query exceeds the lexical parser's query length bound",
+                "rendered exclusion query exceeds the lexical parser's query length bound",
             ));
         }
         // This is a complete membership census, not a top-k sample. Existing

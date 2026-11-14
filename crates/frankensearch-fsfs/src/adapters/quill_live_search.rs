@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use asupersync::Cx;
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{ParsedQuery, SearchError, SearchResult};
 use frankensearch_quill::{
     BlueGreenEngine, LexicalLayout, QuillConfig, QuillSearchIndex, inspect_lexical_layout,
 };
@@ -252,19 +252,43 @@ impl LiveSearchSource for QuillSource {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<LiveSearchHit<Option<Value>>>> {
-        if let Some(filter) = &self.filter {
+        // Bound raw input before the exclusion scanner allocates its scalar
+        // buffer. Rendering can expand it further and is checked below.
+        if query
+            .chars()
+            .nth(frankensearch_quill::query::MAX_QUERY_LENGTH)
+            .is_some()
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.search_query".to_owned(),
+                value: "query_limit".to_owned(),
+                reason: "search query exceeds the lexical parser's query length bound".to_owned(),
+            });
+        }
+        let parsed = ParsedQuery::parse(query);
+        if self.filter.is_some() || parsed.has_negations() {
             let live_docs = usize::try_from(snapshot.reader.doc_count()?).unwrap_or(usize::MAX);
+            let excluded =
+                FsfsRuntime::query_exclusions(cx, Some(&snapshot.reader), &parsed, live_docs)?;
             let candidates = FsfsRuntime::gather_lexical_candidates(
                 cx,
                 &snapshot.reader,
                 query,
                 limit,
-                Some(filter),
+                self.filter.as_ref(),
+                excluded.as_deref(),
                 live_docs,
             )?;
             let selected = candidates
                 .into_iter()
-                .filter(|hit| filter.matches_doc_id(&hit.doc_id))
+                .filter(|hit| {
+                    self.filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.matches_doc_id(&hit.doc_id))
+                        && excluded
+                            .as_deref()
+                            .is_none_or(|excluded| !excluded.contains(&hit.doc_id))
+                })
                 .take(limit)
                 .collect::<Vec<_>>();
             let ids = selected
@@ -284,11 +308,16 @@ impl LiveSearchSource for QuillSource {
                 })
                 .collect());
         }
-        let results = snapshot.reader.search_results(
-            cx,
-            &crate::lexical_pipeline::lexical_query_text(query),
-            limit,
-        )?;
+        let query = crate::lexical_pipeline::lexical_query_text(query);
+        if query.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.search_query".to_owned(),
+                value: "lexical_query_limit".to_owned(),
+                reason: "rendered search query exceeds the lexical parser's query length bound"
+                    .to_owned(),
+            });
+        }
+        let results = snapshot.reader.search_results(cx, &query, limit)?;
         Ok(results
             .into_iter()
             .map(|hit| LiveSearchHit {
@@ -599,6 +628,176 @@ mod tests {
                     .iter()
                     .all(|change| matches!(change, LiveSearchChange::Removed { .. }))
             );
+        });
+    }
+
+    #[test]
+    fn global_exclusions_fill_the_live_lexical_tail_with_and_without_a_scope() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let mut documents = (0..96)
+                .map(|index| {
+                    IndexableDocument::new(
+                        format!("src/blocked-{index:03}.rs"),
+                        "alpha blocked AND OR NOT internal secret",
+                    )
+                    .with_title("alpha alpha")
+                })
+                .collect::<Vec<_>>();
+            for id in [
+                "src/allowed-a.rs",
+                "src/allowed-b.rs",
+                "docs/allowed-c.md",
+                "docs/allowed-d.md",
+            ] {
+                documents.push(
+                    IndexableDocument::new(id, format!("alpha {}", "padding ".repeat(64)))
+                        .with_metadata("source", id),
+                );
+            }
+            let generation = publish(&cx, &store, &documents).await;
+            let open = |query: &str, filter: Option<&str>| {
+                QuillLiveSearchSession::new_filtered(
+                    store.clone(),
+                    query,
+                    filter,
+                    LiveSearchConfig {
+                        max_results: 2,
+                        ..LiveSearchConfig::default()
+                    },
+                    LiveSearchRefreshConfig {
+                        debounce: Duration::ZERO,
+                        max_wait: Duration::from_millis(100),
+                    },
+                    config(),
+                )
+                .unwrap()
+            };
+            let mut positive = open("alpha", None);
+            positive.poll(&cx, Instant::now()).await.unwrap().unwrap();
+            let reader = &positive
+                .session
+                .source_mut()
+                .admitted
+                .as_ref()
+                .unwrap()
+                .reader;
+            let prefix = reader.search_doc_ids(&cx, "alpha", 64).unwrap();
+            assert_eq!(prefix.len(), 64);
+            assert!(
+                prefix
+                    .iter()
+                    .all(|hit| hit.document_id.contains("blocked-"))
+            );
+            for filter in [None, Some("path:src/ ext:rs")] {
+                for exclusion in [
+                    "-blocked",
+                    "-AND",
+                    "-OR",
+                    "-NOT",
+                    r#"NOT "internal secret""#,
+                ] {
+                    for query in [
+                        format!("alpha OR missing AND {exclusion}"),
+                        format!("{exclusion} -absent"),
+                    ] {
+                        let mut live = open(&query, filter);
+                        let frame = live.poll(&cx, Instant::now()).await.unwrap().unwrap();
+                        assert!(frame.generation.starts_with(generation.id()));
+                        let results = live.tracker().results();
+                        assert_eq!(results.len(), 2, "{query}, filter={filter:?}");
+                        for hit in results {
+                            assert!(hit.hit.doc_id.contains("allowed-"), "{query}");
+                            if filter.is_some() {
+                                assert!(hit.hit.doc_id.starts_with("src/"), "{query}");
+                            }
+                            assert_eq!(
+                                hit.hit.item.as_ref().unwrap()["source"],
+                                hit.hit.doc_id,
+                                "{query}",
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn live_query_rendering_refuses_overflow_and_preserves_query_recovery() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            publish(
+                &cx,
+                &store,
+                &[
+                    IndexableDocument::new("blocked", "alpha AND"),
+                    IndexableDocument::new("allowed", "alpha"),
+                ],
+            )
+            .await;
+            for (query, expected, fits_raw_bound) in [
+                (
+                    format!("alpha {}", "-AND ".repeat(1_998)),
+                    "exclusion_query_limit",
+                    true,
+                ),
+                (
+                    format!("-absent {}alpha", "x:: ".repeat(2_000)),
+                    "lexical_query_limit",
+                    true,
+                ),
+                (
+                    "a".repeat(frankensearch_quill::query::MAX_QUERY_LENGTH + 1),
+                    "query_limit",
+                    false,
+                ),
+                (
+                    format!("{}alpha", "x:: ".repeat(2_000)),
+                    "lexical_query_limit",
+                    true,
+                ),
+            ] {
+                assert_eq!(
+                    query.chars().count() <= frankensearch_quill::query::MAX_QUERY_LENGTH,
+                    fits_raw_bound,
+                );
+                let mut live = QuillLiveSearchSession::new(
+                    store.clone(),
+                    query,
+                    LiveSearchConfig::default(),
+                    LiveSearchRefreshConfig {
+                        debounce: Duration::ZERO,
+                        max_wait: Duration::from_millis(100),
+                    },
+                    config(),
+                )
+                .unwrap();
+                let error = live.poll(&cx, Instant::now()).await.unwrap_err();
+                assert!(
+                    matches!(&error, SearchError::InvalidConfig { value, .. } if value == expected),
+                    "{error:?}",
+                );
+                assert_eq!(live.tracker().sequence(), 0);
+                assert!(live.tracker().generation().is_none());
+                assert!(live.tracker().results().is_empty());
+                assert!(live.set_query(&cx, "alpha -AND").unwrap());
+                live.poll(&cx, Instant::now()).await.unwrap().unwrap();
+                assert_eq!(live.tracker().results().len(), 1);
+                assert_eq!(live.tracker().results()[0].hit.doc_id, "allowed");
+            }
+            let unicode_query = format!(
+                "alpha OR {}",
+                "é".repeat(frankensearch_quill::query::MAX_QUERY_LENGTH / 2 + 1),
+            );
+            assert!(unicode_query.len() > frankensearch_quill::query::MAX_QUERY_LENGTH);
+            assert!(unicode_query.chars().count() < frankensearch_quill::query::MAX_QUERY_LENGTH);
+            let mut unicode = session(store.clone());
+            assert!(unicode.set_query(&cx, unicode_query).unwrap());
+            unicode.poll(&cx, Instant::now()).await.unwrap().unwrap();
+            assert_eq!(unicode.tracker().results().len(), 2);
         });
     }
 

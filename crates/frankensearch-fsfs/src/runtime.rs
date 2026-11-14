@@ -676,7 +676,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v23: successful degraded phases retain canonical lane recovery diagnostics.
 // v24: quoted literals and case-insensitive phrase exclusions agree across lanes.
 // v25: bare Boolean-word exclusions stay literal in lexical and vector lanes.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v25";
+// v26: global exclusions also constrain lexical OR branches and candidate tails.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v26";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -698,8 +699,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v20 / stream v18: failures retain typed error codes, exit status and recovery.
 // v21 / stream v19: quoted literals and phrase exclusions agree across lanes.
 // v22 / stream v20: bare Boolean-word exclusions stay literal across lanes.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v22";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v20";
+// v23 / stream v21: global exclusions also constrain every lexical OR branch.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v23";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v21";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -15119,17 +15121,19 @@ impl FsfsRuntime {
         )
     }
 
-    /// Widen the lexical prefix until it contains enough eligible documents.
+    /// Widen the lexical prefix until enough documents satisfy both the CLI
+    /// predicate and the query's global exclusion membership.
     /// Quill's ID-only search has no path predicate, so a fixed oversampling
     /// factor cannot preserve recall for arbitrarily selective CLI filters.
-    /// Keep the original ranking here for the lexical tail and shadow oracle;
-    /// select the eligible fusion head only after gathering has completed.
+    /// Keep the original ranking here for the shadow oracle; the caller selects
+    /// the eligible fusion head and serving tail after gathering has completed.
     pub(crate) fn gather_lexical_candidates(
         cx: &Cx,
         lexical: &QuillSearchIndex,
         query: &str,
         output_limit: usize,
         filter_expr: Option<&SearchFilterExpr>,
+        excluded_doc_ids: Option<&HashSet<String>>,
         live_docs: usize,
     ) -> SearchResult<Vec<LexicalCandidate>> {
         if output_limit == 0 {
@@ -15138,15 +15142,26 @@ impl FsfsRuntime {
         let ceiling = live_docs.max(1);
         let mut fetch_limit = output_limit.min(ceiling);
         let query = lexical_query_text(query);
+        if query.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.search_query".to_owned(),
+                value: "lexical_query_limit".to_owned(),
+                reason: "rendered search query exceeds the lexical parser's query length bound"
+                    .to_owned(),
+            });
+        }
         loop {
             let hits = lexical.search_doc_ids(cx, &query, fetch_limit)?;
-            let enough_matches = filter_expr.is_none_or(|filter| {
-                hits.iter()
-                    .filter(|hit| filter.matches_doc_id(&hit.document_id))
-                    .take(output_limit)
-                    .count()
-                    >= output_limit
-            });
+            let enough_matches = hits
+                .iter()
+                .filter(|hit| {
+                    filter_expr.is_none_or(|filter| filter.matches_doc_id(&hit.document_id))
+                        && excluded_doc_ids
+                            .is_none_or(|excluded| !excluded.contains(&hit.document_id))
+                })
+                .take(output_limit)
+                .count()
+                >= output_limit;
             if enough_matches || hits.len() < fetch_limit || fetch_limit >= ceiling {
                 return Ok(hits
                     .iter()
@@ -15900,6 +15915,14 @@ impl FsfsRuntime {
             };
 
         let lexical_start = Instant::now();
+        // One complete membership census constrains every retrieval lane
+        // before candidate cutoffs, including a separate lexical OR branch.
+        let excluded_doc_ids = Self::query_exclusions(
+            cx,
+            resources.lexical_index.as_ref(),
+            &parsed_query,
+            lexical_doc_count.unwrap_or(0),
+        )?;
         let lexical_budget =
             if matches!(mode, SearchExecutionMode::LexicalOnly) && filter_expr.is_none() {
                 planning_limit.saturating_mul(2).max(planning_limit)
@@ -15947,6 +15970,7 @@ impl FsfsRuntime {
 
                     let needs_full_lexical = output_limit > snippet_limit
                         || filter_expr.is_some()
+                        || excluded_doc_ids.is_some()
                         || snippet_hits.is_empty();
                     let full_candidates = if needs_full_lexical {
                         Self::gather_lexical_candidates(
@@ -15955,6 +15979,7 @@ impl FsfsRuntime {
                             &normalized_query,
                             output_limit,
                             filter_expr.as_ref(),
+                            excluded_doc_ids.as_deref(),
                             lexical_doc_count.unwrap_or(0),
                         )?
                     } else {
@@ -15970,6 +15995,9 @@ impl FsfsRuntime {
                             filter_expr
                                 .as_ref()
                                 .is_none_or(|filter| filter.matches_doc_id(&candidate.doc_id))
+                                && excluded_doc_ids.as_deref().is_none_or(|excluded| {
+                                    !excluded.contains(&candidate.doc_id)
+                                })
                         })
                         .take(lexical_head_budget)
                         .cloned()
@@ -15982,6 +16010,7 @@ impl FsfsRuntime {
                         &normalized_query,
                         output_limit,
                         filter_expr.as_ref(),
+                        excluded_doc_ids.as_deref(),
                         lexical_doc_count.unwrap_or(0),
                     )?;
                     let lexical_head_budget = lexical_budget.min(planning_limit).max(1);
@@ -15991,6 +16020,9 @@ impl FsfsRuntime {
                             filter_expr
                                 .as_ref()
                                 .is_none_or(|filter| filter.matches_doc_id(&candidate.doc_id))
+                                && excluded_doc_ids.as_deref().is_none_or(|excluded| {
+                                    !excluded.contains(&candidate.doc_id)
+                                })
                         })
                         .take(lexical_head_budget)
                         .cloned()
@@ -16013,8 +16045,9 @@ impl FsfsRuntime {
             let serving_results = lexical_candidates
                 .iter()
                 // Shadow observes the unfiltered lexical query at its original
-                // limit, not the extra prefix gathered for the CLI predicate.
-                .take(if filter_expr.is_some() {
+                // limit, not the extra prefix gathered for CLI or global
+                // exclusion predicates.
+                .take(if filter_expr.is_some() || excluded_doc_ids.is_some() {
                     output_limit
                 } else {
                     usize::MAX
@@ -16042,6 +16075,16 @@ impl FsfsRuntime {
             );
         }
 
+        // Shadow observes the original ranked prefix. Serving candidates must
+        // satisfy global exclusions even if another OR branch matched them.
+        let lexical_candidates = if let Some(excluded) = excluded_doc_ids.as_deref() {
+            lexical_candidates
+                .into_iter()
+                .filter(|candidate| !excluded.contains(&candidate.doc_id))
+                .collect::<Vec<_>>()
+        } else {
+            lexical_candidates
+        };
         let semantic_start = Instant::now();
         let force_full_semantic_recall =
             Self::should_force_full_semantic_recall(SemanticRecallDecisionInput {
@@ -16203,20 +16246,13 @@ impl FsfsRuntime {
         }
 
         // Exclusions (`-term`, `-"phrase"`, `NOT "phrase"`) reach the lexical
-        // lane through its own parser. The vector lanes embed the rest of the
-        // query and skip every document the lexical engine matches for them;
-        // otherwise an excluded file returned through its vectors (bd-ekop5).
+        // lane through its parser and global census. Vector lanes reuse that
+        // membership and embed the positive query when present (bd-ekop5).
         let semantic_query = if parsed_query.has_negations() && !parsed_query.is_positive_empty() {
             parsed_query.positive.clone()
         } else {
             normalized_query.clone()
         };
-        let excluded_doc_ids = Self::query_exclusions(
-            cx,
-            resources.lexical_index.as_ref(),
-            &parsed_query,
-            lexical_doc_count.unwrap_or(0),
-        )?;
         let exclusion_filter = excluded_doc_ids.as_deref().map(|excluded| {
             ExcludeDocIdsFilter::new(
                 filter_expr
@@ -26377,9 +26413,9 @@ impl FsfsRuntime {
     }
 
     /// Every live document the lexical engine matches for the query's
-    /// exclusions, which the vector lanes then skip. `None` only when the
+    /// exclusions, which every retrieval lane then skips. `None` only when the
     /// query has no exclusions; missing lexical evidence is an error.
-    fn query_exclusions(
+    pub(crate) fn query_exclusions(
         cx: &Cx,
         lexical: Option<&QuillSearchIndex>,
         parsed: &ParsedQuery,
@@ -26405,6 +26441,14 @@ impl FsfsRuntime {
             )
             .collect::<Vec<_>>()
             .join(" OR ");
+        if excluded.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.search_query".to_owned(),
+                value: "exclusion_query_limit".to_owned(),
+                reason: "exclusion membership query exceeds the lexical parser's query length bound"
+                    .to_owned(),
+            });
+        }
         let hits = lexical.search_doc_ids(cx, &excluded, live_docs.max(1))?;
         Ok(Some(Arc::new(
             hits.iter().map(|hit| hit.document_id.clone()).collect(),
@@ -38033,6 +38077,7 @@ mod tests {
             "fsfs.search.serve.v19",
             "fsfs.search.serve.v20",
             "fsfs.search.serve.v21",
+            "fsfs.search.serve.v22",
         ] {
             response.schema_version = old_schema.to_owned();
             assert!(
@@ -46204,6 +46249,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(lexical.search_doc_ids(&cx, "needle", 4).unwrap().len(), 4);
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(&cx, SearchExecutionMode::LexicalOnly)
+                .await
+                .unwrap();
             for word in ["AND", "OR", "NOT"] {
                 let allowed = ["AND", "OR", "NOT", "clean"]
                     .into_iter()
@@ -46237,6 +46290,30 @@ mod tests {
                         .map(|hit| hit.document_id.clone())
                         .collect::<std::collections::HashSet<_>>();
                     assert_eq!(actual, allowed, "lexical: {query}");
+                }
+                let query = format!("\"{word}\" OR needle AND -{word} -absent");
+                for include_snippets in [false, true] {
+                    let phases = runtime
+                        .execute_search_payloads_with_mode_using_resources(
+                            &cx,
+                            &query,
+                            4,
+                            SearchExecutionMode::LexicalOnly,
+                            &mut resources,
+                            SearchExecutionFlags {
+                                include_snippets,
+                                persist_explain_session: false,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let actual = phases[0]
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.clone())
+                        .collect::<std::collections::HashSet<_>>();
+                    assert_eq!(phases[0].hits.len(), 3, "{query}");
+                    assert_eq!(actual, allowed, "{query}, snippets={include_snippets}");
                 }
             }
         });
@@ -54497,8 +54574,11 @@ mod tests {
                 .unwrap();
             for filter in [Some("path:src/ ext:rs"), None] {
                 runtime.cli_input.filter = filter.map(str::to_owned);
-                for keyword in ["not", "Not", "nOt", "NOT"] {
-                    let query = format!(r#"needle {keyword} "internal secret""#);
+                let queries = ["not", "Not", "nOt", "NOT"].map(|keyword| [
+                    format!(r#"needle {keyword} "internal secret""#),
+                    format!(r#"needle OR absent AND {keyword} "internal secret""#),
+                ]);
+                for query in queries.into_iter().flatten() {
                     for include_snippets in [false, true] {
                         for limit in [1, 2, 10, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL] {
                             let phases = runtime
@@ -61337,7 +61417,7 @@ mod tests {
                 .expect("open swept index");
             let lexical = resources.lexical_index.as_ref().expect("lexical index");
             let found =
-                FsfsRuntime::gather_lexical_candidates(&cx, lexical, "revision", 10, None, 10)
+                FsfsRuntime::gather_lexical_candidates(&cx, lexical, "revision", 10, None, None, 10)
                     .expect("lexical candidates");
             assert_eq!(found.len(), 1);
         });
@@ -61426,7 +61506,7 @@ mod tests {
                 .expect("open index");
             let lexical = resources.lexical_index.as_ref().expect("lexical index");
             let found =
-                FsfsRuntime::gather_lexical_candidates(&cx, lexical, "capybara", 100, None, 100)
+                FsfsRuntime::gather_lexical_candidates(&cx, lexical, "capybara", 100, None, None, 100)
                     .expect("lexical candidates");
             assert_eq!(found.len(), 64);
         });
@@ -61528,7 +61608,7 @@ mod tests {
                 ("title:HashMap", None),
             ] {
                 let found =
-                    FsfsRuntime::gather_lexical_candidates(&cx, lexical, query, 10, None, 10)
+                    FsfsRuntime::gather_lexical_candidates(&cx, lexical, query, 10, None, None, 10)
                         .expect("lexical candidates")
                         .into_iter()
                         .map(|candidate| candidate.doc_id)
@@ -66380,6 +66460,8 @@ mod tests {
                 "fsfs.search.cache.v23",
                 // Could reinterpret bare Boolean-word exclusions as operators.
                 "fsfs.search.cache.v24",
+                // Could retain lexical hits from an excluded OR branch.
+                "fsfs.search.cache.v25",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

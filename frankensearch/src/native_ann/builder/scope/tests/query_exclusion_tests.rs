@@ -430,6 +430,27 @@ fn exclusion_census_refuses_one_oversized_escaped_phrase_before_inference() {
             "unexpected normalized-query refusal: {error:?}"
         );
         assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+
+        // The immutable reader also escapes unknown-field colons after core
+        // normalization. Bound that final rendering before starting inference.
+        let escaped_query = format!("-absent {}needle", "x:: ".repeat(2_000));
+        assert!(escaped_query.chars().count() < frankensearch_quill::query::MAX_QUERY_LENGTH);
+        assert!(
+            frankensearch_quill::escape_unknown_field_colons(
+                &escaped_query,
+                frankensearch_quill::DEFAULT_SCHEMA,
+            )
+            .chars()
+            .count()
+                > frankensearch_quill::query::MAX_QUERY_LENGTH
+        );
+        let error = index.search(&cx, &escaped_query, 28).await.unwrap_err();
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { field, value, .. }
+            if field == "native_ann.query.exclusions" && value == "oversized-lexical-query"),
+            "unexpected rendered-query refusal: {error:?}"
+        );
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
     });
 }
 
