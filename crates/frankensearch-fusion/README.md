@@ -120,19 +120,33 @@ fn display_progressively(searcher: &SyncTwoTierSearcher, query: &TieredQueryEmbe
 The iterator borrows its searcher, query and optional filter for its lifetime.
 Identity or initial-retrieval failures yield `RefinementFailed` with an empty
 initial result set; a refinement failure retains the already delivered results.
-Fast-only and zero-quality-signal searches stop after the initial phase. Use
+By default, fast-only and zero-quality-signal searches stop after the initial phase. Use
 `search_collect` when only the final result set and aggregate metrics are needed.
+
+`SyncTwoTierSearcher::with_mmr_config` enables synchronous diversity ranking
+with the existing `MmrConfig`. It retains a bounded candidate window beyond
+the displayed page and can emit a final `Reranked` phase after Initial or
+Refined. MMR runs only when that iterator phase is requested; collection runs
+it before returning. It compares every candidate in one admitted vector space,
+preferring complete quality coverage after refinement and otherwise complete
+fast coverage. A pool with no common eligible space keeps the previous result.
+Disabled MMR performs no candidate retention or diversity work, and enabled
+candidate pools above 1,000 are refused before retrieval.
 
 `TieredQueryEmbeddings::quality_only` performs direct quality retrieval through
 the same APIs. It requires a semantic quality tier with an admitted FSVI v2 owner
 or a matching persisted producer fingerprint. The request never searches fast
-vectors or blends fast scores, and it emits one terminal `Initial` phase whose
-results and metrics identify the quality tier. Optional lexical fusion preserves
+vectors or blends fast scores, and its `Initial` phase identifies the quality
+tier through its results and metrics. Optional lexical fusion preserves
 the same metadata and receives the quality query vector. Quality results carry
 `quality_score` and no fast-row `index`; malformed identities, absent quality,
 control-only producers, and a conflicting `fast_only` configuration are refused
 before retrieval. A zero-result limit still validates admission and performs no
 search.
+
+With MMR enabled, direct quality can also emit `Reranked`, using quality vectors
+exclusively. Missing quality coverage for a lexical candidate skips diversity;
+it never authorizes a fallback into the fast embedding space.
 
 ### Federation with separate document stores
 

@@ -3658,6 +3658,24 @@ impl InMemoryVectorIndex {
         Ok(out)
     }
 
+    /// Read a document's vector from this retained tier by canonical document ID.
+    ///
+    /// This uses the same lazy document lookup as quality rescoring. A row
+    /// ordinal from another tier must never be used in its place: independent
+    /// tiers may have different order, dimensions and coverage. The accessor
+    /// does not establish embedding-space admission; callers must authorize
+    /// any vector comparison against this index's retained identity first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a vector access error if the retained lookup is inconsistent.
+    /// A document absent from this tier returns `Ok(None)`.
+    pub fn vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
+        self.index_of_doc_id(doc_id)
+            .map(|index| self.vector_at_f32(index))
+            .transpose()
+    }
+
     /// Compute dot products between a query and specific hit positions.
     ///
     /// Used for quality scoring when this index serves as the quality tier.
