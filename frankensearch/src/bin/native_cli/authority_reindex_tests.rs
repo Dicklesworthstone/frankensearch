@@ -717,6 +717,7 @@ fn bound_reindex_preserves_tuned_reranking_and_gives_each_query_its_original_bud
                             .iter()
                             .all(|(id, text)| { id.starts_with("selected-") && !text.is_empty() })
                     );
+                    drop(observed);
                 }
                 let responses = frames(&output);
                 assert_eq!(responses.len(), if stream { 3 } else { 1 });
@@ -731,9 +732,11 @@ fn bound_reindex_preserves_tuned_reranking_and_gives_each_query_its_original_bud
                 // Compare the complete recovery replay with the ordinary
                 // retained query executor over the same admitted publication.
                 let receipt = Receipt::read(&options.receipt).unwrap();
-                let active = receipt
-                    .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
-                    .unwrap();
+                let active = Arc::new(
+                    receipt
+                        .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
+                        .unwrap(),
+                );
                 let scope = prepare_scope(
                     &cx,
                     &active,

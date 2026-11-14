@@ -2391,7 +2391,7 @@ mod tests {
             vec!["declared".to_owned()],
             vec![vec![1.0, 0.0]],
             2,
-            &semantic,
+            &semantic.space,
         )
         .unwrap();
         let unidentified = SyncTwoTierSearcher::new(

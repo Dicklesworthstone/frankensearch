@@ -5590,7 +5590,7 @@ pub struct KeeperWriter {
     /// retained snapshot has been proven against the durable generation that
     /// attempt may have installed.
     pending_publication: Option<PendingPublication>,
-    pending_compaction: Option<PendingCompaction>,
+    pending_compaction: Option<Box<PendingCompaction>>,
 }
 
 impl KeeperWriter {
@@ -6500,11 +6500,12 @@ impl KeeperWriter {
         let from_generation = self.snapshot.loaded_manifest().manifest.generation;
         if self
             .pending_compaction
+            .as_deref()
             .is_some_and(|pending| pending.from_generation != from_generation)
         {
             self.pending_compaction = None;
         }
-        let pending = if let Some(pending) = self.pending_compaction {
+        let pending = if let Some(pending) = self.pending_compaction.as_deref().copied() {
             if pending.policy != policy || pending.selected_segment_id != selected_segment_id {
                 return Err(KeeperError::InvalidTransition {
                     detail: "retry pending compaction with its original policy and selection"
@@ -6521,7 +6522,7 @@ impl KeeperWriter {
                 last_publish_unix_s: current_manifest_publish_unix_s()?,
             };
             // Store before the first await that can produce retry artifacts.
-            self.pending_compaction = Some(pending);
+            self.pending_compaction = Some(Box::new(pending));
             pending
         };
         let snapshot = self.snapshot.clone();
@@ -28091,7 +28092,11 @@ mod tests {
                 Err(KeeperError::InvalidTransition { .. })
             ));
             drop(failure);
-            let pending = writer.pending_compaction.expect("retain retry inputs");
+            let pending = writer
+                .pending_compaction
+                .as_deref()
+                .copied()
+                .expect("retain retry inputs");
             assert_eq!(pending.created_unix_s, 111);
             assert!(pending.last_publish_unix_s > 0);
             let temp_path = directory
