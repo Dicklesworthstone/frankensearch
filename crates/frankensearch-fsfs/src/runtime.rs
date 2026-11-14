@@ -40682,6 +40682,8 @@ mod tests {
         );
 
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        rustix::net::sockopt::set_socket_send_buffer_size(&writer, 64 << 10)
+            .expect("shrink SO_SNDBUF so the write budget, not the host socket buffer, bounds the transfer");
         let peer = thread::spawn(move || {
             let mut total = 0;
             let mut bytes = [0_u8; 16 << 10];

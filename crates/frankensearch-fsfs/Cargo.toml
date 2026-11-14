@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-fsfs"
-version = "1.12.3"
+version = "1.13.0"
 default-run = "fsfs"
 description = "Standalone fsfs CLI for two-tier hybrid local search"
 edition.workspace = true
@@ -111,8 +111,8 @@ ahash = { workspace = true }
 # lexical token text — the per-token to_ascii_lowercase heap alloc dominated
 # tokenize_lexical emission. Already resolved in the workspace lock (fusion dep).
 compact_str = "0.10"
-fsqlite = { version = "0.4.7", default-features = false, features = ["native", "async-api"] }
-fsqlite-types = { version = "0.4.7", features = ["native"] }
+fsqlite = { version = "0.5.0", default-features = false, features = ["native", "async-api"] }
+fsqlite-types = { version = "0.5.0", features = ["native"] }
 serde = { workspace = true }
 # Receipt hashes include JSON Value bytes; keep their insertion order stable
 # instead of depending on another workspace member to enable this feature.
@@ -138,7 +138,7 @@ same-file = "1.0.6"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-frankensearch = { path = "../../frankensearch", version = "0.7.1", default-features = false }
+frankensearch = { path = "../../frankensearch", version = "0.8.0", default-features = false }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
 frankensearch-lexical = { workspace = true }

@@ -1,5 +1,20 @@
 # Dependency Upgrade Log
 
+## 2026-11-14 - FrankenSQLite 0.5.0 family
+
+The crates.io sparse index serves the FrankenSQLite 0.5.0 family, with the
+pager at 0.5.0. The ten direct SQLite requirements and all twenty SQLite lock
+entries advance together from 0.4.7. The lock refresh moves libc from 0.2.190
+to 0.2.191, adds parking_lot 0.13.0, parking_lot_core 0.10.0, lock_api 0.5.0,
+lru 0.19.0 and redox_syscall 0.9.5, and removes the Asupersync 0.5.0 runtime
+crates (asupersync, franken-decision, franken-evidence and franken-kernel),
+which only the 0.4.7 SQLite crates used: 25 entries removed, 26 added, 658
+packages before and 659 after. The single Asupersync 0.6.2 registry identity
+is unchanged, so the fresh-process contract pin in frankensearch-embed stays
+as it is. The publication planner now requires the same registry-only 0.5.0
+identity, including the pager; its self-test passes and also rejects the
+previous coherent 0.4.7 family.
+
 ## 2026-10-03 — Release dependency preparation
 
 The live stable-version census selects the published FrankenSQLite 0.4.7

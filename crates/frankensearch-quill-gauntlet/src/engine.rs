@@ -139,6 +139,12 @@ const BUILT_IN_PROFILE_V10_LEXICAL_CRATE_VERSION: &str = "0.4.0";
 // an exact archived identity rather than attesting the new query semantics.
 const BUILT_IN_PROFILE_V11_CASS_SCHEMA_HASH: &str =
     "4618b34a6b59c4e45ef07593502df833e37516e965c43dee909badb19038aeca";
+// v12 binds the 0.5 synchronized library release: quill 0.5.0 and lexical
+// 0.5.0 (oracle dependency contract v13). Its semantic contracts are v11's;
+// only the crate versions moved. v11 remains an exact archived 0.4.0/0.4.0
+// identity.
+const BUILT_IN_PROFILE_V12_QUILL_CRATE_VERSION: &str = "0.5.0";
+const BUILT_IN_PROFILE_V12_LEXICAL_CRATE_VERSION: &str = "0.5.0";
 
 /// Closed engine family used by the cross-engine false-green guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,7 +471,8 @@ impl BuiltInEngineProfileReceipt {
     const V9_SCHEMA_VERSION: u32 = 9;
     const V10_SCHEMA_VERSION: u32 = 10;
     const V11_SCHEMA_VERSION: u32 = 11;
-    const CURRENT_SCHEMA_VERSION: u32 = Self::V11_SCHEMA_VERSION;
+    const V12_SCHEMA_VERSION: u32 = 12;
+    const CURRENT_SCHEMA_VERSION: u32 = Self::V12_SCHEMA_VERSION;
 
     #[cfg_attr(
         not(any(test, feature = "tantivy-oracle")),
@@ -499,7 +506,7 @@ impl BuiltInEngineProfileReceipt {
             3 => self.validate_stored_v3(engines),
             4 => self.validate_stored_v4(engines),
             5 => self.validate_stored_v5(engines),
-            6..=11 => self.validate_stored_release_profile(engines),
+            6..=12 => self.validate_stored_release_profile(engines),
             _ => Err(GauntletError::InvalidContract {
                 reason: "built-in engine profile receipt schema is unsupported".to_owned(),
             }),
@@ -608,8 +615,8 @@ impl BuiltInEngineProfileReceipt {
         }
     }
 
-    /// v11's contract: v3's, except explicit ASCII prefixes search complete
-    /// positional fields with bounded, complete-or-error expansion.
+    /// v11's and v12's contract: v3's, except explicit ASCII prefixes search
+    /// complete positional fields with bounded, complete-or-error expansion.
     fn stored_semantic_contract_v4(&self) -> crate::runner::SemanticContract {
         match self.profile {
             BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => {
@@ -798,7 +805,7 @@ impl BuiltInEngineProfileReceipt {
 
     /// Release profiles, each with its own frozen adapter versions and
     /// semantic contract: v6 through v8 retain v2's, v9 and v10 carry v3's,
-    /// and v11 carries v4's.
+    /// and v11 and v12 carry v4's.
     /// None admits another profile's identities.
     fn validate_stored_release_profile(
         &self,
@@ -835,9 +842,14 @@ impl BuiltInEngineProfileReceipt {
                 BUILT_IN_PROFILE_V10_LEXICAL_CRATE_VERSION,
                 self.stored_semantic_contract_v4(),
             ),
+            Self::V12_SCHEMA_VERSION => (
+                BUILT_IN_PROFILE_V12_QUILL_CRATE_VERSION,
+                BUILT_IN_PROFILE_V12_LEXICAL_CRATE_VERSION,
+                self.stored_semantic_contract_v4(),
+            ),
             _ => {
                 return Err(GauntletError::InvalidContract {
-                    reason: "expected built-in engine profile v6, v7, v8, v9, v10 or v11"
+                    reason: "expected built-in engine profile v6, v7, v8, v9, v10, v11 or v12"
                         .to_owned(),
                 });
             }
@@ -870,7 +882,7 @@ impl BuiltInEngineProfileReceipt {
             || engines.subject.source_dirty != engines.oracle.source_dirty
         {
             return Err(GauntletError::InvalidContract {
-                reason: "built-in engine profile receipt v6/v7/v8/v9/v10/v11 does not match its stored adapter identities and semantic contract"
+                reason: "built-in engine profile receipt v6/v7/v8/v9/v10/v11/v12 does not match its stored adapter identities and semantic contract"
                     .to_owned(),
             });
         }
@@ -4845,12 +4857,13 @@ mod tests {
             | BuiltInEngineProfileReceipt::V7_SCHEMA_VERSION
             | BuiltInEngineProfileReceipt::V8_SCHEMA_VERSION
             | BuiltInEngineProfileReceipt::V9_SCHEMA_VERSION
-            | BuiltInEngineProfileReceipt::V10_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
+            | BuiltInEngineProfileReceipt::V10_SCHEMA_VERSION
+            | BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION => BuiltInEngineProfileReceipt {
                 schema_version,
                 profile,
                 subject_config: QuillConfigReceipt::from_config(config),
             },
-            BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION => {
+            BuiltInEngineProfileReceipt::V12_SCHEMA_VERSION => {
                 BuiltInEngineProfileReceipt::new(profile, config)
             }
             _ => panic!("unsupported test profile schema {schema_version}"),
@@ -4871,7 +4884,8 @@ mod tests {
             | BuiltInEngineProfileReceipt::V10_SCHEMA_VERSION => {
                 receipt.stored_semantic_contract_v3()
             }
-            BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION => {
+            BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION
+            | BuiltInEngineProfileReceipt::V12_SCHEMA_VERSION => {
                 receipt.stored_semantic_contract_v4()
             }
             _ => unreachable!("validated above"),
@@ -4909,6 +4923,10 @@ mod tests {
             | BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION => (
                 BUILT_IN_PROFILE_V10_QUILL_CRATE_VERSION,
                 BUILT_IN_PROFILE_V10_LEXICAL_CRATE_VERSION,
+            ),
+            BuiltInEngineProfileReceipt::V12_SCHEMA_VERSION => (
+                BUILT_IN_PROFILE_V12_QUILL_CRATE_VERSION,
+                BUILT_IN_PROFILE_V12_LEXICAL_CRATE_VERSION,
             ),
             _ => (
                 BUILT_IN_PROFILE_V1_QUILL_CRATE_VERSION,
@@ -7315,7 +7333,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_profile_v11_is_current_while_v1_to_v10_remain_archive_only() {
+    fn built_in_profile_v12_is_current_while_v1_to_v11_remain_archive_only() {
         for profile in [
             BuiltInEngineProfile::ScalarShipping,
             BuiltInEngineProfile::ScalarG1a,
@@ -7332,6 +7350,7 @@ mod tests {
                 BuiltInEngineProfileReceipt::V8_SCHEMA_VERSION,
                 BuiltInEngineProfileReceipt::V9_SCHEMA_VERSION,
                 BuiltInEngineProfileReceipt::V10_SCHEMA_VERSION,
+                BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION,
             ] {
                 let archived =
                     stored_profile_pair(profile, &QuillConfig::default(), archived_schema);
@@ -7341,33 +7360,43 @@ mod tests {
                 assert!(
                     archived.validate_builtin_contract().is_err(),
                     "schema v{archived_schema} cannot create a run under the release \
-                     dependency contract (quill 0.4.0, lexical 0.4.0)"
+                     dependency contract (quill 0.5.0, lexical 0.5.0)"
                 );
             }
 
             let current = stored_profile_pair(
                 profile,
                 &QuillConfig::default(),
-                BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION,
+                BuiltInEngineProfileReceipt::V12_SCHEMA_VERSION,
             );
             current
                 .validate_stored_contract()
-                .expect("v11 receipt remains independently replay-valid");
+                .expect("v12 receipt remains independently replay-valid");
             current
                 .validate_builtin_contract()
-                .expect("v11 receipt must match the current adapters");
+                .expect("v12 receipt must match the current adapters");
+            // The 0.5 release moves only the crate versions: every semantic
+            // contract is v11's.
+            let v11 = stored_profile_pair(
+                profile,
+                &QuillConfig::default(),
+                BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION,
+            );
+            assert_eq!(current.semantic_contract, v11.semantic_contract);
+            assert_ne!(current.subject.crate_version, v11.subject.crate_version);
+            assert_ne!(current.oracle.crate_version, v11.oracle.crate_version);
             let v10 = stored_profile_pair(
                 profile,
                 &QuillConfig::default(),
                 BuiltInEngineProfileReceipt::V10_SCHEMA_VERSION,
             );
             assert_eq!(
-                current.semantic_contract == v10.semantic_contract,
+                v11.semantic_contract == v10.semantic_contract,
                 profile != BuiltInEngineProfile::Cass,
                 "{profile:?}: v11 changes exactly the CASS semantic contract"
             );
-            assert_eq!(current.subject.crate_version, v10.subject.crate_version);
-            assert_eq!(current.oracle.crate_version, v10.oracle.crate_version);
+            assert_eq!(v11.subject.crate_version, v10.subject.crate_version);
+            assert_eq!(v11.oracle.crate_version, v10.oracle.crate_version);
             // The 0.4 release moved only the crate versions, and the v8 -> v9
             // step changed exactly the CASS contract (GH #56). Preserve those
             // historical identities independently of v11's prefix correction.
@@ -7398,7 +7427,7 @@ mod tests {
                 BuiltInEngineProfileReceipt::V10_SCHEMA_VERSION;
             assert!(archived.validate_stored_contract().is_err());
 
-            let mut relabeled = current;
+            let mut relabeled = v11.clone();
             relabeled.built_in_profile.as_mut().unwrap().schema_version =
                 BuiltInEngineProfileReceipt::V10_SCHEMA_VERSION;
             assert_eq!(
@@ -7415,6 +7444,15 @@ mod tests {
                 profile == BuiltInEngineProfile::Cass,
                 "historical CASS prefixes cannot attest the complete-field contract"
             );
+
+            let mut relabeled = current;
+            relabeled.built_in_profile.as_mut().unwrap().schema_version =
+                BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION;
+            assert!(relabeled.validate_stored_contract().is_err());
+            let mut archived = v11;
+            archived.built_in_profile.as_mut().unwrap().schema_version =
+                BuiltInEngineProfileReceipt::V12_SCHEMA_VERSION;
+            assert!(archived.validate_stored_contract().is_err());
         }
     }
 
@@ -7550,6 +7588,13 @@ mod tests {
     fn built_in_profile_v11_rejects_every_bound_identity_mutation() {
         assert_profile_rejects_every_bound_identity_mutation(
             BuiltInEngineProfileReceipt::V11_SCHEMA_VERSION,
+        );
+    }
+
+    #[test]
+    fn built_in_profile_v12_rejects_every_bound_identity_mutation() {
+        assert_profile_rejects_every_bound_identity_mutation(
+            BuiltInEngineProfileReceipt::V12_SCHEMA_VERSION,
         );
     }
 
