@@ -275,7 +275,7 @@ impl NetworkAcquisitionGuard<'_> {
         self.validate(url)?;
         let bytes = u64::try_from(bytes).map_err(|_| local_recovery_error("byte_budget"))?;
         self.bytes_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 remaining.checked_sub(bytes)
             })
             .map_err(|_| local_recovery_error("byte_budget"))?;
