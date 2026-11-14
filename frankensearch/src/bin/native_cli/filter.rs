@@ -232,6 +232,27 @@ impl<'a> Query<'a> {
         Ok(payload)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn progressive_tier_with_reranker<'q>(
+        &'q self,
+        cx: &'q Cx,
+        text: &'q str,
+        limit: usize,
+        tier: frankensearch_core::generation::EmbedderTierTag,
+        reranker: &'q dyn frankensearch::Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
+        match &self.scope {
+            Some(scope) => {
+                scope.progressive_tier_with_reranker(cx, text, limit, tier, reranker, window, pool)
+            }
+            None => self
+                .index
+                .progressive_tier_with_reranker(cx, text, limit, tier, reranker, window, pool),
+        }
+    }
+
     pub(super) fn progressive_with_reranker<'q>(
         &'q self,
         cx: &'q Cx,

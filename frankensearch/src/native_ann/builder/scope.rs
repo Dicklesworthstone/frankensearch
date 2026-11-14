@@ -1066,6 +1066,40 @@ impl NativeScopedHybridIndex<'_> {
             .with_allowed_documents_arc(Arc::clone(&self.lexical.allowed))
     }
 
+    /// Retrieve one selected tier and lazily rerank its scoped source window.
+    ///
+    /// Only the selected model runs. Membership is frozen before retrieval,
+    /// and excluded source bodies never reach the cross-encoder. Quality scores
+    /// and physical rows remain attached to the quality owner in every phase.
+    /// The optional caller pool retains the same selected owner and membership.
+    ///
+    /// # Errors
+    /// Refuses missing quality or invalid selected-owner identity before empty
+    /// scopes or zero-k work, and propagates ordinary rerank admission errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn progressive_tier_with_reranker<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        selected: EmbedderTierTag,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let quality = selected == EmbedderTierTag::Quality;
+        let query = match pool {
+            Some(pool) => self.primary_with_pool(cx, text, k, quality, pool)?,
+            None => self.primary(cx, text, k, quality)?,
+        };
+        let query = if quality {
+            query.with_quality_primary()
+        } else {
+            query
+        };
+        query.with_reranker(reranker, self.text.as_ref(), window)
+    }
+
     /// Add lazy reranking of scoped candidates using their retained source text.
     ///
     /// Excluded documents never enter the rerank window, even when their global

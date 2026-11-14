@@ -279,7 +279,7 @@ impl Policy {
         }))
     }
 
-    /// Prepare the same full-mode query for buffered and streaming execution.
+    /// Prepare the same selected-mode query for buffered and streaming execution.
     /// Attach retained-source reranking first so candidate tuning accounts for
     /// its larger window. The complete scope and all original owners survive.
     pub(crate) fn progressive<'a>(
@@ -287,8 +287,29 @@ impl Policy {
         scoped: &'a cohort::Prepared<'_>,
         cx: &'a Cx,
         text: &'a str,
+        mode: Mode,
         limit: usize,
     ) -> Result<cohort::Progressive<'a>> {
+        if mode != Mode::Full {
+            let rerank = self
+                .rerank
+                .as_ref()
+                .ok_or_else(|| bad("primary progressive requests require a configured reranker"))?;
+            let tier = match mode {
+                Mode::Fast => frankensearch_core::generation::EmbedderTierTag::Fast,
+                Mode::Quality => frankensearch_core::generation::EmbedderTierTag::Quality,
+                Mode::Full => unreachable!("full queries use independent refinement below"),
+            };
+            return Ok(scoped.progressive_tier_with_reranker(
+                cx,
+                text,
+                limit,
+                tier,
+                rerank.model.as_ref(),
+                rerank.window,
+                self.query_pool(),
+            )?);
+        }
         let query = match &self.rerank {
             Some(rerank) => scoped.progressive_with_reranker_on_pool(
                 cx,

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch_core::ParsedQuery;
+use frankensearch_core::generation::EmbedderTierTag;
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 
 use super::super::{checkpoint, invalid};
@@ -433,6 +434,66 @@ impl NativeBuiltHybridIndex {
                 pool,
             )
             .map(NativeProgressiveSearch::with_immutable_query)
+    }
+
+    /// Retrieve one selected tier and lazily rerank its retained source window.
+    ///
+    /// Only the selected producer runs. Quality-primary results keep quality
+    /// scores and owner-local rows in every phase, including rerank failures.
+    /// The optional caller pool owns vector traversal; no runtime is created.
+    /// Dropping after Initial starts no text resolution or cross-encoder work.
+    ///
+    /// # Errors
+    /// Refuses missing quality or invalid selected-owner admission even for
+    /// zero-k requests, and propagates rerank-window and cancellation errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn progressive_tier_with_reranker<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        selected: EmbedderTierTag,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.builder.primary_rerank")?;
+        let tier = match selected {
+            EmbedderTierTag::Fast => self.vectors.fast(),
+            EmbedderTierTag::Quality => self.vectors.quality().ok_or_else(|| {
+                invalid(
+                    "builder.quality",
+                    "absent",
+                    "quality-primary search requires a built quality tier",
+                )
+            })?,
+        };
+        let query = match pool {
+            Some(pool) => tier.index.search_hybrid_progressive_with_pool(
+                cx,
+                tier.embedder(),
+                None,
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )?,
+            None => tier.index().search_hybrid_progressive(
+                cx,
+                tier.embedder(),
+                None,
+                &self.lexical,
+                text,
+                k,
+            )?,
+        }
+        .with_immutable_query();
+        let query = if selected == EmbedderTierTag::Quality {
+            query.with_quality_primary()
+        } else {
+            query
+        };
+        query.with_reranker(reranker, self.text.as_ref(), window)
     }
 
     /// Prepare lazy native retrieval and cross-encoder reranking using the EXACT

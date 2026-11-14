@@ -38,7 +38,8 @@ pub struct NativeShardedResult {
 /// One requested phase of sharded native retrieval.
 #[derive(Debug)]
 pub enum NativeShardedSearchPhase {
-    /// Fast and lexical results; no quality inference has started.
+    /// Selected primary-tier and lexical results, before any later stage.
+    /// Quality-primary queries retain quality scores and shard coordinates.
     Initial {
         /// Hydrated winners in fused order.
         results: Vec<NativeShardedResult>,
@@ -364,6 +365,7 @@ impl NativeShardSet {
             cx,
             fast_embedder,
             quality,
+            primary_quality: false,
             quality_owner: None,
             pool: None,
             lexical,
@@ -402,6 +404,7 @@ impl NativeShardSet {
             cx,
             fast_embedder,
             quality,
+            primary_quality: false,
             quality_owner: quality.map(|(shards, _)| shards.clone()),
             pool: Some(pool),
             lexical,
@@ -446,6 +449,7 @@ pub struct NativeShardedProgressiveSearch<'a> {
     cx: &'a Cx,
     fast_embedder: &'a dyn Embedder,
     quality: Option<(&'a NativeShardSet, &'a dyn Embedder)>,
+    primary_quality: bool,
     quality_owner: Option<NativeShardSet>,
     pool: Option<BlockingPoolHandle>,
     lexical: &'a dyn LexicalRead,
@@ -460,6 +464,13 @@ pub struct NativeShardedProgressiveSearch<'a> {
 }
 
 impl<'a> NativeShardedProgressiveSearch<'a> {
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_quality_primary(mut self) -> Self {
+        debug_assert!(self.quality.is_none());
+        self.primary_quality = true;
+        self
+    }
+
     #[cfg(feature = "quill")]
     pub(in crate::native_ann) async fn collect(mut self) -> SearchResult<Vec<NativeShardedResult>> {
         let mut page = Vec::new();
@@ -721,7 +732,15 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         }
         let (fast, batch) = join_sources(
             self.cx,
-            self.vector_candidates(self.fast, self.fast_embedder, self.policy.fast_ef),
+            self.vector_candidates(
+                self.fast,
+                self.fast_embedder,
+                if self.primary_quality {
+                    self.policy.quality_ef
+                } else {
+                    self.policy.fast_ef
+                },
+            ),
             self.lexical_candidates(),
         )
         .await?;
@@ -738,8 +757,8 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
             }
         }
         let candidates = NativePhaseCandidates {
-            fast: fast.len(),
-            quality: 0,
+            fast: if self.primary_quality { 0 } else { fast.len() },
+            quality: if self.primary_quality { fast.len() } else { 0 },
             lexical: batch.results().len(),
         };
         let mut results = finish(
@@ -751,6 +770,16 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
             self.policy.fusion(self.result_window(), is_hash, false),
         )
         .await?;
+        if self.primary_quality {
+            for hit in &mut results {
+                checkpoint(self.cx, "native_ann.shards.primary_quality_result")?;
+                hit.quality_row = hit.fast_row.take();
+                hit.result.quality_score = hit.result.fast_score.take();
+                if hit.result.source == ScoreSource::SemanticFast {
+                    hit.result.source = ScoreSource::SemanticQuality;
+                }
+            }
+        }
         checkpoint(self.cx, "native_ann.shards.initial_complete")?;
         if self.quality.is_some() {
             self.state = State::Refine(Pending {

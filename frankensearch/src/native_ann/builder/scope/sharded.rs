@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use frankensearch_core::generation::EmbedderTierTag;
 
 use super::{ScopeSource, ScopedLexical, ScopedText};
 use crate::native_ann::builder::sharded::NativeBuiltShardedHybridIndex;
@@ -184,6 +185,40 @@ impl NativeScopedShardedHybridIndex<'_> {
                 pool,
             )?
             .with_allowed_documents_arc(Arc::clone(&self.lexical.allowed))
+    }
+
+    /// Retrieve one selected tier and lazily rerank its scoped source window.
+    ///
+    /// The selected producer runs once across the complete partition inventory.
+    /// Frozen membership constrains both retrieval and cross-encoder text, and
+    /// quality-primary candidates retain quality shard coordinates in every
+    /// phase. The optional caller pool preserves this same retained inventory.
+    ///
+    /// # Errors
+    /// Refuses missing quality or invalid selected inventory before empty scopes
+    /// or zero-k work, and propagates ordinary rerank admission errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn progressive_tier_with_reranker<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        selected: EmbedderTierTag,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        let quality = selected == EmbedderTierTag::Quality;
+        let query = match pool {
+            Some(pool) => self.primary_with_pool(cx, text, k, quality, pool)?,
+            None => self.primary(cx, text, k, quality)?,
+        };
+        let query = if quality {
+            query.with_quality_primary()
+        } else {
+            query
+        };
+        query.with_reranker(reranker, self.text.as_ref(), window)
     }
 
     /// Rerank only eligible candidates using their original retained source text.

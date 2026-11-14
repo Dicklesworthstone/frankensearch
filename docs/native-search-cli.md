@@ -262,8 +262,8 @@ and slow delivery of an already completed final page does not create a timeout.
 
 `--full-query` fusion and graph tuning still require full mode. Explicit lexical
 queries skip a warm server's reranker; a lexical-only startup rejects its model
-options. The ordinary receipt-based `search`/`serve` commands keep their separate
-full-mode policy described below.
+options. Ordinary and sharded receipt-based `search`/`serve` commands also support
+selected-tier reranking, with the retained source policy described below.
 
 ### Complete quality for an existing fast-only generation
 
@@ -1752,11 +1752,18 @@ candidate budgeting grows to include the requested window. With a larger result
 limit, the existing native policy reranks the requested head and retains its
 unscored tail; no evaluated-count or whole-corpus relevance claim is made.
 
-Fast and quality-primary server requests deliberately skip the cross-encoder.
-One-shot `search --reranker-dir` therefore requires full mode instead of quietly
-ignoring an explicitly supplied reranker. Server readiness names the configured
-full-mode reranker/window. Individual requests cannot select arbitrary model
-paths, reload the provider, or enlarge the rerank window.
+Fast and quality-primary requests also support the configured cross-encoder,
+for both ordinary and sharded receipts. `search --mode fast --reranker-dir ...`
+retrieves with the fast model, then reranks; `--mode quality` retrieves directly
+with the quality model, then reranks. No other query embedder runs and no
+refinement phase is fabricated. Streaming emits `initial` or `quality` before
+the final `reranked` page. Quality-primary scores, candidate counts and physical
+row coordinates stay associated with the quality tier, including on failure.
+Server readiness lists eligible `rerank_modes`; `reranker` and `rerank_window`
+identify the loaded scorer. `full_mode_reranker` identifies that same scorer for
+the full pipeline.
+Individual requests cannot select arbitrary model paths, reload the provider,
+or enlarge the rerank window. Full-query tuning remains specific to full mode.
 
 The source text is the exact stored body from the query's pinned cohort, including
 after live activation. Server/request scopes apply before retrieval and also
@@ -1766,10 +1773,10 @@ ownership; a malformed score envelope is a failure, not a partial reorder.
 
 A successful final phase is `reranked` with actual `evaluated` count. Empty pools
 skip the scorer; buffered output then retains the actual retrieval phase and
-reports `rerank_applied: false`. Buffered full-mode search fails when any required
+reports `rerank_applied: false`. Buffered reranked search fails when any required
 phase fails. Streaming emits `rerank_failed` with the exact preceding page and a
 `degraded` terminal, and the next request remains usable. The original total
-deadline includes reranking: expiry after Refined starts no scorer; late scoring
+deadline includes reranking: expiry after a retrieval page starts no scorer; late scoring
 never replaces the delivered page. Synchronous native work is not preemptible.
 
 ## Add quality to a fast-only native index
