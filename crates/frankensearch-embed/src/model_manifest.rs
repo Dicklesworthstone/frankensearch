@@ -4739,6 +4739,13 @@ mod tests {
         manifest
     }
 
+    // Package 0.5.0 is a version-only release: it moves only the adapters'
+    // implementation_revision package version, not space, vectors, or certificate.
+    // Reconstruct the 0.4.0 revision before applying the 0.4.0 step.
+    fn before_embed_0_5(manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        with_adapter_package(manifest, "0.5.0", "0.4.0")
+    }
+
     // Package 0.4.0 changes only these adapters' implementation provenance.
     // Reconstruct the 0.3.1 revision that wrote every index of the 0.3 line.
     fn before_embed_0_4(manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
@@ -4756,14 +4763,15 @@ mod tests {
     fn adapter_release_changes_producer_identity_without_changing_space_or_vectors() {
         use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.0");
         for current in [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
         ] {
-            let historical = before_adapter_release(before_embed_0_4(current.clone()));
+            let historical =
+                before_adapter_release(before_embed_0_4(before_embed_0_5(current.clone())));
             assert_eq!(
                 current.space_contract_fingerprint().unwrap(),
                 historical.space_contract_fingerprint().unwrap()
@@ -4798,7 +4806,7 @@ mod tests {
             // Preserve admission refusal for the 0.3 line's adapters too,
             // without changing their model bytes, space, or certificate.
             for previous_package in ["0.3.1", "0.3.0"] {
-                let previous = with_adapter_package(current.clone(), "0.4.0", previous_package);
+                let previous = with_adapter_package(current.clone(), "0.5.0", previous_package);
                 assert_ne!(previous, current);
                 assert_eq!(
                     current.space_contract_fingerprint().unwrap(),
@@ -5109,6 +5117,7 @@ mod tests {
     // qualified Windows output. Current owning-loader tests check the new bits.
     fn before_dependency_refresh(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         let current = manifest.freeze().unwrap().fingerprint;
+        manifest = before_embed_0_5(manifest);
         manifest = before_embed_0_4(manifest);
         manifest = before_minilm_256(manifest);
         manifest = before_fastembed_7_1(manifest);
