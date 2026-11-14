@@ -37779,6 +37779,8 @@ mod tests {
     fn literal_colon_adapter_preserves_quoted_and_escaped_operand_membership() {
         use std::collections::BTreeSet;
 
+        use frankensearch_core::ParsedQuery;
+
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).unwrap();
             let documents = [
@@ -37790,6 +37792,7 @@ mod tests {
                 IndexableDocument::new("title", "other").with_title("rust"),
                 IndexableDocument::new("inch", "inch").with_title("plain"),
                 IndexableDocument::new("url", "https sqlite org").with_title("plain"),
+                IndexableDocument::new("a \" b", "opaque").with_title("plain"),
             ];
             index.index_documents(&cx, &documents).await.unwrap();
             index.commit(&cx).await.unwrap();
@@ -37809,6 +37812,14 @@ mod tests {
                 ("title:rust", &["title"]),
                 ("title : rust", &["title"]),
                 ("(title : rust)", &["title"]),
+                (
+                    r#"id:['a " b' TO b] OR https://sqlite.org"#,
+                    &["a \" b", "url"],
+                ),
+                (
+                    r#"id:IN ['a " b'] OR https://sqlite.org"#,
+                    &["a \" b", "url"],
+                ),
             ] {
                 let rendered = index.query_text(raw);
                 let hits = index.search(&cx, &rendered, documents.len()).await.unwrap();
@@ -37818,6 +37829,21 @@ mod tests {
                     .collect::<BTreeSet<_>>();
                 let expected = expected.iter().copied().collect::<BTreeSet<_>>();
                 assert_eq!(actual, expected, "{raw} -> {rendered}");
+            }
+            for operand in [r#"id:['a " b' TO b]"#, r#"id:IN ['a " b']"#] {
+                let raw = format!("needle -{operand} -absent");
+                let parsed = ParsedQuery::parse(&raw);
+                assert_eq!(parsed.positive, "needle", "{raw}");
+                assert_eq!(parsed.negative_terms, [operand, "absent"], "{raw}");
+                let census = parsed
+                    .negative_terms
+                    .iter()
+                    .map(|term| index.query_text(term))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                let hits = index.search(&cx, &census, documents.len()).await.unwrap();
+                assert_eq!(hits.len(), 1, "{raw}: {hits:?}");
+                assert_eq!(hits[0].doc_id, "a \" b", "{raw}");
             }
         });
     }

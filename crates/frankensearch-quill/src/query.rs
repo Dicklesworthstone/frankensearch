@@ -1223,8 +1223,9 @@ pub fn validate_index_capabilities(
 /// The lenient parser reads `HashMap::new` or `https://x` as `field:value`
 /// with an unknown field and drops the fragment. A real field prefix keeps
 /// its meaning (`title:rust`, also after a group or negation), `name::x` is
-/// never a field prefix, quoted phrases are left alone, and an escape the
-/// caller already wrote is kept, so applying this twice changes nothing.
+/// never a field prefix, quoted phrases and typed literals are left alone,
+/// and an escape the caller already wrote is kept, so applying this twice
+/// changes nothing.
 /// Search consumers call it on user text; the parser itself is unchanged.
 #[must_use]
 pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow<'_, str> {
@@ -1237,7 +1238,12 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
     let mut operand_start = true;
     let mut quote = None;
     let mut escaped = false;
+    let mut typed_end = 0;
     for (index, ch) in query.char_indices() {
+        if index < typed_end {
+            escaped_query.push(ch);
+            continue;
+        }
         if escaped {
             escaped = false;
             escaped_query.push(ch);
@@ -1262,6 +1268,14 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
             after_whitespace = false;
         }
         match ch {
+            '[' | '{' if operand_start => {
+                // Range/set contents have their own quote and escape grammar.
+                // Copy exactly the span the lexer consumes, then begin its
+                // next operand even when no whitespace separates them.
+                typed_end = typed_close(query, index).map_or(query.len(), |(end, _)| end + 1);
+                field_start = Some(typed_end);
+                operand_start = true;
+            }
             '\\' => {
                 escaped = true;
                 operand_start = false;
@@ -7238,6 +7252,22 @@ mod tests {
                 r#"title:bare" OR https\://sqlite.org"#,
             ),
             ("title:content:rust", r"title:content\:rust"),
+            (
+                r#"id:['a " b' TO b] OR https://sqlite.org"#,
+                r#"id:['a " b' TO b] OR https\://sqlite.org"#,
+            ),
+            (
+                r#"id:IN ['a " b'] OR https://sqlite.org"#,
+                r#"id:IN ['a " b'] OR https\://sqlite.org"#,
+            ),
+            (
+                r#"id:{'a ] " b' TO z} OR https://sqlite.org"#,
+                r#"id:{'a ] " b' TO z} OR https\://sqlite.org"#,
+            ),
+            (
+                r#"id:['a " b' TO b]title:rust"#,
+                r#"id:['a " b' TO b]title:rust"#,
+            ),
         ] {
             let escaped = escape_unknown_field_colons(query, crate::DEFAULT_SCHEMA);
             assert_eq!(escaped, expected, "{query}");

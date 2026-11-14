@@ -288,6 +288,7 @@ fn parse_quoted_phrase(chars: &[char], quote: usize) -> (String, usize) {
 fn query_fragment_end(chars: &[char], start: usize) -> usize {
     let mut cursor = start;
     let mut quote = None;
+    let mut typed_literal = false;
     let mut operand_start = true;
     let mut field_start = Some(start);
     while cursor < chars.len() {
@@ -304,7 +305,21 @@ fn query_fragment_end(chars: &[char], start: usize) -> usize {
             if ch == delimiter {
                 quote = None;
             }
+        } else if typed_literal {
+            if matches!(ch, '"' | '\'') {
+                quote = Some(ch);
+            } else if matches!(ch, ']' | '}') {
+                typed_literal = false;
+                operand_start = true;
+                field_start = Some(cursor + 1);
+            }
         } else {
+            if operand_start && let Some(open) = query_set_open(chars, cursor) {
+                // IN and its bracketed members form one operand, including
+                // when that operand is an exclusion after a field prefix.
+                cursor = open;
+                continue;
+            }
             if ch.is_whitespace() {
                 // A field separator may follow whitespace after its name.
                 // Preserve that complete operand before inspecting exclusions.
@@ -328,6 +343,11 @@ fn query_fragment_end(chars: &[char], start: usize) -> usize {
                 break;
             }
             match ch {
+                '[' | '{' if operand_start => {
+                    typed_literal = true;
+                    operand_start = false;
+                    field_start = None;
+                }
                 '"' | '\'' if operand_start => {
                     quote = Some(ch);
                     operand_start = false;
@@ -360,6 +380,18 @@ fn query_fragment_end(chars: &[char], start: usize) -> usize {
         cursor += 1;
     }
     cursor
+}
+
+fn query_set_open(chars: &[char], start: usize) -> Option<usize> {
+    let after_in = start.checked_add(2)?;
+    if chars.get(start..after_in)? != ['I', 'N'] {
+        return None;
+    }
+    let mut open = after_in;
+    while chars.get(open).is_some_and(|ch| ch.is_whitespace()) {
+        open += 1;
+    }
+    (open > after_in && chars.get(open) == Some(&'[')).then_some(open)
 }
 
 /// Check if the characters at position `i` match "NOT" (case-insensitive)
@@ -609,6 +641,10 @@ mod tests {
             r#"title:"internal secret"~2"#,
             r"title: internal",
             r#"title:"internal secret"#,
+            r#"id:['a " b' TO b]"#,
+            r#"id: IN ['a " b']"#,
+            "ord:[0 TO -1]",
+            r#"id:IN ['a -b' 'NOT "phrase"']"#,
         ] {
             let raw = format!("needle -{operand}");
             let parsed = ParsedQuery::parse(&raw);
@@ -625,6 +661,35 @@ mod tests {
             [r#"title : "internal -secret""#, "outside"]
         );
         assert!(parsed.negative_phrases.is_empty());
+    }
+
+    #[test]
+    fn typed_literal_operands_do_not_create_exclusions() {
+        for operand in [
+            r"id:['a -b' TO z]",
+            r#"id:{'a not "b"' TO z]"#,
+            r#"id:IN ['not "phrase"' -AND]"#,
+            r"id: IN ['a -b']",
+            "ord:[0 TO -1]",
+            r"id:['a\' ] -b' TO z]",
+            "id:['café -猫' TO z]",
+            "id:IN [a -b]",
+        ] {
+            let raw = format!("{operand} -outside");
+            let parsed = ParsedQuery::parse(&raw);
+            assert_eq!(parsed.positive, operand, "{raw}");
+            assert_eq!(parsed.negative_terms, ["outside"], "{raw}");
+            assert!(parsed.negative_phrases.is_empty(), "{raw}");
+            assert_eq!(normalize_query_negations(&raw), raw, "{raw}");
+        }
+        for raw in [
+            r#"id:['unterminated -inside NOT "phrase""#,
+            "id:IN [a -inside",
+        ] {
+            let parsed = ParsedQuery::parse(raw);
+            assert_eq!(parsed.positive, raw, "{raw}");
+            assert!(!parsed.has_negations(), "{raw}");
+        }
     }
 
     #[test]
