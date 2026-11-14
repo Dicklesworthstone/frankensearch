@@ -1268,8 +1268,8 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
             after_whitespace = false;
         }
         if operand_start
-            && (field_start.is_none() || field_prefix(query, index).is_none())
             && let Some((_, length)) = comparison_operator(query, index)
+            && (field_start.is_none() || field_prefix(query, index).is_none())
         {
             // Comparison bounds are bare fragments, even when they start
             // with a quote or contain colons. Match the lexer's field-prefix
