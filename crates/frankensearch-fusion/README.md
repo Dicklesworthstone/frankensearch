@@ -73,6 +73,26 @@ let fused = rrf_fuse(&vector_hits, &lexical_hits, &config);
 // let (results, metrics) = searcher.search_collect(&cx, "query", 10).await?;
 ```
 
+### Final ranking with optional quality refinement
+
+`TwoTierSearcher::with_reranker` enables a cross-encoder with the `rerank`
+feature. `with_mmr_config` enables diversity ranking without that feature.
+Both retain a bounded candidate window beyond the displayed page, so a final
+ranker can promote a document outside the Initial top-k.
+
+Final ranking uses the refined pool when quality succeeds and the retained
+Initial pool when quality is absent, disabled, skipped, or fails. A fast-only
+search can therefore emit `Initial` followed by `Reranked`; a quality failure
+can emit `Initial`, `RefinementFailed`, then `Reranked`. Quality skip and failure
+reasons remain in the metrics. Cancellation at a phase callback stops later
+ranking work, and failed or unapplied ranking preserves the preceding result.
+MMR uses only fast vectors when quality did not succeed, and skips a pool that
+no single eligible vector space covers. Exclusion-only lexical browsing keeps
+its single Initial phase.
+
+Use `search` to observe each phase or `search_collect_with_text` to obtain the
+last successful ranking with document text available to the cross-encoder.
+
 ### Synchronous progressive retrieval
 
 `SyncTwoTierSearcher::search_iter` starts work when the iterator is consumed.
@@ -90,6 +110,7 @@ fn display_progressively(searcher: &SyncTwoTierSearcher, query: &TieredQueryEmbe
         match phase {
             SearchPhase::Initial { results, .. } => println!("Initial results: {results:?}"),
             SearchPhase::Refined { results, .. } => println!("Refined results: {results:?}"),
+            SearchPhase::Reranked { results, .. } => println!("Final results: {results:?}"),
             SearchPhase::RefinementFailed { error, .. } => eprintln!("{error}"),
         }
     }

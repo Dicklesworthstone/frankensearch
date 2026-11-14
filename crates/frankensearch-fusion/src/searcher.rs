@@ -12,8 +12,8 @@
 //!    result or graceful degradation (only fired when quality embedder is available
 //!    and `fast_only` is false).
 //! 3. [`SearchPhase::Reranked`] — optional cross-encoder or MMR ranking of the
-//!    retained refined candidate pool. Every displayed phase remains bounded to
-//!    the requested result limit.
+//!    retained refined pool, or the Initial pool when quality is skipped or
+//!    fails. Every displayed phase remains bounded to the requested result limit.
 
 use ahash::AHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -814,13 +814,16 @@ impl TwoTierSearcher {
         self.rrf_semantic_weight * f64::from(factor)
     }
 
-    /// Set the cross-encoder reranker for the final phase after quality succeeds.
+    /// Set the cross-encoder reranker for the final available candidate pool.
     ///
-    /// With the `rerank` feature enabled, the search retains up to 100 refined
+    /// With the `rerank` feature enabled, the search retains up to 100
     /// candidates by default, independently of the displayed result limit. The
     /// initial retrieval budgets widen to support that window, so its Initial
     /// page can differ from an otherwise identical search without reranking.
     /// Use `with_rerank_window` to choose a different bounded window.
+    /// Reranking uses refined candidates when quality succeeds, otherwise the
+    /// valid Initial pool, including fast-only searches and quality failures.
+    /// Cancellation always stops the request before another phase starts.
     /// Without the feature, the provider is retained but never invoked.
     #[must_use]
     pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
@@ -828,7 +831,7 @@ impl TwoTierSearcher {
         self
     }
 
-    /// Set the maximum refined candidate window submitted to the cross-encoder.
+    /// Set the maximum final candidate window submitted to the cross-encoder.
     ///
     /// This is independent of the requested output limit: a top-1 request can
     /// promote a candidate outside its Initial and Refined pages. The window is
@@ -873,14 +876,16 @@ impl TwoTierSearcher {
         self
     }
 
-    /// Configure MMR diversity ranking after successful quality refinement.
+    /// Configure MMR diversity ranking of the final available candidate pool.
     ///
     /// MMR works independently of a cross-encoder and does not require the
     /// `rerank` feature. Its candidate pool is retained before output is limited
     /// to `k`, allowing a diverse result below the displayed page to be selected.
     /// All compared vectors must come from one tier covering the entire pool;
-    /// otherwise MMR is skipped. When a cross-encoder ran first, MMR uses that
-    /// stage's final ordering as relevance, including any RRF combination.
+    /// otherwise MMR is skipped. Successful quality refinement permits quality
+    /// vectors; a skipped or failed quality stage uses only fast vectors.
+    /// When a cross-encoder ran first, MMR uses that stage's final ordering as
+    /// relevance, including any RRF combination.
     /// Enabled candidate pools above 1,000 are rejected by [`Self::search`]
     /// before retrieval or model work. Pools of zero or one disable MMR work.
     #[must_use]
@@ -1421,9 +1426,12 @@ impl TwoTierSearcher {
         // A final ranking window is a retrieval requirement, not a display
         // limit. Request it once up front so later stages can promote an
         // undisplayed candidate without re-querying a changing lexical index.
-        // Fast-only and absent-quality paths keep their existing work policy.
+        // An explicitly requested final ranker needs its window even when
+        // quality is unavailable, disabled, or later fails. Exclusion-only
+        // lexical browsing retains its single-phase contract.
         let quality_enabled = !lexical_complement && self.should_run_quality();
-        let candidate_target = if quality_enabled {
+        let final_ranking_enabled = !lexical_complement && self.final_ranking_enabled();
+        let candidate_target = if quality_enabled || final_ranking_enabled {
             self.final_candidate_target(k)
         } else {
             k
@@ -1592,6 +1600,8 @@ impl TwoTierSearcher {
                 false
             };
         let quality_phase_gate_skip = quality_enabled && self.phase_gate_should_skip_quality();
+        let mut refined_ranking_pool = None;
+        let mut phase2_latency = Duration::ZERO;
 
         if quality_enabled
             && !quality_circuit_open
@@ -1630,10 +1640,10 @@ impl TwoTierSearcher {
                     Err(error) => Ok(Err(error)),
                 },
             };
+            phase2_latency = phase2_start.elapsed();
 
             match phase2_result {
                 Err(_elapsed) => {
-                    let phase2_latency = phase2_start.elapsed();
                     metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                     let phase2_latency_ms =
                         u64::try_from(phase2_latency.as_millis()).unwrap_or(u64::MAX);
@@ -1679,7 +1689,6 @@ impl TwoTierSearcher {
                 }
                 Ok(phase2_outcome) => match phase2_outcome {
                     Ok(Phase2Outcome::SkippedZeroSignal) => {
-                        let phase2_latency = phase2_start.elapsed();
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                         metrics.skip_reason = Some("quality_query_zero_norm".to_owned());
                         self.maybe_record_quality_completion(phase2_latency, None);
@@ -1704,7 +1713,6 @@ impl TwoTierSearcher {
                             return Err(SearchError::Cancelled { phase, reason });
                         }
 
-                        let phase2_latency = phase2_start.elapsed();
                         let refined_display: Vec<_> =
                             refined_results.iter().take(k).cloned().collect();
                         let refined_count = refined_display.len();
@@ -1781,98 +1789,7 @@ impl TwoTierSearcher {
                             return Err(SearchError::Cancelled { phase, reason });
                         }
 
-                        // Phase 3: optional cross-encoder and/or MMR ranking.
-                        // MMR has no model dependency and remains available in
-                        // the ordinary feature profile.
-                        if self.final_ranking_enabled() {
-                            let phase3_start = Instant::now();
-                            let phase3 = async {
-                                #[cfg(feature = "rerank")]
-                                let (refined_results, ranker_id) = self
-                                    .run_cross_encoder(
-                                        cx,
-                                        semantic_query,
-                                        refined_results,
-                                        &text_fn,
-                                    )
-                                    .await?;
-                                #[cfg(not(feature = "rerank"))]
-                                let ranker_id = None;
-                                self.run_phase3(
-                                    cx,
-                                    k,
-                                    refined_results,
-                                    ranker_id,
-                                    phase3_start,
-                                    &mut metrics,
-                                )
-                            }
-                            .await;
-                            match phase3 {
-                                Ok(Some(outcome)) => {
-                                    let phase3_latency = phase3_start.elapsed();
-                                    let reranked_count = outcome.results.len();
-
-                                    if let Some(root_request_id) =
-                                        telemetry_root_request_id.as_deref()
-                                    {
-                                        let reranked_event_id = self.emit_search_telemetry(
-                                            semantic_query,
-                                            query_class,
-                                            SearchEventPhase::Reranked,
-                                            reranked_count,
-                                            metrics.lexical_candidates,
-                                            metrics.semantic_candidates,
-                                            metrics.hash_control_candidates,
-                                            phase3_latency,
-                                            root_request_id,
-                                            telemetry_initial_event_id.clone(),
-                                        );
-                                        if let Some(event_id) = &reranked_event_id {
-                                            telemetry_last_event_id = Some(event_id.clone());
-                                        }
-                                    }
-
-                                    on_phase(SearchPhase::Reranked {
-                                        results: outcome.results,
-                                        latency: phase3_latency + phase2_latency,
-                                        metrics: PhaseMetrics {
-                                            embedder_id: outcome.ranker_id,
-                                            vectors_searched: metrics.phase2_vectors_searched,
-                                            lexical_candidates: metrics.lexical_candidates,
-                                            fused_count: reranked_count,
-                                            skip_reason: None,
-                                            hash_control_candidates: metrics
-                                                .hash_control_candidates,
-                                        },
-                                    });
-                                }
-                                Ok(None) => {}
-                                Err(SearchError::Cancelled { phase, reason }) => {
-                                    if let Some(root_request_id) =
-                                        telemetry_root_request_id.as_deref()
-                                    {
-                                        self.emit_session_stop_telemetry(
-                                            root_request_id,
-                                            telemetry_last_event_id.clone(),
-                                            LifecycleState::Degraded,
-                                            LifecycleSeverity::Warn,
-                                            Some("cancelled".to_owned()),
-                                            search_started_at.elapsed(),
-                                        );
-                                    }
-                                    return Err(SearchError::Cancelled { phase, reason });
-                                }
-                                Err(err) => {
-                                    self.export_error(&err);
-                                    tracing::warn!(
-                                        error_code = err.diagnostic_code(),
-                                        "reranking phase failed"
-                                    );
-                                    // Don't emit RefinementFailed here because Refined already succeeded.
-                                }
-                            }
-                        }
+                        refined_ranking_pool = Some(refined_results);
                     }
                     Err(SearchError::Cancelled { phase, reason }) => {
                         // Cancellation describes this request, not the quality
@@ -1892,7 +1809,6 @@ impl TwoTierSearcher {
                         return Err(SearchError::Cancelled { phase, reason });
                     }
                     Err(err) => {
-                        let phase2_latency = phase2_start.elapsed();
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                         metrics.skip_reason = Some(err.diagnostic_code().to_owned());
                         self.export_error(&err);
@@ -1952,6 +1868,107 @@ impl TwoTierSearcher {
             }
         }
 
+        // Phase 3 is independently requested. Quality failure or a skip does
+        // not invalidate the retained Initial pool or disable its ranker.
+        // No Refined phase is invented when only final ordering changes.
+        if final_ranking_enabled {
+            let quality_refined = refined_ranking_pool.is_some();
+            if let Err(SearchError::Cancelled { phase, reason }) =
+                cancellation_checkpoint(cx, "initial_to_rerank")
+            {
+                if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                    self.emit_session_stop_telemetry(
+                        root_request_id,
+                        telemetry_last_event_id.clone(),
+                        LifecycleState::Degraded,
+                        LifecycleSeverity::Warn,
+                        Some("cancelled".to_owned()),
+                        search_started_at.elapsed(),
+                    );
+                }
+                return Err(SearchError::Cancelled { phase, reason });
+            }
+            let final_candidates = refined_ranking_pool.unwrap_or(initial_hits);
+            let phase3_start = Instant::now();
+            let phase3 = async {
+                #[cfg(feature = "rerank")]
+                let (final_candidates, ranker_id) = self
+                    .run_cross_encoder(cx, semantic_query, final_candidates, &text_fn)
+                    .await?;
+                #[cfg(not(feature = "rerank"))]
+                let ranker_id = None;
+                self.run_phase3(
+                    cx,
+                    k,
+                    final_candidates,
+                    ranker_id,
+                    quality_refined,
+                    phase3_start,
+                    &mut metrics,
+                )
+            }
+            .await;
+            match phase3 {
+                Ok(Some(outcome)) => {
+                    let phase3_latency = phase3_start.elapsed();
+                    let reranked_count = outcome.results.len();
+                    if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                        let reranked_event_id = self.emit_search_telemetry(
+                            semantic_query,
+                            query_class,
+                            SearchEventPhase::Reranked,
+                            reranked_count,
+                            metrics.lexical_candidates,
+                            metrics.semantic_candidates,
+                            metrics.hash_control_candidates,
+                            phase3_latency,
+                            root_request_id,
+                            telemetry_initial_event_id.clone(),
+                        );
+                        if let Some(event_id) = &reranked_event_id {
+                            telemetry_last_event_id = Some(event_id.clone());
+                        }
+                    }
+                    on_phase(SearchPhase::Reranked {
+                        results: outcome.results,
+                        latency: phase3_latency + phase2_latency,
+                        metrics: PhaseMetrics {
+                            embedder_id: outcome.ranker_id,
+                            vectors_searched: if quality_refined {
+                                metrics.phase2_vectors_searched
+                            } else {
+                                metrics.phase1_vectors_searched
+                            },
+                            lexical_candidates: metrics.lexical_candidates,
+                            fused_count: reranked_count,
+                            skip_reason: metrics.skip_reason.clone(),
+                            hash_control_candidates: metrics.hash_control_candidates,
+                        },
+                    });
+                }
+                Ok(None) => {}
+                Err(SearchError::Cancelled { phase, reason }) => {
+                    if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                        self.emit_session_stop_telemetry(
+                            root_request_id,
+                            telemetry_last_event_id.clone(),
+                            LifecycleState::Degraded,
+                            LifecycleSeverity::Warn,
+                            Some("cancelled".to_owned()),
+                            search_started_at.elapsed(),
+                        );
+                    }
+                    return Err(SearchError::Cancelled { phase, reason });
+                }
+                Err(err) => {
+                    self.export_error(&err);
+                    tracing::warn!(error_code = err.diagnostic_code(), "reranking phase failed");
+                    // Keep the preceding valid phase. A final-ranking failure
+                    // is not a second quality-refinement outcome.
+                }
+            }
+        }
+
         if let Err(cancellation) = cancellation_checkpoint(cx, "search_completion_to_session_stop")
         {
             let (phase, reason) = match cancellation {
@@ -1987,7 +2004,7 @@ impl TwoTierSearcher {
 
     /// Convenience method that collects all phases and returns the best results.
     ///
-    /// Returns the refined results if Phase 2 succeeds, otherwise the initial results.
+    /// Returns the last successful ranking: reranked, refined, or initial.
     ///
     /// This method cannot evaluate exclusion clauses because it does not accept
     /// a document text provider. Use [`search_collect_with_text`](Self::search_collect_with_text)
@@ -2016,7 +2033,7 @@ impl TwoTierSearcher {
     /// Convenience method that collects all phases while using `text_fn` for
     /// reranking and exclusion filtering.
     ///
-    /// Returns the refined results if Phase 2 succeeds, otherwise the initial results.
+    /// Returns the last successful ranking: reranked, refined, or initial.
     ///
     /// # Errors
     ///
@@ -3500,27 +3517,32 @@ impl TwoTierSearcher {
 
     /// Load one complete MMR candidate pool from a single embedding space.
     ///
-    /// Prefer quality when every candidate has quality coverage. Otherwise
-    /// retry the entire pool in the fast space. A pool spanning quality-only
-    /// and fast-only documents has no valid comparison space, so MMR is
-    /// skipped instead of comparing unrelated coordinates.
+    /// After successful quality refinement, prefer quality when every candidate
+    /// has quality coverage. Otherwise use the entire pool in the fast space.
+    /// A failed or skipped quality stage never authorizes its vectors for MMR.
+    /// A pool spanning quality-only and fast-only documents has no valid
+    /// comparison space, so MMR is skipped instead of comparing unrelated
+    /// coordinates.
     fn mmr_embeddings_in_one_space(
         &self,
         cx: &Cx,
         results: &[ScoredResult],
+        quality_refined: bool,
     ) -> SearchResult<Option<Vec<Vec<f32>>>> {
-        let mut quality = Vec::with_capacity(results.len());
-        for result in results {
-            let embedding = self.index.quality_vector_for_doc_id(&result.doc_id)?;
-            cancellation_checkpoint(cx, "mmr_quality_vector_lookup")?;
-            let Some(embedding) = embedding else {
-                quality.clear();
-                break;
-            };
-            quality.push(embedding);
-        }
-        if quality.len() == results.len() {
-            return Ok(Some(quality));
+        if quality_refined {
+            let mut quality = Vec::with_capacity(results.len());
+            for result in results {
+                let embedding = self.index.quality_vector_for_doc_id(&result.doc_id)?;
+                cancellation_checkpoint(cx, "mmr_quality_vector_lookup")?;
+                let Some(embedding) = embedding else {
+                    quality.clear();
+                    break;
+                };
+                quality.push(embedding);
+            }
+            if quality.len() == results.len() {
+                return Ok(Some(quality));
+            }
         }
 
         let mut fast = Vec::with_capacity(results.len());
@@ -3571,13 +3593,14 @@ impl TwoTierSearcher {
     }
 
     /// Finish Phase 3 with synchronous MMR and result explanations.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn run_phase3(
         &self,
         cx: &Cx,
         k: usize,
         mut results: Vec<ScoredResult>,
         mut ranker_id: Option<String>,
+        quality_refined: bool,
         ranking_start: Instant,
         metrics: &mut TwoTierMetrics,
     ) -> SearchResult<Option<Phase3Outcome>> {
@@ -3586,7 +3609,9 @@ impl TwoTierSearcher {
         if self.mmr_config.enabled && results.len() > 1 {
             let pool = results.len().min(self.mmr_config.candidate_pool.max(1));
             if pool > 1 {
-                if let Some(embeddings) = self.mmr_embeddings_in_one_space(cx, &results[..pool])? {
+                if let Some(embeddings) =
+                    self.mmr_embeddings_in_one_space(cx, &results[..pool], quality_refined)?
+                {
                     cancellation_checkpoint(cx, "mmr_lookup_to_rerank")?;
                     let scores = results
                         .iter()
@@ -7718,7 +7743,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_quality_response_preserves_initial_before_prf_and_reranking() {
+    fn zero_quality_response_skips_quality_work_but_allows_explicit_final_ranking() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for layout in ["stamped-v1", "exact-v2", "native-v2"] {
                 let (_index_dir, index) = query_admission_index(layout);
@@ -7765,12 +7790,24 @@ mod tests {
                                         );
                                         phases.push("initial");
                                     }
+                                    SearchPhase::Reranked { results, .. } => {
+                                        assert!(cfg!(feature = "rerank") && !zero_fast);
+                                        assert!(results.iter().all(|hit| {
+                                            hit.quality_score.is_none()
+                                                && hit.rerank_score.is_some()
+                                        }));
+                                        phases.push("reranked");
+                                    }
                                     phase => panic!("zero quality published {phase:?}"),
                                 },
                             )
                             .await
                             .unwrap();
-                        assert_eq!(phases, ["initial"]);
+                        if cfg!(feature = "rerank") && !zero_fast {
+                            assert_eq!(phases, ["initial", "reranked"]);
+                        } else {
+                            assert_eq!(phases, ["initial"]);
+                        }
                         assert_eq!(
                             metrics.skip_reason.as_deref(),
                             Some("quality_query_zero_norm")
@@ -7780,7 +7817,10 @@ mod tests {
                         assert_eq!(metrics.zero_signal.is_some(), zero_fast);
                         assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
                         #[cfg(feature = "rerank")]
-                        assert_eq!(rerank_calls.load(Ordering::Relaxed), 0);
+                        assert_eq!(
+                            rerank_calls.load(Ordering::Relaxed),
+                            usize::from(!zero_fast)
+                        );
                     }
                 }
             }
@@ -8810,7 +8850,7 @@ mod tests {
             ];
 
             let embeddings = searcher
-                .mmr_embeddings_in_one_space(&cx, &results)
+                .mmr_embeddings_in_one_space(&cx, &results, true)
                 .expect("load one-space MMR pool")
                 .expect("the complete fast tier covers this pool");
 
@@ -8845,7 +8885,7 @@ mod tests {
 
             assert!(
                 searcher
-                    .mmr_embeddings_in_one_space(&cx, &results)
+                    .mmr_embeddings_in_one_space(&cx, &results, true)
                     .expect("lookups remain valid")
                     .is_none(),
                 "MMR must skip when no one vector space covers the whole pool"
@@ -9059,6 +9099,122 @@ mod tests {
                 assert_eq!(fast_calls.load(Ordering::Relaxed), 1);
                 assert_eq!(quality_calls.load(Ordering::Relaxed), 1);
                 assert_eq!(text_calls.load(Ordering::Relaxed), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn mmr_ranks_initial_pool_when_quality_is_absent_disabled_or_failed() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for quality_mode in ["absent", "disabled", "failed"] {
+                let directory = fixture_tempdir("mmr-initial-pool-");
+                let mut builder =
+                    TwoTierIndex::create(directory.path(), TwoTierConfig::default()).unwrap();
+                builder.set_fast_embedder_id("stub-fast");
+                builder.set_quality_embedder_id("stub-quality");
+                for (doc_id, relevance, direction) in [
+                    ("doc-0", 0.8_f32, 1.0),
+                    ("doc-4", 0.75, 1.0),
+                    ("doc-1", 0.6, -1.0),
+                ] {
+                    builder
+                        .add_fast_record(
+                            doc_id,
+                            &[
+                                relevance,
+                                direction * (1.0 - relevance * relevance).sqrt(),
+                                0.0,
+                                0.0,
+                            ],
+                        )
+                        .unwrap();
+                    // Quality covers every candidate, but carries different
+                    // similarity evidence. Using it after a skip or failure
+                    // would wrongly keep doc-4 instead of diversifying to doc-1.
+                    builder
+                        .add_quality_record(doc_id, &[1.0, 0.0, 0.0, 0.0])
+                        .unwrap();
+                }
+                let index = Arc::new(builder.finish().unwrap());
+                let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(CountingEmbedder::new("fast", 4, fast_calls.clone())),
+                    TwoTierConfig {
+                        candidate_multiplier: 1,
+                        fast_only: quality_mode == "disabled",
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_mmr_config(MmrConfig {
+                    enabled: true,
+                    lambda: 0.3,
+                    candidate_pool: 3,
+                });
+                if quality_mode == "failed" {
+                    searcher = searcher.with_quality_embedder(Arc::new(FailingEmbedder));
+                } else if quality_mode == "disabled" {
+                    searcher = searcher.with_quality_embedder(Arc::new(CountingEmbedder::new(
+                        "quality",
+                        4,
+                        quality_calls.clone(),
+                    )));
+                }
+                let mut phases = Vec::new();
+                let mut initial = serde_json::Value::Null;
+                let metrics = searcher
+                    .search(
+                        &cx,
+                        "find diverse relevant documents",
+                        2,
+                        |_| panic!("standalone MMR must not hydrate cross-encoder text"),
+                        |phase| match phase {
+                            SearchPhase::Initial { results, .. } => {
+                                assert_eq!(results.len(), 2);
+                                assert_eq!(results[0].doc_id, "doc-0");
+                                assert_eq!(results[1].doc_id, "doc-4");
+                                initial = serde_json::to_value(&results).unwrap();
+                                phases.push("initial");
+                            }
+                            SearchPhase::RefinementFailed {
+                                initial_results, ..
+                            } => {
+                                assert_eq!(quality_mode, "failed");
+                                assert_eq!(serde_json::to_value(initial_results).unwrap(), initial);
+                                phases.push("failed");
+                            }
+                            SearchPhase::Reranked {
+                                results, metrics, ..
+                            } => {
+                                assert_eq!(metrics.embedder_id, "mmr");
+                                assert_eq!(metrics.vectors_searched, 3);
+                                assert!(metrics.skip_reason.is_some());
+                                assert_eq!(results.len(), 2);
+                                assert_eq!(results[0].doc_id, "doc-0");
+                                assert_eq!(results[1].doc_id, "doc-1");
+                                assert!(results.iter().all(|hit| {
+                                    hit.source == ScoreSource::SemanticFast
+                                        && hit.quality_score.is_none()
+                                        && hit.rerank_score.is_none()
+                                }));
+                                phases.push("reranked");
+                            }
+                            phase => panic!("unavailable quality must not publish {phase:?}"),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let expected: &[&str] = if quality_mode == "failed" {
+                    &["initial", "failed", "reranked"]
+                } else {
+                    &["initial", "reranked"]
+                };
+                assert_eq!(phases, expected, "{quality_mode}");
+                assert_eq!(fast_calls.load(Ordering::Relaxed), 1);
+                assert_eq!(quality_calls.load(Ordering::Relaxed), 0);
+                assert_eq!(metrics.phase2_vectors_searched, 0);
+                assert!(metrics.skip_reason.is_some());
             }
         });
     }
@@ -14446,6 +14602,202 @@ mod tests {
 
     #[cfg(feature = "rerank")]
     #[test]
+    fn rerank_promotes_initial_candidates_without_successful_quality() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_directory, index) = query_admission_index(layout);
+                for quality_mode in ["absent", "failed", "circuit-open"] {
+                    let fast = Arc::new(query_admission_embedder("fast"));
+                    let mut quality = query_admission_embedder("quality");
+                    if quality_mode == "failed" {
+                        quality.bound_action = Some(BoundResponseAction::Fail);
+                    }
+                    let quality = Arc::new(quality);
+                    let reranker = Arc::new(WindowReranker::default());
+                    let mut searcher = TwoTierSearcher::new(
+                        index.clone(),
+                        fast.clone(),
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_reranker(reranker.clone())
+                    .with_rerank_window(2)
+                    .unwrap();
+                    if quality_mode != "absent" {
+                        searcher = searcher.with_quality_embedder(quality.clone());
+                    }
+                    if quality_mode == "circuit-open" {
+                        let breaker = Arc::new(CircuitBreaker::with_defaults());
+                        breaker.force_open();
+                        searcher = searcher.with_circuit_breaker(breaker);
+                    }
+                    let mut phases = Vec::new();
+                    let mut initial = serde_json::Value::Null;
+                    let mut final_results = Vec::new();
+                    let metrics = searcher
+                        .search(
+                            &cx,
+                            "find relevant documents",
+                            1,
+                            |id| Some(format!("text for {id}")),
+                            |phase| match phase {
+                                SearchPhase::Initial { results, .. } => {
+                                    assert_eq!(results.len(), 1);
+                                    assert_eq!(results[0].doc_id, "doc-a");
+                                    assert!(reranker.submitted.lock().unwrap().is_empty());
+                                    assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 0);
+                                    initial = serde_json::to_value(&results).unwrap();
+                                    phases.push("initial");
+                                }
+                                SearchPhase::RefinementFailed {
+                                    initial_results, ..
+                                } => {
+                                    assert_eq!(quality_mode, "failed");
+                                    assert_eq!(
+                                        serde_json::to_value(initial_results).unwrap(),
+                                        initial
+                                    );
+                                    assert!(reranker.submitted.lock().unwrap().is_empty());
+                                    phases.push("failed");
+                                }
+                                SearchPhase::Reranked {
+                                    results, metrics, ..
+                                } => {
+                                    assert_eq!(results.len(), 1);
+                                    assert_eq!(results[0].doc_id, "doc-b");
+                                    assert_eq!(results[0].source, ScoreSource::Reranked);
+                                    assert!(results[0].fast_score.is_some());
+                                    assert!(results[0].quality_score.is_none());
+                                    assert!(results[0].rerank_score.is_some());
+                                    assert_eq!(metrics.embedder_id, "window-reranker");
+                                    assert!(metrics.skip_reason.is_some());
+                                    final_results = results;
+                                    phases.push("reranked");
+                                }
+                                phase => panic!("{layout}/{quality_mode}: unexpected {phase:?}"),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let expected: &[&str] = if quality_mode == "failed" {
+                        &["initial", "failed", "reranked"]
+                    } else {
+                        &["initial", "reranked"]
+                    };
+                    assert_eq!(phases, expected, "{layout}/{quality_mode}");
+                    assert_eq!(fast.embed_count(), 1);
+                    assert_eq!(
+                        quality.bound_embeds.load(Ordering::Relaxed),
+                        u64::from(quality_mode == "failed")
+                    );
+                    assert_eq!(metrics.phase2_vectors_searched, 0);
+                    assert_eq!(
+                        *reranker.submitted.lock().unwrap(),
+                        [vec!["doc-a", "doc-b"]]
+                    );
+                    let expected_skip = match quality_mode {
+                        "absent" => "no_quality_embedder",
+                        "failed" => "embedding_failed",
+                        _ => "circuit_breaker_open",
+                    };
+                    assert_eq!(metrics.skip_reason.as_deref(), Some(expected_skip));
+                    if quality_mode == "absent" {
+                        let (collected, _) = searcher
+                            .search_collect_with_text(&cx, "find relevant documents", 1, |id| {
+                                Some(format!("text for {id}"))
+                            })
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(collected).unwrap(),
+                            serde_json::to_value(final_results).unwrap()
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn initial_and_quality_failure_cancellation_stop_before_final_ranking() {
+        for cancel_after_failure in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_directory, index) = query_admission_index("exact-v2");
+                let mut quality = query_admission_embedder("quality");
+                quality.bound_action = Some(BoundResponseAction::Fail);
+                let quality = Arc::new(quality);
+                let reranker = Arc::new(WindowReranker::default());
+                let adapter = Arc::new(RecordingHostAdapter::new("initial_ranking_cancel"));
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(query_admission_embedder("fast")),
+                    TwoTierConfig::default(),
+                )
+                .with_quality_embedder(quality.clone())
+                .with_reranker(reranker.clone())
+                .with_mmr_config(MmrConfig {
+                    enabled: true,
+                    lambda: 0.3,
+                    candidate_pool: 2,
+                })
+                .with_host_adapter(adapter.clone());
+                let mut phases = Vec::new();
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find relevant documents",
+                        1,
+                        |_| panic!("cancelled final ranking must not hydrate text"),
+                        |phase| {
+                            let cancel = match phase {
+                                SearchPhase::Initial { .. } => {
+                                    phases.push("initial");
+                                    !cancel_after_failure
+                                }
+                                SearchPhase::RefinementFailed { .. } => {
+                                    phases.push("failed");
+                                    cancel_after_failure
+                                }
+                                phase => panic!("cancelled search published {phase:?}"),
+                            };
+                            if cancel {
+                                cx.cancel_with(
+                                    asupersync::CancelKind::User,
+                                    Some("stop before final ranking"),
+                                );
+                            }
+                        },
+                    )
+                    .await
+                    .expect_err("phase callback cancellation must stop final ranking");
+                let expected_phase = if cancel_after_failure {
+                    "initial_to_rerank"
+                } else {
+                    "initial_to_quality"
+                };
+                assert!(matches!(error, SearchError::Cancelled { ref phase, .. }
+                    if phase == expected_phase));
+                let expected: &[&str] = if cancel_after_failure {
+                    &["initial", "failed"]
+                } else {
+                    &["initial"]
+                };
+                assert_eq!(phases, expected);
+                assert!(reranker.submitted.lock().unwrap().is_empty());
+                assert_eq!(
+                    quality.bound_embeds.load(Ordering::Relaxed),
+                    u64::from(cancel_after_failure)
+                );
+                assert_single_cancelled_session_stop(&adapter, expected_phase);
+            });
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
     fn rerank_window_promotes_an_undisplayed_candidate_for_top_one() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for layout in ["stamped-v1", "exact-v2", "native-v2"] {
@@ -14586,7 +14938,7 @@ mod tests {
 
     #[cfg(feature = "rerank")]
     #[test]
-    fn rerank_window_rejects_unbounded_work_and_preserves_fast_only_policy() {
+    fn rerank_window_rejects_unbounded_work_and_keeps_quality_disabled_in_fast_only_mode() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_index_dir, index) = query_admission_index("exact-v2");
             let fast = Arc::new(query_admission_embedder("fast"));
@@ -14620,25 +14972,46 @@ mod tests {
                 candidate_pool: 30,
             });
             for k in [0, 1] {
-                let mut phases = 0;
+                let mut phases = Vec::new();
                 searcher
                     .search(
                         &cx,
                         "find relevant documents",
                         k,
-                        |_| panic!("fast-only must not start final text hydration"),
-                        |phase| {
-                            assert!(matches!(phase, SearchPhase::Initial { .. }));
-                            phases += 1;
+                        |id| Some(format!("text for {id}")),
+                        |phase| match phase {
+                            SearchPhase::Initial { results, .. } => {
+                                assert_eq!(results[0].doc_id, "doc-a");
+                                assert!(reranker.submitted.lock().unwrap().is_empty());
+                                phases.push("initial");
+                            }
+                            SearchPhase::Reranked {
+                                results, metrics, ..
+                            } => {
+                                assert_eq!(results[0].doc_id, "doc-b");
+                                assert!(results[0].quality_score.is_none());
+                                assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only"));
+                                phases.push("reranked");
+                            }
+                            phase => panic!("fast-only must not refine quality: {phase:?}"),
                         },
                     )
                     .await
                     .expect("fast-only policy");
-                assert_eq!(phases, k);
+                if k == 0 {
+                    assert!(phases.is_empty());
+                    assert_eq!(fast.embed_count(), 0);
+                    assert!(reranker.submitted.lock().unwrap().is_empty());
+                } else {
+                    assert_eq!(phases, ["initial", "reranked"]);
+                }
             }
             assert_eq!(fast.embed_count(), 1);
             assert_eq!(quality.embed_count(), 0);
-            assert!(reranker.submitted.lock().unwrap().is_empty());
+            assert_eq!(
+                *reranker.submitted.lock().unwrap(),
+                [vec!["doc-a", "doc-b"]]
+            );
         });
     }
 
