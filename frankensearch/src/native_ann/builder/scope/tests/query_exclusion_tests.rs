@@ -279,11 +279,23 @@ fn exclusion_census_keeps_boolean_words_literal_when_combining_terms() {
                     .into_iter()
                     .filter(|id| *id != word)
                     .collect();
-                for query in [
-                    format!("needle -{word} -absent"),
-                    format!("needle -absent -{word}"),
-                    format!("needle -\"{word}\" -absent"),
+                for (query, exclusion_only) in [
+                    (format!("needle -{word} -absent"), false),
+                    (format!("needle -absent -{word}"), false),
+                    (format!("needle -\"{word}\" -absent"), false),
+                    (format!("-{word}"), true),
+                    (format!("-{word} "), true),
+                    (format!("-{word} \t"), true),
+                    (format!("-{word} -absent"), true),
+                    (format!("-absent -{word} "), true),
+                    (format!("-\"{word}\" "), true),
                 ] {
+                    fast.fail.store(exclusion_only, Ordering::SeqCst);
+                    quality.fail.store(exclusion_only, Ordering::SeqCst);
+                    let calls_before = (
+                        fast.queries.load(Ordering::SeqCst),
+                        quality.queries.load(Ordering::SeqCst),
+                    );
                     for hits in [
                         index.search(&cx, &query, 10).await.unwrap(),
                         index.search_refined(&cx, &query, 10).await.unwrap(),
@@ -292,6 +304,23 @@ fn exclusion_census_keeps_boolean_words_literal_when_combining_terms() {
                         let actual: BTreeSet<_> =
                             hits.iter().map(|hit| hit.doc_id.as_str()).collect();
                         assert_eq!(actual, expected, "ann={ann}, query={query}");
+                        if exclusion_only {
+                            assert!(
+                                hits.iter()
+                                    .all(|hit| hit.fast_score.is_none()
+                                        && hit.quality_score.is_none())
+                            );
+                        }
+                    }
+                    if exclusion_only {
+                        assert_eq!(
+                            (
+                                fast.queries.load(Ordering::SeqCst),
+                                quality.queries.load(Ordering::SeqCst),
+                            ),
+                            calls_before,
+                            "exclusion-only queries must not run inference: {query}"
+                        );
                     }
                 }
             }

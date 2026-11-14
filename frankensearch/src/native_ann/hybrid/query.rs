@@ -72,9 +72,18 @@ impl ImmutableTextQuery {
         if !query.is_empty() {
             exclusion_queries.push(query);
         }
+        // prepare() captures every exclusion against this immutable cohort.
+        // With no positive predicate, enumerate All and apply that membership.
+        // Parsing the original all-negative text again can instead drop bare
+        // Boolean operands (for example, "-AND ") and leave an Empty query.
+        let lexical = if parsed.is_positive_empty() {
+            "*".to_owned()
+        } else {
+            normalize_phrase_negation_keywords(text).into_owned()
+        };
         Some(Self {
             semantic: parsed.positive,
-            lexical: normalize_phrase_negation_keywords(text).into_owned(),
+            lexical,
             exclusion_queries,
             excluded: Arc::default(),
             ceiling: 0,
