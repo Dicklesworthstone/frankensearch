@@ -5455,7 +5455,7 @@ impl CassQueryParser {
                 if fragments.terms.is_empty() {
                     return Err(QueryDiagnosticKind::DroppedFragment);
                 }
-                if cass_needs_indexed_fragments(raw) {
+                if cass_needs_indexed_fragments(raw) || cass_has_mixed_ascii_cjk(raw) {
                     let ascii_tail = fragments.terms.last().is_some_and(|term| term.is_ascii());
                     let implicit_prefix = (2..=20).contains(&raw.chars().take(21).count());
                     return Ok(Some(self.lower_indexed_fragments(
@@ -5477,9 +5477,9 @@ impl CassQueryParser {
             CassWildcardPattern::Suffix(_)
             | CassWildcardPattern::Substring(_)
             | CassWildcardPattern::Complex(_) => {
-                if cass_needs_indexed_fragments(raw) {
+                if cass_needs_indexed_fragments(raw) || cass_has_mixed_ascii_cjk(raw) {
                     // A regex over one dictionary term cannot express a
-                    // wildcard spanning the fragments of an accented word.
+                    // wildcard spanning accented or mixed-script fragments.
                     return Err(QueryDiagnosticKind::DroppedFragment);
                 }
                 if !cass_short_ascii_operand_is_admitted(raw.trim_matches('*'))
@@ -5570,7 +5570,9 @@ impl CassQueryParser {
                 return Err(QueryDiagnosticKind::DroppedFragment);
             }
         }
-        if cass_needs_indexed_fragments(raw) {
+        if cass_needs_indexed_fragments(raw)
+            || parts.iter().any(|part| cass_has_mixed_ascii_cjk(part))
+        {
             let fragments = cass_analyzed_fragments(&parts.join(" "))?;
             return Ok(self.lower_indexed_fragments(&fragments, false));
         }
@@ -5608,6 +5610,13 @@ struct CassIndexedFragments {
 
 fn cass_needs_indexed_fragments(raw: &str) -> bool {
     raw.chars().any(|ch| !ch.is_ascii() && !is_cass_cjk(ch))
+}
+
+/// A mixed operand crosses tokenizer runs even without an unsupported scalar.
+/// Keep its ASCII terms and CJK run boundaries: filtering to CJK first would
+/// turn `東京abc大阪` into `東京大阪`, dropping `abc` and inventing `京大`.
+fn cass_has_mixed_ascii_cjk(raw: &str) -> bool {
+    raw.chars().any(is_cass_cjk) && raw.bytes().any(|byte| byte.is_ascii_alphanumeric())
 }
 
 /// Preserve combining marks and original case inside affected operands.

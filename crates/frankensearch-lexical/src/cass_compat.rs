@@ -2621,7 +2621,9 @@ fn cass_normalize_phrase_terms(raw: &str) -> SearchResult<(CassIndexedFragments,
             ));
         }
     }
-    if cass_needs_indexed_fragments(raw) {
+    if cass_needs_indexed_fragments(raw)
+        || parts.iter().any(|part| cass_has_mixed_ascii_cjk(part))
+    {
         return Ok((cass_analyzed_fragments(&parts.join(" "))?, true));
     }
     if parts.len() > CASS_MAX_QUERY_FRAGMENTS {
@@ -3030,7 +3032,7 @@ fn cass_build_compound_term_query(
         if fragments.terms.is_empty() {
             return Err(cass_normalization_error("operand has no searchable terms"));
         }
-        if cass_needs_indexed_fragments(part) {
+        if cass_needs_indexed_fragments(part) || cass_has_mixed_ascii_cjk(part) {
             let prefix = match pattern {
                 CassWildcardPattern::Exact(_) => (2..=20).contains(&core.chars().take(21).count()),
                 CassWildcardPattern::Prefix(_) => true,
@@ -3357,6 +3359,13 @@ const CASS_MAX_QUERY_NESTING: usize = 128;
 fn cass_needs_indexed_fragments(raw: &str) -> bool {
     raw.chars()
         .any(|ch| !ch.is_ascii() && !is_cass_tokenizer_cjk(ch))
+}
+
+/// A mixed operand crosses tokenizer runs even without an unsupported scalar.
+/// Keep its ASCII terms and CJK run boundaries: filtering to CJK first would
+/// turn `東京abc大阪` into `東京大阪`, dropping `abc` and inventing `京大`.
+fn cass_has_mixed_ascii_cjk(raw: &str) -> bool {
+    raw.chars().any(is_cass_tokenizer_cjk) && raw.bytes().any(|byte| byte.is_ascii_alphanumeric())
 }
 
 /// A short ASCII operand containing a letter or digit necessarily contributes
@@ -5632,6 +5641,105 @@ mod cass_query_tests {
                 cass_result_ids(&searcher, &fields, omitted, &filters),
                 vec![0, 1, 2],
                 "{omitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_mixed_ascii_cjk_operands_preserve_indexed_runs() {
+        let directory = tempfile::tempdir().expect("mixed-script CASS directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create mixed-script CASS index");
+        let rows = [
+            ("", "backup abc東京"),
+            ("", "backup 東京"),
+            ("abc", "backup 東京"),
+            ("", "backup 東京abc大阪"),
+            ("", "backup 東京xyz大阪"),
+            ("", "backup 東京大阪"),
+            ("", "backup 東京abcdef大阪"),
+            ("東京", "backup abc大阪"),
+            ("", "backup foo東京bar大阪baz"),
+            ("", "backup foo東京qux大阪baz"),
+            ("", "backup 42東京7大阪9"),
+            ("abc東京", "backup"),
+        ];
+        let documents = rows
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (title, content))| {
+                cass_prefix_fixture_document(
+                    u64::try_from(ordinal).expect("fixture ordinal"),
+                    title,
+                    content,
+                )
+            })
+            .collect::<Vec<_>>();
+        index
+            .add_cass_documents(&documents)
+            .expect("index mixed scripts");
+        index.commit().expect("commit mixed scripts");
+        let reader = index.reader().expect("mixed-script reader");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let filters = CassQueryFilters::default();
+        for (raw, expected) in [
+            ("abc東京", vec![0, 3, 11]),
+            ("ABC東京", vec![0, 3, 11]),
+            ("abc-東京", vec![0, 3, 11]),
+            ("東京abc大阪", vec![3]),
+            ("東京abc", vec![0, 3, 6, 11]),
+            ("東京abc*", vec![0, 3, 6, 11]),
+            ("東京ab*", vec![0, 3, 6, 11]),
+            // CJK tails retain the legacy bigram expansion policy.
+            ("abc東京*", vec![0, 3, 11]),
+            ("\"東京abc\"", vec![0, 3, 11]),
+            ("\"東京abc大阪\"", vec![3]),
+            ("foo東京bar大阪baz", vec![8]),
+            ("42東京7大阪9", vec![10]),
+            ("abc東京 AND 大阪", vec![3]),
+            ("abc東京 OR foo", vec![0, 3, 8, 9, 11]),
+            ("NOT NOT 東京abc大阪", vec![3]),
+            ("backup NOT abc東京", vec![1, 2, 4, 5, 6, 7, 8, 9, 10]),
+            (
+                "backup NOT 東京abc大阪",
+                vec![0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11],
+            ),
+            // Keep pure-CJK and separate operands' legacy behavior.
+            ("東京大阪", vec![5]),
+            ("\"東京 大阪\"", vec![3, 4, 5, 6, 7, 8, 9, 10]),
+            ("\"東京 abc 大阪\"", vec![3, 6, 7]),
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, raw, &filters),
+                expected,
+                "mixed-script query {raw:?}"
+            );
+            let query = cass_build_tantivy_query(raw, &filters, &fields);
+            assert_eq!(
+                searcher
+                    .search(&*query, &tantivy::collector::Count)
+                    .expect("count mixed-script query"),
+                expected.len(),
+                "mixed-script count {raw:?}"
+            );
+        }
+        let positive = scored_cass_results(&searcher, &fields, "backup", &filters);
+        for raw in ["backup NOT abc東京", "backup NOT 東京abc大阪"] {
+            for (id, score) in scored_cass_results(&searcher, &fields, raw, &filters) {
+                assert_eq!(score.to_bits(), positive[&id].to_bits(), "{raw:?}");
+            }
+        }
+        for raw in [
+            "*abc東京",
+            "ab*東京",
+            "backup OR *abc東京",
+            "backup NOT *abc東京",
+        ] {
+            assert!(
+                cass_result_ids(&searcher, &fields, raw, &filters).is_empty(),
+                "unsupported mixed wildcard {raw:?}"
             );
         }
     }

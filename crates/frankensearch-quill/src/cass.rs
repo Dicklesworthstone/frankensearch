@@ -2285,6 +2285,142 @@ mod tests {
         });
     }
 
+    /// Mixed ASCII/CJK operands must retain every indexed run. Removing ASCII
+    /// broadens abc東京 and invents a 京大 token in 東京abc大阪, including
+    /// when the caller uses either operand to exclude documents.
+    #[test]
+    fn cass_mixed_ascii_cjk_operands_preserve_indexed_runs() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("mixed-script CASS directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create mixed-script CASS index");
+            let rows = [
+                ("", "backup abc東京"),
+                ("", "backup 東京"),
+                ("abc", "backup 東京"),
+                ("", "backup 東京abc大阪"),
+                ("", "backup 東京xyz大阪"),
+                ("", "backup 東京大阪"),
+                ("", "backup 東京abcdef大阪"),
+                ("東京", "backup abc大阪"),
+                ("", "backup foo東京bar大阪baz"),
+                ("", "backup foo東京qux大阪baz"),
+                ("", "backup 42東京7大阪9"),
+                ("abc東京", "backup"),
+            ];
+            let documents = rows
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (title, content))| {
+                    sample_document(
+                        &format!("mixed-{ordinal}"),
+                        u64::try_from(ordinal).expect("fixture ordinal"),
+                        "codex",
+                        title,
+                        content,
+                    )
+                    .to_schema_document()
+                })
+                .collect::<Vec<_>>();
+            let ids = documents
+                .iter()
+                .enumerate()
+                .map(|(ordinal, document)| (document.id.clone(), ordinal))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            index
+                .index_schema_documents(&cx, &documents)
+                .await
+                .expect("index mixed scripts");
+            index.commit(&cx).await.expect("seal mixed scripts");
+            drop(index);
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("reopen mixed-script index");
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            let search = |raw: &str| {
+                let parsed = parser.parse(raw, &filters);
+                assert!(parsed.diagnostics.is_empty(), "valid mixed operand {raw:?}");
+                reader
+                    .search_preparsed_paginated(&cx, &parsed.query, rows.len(), 0, true)
+                    .expect("search mixed scripts")
+            };
+            for (raw, expected) in [
+                ("abc東京", &[0, 3, 11][..]),
+                ("ABC東京", &[0, 3, 11]),
+                ("abc-東京", &[0, 3, 11]),
+                ("東京abc大阪", &[3]),
+                ("東京abc", &[0, 3, 6, 11]),
+                ("東京abc*", &[0, 3, 6, 11]),
+                ("東京ab*", &[0, 3, 6, 11]),
+                // CJK tails retain the legacy bigram expansion policy.
+                ("abc東京*", &[0, 3, 11]),
+                ("\"東京abc\"", &[0, 3, 11]),
+                ("\"東京abc大阪\"", &[3]),
+                ("foo東京bar大阪baz", &[8]),
+                ("42東京7大阪9", &[10]),
+                ("abc東京 AND 大阪", &[3]),
+                ("abc東京 OR foo", &[0, 3, 8, 9, 11]),
+                ("NOT NOT 東京abc大阪", &[3]),
+                ("backup NOT abc東京", &[1, 2, 4, 5, 6, 7, 8, 9, 10]),
+                (
+                    "backup NOT 東京abc大阪",
+                    &[0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11],
+                ),
+                // Pure-CJK and separate operands keep their legacy contract.
+                ("東京大阪", &[5]),
+                ("\"東京 大阪\"", &[3, 4, 5, 6, 7, 8, 9, 10]),
+                ("\"東京 abc 大阪\"", &[3, 6, 7]),
+            ] {
+                let result = search(raw);
+                let mut actual = result
+                    .hits
+                    .iter()
+                    .map(|hit| ids[&hit.document_id])
+                    .collect::<Vec<_>>();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "mixed-script query {raw:?}");
+                assert_eq!(
+                    result.total_count,
+                    Some(u64::try_from(expected.len()).expect("fixture count")),
+                    "mixed-script count {raw:?}"
+                );
+            }
+            let positive = search("backup")
+                .hits
+                .iter()
+                .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            for raw in ["backup NOT abc東京", "backup NOT 東京abc大阪"] {
+                for hit in search(raw).hits.iter() {
+                    assert_eq!(hit.score.to_bits(), positive[&hit.document_id], "{raw:?}");
+                }
+            }
+            for raw in [
+                "*abc東京",
+                "ab*東京",
+                "backup OR *abc東京",
+                "backup NOT *abc東京",
+            ] {
+                let parsed = parser.parse(raw, &filters);
+                assert!(parsed.query.is_empty(), "unsupported mixed wildcard {raw:?}");
+                assert!(!parsed.diagnostics.is_empty(), "refused query {raw:?}");
+            }
+        });
+    }
+
     /// A date-filtered query must keep working once a sealed segment holds a
     /// tombstone (frankensearch#49, cass GH #499).
     ///
