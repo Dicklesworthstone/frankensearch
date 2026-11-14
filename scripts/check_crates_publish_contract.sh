@@ -17,8 +17,8 @@ CENSUS_SCHEMA_VERSION="frankensearch-crates-registry-census-v1"
 # only; bump these literals deliberately, together with the lockfile, the
 # fresh-process contract pin in frankensearch-embed, and docs/planning/UPGRADE_LOG.md.
 AUDITED_ASUPERSYNC_VERSION="0.6.2"
-AUDITED_FSQLITE_FAMILY_VERSION="0.4.7"
-AUDITED_FSQLITE_PAGER_VERSION="0.4.7"
+AUDITED_FSQLITE_FAMILY_VERSION="0.5.0"
+AUDITED_FSQLITE_PAGER_VERSION="0.5.0"
 USER_AGENT="frankensearch-publish-contract/1.0 (https://github.com/Dicklesworthstone/frankensearch)"
 
 usage() {
@@ -719,7 +719,7 @@ run_self_test() {
   # The immediately preceding audited versions remain invalid for this
   # candidate, even with coherent registry sources and no duplicate packages.
   local prior_family prior_receipt prior_code
-  for prior_family in asupersync fsqlite family-previous family-0.4.4 pager-old pager-previous pager-unreviewed; do
+  for prior_family in asupersync fsqlite family-previous family-0.4.4 family-0.4.7 pager-old pager-previous pager-unreviewed; do
     prior_receipt="${temp_dir}/receipt-prior-${prior_family}.json"
     if [[ "$prior_family" == "asupersync" ]]; then
       write_registry_universe_lock "${source_root}/Cargo.lock" "0.4.10"
@@ -729,6 +729,9 @@ run_self_test() {
       prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
     elif [[ "$prior_family" == "family-0.4.4" ]]; then
       write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.4.4" "0.4.4"
+      prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
+    elif [[ "$prior_family" == "family-0.4.7" ]]; then
+      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.4.7" "0.4.7"
       prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
     elif [[ "$prior_family" == pager-* ]]; then
       local rejected_pager="0.4.0"
@@ -1037,7 +1040,7 @@ PY
   fi
 
   # Rule 3: registry-only audited versions. The candidate deliberately advances
-  # the whole published family to 0.4.7 (UPGRADE_LOG 2026-10-03). This exact
+  # the whole published family to 0.5.0 (UPGRADE_LOG 2026-11-14). This exact
   # identity check does not waive combined dependency, platform, or
   # release-artifact qualification.
   mapfile -t fsqlite_lock_entries < <(
