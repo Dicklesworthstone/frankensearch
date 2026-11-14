@@ -71,6 +71,20 @@ pub enum NativeGenerationTopology {
     FullProgressive,
 }
 
+pub(in crate::native_ann) fn require_query_tier(
+    topology: NativeGenerationTopology,
+    tier: EmbedderTierTag,
+) -> SearchResult<()> {
+    if matches!(
+        (topology, tier),
+        (NativeGenerationTopology::FastOnly, EmbedderTierTag::Quality)
+            | (NativeGenerationTopology::QualityOnly, EmbedderTierTag::Fast)
+    ) {
+        return Err(refused("query-tier", "unavailable"));
+    }
+    Ok(())
+}
+
 /// Query-capable readers for one fixed-authority native generation.
 ///
 /// The authority-selected vector, lexical and metadata images are parsed and
@@ -152,6 +166,39 @@ impl NativeGenerationPreview {
     #[must_use]
     pub const fn metadata(&self) -> &GenerationManifest {
         &self.readers.metadata
+    }
+
+    /// Lazily preview exactly one admitted vector tier and its lexical source.
+    ///
+    /// The other producer is neither required nor invoked. The Initial phase
+    /// carries the selected tier's score and candidate provenance; attaching
+    /// [`NativeProgressiveSearch::with_retained_reranker`] adds a lazy final
+    /// cross-encoder stage over this candidate's own bounded stored source.
+    /// An optional caller pool owns vector traversal, without inline fallback.
+    ///
+    /// # Errors
+    /// Refuses no-op previews, an absent requested tier, producer disagreement,
+    /// invalid budgets or cancellation. Validation must consume every required
+    /// stage; constructing or abandoning the query proves no successful preview.
+    pub fn search_tier_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        tier: EmbedderTierTag,
+        embedder: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        require_query_tier(self.topology(), tier)?;
+        self.readers.primary_query(
+            cx,
+            embedder,
+            text,
+            k,
+            tier == EmbedderTierTag::Quality,
+            pool,
+        )
     }
 
     /// Execute the candidate's primary tier and hydrate its actual results.
@@ -1011,6 +1058,41 @@ impl NativeGenerationSnapshot {
         self.readers.search_text(cx, embedder, text, k).await
     }
 
+    /// Lazily query one explicitly selected vector tier plus retained lexical
+    /// data, with optional source-bound cross-encoder reranking.
+    ///
+    /// Only the requested owner and producer participate. Quality-only requests
+    /// carry quality scores and candidate counts in both Initial and Reranked;
+    /// no fast inference or synthetic refinement occurs. The optional caller
+    /// pool owns vector traversal. Dropping after Initial starts no reranking,
+    /// and later publication cannot change this query's source or owner.
+    ///
+    /// # Errors
+    /// Refuses an absent tier, producer disagreement, invalid budgets and
+    /// cancellation before retrieval, including empty and zero-limit queries.
+    /// Phase execution can additionally fail source admission, inference,
+    /// traversal, hydration or the configured reranker.
+    pub fn search_tier_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        tier: EmbedderTierTag,
+        embedder: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation.tier_query")?;
+        require_query_tier(self.topology(), tier)?;
+        self.readers.primary_query(
+            cx,
+            embedder,
+            text,
+            k,
+            tier == EmbedderTierTag::Quality,
+            pool,
+        )
+    }
+
     /// Search the retained primary tier with vector traversal on the caller's
     /// pool. The job owns the admitted vector image; later publications cannot
     /// alter it. Inference, lexical scoring and hydration stay on their ordinary
@@ -1357,7 +1439,12 @@ impl CompositeReaders {
                 self.bounded_limit(k),
             )?,
         };
-        Ok(search.with_retained_metadata(self))
+        let search = search.with_retained_metadata(self);
+        Ok(if quality_only || self.tier == EmbedderTierTag::Quality {
+            search.with_quality_primary()
+        } else {
+            search
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1396,9 +1483,13 @@ impl CompositeReaders {
                 k,
             )?,
         };
-        search
-            .with_retained_metadata(self)
-            .with_allowed_documents_arc(allowed)
+        let search = search.with_retained_metadata(self);
+        let search = if quality_only || self.tier == EmbedderTierTag::Quality {
+            search.with_quality_primary()
+        } else {
+            search
+        };
+        search.with_allowed_documents_arc(allowed)
     }
 
     async fn search_lexical_with_reader(

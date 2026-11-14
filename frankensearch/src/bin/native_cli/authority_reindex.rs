@@ -236,7 +236,7 @@ pub(super) async fn execute_with_policy(
                 text,
                 limit: options.limit,
                 mode: inputs.mode,
-                stream: inputs.mode == QueryMode::Full,
+                stream: inputs.mode == QueryMode::Full || policy.rerank.is_some(),
                 deadline: deadline.as_ref(),
                 policy: Some(policy),
                 max_source_bytes: options.max_source_bytes,
@@ -587,6 +587,55 @@ impl Inputs<'_> {
                 validate_results(name, &results)?;
                 phases.push((name, results));
             }
+        } else if self.query_policy.rerank.is_some() {
+            let tier = if self.mode == QueryMode::Quality {
+                EmbedderTierTag::Quality
+            } else {
+                EmbedderTierTag::Fast
+            };
+            let query = match &scope {
+                Some(scope) => scope.search_tier_progressive(
+                    cx,
+                    tier,
+                    self.loaded.fast.as_ref(),
+                    self.text,
+                    self.options.limit,
+                    self.query_policy.query_pool(),
+                )?,
+                None => preview.search_tier_progressive(
+                    cx,
+                    tier,
+                    self.loaded.fast.as_ref(),
+                    self.text,
+                    self.options.limit,
+                    self.query_policy.query_pool(),
+                )?,
+            };
+            let mut query = query_controls::configure_reranker(
+                query,
+                self.query_policy,
+                self.options.max_source_bytes,
+            )?;
+            while let Some(phase) = query.next_phase().await? {
+                let (name, results) = match phase {
+                    NativeSearchPhase::Initial { results, .. } => (
+                        if self.mode == QueryMode::Quality {
+                            "quality"
+                        } else {
+                            "initial"
+                        },
+                        results,
+                    ),
+                    NativeSearchPhase::Reranked { results, .. } => ("reranked", results),
+                    NativeSearchPhase::RerankFailed { error, .. }
+                    | NativeSearchPhase::RefinementFailed { error, .. } => return Err(error.into()),
+                    NativeSearchPhase::Refined { .. } => {
+                        return Err(bad("single-tier preview cannot produce refinement"));
+                    }
+                };
+                validate_results(name, &results)?;
+                phases.push((name, results));
+            }
         } else {
             let (phase, results) = if self.mode == QueryMode::Quality {
                 (
@@ -832,7 +881,9 @@ fn validate_results(phase: &str, results: &[ScoredResult]) -> Result<()> {
 
 fn validate_phases(mode: QueryMode, rerank: bool, phases: &Phases) -> Result<()> {
     let expected: &[&str] = match mode {
+        QueryMode::Fast if rerank => &["initial", "reranked"],
         QueryMode::Fast => &["initial"],
+        QueryMode::Quality if rerank => &["quality", "reranked"],
         QueryMode::Quality => &["quality"],
         QueryMode::Full if rerank => &["initial", "refined", "reranked"],
         QueryMode::Full => &["initial", "refined"],

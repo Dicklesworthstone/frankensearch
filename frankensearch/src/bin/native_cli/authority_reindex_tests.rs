@@ -673,22 +673,205 @@ fn bound_reindex_previews_publishes_and_replays_every_complete_topology_and_filt
 }
 
 #[test]
-fn bound_reindex_preserves_tuned_reranking_and_gives_each_query_its_original_budget() {
+fn bound_reindex_preserves_semantic_reranking_and_gives_each_query_its_original_budget() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
-        for ann in [false, true] {
-            for stream in [false, true] {
-                let fixture =
-                    ReindexFixture::new(&cx, NativeGenerationTopology::FullProgressive, ann).await;
-                let (primary, quality, loaded) = fixture.replacements();
-                let built = fixture.build(&cx, &loaded, ann).await;
+        for topology in [
+            NativeGenerationTopology::FastOnly,
+            NativeGenerationTopology::QualityOnly,
+            NativeGenerationTopology::FullProgressive,
+        ] {
+            for ann in [false, true] {
+                for stream in [false, true] {
+                    let fixture = ReindexFixture::new(&cx, topology, ann).await;
+                    let (primary, quality, loaded) = fixture.replacements();
+                    let built = fixture.build(&cx, &loaded, ann).await;
+                    let mut options = fixture.options();
+                    options.stream = stream;
+                    // Each complete query spends seven of its ten milliseconds.
+                    // Reusing the preview's absolute deadline would reject replay.
+                    let (mut policy, scorer) =
+                        tuned_reindex_policy(&cx, &mut options, 0, [7_000_000, 7_000_000]);
+                    if topology != NativeGenerationTopology::FullProgressive {
+                        options.full_query = None;
+                        policy.full_query = None;
+                    }
+                    let mut output = Vec::new();
+                    reindex::execute_with_policy(
+                        &cx,
+                        &options,
+                        &fixture.root,
+                        &fixture.selected,
+                        &fixture.previous,
+                        &built,
+                        &loaded,
+                        &policy,
+                        &mut output,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(primary.queries.load(Ordering::SeqCst), 2);
+                    if let Some(quality) = quality {
+                        assert_eq!(quality.queries.load(Ordering::SeqCst), 2);
+                    }
+                    assert_eq!(scorer.calls.load(Ordering::SeqCst), 2);
+                    assert!(policy.timer.as_ref().unwrap().is_empty());
+                    {
+                        let observed = scorer.observed.lock().unwrap();
+                        assert_eq!(observed.len(), 2);
+                        assert_eq!(observed[0], observed[1]);
+                        assert_eq!(observed[0].0, REINDEX_QUERY);
+                        assert_eq!(observed[0].1.len(), 2);
+                        assert!(
+                            observed[0].1.iter().all(|(id, text)| {
+                                id.starts_with("selected-") && !text.is_empty()
+                            })
+                        );
+                    }
+                    let responses = frames(&output);
+                    assert_eq!(
+                        responses.len(),
+                        if stream {
+                            if topology == NativeGenerationTopology::FullProgressive {
+                                3
+                            } else {
+                                2
+                            }
+                        } else {
+                            1
+                        }
+                    );
+                    let last = responses.last().unwrap();
+                    assert_eq!(last["phase"], "reranked");
+                    assert_eq!(last["results"][0]["doc_id"], "selected-garden");
+                    assert_eq!(last["reranker"], scorer.id());
+                    assert_eq!(last["rerank_window"], 2);
+                    assert_eq!(last["timeout_ms"], 10);
+                    if topology == NativeGenerationTopology::QualityOnly {
+                        assert!(
+                            last["results"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .all(|hit| hit["fast_score"].is_null()
+                                    && hit["quality_score"].is_number())
+                        );
+                    }
+                    assert!(!options.rollback_receipt.as_ref().unwrap().exists());
+
+                    // Compare the complete recovery replay with the ordinary
+                    // retained query executor over the same admitted publication.
+                    let receipt = Receipt::read(&options.receipt).unwrap();
+                    let active = receipt
+                        .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
+                        .unwrap();
+                    let scope = prepare_scope(
+                        &cx,
+                        &active,
+                        options.filter.as_ref(),
+                        options.max_source_bytes,
+                    )
+                    .unwrap();
+                    let mut ordinary = Vec::new();
+                    query_admitted(
+                        &cx,
+                        &active,
+                        scope.as_ref(),
+                        &loaded,
+                        QueryPlan {
+                            text: REINDEX_QUERY,
+                            limit: options.limit,
+                            mode: receipt.query_mode(None).unwrap(),
+                            stream: true,
+                            deadline: None,
+                            policy: Some(&policy),
+                            max_source_bytes: options.max_source_bytes,
+                        },
+                        |phase, results| {
+                            ordinary.push((phase, serde_json::to_value(results).unwrap()));
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    for response in &responses {
+                        let phase = response["phase"].as_str().unwrap();
+                        let (_, results) = ordinary
+                            .iter()
+                            .find(|(ordinary_phase, _)| *ordinary_phase == phase)
+                            .unwrap();
+                        assert_eq!(&response["results"], results);
+                    }
+                    // A default query is a negative control: losing the configured
+                    // fusion policy must change the actual Initial scores.
+                    let mut defaults = Vec::new();
+                    query_admitted(
+                        &cx,
+                        &active,
+                        scope.as_ref(),
+                        &loaded,
+                        QueryPlan {
+                            text: REINDEX_QUERY,
+                            limit: options.limit,
+                            mode: receipt.query_mode(None).unwrap(),
+                            stream: true,
+                            deadline: None,
+                            policy: None,
+                            max_source_bytes: options.max_source_bytes,
+                        },
+                        |phase, results| {
+                            defaults.push((phase, serde_json::to_value(results).unwrap()));
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    if topology == NativeGenerationTopology::FullProgressive {
+                        assert_ne!(ordinary[0].1, defaults[0].1);
+                    } else {
+                        assert_eq!(ordinary.len(), 2);
+                        assert_eq!(defaults.len(), 1);
+                        assert_ne!(
+                            ordinary[1].1, defaults[0].1,
+                            "single-tier recovery must preserve the requested final ranking"
+                        );
+                    }
+                    let report = String::from_utf8(output).unwrap();
+                    assert!(!report.contains(REINDEX_QUERY));
+                    assert!(!report.contains("private-reindex-reranker-source"));
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn bound_reindex_query_timeout_and_reranker_failure_preserve_exact_publication_outcomes() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for topology in [
+            NativeGenerationTopology::FastOnly,
+            NativeGenerationTopology::QualityOnly,
+            NativeGenerationTopology::FullProgressive,
+        ] {
+            for (fail_call, advance_ns, reason, published) in [
+                (1, [0, 0], "preview_refused", false),
+                (2, [0, 0], "replay_refused", true),
+                (0, [11_000_000, 0], "preview_timed_out", false),
+                (0, [0, 11_000_000], "replay_timed_out", true),
+            ] {
+                let fixture = ReindexFixture::new(&cx, topology, false).await;
+                let (_, _, loaded) = fixture.replacements();
+                let built = fixture.build(&cx, &loaded, false).await;
                 let mut options = fixture.options();
-                options.stream = stream;
-                // Each complete query spends seven of its ten milliseconds.
-                // Reusing the preview's absolute deadline would reject replay.
-                let (policy, scorer) =
-                    tuned_reindex_policy(&cx, &mut options, 0, [7_000_000, 7_000_000]);
+                options.stream = true;
+                let (mut policy, scorer) =
+                    tuned_reindex_policy(&cx, &mut options, fail_call, advance_ns);
+                if topology != NativeGenerationTopology::FullProgressive {
+                    options.full_query = None;
+                    policy.full_query = None;
+                }
+                let authority_before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
                 let mut output = Vec::new();
-                reindex::execute_with_policy(
+                let error = reindex::execute_with_policy(
                     &cx,
                     &options,
                     &fixture.root,
@@ -700,185 +883,52 @@ fn bound_reindex_preserves_tuned_reranking_and_gives_each_query_its_original_bud
                     &mut output,
                 )
                 .await
-                .unwrap();
-                assert_eq!(primary.queries.load(Ordering::SeqCst), 2);
-                assert_eq!(quality.unwrap().queries.load(Ordering::SeqCst), 2);
-                assert_eq!(scorer.calls.load(Ordering::SeqCst), 2);
+                .unwrap_err();
+                let report = publication_failure(error.as_ref()).unwrap();
+                assert_eq!(report["reason"], reason);
+                assert!(output.is_empty(), "partial recovery results cannot escape");
+                assert!(
+                    !cx.is_cancel_requested(),
+                    "query expiry must not cancel rollback"
+                );
                 assert!(policy.timer.as_ref().unwrap().is_empty());
-                {
-                    let observed = scorer.observed.lock().unwrap();
-                    assert_eq!(observed.len(), 2);
-                    assert_eq!(observed[0], observed[1]);
-                    assert_eq!(observed[0].0, REINDEX_QUERY);
-                    assert_eq!(observed[0].1.len(), 2);
-                    assert!(
-                        observed[0]
-                            .1
-                            .iter()
-                            .all(|(id, text)| { id.starts_with("selected-") && !text.is_empty() })
+                assert_eq!(
+                    scorer.calls.load(Ordering::SeqCst),
+                    if published { 2 } else { 1 }
+                );
+                let rollback_path = options.rollback_receipt.as_ref().unwrap();
+                if published {
+                    assert_eq!(report["publication"], "committed");
+                    assert_eq!(report["replay"], "failed");
+                    assert_eq!(report["rollback"]["status"], "committed");
+                    let replacement = Receipt::read(&options.receipt).unwrap();
+                    let restored = Receipt::read(rollback_path).unwrap();
+                    assert_eq!(
+                        restored.authority().unwrap().sequence,
+                        replacement.authority().unwrap().sequence + 1,
+                    );
+                    assert_eq!(restored.generation, fixture.selected.generation);
+                    assert_eq!(
+                        restored
+                            .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
+                            .unwrap()
+                            .metadata(),
+                        fixture.previous.metadata(),
+                    );
+                } else {
+                    assert_eq!(report["publication"], "not_attempted");
+                    assert!(!options.receipt.exists());
+                    assert!(!rollback_path.exists());
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        authority_before,
                     );
                 }
-                let responses = frames(&output);
-                assert_eq!(responses.len(), if stream { 3 } else { 1 });
-                let last = responses.last().unwrap();
-                assert_eq!(last["phase"], "reranked");
-                assert_eq!(last["results"][0]["doc_id"], "selected-garden");
-                assert_eq!(last["reranker"], scorer.id());
-                assert_eq!(last["rerank_window"], 2);
-                assert_eq!(last["timeout_ms"], 10);
-                assert!(!options.rollback_receipt.as_ref().unwrap().exists());
-
-                // Compare the complete recovery replay with the ordinary
-                // retained query executor over the same admitted publication.
-                let receipt = Receipt::read(&options.receipt).unwrap();
-                let active = receipt
-                    .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
-                    .unwrap();
-                let scope = prepare_scope(
-                    &cx,
-                    &active,
-                    options.filter.as_ref(),
-                    options.max_source_bytes,
-                )
-                .unwrap();
-                let mut ordinary = Vec::new();
-                query_admitted(
-                    &cx,
-                    &active,
-                    scope.as_ref(),
-                    &loaded,
-                    QueryPlan {
-                        text: REINDEX_QUERY,
-                        limit: options.limit,
-                        mode: QueryMode::Full,
-                        stream: true,
-                        deadline: None,
-                        policy: Some(&policy),
-                        max_source_bytes: options.max_source_bytes,
-                    },
-                    |phase, results| {
-                        ordinary.push((phase, serde_json::to_value(results).unwrap()));
-                        Ok(())
-                    },
-                )
-                .await
-                .unwrap();
-                for response in &responses {
-                    let phase = response["phase"].as_str().unwrap();
-                    let (_, results) = ordinary
-                        .iter()
-                        .find(|(ordinary_phase, _)| *ordinary_phase == phase)
-                        .unwrap();
-                    assert_eq!(&response["results"], results);
-                }
-                // A default query is a negative control: losing the configured
-                // fusion policy must change the actual Initial scores.
-                let mut defaults = Vec::new();
-                query_admitted(
-                    &cx,
-                    &active,
-                    scope.as_ref(),
-                    &loaded,
-                    QueryPlan {
-                        text: REINDEX_QUERY,
-                        limit: options.limit,
-                        mode: QueryMode::Full,
-                        stream: true,
-                        deadline: None,
-                        policy: None,
-                        max_source_bytes: options.max_source_bytes,
-                    },
-                    |phase, results| {
-                        defaults.push((phase, serde_json::to_value(results).unwrap()));
-                        Ok(())
-                    },
-                )
-                .await
-                .unwrap();
-                assert_ne!(ordinary[0].1, defaults[0].1);
-                let report = String::from_utf8(output).unwrap();
-                assert!(!report.contains(REINDEX_QUERY));
+                let report = serde_json::to_string(&report).unwrap();
+                assert!(!report.contains("private-reindex-rerank-failure"));
                 assert!(!report.contains("private-reindex-reranker-source"));
+                assert!(!report.contains(REINDEX_QUERY));
             }
-        }
-    });
-}
-
-#[test]
-fn bound_reindex_query_timeout_and_reranker_failure_preserve_exact_publication_outcomes() {
-    asupersync::test_utils::run_test_with_cx(|cx| async move {
-        for (fail_call, advance_ns, reason, published) in [
-            (1, [0, 0], "preview_refused", false),
-            (2, [0, 0], "replay_refused", true),
-            (0, [11_000_000, 0], "preview_timed_out", false),
-            (0, [0, 11_000_000], "replay_timed_out", true),
-        ] {
-            let fixture =
-                ReindexFixture::new(&cx, NativeGenerationTopology::FullProgressive, false).await;
-            let (_, _, loaded) = fixture.replacements();
-            let built = fixture.build(&cx, &loaded, false).await;
-            let mut options = fixture.options();
-            options.stream = true;
-            let (policy, scorer) = tuned_reindex_policy(&cx, &mut options, fail_call, advance_ns);
-            let authority_before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
-            let mut output = Vec::new();
-            let error = reindex::execute_with_policy(
-                &cx,
-                &options,
-                &fixture.root,
-                &fixture.selected,
-                &fixture.previous,
-                &built,
-                &loaded,
-                &policy,
-                &mut output,
-            )
-            .await
-            .unwrap_err();
-            let report = publication_failure(error.as_ref()).unwrap();
-            assert_eq!(report["reason"], reason);
-            assert!(output.is_empty(), "partial recovery results cannot escape");
-            assert!(
-                !cx.is_cancel_requested(),
-                "query expiry must not cancel rollback"
-            );
-            assert!(policy.timer.as_ref().unwrap().is_empty());
-            assert_eq!(
-                scorer.calls.load(Ordering::SeqCst),
-                if published { 2 } else { 1 }
-            );
-            let rollback_path = options.rollback_receipt.as_ref().unwrap();
-            if published {
-                assert_eq!(report["publication"], "committed");
-                assert_eq!(report["replay"], "failed");
-                assert_eq!(report["rollback"]["status"], "committed");
-                let replacement = Receipt::read(&options.receipt).unwrap();
-                let restored = Receipt::read(rollback_path).unwrap();
-                assert_eq!(
-                    restored.authority().unwrap().sequence,
-                    replacement.authority().unwrap().sequence + 1,
-                );
-                assert_eq!(restored.generation, fixture.selected.generation);
-                assert_eq!(
-                    restored
-                        .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
-                        .unwrap()
-                        .metadata(),
-                    fixture.previous.metadata(),
-                );
-            } else {
-                assert_eq!(report["publication"], "not_attempted");
-                assert!(!options.receipt.exists());
-                assert!(!rollback_path.exists());
-                assert_eq!(
-                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
-                    authority_before,
-                );
-            }
-            let report = serde_json::to_string(&report).unwrap();
-            assert!(!report.contains("private-reindex-rerank-failure"));
-            assert!(!report.contains("private-reindex-reranker-source"));
-            assert!(!report.contains(REINDEX_QUERY));
         }
     });
 }
@@ -942,28 +992,22 @@ fn bound_reindex_full_query_policy_refuses_single_tier_before_loading_models() {
         ] {
             let fixture = ReindexFixture::new(&cx, topology, false).await;
             let authority_before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
-            for rerank in [false, true] {
-                let mut options = fixture.options();
-                if rerank {
-                    options.reranker_dir = Some(fixture.parent.join("missing-reranker"));
-                } else {
-                    options.full_query = Some(query::FullQuery::parse(REINDEX_TUNING).unwrap());
-                }
-                let mut output = Vec::new();
-                let error = rebuild_with_loader(&cx, &options, &mut output, |_| {
-                    panic!("single-tier query policy must refuse before model loading");
-                })
-                .await
-                .expect_err("full query policy requires both stored tiers");
-                assert!(error.to_string().contains("complete full generation"));
-                assert!(output.is_empty());
-                assert!(!options.work.as_ref().unwrap().exists());
-                assert!(!options.receipt.exists());
-                assert_eq!(
-                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
-                    authority_before,
-                );
-            }
+            let mut options = fixture.options();
+            options.full_query = Some(query::FullQuery::parse(REINDEX_TUNING).unwrap());
+            let mut output = Vec::new();
+            let error = rebuild_with_loader(&cx, &options, &mut output, |_| {
+                panic!("single-tier query policy must refuse before model loading");
+            })
+            .await
+            .expect_err("full query policy requires both stored tiers");
+            assert!(error.to_string().contains("complete full generation"));
+            assert!(output.is_empty());
+            assert!(!options.work.as_ref().unwrap().exists());
+            assert!(!options.receipt.exists());
+            assert_eq!(
+                fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                authority_before,
+            );
         }
     });
 }

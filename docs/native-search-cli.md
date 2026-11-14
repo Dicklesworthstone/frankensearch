@@ -227,6 +227,44 @@ The optional full ANN image similarly retains each tier's original native graph
 with an independent metadata receipt. A graph for one tier cannot be reinterpreted
 as the other tier's graph, even when the dimensions agree.
 
+### Rerank an individual authority tier
+
+`authority-search` and `authority-serve` can apply an explicitly selected local
+cross-encoder to fast-only or quality-only retrieval, including an individual
+tier selected from a full generation:
+
+```sh
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --mode quality --query 'retry network requests' \
+  --reranker-dir /absolute/local/cross-encoder --rerank-window 50 \
+  --timeout-ms 5000 --stream
+```
+
+The binary requires the existing `native` or `rerank` feature and the local
+embedding model for the selected tier. One-shot search loads no unused embedding
+producer. Streaming delivers `initial` for fast retrieval or `quality` for
+quality retrieval, then `reranked` after successful cross-encoder inference.
+Buffered requests deliver only the final successful page. Quality scores and
+quality row ownership remain intact after reordering; no fast or refinement
+phase is fabricated. A warm server applies its configured reranker to every
+semantic mode and advertises eligible modes in `rerank_modes`.
+
+The rerank window is independent of the displayed limit and can promote an
+eligible candidate outside the first page. Both fixed and request filters apply
+before candidate selection. Source comes only from the same retained authority,
+under `--max-source-bytes`; original source files are never reopened. Empty and
+exclusion-only queries skip the scorer. Source-budget, provider-response and
+inference failures fail the request; streaming leaves the already delivered
+page intact and reports one failure. The original total query deadline covers
+retrieval and reranking. Failure to deliver the first page starts no reranking,
+and slow delivery of an already completed final page does not create a timeout.
+
+`--full-query` fusion and graph tuning still require full mode. Explicit lexical
+queries skip a warm server's reranker; a lexical-only startup rejects its model
+options. The ordinary receipt-based `search`/`serve` commands keep their separate
+full-mode policy described below.
+
 ### Complete quality for an existing fast-only generation
 
 `authority-complete-quality` adds a complete, independently bound quality tier
@@ -429,6 +467,14 @@ membership before retrieval and fusion; `--max-source-bytes` bounds source
 materialization for that scope. Blank queries, zero limits and empty scopes
 cannot substitute for semantic validation. Preview failure or cancellation leaves
 the old authority selected.
+
+An explicit `--reranker-dir` and `--rerank-window` also apply to fast-only and
+quality-only recovery. Both preview and replay must complete the requested
+cross-encoder stage using the same retained source, scope and model policy.
+`--timeout-ms` supplies a fresh equal total query budget to each execution;
+building and publishing do not spend those query budgets. Full-query tuning
+remains restricted to full generations. A preview failure never publishes, and
+a rerank failure or timeout during replay follows the rollback rules below.
 
 Publication uses the original expected authority pair. An unknown outcome is
 reconciled once before any replay; unresolved or superseded attempts retain their
@@ -749,8 +795,9 @@ For a full generation, requests may use `"mode":"fast"`, `"mode":"quality"`,
 or `"mode":"full"` (the default). Add `"stream":true` to deliver separate
 `initial` and `refined` result frames for a full query. Each frame preserves the
 request ordinal and ID and uses the same retained authority. Single-tier query
-modes emit one result frame. The ready event declares `default_mode` and
-`progressive_available`. A full warm session loads both models at startup;
+modes emit one result frame unless a configured cross-encoder adds `reranked`.
+The ready event declares `default_mode`, `progressive_available` and
+`rerank_modes`. A full warm session loads both models at startup;
 one-shot selective search can load only the requested tier.
 
 Each query searches the retained vector, lexical and optional HNSW images with

@@ -143,8 +143,11 @@ its window defaults to 50 (1..1000). Only final eligible candidate source is\n\
 read, bounded by --max-source-bytes, from the same retained authority. Streaming\n\
 delivers Initial, Refined and, when performed, Reranked; buffered search requires\n\
 every configured stage to succeed. The original timeout also covers reranking.\n\
-Full-mode controls require a complete full generation; primary and lexical\n\
-requests explicitly skip them. Request tuning requires request_overrides:true\n\
+Full-query tuning requires a complete full generation. Reranking also supports\n\
+fast-only and quality-only requests: streaming emits Initial or Quality, then\n\
+Reranked when a nonempty eligible window is scored. Only the chosen embedding\n\
+producer is queried; its scores and row ownership survive final ranking.\n\
+Lexical requests skip reranking. Request tuning requires request_overrides:true\n\
 in the server --full-query and an envelope {\"op\":\"search\",\"request\":{...},\n\
 \"full_query\":{...}}. Overrides cannot increase server candidate, beam or rerank\n\
 limits, change models/source scope, or extend its timeout ceiling.\n\
@@ -225,8 +228,9 @@ for both preview and replay and are bound into the recovery request digest.\n\
 --timeout-ms bounds each complete query independently: one budget for preview\n\
 and a fresh equal budget for replay. Build, publication and rollback are outside\n\
 these query budgets. Preview timeout never publishes; replay timeout attempts\n\
-the same expected-old rollback as another query failure. Full-query tuning and\n\
-reranking require a complete full generation; a requested rerank must succeed.\n\
+the same expected-old rollback as another query failure. Full-query tuning\n\
+requires a full generation; reranking also supports single-tier recovery.\n\
+Every requested rerank must succeed in both preview and replay.\n\
 Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
 by authority-index. Search refuses a head different from the receipt.\n\
@@ -253,7 +257,8 @@ failed activation preserves the previous caches. Enabled caching excludes\n\
 --lexical-only. Query/filter text and embeddings are never written to disk.\n\
 Requests use {\"id\":\"q1\",\"query\":\"text\",\"limit\":10} and may select\n\
 \"mode\":\"fast\"|\"quality\"|\"full\" and \"stream\":true. Full is the default for\n\
-a full generation. Streaming emits separate Initial and Refined frames. It never follows a new\n\
+a full generation. Streaming emits each requested semantic stage and an optional\n\
+final Reranked frame; empty or exclusion-only pools skip the scorer. It never follows a new\n\
 authority implicitly. With --allow-activation, an explicit request may select a\n\
 new receipt: {\"op\":\"activate\",\"receipt\":\"/absolute/new.json\",\n\
 \"expected_authority\":[...the current ready/results authority bytes...]}.\n\
@@ -767,9 +772,9 @@ impl Options {
         }
         if command == Command::Search
             && options.mode.is_some_and(|mode| mode != QueryMode::Full)
-            && (options.full_query.is_some() || options.reranker_dir.is_some())
+            && options.full_query.is_some()
         {
-            return Err(bad("full-query tuning and reranking require --mode full"));
+            return Err(bad("full-query tuning requires --mode full"));
         }
         match command {
             Command::Index => {
@@ -2881,6 +2886,63 @@ where
             .await?;
             deliver("refined", &results)?;
         }
+    } else if let Some(policy) = plan.policy.filter(|policy| policy.rerank.is_some()) {
+        let tier = if plan.mode == QueryMode::Quality {
+            EmbedderTierTag::Quality
+        } else {
+            EmbedderTierTag::Fast
+        };
+        let embedder = if plan.mode == QueryMode::Quality {
+            loaded
+                .quality
+                .as_deref()
+                .unwrap_or_else(|| loaded.fast.as_ref())
+        } else {
+            loaded.fast.as_ref()
+        };
+        let mut search = query::within(cx, plan.deadline, async {
+            let search = selection.tier_progressive(cx, tier, embedder, plan.text, plan.limit)?;
+            query_controls::configure_reranker(search, policy, plan.max_source_bytes)
+        })
+        .await?;
+        let mut buffered = None;
+        // The retained iterator owns both phases. Deliver Initial/Quality
+        // before starting reranking; a failed output abandons the lazy stage.
+        while !search.is_finished() {
+            let Some(phase) = Box::pin(query::within(cx, plan.deadline, async {
+                Ok(search.next_phase().await?)
+            }))
+            .await?
+            else {
+                break;
+            };
+            let (name, results) = match phase {
+                NativeSearchPhase::Initial { results, .. } => (
+                    if plan.mode == QueryMode::Quality {
+                        "quality"
+                    } else {
+                        "initial"
+                    },
+                    results,
+                ),
+                NativeSearchPhase::Reranked { results, .. } => ("reranked", results),
+                NativeSearchPhase::RerankFailed { error, .. }
+                | NativeSearchPhase::RefinementFailed { error, .. } => return Err(error.into()),
+                NativeSearchPhase::Refined { .. } => {
+                    return Err(serve_refused("unexpected_single_tier_refinement"));
+                }
+            };
+            if plan.stream {
+                deliver(name, &results)?;
+            } else {
+                buffered = Some((name, results));
+            }
+        }
+        if !plan.stream {
+            let (phase, results) =
+                buffered.ok_or_else(|| serve_refused("missing_tier_query_phase"))?;
+            deliver(phase, &results)?;
+        }
     } else {
         let (phase, results) = query::within(cx, plan.deadline, async {
             Ok(if plan.mode == QueryMode::Quality {
@@ -3987,8 +4049,22 @@ async fn serve_session(
             .query_policy
             .rerank
             .as_ref()
+            .filter(|_| session.receipt.quality_identity.is_some())
             .map(|rerank| rerank.model.id())
     );
+    ready["rerank_modes"] = if session.query_policy.rerank.is_some() {
+        serde_json::Value::Array(
+            ready["query_modes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|mode| mode.as_str() != Some("lexical"))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        serde_json::json!([])
+    };
     ready["rerank_window"] = serde_json::json!(
         session
             .query_policy
@@ -4002,7 +4078,9 @@ async fn serve_session(
     ready["default_mode"] =
         serde_json::json!(session.models.query_mode(&session.receipt, None)?.as_str());
     ready["progressive_available"] = serde_json::json!(
-        !session.models.is_lexical() && session.receipt.quality_identity.is_some()
+        !session.models.is_lexical()
+            && (session.receipt.quality_identity.is_some()
+                || session.query_policy.rerank.is_some())
     );
     emit(output, &ready)?;
     let mut record = Vec::new();

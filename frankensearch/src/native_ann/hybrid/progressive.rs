@@ -54,6 +54,7 @@ impl NativeAnnIndex {
             cx,
             fast_embedder,
             quality,
+            primary_quality: false,
             quality_owner: None,
             pool: None,
             lexical,
@@ -109,6 +110,7 @@ impl NativeAnnIndex {
             cx,
             fast_embedder,
             quality: quality.map(|(index, embedder)| (index.as_ref(), embedder)),
+            primary_quality: false,
             quality_owner: quality.map(|(index, _)| Arc::clone(index)),
             pool: Some(pool),
             lexical,
@@ -152,11 +154,12 @@ pub struct NativePhaseCandidates {
 /// A requested phase of caller-owned native progressive retrieval.
 #[derive(Debug)]
 pub enum NativeSearchPhase {
-    /// Fast-plus-lexical results ready without any quality inference.
+    /// The selected primary tier plus lexical results, before any later stage.
+    /// Direct quality queries retain quality scores and candidate provenance.
     Initial {
         /// Hydrated winners in fused rank order.
         results: Vec<ScoredResult>,
-        /// Observed candidate counts; quality is zero in this phase.
+        /// Observed candidate counts for the owner actually queried.
         candidates: NativePhaseCandidates,
     },
     /// Winners after independent quality retrieval and candidate union.
@@ -232,6 +235,9 @@ pub struct NativeProgressiveSearch<'a> {
     cx: &'a Cx,
     fast_embedder: &'a dyn Embedder,
     quality: Option<(&'a NativeAnnIndex, &'a dyn Embedder)>,
+    // Set only after an admitted composite reader selects its quality owner.
+    // This changes provenance, never the producer or owner admission boundary.
+    primary_quality: bool,
     quality_owner: Option<Arc<NativeAnnIndex>>,
     pool: Option<BlockingPoolHandle>,
     lexical: &'a dyn LexicalRead,
@@ -256,6 +262,13 @@ pub struct NativeProgressiveSearch<'a> {
 }
 
 impl<'a> NativeProgressiveSearch<'a> {
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_quality_primary(mut self) -> Self {
+        debug_assert!(self.quality.is_none());
+        self.primary_quality = true;
+        self
+    }
+
     // Only complete immutable source wrappers may opt in. A generic lexical
     // reader cannot promise the same membership through multiple searches.
     #[cfg(feature = "quill")]
@@ -712,13 +725,21 @@ impl<'a> NativeProgressiveSearch<'a> {
         }
         let (fast, batch) = join_sources(
             self.cx,
-            self.search_tier(self.fast, self.fast_embedder, self.fast_ef),
+            self.search_tier(
+                self.fast,
+                self.fast_embedder,
+                if self.primary_quality {
+                    self.quality_ef
+                } else {
+                    self.fast_ef
+                },
+            ),
             self.lexical_candidates(),
         )
         .await?;
         let candidates = NativePhaseCandidates {
-            fast: fast.len(),
-            quality: 0,
+            fast: if self.primary_quality { 0 } else { fast.len() },
+            quality: if self.primary_quality { fast.len() } else { 0 },
             lexical: batch.results().len(),
         };
         let fused = rrf_fuse_for_vector_lane(
@@ -733,6 +754,10 @@ impl<'a> NativeProgressiveSearch<'a> {
         #[cfg(feature = "quill")]
         if let Some(source) = self.retained_metadata {
             source.hydrate_vector_metadata(self.cx, &mut results)?;
+        }
+        #[cfg(feature = "quill")]
+        if self.primary_quality {
+            crate::native_ann::builder::scope::quality_provenance(self.cx, &mut results)?;
         }
         checkpoint(self.cx, "native_ann.progressive_initial_complete")?;
         if self.quality.is_some() {
