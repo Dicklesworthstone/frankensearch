@@ -1233,9 +1233,19 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
     }
     let mut escaped_query = String::with_capacity(query.len() + 8);
     let mut term_start = 0;
+    let mut after_whitespace = false;
     let mut in_quotes = false;
     let mut escaped = false;
     for (index, ch) in query.char_indices() {
+        if after_whitespace && !ch.is_whitespace() {
+            // The parser accepts whitespace before a field separator. Keep
+            // that candidate name until the next non-whitespace character
+            // decides whether it belongs to this field or a new operand.
+            if ch != ':' {
+                term_start = index;
+            }
+            after_whitespace = false;
+        }
         if escaped {
             escaped = false;
         } else if ch == '\\' {
@@ -1243,7 +1253,7 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
         } else if ch == '"' {
             in_quotes = !in_quotes;
         } else if ch == ':' && !in_quotes {
-            let name = query.get(term_start..index).unwrap_or_default();
+            let name = query.get(term_start..index).unwrap_or_default().trim_end();
             let doubled = query
                 .get(index + 1..)
                 .is_some_and(|rest| rest.starts_with(':'));
@@ -1253,7 +1263,9 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
             }
         }
         escaped_query.push(ch);
-        if ch.is_whitespace() || matches!(ch, '(' | ')' | '+' | '-') {
+        if ch.is_whitespace() {
+            after_whitespace = true;
+        } else if matches!(ch, '(' | ')' | '+' | '-') {
             term_start = index + ch.len_utf8();
         }
     }
@@ -7114,6 +7126,17 @@ mod tests {
             // A real field keeps its prefix, also after a group or negation.
             ("title:rust", "title:rust"),
             ("(title:rust) -content:beta", "(title:rust) -content:beta"),
+            (
+                r#"title : "internal secret""#,
+                r#"title : "internal secret""#,
+            ),
+            (
+                "-title \t: \"internal secret\"",
+                "-title \t: \"internal secret\"",
+            ),
+            ("needle title\u{2003}:rust", "needle title\u{2003}:rust"),
+            ("unknown title :rust", "unknown title :rust"),
+            ("unknown :rust", r"unknown \:rust"),
             // `title::x` is not a field prefix; a quoted phrase is literal.
             ("title::x", r"title\:\:x"),
             ("\"std::io\" error", "\"std::io\" error"),

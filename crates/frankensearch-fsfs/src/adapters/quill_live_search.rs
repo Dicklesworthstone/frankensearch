@@ -725,6 +725,65 @@ mod tests {
     }
 
     #[test]
+    fn quoted_field_exclusions_keep_nonadjacent_and_other_field_matches() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let documents = [
+                IndexableDocument::new("src/exact.rs", "needle").with_title("internal secret"),
+                IndexableDocument::new("src/nonadjacent.rs", "needle")
+                    .with_title("internal unrelated secret"),
+                IndexableDocument::new("src/content.rs", "needle internal secret")
+                    .with_title("public"),
+                IndexableDocument::new("src/partial.rs", "needle").with_title("internal"),
+                IndexableDocument::new("docs/plain.md", "needle").with_title("public"),
+            ];
+            publish(&cx, &store, &documents).await;
+            for filter in [None, Some("path:src/ ext:rs")] {
+                for exclusion in [
+                    r#"-title:"internal secret""#,
+                    "-title:'internal secret'",
+                    r#"-title : "internal secret""#,
+                    r#"-title: "internal secret""#,
+                ] {
+                    for positive in ["needle", "needle OR absent AND"] {
+                        let query = format!("{positive} {exclusion} -absent");
+                        let mut live = QuillLiveSearchSession::new_filtered(
+                            store.clone(),
+                            &query,
+                            filter,
+                            LiveSearchConfig {
+                                max_results: documents.len(),
+                                ..LiveSearchConfig::default()
+                            },
+                            LiveSearchRefreshConfig {
+                                debounce: Duration::ZERO,
+                                max_wait: Duration::from_millis(100),
+                            },
+                            config(),
+                        )
+                        .unwrap();
+                        live.poll(&cx, Instant::now()).await.unwrap().unwrap();
+                        let mut actual = live
+                            .tracker()
+                            .results()
+                            .iter()
+                            .map(|hit| hit.hit.doc_id.as_str())
+                            .collect::<Vec<_>>();
+                        actual.sort_unstable();
+                        let mut expected =
+                            vec!["src/content.rs", "src/nonadjacent.rs", "src/partial.rs"];
+                        if filter.is_none() {
+                            expected.insert(0, "docs/plain.md");
+                        }
+                        assert_eq!(actual, expected, "{query}, filter={filter:?}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn live_query_rendering_refuses_overflow_and_preserves_query_recovery() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 pub struct ParsedQuery {
     /// The main query text (what to search for).
     pub positive: String,
-    /// Individual terms to exclude (from `-term` syntax).
+    /// Terms or field-qualified operands to exclude (from `-term` syntax).
     pub negative_terms: Vec<String>,
     /// Exact phrases to exclude (from `NOT "phrase"` syntax).
     pub negative_phrases: Vec<String>,
@@ -45,6 +45,7 @@ impl ParsedQuery {
     /// # Syntax
     ///
     /// - `-term` : exclude documents containing "term"
+    /// - `-title:"exact phrase"` : preserve a field-qualified lexical exclusion
     /// - `NOT "exact phrase"` or `-"exact phrase"` : exclude a quoted phrase
     /// - Single quotes also delimit phrases; a backslash escapes the next character
     /// - `\-term` : literal dash (escaped, not negation)
@@ -120,7 +121,7 @@ impl ParsedQuery {
             if chars[i] == '\\' && i + 1 < len && chars[i + 1] == '-' {
                 // Retain the established literal-dash representation.
                 let start = i + 1;
-                i = positive_fragment_end(&chars, i);
+                i = query_fragment_end(&chars, i);
                 positive_parts.push(chars[start..i].iter().collect::<String>());
                 continue;
             }
@@ -145,9 +146,7 @@ impl ParsedQuery {
             {
                 i += 1;
                 let start = i;
-                while i < len && !chars[i].is_whitespace() {
-                    i += 1;
-                }
+                i = query_fragment_end(&chars, start);
                 let term: String = chars[start..i].iter().collect();
                 if !term.is_empty() {
                     if let Some(edits) = edits.as_deref_mut()
@@ -164,7 +163,7 @@ impl ParsedQuery {
             // value or operand. Whitespace inside a phrase cannot start a new
             // exclusion, and escaped quotes cannot end that phrase.
             let start = i;
-            i = positive_fragment_end(&chars, start);
+            i = query_fragment_end(&chars, start);
             positive_parts.push(chars[start..i].iter().collect::<String>());
         }
 
@@ -284,9 +283,9 @@ fn parse_quoted_phrase(chars: &[char], quote: usize) -> (String, usize) {
     (phrase, cursor)
 }
 
-/// Preserve the source spelling of positive phrases without interpreting
+/// Preserve the source spelling of query operands without interpreting
 /// apostrophes or embedded quotes in ordinary words as phrase delimiters.
-fn positive_fragment_end(chars: &[char], start: usize) -> usize {
+fn query_fragment_end(chars: &[char], start: usize) -> usize {
     let mut cursor = start;
     let mut quote = None;
     let mut operand_start = true;
@@ -312,6 +311,12 @@ fn positive_fragment_end(chars: &[char], start: usize) -> usize {
                 let mut next = cursor;
                 while next < chars.len() && chars[next].is_whitespace() {
                     next += 1;
+                }
+                if next < chars.len() && operand_start && field_start.is_none() {
+                    // A field value may also begin after whitespace following
+                    // its colon. Keep it inside the same exclusion operand.
+                    cursor = next;
+                    continue;
                 }
                 if next < chars.len()
                     && chars[next] == ':'
@@ -589,6 +594,63 @@ mod tests {
             assert_eq!(parsed.positive, raw);
             assert!(!parsed.has_negations(), "{raw}");
         }
+    }
+
+    #[test]
+    fn negative_field_operands_preserve_phrases_and_source_spelling() {
+        for operand in [
+            r#"title:"internal secret""#,
+            "title:'internal secret'",
+            r#"title : "internal secret""#,
+            r#"title: "internal secret""#,
+            r#"title:"internal   secret""#,
+            r#"content:"café 日本語 -literal NOT \"quoted\" \\ path""#,
+            r"title:'it\'s -literal'",
+            r#"title:"internal secret"~2"#,
+            r"title: internal",
+            r#"title:"internal secret"#,
+        ] {
+            let raw = format!("needle -{operand}");
+            let parsed = ParsedQuery::parse(&raw);
+            assert_eq!(parsed.positive, "needle", "{raw}");
+            assert_eq!(parsed.negative_terms, [operand], "{raw}");
+            assert!(parsed.negative_phrases.is_empty(), "{raw}");
+            assert_eq!(normalize_query_negations(&raw), raw, "{raw}");
+        }
+        let raw = r#"needle OR other -title : "internal -secret" -outside"#;
+        let parsed = ParsedQuery::parse(raw);
+        assert_eq!(parsed.positive, "needle OR other");
+        assert_eq!(
+            parsed.negative_terms,
+            [r#"title : "internal -secret""#, "outside"]
+        );
+        assert!(parsed.negative_phrases.is_empty());
+    }
+
+    #[test]
+    fn negative_bare_words_do_not_swallow_following_operands() {
+        for operand in [
+            "can't",
+            r#"say"hello"#,
+            r#"title\:"literal"#,
+            r#"id:part:"literal"#,
+            r#"foo+bar:"literal"#,
+        ] {
+            let raw = format!("needle -{operand} tail -outside");
+            let parsed = ParsedQuery::parse(&raw);
+            assert_eq!(parsed.positive, "needle tail", "{raw}");
+            assert_eq!(parsed.negative_terms, [operand, "outside"], "{raw}");
+            assert!(parsed.negative_phrases.is_empty(), "{raw}");
+        }
+        let parsed = ParsedQuery::parse(r#"needle -title:"alpha \\\" -inside" -outside"#);
+        assert_eq!(parsed.positive, "needle");
+        assert_eq!(
+            parsed.negative_terms,
+            [r#"title:"alpha \\\" -inside""#, "outside"]
+        );
+        let parsed = ParsedQuery::parse(r#"needle -title:"alpha \\" -outside"#);
+        assert_eq!(parsed.positive, "needle");
+        assert_eq!(parsed.negative_terms, [r#"title:"alpha \\""#, "outside"]);
     }
 
     #[test]

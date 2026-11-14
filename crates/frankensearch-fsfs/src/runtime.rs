@@ -677,7 +677,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v24: quoted literals and case-insensitive phrase exclusions agree across lanes.
 // v25: bare Boolean-word exclusions stay literal in lexical and vector lanes.
 // v26: global exclusions also constrain lexical OR branches and candidate tails.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v26";
+// v27: quoted field exclusions retain their complete operand and field scope.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v27";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -700,8 +701,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v21 / stream v19: quoted literals and phrase exclusions agree across lanes.
 // v22 / stream v20: bare Boolean-word exclusions stay literal across lanes.
 // v23 / stream v21: global exclusions also constrain every lexical OR branch.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v23";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v21";
+// v24 / stream v22: quoted field exclusions retain their complete operand.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v24";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v22";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -38078,6 +38080,7 @@ mod tests {
             "fsfs.search.serve.v20",
             "fsfs.search.serve.v21",
             "fsfs.search.serve.v22",
+            "fsfs.search.serve.v23",
         ] {
             response.schema_version = old_schema.to_owned();
             assert!(
@@ -66462,6 +66465,8 @@ mod tests {
                 "fsfs.search.cache.v24",
                 // Could retain lexical hits from an excluded OR branch.
                 "fsfs.search.cache.v25",
+                // Could truncate quoted field exclusions at their first space.
+                "fsfs.search.cache.v26",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

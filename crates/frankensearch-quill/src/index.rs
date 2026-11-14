@@ -37775,6 +37775,47 @@ mod tests {
         });
     }
 
+    #[test]
+    fn parsed_field_exclusion_census_preserves_adjacency_and_field_scope() {
+        use frankensearch_core::ParsedQuery;
+
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).unwrap();
+            let documents = [
+                IndexableDocument::new("exact-title", "needle").with_title("internal secret"),
+                IndexableDocument::new("nonadjacent-title", "needle")
+                    .with_title("internal unrelated secret"),
+                IndexableDocument::new("exact-content", "needle internal secret")
+                    .with_title("public"),
+                IndexableDocument::new("partial-title", "needle").with_title("internal"),
+                IndexableDocument::new("plain", "needle").with_title("public"),
+            ];
+            index.index_documents(&cx, &documents).await.unwrap();
+            index.commit(&cx).await.unwrap();
+
+            for (operand, expected) in [
+                (r#"title:"internal secret""#, "exact-title"),
+                ("title:'internal secret'", "exact-title"),
+                (r#"title : "internal secret""#, "exact-title"),
+                (r#"title: "internal secret""#, "exact-title"),
+                (r#"content:"internal secret""#, "exact-content"),
+            ] {
+                let raw = format!("needle -{operand} -absent");
+                let parsed = ParsedQuery::parse(&raw);
+                assert_eq!(parsed.positive, "needle", "{raw}");
+                let census = parsed
+                    .negative_terms
+                    .iter()
+                    .map(|term| index.query_text(term))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                let hits = index.search(&cx, &census, documents.len()).await.unwrap();
+                assert_eq!(hits.len(), 1, "{raw}: {hits:?}");
+                assert_eq!(hits[0].doc_id, expected, "{raw}");
+            }
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn public_phrase_slop_matches_tantivy_ids_order_and_score_bits() {

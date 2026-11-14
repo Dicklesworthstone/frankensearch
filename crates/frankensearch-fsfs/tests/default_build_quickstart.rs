@@ -770,7 +770,7 @@ mod loader_only {
         let mut records = matching_records();
         assert_eq!(records.len(), 1, "the real query must persist one answer");
         let (cache_path, cache_bytes, record) = records.pop().unwrap();
-        assert_eq!(record["schema_version"], "fsfs.search.cache.v26");
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v27");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
 
         // Multiple fresh processes keep an isolated scheduling delay from
@@ -2997,7 +2997,7 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v23");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v24");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
                     let mut contracts = sha2::Sha256::new();
                     for manifest in [
