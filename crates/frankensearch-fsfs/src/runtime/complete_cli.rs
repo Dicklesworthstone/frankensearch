@@ -1758,7 +1758,7 @@ fn emit_complete_serve_line<T: serde::Serialize, W: Write>(
     output.flush().map_err(SearchError::Io)
 }
 
-fn complete_entry_exists(path: &Path) -> SearchResult<bool> {
+pub(super) fn complete_entry_exists(path: &Path) -> SearchResult<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),

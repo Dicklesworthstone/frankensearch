@@ -334,9 +334,10 @@ impl FsfsRuntime {
         let declared = |reason| sentinel.reason_codes.iter().any(|code| code == reason);
         let quality_only = declared(REASON_VECTOR_FAST_TIER_SKIPPED_QUALITY_ONLY);
         let lexical_only = declared(REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY);
-        let fast_present = complete_entry_exists(&index_root.join(FSFS_VECTOR_INDEX_FILE))?;
+        let fast_present =
+            complete_cli::complete_entry_exists(&index_root.join(FSFS_VECTOR_INDEX_FILE))?;
         let quality_present =
-            complete_entry_exists(&index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE))?;
+            complete_cli::complete_entry_exists(&index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE))?;
         let quality_built = declared(REASON_VECTOR_QUALITY_TIER_BUILT);
         if sentinel.schema_version != 1
             || quality_built
@@ -1068,7 +1069,7 @@ impl FsfsRuntime {
             retained_search_checkpoint(cx)?;
             candidate_lease.fence("complete-generation vector compaction")?;
             let path = build.path().join(relative);
-            if !complete_entry_exists(&path)? {
+            if !complete_cli::complete_entry_exists(&path)? {
                 continue;
             }
             let mut index = Self::open_vector_index_for_mutation(&path)?;
