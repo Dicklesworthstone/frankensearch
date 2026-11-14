@@ -5231,6 +5231,17 @@ struct PendingPublication {
     proposed_generation: u64,
 }
 
+/// Inputs that must not change while a compaction's installed outputs or
+/// temporary MANIFEST remain available for an exact retry.
+#[derive(Debug, Clone, Copy)]
+struct PendingCompaction {
+    from_generation: u64,
+    policy: CompactionPolicy,
+    selected_segment_id: Option<u64>,
+    created_unix_s: i64,
+    last_publish_unix_s: i64,
+}
+
 /// The publication phase carried alongside the last fully published
 /// generation in [`PublicationReadState`].
 ///
@@ -5579,6 +5590,7 @@ pub struct KeeperWriter {
     /// retained snapshot has been proven against the durable generation that
     /// attempt may have installed.
     pending_publication: Option<PendingPublication>,
+    pending_compaction: Option<PendingCompaction>,
 }
 
 impl KeeperWriter {
@@ -5897,6 +5909,7 @@ impl KeeperWriter {
             benchmark_linear_segment_reuse: false,
             publication_read_state: None,
             pending_publication: None,
+            pending_compaction: None,
         })
     }
 
@@ -6483,12 +6496,46 @@ impl KeeperWriter {
         // snapshot that an abandoned publication already superseded would
         // propose a generation that exists.
         self.reconcile_pending_publication(cx).await?;
+        validate_compaction_policy(policy)?;
+        let from_generation = self.snapshot.loaded_manifest().manifest.generation;
+        if self
+            .pending_compaction
+            .is_some_and(|pending| pending.from_generation != from_generation)
+        {
+            self.pending_compaction = None;
+        }
+        let pending = if let Some(pending) = self.pending_compaction {
+            if pending.policy != policy || pending.selected_segment_id != selected_segment_id {
+                return Err(KeeperError::InvalidTransition {
+                    detail: "retry pending compaction with its original policy and selection"
+                        .to_owned(),
+                });
+            }
+            pending
+        } else {
+            let pending = PendingCompaction {
+                from_generation,
+                policy,
+                selected_segment_id,
+                created_unix_s,
+                last_publish_unix_s: current_manifest_publish_unix_s()?,
+            };
+            // Store before the first await that can produce retry artifacts.
+            self.pending_compaction = Some(pending);
+            pending
+        };
         let snapshot = self.snapshot.clone();
         let artifact = spawn_blocking(move || {
-            build_compaction(&snapshot, policy, selected_segment_id, created_unix_s)
+            build_compaction(
+                &snapshot,
+                policy,
+                selected_segment_id,
+                pending.created_unix_s,
+            )
         })
         .await?;
         if !artifact.report.changed() {
+            self.pending_compaction = None;
             return Ok(artifact.report);
         }
         if cx.is_cancel_requested() {
@@ -6497,9 +6544,10 @@ impl KeeperWriter {
 
         let CompactionArtifact {
             encoded,
-            manifest,
+            mut manifest,
             report,
         } = artifact;
+        manifest.last_publish_unix_s = pending.last_publish_unix_s;
         for segment in encoded {
             self.publish_encoded_segment_retryable(cx, Arc::new(segment))
                 .await?;
@@ -6511,6 +6559,7 @@ impl KeeperWriter {
         // row survives, so the live-document floor holds here as well.
         self.publish_with_intent(cx, &manifest, PublishIntent::PreserveLiveDocuments)
             .await?;
+        self.pending_compaction = None;
         Ok(report)
     }
 
@@ -15356,6 +15405,16 @@ enum ManifestProtection {
     Enabled(FileProtector),
 }
 
+fn current_manifest_publish_unix_s() -> Result<i64, KeeperError> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .ok_or_else(|| KeeperError::InvalidTransition {
+            detail: "current wall clock is outside the MANIFEST timestamp range".to_owned(),
+        })
+}
+
 impl ManifestPublisher {
     /// Bind a publisher to one Quill index directory.
     #[must_use]
@@ -15567,13 +15626,7 @@ impl ManifestPublisher {
         // keeps deterministic fixtures byte-stable.
         let mut manifest = manifest.clone();
         if manifest.last_publish_unix_s == 0 {
-            manifest.last_publish_unix_s = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .ok()
-                .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
-                .ok_or_else(|| KeeperError::InvalidTransition {
-                    detail: "current wall clock is outside the MANIFEST timestamp range".to_owned(),
-                })?;
+            manifest.last_publish_unix_s = current_manifest_publish_unix_s()?;
         }
         let bytes = manifest
             .to_bytes()
@@ -27987,6 +28040,100 @@ mod tests {
             );
         });
         Ok(())
+    }
+
+    #[test]
+    fn compaction_retry_preserves_timestamps_and_exact_manifest_temp() {
+        let _pause_serial = manifest_publish_pause_test_serial_guard();
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempdir().expect("compaction retry directory");
+            let config = crate::QuillConfig {
+                compaction_tombstone_density: 1.0,
+                tier_fanout: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                deterministic_ingest: true,
+                ..crate::QuillConfig::default()
+            };
+            let index = crate::QuillIndex::create(&cx, directory.path(), config)
+                .await
+                .expect("create real source index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        frankensearch_core::IndexableDocument::new("keep", "retained original"),
+                        frankensearch_core::IndexableDocument::new("drop", "retired original"),
+                    ],
+                )
+                .await
+                .unwrap();
+            index.commit(&cx).await.unwrap();
+            assert!(index.delete_document(&cx, "drop").await.unwrap());
+            index.commit(&cx).await.unwrap();
+            drop(index);
+            let mut writer = KeeperWriter::open(&cx, directory.path(), DEFAULT_SCHEMA)
+                .await
+                .expect("reopen the committed source for maintenance");
+            let generation = writer
+                .snapshot()
+                .unwrap()
+                .loaded_manifest()
+                .manifest
+                .generation;
+            writer.bind_publication_read_state(PublicationReadState::new(generation).unwrap());
+            let policy = CompactionPolicy::new(0.25);
+            let failure = fail_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                PublishCheckpoint::TempWritten,
+            );
+            assert!(matches!(
+                writer.compact(&cx, policy, 111).await,
+                Err(KeeperError::InvalidTransition { .. })
+            ));
+            drop(failure);
+            let pending = writer.pending_compaction.expect("retain retry inputs");
+            assert_eq!(pending.created_unix_s, 111);
+            assert!(pending.last_publish_unix_s > 0);
+            let temp_path = directory
+                .path()
+                .join(format!(".tmp-manifest-{}", generation + 1));
+            let retained = std::fs::read(&temp_path).expect("read retained compaction proposal");
+            let proposed = Manifest::from_bytes(&retained).unwrap();
+            assert_eq!(proposed.last_publish_unix_s, pending.last_publish_unix_s);
+
+            // Rebuilding with later creation/publication times, as the old
+            // retry did, must still fail the unchanged exact-temp guard.
+            let mut later = build_compaction(writer.snapshot().unwrap(), policy, None, 222)
+                .expect("build the old retry's changed segment identity");
+            later.manifest.last_publish_unix_s = pending.last_publish_unix_s + 1;
+            assert!(matches!(
+                verify_reusable_manifest_temp(&temp_path, &later.manifest.to_bytes().unwrap()),
+                Err(KeeperError::TempConflict { .. })
+            ));
+            assert_eq!(std::fs::read(&temp_path).unwrap(), retained);
+
+            let report = writer
+                .compact(&cx, policy, 222)
+                .await
+                .expect("retry the original compaction despite the later creation time");
+            assert_eq!(report.generation_before, generation);
+            assert_eq!(report.generation_after, generation + 1);
+            assert_eq!(report.compacted_segments, 1);
+            assert!(writer.pending_compaction.is_none());
+            assert_eq!(
+                std::fs::read(directory.path().join("MANIFEST")).unwrap(),
+                retained
+            );
+            let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                .expect("cold reader of the retried compaction");
+            assert_eq!(reopened.doc_count(), 1);
+            assert_eq!(reopened.tombstone_count(), 0);
+            assert_eq!(
+                reopened.materialize_document_id(0),
+                Some(DocId::new("keep"))
+            );
+            assert_eq!(reopened.materialize_document_id(1), None);
+        });
     }
 
     #[test]
