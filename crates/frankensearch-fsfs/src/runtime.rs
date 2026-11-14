@@ -28,7 +28,7 @@ use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::filter::{ExcludeDocIdsFilter, PredicateFilter, SearchFilter};
-use frankensearch_core::parsed_query::{ParsedQuery, quote_query_phrase};
+use frankensearch_core::parsed_query::{ParsedQuery, normalize_query_whitespace, quote_query_phrase};
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::traits::ModelTier;
 use frankensearch_core::{
@@ -682,7 +682,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v29: range/set literals retain their contents and exclusion boundaries.
 // v30: spaced comparison bounds retain their complete bare operand.
 // v31: grouped comparison bounds retain their operand and field scope.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v31";
+// v32: normalization preserves whitespace inside literal query values.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v32";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -710,8 +711,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v26 / stream v24: typed literals retain quote and exclusion boundaries.
 // v27 / stream v25: comparison bounds retain whitespace and bare context.
 // v28 / stream v26: grouped comparison bounds retain their field scope.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v28";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v26";
+// v29 / stream v27: normalization preserves literal query whitespace.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v29";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v27";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -14101,7 +14103,7 @@ impl FsfsRuntime {
             .chars()
             .map(|ch| if ch.is_control() { ' ' } else { ch })
             .collect::<String>();
-        let mut normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut normalized = normalize_query_whitespace(&cleaned);
         if let Some((cut, _)) = normalized
             .char_indices()
             .nth(crate::query_planning::MAX_QUERY_CHARS)
@@ -38144,6 +38146,7 @@ mod tests {
             "fsfs.search.serve.v25",
             "fsfs.search.serve.v26",
             "fsfs.search.serve.v27",
+            "fsfs.search.serve.v28",
         ] {
             response.schema_version = old_schema.to_owned();
             assert!(
@@ -38786,6 +38789,20 @@ mod tests {
                 index_dir: Some(temp.path().to_path_buf()),
                 ..CliInput::default()
             });
+            let literal = r#"id:"a  b""#;
+            let one_space = r#"id:"a b""#;
+            assert_eq!(FsfsRuntime::normalize_search_query(literal), literal);
+            let literal_key = runtime
+                .search_cache_key(literal, 10, SearchExecutionMode::LexicalOnly)
+                .unwrap();
+            let one_space_key = runtime
+                .search_cache_key(one_space, 10, SearchExecutionMode::LexicalOnly)
+                .unwrap();
+            assert_ne!(literal_key, one_space_key);
+            assert_ne!(
+                FsfsRuntime::search_cache_key_hash(&literal_key),
+                FsfsRuntime::search_cache_key_hash(&one_space_key)
+            );
             let mut cache = std::collections::HashMap::new();
             let long = "network ".repeat(700);
             for (query, expected_query) in [
@@ -66538,6 +66555,8 @@ mod tests {
                 "fsfs.search.cache.v29",
                 // Could split a comparison bound inside a field-scoped group.
                 "fsfs.search.cache.v30",
+                // Could collapse distinct quoted keyword values together.
+                "fsfs.search.cache.v31",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

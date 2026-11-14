@@ -37883,6 +37883,66 @@ mod tests {
     }
 
     #[test]
+    fn query_whitespace_normalization_preserves_exact_keyword_membership() {
+        use std::collections::BTreeSet;
+
+        use frankensearch_core::parsed_query::{ParsedQuery, normalize_query_whitespace};
+
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).unwrap();
+            let documents = [
+                IndexableDocument::new("a  b", "double space"),
+                IndexableDocument::new("a b", "single space"),
+                IndexableDocument::new("a ", "trailing space"),
+                IndexableDocument::new("url", "https sqlite org"),
+            ];
+            index.index_documents(&cx, &documents).await.unwrap();
+            index.commit(&cx).await.unwrap();
+            for (raw, expected) in [
+                (r#"  id:"a  b"  "#, &["a  b"][..]),
+                (r#"id:"a b""#, &["a b"]),
+                (" id:'a  b' ", &["a  b"]),
+                (r" id:a\ \ b ", &["a  b"]),
+                (r" id:a\ ", &["a "]),
+                (" id:IN ['a  b'] ", &["a  b"]),
+                (" id:['a  b' TO 'a  b'] ", &["a  b"]),
+                (r#"id:"a  b"   OR https://sqlite.org"#, &["a  b", "url"]),
+            ] {
+                let normalized = normalize_query_whitespace(raw);
+                let rendered = index.query_text(&normalized);
+                let hits = index.search(&cx, &rendered, documents.len()).await.unwrap();
+                assert_eq!(hits.len(), expected.len(), "{raw}: {hits:?}");
+                let actual = hits
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+                assert_eq!(actual, expected, "{raw} -> {normalized}");
+            }
+            // The previous fsfs algorithm changes the exact keyword value and
+            // selects the independently planted one-space document instead.
+            let previous = r#"id:"a  b""#.split_whitespace().collect::<Vec<_>>().join(" ");
+            let hits = index.search(&cx, &previous, documents.len()).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "a b");
+
+            let normalized = normalize_query_whitespace(r#" needle   -id:"a  b"   -absent "#);
+            let parsed = ParsedQuery::parse(&normalized);
+            assert_eq!(parsed.positive, "needle");
+            assert_eq!(parsed.negative_terms, [r#"id:"a  b""#, "absent"]);
+            let census = parsed
+                .negative_terms
+                .iter()
+                .map(|term| index.query_text(term))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let hits = index.search(&cx, &census, documents.len()).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "a  b");
+        });
+    }
+
+    #[test]
     fn parsed_field_exclusion_census_preserves_adjacency_and_field_scope() {
         use frankensearch_core::ParsedQuery;
 

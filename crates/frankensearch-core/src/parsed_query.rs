@@ -241,6 +241,31 @@ pub fn normalize_query_negations(raw: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
+/// Collapse whitespace between complete query operands.
+///
+/// Quoted text, escaped whitespace, and typed literals retain their source
+/// spelling. In particular, distinct keyword values such as `id:"a  b"` and
+/// `id:"a b"` must not become the same query or cache key.
+#[must_use]
+pub fn normalize_query_whitespace(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut normalized = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    while cursor < chars.len() {
+        if chars[cursor].is_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        let end = query_fragment_end(&chars, cursor);
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.extend(chars[cursor..end].iter().copied());
+        cursor = end;
+    }
+    normalized
+}
+
 /// Render decoded text as one double-quoted query phrase.
 ///
 /// Escapes both backslashes and quote delimiters so literal phrase content
@@ -502,6 +527,45 @@ impl std::fmt::Display for ParsedQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whitespace_normalization_preserves_literal_operands() {
+        for (raw, expected) in [
+            ("", ""),
+            (" \t\n\u{2003}", ""),
+            ("  alpha\t beta\n gamma  ", "alpha beta gamma"),
+            (r#"  id:"a  b"   -outside  "#, r#"id:"a  b" -outside"#),
+            ("  id:'a  b'  ", "id:'a  b'"),
+            (r"  id:a\ \ b   tail  ", r"id:a\ \ b tail"),
+            (r"  id:a\ ", r"id:a\ "),
+            (r#"  NOT "a  b"   needle  "#, r#"NOT "a  b" needle"#),
+            (
+                r#" id:IN ['a  b' "c  d"]  tail "#,
+                r#"id:IN ['a  b' "c  d"] tail"#,
+            ),
+            (" id:['a  b' TO z]  tail ", "id:['a  b' TO z] tail"),
+            (
+                r#" id:(>= x:"literal)   -outside "#,
+                r#"id:(>= x:"literal) -outside"#,
+            ),
+            (r#" id:"a  b  "#, r#"id:"a  b  "#),
+            ("don't   split", "don't split"),
+            (r#"say"hello   world"#, r#"say"hello world"#),
+            ("'雪  猫'   -outside", "'雪  猫' -outside"),
+        ] {
+            let normalized = normalize_query_whitespace(raw);
+            assert_eq!(normalized, expected, "{raw}");
+            assert_eq!(
+                normalize_query_whitespace(&normalized),
+                expected,
+                "{raw} twice"
+            );
+        }
+        assert_ne!(
+            normalize_query_whitespace(r#"id:"a  b""#),
+            normalize_query_whitespace(r#"id:"a b""#)
+        );
+    }
 
     // ── Basic parsing ──────────────────────────────────────────────────
 
