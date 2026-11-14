@@ -623,16 +623,15 @@ async fn import_authorized_model(
         )
         .await;
     Ok(match result {
-        Ok(receipt) => ImportOutcome::Imported(receipt, Some(bound.plan().clone())),
-        Err(error) => ImportOutcome::FailedAttempt(error, bound.plan().clone()),
+        Ok(receipt) => ImportOutcome::Imported(Box::new((receipt, Some(bound.plan().clone())))),
+        Err(error) => ImportOutcome::FailedAttempt(Box::new((error, bound.plan().clone()))),
     })
 }
 
-#[allow(clippy::large_enum_variant)] // Request-local outcome; retain the exact canonical plan.
 enum ImportOutcome {
-    Planned(RecoveryPlan, ModelAcquisitionAuthorization),
-    Imported(ModelAcquisitionReceiptV1, Option<RecoveryPlan>),
-    FailedAttempt(SearchError, RecoveryPlan),
+    Planned(Box<(RecoveryPlan, ModelAcquisitionAuthorization)>),
+    Imported(Box<(ModelAcquisitionReceiptV1, Option<RecoveryPlan>)>),
+    FailedAttempt(Box<(SearchError, RecoveryPlan)>),
 }
 
 fn run(options: Options) -> SearchResult<ImportOutcome> {
@@ -658,7 +657,7 @@ fn run(options: Options) -> SearchResult<ImportOutcome> {
                 .and_then(|action| action.required_authorization())
                 .cloned()
                 .ok_or_else(|| invalid("plan", "The exact acquisition scope is unavailable."))?;
-            Ok(ImportOutcome::Planned(recovery, authorization))
+            Ok(ImportOutcome::Planned(Box::new((recovery, authorization))))
         } else if let Some(path) = &options.authorization {
             let authorization = read_authorization(path)?;
             import_authorized_model(
@@ -672,7 +671,7 @@ fn run(options: Options) -> SearchResult<ImportOutcome> {
         } else {
             import_model(&cx, &selected, &options.source, &options.output)
                 .await
-                .map(|receipt| ImportOutcome::Imported(receipt, None))
+                .map(|receipt| ImportOutcome::Imported(Box::new((receipt, None))))
         }
     });
     let result = scheduler.block_on(task);
@@ -834,33 +833,40 @@ fn main() -> ExitCode {
         Ok(options) => {
             format = options.format;
             match run(options) {
-                Ok(ImportOutcome::Imported(receipt, recovery)) => (
-                    Response {
-                        schema_version: 1,
-                        ok: true,
-                        postcondition: Some("model_acquired_needs_reindex"),
-                        acquisition: Some(receipt),
-                        recovery_plan: recovery,
-                        authorization: None,
-                        publication_uncertainty: None,
-                        error: None,
-                    },
-                    0,
-                ),
-                Ok(ImportOutcome::Planned(recovery, authorization)) => (
-                    Response {
-                        schema_version: 1,
-                        ok: true,
-                        postcondition: None,
-                        acquisition: None,
-                        recovery_plan: Some(recovery),
-                        authorization: Some(authorization),
-                        publication_uncertainty: None,
-                        error: None,
-                    },
-                    0,
-                ),
-                Ok(ImportOutcome::FailedAttempt(error, recovery)) => {
+                Ok(ImportOutcome::Imported(outcome)) => {
+                    let (receipt, recovery) = *outcome;
+                    (
+                        Response {
+                            schema_version: 1,
+                            ok: true,
+                            postcondition: Some("model_acquired_needs_reindex"),
+                            acquisition: Some(receipt),
+                            recovery_plan: recovery,
+                            authorization: None,
+                            publication_uncertainty: None,
+                            error: None,
+                        },
+                        0,
+                    )
+                }
+                Ok(ImportOutcome::Planned(outcome)) => {
+                    let (recovery, authorization) = *outcome;
+                    (
+                        Response {
+                            schema_version: 1,
+                            ok: true,
+                            postcondition: None,
+                            acquisition: None,
+                            recovery_plan: Some(recovery),
+                            authorization: Some(authorization),
+                            publication_uncertainty: None,
+                            error: None,
+                        },
+                        0,
+                    )
+                }
+                Ok(ImportOutcome::FailedAttempt(outcome)) => {
+                    let (error, recovery) = *outcome;
                     let (mut response, exit) = failure_response(&error, failure_message(&error));
                     response.recovery_plan = Some(recovery);
                     (response, exit)
@@ -1220,12 +1226,15 @@ mod tests {
                 let grant_file = temp.path().join("consent.json");
                 fs::write(&grant_file, serde_json::to_vec(&authorization).unwrap()).unwrap();
                 let supplied = read_authorization(&grant_file).unwrap();
-                let ImportOutcome::Imported(receipt, Some(executed)) =
+                let ImportOutcome::Imported(outcome) =
                     import_authorized_model(&cx, &selected, source.path(), &cache, supplied)
                         .await
                         .unwrap()
                 else {
                     panic!("the scoped real producer import must complete");
+                };
+                let (receipt, Some(executed)) = *outcome else {
+                    panic!("the scoped real producer import must retain its executed plan");
                 };
                 assert_eq!(
                     receipt.outcome,
@@ -1337,7 +1346,7 @@ mod tests {
                     .required_authorization()
                     .unwrap()
                     .clone();
-                let ImportOutcome::FailedAttempt(error, executed) = import_authorized_model(
+                let ImportOutcome::FailedAttempt(outcome) = import_authorized_model(
                     &cx,
                     &selected,
                     source.path(),
@@ -1348,6 +1357,7 @@ mod tests {
                 .unwrap() else {
                     panic!("incorrect registered execution certificate must fail");
                 };
+                let (error, executed) = *outcome;
                 assert!(matches!(error, SearchError::ModelLoadFailed { .. }));
                 assert_eq!(
                     executed.action().unwrap().required_authorization(),
