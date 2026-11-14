@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use ahash::{AHashMap, AHashSet};
-use frankensearch_core::{RankChanges, VectorHit};
+use frankensearch_core::{RankChanges, SearchError, SearchResult, VectorHit};
 use tracing::{debug, instrument};
 
 const DEFAULT_BLEND_FACTOR: f32 = 0.7;
@@ -81,6 +81,61 @@ struct ScorePair {
     fast: Option<f32>,
     quality: Option<f32>,
     index: u32,
+}
+
+/// Add available quality scores for retained fast candidates outside the
+/// independently retrieved quality window.
+///
+/// Falling below quality top-k does not mean a document lacks a quality
+/// vector. Treating that cutoff as missing evidence gives it the unpenalized
+/// fast-only score and can let it beat the quality winner. Score only the
+/// missing candidates, preserve retrieved scores, and retain genuine `None`
+/// coverage as absent. The candidate union and the blend policy stay unchanged.
+///
+/// Supplemental entries use the no-index sentinel: these are exact score
+/// observations, not quality retrieval rows. Callers must retain any retrieval
+/// coverage receipt before supplementation and restore fast row ordinals after
+/// blending by canonical document identity.
+///
+/// # Errors
+/// Propagates scoring failures and refuses a scorer that returns a different
+/// number of observations than the requested candidate batch.
+pub(crate) fn complete_quality_evidence(
+    fast_hits: &[VectorHit],
+    quality_hits: &mut Vec<VectorHit>,
+    score_missing: impl FnOnce(&[VectorHit]) -> SearchResult<Vec<Option<f32>>>,
+) -> SearchResult<()> {
+    let missing = {
+        let mut seen: AHashSet<&str> = quality_hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+        fast_hits
+            .iter()
+            .filter(|hit| seen.insert(hit.doc_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let scores = score_missing(&missing)?;
+    if scores.len() != missing.len() {
+        return Err(SearchError::InvalidConfig {
+            field: "quality_candidate_scores".to_owned(),
+            value: scores.len().to_string(),
+            reason: format!(
+                "quality scorer returned {} observations for {} retained candidates",
+                scores.len(),
+                missing.len()
+            ),
+        });
+    }
+    quality_hits.extend(missing.into_iter().zip(scores).filter_map(|(hit, score)| {
+        score.map(|score| VectorHit {
+            index: u32::MAX,
+            score,
+            doc_id: hit.doc_id,
+        })
+    }));
+    Ok(())
 }
 
 /// Blend fast-tier and quality-tier vector hits into a single ranking.

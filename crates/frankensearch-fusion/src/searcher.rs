@@ -59,7 +59,7 @@ use frankensearch_index::{FsviV2IdentityBinding, SearchParams, TwoTierIndex};
 use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
     blend_two_tier, blend_two_tier_aligned_vector_index, build_borrowed_rank_map,
-    compute_rank_changes_with_maps, kendall_tau_with_refined_rank,
+    complete_quality_evidence, compute_rank_changes_with_maps, kendall_tau_with_refined_rank,
 };
 use crate::calibration::CalibratorConfig;
 use crate::circuit_breaker::{CircuitBreaker, QualityOutcome};
@@ -538,22 +538,24 @@ struct RefinementPools {
 /// What the quality tier contributed to a refinement (bd-ctzo C2).
 ///
 /// The two variants are not two encodings of one thing — they answer
-/// different questions. `Retrieved` is the quality tier's OWN top-k, which can
-/// name documents the fast tier never selected. `RescoredFastPool` can only
-/// ever re-rank documents the fast tier already chose, so a relevant document
+/// different questions. `Retrieved` starts with the quality tier's own top-k,
+/// which can name documents the fast tier never selected, and retains exact
+/// quality evidence for fast candidates outside that window. `RescoredFastPool`
+/// can only re-rank documents the fast tier already chose, so a relevant document
 /// outside the fast pool is invisible to it. The second remains the path for
 /// legacy artifacts, where there is no admitted quality owner to retrieve
 /// from.
 enum QualityPool {
-    /// The quality owner's own top-k for this query.
+    /// Independently retrieved hits plus available quality scores for retained
+    /// fast candidates. Supplemental scores are not retrieval contributions.
     Retrieved(Vec<VectorHit>),
     /// Quality scores aligned positionally to the fast pool.
     RescoredFastPool(Vec<Option<f32>>),
 }
 
 /// A valid quality response may carry no signal. Keep that outcome distinct
-/// from successful refinement so it cannot publish Refined, train a success
-/// gate, or start reranking the unchanged Initial results.
+/// from successful refinement so it cannot publish Refined or train a success
+/// gate. Explicit final ranking may still use the valid Initial results.
 enum Phase2Outcome {
     Refined(Vec<ScoredResult>),
     SkippedZeroSignal,
@@ -561,7 +563,8 @@ enum Phase2Outcome {
 
 /// A final phase is emitted only when a configured ranking stage actually ran.
 /// Missing text, rejected model output or absent common-space coverage retain
-/// the already published Refined page without claiming a reranked result.
+/// the already published Initial or Refined page without claiming a reranked
+/// result.
 struct Phase3Outcome {
     results: Vec<ScoredResult>,
     ranker_id: String,
@@ -2985,33 +2988,23 @@ impl TwoTierSearcher {
         // power for non-idempotent calibrators (TemperatureScaling, PlattScaling,
         // IsotonicRegression).
 
-        // bd-ctzo C2: RETRIEVE from the quality tier, do not rescore the fast
-        // pool.
-        //
-        // `quality_scores_for_hits(&quality_vec, &fast_hits)` scores exactly
-        // the documents the FAST tier already selected. Its own comment above
-        // claims quality "can promote candidates that never reached the
-        // Initial top-k", and within the retained pool that is true — but a
-        // document the fast tier ranked below `k * candidate_multiplier`, or
-        // does not contain at all, is unreachable no matter what the quality
-        // tier thinks of it. That is the anti-pattern C2 forbids, and it was
-        // the production path.
-        //
-        // When the quality tier is an admitted owner, the query is instead
-        // embedded, bound, and used to search the quality owner directly; the
-        // two pools are then unioned by canonical doc_id in the blend. The
-        // fast pool is NOT re-retrieved through the activation: phase 1's pool
-        // already went through ANN candidate retrieval, score calibration,
+        // Independent quality retrieval can discover documents beyond the
+        // retained fast window. Join its actual query response to the quality
+        // producer before searching, then blend the union by canonical doc_id.
+        // The fast pool is not re-retrieved through the activation: phase 1's
+        // pool already went through ANN candidate retrieval, score calibration,
         // negation filtering and the dense-score corrections, and
         // `ActivatedTierSearch::search_fast` reproduces none of that. Union
         // here therefore means "phase 1's real fast pool ∪ the quality owner's
-        // own top-k", which is strictly more than either arm alone.
+        // own top-k". Exact quality scores for retained fast candidates may
+        // complete that union's evidence without widening either retrieval
+        // budget or introducing additional candidate identities.
         let quality_budget = pools
             .map_or(fast_hits.len(), |pools| pools.semantic_budget)
             .max(k);
         cancellation_checkpoint(cx, "fast_pool_to_quality_search")?;
         let mut quality_coverage = None;
-        let quality_pool = match admission {
+        let mut quality_pool = match admission {
             SemanticAdmission::OwnerBacked { quality: true } => {
                 // The PRF-expanded vector stays inside this space by
                 // construction: it is a convex mix of this query and vectors
@@ -3095,6 +3088,19 @@ impl TwoTierSearcher {
                     .quality_scores_for_hits(&quality_vec, &fast_hits)?,
             ),
         };
+        if let QualityPool::Retrieved(hits) = &mut quality_pool {
+            // A quality top-k cutoff is not missing vector coverage. Preserve
+            // available scores (including zero) for fast candidates below that
+            // cutoff so they receive the same paired blend as retrieved peers.
+            // Admission above binds this query to the same retained quality
+            // owner used by the exact scorer, including native retrieval.
+            // The coverage receipt was already minted from actual retrieval:
+            // these score-only observations must not inflate its contribution.
+            complete_quality_evidence(&fast_hits, hits, |missing| {
+                cancellation_checkpoint(cx, "quality_search_to_candidate_evidence")?;
+                self.index.quality_scores_for_hits(&quality_vec, missing)
+            })?;
+        }
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         cancellation_checkpoint(cx, "quality_search_to_calibration")?;
@@ -3126,12 +3132,12 @@ impl TwoTierSearcher {
         // that are only ever read as `&str`. Docs left `None` blend at their
         // fast-only score without penalty.
         //
-        // On the retrieved path the pool is the quality owner's own hits and
-        // carries doc_ids the fast pool may not have at all, so there is
-        // nothing to align to and each hit's score is transformed in place.
+        // On the retrieved path, independent hits and supplemental exact
+        // observations share this single calibration pass. The pool can carry
+        // doc_ids absent from the fast pool, so each score is transformed in
+        // place without assuming positional alignment.
         //
         // The default no-calibrator path skips both entirely.
-        let mut quality_pool = quality_pool;
         if self.score_calibrator.is_some() {
             match &mut quality_pool {
                 QualityPool::RescoredFastPool(scores) => {
@@ -3163,10 +3169,9 @@ impl TwoTierSearcher {
                 .map(|hit| (hit.doc_id.as_str(), hit.score))
                 .collect(),
         };
-        // "Incomplete" means a fast candidate the quality tier had nothing to
-        // say about — under retrieval that is a fast document the quality
-        // top-k did not reach, which is a real and different fact from "the
-        // quality tier has no vector for it".
+        // Only fast candidates without a live quality observation are
+        // incomplete. Falling below the independent quality top-k is not
+        // missing coverage once exact candidate evidence has been retained.
         metrics.incomplete_embeddings = fast_hits
             .iter()
             .filter(|hit| !quality_scores_by_doc.contains_key(hit.doc_id.as_str()))
@@ -9464,6 +9469,185 @@ mod tests {
     }
 
     #[test]
+    fn independent_quality_top_k_completes_fast_evidence_before_calibration() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_dir, index) = query_admission_index(layout);
+                for prefer_quality in [false, true] {
+                    for calibrated in [false, true] {
+                        let mut searcher = TwoTierSearcher::new(
+                            Arc::clone(&index),
+                            Arc::new(query_admission_embedder("fast")),
+                            TwoTierConfig {
+                                candidate_multiplier: 1,
+                                quality_weight: if prefer_quality { 1.0 } else { 0.0 },
+                                ..TwoTierConfig::default()
+                            },
+                        )
+                        .with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+                        if calibrated {
+                            searcher = searcher.with_score_calibrator(
+                                CalibratorConfig::TemperatureScaling(
+                                    crate::calibration::TemperatureScaling::new(2.0),
+                                ),
+                            );
+                        }
+                        let mut phases = Vec::new();
+                        let metrics = searcher
+                            .search(&cx, "query", 1, |_| None, |phase| phases.push(phase))
+                            .await
+                            .expect("independently admitted top-k pools refine");
+                        let [
+                            SearchPhase::Initial {
+                                results: initial, ..
+                            },
+                            SearchPhase::Refined { results, .. },
+                        ] = phases.as_slice()
+                        else {
+                            panic!("both tiers must run for {layout}: {phases:?}");
+                        };
+                        assert_eq!(initial.len(), 1);
+                        assert_eq!(initial[0].doc_id, "doc-a");
+                        assert_eq!(results.len(), 1);
+                        let result = &results[0];
+                        if prefer_quality {
+                            assert_eq!(result.doc_id, "doc-quality-only");
+                            assert_eq!(result.index, None);
+                            assert_eq!(result.fast_score, None);
+                            assert_eq!(result.quality_score, Some(searcher.calibrate_score(1.0)));
+                        } else {
+                            assert_eq!(result.doc_id, "doc-a");
+                            assert_eq!(result.index, initial[0].index);
+                            assert_eq!(result.fast_score, initial[0].fast_score);
+                            // doc-a was outside quality top-1 but has a real
+                            // zero score. A single sigmoid maps it to 0.5;
+                            // skipping or repeating calibration cannot pass.
+                            assert_eq!(
+                                result.quality_score,
+                                Some(if calibrated { 0.5 } else { 0.0 })
+                            );
+                        }
+                        assert_eq!(metrics.incomplete_embeddings, 0);
+                        assert_eq!(metrics.phase2_vectors_searched, 2);
+                        if layout == "stamped-v1" {
+                            assert!(metrics.coverage.is_none(), "v1 has no v2 receipt");
+                        } else {
+                            assert!(matches!(
+                                metrics.coverage.as_ref().unwrap().quality,
+                                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                    live_count: 3,
+                                    contributed_candidates: 1,
+                                    ..
+                                }
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn independent_quality_keeps_absent_and_tombstoned_vectors_missing() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for native in [false, true] {
+                for tombstoned in [false, true] {
+                    let dir = owner_backed_dir("quality-evidence-missing");
+                    let binding = |model, dimension| {
+                        let mut identity = query_admission_identity(model, dimension);
+                        "fsvi-v2".clone_into(&mut identity.storage.format);
+                        identity.storage.quantization = QuantizationFormat::F16;
+                        "little-endian".clone_into(&mut identity.storage.endianness);
+                        FsviV2IdentityBinding::new(
+                            ArtifactGenerationIdentityV1::new(79, [0x5c; 16]).unwrap(),
+                            identity.freeze().unwrap(),
+                        )
+                        .unwrap()
+                    };
+                    let fast_binding = binding("response-fast", 4);
+                    let quality_binding = binding("response-quality", 6);
+                    let fast_path = dir.join("vector.fast.idx");
+                    let quality_path = dir.join("vector.quality.idx");
+                    write_v2_tier(
+                        &fast_path,
+                        &fast_binding,
+                        &[("a-uncovered", &[1.0, 0.0, 0.0, 0.0])],
+                    );
+                    let mut writer = frankensearch_index::VectorIndex::create_v2(
+                        &quality_path,
+                        quality_binding.clone(),
+                    )
+                    .unwrap();
+                    writer
+                        .write_record("z-quality", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+                        .unwrap();
+                    if tombstoned {
+                        writer
+                            .write_tombstone_record("a-uncovered", &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+                            .unwrap();
+                    }
+                    writer.finish().unwrap();
+                    let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                        &frankensearch_index::TwoTierIndexPaths::new(&fast_path)
+                            .with_quality_index(&quality_path),
+                        TwoTierConfig::default(),
+                        &fast_binding,
+                        Some(&quality_binding),
+                    )
+                    .unwrap();
+                    if native {
+                        let params = frankensearch_index::native_hnsw::HnswParams::default();
+                        index.enable_native_fast_hnsw(&cx, params, 43).unwrap();
+                        index.enable_native_quality_hnsw(&cx, params, 47).unwrap();
+                    }
+                    let searcher = TwoTierSearcher::new(
+                        Arc::new(index),
+                        Arc::new(query_admission_embedder("fast")),
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            quality_weight: 1.0,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+                    let mut phases = Vec::new();
+                    let metrics = searcher
+                        .search(&cx, "query", 1, |_| None, |phase| phases.push(phase))
+                        .await
+                        .expect("partial quality coverage remains a valid refinement");
+                    let [
+                        SearchPhase::Initial { .. },
+                        SearchPhase::Refined { results, .. },
+                    ] = phases.as_slice()
+                    else {
+                        panic!("both tiers must run: {phases:?}");
+                    };
+                    // Genuine absence retains the existing unpenalized
+                    // single-source score, including after native retrieval.
+                    // A retained tombstone must not become zero-valued quality
+                    // evidence and demote this fast-only document.
+                    assert_eq!(results.len(), 1);
+                    assert_eq!(results[0].doc_id, "a-uncovered");
+                    assert_eq!(results[0].index, Some(0));
+                    assert_eq!(results[0].fast_score, Some(1.0));
+                    assert_eq!(results[0].quality_score, None);
+                    assert_eq!(metrics.incomplete_embeddings, 1);
+                    assert_eq!(metrics.phase2_vectors_searched, 1);
+                    assert!(matches!(
+                        metrics.coverage.as_ref().unwrap().quality,
+                        frankensearch_core::TierQueryCoverageV1::Witnessed {
+                            live_count: 1,
+                            contributed_candidates: 1,
+                            ..
+                        }
+                    ));
+                }
+            }
+        });
+    }
+
+    #[test]
     fn native_fast_and_both_tiers_preserve_progressive_hybrid_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for with_quality in [false, true] {
@@ -13154,10 +13338,13 @@ mod tests {
             .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
             .with_lexical(lexical.clone());
             let mut phases = Vec::new();
+            // A natural-language positive query reaches refinement even when
+            // the eligible lexical tail fills k; short keywords intentionally
+            // return that lexical page before vector retrieval.
             let metrics = searcher
                 .search(
                     &cx,
-                    "needle -blocked",
+                    "needle metadata scoring snapshot -blocked",
                     1,
                     |id| {
                         Some(
@@ -13178,6 +13365,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            assert_eq!(metrics.query_class, Some(QueryClass::NaturalLanguage));
+            assert!(metrics.phase1_vectors_searched > 0);
             assert!(lexical.searches.load(Ordering::Relaxed) > 1);
             assert_eq!(metrics.lexical_candidates, 1);
             assert_eq!(phases.len(), 2);

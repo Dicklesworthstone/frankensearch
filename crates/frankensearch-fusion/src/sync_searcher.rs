@@ -28,7 +28,10 @@ use frankensearch_index::{
     InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams, ValidatedFsviBytes,
 };
 
-use crate::blend::{blend_two_tier, blend_two_tier_aligned_vector_index, compute_rank_changes};
+use crate::blend::{
+    blend_two_tier, blend_two_tier_aligned_vector_index, complete_quality_evidence,
+    compute_rank_changes,
+};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{
     RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
@@ -56,13 +59,14 @@ enum AdmittedSyncQuery<'query> {
 /// What the quality tier contributed to a synchronous refinement.
 ///
 /// Same distinction the async searcher draws: `Retrieved` is the quality
-/// tier's OWN top-k and can name documents the fast tier never selected;
+/// tier's OWN top-k and can name documents the fast tier never selected,
+/// supplemented with exact quality scores for retained fast candidates;
 /// `RescoredFastPool` can only re-rank what the fast tier already chose.
 /// Independent retrieval requires an admitted v2 owner or a persisted v1
 /// producer fingerprint joined to the bound query. A caller-declared space
 /// alone does not establish that producer contract.
 enum SyncQualityPool {
-    /// The quality tier's own top-k for the quality-bound query.
+    /// Independent quality retrieval plus available retained-candidate evidence.
     Retrieved(Vec<VectorHit>),
     /// Quality scores aligned positionally to the fast pool. Still computed
     /// from the QUALITY-bound query: the aligned SHAPE was never the bug, the
@@ -1104,7 +1108,13 @@ impl SyncTwoTierSearcher {
         let quality_pool = if independent_quality {
             quality_index
                 .search_top_k(quality_query.vector(), fetch, filter)
-                .map(SyncQualityPool::Retrieved)
+                .and_then(|mut hits| {
+                    complete_quality_evidence(&fast_hits, &mut hits, |missing| {
+                        self.index
+                            .quality_scores_for_hits(quality_query.vector(), missing)
+                    })?;
+                    Ok(SyncQualityPool::Retrieved(hits))
+                })
         } else {
             self.index
                 .quality_scores_for_hits(quality_query.vector(), &fast_hits)
@@ -1152,6 +1162,10 @@ impl SyncTwoTierSearcher {
         };
         let quality_count = quality_scores_by_doc.len();
         metrics.phase2_vectors_searched = quality_count;
+        metrics.incomplete_embeddings = fast_hits
+            .iter()
+            .filter(|hit| !quality_scores_by_doc.contains_key(hit.doc_id.as_str()))
+            .count();
         if quality_count > 0 {
             // This classifies the combined semantic lane. Independent quality
             // retrieval can supply signal even when the fast lane had none.
@@ -2057,6 +2071,88 @@ mod tests {
                 assert!(metrics.zero_signal.is_none());
             }
         }
+    }
+
+    #[test]
+    fn independent_quality_window_retains_exact_fast_candidate_evidence() {
+        let dir = temp_dir("persisted-quality-evidence");
+        let (fast, quality) = persisted_producer_pair(dir.path());
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        for quality_weight in [0.0, 1.0] {
+            let searcher = SyncTwoTierSearcher::new(
+                Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap()),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    quality_weight,
+                    explain: true,
+                    ..TwoTierConfig::default()
+                },
+            );
+            let (results, metrics) = searcher.search_collect(&query, 2).unwrap();
+            // Quality retrieves b/c, but a has a real quality vector below
+            // that top-k window. Its zero score must remain present evidence,
+            // rather than becoming an unpenalized missing-source observation.
+            assert_eq!(metrics.phase2_vectors_searched, 3);
+            assert_eq!(metrics.incomplete_embeddings, 0);
+            assert!(metrics.coverage.is_none(), "v1 cannot mint v2 coverage");
+            assert!(results.iter().all(|result| result.explanation.is_some()));
+            let ids = results
+                .iter()
+                .map(|result| result.doc_id.as_str())
+                .collect::<Vec<_>>();
+            if quality_weight == 0.0 {
+                assert_eq!(ids, ["a", "b"]);
+                assert_eq!(results[0].quality_score, Some(0.0));
+                assert!(results[0].fast_score.is_some());
+                assert_eq!(results[0].index, Some(0));
+            } else {
+                assert_eq!(ids, ["b", "c"]);
+                assert!(results.iter().all(|result| result.fast_score.is_none()));
+                assert!(results.iter().all(|result| result.index.is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn independent_quality_preserves_genuinely_missing_vectors_without_penalty() {
+        let dir = temp_dir("persisted-quality-absent-vector");
+        let fast = semantic_identity("persisted-fast", 2);
+        let quality = semantic_identity("persisted-quality", 3);
+        let mut writer =
+            frankensearch_index::TwoTierIndex::create(dir.path(), TwoTierConfig::default())
+                .unwrap();
+        writer.set_fast_embedder_id("persisted-fast");
+        writer.set_quality_embedder_id("persisted-quality");
+        writer.set_fast_identity(&fast).unwrap();
+        writer.set_quality_identity(&quality).unwrap();
+        writer.add_fast_record("a-uncovered", &[1.0, 0.0]).unwrap();
+        writer
+            .add_quality_record("z-quality", &[1.0, 0.0, 0.0])
+            .unwrap();
+        drop(writer.finish().unwrap());
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap()),
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                quality_weight: 1.0,
+                ..TwoTierConfig::default()
+            },
+        );
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let (results, metrics) = searcher.search_collect(&query, 1).unwrap();
+        assert_eq!(results[0].doc_id, "a-uncovered");
+        assert_eq!(results[0].score, 1.0);
+        assert_eq!(results[0].fast_score, Some(1.0));
+        assert_eq!(results[0].quality_score, None);
+        assert_eq!(results[0].index, Some(0));
+        assert_eq!(metrics.incomplete_embeddings, 1);
+        assert_eq!(metrics.phase2_vectors_searched, 1);
     }
 
     #[test]
