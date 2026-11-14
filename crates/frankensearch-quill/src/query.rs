@@ -7268,6 +7268,18 @@ mod tests {
                 r#"id:['a " b' TO b]title:rust"#,
                 r#"id:['a " b' TO b]title:rust"#,
             ),
+            (
+                r#"id:< "literal OR https://sqlite.org"#,
+                r#"id:< "literal OR https\://sqlite.org"#,
+            ),
+            (
+                r#"id:<"literal OR https://sqlite.org"#,
+                r#"id:<"literal OR https\://sqlite.org"#,
+            ),
+            (
+                "id:>= https://sqlite.org OR other",
+                "id:>= https://sqlite.org OR other",
+            ),
         ] {
             let escaped = escape_unknown_field_colons(query, crate::DEFAULT_SCHEMA);
             assert_eq!(escaped, expected, "{query}");

@@ -645,6 +645,10 @@ mod tests {
             r#"id: IN ['a " b']"#,
             "ord:[0 TO -1]",
             r#"id:IN ['a -b' 'NOT "phrase"']"#,
+            "id:>= literal",
+            "id : < -b",
+            "id:<=\t-猫",
+            r"id:> a\ b",
         ] {
             let raw = format!("needle -{operand}");
             let parsed = ParsedQuery::parse(&raw);
@@ -674,6 +678,13 @@ mod tests {
             r"id:['a\' ] -b' TO z]",
             "id:['café -猫' TO z]",
             "id:IN [a -b]",
+            "id:>= -b",
+            "id:<=\t-猫",
+            "id : <\u{2003}-b",
+            r"id:> a\ b",
+            r#"id:< "literal"#,
+            r#"id:>= not "a phrase""#,
+            "filename>=thing",
         ] {
             let raw = format!("{operand} -outside");
             let parsed = ParsedQuery::parse(&raw);

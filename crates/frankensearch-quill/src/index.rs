@@ -37812,6 +37812,12 @@ mod tests {
                 ("title:rust", &["title"]),
                 ("title : rust", &["title"]),
                 ("(title : rust)", &["title"]),
+                ("id:>= literal", &["literal", "title", "url"]),
+                ("id:> literal", &["title", "url"]),
+                ("id:< literal", &["a \" b", "inch"]),
+                ("id:<= literal", &["a \" b", "inch", "literal"]),
+                (r#"id:<"literal OR https://sqlite.org"#, &["url"]),
+                (r#"id:< "literal OR https://sqlite.org"#, &["url"]),
                 (
                     r#"id:['a " b' TO b] OR https://sqlite.org"#,
                     &["a \" b", "url"],
@@ -37830,7 +37836,14 @@ mod tests {
                 let expected = expected.iter().copied().collect::<BTreeSet<_>>();
                 assert_eq!(actual, expected, "{raw} -> {rendered}");
             }
-            for operand in [r#"id:['a " b' TO b]"#, r#"id:IN ['a " b']"#] {
+            for (operand, expected) in [
+                (r#"id:['a " b' TO b]"#, &["a \" b"][..]),
+                (r#"id:IN ['a " b']"#, &["a \" b"]),
+                ("id:>= literal", &["literal", "title", "url"]),
+                ("id:> literal", &["title", "url"]),
+                ("id:< literal", &["a \" b", "inch"]),
+                ("id:<= literal", &["a \" b", "inch", "literal"]),
+            ] {
                 let raw = format!("needle -{operand} -absent");
                 let parsed = ParsedQuery::parse(&raw);
                 assert_eq!(parsed.positive, "needle", "{raw}");
@@ -37842,8 +37855,13 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" OR ");
                 let hits = index.search(&cx, &census, documents.len()).await.unwrap();
-                assert_eq!(hits.len(), 1, "{raw}: {hits:?}");
-                assert_eq!(hits[0].doc_id, "a \" b", "{raw}");
+                assert_eq!(hits.len(), expected.len(), "{raw}: {hits:?}");
+                let actual = hits
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+                assert_eq!(actual, expected, "{raw}");
             }
         });
     }
