@@ -1088,7 +1088,7 @@ pub(super) fn copy_selected_generation(
     let predecessor = store.active(cx)?.ok_or_else(|| {
         reuse_error("no complete generation has been published; index the store first")
     })?;
-    FsfsRuntime::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
+    FsfsRuntime::retained_generation_search_mode(predecessor.path())?;
     if FsfsRuntime::resolve_lexical_engine(predecessor.path())?.engine()
         == Some(frankensearch_quill::BlueGreenEngine::Tantivy)
     {

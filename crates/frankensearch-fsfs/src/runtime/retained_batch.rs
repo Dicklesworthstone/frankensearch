@@ -684,7 +684,7 @@ impl FsfsRuntime {
                 "selected generation differs from the expected batch base",
             ));
         }
-        Self::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
+        let candidate_mode = Self::retained_generation_search_mode(predecessor.path())?;
         let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
             .ok_or_else(|| invalid("selected membership manifests disagree"))?;
         // A source deleted before it ever acquired index rows can still have
@@ -704,7 +704,7 @@ impl FsfsRuntime {
         if upserted > 0 {
             self.validate_append_indexing_mode(predecessor.path())?;
         }
-        let lexical_only = Self::is_lexical_only_generation(predecessor.path());
+        let lexical_only = candidate_mode == SearchExecutionMode::LexicalOnly;
         if lexical_only
             && documents
                 .values()
@@ -737,7 +737,11 @@ impl FsfsRuntime {
         } else {
             Self::fast_window_policy_at_root(predecessor.path())?
         };
-        let fast = if lexical_only || !semantic_upserts {
+        let fast = if !matches!(
+            candidate_mode,
+            SearchExecutionMode::Full | SearchExecutionMode::FastOnly
+        ) || !semantic_upserts
+        {
             None
         } else {
             control
@@ -1020,11 +1024,11 @@ impl FsfsRuntime {
         if !lexical_reclaimed {
             reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
         }
-        let candidate_mode = if lexical_only {
-            SearchExecutionMode::LexicalOnly
-        } else {
-            SearchExecutionMode::Full
-        };
+        if Self::retained_generation_search_mode(build.path())? != candidate_mode {
+            return Err(invalid(
+                "batch mutation changed the selected generation's retrieval topology",
+            ));
+        }
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
