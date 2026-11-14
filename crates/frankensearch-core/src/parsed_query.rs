@@ -314,6 +314,14 @@ fn query_fragment_end(chars: &[char], start: usize) -> usize {
                 field_start = Some(cursor + 1);
             }
         } else {
+            if operand_start
+                && field_start.is_none()
+                && let Some(value) = query_comparison_value_start(chars, cursor)
+            {
+                cursor = value;
+                operand_start = false;
+                continue;
+            }
             if operand_start && let Some(open) = query_set_open(chars, cursor) {
                 // IN and its bracketed members form one operand, including
                 // when that operand is an exclusion after a field prefix.
@@ -392,6 +400,20 @@ fn query_set_open(chars: &[char], start: usize) -> Option<usize> {
         open += 1;
     }
     (open > after_in && chars.get(open) == Some(&'[')).then_some(open)
+}
+
+fn query_comparison_value_start(chars: &[char], start: usize) -> Option<usize> {
+    if !matches!(chars.get(start).copied(), Some('>' | '<')) {
+        return None;
+    }
+    let mut value = start.checked_add(1)?;
+    if chars.get(value) == Some(&'=') {
+        value += 1;
+    }
+    while chars.get(value).is_some_and(|ch| ch.is_whitespace()) {
+        value += 1;
+    }
+    Some(value)
 }
 
 /// Check if the characters at position `i` match "NOT" (case-insensitive)
@@ -597,6 +619,10 @@ mod tests {
             ),
             ("'alpha -banned' -outside", "'alpha -banned'"),
             ("title:'alpha -banned' -outside", "title:'alpha -banned'"),
+            (
+                r#"<kind:"alpha -banned" -outside"#,
+                r#"<kind:"alpha -banned""#,
+            ),
             (
                 r#"title : "alpha -banned" -outside"#,
                 r#"title : "alpha -banned""#,

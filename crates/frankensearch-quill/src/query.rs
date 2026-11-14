@@ -1267,6 +1267,18 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
             }
             after_whitespace = false;
         }
+        if operand_start
+            && (field_start.is_none() || field_prefix(query, index).is_none())
+            && let Some((_, length)) = comparison_operator(query, index)
+        {
+            // Comparison bounds are bare fragments, even when they start
+            // with a quote or contain colons. Match the lexer's field-prefix
+            // precedence and copy the bound without opening phrase context.
+            typed_end = scan_fragment_end(query, skip_whitespace(query, index + length));
+            field_start = Some(typed_end);
+            escaped_query.push(ch);
+            continue;
+        }
         match ch {
             '[' | '{' if operand_start => {
                 // Range/set contents have their own quote and escape grammar.
@@ -7252,6 +7264,7 @@ mod tests {
                 r#"title:bare" OR https\://sqlite.org"#,
             ),
             ("title:content:rust", r"title:content\:rust"),
+            ("<kind:value", r"<kind\:value"),
             (
                 r#"id:['a " b' TO b] OR https://sqlite.org"#,
                 r#"id:['a " b' TO b] OR https\://sqlite.org"#,

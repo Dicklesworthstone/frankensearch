@@ -680,7 +680,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v27: quoted field exclusions retain their complete operand and field scope.
 // v28: literal-colon escaping respects quotes and real operand boundaries.
 // v29: range/set literals retain their contents and exclusion boundaries.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v29";
+// v30: spaced comparison bounds retain their complete bare operand.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v30";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -706,8 +707,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v24 / stream v22: quoted field exclusions retain their complete operand.
 // v25 / stream v23: literal colons respect quoted and escaped operands.
 // v26 / stream v24: typed literals retain quote and exclusion boundaries.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v26";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v24";
+// v27 / stream v25: comparison bounds retain whitespace and bare context.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v27";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v25";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -38138,6 +38140,7 @@ mod tests {
             "fsfs.search.serve.v23",
             "fsfs.search.serve.v24",
             "fsfs.search.serve.v25",
+            "fsfs.search.serve.v26",
         ] {
             response.schema_version = old_schema.to_owned();
             assert!(
@@ -66528,6 +66531,8 @@ mod tests {
                 "fsfs.search.cache.v27",
                 // Could misread quoted range/set contents as query syntax.
                 "fsfs.search.cache.v28",
+                // Could split a spaced comparison bound into query syntax.
+                "fsfs.search.cache.v29",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
