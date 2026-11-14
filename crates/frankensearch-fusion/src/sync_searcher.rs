@@ -41,14 +41,16 @@ use crate::rrf::{
 /// Every admitted tier must join the query's space and attested producer.
 /// Legacy and caller-declared tiers retain their explicitly weaker identity
 /// contract; they do not acquire owner-backed authority by being loaded here.
-struct AdmittedSyncQuery<'query> {
-    /// The fast-tier query. Always present: the sync contract is
-    /// fast-then-refine, so a search with no fast arm has no phase 1.
-    fast: &'query BoundQueryEmbedding,
-    /// The quality-tier query, when the caller bound one AND this index has a
-    /// quality tier. `None` is why phase 2 is skipped, not a licence to reuse
-    /// `fast` against the quality index.
-    quality: Option<&'query BoundQueryEmbedding>,
+enum AdmittedSyncQuery<'query> {
+    /// Fast results followed by independently bound quality when requested.
+    Progressive {
+        fast: &'query BoundQueryEmbedding,
+        quality: Option<&'query BoundQueryEmbedding>,
+    },
+    /// Direct quality retrieval, with no fast query or fast-vector access.
+    QualityOnly {
+        quality: &'query BoundQueryEmbedding,
+    },
 }
 
 /// What the quality tier contributed to a synchronous refinement.
@@ -121,6 +123,14 @@ fn admit_tier_query(
         return Err(SearchError::DimensionMismatch { expected, found });
     }
     Ok(())
+}
+
+fn independently_retrievable_quality(index: &InMemoryVectorIndex) -> bool {
+    index.space_identity_is_attested()
+        || (index.space_fingerprint_hex().is_none()
+            && index
+                .embedder_revision()
+                .is_some_and(|revision| !revision.is_empty()))
 }
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
@@ -548,11 +558,16 @@ impl SyncTwoTierSearcher {
     /// index was scored with the fast tier's query — a cross-space read that
     /// no dimension check can catch, because the two tiers usually have the
     /// same width. That vector is no longer representable here.
+    /// A quality-only query directly retrieves the independently admitted quality
+    /// tier without touching fast vectors. It can still fuse an attached lexical
+    /// arm; that adapter receives the quality query vector. A quality-only request
+    /// requires semantic quality with an admitted owner or persisted producer
+    /// fingerprint, and is incompatible with `config.fast_only`.
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError::InvalidConfig`] when the query binds no fast
-    /// embedding, or when a query fails its tier's retained space and producer
+    /// Returns [`SearchError::InvalidConfig`] when the requested tier is absent
+    /// or unauthorized, or when a query fails its retained space and producer
     /// admission; plus dimension/filter errors from vector search and
     /// lexical backend failures (when lexical fusion is enabled).
     pub fn search_collect(
@@ -596,6 +611,9 @@ impl SyncTwoTierSearcher {
     /// identities and returns Initial; quality retrieval runs only when the
     /// caller requests the next phase. Dropping the iterator discards pending
     /// refinement without starting it. Each call uses the caller's thread.
+    /// A quality-only request instead returns one terminal Initial containing
+    /// quality results, labeled through their quality source, score and phase
+    /// metrics. There is no fabricated fast phase or subsequent refinement.
     #[must_use]
     pub const fn search_iter<'a>(
         &'a self,
@@ -632,14 +650,48 @@ impl SyncTwoTierSearcher {
         &self,
         query: &'query TieredQueryEmbeddings,
     ) -> SearchResult<AdmittedSyncQuery<'query>> {
-        let fast = query.fast().ok_or_else(|| SearchError::InvalidConfig {
-            field: "sync_search.topology".to_owned(),
-            value: format!("{:?}", query.supported_topology()),
-            reason: "the synchronous progressive contract is fast-then-refine, so it requires a \
-                     fast-tier query embedding; a quality-only retrieval has no Initial phase \
-                     and belongs on the owner-backed activation surface instead"
-                .to_owned(),
-        })?;
+        let Some(fast) = query.fast() else {
+            let quality = query.quality().ok_or_else(|| SearchError::InvalidConfig {
+                field: "sync_search.topology".to_owned(),
+                value: "empty".to_owned(),
+                reason: "at least one independently bound query tier is required".to_owned(),
+            })?;
+            let index = self
+                .index
+                .quality_index()
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "sync_search.topology".to_owned(),
+                    value: "quality_only".to_owned(),
+                    reason: "quality-only retrieval requires a quality index".to_owned(),
+                })?;
+            admit_tier_query(index, quality, "quality")?;
+            if !independently_retrievable_quality(index) {
+                return Err(SearchError::InvalidConfig {
+                    field: "search_activation.quality.producer_identity".to_owned(),
+                    value: "unidentified".to_owned(),
+                    reason: "quality-only retrieval requires an admitted owner or a persisted \
+                             complete producer fingerprint"
+                        .to_owned(),
+                });
+            }
+            if quality.identity().space.kind != EmbeddingSpaceKindV1::Semantic {
+                return Err(SearchError::InvalidConfig {
+                    field: "sync_search.quality_kind".to_owned(),
+                    value: "non_semantic".to_owned(),
+                    reason: "quality-only retrieval requires a semantic quality producer"
+                        .to_owned(),
+                });
+            }
+            if self.config.fast_only {
+                return Err(SearchError::InvalidConfig {
+                    field: "sync_search.topology".to_owned(),
+                    value: "quality_only".to_owned(),
+                    reason: "quality-only retrieval conflicts with the fast-only search policy"
+                        .to_owned(),
+                });
+            }
+            return Ok(AdmittedSyncQuery::QualityOnly { quality });
+        };
         admit_tier_query(self.index.fast_index(), fast, "fast")?;
 
         let quality = match (query.quality(), self.index.quality_index()) {
@@ -653,7 +705,7 @@ impl SyncTwoTierSearcher {
             // consulted. Neither case licenses reusing the fast embedding.
             _ => None,
         };
-        Ok(AdmittedSyncQuery { fast, quality })
+        Ok(AdmittedSyncQuery::Progressive { fast, quality })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -666,8 +718,13 @@ impl SyncTwoTierSearcher {
     ) -> SearchResult<SyncPreparedSearch<'query>> {
         // Identity first, before k == 0, before the zero-norm check, and
         // before any index is touched.
-        let admitted = self.admit(query)?;
-        let query_vec = admitted.fast.vector();
+        let (fast_query, quality_query) = match self.admit(query)? {
+            AdmittedSyncQuery::Progressive { fast, quality } => (fast, quality),
+            AdmittedSyncQuery::QualityOnly { quality } => {
+                return self.search_quality_only(quality, k, filter, want_phase);
+            }
+        };
+        let query_vec = fast_query.vector();
         let mut metrics = TwoTierMetrics::default();
         // Match the async progressive contract: zero requested results is a
         // successful no-op, not a request to scan the corpus and discard the
@@ -801,9 +858,7 @@ impl SyncTwoTierSearcher {
         // QUALITY-space embedding for it, and the fast lane must be semantic.
         // A hash-control fast lane is a control path, not a first semantic
         // pass, so a bound quality embedding does not schedule refinement.
-        let quality_query = admitted
-            .quality
-            .filter(|_| !self.config.fast_only && !hash_control);
+        let quality_query = quality_query.filter(|_| !self.config.fast_only && !hash_control);
         let Some(quality_query) = quality_query else {
             // Same vocabulary as the async searcher (searcher.rs) — the two
             // sides share one skip_reason contract; "fast_only" is the string
@@ -845,6 +900,170 @@ impl SyncTwoTierSearcher {
         })
     }
 
+    fn search_quality_only<'query>(
+        &self,
+        query: &'query BoundQueryEmbedding,
+        k: usize,
+        filter: Option<&dyn SearchFilter>,
+        want_phase: bool,
+    ) -> SearchResult<SyncPreparedSearch<'query>> {
+        // Admission has already joined this query to the quality producer.
+        // Nothing here consults fast identity, vectors, ordinals or ranking.
+        let index = self
+            .index
+            .quality_index()
+            .expect("quality-only admission requires the quality tier");
+        let embedder_id = index.embedder_id().unwrap_or("sync-quality-query");
+        let mut metrics = TwoTierMetrics {
+            quality_embedder_id: Some(embedder_id.to_owned()),
+            ..TwoTierMetrics::default()
+        };
+        if k == 0 {
+            metrics.zero_signal = Some(ZeroSignalReason::CallerRequestedZeroK);
+            return Ok(SyncPreparedSearch {
+                initial: SyncSearchOutcome {
+                    phase: None,
+                    final_results: Vec::new(),
+                    metrics,
+                },
+                refinement: None,
+            });
+        }
+        let started = Instant::now();
+        let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
+        let lexical_started = Instant::now();
+        let lexical_hits = self
+            .lexical
+            .as_ref()
+            .map(|lexical| search_filtered_lexical(lexical.as_ref(), query.vector(), fetch, filter))
+            .transpose()?;
+        metrics.lexical_search_ms = ms(lexical_started.elapsed());
+        metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
+
+        let quality_started = Instant::now();
+        let hits = if query.vector().iter().all(|&value| value == 0.0) {
+            metrics.zero_signal = Some(ZeroSignalReason::ZeroNormQuery);
+            Vec::new()
+        } else {
+            let hits = self.search_params.map_or_else(
+                || index.search_top_k(query.vector(), fetch, filter),
+                |params| index.search_top_k_with_params(query.vector(), fetch, filter, params),
+            )?;
+            // These are Phase-1 vectors because direct quality is the first
+            // and only phase. The embedder and quality timing identify its tier.
+            metrics.phase1_vectors_searched = index.record_count();
+            if hits.is_empty() {
+                metrics.zero_signal = Some(
+                    index
+                        .zero_signal_state()
+                        .empty_result_reason(filter.is_some()),
+                );
+            }
+            hits
+        };
+        metrics.quality_search_ms = ms(quality_started.elapsed());
+        metrics.vector_search_ms = metrics.quality_search_ms;
+        metrics.semantic_candidates = hits.len();
+        let fusion_started = Instant::now();
+        let results = self.quality_only_results(&hits, lexical_hits.as_deref(), k, embedder_id);
+        metrics.rrf_fusion_ms = ms(fusion_started.elapsed());
+        let latency = started.elapsed();
+        metrics.phase1_total_ms = ms(latency);
+        let phase = want_phase.then(|| SearchPhase::Initial {
+            results: results.clone(),
+            latency,
+            metrics: PhaseMetrics {
+                embedder_id: embedder_id.to_owned(),
+                vectors_searched: metrics.phase1_vectors_searched,
+                lexical_candidates: metrics.lexical_candidates,
+                fused_count: results.len(),
+                skip_reason: metrics
+                    .zero_signal
+                    .map(|reason| reason.reason_code().to_owned()),
+                hash_control_candidates: 0,
+            },
+        });
+        Ok(SyncPreparedSearch {
+            initial: SyncSearchOutcome {
+                phase,
+                final_results: results,
+                metrics,
+            },
+            refinement: None,
+        })
+    }
+
+    fn quality_only_results(
+        &self,
+        hits: &[VectorHit],
+        lexical: Option<&[ScoredResult]>,
+        k: usize,
+        embedder_id: &str,
+    ) -> Vec<ScoredResult> {
+        let mut results = lexical.map_or_else(
+            || {
+                vector_hits_to_scored_results(
+                    hits,
+                    k,
+                    ScoreSource::SemanticQuality,
+                    None,
+                    None,
+                    &self.config,
+                    embedder_id,
+                )
+            },
+            |lexical| {
+                fused_hits_to_scored_results(
+                    fuse_by_strategy(
+                        self.config.fusion_strategy,
+                        lexical,
+                        hits,
+                        &[],
+                        0.0,
+                        k,
+                        0,
+                        &RrfConfig {
+                            k: self.config.rrf_k,
+                            lexical_weight: self.rrf_lexical_weight,
+                            semantic_weight: self.effective_semantic_weight(lexical),
+                            tiebreak: self.rrf_tiebreak,
+                        },
+                    ),
+                    lexical,
+                    k,
+                    &self.config,
+                    embedder_id,
+                    false,
+                )
+            },
+        );
+        // The shared converters describe their primary vector input as fast.
+        // This input was exclusively quality, so retain its raw evidence under
+        // that tier and never expose a quality ordinal as a fast-row ordinal.
+        for result in &mut results {
+            result.index = None;
+            result.quality_score = result.fast_score.take();
+            if result.source == ScoreSource::SemanticFast {
+                result.source = ScoreSource::SemanticQuality;
+            }
+            if let Some(explanation) = &mut result.explanation {
+                for component in &mut explanation.components {
+                    if let ExplainedSource::SemanticFast {
+                        embedder,
+                        cosine_sim,
+                    } = &component.source
+                    {
+                        component.source = ExplainedSource::SemanticQuality {
+                            embedder: embedder.clone(),
+                            cosine_sim: *cosine_sim,
+                        };
+                    }
+                }
+            }
+        }
+        results
+    }
+
     #[allow(clippy::too_many_lines)]
     fn search_refined(
         &self,
@@ -881,11 +1100,7 @@ impl SyncTwoTierSearcher {
         // The v1 fingerprint does not manufacture v2 generation authority or
         // coverage. Caller-declared spaces and unstamped control fixtures keep
         // their existing rescoring contract.
-        let independent_quality = quality_index.space_identity_is_attested()
-            || (quality_index.space_fingerprint_hex().is_none()
-                && quality_index
-                    .embedder_revision()
-                    .is_some_and(|revision| !revision.is_empty()));
+        let independent_quality = independently_retrievable_quality(quality_index);
         let quality_pool = if independent_quality {
             quality_index
                 .search_top_k(quality_query.vector(), fetch, filter)
@@ -1215,6 +1430,8 @@ enum SyncIteratorState<'query> {
 /// and lexical retrieval. A second `next()` runs quality refinement when that
 /// tier is available and requested. Dropping an unconsumed iterator performs
 /// no search; dropping after Initial performs no quality traversal or blending.
+/// A quality-only request directly retrieves quality on the first `next()` and
+/// yields one terminal Initial with quality provenance. No fast tier is read.
 /// The searcher, bound queries and filter remain borrowed until the iterator is
 /// dropped, keeping both phases on the same retained in-memory index. Filters
 /// should keep their selection policy stable across those phases.
@@ -1282,6 +1499,7 @@ impl Iterator for SyncSearchIterator<'_> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self.state {
             SyncIteratorState::Initial { k: 0, .. } => (0, Some(1)),
+            SyncIteratorState::Initial { query, .. } if query.fast().is_none() => (1, Some(1)),
             SyncIteratorState::Initial { .. } => (1, Some(2)),
             SyncIteratorState::Refine(_) => (1, Some(1)),
             SyncIteratorState::Done => (0, Some(0)),
@@ -1956,6 +2174,382 @@ mod tests {
         };
         assert!(initial_results.is_empty());
         assert_eq!(field, expected_field);
+    }
+
+    fn quality_only_index(
+        directory: &Path,
+        attested: bool,
+    ) -> (Arc<InMemoryTwoTierIndex>, EmbeddingIdentityBundleV1) {
+        if !attested {
+            let (_, quality) = persisted_producer_pair(directory);
+            return (
+                Arc::new(InMemoryTwoTierIndex::from_dir(directory).unwrap()),
+                quality,
+            );
+        }
+        let (fast, _) = attested_tier(
+            directory,
+            "fast.fsvi",
+            "unused-fast",
+            1,
+            &[("fast-only", &[1.0, 0.0])],
+        );
+        let (quality, identity) = attested_tier(
+            directory,
+            "quality.fsvi",
+            "direct-quality",
+            1,
+            &[("b", &[1.0, 0.0, 0.0]), ("c", &[0.8, 0.6, 0.0])],
+        );
+        (
+            Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap()),
+            identity,
+        )
+    }
+
+    #[test]
+    fn quality_only_sync_retrieves_quality_without_reading_fast() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct QualityTraversal(AtomicUsize);
+        impl SearchFilter for QualityTraversal {
+            fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool {
+                assert_ne!(
+                    id, "fast-only",
+                    "quality-only must never traverse fast rows"
+                );
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "quality-traversal"
+            }
+        }
+        for attested in [false, true] {
+            let directory = temp_dir("quality-only-positive");
+            let (index, identity) = quality_only_index(directory.path(), attested);
+            let query = TieredQueryEmbeddings::quality_only(
+                BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], identity).unwrap(),
+            );
+            for hybrid in [false, true] {
+                let mut searcher = SyncTwoTierSearcher::new(
+                    Arc::clone(&index),
+                    TwoTierConfig {
+                        quality_weight: 0.0,
+                        candidate_multiplier: 1,
+                        explain: true,
+                        ..TwoTierConfig::default()
+                    },
+                );
+                if hybrid {
+                    let mut hit = lexical_result("b", 4.0);
+                    hit.metadata = Some(Arc::new(serde_json::json!({"snapshot": "retained"})));
+                    searcher = searcher.with_lexical(Arc::new(StaticLexical { hits: vec![hit] }));
+                }
+                let observed = QualityTraversal(AtomicUsize::new(0));
+                let unused = searcher.search_iter_with_filter(&query, 1, Some(&observed));
+                assert_eq!(unused.size_hint(), (1, Some(1)));
+                drop(unused);
+                assert_eq!(observed.0.load(Ordering::SeqCst), 0);
+
+                let phases = searcher
+                    .search_iter_with_filter(&query, 1, Some(&observed))
+                    .collect::<Vec<_>>();
+                let [
+                    SearchPhase::Initial {
+                        results, metrics, ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("direct quality yields one terminal Initial: {phases:?}");
+                };
+                assert!(observed.0.load(Ordering::SeqCst) > 0);
+                assert_eq!(metrics.embedder_id, index.quality_embedder_id().unwrap());
+                assert_eq!(
+                    metrics.vectors_searched,
+                    index.quality_index().unwrap().record_count()
+                );
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].doc_id, "b");
+                assert_eq!(results[0].index, None);
+                assert_eq!(results[0].fast_score, None);
+                assert_eq!(results[0].quality_score, Some(1.0));
+                assert_eq!(
+                    results[0].source,
+                    if hybrid {
+                        ScoreSource::Hybrid
+                    } else {
+                        ScoreSource::SemanticQuality
+                    }
+                );
+                let explanation = results[0].explanation.as_ref().unwrap();
+                assert!(explanation.rank_movement.is_none());
+                assert!(explanation.components.iter().any(|component| matches!(
+                    component.source,
+                    ExplainedSource::SemanticQuality { .. }
+                )));
+                assert!(!explanation.components.iter().any(|component| matches!(
+                    component.source,
+                    ExplainedSource::SemanticFast { .. } | ExplainedSource::HashControl { .. }
+                )));
+                if hybrid {
+                    assert_eq!(
+                        results[0].metadata.as_ref().unwrap()["snapshot"],
+                        "retained"
+                    );
+                }
+                let (collected, metrics) = searcher.search_collect(&query, 1).unwrap();
+                assert_eq!(collected[0].doc_id, "b");
+                assert_eq!(collected[0].score.to_bits(), results[0].score.to_bits());
+                assert_eq!(metrics.fast_embedder_id, None);
+                assert_eq!(
+                    metrics.quality_embedder_id.as_deref(),
+                    index.quality_embedder_id()
+                );
+                assert_eq!(metrics.phase2_vectors_searched, 0);
+                assert_eq!(metrics.phase2_total_ms, 0.0);
+                assert_eq!(metrics.blend_ms, 0.0);
+                assert_eq!(metrics.rank_changes.total(), 0);
+                assert_eq!(metrics.semantic_candidates, 1);
+            }
+        }
+    }
+
+    struct UnreachableQualityWork;
+
+    impl SyncLexicalSearch for UnreachableQualityWork {
+        fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+            panic!("quality admission must precede lexical retrieval");
+        }
+    }
+
+    impl SearchFilter for UnreachableQualityWork {
+        fn matches(&self, _: &str, _: Option<&serde_json::Value>) -> bool {
+            panic!("quality admission must precede vector traversal");
+        }
+
+        fn name(&self) -> &'static str {
+            "unreachable-quality-work"
+        }
+    }
+
+    #[test]
+    fn quality_only_sync_admission_precedes_all_work() {
+        for attested in [false, true] {
+            let directory = temp_dir("quality-only-admission");
+            let (index, identity) = quality_only_index(directory.path(), attested);
+            let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+                .with_lexical(Arc::new(UnreachableQualityWork));
+            for producer_change in [false, true] {
+                let mut foreign = identity.clone();
+                if producer_change {
+                    "foreign-implementation".clone_into(&mut foreign.producer.backend);
+                } else {
+                    "foreign-weights".clone_into(&mut foreign.space.immutable_revision);
+                    foreign.producer.space_fingerprint = foreign.space.fingerprint();
+                }
+                for k in [0, 1] {
+                    for signal in [0.0, 1.0] {
+                        let query = TieredQueryEmbeddings::quality_only(
+                            BoundQueryEmbedding::new(vec![signal, 0.0, 0.0], foreign.clone())
+                                .unwrap(),
+                        );
+                        assert!(matches!(
+                            searcher.search_collect_with_filter(&query, k, Some(&UnreachableQualityWork)),
+                            Err(SearchError::InvalidConfig { field, .. }) if field.contains("quality")
+                        ));
+                        let phases = searcher
+                            .search_iter_with_filter(&query, k, Some(&UnreachableQualityWork))
+                            .collect::<Vec<_>>();
+                        assert!(
+                            matches!(phases.as_slice(), [SearchPhase::RefinementFailed { initial_results, error: SearchError::InvalidConfig { field, .. }, .. }] if initial_results.is_empty() && field.contains("quality"))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quality_only_sync_refuses_missing_unidentified_control_and_disabled_tiers() {
+        let raw = || {
+            InMemoryVectorIndex::from_vectors(vec!["raw".to_owned()], vec![vec![1.0, 0.0]], 2)
+                .unwrap()
+        };
+        let semantic = semantic_identity("declared-quality", 2);
+        let query = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], semantic.clone()).unwrap(),
+        );
+        let absent = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(raw(), None).unwrap()),
+            TwoTierConfig::default(),
+        )
+        .with_lexical(Arc::new(UnreachableQualityWork));
+        assert_admission_refusal(&absent, &query, 0, "sync_search.topology");
+        let declared = InMemoryVectorIndex::from_vectors_with_identity(
+            vec!["declared".to_owned()],
+            vec![vec![1.0, 0.0]],
+            2,
+            &semantic,
+        )
+        .unwrap();
+        let unidentified = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(raw(), Some(declared)).unwrap()),
+            TwoTierConfig::default(),
+        )
+        .with_lexical(Arc::new(UnreachableQualityWork));
+        assert_admission_refusal(
+            &unidentified,
+            &query,
+            0,
+            "search_activation.quality.producer_identity",
+        );
+
+        let directory = temp_dir("quality-only-control");
+        let control = EmbeddingIdentityBundleV1::explicit_test_model("explicit-control", 2);
+        let fast = attested_tier_with_identity(
+            directory.path(),
+            "fast.fsvi",
+            1,
+            &[("control", &[1.0, 0.0])],
+            &control,
+        );
+        let quality = attested_tier_with_identity(
+            directory.path(),
+            "quality.fsvi",
+            1,
+            &[("control", &[1.0, 0.0])],
+            &control,
+        );
+        let control_searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap()),
+            TwoTierConfig::default(),
+        )
+        .with_lexical(Arc::new(UnreachableQualityWork));
+        let control_query = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], control).unwrap(),
+        );
+        assert_admission_refusal(
+            &control_searcher,
+            &control_query,
+            0,
+            "sync_search.quality_kind",
+        );
+
+        let directory = temp_dir("quality-only-disabled");
+        let (index, identity) = quality_only_index(directory.path(), true);
+        let disabled = SyncTwoTierSearcher::new(
+            index,
+            TwoTierConfig {
+                fast_only: true,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_lexical(Arc::new(UnreachableQualityWork));
+        let query = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], identity).unwrap(),
+        );
+        assert_admission_refusal(&disabled, &query, 0, "sync_search.topology");
+    }
+
+    #[test]
+    fn quality_only_sync_zero_empty_and_filtered_queries_report_the_actual_lane() {
+        let directory = temp_dir("quality-only-empty");
+        let identity = semantic_identity("empty-quality", 3);
+        let fast = attested_tier_with_identity(
+            directory.path(),
+            "fast.fsvi",
+            1,
+            &[("fast-only", &[1.0, 0.0, 0.0])],
+            &identity,
+        );
+        let quality =
+            attested_tier_with_identity(directory.path(), "quality.fsvi", 1, &[], &identity);
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap()),
+            TwoTierConfig::default(),
+        );
+        let query = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], identity).unwrap(),
+        );
+        let (results, metrics) = searcher.search_collect(&query, 4).unwrap();
+        assert!(results.is_empty());
+        assert_eq!(
+            metrics.zero_signal,
+            Some(ZeroSignalReason::NewlyCreatedEmpty)
+        );
+        assert_eq!(metrics.phase1_vectors_searched, 0);
+        assert!(
+            matches!(searcher.search_iter(&query, 4).collect::<Vec<_>>().as_slice(), [SearchPhase::Initial { results, .. }] if results.is_empty())
+        );
+        let (_, metrics) = searcher.search_collect(&query, 0).unwrap();
+        assert_eq!(
+            metrics.zero_signal,
+            Some(ZeroSignalReason::CallerRequestedZeroK)
+        );
+        assert!(searcher.search_iter(&query, 0).next().is_none());
+
+        let directory = temp_dir("quality-only-zero");
+        let (index, identity) = quality_only_index(directory.path(), true);
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default()).with_lexical(
+            Arc::new(StaticLexical {
+                hits: vec![lexical_result("lexical-only", 2.0)],
+            }),
+        );
+        let zero = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![0.0; 3], identity.clone()).unwrap(),
+        );
+        let (results, metrics) = searcher.search_collect(&zero, 4).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, ScoreSource::Lexical);
+        assert_eq!(results[0].fast_score, None);
+        assert_eq!(results[0].quality_score, None);
+        assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
+        assert_eq!(metrics.phase1_vectors_searched, 0);
+        let query = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], identity).unwrap(),
+        );
+        let reject = frankensearch_core::filter::PredicateFilter::new("reject-all", |_| false);
+        let (results, metrics) = searcher
+            .search_collect_with_filter(&query, 4, Some(&reject))
+            .unwrap();
+        assert!(results.is_empty());
+        assert_eq!(
+            metrics.zero_signal,
+            Some(ZeroSignalReason::FilterEliminatedAll)
+        );
+        assert_eq!(metrics.semantic_candidates, 0);
+    }
+
+    #[test]
+    fn quality_only_sync_lexical_cancellation_precedes_vector_work() {
+        struct CancelledLexical;
+        impl SyncLexicalSearch for CancelledLexical {
+            fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+                Err(SearchError::Cancelled {
+                    phase: "quality-only-lexical".to_owned(),
+                    reason: "caller cancelled".to_owned(),
+                })
+            }
+        }
+        let directory = temp_dir("quality-only-cancelled");
+        let (index, identity) = quality_only_index(directory.path(), true);
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+            .with_lexical(Arc::new(CancelledLexical));
+        let query = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], identity).unwrap(),
+        );
+        assert!(matches!(
+            searcher.search_collect_with_filter(&query, 1, Some(&UnreachableQualityWork)),
+            Err(SearchError::Cancelled { .. })
+        ));
+        let phases = searcher
+            .search_iter_with_filter(&query, 1, Some(&UnreachableQualityWork))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(phases.as_slice(), [SearchPhase::RefinementFailed { initial_results, error: SearchError::Cancelled { .. }, .. }] if initial_results.is_empty())
+        );
     }
 
     #[cfg(target_os = "linux")]

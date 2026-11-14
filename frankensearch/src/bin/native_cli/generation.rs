@@ -94,7 +94,8 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       [--max-source-bytes N] [--batch-size N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\
-      [--query TEXT --rollback-receipt NEW_JSON [--filter JSON] [--limit N] [--stream]]\n\n\
+      [--query TEXT --rollback-receipt NEW_JSON [--filter JSON] [--limit N] [--stream]\n\
+       [--timeout-ms N] [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]]\n\n\
   authority-update --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       --source-low N --source-high N [--input EDITS_JSONL]\n\
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
@@ -219,6 +220,13 @@ authorities, source, producers and request. It previews a nonempty semantic\n\
 query before publication, replays it once after publication, and attempts one\n\
 higher-sequence rollback on replay failure. Cancellation or uncertain publication\n\
 keeps its actual outcome and receipts; neither grants permission to republish.\n\
+The original filter, fusion/candidate/beam policy and retained reranker are used\n\
+for both preview and replay and are bound into the recovery request digest.\n\
+--timeout-ms bounds each complete query independently: one budget for preview\n\
+and a fresh equal budget for replay. Build, publication and rollback are outside\n\
+these query budgets. Preview timeout never publishes; replay timeout attempts\n\
+the same expected-old rollback as another query failure. Full-query tuning and\n\
+reranking require a complete full generation; a requested rerank must succeed.\n\
 Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
 by authority-index. Search refuses a head different from the receipt.\n\
@@ -679,7 +687,9 @@ impl Options {
                 {
                     options.limit = number(&value(&mut args)?, 1_000)?;
                 }
-                "--timeout-ms" if matches!(command, Command::Search | Command::Serve) => {
+                "--timeout-ms"
+                    if matches!(command, Command::Search | Command::Serve | Command::Rebuild) =>
+                {
                     options.timeout_ms =
                         Some(value(&mut args)?.parse().map_err(|_| {
                             bad("query timeout must be an unsigned millisecond count")
@@ -689,13 +699,19 @@ impl Options {
                 "--query-cache-entries" if command == Command::Serve => {
                     options.query_cache = query_cache::Config::parse(&value(&mut args)?)?;
                 }
-                "--full-query" if matches!(command, Command::Search | Command::Serve) => {
+                "--full-query"
+                    if matches!(command, Command::Search | Command::Serve | Command::Rebuild) =>
+                {
                     options.full_query = Some(query::FullQuery::parse(&value(&mut args)?)?);
                 }
-                "--reranker-dir" if matches!(command, Command::Search | Command::Serve) => {
+                "--reranker-dir"
+                    if matches!(command, Command::Search | Command::Serve | Command::Rebuild) =>
+                {
                     options.reranker_dir = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--rerank-window" if matches!(command, Command::Search | Command::Serve) => {
+                "--rerank-window"
+                    if matches!(command, Command::Search | Command::Serve | Command::Rebuild) =>
+                {
                     options.rerank_window = number(&value(&mut args)?, 1_000)?;
                 }
                 "--mode" if command == Command::Search => {
@@ -803,10 +819,13 @@ impl Options {
                 } else if options.rollback_receipt.is_some()
                     || options.filter.is_some()
                     || options.stream
+                    || options.timeout_ms.is_some()
+                    || options.full_query.is_some()
+                    || options.reranker_dir.is_some()
                     || seen.contains("--limit")
                 {
                     return Err(bad(
-                        "rebuild query, filter, limit, stream and rollback options require --query",
+                        "rebuild query policy, stream and rollback options require --query",
                     ));
                 }
                 if options.retained_source {
@@ -2106,6 +2125,9 @@ where
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;
+    if options.query.is_some() {
+        query_controls::validate_startup(options, selected.query_mode(None)?)?;
+    }
     let work_path = new_path(
         options
             .work

@@ -102,6 +102,17 @@ initial result set; a refinement failure retains the already delivered results.
 Fast-only and zero-quality-signal searches stop after the initial phase. Use
 `search_collect` when only the final result set and aggregate metrics are needed.
 
+`TieredQueryEmbeddings::quality_only` performs direct quality retrieval through
+the same APIs. It requires a semantic quality tier with an admitted FSVI v2 owner
+or a matching persisted producer fingerprint. The request never searches fast
+vectors or blends fast scores, and it emits one terminal `Initial` phase whose
+results and metrics identify the quality tier. Optional lexical fusion preserves
+the same metadata and receives the quality query vector. Quality results carry
+`quality_score` and no fast-row `index`; malformed identities, absent quality,
+control-only producers, and a conflicting `fast_only` configuration are refused
+before retrieval. A zero-result limit still validates admission and performs no
+search.
+
 ### Federation with separate document stores
 
 `FederatedSearcher::search` accepts a shared `doc_id`-to-text callback. Use
