@@ -9205,7 +9205,9 @@ mod tests {
                                 }));
                                 phases.push("reranked");
                             }
-                            phase => panic!("unavailable quality must not publish {phase:?}"),
+                            phase @ SearchPhase::Refined { .. } => {
+                                panic!("unavailable quality must not publish {phase:?}");
+                            }
                         },
                     )
                     .await

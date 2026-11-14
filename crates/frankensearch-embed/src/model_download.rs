@@ -2644,7 +2644,7 @@ mod tests {
 
     fn bound_local_fixture(
         target: &ModelAcquisitionTarget,
-        state: SemanticReadiness,
+        state: &SemanticReadiness,
     ) -> BoundLocalModelAcquisitionPlan {
         use frankensearch_core::recovery_plan::{
             InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
@@ -2661,7 +2661,7 @@ mod tests {
         };
         let now = target.issued_at_unix_seconds + 1;
         let preview = plan(TrustedRecoveryContext::new(
-            &state,
+            state,
             request,
             &policy,
             Some(target),
@@ -2671,7 +2671,7 @@ mod tests {
         policy.acquisition_authorization =
             preview.action().unwrap().required_authorization().cloned();
         plan(TrustedRecoveryContext::new(
-            &state,
+            state,
             request,
             &policy,
             Some(target),
@@ -2742,7 +2742,7 @@ mod tests {
         .unwrap();
         let bound = bound_local_fixture(
             &target,
-            SemanticReadiness::ModelUnloadable {
+            &SemanticReadiness::ModelUnloadable {
                 tier: ModelTier::Fast,
             },
         );
@@ -2862,7 +2862,7 @@ mod tests {
         .unwrap();
         let plan = bound_local_fixture(
             &target,
-            SemanticReadiness::ModelMissing {
+            &SemanticReadiness::ModelMissing {
                 tier: ModelTier::Fast,
             },
         );
@@ -2870,7 +2870,7 @@ mod tests {
         oversized.byte_budget += 1;
         let wrong_budget = bound_local_fixture(
             &oversized,
-            SemanticReadiness::ModelMissing {
+            &SemanticReadiness::ModelMissing {
                 tier: ModelTier::Fast,
             },
         );
@@ -2935,7 +2935,7 @@ mod tests {
         .unwrap();
         let bound = bound_local_fixture(
             &target,
-            SemanticReadiness::ModelUnloadable {
+            &SemanticReadiness::ModelUnloadable {
                 tier: ModelTier::Fast,
             },
         );
@@ -2984,7 +2984,7 @@ mod tests {
             fresh.expires_at_unix_seconds = 1900;
             let fresh = bound_local_fixture(
                 &fresh,
-                SemanticReadiness::ModelUnloadable {
+                &SemanticReadiness::ModelUnloadable {
                     tier: ModelTier::Fast,
                 },
             );

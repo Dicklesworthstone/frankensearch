@@ -604,8 +604,8 @@ async fn import_authorized_model(
     let source = std::path::absolute(source)?;
     let destination = std::path::absolute(cache_root)?.join(selected.install_directory());
     let mut lifecycle = import_lifecycle(selected, &frozen);
-    let result = ModelDownloader::with_defaults()
-        .acquire_local_model_recovery(
+    let result = Box::pin(
+        ModelDownloader::with_defaults().acquire_local_model_recovery(
             cx,
             &bound,
             ModelAcquisitionRequest {
@@ -620,8 +620,9 @@ async fn import_authorized_model(
                 ensure_unsealed_destination(&destination)?;
                 current_time()
             },
-        )
-        .await;
+        ),
+    )
+    .await;
     Ok(match result {
         Ok(receipt) => ImportOutcome::Imported(Box::new((receipt, Some(bound.plan().clone())))),
         Err(error) => ImportOutcome::FailedAttempt(Box::new((error, bound.plan().clone()))),
