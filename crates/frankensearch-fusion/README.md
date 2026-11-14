@@ -73,6 +73,26 @@ let fused = rrf_fuse(&vector_hits, &lexical_hits, &config);
 // let (results, metrics) = searcher.search_collect(&cx, "query", 10).await?;
 ```
 
+### Final ranking with optional quality refinement
+
+`TwoTierSearcher::with_reranker` enables a cross-encoder with the `rerank`
+feature. `with_mmr_config` enables diversity ranking without that feature.
+Both retain a bounded candidate window beyond the displayed page, so a final
+ranker can promote a document outside the Initial top-k.
+
+Final ranking uses the refined pool when quality succeeds and the retained
+Initial pool when quality is absent, disabled, skipped, or fails. A fast-only
+search can therefore emit `Initial` followed by `Reranked`; a quality failure
+can emit `Initial`, `RefinementFailed`, then `Reranked`. Quality skip and failure
+reasons remain in the metrics. Cancellation at a phase callback stops later
+ranking work, and failed or unapplied ranking preserves the preceding result.
+MMR uses only fast vectors when quality did not succeed, and skips a pool that
+no single eligible vector space covers. Exclusion-only lexical browsing keeps
+its single Initial phase.
+
+Use `search` to observe each phase or `search_collect_with_text` to obtain the
+last successful ranking with document text available to the cross-encoder.
+
 ### Synchronous progressive retrieval
 
 `SyncTwoTierSearcher::search_iter` starts work when the iterator is consumed.
@@ -90,6 +110,7 @@ fn display_progressively(searcher: &SyncTwoTierSearcher, query: &TieredQueryEmbe
         match phase {
             SearchPhase::Initial { results, .. } => println!("Initial results: {results:?}"),
             SearchPhase::Refined { results, .. } => println!("Refined results: {results:?}"),
+            SearchPhase::Reranked { results, .. } => println!("Final results: {results:?}"),
             SearchPhase::RefinementFailed { error, .. } => eprintln!("{error}"),
         }
     }
@@ -99,19 +120,33 @@ fn display_progressively(searcher: &SyncTwoTierSearcher, query: &TieredQueryEmbe
 The iterator borrows its searcher, query and optional filter for its lifetime.
 Identity or initial-retrieval failures yield `RefinementFailed` with an empty
 initial result set; a refinement failure retains the already delivered results.
-Fast-only and zero-quality-signal searches stop after the initial phase. Use
+By default, fast-only and zero-quality-signal searches stop after the initial phase. Use
 `search_collect` when only the final result set and aggregate metrics are needed.
+
+`SyncTwoTierSearcher::with_mmr_config` enables synchronous diversity ranking
+with the existing `MmrConfig`. It retains a bounded candidate window beyond
+the displayed page and can emit a final `Reranked` phase after Initial or
+Refined. MMR runs only when that iterator phase is requested; collection runs
+it before returning. It compares every candidate in one admitted vector space,
+preferring complete quality coverage after refinement and otherwise complete
+fast coverage. A pool with no common eligible space keeps the previous result.
+Disabled MMR performs no candidate retention or diversity work, and enabled
+candidate pools above 1,000 are refused before retrieval.
 
 `TieredQueryEmbeddings::quality_only` performs direct quality retrieval through
 the same APIs. It requires a semantic quality tier with an admitted FSVI v2 owner
 or a matching persisted producer fingerprint. The request never searches fast
-vectors or blends fast scores, and it emits one terminal `Initial` phase whose
-results and metrics identify the quality tier. Optional lexical fusion preserves
+vectors or blends fast scores, and its `Initial` phase identifies the quality
+tier through its results and metrics. Optional lexical fusion preserves
 the same metadata and receives the quality query vector. Quality results carry
 `quality_score` and no fast-row `index`; malformed identities, absent quality,
 control-only producers, and a conflicting `fast_only` configuration are refused
 before retrieval. A zero-result limit still validates admission and performs no
 search.
+
+With MMR enabled, direct quality can also emit `Reranked`, using quality vectors
+exclusively. Missing quality coverage for a lexical candidate skips diversity;
+it never authorizes a fallback into the fast embedding space.
 
 ### Federation with separate document stores
 

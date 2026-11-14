@@ -28,7 +28,9 @@ use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::filter::{ExcludeDocIdsFilter, PredicateFilter, SearchFilter};
-use frankensearch_core::parsed_query::{ParsedQuery, normalize_query_whitespace, quote_query_phrase};
+use frankensearch_core::parsed_query::{
+    ParsedQuery, normalize_query_whitespace, quote_query_phrase,
+};
 use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::traits::ModelTier;
 use frankensearch_core::{
@@ -541,6 +543,7 @@ const REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED: &str =
 const REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY: &str =
     "vector.quality_tier.skipped.lexical_only";
 const REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY: &str = "vector.fast_tier.skipped.lexical_only";
+const REASON_VECTOR_FAST_TIER_SKIPPED_QUALITY_ONLY: &str = "vector.fast_tier.skipped.quality_only";
 
 /// Why a retained source build owes exact quality work to a later completion.
 /// Producer backoff is local to indexing; it must not change query policy.
@@ -1023,6 +1026,15 @@ enum SearchExecutionMode {
     FastOnly,
     QualityOnly,
     LexicalOnly,
+}
+
+/// The required semantic producer for a source build. Ordinary indexing uses
+/// fast vectors plus an optional quality tier; explicit quality-only recovery
+/// builds the quality space directly, without acquiring a fast dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexingPrimaryTier {
+    Fast,
+    Quality,
 }
 
 impl SearchExecutionMode {
@@ -7494,6 +7506,9 @@ pub struct FsfsRuntime {
     /// tiers. Selected by `force_lexical_only` or `force_metadata_only`, and
     /// always set in a build without semantic loaders (bd-636yz).
     lexical_only_indexing: bool,
+    /// Selected only on the private source-recovery runtime. The checkpoint's
+    /// primary producer and vector rows belong to this exact tier.
+    indexing_primary_tier: IndexingPrimaryTier,
     /// A watcher with an unavailable optional producer continues source work
     /// while preserving exact quality inputs for its bounded acquisition retry.
     /// This applies only to private source-build clones, never serving policy.
@@ -7596,6 +7611,7 @@ impl FsfsRuntime {
             generation_retention: crate::generation_store::GenerationRetention::default(),
             complete_generations_for_new_roots: false,
             lexical_only_indexing,
+            indexing_primary_tier: IndexingPrimaryTier::Fast,
             indexing_quality_deferral: None,
             unchanged_sources: None,
             seeded_from_receipt: false,
@@ -14244,6 +14260,16 @@ impl FsfsRuntime {
         }
     }
 
+    const fn indexing_search_mode(&self) -> SearchExecutionMode {
+        if matches!(self.indexing_primary_tier, IndexingPrimaryTier::Quality) {
+            SearchExecutionMode::QualityOnly
+        } else if self.lexical_only_indexing {
+            SearchExecutionMode::LexicalOnly
+        } else {
+            SearchExecutionMode::Full
+        }
+    }
+
     /// A lexical answer has no embedding producer. Ignore unrelated model
     /// configuration only when the effective execution mode is lexical-only.
     fn selected_model_ids_for_mode(
@@ -16007,9 +16033,9 @@ impl FsfsRuntime {
                             filter_expr
                                 .as_ref()
                                 .is_none_or(|filter| filter.matches_doc_id(&candidate.doc_id))
-                                && excluded_doc_ids.as_deref().is_none_or(|excluded| {
-                                    !excluded.contains(&candidate.doc_id)
-                                })
+                                && excluded_doc_ids
+                                    .as_deref()
+                                    .is_none_or(|excluded| !excluded.contains(&candidate.doc_id))
                         })
                         .take(lexical_head_budget)
                         .cloned()
@@ -16032,9 +16058,9 @@ impl FsfsRuntime {
                             filter_expr
                                 .as_ref()
                                 .is_none_or(|filter| filter.matches_doc_id(&candidate.doc_id))
-                                && excluded_doc_ids.as_deref().is_none_or(|excluded| {
-                                    !excluded.contains(&candidate.doc_id)
-                                })
+                                && excluded_doc_ids
+                                    .as_deref()
+                                    .is_none_or(|excluded| !excluded.contains(&candidate.doc_id))
                         })
                         .take(lexical_head_budget)
                         .cloned()
@@ -21416,9 +21442,15 @@ impl FsfsRuntime {
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
     {
-        if !self.lexical_only_indexing {
-            self.validate_semantic_model_selection(SearchExecutionMode::Full)?;
-        }
+        self.validate_semantic_model_selection(self.indexing_search_mode())?;
+        let quality_only = matches!(self.indexing_primary_tier, IndexingPrimaryTier::Quality);
+        // Quality uses the canonical document input, never the fast passage
+        // expansion. Persist its actual coverage in checkpoints and manifests.
+        let fast_window_max_per_file = if quality_only {
+            1
+        } else {
+            self.config.indexing.fast_window_max_per_file
+        };
         let batch_size = self.effective_embedding_batch_size();
         let mut control = IndexRunControl::new(&self.config)?;
         control.admit_work(cx, "index.start").await?;
@@ -21600,6 +21632,19 @@ impl FsfsRuntime {
         // existing typed readiness error with its `fsfs download-models` argv.
         let embedder = if lexical_only {
             None
+        } else if quality_only {
+            control.admit_work(cx, "index.quality_model_load").await?;
+            let embedder = self.resolve_quality_embedder()?.ok_or_else(|| {
+                SearchError::EmbedderUnavailable {
+                    model: self.config.indexing.quality_model.clone(),
+                    reason: "quality-only source recovery requires its verified quality producer"
+                        .to_owned(),
+                }
+            })?;
+            control.checkpoint(cx, "index.quality_model_loaded", true)?;
+            Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
+            Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+            Some(embedder)
         } else {
             control.admit_work(cx, "index.model_provisioning").await?;
             self.maybe_offer_interactive_model_provisioning(cx).await?;
@@ -21615,12 +21660,16 @@ impl FsfsRuntime {
             |embedder| (embedder.id().to_owned(), embedder.dimension()),
         );
 
-        // 1b. The quality tier. Built from the same document set as the fast
-        // tier whenever the configuration allows a quality stage and a
-        // verified quality model is present; otherwise the reason is recorded
-        // on the generation and search serves INITIAL only.
+        // 1b. The optional secondary quality tier. Built from the same document
+        // set as the fast tier whenever the configuration allows a quality
+        // stage and a verified quality model is present; otherwise the reason
+        // is recorded on the generation and search serves INITIAL only.
         let (quality_embedder, mut quality_tier_reason) = if lexical_only {
             (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY)
+        } else if quality_only {
+            // The required primary already owns quality. Do not resolve it a
+            // second time or open a second writer for the same vector file.
+            (None, REASON_VECTOR_QUALITY_TIER_BUILT)
         } else {
             control.admit_work(cx, "index.quality_model_load").await?;
             self.resolve_indexing_quality_embedder()
@@ -21632,7 +21681,7 @@ impl FsfsRuntime {
         // Each generation is stamped with its producer's identity; every
         // vector stored in it must come from a response bound to that same
         // identity, so capture it once and hold each batch to it.
-        let fast_admission = embedder
+        let primary_admission = embedder
             .as_ref()
             .map(|embedder| {
                 self.admit_workload_embedder(cx, Arc::clone(embedder), WorkloadClass::Embed)
@@ -21676,7 +21725,11 @@ impl FsfsRuntime {
         ))?;
 
         // 2. Prepare indexes and validate the last durable checkpoint generation.
-        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        let vector_path = index_root.join(if quality_only {
+            FSFS_VECTOR_QUALITY_INDEX_FILE
+        } else {
+            FSFS_VECTOR_INDEX_FILE
+        });
         let mut existing_checkpoint = match read_indexing_checkpoint(&index_root) {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
@@ -21708,8 +21761,7 @@ impl FsfsRuntime {
                 && checkpoint.artifacts_durable
                 && checkpoint.target_root == target_root_label
                 && checkpoint.index_root == index_root_label
-                && checkpoint.fast_window_max_per_file
-                    == self.config.indexing.fast_window_max_per_file
+                && checkpoint.fast_window_max_per_file == fast_window_max_per_file
         });
         let checkpoint_manifests = if checkpoint_metadata_valid {
             match Self::read_checkpoint_manifest_generation(
@@ -21768,7 +21820,7 @@ impl FsfsRuntime {
                     .map_or_else(BTreeMap::new, |previous| previous.files.clone()),
                 discovered_files: stats.discovered_files,
                 skipped_files: stats.skipped_files,
-                fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
+                fast_window_max_per_file,
                 content_skipped: existing_checkpoint
                     .as_ref()
                     .map_or_else(BTreeMap::new, |previous| previous.content_skipped.clone()),
@@ -21776,9 +21828,9 @@ impl FsfsRuntime {
         )?;
 
         let mut vector_generation_compatible = false;
-        let mut vector_index = if let Some(fast_admission) = fast_admission.as_ref() {
-            let embedder = fast_admission.embedder();
-            let embedder_revision = fast_admission.identity.fingerprint();
+        let mut vector_index = if let Some(primary_admission) = primary_admission.as_ref() {
+            let embedder = primary_admission.embedder();
+            let embedder_revision = primary_admission.identity.fingerprint();
             let reused = if checkpoint_manifests.is_some() && vector_path.exists() {
                 // Reuse mutates the checkpoint generations in place. A warm query
                 // daemon from any earlier `fsfs search` holds them under the
@@ -21902,7 +21954,7 @@ impl FsfsRuntime {
                 }
             };
             quality_vector_index = Some(index);
-        } else if quality_vector_path.exists() {
+        } else if !quality_only && quality_vector_path.exists() {
             publication_lease.fence("one-shot stale quality generation retirement")?;
             Self::retire_vector_generation(&quality_vector_path, quality_tier_reason)?;
         }
@@ -22190,7 +22242,7 @@ impl FsfsRuntime {
             files: BTreeMap::new(),
             discovered_files: stats.discovered_files,
             skipped_files: stats.skipped_files,
-            fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
+            fast_window_max_per_file,
             content_skipped: BTreeMap::new(),
         };
 
@@ -22387,14 +22439,14 @@ impl FsfsRuntime {
                 let ingestion_class = ingestion_class_label(candidate.ingestion_class).to_owned();
                 let reason_code = ingestion_plan_reason(candidate.ingestion_class).to_owned();
                 let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
-                let fast_windows = if self.config.indexing.fast_window_max_per_file > 1
+                let fast_windows = if fast_window_max_per_file > 1
                     && matches!(
                         candidate.ingestion_class,
                         IngestionClass::FullSemanticLexical
                     ) {
                     Some(semantic_windows::plan(
                         &lexical_text,
-                        self.config.indexing.fast_window_max_per_file,
+                        fast_window_max_per_file,
                     )?)
                 } else {
                     None
@@ -22560,7 +22612,7 @@ impl FsfsRuntime {
 
             let mut semantic_succeeded_this_chunk = HashSet::new();
 
-            if self.config.indexing.fast_window_max_per_file > 1 {
+            if fast_window_max_per_file > 1 {
                 // The chunk's windows share bounded batches: a short file is a
                 // single window, and embedding and appending it alone costs one
                 // call and one WAL fsync per file.
@@ -22614,7 +22666,7 @@ impl FsfsRuntime {
                     let texts = live.iter().map(|(_, text)| *text).collect::<Vec<_>>();
                     let outcome = Self::embed_indexing_batch_with_backoffs(
                         cx,
-                        fast_admission
+                        primary_admission
                             .as_ref()
                             .ok_or_else(Self::lexical_only_generation_has_no_fast_tier)?,
                         &texts,
@@ -22713,7 +22765,7 @@ impl FsfsRuntime {
                 const RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] = [200, 400];
                 let batch_outcome = Self::embed_indexing_batch_with_backoffs(
                     cx,
-                    fast_admission
+                    primary_admission
                         .as_ref()
                         .ok_or_else(Self::lexical_only_generation_has_no_fast_tier)?,
                     &semantic_texts,
@@ -22796,6 +22848,11 @@ impl FsfsRuntime {
                         embedding_elapsed_ms: batch_embedding_elapsed_ms,
                         retries_executed,
                     } => {
+                        if quality_only {
+                            // A required quality primary cannot become an
+                            // optional skipped tier or a partial success.
+                            return Err(error);
+                        }
                         embedding_elapsed_ms =
                             embedding_elapsed_ms.saturating_add(batch_embedding_elapsed_ms);
                         embedding_retries = embedding_retries.saturating_add(retries_executed);
@@ -23026,7 +23083,7 @@ impl FsfsRuntime {
                         reason_codes: checkpoint.reason_codes.clone(),
                         total_canonical_bytes: partial_total_canonical_bytes,
                         source_hash_hex: checkpoint.source_hash_hex.clone(),
-                        fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
+                        fast_window_max_per_file,
                     },
                 )?;
                 checkpoint.artifacts_durable = true;
@@ -23160,7 +23217,11 @@ impl FsfsRuntime {
         let vector_finish_start = Instant::now();
         publication_lease.fence("final vector generation reconciliation")?;
         if let Some(vector_index) = vector_index.as_mut() {
-            reconcile_fast_vector_generation(vector_index, &checkpoint)?;
+            if quality_only {
+                reconcile_vector_generation(vector_index, &checkpoint)?;
+            } else {
+                reconcile_fast_vector_generation(vector_index, &checkpoint)?;
+            }
         }
         if let Some(quality_index) = quality_vector_index.as_mut() {
             publication_lease.fence("final quality vector generation reconciliation")?;
@@ -23177,17 +23238,14 @@ impl FsfsRuntime {
         // Both generations are final: drop the writer handles (the protector
         // takes the reader side of the map lock) and write their RaptorQ
         // sidecars under the same lease.
-        let published_vector = vector_index
+        let published_primary = vector_index
             .as_ref()
             .map(|index| PublishedVectorGeneration {
                 id: index.embedder_id().to_owned(),
                 dimension: index.dimension(),
                 is_hash_control: Self::is_legacy_hash_vector_generation(index.embedder_id()),
             });
-        if published_vector.is_none() {
-            observed_reason_codes.insert(REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY.to_owned());
-        }
-        let published_quality =
+        let published_secondary =
             quality_vector_index
                 .as_ref()
                 .map(|index| PublishedVectorGeneration {
@@ -23195,6 +23253,16 @@ impl FsfsRuntime {
                     dimension: index.dimension(),
                     is_hash_control: Self::is_legacy_hash_vector_generation(index.embedder_id()),
                 });
+        let (published_vector, published_quality) = if quality_only {
+            observed_reason_codes.insert(REASON_VECTOR_FAST_TIER_SKIPPED_QUALITY_ONLY.to_owned());
+            (None, published_primary)
+        } else {
+            if published_primary.is_none() {
+                observed_reason_codes
+                    .insert(REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY.to_owned());
+            }
+            (published_primary, published_secondary)
+        };
         drop(vector_index);
         drop(quality_vector_index);
         publication_lease.fence("vector generation durability sidecars")?;
@@ -23231,7 +23299,7 @@ impl FsfsRuntime {
             reason_codes: reason_codes.clone(),
             total_canonical_bytes,
             source_hash_hex: source_hash_hex.clone(),
-            fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
+            fast_window_max_per_file,
         };
 
         let mut storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
@@ -26457,8 +26525,9 @@ impl FsfsRuntime {
             return Err(SearchError::InvalidConfig {
                 field: "cli.search_query".to_owned(),
                 value: "exclusion_query_limit".to_owned(),
-                reason: "exclusion membership query exceeds the lexical parser's query length bound"
-                    .to_owned(),
+                reason:
+                    "exclusion membership query exceeds the lexical parser's query length bound"
+                        .to_owned(),
             });
         }
         let hits = lexical.search_doc_ids(cx, &excluded, live_docs.max(1))?;
@@ -40835,8 +40904,9 @@ mod tests {
         );
 
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
-        rustix::net::sockopt::set_socket_send_buffer_size(&writer, 64 << 10)
-            .expect("shrink SO_SNDBUF so the write budget, not the host socket buffer, bounds the transfer");
+        rustix::net::sockopt::set_socket_send_buffer_size(&writer, 64 << 10).expect(
+            "shrink SO_SNDBUF so the write budget, not the host socket buffer, bounds the transfer",
+        );
         let peer = thread::spawn(move || {
             let mut total = 0;
             let mut bytes = [0_u8; 16 << 10];
@@ -46345,10 +46415,7 @@ mod tests {
             let writer = create_test_quill(&cx, &path).await;
             for word in ["AND", "OR", "NOT", "clean"] {
                 writer
-                    .index_document(
-                        &cx,
-                        &IndexableDocument::new(word, format!("needle {word}")),
-                    )
+                    .index_document(&cx, &IndexableDocument::new(word, format!("needle {word}")))
                     .await
                     .unwrap();
             }
@@ -46380,10 +46447,9 @@ mod tests {
                 ] {
                     let normalized = FsfsRuntime::normalize_search_query(&query);
                     let parsed = super::ParsedQuery::parse(&normalized);
-                    let excluded =
-                        FsfsRuntime::query_exclusions(&cx, Some(&lexical), &parsed, 4)
-                            .unwrap()
-                            .expect("explicit exclusion");
+                    let excluded = FsfsRuntime::query_exclusions(&cx, Some(&lexical), &parsed, 4)
+                        .unwrap()
+                        .expect("explicit exclusion");
                     assert_eq!(
                         excluded.as_ref(),
                         &std::collections::HashSet::from([word.to_owned()]),
@@ -54682,10 +54748,12 @@ mod tests {
                 .unwrap();
             for filter in [Some("path:src/ ext:rs"), None] {
                 runtime.cli_input.filter = filter.map(str::to_owned);
-                let queries = ["not", "Not", "nOt", "NOT"].map(|keyword| [
-                    format!(r#"needle {keyword} "internal secret""#),
-                    format!(r#"needle OR absent AND {keyword} "internal secret""#),
-                ]);
+                let queries = ["not", "Not", "nOt", "NOT"].map(|keyword| {
+                    [
+                        format!(r#"needle {keyword} "internal secret""#),
+                        format!(r#"needle OR absent AND {keyword} "internal secret""#),
+                    ]
+                });
                 for query in queries.into_iter().flatten() {
                     for include_snippets in [false, true] {
                         for limit in [1, 2, 10, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL] {
@@ -61524,9 +61592,10 @@ mod tests {
                 .await
                 .expect("open swept index");
             let lexical = resources.lexical_index.as_ref().expect("lexical index");
-            let found =
-                FsfsRuntime::gather_lexical_candidates(&cx, lexical, "revision", 10, None, None, 10)
-                    .expect("lexical candidates");
+            let found = FsfsRuntime::gather_lexical_candidates(
+                &cx, lexical, "revision", 10, None, None, 10,
+            )
+            .expect("lexical candidates");
             assert_eq!(found.len(), 1);
         });
     }
@@ -61613,9 +61682,10 @@ mod tests {
                 .await
                 .expect("open index");
             let lexical = resources.lexical_index.as_ref().expect("lexical index");
-            let found =
-                FsfsRuntime::gather_lexical_candidates(&cx, lexical, "capybara", 100, None, None, 100)
-                    .expect("lexical candidates");
+            let found = FsfsRuntime::gather_lexical_candidates(
+                &cx, lexical, "capybara", 100, None, None, 100,
+            )
+            .expect("lexical candidates");
             assert_eq!(found.len(), 64);
         });
     }

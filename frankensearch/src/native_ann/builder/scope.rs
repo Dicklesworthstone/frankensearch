@@ -255,6 +255,40 @@ impl NativeGenerationPreview {
 }
 
 impl NativeScopedGenerationPreview {
+    /// Lazily preview one selected tier inside this candidate's fixed scope.
+    ///
+    /// Only that owner and producer participate. The returned query can attach
+    /// bounded retained-source reranking without reevaluating the predicate or
+    /// reading a mutable source path. A supplied pool owns vector traversal.
+    ///
+    /// # Errors
+    /// Refuses an absent tier, no-op preview, producer disagreement, invalid
+    /// budget or cancellation. Every configured stage must be consumed to
+    /// establish successful preview execution.
+    pub fn search_tier_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        tier: EmbedderTierTag,
+        embedder: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation_preview_scope.tier_query")?;
+        crate::native_ann::generation::require_query_tier(self.preview.topology(), tier)?;
+        self.preview.scoped_progressive(
+            cx,
+            embedder,
+            None,
+            tier == EmbedderTierTag::Quality,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            pool,
+        )
+    }
+
     /// Prospective candidate identity; no claim of current publication.
     #[must_use]
     pub fn candidate_authority(&self) -> AuthorityRefV1 {
@@ -512,6 +546,55 @@ pub(in crate::native_ann) fn quality_provenance(
 }
 
 impl NativeScopedGenerationSnapshot {
+    /// Lazily query exactly one tier inside this retained generation's scope.
+    ///
+    /// Membership is frozen before retrieval, fusion, hydration and optional
+    /// retained-source reranking. No other producer is needed or invoked;
+    /// quality results keep quality provenance throughout every phase. A
+    /// supplied caller pool owns vector traversal without inline fallback.
+    ///
+    /// # Errors
+    /// Refuses an absent tier, producer mismatch, invalid budgets or
+    /// cancellation, including zero-limit and empty-scope requests. Polling a
+    /// phase additionally propagates retrieval, hydration and rerank failures.
+    pub fn search_tier_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        tier: EmbedderTierTag,
+        embedder: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation_scope.tier_query")?;
+        crate::native_ann::generation::require_query_tier(self.snapshot.topology(), tier)?;
+        let allowed = Arc::clone(&self.lexical.allowed);
+        match pool {
+            Some(pool) => self.snapshot.scoped_progressive_on_pool(
+                cx,
+                embedder,
+                None,
+                tier == EmbedderTierTag::Quality,
+                &self.lexical,
+                text,
+                k,
+                allowed,
+                pool,
+            ),
+            None if tier == EmbedderTierTag::Quality => self.snapshot.scoped_quality_progressive(
+                cx,
+                embedder,
+                &self.lexical,
+                text,
+                k,
+                allowed,
+            ),
+            None => self
+                .snapshot
+                .scoped_progressive(cx, embedder, &self.lexical, text, k, allowed),
+        }
+    }
+
     fn from_membership(
         snapshot: Arc<NativeGenerationSnapshot>,
         membership: GenerationScopeMembership,

@@ -52,7 +52,7 @@ No directory scan chooses a recovery target. Models are never downloaded.
   --config FILE       Use the normal fsfs configuration loader and model selection
   --query TEXT        Preview a query against the target before any restoration
   --limit N           Preview results per phase (1..=100; default 10)
-  --search-mode MODE  Explicit preview policy: full, fast, quality, or lexical
+  --search-mode MODE  Search/rebuild policy: full, fast, quality, or lexical
   --filter EXPR       Apply the ordinary search filter to every preview phase
   --rerank|--no-rerank
                       Override the configured cross-encoder reranking policy
@@ -93,6 +93,9 @@ Keep all three fields in trusted storage; the guard is not a signature or a rete
 A removed target or changed selection is refused, not rebuilt or automatically rebased.
 Any requested preview must succeed before a prepare report is emitted or selection changes.
 --rebuild-source requires --query and --prepare or --apply; all input is reindexed offline.
+With --search-mode quality, it builds Quill plus a standalone required quality vector tier.
+The configured quality producer must succeed; no fast model is selected, loaded or probed.
+Resume an interrupted quality-only build with the same mode and configuration.
 It cannot mix with target receipts, resume/guard fields or artifact-repair options.
 It can replace a damaged selected bundle or malformed bounded descriptor, without reusing old artifacts.
 Its preview must return hits and exercise the requested semantic tiers before export or publication.

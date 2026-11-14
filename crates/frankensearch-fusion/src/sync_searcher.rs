@@ -28,7 +28,11 @@ use frankensearch_index::{
     InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams, ValidatedFsviBytes,
 };
 
-use crate::blend::{blend_two_tier, blend_two_tier_aligned_vector_index, compute_rank_changes};
+use crate::blend::{
+    blend_two_tier, blend_two_tier_aligned_vector_index, complete_quality_evidence,
+    compute_rank_changes,
+};
+use crate::mmr::{MmrConfig, mmr_rerank};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{
     RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
@@ -56,13 +60,14 @@ enum AdmittedSyncQuery<'query> {
 /// What the quality tier contributed to a synchronous refinement.
 ///
 /// Same distinction the async searcher draws: `Retrieved` is the quality
-/// tier's OWN top-k and can name documents the fast tier never selected;
+/// tier's OWN top-k and can name documents the fast tier never selected,
+/// supplemented with exact quality scores for retained fast candidates;
 /// `RescoredFastPool` can only re-rank what the fast tier already chose.
 /// Independent retrieval requires an admitted v2 owner or a persisted v1
 /// producer fingerprint joined to the bound query. A caller-declared space
 /// alone does not establish that producer contract.
 enum SyncQualityPool {
-    /// The quality tier's own top-k for the quality-bound query.
+    /// Independent quality retrieval plus available retained-candidate evidence.
     Retrieved(Vec<VectorHit>),
     /// Quality scores aligned positionally to the fast pool. Still computed
     /// from the QUALITY-bound query: the aligned SHAPE was never the bug, the
@@ -340,6 +345,7 @@ pub struct SyncTwoTierSearcher {
     /// Behind a `Mutex` so per-query observation mutates the rolling state while `search` stays
     /// `&self`.
     nqc_adaptive: Option<Mutex<AdaptiveNqcDenseWeight>>,
+    mmr_config: MmrConfig,
 }
 
 impl SyncTwoTierSearcher {
@@ -366,6 +372,7 @@ impl SyncTwoTierSearcher {
             nqc_downweight_w_min: 0.0,
             nqc_dense_weight: NqcDenseWeight::new(),
             nqc_adaptive: Some(Mutex::new(AdaptiveNqcDenseWeight::production_default())),
+            mmr_config: MmrConfig::default(),
         }
     }
 
@@ -405,6 +412,55 @@ impl SyncTwoTierSearcher {
     pub const fn with_search_params(mut self, params: SearchParams) -> Self {
         self.search_params = Some(params);
         self
+    }
+
+    /// Enable optional diversity ranking over the last successful candidate pool.
+    ///
+    /// The search retains up to `max(k, candidate_pool)` fused candidates so
+    /// MMR can promote documents outside the displayed page. The broader
+    /// retrieval window can also affect fusion in Initial and Refined.
+    /// Iteration performs MMR only when the caller requests the final phase.
+    /// Fast-only searches use fast vectors; successful refinement prefers a
+    /// complete quality-space pool and otherwise uses a complete fast-space
+    /// pool. Quality-only requests never consult fast vectors. If no single
+    /// eligible tier covers every candidate, the preceding results are kept.
+    ///
+    /// Disabled MMR and pools of zero or one perform no additional work.
+    /// Enabled pools above 1,000 are rejected before retrieval.
+    #[must_use]
+    pub const fn with_mmr_config(mut self, config: MmrConfig) -> Self {
+        self.mmr_config = config;
+        self
+    }
+
+    fn final_ranking_enabled(&self) -> bool {
+        self.mmr_config.enabled && self.mmr_config.candidate_pool > 1
+    }
+
+    fn final_candidate_target(&self, k: usize) -> usize {
+        if self.final_ranking_enabled() {
+            k.max(self.mmr_config.candidate_pool)
+        } else {
+            k
+        }
+    }
+
+    fn retain_final_candidates(
+        &self,
+        results: &mut Vec<ScoredResult>,
+        k: usize,
+        space: SyncMmrSpace,
+    ) -> Option<SyncFinalRanking> {
+        if !self.final_ranking_enabled() || results.len() < 2 {
+            return None;
+        }
+        let candidates = std::mem::take(results);
+        *results = candidates.iter().take(k).cloned().collect();
+        Some(SyncFinalRanking {
+            candidates,
+            k,
+            space,
+        })
     }
 
     /// Select the approximate int8 candidate generator for an isolated
@@ -598,6 +654,7 @@ impl SyncTwoTierSearcher {
         } else {
             prepared.initial
         };
+        let outcome = self.search_final(outcome, false);
         Ok((outcome.final_results, outcome.metrics))
     }
 
@@ -611,9 +668,11 @@ impl SyncTwoTierSearcher {
     /// identities and returns Initial; quality retrieval runs only when the
     /// caller requests the next phase. Dropping the iterator discards pending
     /// refinement without starting it. Each call uses the caller's thread.
-    /// A quality-only request instead returns one terminal Initial containing
+    /// A quality-only request instead returns an Initial containing
     /// quality results, labeled through their quality source, score and phase
     /// metrics. There is no fabricated fast phase or subsequent refinement.
+    /// Opt-in MMR can append a lazy Reranked phase after the last successful
+    /// retrieval. Dropping the iterator before that phase performs no MMR work.
     #[must_use]
     pub const fn search_iter<'a>(
         &'a self,
@@ -718,7 +777,15 @@ impl SyncTwoTierSearcher {
     ) -> SearchResult<SyncPreparedSearch<'query>> {
         // Identity first, before k == 0, before the zero-norm check, and
         // before any index is touched.
-        let (fast_query, quality_query) = match self.admit(query)? {
+        let admitted = self.admit(query)?;
+        if self.mmr_config.enabled && self.mmr_config.candidate_pool > 1_000 {
+            return Err(SearchError::InvalidConfig {
+                field: "mmr.candidate_pool".to_owned(),
+                value: self.mmr_config.candidate_pool.to_string(),
+                reason: "enabled MMR candidate pool must not exceed 1000".to_owned(),
+            });
+        }
+        let (fast_query, quality_query) = match admitted {
             AdmittedSyncQuery::Progressive { fast, quality } => (fast, quality),
             AdmittedSyncQuery::QualityOnly { quality } => {
                 return self.search_quality_only(quality, k, filter, want_phase);
@@ -735,11 +802,13 @@ impl SyncTwoTierSearcher {
                     phase: None,
                     final_results: Vec::new(),
                     metrics,
+                    final_ranking: None,
                 },
                 refinement: None,
             });
         }
-        let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
+        let target = self.final_candidate_target(k);
+        let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
 
         let phase1_started = Instant::now();
         let (fast_hits, phase1_vectors_searched) = if query_vec.iter().all(|&value| value == 0.0) {
@@ -786,11 +855,11 @@ impl SyncTwoTierSearcher {
             .map_or(self.rrf_semantic_weight, |lexical| {
                 self.effective_semantic_weight(lexical)
             });
-        let initial_results = lexical_hits.as_ref().map_or_else(
+        let mut initial_results = lexical_hits.as_ref().map_or_else(
             || {
                 vector_hits_to_scored_results(
                     &fast_hits,
-                    k,
+                    target,
                     if hash_control {
                         ScoreSource::HashControl
                     } else {
@@ -810,7 +879,7 @@ impl SyncTwoTierSearcher {
                         &fast_hits,
                         &[],
                         0.0,
-                        k,
+                        target,
                         0,
                         &RrfConfig {
                             k: self.config.rrf_k,
@@ -821,7 +890,7 @@ impl SyncTwoTierSearcher {
                         hash_control,
                     ),
                     lexical,
-                    k,
+                    target,
                     &self.config,
                     sync_fast_embedder_id(&self.index),
                     hash_control,
@@ -834,6 +903,9 @@ impl SyncTwoTierSearcher {
         metrics.vector_search_ms = ms(phase1_latency);
         metrics.phase1_total_ms = ms(phase1_latency);
         metrics.fast_embed_ms = 0.0;
+
+        let final_ranking =
+            self.retain_final_candidates(&mut initial_results, k, SyncMmrSpace::Fast);
 
         let phase = want_phase.then(|| SearchPhase::Initial {
             results: initial_results.clone(),
@@ -851,6 +923,7 @@ impl SyncTwoTierSearcher {
             phase,
             final_results: initial_results,
             metrics,
+            final_ranking,
         };
 
         // The quality arm needs four things: it must not be switched off, the
@@ -925,12 +998,14 @@ impl SyncTwoTierSearcher {
                     phase: None,
                     final_results: Vec::new(),
                     metrics,
+                    final_ranking: None,
                 },
                 refinement: None,
             });
         }
         let started = Instant::now();
-        let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
+        let target = self.final_candidate_target(k);
+        let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
         let lexical_started = Instant::now();
         let lexical_hits = self
             .lexical
@@ -965,10 +1040,13 @@ impl SyncTwoTierSearcher {
         metrics.vector_search_ms = metrics.quality_search_ms;
         metrics.semantic_candidates = hits.len();
         let fusion_started = Instant::now();
-        let results = self.quality_only_results(&hits, lexical_hits.as_deref(), k, embedder_id);
+        let mut results =
+            self.quality_only_results(&hits, lexical_hits.as_deref(), target, embedder_id);
         metrics.rrf_fusion_ms = ms(fusion_started.elapsed());
         let latency = started.elapsed();
         metrics.phase1_total_ms = ms(latency);
+        let final_ranking =
+            self.retain_final_candidates(&mut results, k, SyncMmrSpace::QualityOnly);
         let phase = want_phase.then(|| SearchPhase::Initial {
             results: results.clone(),
             latency,
@@ -988,6 +1066,7 @@ impl SyncTwoTierSearcher {
                 phase,
                 final_results: results,
                 metrics,
+                final_ranking,
             },
             refinement: None,
         })
@@ -1075,6 +1154,7 @@ impl SyncTwoTierSearcher {
         let SyncSearchOutcome {
             final_results: initial_results,
             mut metrics,
+            final_ranking,
             ..
         } = initial;
         let SyncRefinement {
@@ -1104,7 +1184,13 @@ impl SyncTwoTierSearcher {
         let quality_pool = if independent_quality {
             quality_index
                 .search_top_k(quality_query.vector(), fetch, filter)
-                .map(SyncQualityPool::Retrieved)
+                .and_then(|mut hits| {
+                    complete_quality_evidence(&fast_hits, &mut hits, |missing| {
+                        self.index
+                            .quality_scores_for_hits(quality_query.vector(), missing)
+                    })?;
+                    Ok(SyncQualityPool::Retrieved(hits))
+                })
         } else {
             self.index
                 .quality_scores_for_hits(quality_query.vector(), &fast_hits)
@@ -1113,6 +1199,11 @@ impl SyncTwoTierSearcher {
         let quality_pool = match quality_pool {
             Ok(pool) => pool,
             Err(error) => {
+                let final_ranking = if matches!(&error, SearchError::Cancelled { .. }) {
+                    None
+                } else {
+                    final_ranking
+                };
                 let latency = phase2_started.elapsed();
                 metrics.phase2_total_ms = ms(latency);
                 metrics.skip_reason = Some(error.diagnostic_code().to_owned());
@@ -1125,6 +1216,7 @@ impl SyncTwoTierSearcher {
                     phase,
                     final_results: initial_results,
                     metrics,
+                    final_ranking,
                 };
             }
         };
@@ -1152,6 +1244,10 @@ impl SyncTwoTierSearcher {
         };
         let quality_count = quality_scores_by_doc.len();
         metrics.phase2_vectors_searched = quality_count;
+        metrics.incomplete_embeddings = fast_hits
+            .iter()
+            .filter(|hit| !quality_scores_by_doc.contains_key(hit.doc_id.as_str()))
+            .count();
         if quality_count > 0 {
             // This classifies the combined semantic lane. Independent quality
             // retrieval can supply signal even when the fast lane had none.
@@ -1192,6 +1288,7 @@ impl SyncTwoTierSearcher {
         // promoted / demoted counts whenever `k < fetch` (bd-k3089).
         let rank_changes = compute_rank_changes(&fast_hits, &blended);
 
+        let target = self.final_candidate_target(k);
         let mut refined_results = if let Some(lexical) = lexical_hits.as_ref() {
             fused_hits_to_scored_results(
                 fuse_by_strategy(
@@ -1200,7 +1297,7 @@ impl SyncTwoTierSearcher {
                     &blended,
                     &[],
                     0.0,
-                    k,
+                    target,
                     0,
                     &RrfConfig {
                         k: self.config.rrf_k,
@@ -1210,13 +1307,17 @@ impl SyncTwoTierSearcher {
                     },
                 ),
                 lexical,
-                k,
+                target,
                 &self.config,
                 sync_fast_embedder_id(&self.index),
                 false,
             )
         } else {
-            unique_vector_hits_to_scored_results_owned(blended, k, ScoreSource::SemanticQuality)
+            unique_vector_hits_to_scored_results_owned(
+                blended,
+                target,
+                ScoreSource::SemanticQuality,
+            )
         };
 
         // Re-fusion ranks on blended semantic scores, but `fast_score` and
@@ -1275,6 +1376,8 @@ impl SyncTwoTierSearcher {
         metrics.rank_changes = rank_changes.clone();
         metrics.phase2_total_ms = ms(phase2_started.elapsed());
         metrics.kendall_tau = None;
+        let final_ranking =
+            self.retain_final_candidates(&mut refined_results, k, SyncMmrSpace::PreferQuality);
 
         let phase = want_phase.then(|| SearchPhase::Refined {
             results: refined_results.clone(),
@@ -1294,7 +1397,119 @@ impl SyncTwoTierSearcher {
             phase,
             final_results: refined_results,
             metrics,
+            final_ranking,
         }
+    }
+
+    fn mmr_embeddings(
+        &self,
+        results: &[ScoredResult],
+        space: SyncMmrSpace,
+    ) -> SearchResult<Option<Vec<Vec<f32>>>> {
+        if !matches!(space, SyncMmrSpace::Fast)
+            && let Some(quality) = self.index.quality_index()
+            && let Some(embeddings) = sync_tier_embeddings(quality, results)?
+        {
+            return Ok(Some(embeddings));
+        }
+        if matches!(space, SyncMmrSpace::QualityOnly) {
+            return Ok(None);
+        }
+        sync_tier_embeddings(self.index.fast_index(), results)
+    }
+
+    fn search_final(&self, mut outcome: SyncSearchOutcome, want_phase: bool) -> SyncSearchOutcome {
+        outcome.phase = None;
+        let Some(ranking) = outcome.final_ranking.take() else {
+            return outcome;
+        };
+        let started = Instant::now();
+        let SyncFinalRanking {
+            mut candidates,
+            k,
+            space,
+        } = ranking;
+        let pool = candidates.len().min(self.mmr_config.candidate_pool);
+        let embeddings = match self.mmr_embeddings(&candidates[..pool], space) {
+            Ok(Some(embeddings)) => embeddings,
+            Ok(None) => return outcome,
+            Err(error) => {
+                outcome.metrics.rerank_ms = ms(started.elapsed());
+                tracing::warn!(
+                    error_code = error.diagnostic_code(),
+                    "synchronous diversity ranking failed"
+                );
+                // Preserve the last valid phase. A final ranking failure is
+                // not another quality-refinement outcome.
+                return outcome;
+            }
+        };
+        let scores = candidates[..pool]
+            .iter()
+            .map(|result| f64::from(result.score))
+            .collect::<Vec<_>>();
+        let refs = embeddings.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let selected = k.min(pool);
+        let order = mmr_rerank(&scores, &refs, selected, &self.mmr_config);
+        if order.len() != selected {
+            return outcome;
+        }
+
+        // Only the bounded prefix participates in diversity. Preserve the
+        // relevance-ranked tail when the caller requests more than that pool.
+        let tail = candidates.split_off(pool);
+        let mut slots = candidates.into_iter().map(Some).collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(k.min(selected + tail.len()));
+        for index in order {
+            if let Some(result) = slots.get_mut(index).and_then(Option::take) {
+                results.push(result);
+            }
+        }
+        results.extend(tail.into_iter().take(k.saturating_sub(selected)));
+        if self.config.explain {
+            for (rank, result) in results.iter_mut().enumerate() {
+                if let Some(explanation) = &mut result.explanation
+                    && let Some(movement) = &mut explanation.rank_movement
+                {
+                    movement.refined_rank = rank;
+                    let initial = i64::try_from(movement.initial_rank).unwrap_or(i64::MAX);
+                    let final_rank = i64::try_from(rank).unwrap_or(i64::MAX);
+                    let delta = final_rank.saturating_sub(initial);
+                    movement.delta = i32::try_from(delta).unwrap_or_else(|_| {
+                        if delta.is_negative() {
+                            i32::MIN
+                        } else {
+                            i32::MAX
+                        }
+                    });
+                    movement.reason = match movement.delta.cmp(&0) {
+                        std::cmp::Ordering::Less => "promoted".to_owned(),
+                        std::cmp::Ordering::Greater => "demoted".to_owned(),
+                        std::cmp::Ordering::Equal => "stable".to_owned(),
+                    };
+                }
+            }
+        }
+        let latency = started.elapsed();
+        outcome.metrics.rerank_ms = ms(latency);
+        outcome.phase = want_phase.then(|| SearchPhase::Reranked {
+            results: results.clone(),
+            latency,
+            metrics: PhaseMetrics {
+                embedder_id: "mmr".to_owned(),
+                vectors_searched: if matches!(space, SyncMmrSpace::PreferQuality) {
+                    outcome.metrics.phase2_vectors_searched
+                } else {
+                    outcome.metrics.phase1_vectors_searched
+                },
+                lexical_candidates: outcome.metrics.lexical_candidates,
+                fused_count: results.len(),
+                skip_reason: outcome.metrics.skip_reason.clone(),
+                hash_control_candidates: outcome.metrics.hash_control_candidates,
+            },
+        });
+        outcome.final_results = results;
+        outcome
     }
 
     fn search_fast_hits(
@@ -1383,6 +1598,7 @@ impl std::fmt::Debug for SyncTwoTierSearcher {
             .field("nqc_downweight_w_min", &self.nqc_downweight_w_min)
             .field("nqc_dense_weight", &self.nqc_dense_weight)
             .field("nqc_adaptive", &self.nqc_adaptive)
+            .field("mmr_config", &self.mmr_config)
             .finish()
     }
 }
@@ -1392,6 +1608,21 @@ struct SyncSearchOutcome {
     phase: Option<SearchPhase>,
     final_results: Vec<ScoredResult>,
     metrics: TwoTierMetrics,
+    final_ranking: Option<SyncFinalRanking>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SyncMmrSpace {
+    Fast,
+    PreferQuality,
+    QualityOnly,
+}
+
+#[derive(Debug)]
+struct SyncFinalRanking {
+    candidates: Vec<ScoredResult>,
+    k: usize,
+    space: SyncMmrSpace,
 }
 
 #[derive(Debug)]
@@ -1421,6 +1652,7 @@ enum SyncIteratorState<'query> {
         k: usize,
     },
     Refine(Box<SyncPendingRefinement<'query>>),
+    Rank(Box<SyncSearchOutcome>),
     Done,
 }
 
@@ -1431,7 +1663,9 @@ enum SyncIteratorState<'query> {
 /// tier is available and requested. Dropping an unconsumed iterator performs
 /// no search; dropping after Initial performs no quality traversal or blending.
 /// A quality-only request directly retrieves quality on the first `next()` and
-/// yields one terminal Initial with quality provenance. No fast tier is read.
+/// yields Initial with quality provenance. No fast tier is read.
+/// With MMR enabled, one further `next()` may emit Reranked after the last
+/// successful retrieval. Dropping before that call performs no diversity work.
 /// The searcher, bound queries and filter remain borrowed until the iterator is
 /// dropped, keeping both phases on the same retained in-memory index. Filters
 /// should keep their selection policy stable across those phases.
@@ -1450,6 +1684,7 @@ impl std::fmt::Debug for SyncSearchIterator<'_> {
         let state = match self.state {
             SyncIteratorState::Initial { .. } => "initial",
             SyncIteratorState::Refine(_) => "refinement",
+            SyncIteratorState::Rank(_) => "ranking",
             SyncIteratorState::Done => "done",
         };
         formatter
@@ -1477,6 +1712,8 @@ impl Iterator for SyncSearchIterator<'_> {
                                     initial: prepared.initial,
                                     refinement,
                                 }));
+                        } else if prepared.initial.final_ranking.is_some() {
+                            self.state = SyncIteratorState::Rank(Box::new(prepared.initial));
                         }
                         phase
                     }
@@ -1488,26 +1725,53 @@ impl Iterator for SyncSearchIterator<'_> {
                 }
             }
             SyncIteratorState::Refine(pending) => {
-                self.searcher
-                    .search_refined(pending.initial, pending.refinement, self.filter, true)
-                    .phase
+                let mut outcome = self.searcher.search_refined(
+                    pending.initial,
+                    pending.refinement,
+                    self.filter,
+                    true,
+                );
+                let phase = outcome.phase.take();
+                if outcome.final_ranking.is_some() {
+                    self.state = SyncIteratorState::Rank(Box::new(outcome));
+                }
+                phase
             }
+            SyncIteratorState::Rank(pending) => self.searcher.search_final(*pending, true).phase,
             SyncIteratorState::Done => None,
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
+        let ranking = usize::from(self.searcher.final_ranking_enabled());
         match self.state {
             SyncIteratorState::Initial { k: 0, .. } => (0, Some(1)),
-            SyncIteratorState::Initial { query, .. } if query.fast().is_none() => (1, Some(1)),
-            SyncIteratorState::Initial { .. } => (1, Some(2)),
-            SyncIteratorState::Refine(_) => (1, Some(1)),
+            SyncIteratorState::Initial { query, .. } if query.fast().is_none() => {
+                (1, Some(1 + ranking))
+            }
+            SyncIteratorState::Initial { .. } => (1, Some(2 + ranking)),
+            SyncIteratorState::Refine(_) => (1, Some(1 + ranking)),
+            SyncIteratorState::Rank(_) => (0, Some(1)),
             SyncIteratorState::Done => (0, Some(0)),
         }
     }
 }
 
 impl std::iter::FusedIterator for SyncSearchIterator<'_> {}
+
+fn sync_tier_embeddings(
+    index: &InMemoryVectorIndex,
+    results: &[ScoredResult],
+) -> SearchResult<Option<Vec<Vec<f32>>>> {
+    let mut embeddings = Vec::with_capacity(results.len());
+    for result in results {
+        let Some(vector) = index.vector_for_doc_id(&result.doc_id)? else {
+            return Ok(None);
+        };
+        embeddings.push(vector);
+    }
+    Ok(Some(embeddings))
+}
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
@@ -2060,6 +2324,88 @@ mod tests {
     }
 
     #[test]
+    fn independent_quality_window_retains_exact_fast_candidate_evidence() {
+        let dir = temp_dir("persisted-quality-evidence");
+        let (fast, quality) = persisted_producer_pair(dir.path());
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        for quality_weight in [0.0, 1.0] {
+            let searcher = SyncTwoTierSearcher::new(
+                Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap()),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    quality_weight,
+                    explain: true,
+                    ..TwoTierConfig::default()
+                },
+            );
+            let (results, metrics) = searcher.search_collect(&query, 2).unwrap();
+            // Quality retrieves b/c, but a has a real quality vector below
+            // that top-k window. Its zero score must remain present evidence,
+            // rather than becoming an unpenalized missing-source observation.
+            assert_eq!(metrics.phase2_vectors_searched, 3);
+            assert_eq!(metrics.incomplete_embeddings, 0);
+            assert!(metrics.coverage.is_none(), "v1 cannot mint v2 coverage");
+            assert!(results.iter().all(|result| result.explanation.is_some()));
+            let ids = results
+                .iter()
+                .map(|result| result.doc_id.as_str())
+                .collect::<Vec<_>>();
+            if quality_weight == 0.0 {
+                assert_eq!(ids, ["a", "b"]);
+                assert_eq!(results[0].quality_score, Some(0.0));
+                assert!(results[0].fast_score.is_some());
+                assert_eq!(results[0].index, Some(0));
+            } else {
+                assert_eq!(ids, ["b", "c"]);
+                assert!(results.iter().all(|result| result.fast_score.is_none()));
+                assert!(results.iter().all(|result| result.index.is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn independent_quality_preserves_genuinely_missing_vectors_without_penalty() {
+        let dir = temp_dir("persisted-quality-absent-vector");
+        let fast = semantic_identity("persisted-fast", 2);
+        let quality = semantic_identity("persisted-quality", 3);
+        let mut writer =
+            frankensearch_index::TwoTierIndex::create(dir.path(), TwoTierConfig::default())
+                .unwrap();
+        writer.set_fast_embedder_id("persisted-fast");
+        writer.set_quality_embedder_id("persisted-quality");
+        writer.set_fast_identity(&fast).unwrap();
+        writer.set_quality_identity(&quality).unwrap();
+        writer.add_fast_record("a-uncovered", &[1.0, 0.0]).unwrap();
+        writer
+            .add_quality_record("z-quality", &[1.0, 0.0, 0.0])
+            .unwrap();
+        drop(writer.finish().unwrap());
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap()),
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                quality_weight: 1.0,
+                ..TwoTierConfig::default()
+            },
+        );
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let (results, metrics) = searcher.search_collect(&query, 1).unwrap();
+        assert_eq!(results[0].doc_id, "a-uncovered");
+        assert_eq!(results[0].score, 1.0);
+        assert_eq!(results[0].fast_score, Some(1.0));
+        assert_eq!(results[0].quality_score, None);
+        assert_eq!(results[0].index, Some(0));
+        assert_eq!(metrics.incomplete_embeddings, 1);
+        assert_eq!(metrics.phase2_vectors_searched, 1);
+    }
+
+    #[test]
     fn persisted_legacy_revision_cannot_admit_a_semantic_query() {
         for revision in ["", "old-model-revision"] {
             let dir = temp_dir("persisted-legacy-refusal");
@@ -2146,6 +2492,446 @@ mod tests {
         // The query bundle keeps native f32 storage; only the artifact uses
         // f16. Space and producer admission must tolerate that storage change.
         tier
+    }
+
+    fn sync_mmr_fixture(
+        directory: &Path,
+        attested: bool,
+        complete_quality: bool,
+    ) -> (
+        Arc<InMemoryTwoTierIndex>,
+        EmbeddingIdentityBundleV1,
+        EmbeddingIdentityBundleV1,
+    ) {
+        let fast = semantic_identity("mmr-fast", 2);
+        let quality = semantic_identity("mmr-quality", 3);
+        let fast_rows: &[(&str, &[f32])] = &[
+            ("a", &[0.8, 0.6]),
+            ("b", &[0.75, 0.661_437_8]),
+            ("c", &[0.6, -0.8]),
+        ];
+        // The quality geometry intentionally disagrees with fast, and its
+        // document order differs too. Reusing fast ordinals or mixing vectors
+        // across tiers changes which candidate is diverse.
+        let quality_rows: &[(&str, &[f32])] = &[
+            ("c", &[0.6, 0.8, 0.0]),
+            ("b", &[0.75, -0.661_437_8, 0.0]),
+            ("a", &[0.8, 0.6, 0.0]),
+        ];
+        let quality_rows = if complete_quality {
+            quality_rows
+        } else {
+            &quality_rows[1..]
+        };
+        let index = if attested {
+            let fast_index =
+                attested_tier_with_identity(directory, "fast.fsvi", 1, fast_rows, &fast);
+            let quality_index =
+                attested_tier_with_identity(directory, "quality.fsvi", 1, quality_rows, &quality);
+            InMemoryTwoTierIndex::new(fast_index, Some(quality_index)).unwrap()
+        } else {
+            let mut writer =
+                frankensearch_index::TwoTierIndex::create(directory, TwoTierConfig::default())
+                    .unwrap();
+            writer.set_fast_embedder_id("mmr-fast");
+            writer.set_quality_embedder_id("mmr-quality");
+            writer.set_fast_identity(&fast).unwrap();
+            writer.set_quality_identity(&quality).unwrap();
+            for (id, vector) in fast_rows {
+                writer.add_fast_record(*id, vector).unwrap();
+            }
+            for (id, vector) in quality_rows {
+                writer.add_quality_record(*id, vector).unwrap();
+            }
+            drop(writer.finish().unwrap());
+            InMemoryTwoTierIndex::from_dir(directory).unwrap()
+        };
+        (Arc::new(index), fast, quality)
+    }
+
+    fn sync_mmr_config() -> MmrConfig {
+        MmrConfig {
+            enabled: true,
+            lambda: 0.3,
+            candidate_pool: 3,
+        }
+    }
+
+    #[test]
+    fn sync_mmr_promotes_an_undisplayed_fast_candidate_after_initial() {
+        for attested in [false, true] {
+            for mode in ["absent", "disabled", "zero"] {
+                let directory = temp_dir("mmr-fast-pool");
+                let (index, fast, quality) = sync_mmr_fixture(directory.path(), attested, true);
+                let fast_query = BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap();
+                let query = if mode == "absent" {
+                    TieredQueryEmbeddings::fast_only(fast_query)
+                } else {
+                    TieredQueryEmbeddings::progressive(
+                        fast_query,
+                        BoundQueryEmbedding::new(
+                            if mode == "zero" {
+                                vec![0.0; 3]
+                            } else {
+                                vec![1.0, 0.0, 0.0]
+                            },
+                            quality,
+                        )
+                        .unwrap(),
+                    )
+                };
+                let config = TwoTierConfig {
+                    fast_only: mode == "disabled",
+                    candidate_multiplier: 1,
+                    explain: true,
+                    ..TwoTierConfig::default()
+                };
+                let baseline = SyncTwoTierSearcher::new(Arc::clone(&index), config.clone());
+                let (original, _) = baseline.search_collect(&query, 2).unwrap();
+                let searcher =
+                    SyncTwoTierSearcher::new(index, config).with_mmr_config(sync_mmr_config());
+
+                let mut stopped = searcher.search_iter(&query, 2);
+                let Some(SearchPhase::Initial { results, .. }) = stopped.next() else {
+                    panic!("Initial must precede optional diversity");
+                };
+                assert_eq!(results[0].doc_id, "a");
+                assert_eq!(results[1].doc_id, "b");
+                assert_eq!(
+                    serde_json::to_value(&results).unwrap(),
+                    serde_json::to_value(original).unwrap(),
+                    "Initial keeps retrieval order and evidence"
+                );
+                assert_eq!(stopped.size_hint(), (0, Some(1)));
+                drop(stopped);
+
+                let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+                let [
+                    SearchPhase::Initial { results: first, .. },
+                    SearchPhase::Reranked {
+                        results: final_results,
+                        metrics,
+                        ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("{mode} must rank Initial without a fabricated quality phase");
+                };
+                assert_eq!(
+                    serde_json::to_value(first).unwrap(),
+                    serde_json::to_value(results).unwrap()
+                );
+                assert_eq!(final_results[0].doc_id, "a");
+                assert_eq!(final_results[1].doc_id, "c");
+                assert_eq!(metrics.embedder_id, "mmr");
+                assert_eq!(metrics.vectors_searched, 3);
+                assert!(metrics.skip_reason.is_some());
+                assert!(final_results.iter().all(|hit| {
+                    hit.source == ScoreSource::SemanticFast
+                        && hit.quality_score.is_none()
+                        && hit.rerank_score.is_none()
+                }));
+                let (collected, metrics) = searcher.search_collect(&query, 2).unwrap();
+                assert_eq!(
+                    serde_json::to_value(collected).unwrap(),
+                    serde_json::to_value(final_results).unwrap()
+                );
+                assert_eq!(metrics.phase2_vectors_searched, 0);
+                assert!(metrics.skip_reason.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn sync_mmr_uses_one_complete_space_after_quality_refinement() {
+        for attested in [false, true] {
+            for complete_quality in [false, true] {
+                let directory = temp_dir("mmr-refined-space");
+                let (index, fast, quality) =
+                    sync_mmr_fixture(directory.path(), attested, complete_quality);
+                let query = TieredQueryEmbeddings::progressive(
+                    BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+                    BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+                );
+                let searcher = SyncTwoTierSearcher::new(
+                    index,
+                    TwoTierConfig {
+                        candidate_multiplier: 1,
+                        quality_weight: 0.0,
+                        explain: true,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_mmr_config(sync_mmr_config());
+                let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+                let [
+                    SearchPhase::Initial { .. },
+                    SearchPhase::Refined {
+                        results: refined, ..
+                    },
+                    SearchPhase::Reranked {
+                        results, metrics, ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("quality retrieval and final ranking must stay separate");
+                };
+                assert_eq!(refined[0].doc_id, "a");
+                assert_eq!(refined[1].doc_id, "b");
+                assert_eq!(results[0].doc_id, "a");
+                assert_eq!(results[1].doc_id, if complete_quality { "b" } else { "c" });
+                assert_eq!(metrics.embedder_id, "mmr");
+                assert_eq!(results[1].quality_score.is_some(), complete_quality);
+                assert!(results.iter().all(|result| result.rerank_score.is_none()));
+                let movement = results[1]
+                    .explanation
+                    .as_ref()
+                    .unwrap()
+                    .rank_movement
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(movement.refined_rank, 1);
+                assert_eq!(movement.delta, if complete_quality { 0 } else { -1 });
+                let (collected, metrics) = searcher.search_collect(&query, 2).unwrap();
+                assert_eq!(
+                    serde_json::to_value(collected).unwrap(),
+                    serde_json::to_value(results).unwrap()
+                );
+                assert_eq!(
+                    metrics.incomplete_embeddings,
+                    usize::from(!complete_quality)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sync_mmr_quality_only_preserves_quality_provenance_and_never_falls_back_to_fast() {
+        for attested in [false, true] {
+            let directory = temp_dir("mmr-direct-quality");
+            let (index, _, quality) = sync_mmr_fixture(directory.path(), attested, true);
+            let query = TieredQueryEmbeddings::quality_only(
+                BoundQueryEmbedding::new(vec![0.0, 1.0, 0.0], quality).unwrap(),
+            );
+            let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+                .with_mmr_config(sync_mmr_config());
+            let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+            let [
+                SearchPhase::Initial { results: first, .. },
+                SearchPhase::Reranked { results, .. },
+            ] = phases.as_slice()
+            else {
+                panic!("quality-only diversity must not invent fast refinement");
+            };
+            assert_eq!(
+                first
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["c", "a"]
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["c", "b"]
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|hit| hit.source == ScoreSource::SemanticQuality
+                        && hit.index.is_none()
+                        && hit.fast_score.is_none()
+                        && hit.quality_score.is_some())
+            );
+            let (collected, metrics) = searcher.search_collect(&query, 2).unwrap();
+            assert_eq!(
+                serde_json::to_value(collected).unwrap(),
+                serde_json::to_value(results).unwrap()
+            );
+            assert_eq!(metrics.quality_embedder_id.as_deref(), Some("mmr-quality"));
+
+            let partial_dir = temp_dir("mmr-direct-partial");
+            let (index, _, quality) = sync_mmr_fixture(partial_dir.path(), attested, false);
+            let query = TieredQueryEmbeddings::quality_only(
+                BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+            );
+            let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+                .with_lexical(Arc::new(StaticLexical {
+                    hits: vec![lexical_result("c", 20.0)],
+                }))
+                .with_mmr_config(sync_mmr_config());
+            let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+            let [SearchPhase::Initial { results, .. }] = phases.as_slice() else {
+                panic!("a lexical candidate without quality coverage cannot license fast MMR");
+            };
+            assert!(results.iter().any(|hit| hit.doc_id == "c"));
+            let (collected, _) = searcher.search_collect(&query, 2).unwrap();
+            assert_eq!(
+                serde_json::to_value(collected).unwrap(),
+                serde_json::to_value(results).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn sync_mmr_disjoint_coverage_keeps_refined_results_and_respects_filters() {
+        struct ExcludeQualityOnly;
+        impl SearchFilter for ExcludeQualityOnly {
+            fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool {
+                id != "quality-only"
+            }
+            fn name(&self) -> &'static str {
+                "exclude-quality-only"
+            }
+        }
+        let directory = temp_dir("mmr-disjoint-coverage");
+        let (fast, fast_identity) = attested_tier(
+            directory.path(),
+            "fast.fsvi",
+            "disjoint-fast",
+            1,
+            &[("a", &[1.0, 0.0]), ("fast-only", &[0.8, 0.6])],
+        );
+        let (quality, quality_identity) = attested_tier(
+            directory.path(),
+            "quality.fsvi",
+            "disjoint-quality",
+            1,
+            &[("a", &[1.0, 0.0, 0.0]), ("quality-only", &[0.8, 0.6, 0.0])],
+        );
+        let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap());
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast_identity).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality_identity).unwrap(),
+        );
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+            .with_mmr_config(sync_mmr_config());
+        let phases = searcher.search_iter(&query, 3).collect::<Vec<_>>();
+        let [
+            SearchPhase::Initial { .. },
+            SearchPhase::Refined { results, .. },
+        ] = phases.as_slice()
+        else {
+            panic!("disjoint tiers must not yield a mixed-space diversity phase");
+        };
+        assert_eq!(results.len(), 3);
+        let (collected, _) = searcher.search_collect(&query, 3).unwrap();
+        assert_eq!(
+            serde_json::to_value(collected).unwrap(),
+            serde_json::to_value(results).unwrap()
+        );
+        let phases = searcher
+            .search_iter_with_filter(&query, 3, Some(&ExcludeQualityOnly))
+            .collect::<Vec<_>>();
+        let [
+            SearchPhase::Initial { .. },
+            SearchPhase::Refined { .. },
+            SearchPhase::Reranked { results, .. },
+        ] = phases.as_slice()
+        else {
+            panic!("the filtered candidate set has complete fast coverage");
+        };
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.doc_id != "quality-only"));
+        let (collected, _) = searcher
+            .search_collect_with_filter(&query, 3, Some(&ExcludeQualityOnly))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(collected).unwrap(),
+            serde_json::to_value(results).unwrap()
+        );
+    }
+
+    #[test]
+    fn sync_mmr_bounds_identity_and_disabled_controls_precede_optional_work() {
+        struct UnreachableWork;
+        impl SyncLexicalSearch for UnreachableWork {
+            fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+                panic!("admission must precede lexical work");
+            }
+        }
+        impl SearchFilter for UnreachableWork {
+            fn matches(&self, _: &str, _: Option<&serde_json::Value>) -> bool {
+                panic!("admission must precede vector work");
+            }
+            fn name(&self) -> &'static str {
+                "unreachable-mmr-work"
+            }
+        }
+        let directory = temp_dir("mmr-admission");
+        let (index, fast, _) = sync_mmr_fixture(directory.path(), true, true);
+        let query = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast.clone()).unwrap(),
+        );
+        let invalid = SyncTwoTierSearcher::new(Arc::clone(&index), TwoTierConfig::default())
+            .with_lexical(Arc::new(UnreachableWork))
+            .with_mmr_config(MmrConfig {
+                candidate_pool: 1001,
+                ..sync_mmr_config()
+            });
+        for k in [0, 1] {
+            assert_admission_refusal(&invalid, &query, k, "mmr.candidate_pool");
+            assert!(matches!(
+                invalid.search_collect_with_filter(&query, k, Some(&UnreachableWork)),
+                Err(SearchError::InvalidConfig { .. })
+            ));
+        }
+        let mut foreign = fast;
+        "foreign-compatible-producer".clone_into(&mut foreign.producer.backend);
+        let foreign_query = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], foreign).unwrap(),
+        );
+        assert_admission_refusal(
+            &invalid,
+            &foreign_query,
+            0,
+            "search_activation.fast.producer_conformance",
+        );
+
+        let baseline = SyncTwoTierSearcher::new(Arc::clone(&index), TwoTierConfig::default());
+        let (expected, _) = baseline.search_collect(&query, 3).unwrap();
+        for config in [
+            MmrConfig {
+                enabled: false,
+                candidate_pool: usize::MAX,
+                ..sync_mmr_config()
+            },
+            MmrConfig {
+                candidate_pool: 0,
+                ..sync_mmr_config()
+            },
+            MmrConfig {
+                candidate_pool: 1,
+                ..sync_mmr_config()
+            },
+        ] {
+            let disabled = SyncTwoTierSearcher::new(Arc::clone(&index), TwoTierConfig::default())
+                .with_mmr_config(config);
+            let phases = disabled.search_iter(&query, 3).collect::<Vec<_>>();
+            assert!(matches!(phases.as_slice(), [SearchPhase::Initial { .. }]));
+            let (results, metrics) = disabled.search_collect(&query, 3).unwrap();
+            assert_eq!(
+                serde_json::to_value(results).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(metrics.rerank_ms, 0.0);
+        }
+        let enabled =
+            SyncTwoTierSearcher::new(index, TwoTierConfig::default()).with_mmr_config(MmrConfig {
+                candidate_pool: 2,
+                ..sync_mmr_config()
+            });
+        let (results, _) = enabled.search_collect(&query, 3).unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(enabled.search_iter(&query, 0).count(), 0);
     }
 
     fn assert_admission_refusal(
@@ -2535,21 +3321,27 @@ mod tests {
         }
         let directory = temp_dir("quality-only-cancelled");
         let (index, identity) = quality_only_index(directory.path(), true);
-        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
-            .with_lexical(Arc::new(CancelledLexical));
         let query = TieredQueryEmbeddings::quality_only(
             BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], identity).unwrap(),
         );
-        assert!(matches!(
-            searcher.search_collect_with_filter(&query, 1, Some(&UnreachableQualityWork)),
-            Err(SearchError::Cancelled { .. })
-        ));
-        let phases = searcher
-            .search_iter_with_filter(&query, 1, Some(&UnreachableQualityWork))
-            .collect::<Vec<_>>();
-        assert!(
-            matches!(phases.as_slice(), [SearchPhase::RefinementFailed { initial_results, error: SearchError::Cancelled { .. }, .. }] if initial_results.is_empty())
-        );
+        for enabled in [false, true] {
+            let searcher = SyncTwoTierSearcher::new(Arc::clone(&index), TwoTierConfig::default())
+                .with_lexical(Arc::new(CancelledLexical))
+                .with_mmr_config(MmrConfig {
+                    enabled,
+                    ..sync_mmr_config()
+                });
+            assert!(matches!(
+                searcher.search_collect_with_filter(&query, 1, Some(&UnreachableQualityWork)),
+                Err(SearchError::Cancelled { .. })
+            ));
+            let phases = searcher
+                .search_iter_with_filter(&query, 1, Some(&UnreachableQualityWork))
+                .collect::<Vec<_>>();
+            assert!(
+                matches!(phases.as_slice(), [SearchPhase::RefinementFailed { initial_results, error: SearchError::Cancelled { .. }, .. }] if initial_results.is_empty())
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

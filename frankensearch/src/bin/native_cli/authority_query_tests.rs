@@ -135,7 +135,21 @@ struct Fixture {
 }
 
 async fn fixture(cx: &Cx, full: bool, ann: bool) -> Fixture {
+    fixture_topology(
+        cx,
+        if full {
+            NativeGenerationTopology::FullProgressive
+        } else {
+            NativeGenerationTopology::FastOnly
+        },
+        ann,
+    )
+    .await
+}
+
+async fn fixture_topology(cx: &Cx, topology: NativeGenerationTopology, ann: bool) -> Fixture {
     let parent = private_parent();
+    let full = topology == NativeGenerationTopology::FullProgressive;
     let clock = Arc::new(VirtualClock::new());
     let make_model = |quality| {
         let mut identity = provider_identity();
@@ -154,6 +168,11 @@ async fn fixture(cx: &Cx, full: bool, ann: bool) -> Fixture {
     };
     let fast = make_model(false);
     let quality = make_model(true);
+    let primary = if topology == NativeGenerationTopology::QualityOnly {
+        quality.clone()
+    } else {
+        fast.clone()
+    };
     let retrieval = if ann {
         NativeBuildRetrieval::Hnsw {
             params: HnswParams {
@@ -172,7 +191,7 @@ async fn fixture(cx: &Cx, full: bool, ann: bool) -> Fixture {
     let mut builder = NativeIndexBuilder::new(
         parent.join("work"),
         new_generation(1).unwrap(),
-        fast.clone(),
+        primary.clone(),
     )
     .unwrap()
     .with_fast_storage(NativeBuildPrecision::F32, retrieval)
@@ -199,7 +218,16 @@ async fn fixture(cx: &Cx, full: bool, ann: bool) -> Fixture {
             .unwrap()
     } else {
         builder
-            .build_exact_generation(cx, EmbedderTierTag::Fast, cut, DEFAULT_IMAGE_BYTES)
+            .build_exact_generation(
+                cx,
+                if topology == NativeGenerationTopology::QualityOnly {
+                    EmbedderTierTag::Quality
+                } else {
+                    EmbedderTierTag::Fast
+                },
+                cut,
+                DEFAULT_IMAGE_BYTES,
+            )
             .await
             .unwrap()
     };
@@ -220,7 +248,7 @@ async fn fixture(cx: &Cx, full: bool, ann: bool) -> Fixture {
         published.receipt,
         published.snapshot,
         Models {
-            fast: fast.clone(),
+            fast: primary,
             quality: full.then(|| quality.clone() as Arc<dyn Embedder>),
         },
         (1, DEFAULT_IMAGE_BYTES),
@@ -454,7 +482,6 @@ fn query_control_options_and_request_envelopes_are_explicit_bounded_and_strict()
         vec!["--rerank-window", "3"],
         vec!["--reranker-dir", "m", "--rerank-window", "0"],
         vec!["--reranker-dir", "m", "--rerank-window", "1001"],
-        vec!["--reranker-dir", "m", "--mode", "fast"],
         vec!["--full-query", "{}", "--mode", "quality"],
         vec!["--full-query", "{}", "--lexical-only"],
         vec!["--reranker-dir", "m", "--mode", "lexical"],
@@ -463,6 +490,13 @@ fn query_control_options_and_request_envelopes_are_explicit_bounded_and_strict()
         vec!["--full-query", "{}", "--full-query", "{}"],
     ] {
         assert!(parsed(&extra).is_err(), "{extra:?}");
+    }
+    for mode in ["fast", "quality"] {
+        let selected = parsed(&["--reranker-dir", "m", "--mode", mode])
+            .unwrap()
+            .unwrap();
+        assert!(selected.reranker_dir.is_some());
+        query_controls::validate_startup(&selected, selected.mode.unwrap()).unwrap();
     }
     for mut arguments in [
         index_arguments(),
@@ -601,6 +635,427 @@ fn reranking_reads_only_eligible_retained_sources_and_reports_the_actual_final_p
 }
 
 #[test]
+fn authority_primary_reranking_uses_only_selected_owners_and_retained_source_scope() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for topology in [
+            NativeGenerationTopology::FastOnly,
+            NativeGenerationTopology::QualityOnly,
+            NativeGenerationTopology::FullProgressive,
+        ] {
+            for ann in [false, true] {
+                let mut f = fixture_topology(&cx, topology, ann).await;
+                f.session.query_policy.rerank =
+                    Some(query::Rerank::new(f.scorer.clone(), 3).unwrap());
+                let retained = Arc::clone(&f.session.snapshot);
+                let modes: &[&str] = match topology {
+                    NativeGenerationTopology::FastOnly => &["fast"],
+                    NativeGenerationTopology::QualityOnly => &["quality"],
+                    NativeGenerationTopology::FullProgressive => &["fast", "quality"],
+                };
+                for &mode in modes {
+                    let mut buffered_results = None;
+                    for stream in [false, true] {
+                        let before = [
+                            f.fast.calls.load(Ordering::SeqCst),
+                            f.quality.calls.load(Ordering::SeqCst),
+                        ];
+                        let output = exchange(
+                            &cx,
+                            &mut f.session,
+                            &[serde_json::json!({
+                                "query":"needle", "mode":mode, "limit":1, "stream":stream,
+                                "filter":{"ids":["vector","quality","keyword","excluded"]},
+                            })],
+                        )
+                        .await;
+                        assert_eq!(output.len(), if stream { 3 } else { 2 }, "{output:?}");
+                        assert_eq!(output[0]["progressive_available"], true);
+                        assert!(
+                            output[0]["rerank_modes"]
+                                .as_array()
+                                .unwrap()
+                                .contains(&serde_json::json!(mode))
+                        );
+                        let final_page = output.last().unwrap();
+                        assert_eq!(final_page["phase"], "reranked");
+                        assert_eq!(final_page["results"][0]["doc_id"], "vector");
+                        assert_eq!(final_page["results"][0]["metadata"]["source_id"], "vector");
+                        assert_eq!(final_page["reranker"], f.scorer.id());
+                        assert_eq!(final_page["scope"]["eligible_documents"], 3);
+                        assert!(final_page["full_query"].is_null());
+                        let hit = &final_page["results"][0];
+                        assert_eq!(hit["source"], "Reranked");
+                        assert!(hit["rerank_score"].is_number());
+                        assert!(hit["index"].is_number());
+                        assert!(
+                            hit[if mode == "quality" {
+                                "fast_score"
+                            } else {
+                                "quality_score"
+                            }]
+                            .is_null()
+                        );
+                        assert!(
+                            hit[if mode == "quality" {
+                                "quality_score"
+                            } else {
+                                "fast_score"
+                            }]
+                            .is_number()
+                        );
+                        if stream {
+                            assert_eq!(
+                                output[1]["phase"],
+                                if mode == "quality" {
+                                    "quality"
+                                } else {
+                                    "initial"
+                                }
+                            );
+                            assert_ne!(
+                                output[1]["results"][0]["doc_id"], "vector",
+                                "reranking promotes a candidate outside the displayed page"
+                            );
+                            assert_eq!(Some(final_page["results"].clone()), buffered_results);
+                        } else {
+                            buffered_results = Some(final_page["results"].clone());
+                        }
+                        assert_eq!(
+                            f.fast.calls.load(Ordering::SeqCst) - before[0],
+                            usize::from(mode == "fast")
+                        );
+                        assert_eq!(
+                            f.quality.calls.load(Ordering::SeqCst) - before[1],
+                            usize::from(mode == "quality")
+                        );
+                        let mut observed = f.scorer.seen.lock().unwrap().last().unwrap().clone();
+                        observed.sort();
+                        assert_eq!(
+                            observed,
+                            vec![
+                                ("keyword".to_owned(), "needle keyword".to_owned()),
+                                ("quality".to_owned(), "quality source".to_owned()),
+                                ("vector".to_owned(), "vector source".to_owned()),
+                            ]
+                        );
+                    }
+                    let before = [
+                        f.fast.calls.load(Ordering::SeqCst),
+                        f.quality.calls.load(Ordering::SeqCst),
+                        f.scorer.calls.load(Ordering::SeqCst),
+                    ];
+                    let empty = exchange(
+                        &cx,
+                        &mut f.session,
+                        &[serde_json::json!({
+                            "query":"needle", "mode":mode, "stream":true,
+                            "filter":{"ids":["excluded"]},
+                        })],
+                    )
+                    .await;
+                    assert_eq!(empty.len(), 2);
+                    assert!(empty[1]["results"].as_array().unwrap().is_empty());
+                    let excluded = exchange(
+                        &cx,
+                        &mut f.session,
+                        &[serde_json::json!({
+                            "query":EXCLUSIONS, "mode":mode, "stream":true,
+                        })],
+                    )
+                    .await;
+                    assert_keyword_exclusion_results(
+                        &excluded,
+                        if mode == "quality" {
+                            &["quality"]
+                        } else {
+                            &["initial"]
+                        },
+                    );
+                    assert_eq!(
+                        before,
+                        [
+                            f.fast.calls.load(Ordering::SeqCst),
+                            f.quality.calls.load(Ordering::SeqCst),
+                            f.scorer.calls.load(Ordering::SeqCst)
+                        ]
+                    );
+                    let tier = if mode == "quality" {
+                        EmbedderTierTag::Quality
+                    } else {
+                        EmbedderTierTag::Fast
+                    };
+                    let (selected, wrong) = if mode == "quality" {
+                        (f.quality.as_ref(), f.fast.as_ref())
+                    } else {
+                        (f.fast.as_ref(), f.quality.as_ref())
+                    };
+                    assert!(
+                        f.session
+                            .snapshot
+                            .search_tier_progressive(&cx, tier, wrong, "needle", 0, None)
+                            .is_err(),
+                        "zero limit must still admit the exact requested producer"
+                    );
+                    let empty_scope = f
+                        .session
+                        .scope
+                        .as_ref()
+                        .unwrap()
+                        .narrow(&cx, |_| Ok(false))
+                        .unwrap();
+                    assert!(
+                        empty_scope
+                            .search_tier_progressive(&cx, tier, wrong, "needle", 0, None)
+                            .is_err(),
+                        "empty membership cannot bypass producer admission"
+                    );
+                    let mut zero = f
+                        .session
+                        .snapshot
+                        .search_tier_progressive(&cx, tier, selected, "needle", 0, None)
+                        .unwrap()
+                        .with_retained_reranker(f.scorer.as_ref(), 3, 0)
+                        .unwrap();
+                    assert!(
+                        matches!(zero.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { results, .. }) if results.is_empty())
+                    );
+                    assert!(zero.is_finished());
+                    assert!(zero.next_phase().await.unwrap().is_none());
+                    assert_eq!(
+                        before,
+                        [
+                            f.fast.calls.load(Ordering::SeqCst),
+                            f.quality.calls.load(Ordering::SeqCst),
+                            f.scorer.calls.load(Ordering::SeqCst)
+                        ]
+                    );
+                    let before_rerank = f.scorer.calls.load(Ordering::SeqCst);
+                    let mut direct = f
+                        .session
+                        .scope
+                        .as_ref()
+                        .unwrap()
+                        .search_tier_progressive(&cx, tier, selected, "needle", 3, None)
+                        .unwrap()
+                        .with_retained_reranker(f.scorer.as_ref(), 3, 512)
+                        .unwrap();
+                    let Some(NativeSearchPhase::Initial {
+                        results: initial,
+                        candidates,
+                    }) = direct.next_phase().await.unwrap()
+                    else {
+                        panic!("a selected tier must deliver its first page before reranking");
+                    };
+                    assert_eq!(f.scorer.calls.load(Ordering::SeqCst), before_rerank);
+                    assert_eq!(candidates.fast, if mode == "fast" { 3 } else { 0 });
+                    assert_eq!(candidates.quality, if mode == "quality" { 3 } else { 0 });
+                    let Some(NativeSearchPhase::Reranked {
+                        results,
+                        candidates: reranked_candidates,
+                        evaluated,
+                    }) = direct.next_phase().await.unwrap()
+                    else {
+                        panic!("a selected tier must reach its retained reranker");
+                    };
+                    assert_eq!(evaluated, 3);
+                    assert_eq!(candidates, reranked_candidates);
+                    for hit in &results {
+                        let prior = initial
+                            .iter()
+                            .find(|prior| prior.doc_id == hit.doc_id)
+                            .unwrap();
+                        assert_eq!(hit.index, prior.index);
+                        assert_eq!(hit.fast_score, prior.fast_score);
+                        assert_eq!(hit.quality_score, prior.quality_score);
+                        assert_eq!(hit.metadata, prior.metadata);
+                    }
+                    assert!(direct.is_finished());
+                }
+                if topology != NativeGenerationTopology::FullProgressive {
+                    let absent = if topology == NativeGenerationTopology::QualityOnly {
+                        EmbedderTierTag::Fast
+                    } else {
+                        EmbedderTierTag::Quality
+                    };
+                    assert!(
+                        f.session
+                            .snapshot
+                            .search_tier_progressive(
+                                &cx,
+                                absent,
+                                f.fast.as_ref(),
+                                "needle",
+                                0,
+                                None
+                            )
+                            .is_err()
+                    );
+                }
+                assert!(Arc::ptr_eq(&retained, &f.session.snapshot));
+            }
+        }
+    });
+}
+
+#[test]
+fn authority_primary_rerank_failures_and_output_failures_preserve_the_previous_page() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for mode in ["fast", "quality"] {
+            let mut f = fixture_topology(
+                &cx,
+                if mode == "quality" {
+                    NativeGenerationTopology::QualityOnly
+                } else {
+                    NativeGenerationTopology::FastOnly
+                },
+                false,
+            )
+            .await;
+            f.session.query_policy.rerank = Some(query::Rerank::new(f.scorer.clone(), 3).unwrap());
+            let selected = f.session.snapshot.authority();
+            let request =
+                |stream| serde_json::json!({"query":"needle", "mode":mode, "stream":stream});
+            for failure in [0, 1, 3] {
+                for stream in [false, true] {
+                    f.session.max_source_bytes = if failure == 0 { 0 } else { 512 };
+                    f.scorer.mode.store(failure, Ordering::SeqCst);
+                    let before = f.scorer.calls.load(Ordering::SeqCst);
+                    let output = exchange(&cx, &mut f.session, &[request(stream)]).await;
+                    assert_eq!(output.len(), if stream { 3 } else { 2 }, "{output:?}");
+                    assert_eq!(output.last().unwrap()["event"], "failed");
+                    assert!(!output.iter().any(|frame| frame["phase"] == "reranked"));
+                    if stream {
+                        assert_eq!(output[1]["event"], "results");
+                        assert_eq!(
+                            output[1]["phase"],
+                            if mode == "quality" {
+                                "quality"
+                            } else {
+                                "initial"
+                            }
+                        );
+                    }
+                    assert_eq!(
+                        f.scorer.calls.load(Ordering::SeqCst) - before,
+                        usize::from(failure != 0)
+                    );
+                    assert_eq!(f.session.snapshot.authority(), selected);
+                }
+            }
+            f.session.max_source_bytes = 512;
+            f.session.query_policy.maximum_ms = Some(10);
+            let request: AuthoritySearchRequest = serde_json::from_value(request(true)).unwrap();
+            let phase = if mode == "quality" {
+                "quality"
+            } else {
+                "initial"
+            };
+            let before = f.scorer.calls.load(Ordering::SeqCst);
+            for fail in [true, false] {
+                let mut output = PhaseOutput {
+                    bytes: Vec::new(),
+                    clock: Arc::clone(&f.clock),
+                    phase,
+                    fail,
+                };
+                let error = f
+                    .session
+                    .query(&cx, &request, 1, &mut output)
+                    .await
+                    .unwrap_err();
+                if fail {
+                    assert_eq!(
+                        error.downcast_ref::<AuthorityServeRefusal>().unwrap().0,
+                        "result_delivery_failed"
+                    );
+                    assert!(output.bytes.is_empty());
+                } else {
+                    assert!(matches!(
+                        error.downcast_ref::<SearchError>(),
+                        Some(SearchError::SearchTimeout { .. })
+                    ));
+                    assert_eq!(frames(&output.bytes).len(), 1);
+                }
+                assert_eq!(
+                    f.scorer.calls.load(Ordering::SeqCst),
+                    before,
+                    "no reranking starts after failed or late first-phase delivery"
+                );
+            }
+            let mut final_output = PhaseOutput {
+                bytes: Vec::new(),
+                clock: Arc::clone(&f.clock),
+                phase: "reranked",
+                fail: false,
+            };
+            f.session
+                .query(&cx, &request, 2, &mut final_output)
+                .await
+                .unwrap();
+            assert_eq!(
+                frames(&final_output.bytes).len(),
+                2,
+                "slow completed final output is not a retrospective timeout"
+            );
+        }
+    });
+}
+
+#[test]
+fn authority_primary_pending_rerank_uses_the_original_deadline_and_releases_work() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for mode in ["fast", "quality"] {
+            for stream in [false, true] {
+                let mut f = fixture_topology(
+                    &cx,
+                    if mode == "quality" {
+                        NativeGenerationTopology::QualityOnly
+                    } else {
+                        NativeGenerationTopology::FastOnly
+                    },
+                    false,
+                )
+                .await;
+                f.session.query_policy.rerank =
+                    Some(query::Rerank::new(f.scorer.clone(), 3).unwrap());
+                f.session.query_policy.maximum_ms = Some(10);
+                f.fast.delay_ns.store(4_000_000, Ordering::SeqCst);
+                f.quality.delay_ns.store(4_000_000, Ordering::SeqCst);
+                f.scorer.mode.store(2, Ordering::SeqCst);
+                let request = serde_json::json!({"query":"needle", "mode":mode, "stream":stream, "timeout_ms":100});
+                let mut input = Cursor::new(format!("{request}\n"));
+                let mut output = Vec::new();
+                let mut serving =
+                    Box::pin(serve_session(&cx, &mut f.session, &mut input, &mut output));
+                assert!(
+                    serving
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                assert_eq!(f.scorer.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(f.scorer.drops.load(Ordering::SeqCst), 0);
+                f.clock.advance(6_000_000);
+                let _ = f.timer.process_timers();
+                serving.await.unwrap();
+                let output = frames(&output);
+                assert_eq!(output.len(), if stream { 3 } else { 2 });
+                assert_eq!(output.last().unwrap()["code"], "search_timeout");
+                assert_eq!(output.last().unwrap()["budget_ms"], 10);
+                assert_eq!(output.last().unwrap()["elapsed_ms"], 10);
+                assert_eq!(f.scorer.drops.load(Ordering::SeqCst), 1);
+                assert!(f.timer.is_empty());
+                assert!(!cx.is_cancel_requested());
+                f.fast.delay_ns.store(0, Ordering::SeqCst);
+                f.quality.delay_ns.store(0, Ordering::SeqCst);
+                let next = exchange(&cx, &mut f.session, &[request]).await;
+                assert_eq!(next.last().unwrap()["phase"], "reranked");
+            }
+        }
+    });
+}
+
+#[test]
 fn failed_source_or_reranking_never_becomes_a_successful_buffered_page() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let mut f = fixture(&cx, true, false).await;
@@ -711,8 +1166,14 @@ fn request_overrides_need_the_server_grant_and_cannot_widen_limits_or_source() {
             .await;
             assert_eq!(output[1]["event"], "results");
             assert!(output[1].get("full_query").is_none());
-            assert!(output[1].get("reranker").is_none());
-            assert_eq!(f.scorer.calls.load(Ordering::SeqCst), before);
+            if mode == "lexical" {
+                assert!(output[1].get("reranker").is_none());
+                assert_eq!(f.scorer.calls.load(Ordering::SeqCst), before);
+            } else {
+                assert_eq!(output[1]["phase"], "reranked");
+                assert_eq!(output[1]["reranker"], f.scorer.id());
+                assert_eq!(f.scorer.calls.load(Ordering::SeqCst), before + 1);
+            }
         }
     });
 }
@@ -721,19 +1182,14 @@ fn request_overrides_need_the_server_grant_and_cannot_widen_limits_or_source() {
 fn full_controls_refuse_incomplete_topology_before_loading_any_provider() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let f = fixture(&cx, false, false).await;
-        for extra in [
-            vec!["--full-query", TUNED],
-            vec!["--reranker-dir", "missing-local-reranker"],
-        ] {
-            let mut options = parsed(&extra).unwrap().unwrap();
-            options.receipt = f.receipt.clone();
-            let error = search_with_loader(&cx, &options, &mut Vec::new(), |_| {
-                panic!("incomplete topology must refuse before loading models")
-            })
-            .await
-            .unwrap_err();
-            assert!(error.to_string().contains("complete full generation"));
-        }
+        let mut options = parsed(&["--full-query", TUNED]).unwrap().unwrap();
+        options.receipt = f.receipt.clone();
+        let error = search_with_loader(&cx, &options, &mut Vec::new(), |_| {
+            panic!("incomplete topology must refuse before loading models")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("complete full generation"));
     });
 }
 

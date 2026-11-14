@@ -1,4 +1,4 @@
-//! Full-mode tuning and bounded, lazy reranking over one retained authority.
+//! Query tuning and bounded, lazy reranking over one retained authority.
 //! The ordinary CLI policy owns validation and request limits; this adapter
 //! changes only how that policy reaches a fixed generation's native query.
 
@@ -8,8 +8,8 @@ use frankensearch::native_ann::{NativeGenerationSnapshot, NativeProgressiveSearc
 use frankensearch::{Embedder, ScoredResult};
 
 use super::{
-    AuthoritySearchRequest, AuthoritySession, Cx, Deserialize, Options, QueryMode, Result,
-    SearchError, Write, bad, checkpoint, query, serve_refused,
+    AuthoritySearchRequest, AuthoritySession, Cx, Deserialize, EmbedderTierTag, Options, QueryMode,
+    Result, SearchError, Write, bad, checkpoint, query, serve_refused,
 };
 
 #[derive(Debug, Deserialize)]
@@ -31,10 +31,13 @@ pub(super) struct SearchEnvelope {
 }
 
 pub(super) fn validate_startup(options: &Options, mode: QueryMode) -> Result<()> {
-    if (options.full_query.is_some() || options.reranker_dir.is_some()) && mode != QueryMode::Full {
+    if options.full_query.is_some() && mode != QueryMode::Full {
         return Err(bad(
-            "full-query tuning and reranking require a complete full generation in full mode",
+            "full-query tuning requires a complete full generation in full mode",
         ));
+    }
+    if options.reranker_dir.is_some() && mode == QueryMode::Lexical {
+        return Err(bad("authority reranking requires a semantic query mode"));
     }
     Ok(())
 }
@@ -98,6 +101,29 @@ impl<'a> RetainedQuery<'a> {
             }
             (Some(scope), None) => Box::pin(scope.search_text(cx, embedder, text, limit)).await?,
             (None, None) => Box::pin(self.snapshot.search_text(cx, embedder, text, limit)).await?,
+        })
+    }
+
+    pub(super) fn tier_progressive(
+        &self,
+        cx: &'a Cx,
+        tier: EmbedderTierTag,
+        embedder: &'a dyn Embedder,
+        text: &'a str,
+        limit: usize,
+    ) -> Result<NativeProgressiveSearch<'a>> {
+        Ok(match self.scope {
+            Some(scope) => {
+                scope.search_tier_progressive(cx, tier, embedder, text, limit, self.pool.clone())?
+            }
+            None => self.snapshot.search_tier_progressive(
+                cx,
+                tier,
+                embedder,
+                text,
+                limit,
+                self.pool.clone(),
+            )?,
         })
     }
 
@@ -187,6 +213,18 @@ impl<'a> RetainedQuery<'a> {
 }
 
 pub(super) fn configure<'a>(
+    search: NativeProgressiveSearch<'a>,
+    policy: &'a query::Policy,
+    max_source_bytes: usize,
+) -> Result<NativeProgressiveSearch<'a>> {
+    let search = configure_reranker(search, policy, max_source_bytes)?;
+    match &policy.full_query {
+        Some(tuning) => tuning.apply_native(search),
+        None => Ok(search),
+    }
+}
+
+pub(super) fn configure_reranker<'a>(
     mut search: NativeProgressiveSearch<'a>,
     policy: &'a query::Policy,
     max_source_bytes: usize,
@@ -198,18 +236,17 @@ pub(super) fn configure<'a>(
             max_source_bytes,
         )?;
     }
-    match &policy.full_query {
-        Some(tuning) => tuning.apply_native(search),
-        None => Ok(search),
-    }
+    Ok(search)
 }
 
 pub(super) fn annotate(policy: &query::Policy, mode: QueryMode, response: &mut serde_json::Value) {
     if mode == QueryMode::Full {
         policy.annotate_full_query(crate::Mode::Full, response);
-        if let Some(rerank) = &policy.rerank {
-            rerank.annotate(response);
-        }
+    }
+    if mode != QueryMode::Lexical
+        && let Some(rerank) = &policy.rerank
+    {
+        rerank.annotate(response);
     }
 }
 

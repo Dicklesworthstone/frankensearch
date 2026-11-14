@@ -1291,6 +1291,15 @@ impl ModelArtifactManifestV1 {
         staged_dir: &Path,
         destination_dir: &Path,
     ) -> SearchResult<Option<PathBuf>> {
+        self.promote_verified_installation_with_validation(staged_dir, destination_dir, || Ok(()))
+    }
+
+    pub(crate) fn promote_verified_installation_with_validation(
+        &self,
+        staged_dir: &Path,
+        destination_dir: &Path,
+        validate_publication: impl Fn() -> SearchResult<()>,
+    ) -> SearchResult<Option<PathBuf>> {
         self.verify_dir(staged_dir)?;
         sync_registered_artifacts(
             staged_dir,
@@ -1298,7 +1307,7 @@ impl ModelArtifactManifestV1 {
                 .iter()
                 .map(|artifact| artifact.relative_path.as_str()),
         )?;
-        promote_atomically(staged_dir, destination_dir)
+        promote_atomically_with_validation(staged_dir, destination_dir, validate_publication)
     }
 
     /// Derive the identity declared by this frozen manifest without claiming
@@ -2828,6 +2837,87 @@ impl ModelManifestCatalog {
     }
 }
 
+/// Observed boundary at which model-cache publication became uncertain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPublicationUncertainOutcomeV1 {
+    /// The verified replacement occupies the destination, but its directory
+    /// durability barrier failed. The publisher never rolls it back blindly.
+    SelectedNewDurabilityUnknown,
+    /// Publication was refused after the predecessor moved to backup, and
+    /// restoring that predecessor failed. Neither selection is acknowledged.
+    SelectionUnknownAfterRestoreFailure,
+    /// The predecessor was restored in the current filesystem view, but the
+    /// durability barrier for that restoration failed.
+    PriorRestoredDurabilityUnknown,
+}
+
+/// Path-free failure facts for a model publication that needs inspection.
+///
+/// This error is carried by [`SearchError::SubsystemError`]. It distinguishes
+/// uncertain selection/durability from artifact verification failure and is
+/// safe to serialize in an operator response. No model paths, arbitrary source
+/// error text, or authorization contents are retained here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelPublicationUncertaintyV1 {
+    /// Version of these bounded diagnostic facts.
+    pub schema_version: u16,
+    /// Last positively observed publication boundary.
+    pub outcome: ModelPublicationUncertainOutcomeV1,
+    /// The publisher retained predecessor bytes in the destination or backup.
+    /// False means there was no predecessor, not that one was deleted.
+    pub prior_generation_preserved: bool,
+    /// Closed diagnostic classification of the failure at that boundary.
+    pub cause_code: &'static str,
+    /// Bounded standard-library I/O kind, when an I/O failure was observed.
+    pub io_error_kind: Option<String>,
+}
+
+impl std::fmt::Display for ModelPublicationUncertaintyV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "model publication outcome is uncertain ({:?}); inspect the selected cache and retained generations before another acquisition",
+            self.outcome
+        )
+    }
+}
+
+impl std::error::Error for ModelPublicationUncertaintyV1 {}
+
+/// Inspect typed model-publication uncertainty without parsing error text.
+#[must_use]
+pub fn model_publication_uncertainty(
+    error: &SearchError,
+) -> Option<&ModelPublicationUncertaintyV1> {
+    match error {
+        SearchError::SubsystemError { source, .. } => {
+            source.downcast_ref::<ModelPublicationUncertaintyV1>()
+        }
+        _ => None,
+    }
+}
+
+fn uncertain_publication_error(
+    outcome: ModelPublicationUncertainOutcomeV1,
+    prior_generation_preserved: bool,
+    cause: &SearchError,
+) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "model_publication",
+        source: Box::new(ModelPublicationUncertaintyV1 {
+            schema_version: 1,
+            outcome,
+            prior_generation_preserved,
+            cause_code: cause.diagnostic_code(),
+            io_error_kind: match cause {
+                SearchError::Io(error) => Some(format!("{:?}", error.kind())),
+                _ => None,
+            },
+        }),
+    }
+}
+
 /// Runtime state of model availability and lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelState {
@@ -2843,6 +2933,9 @@ pub enum ModelState {
     StagedVerified,
     /// Artifacts are installed and load-tested, but no compatible index is selected yet.
     AcquiredNeedsReindex,
+    /// Selection or publication durability needs explicit inspection. This is
+    /// neither verification failure nor permission to retry the acquisition.
+    PublicationUncertain,
     Ready,
     Disabled {
         reason: String,
@@ -2888,6 +2981,9 @@ impl ModelState {
             Self::Verifying => "verifying".into(),
             Self::StagedVerified => "staged and verified".into(),
             Self::AcquiredNeedsReindex => "acquired; compatible index required".into(),
+            Self::PublicationUncertain => {
+                "publication uncertain; inspect retained generations".into()
+            }
             Self::Ready => "ready".into(),
             Self::Disabled { reason } => format!("disabled: {reason}"),
             Self::VerificationFailed { reason } => format!("verification failed: {reason}"),
@@ -3041,6 +3137,13 @@ impl ModelLifecycle {
     ///
     /// Returns `SearchError::InvalidConfig` on invalid transition or zero total bytes.
     pub fn begin_download(&mut self, total_bytes: u64) -> SearchResult<()> {
+        if matches!(self.state, ModelState::PublicationUncertain) {
+            return Err(invalid_state_transition(
+                &self.state,
+                "begin_download",
+                "publication requires inspection before another acquisition",
+            ));
+        }
         if !self.consent.granted {
             self.state = ModelState::NeedsConsent;
             return Err(SearchError::EmbedderUnavailable {
@@ -3175,6 +3278,9 @@ impl ModelLifecycle {
 
     /// Mark install verification failed.
     pub fn fail_verification(&mut self, reason: impl Into<String>) {
+        if matches!(self.state, ModelState::PublicationUncertain) {
+            return;
+        }
         self.state = ModelState::VerificationFailed {
             reason: reason.into(),
         };
@@ -3185,6 +3291,14 @@ impl ModelLifecycle {
         self.state = ModelState::Disabled {
             reason: reason.into(),
         };
+    }
+
+    /// Record a publication whose selection or durability is not acknowledged.
+    ///
+    /// Ordinary cancellation, verification failure and retry transitions must
+    /// not relabel this state as a safely retryable failed download.
+    pub fn mark_publication_uncertain(&mut self) {
+        self.state = ModelState::PublicationUncertain;
     }
 
     /// Mark update available.
@@ -3201,7 +3315,9 @@ impl ModelLifecycle {
 
     /// Cancel current operation.
     pub fn cancel(&mut self) {
-        self.state = ModelState::Cancelled;
+        if !matches!(self.state, ModelState::PublicationUncertain) {
+            self.state = ModelState::Cancelled;
+        }
     }
 
     /// Recover from cancelled state so a new download can start.
@@ -3830,11 +3946,13 @@ fn sync_directory(path: &Path) -> SearchResult<()> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublicationBoundary {
+pub(crate) enum PublicationBoundary {
     InstallingParentSync,
     BackupParentSync,
     PublishRename,
     PublishedParentSync,
+    RestoreRename,
+    RestoredParentSync,
 }
 
 #[cfg(test)]
@@ -3857,11 +3975,11 @@ fn publication_boundary(boundary: PublicationBoundary) -> SearchResult<()> {
 }
 
 #[cfg(test)]
-struct PublicationFaultGuard;
+pub(crate) struct PublicationFaultGuard;
 
 #[cfg(test)]
 impl PublicationFaultGuard {
-    fn install(boundary: PublicationBoundary) -> Self {
+    pub(crate) fn install(boundary: PublicationBoundary) -> Self {
         TEST_PUBLICATION_FAULT.with(|fault| {
             assert!(
                 fault.replace(Some(boundary)).is_none(),
@@ -3880,6 +3998,43 @@ impl Drop for PublicationFaultGuard {
 }
 
 fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult<Option<PathBuf>> {
+    promote_atomically_with_validation(staged_dir, destination_dir, || Ok(()))
+}
+
+fn restore_prior_generation(
+    backup: &Path,
+    destination_dir: &Path,
+    destination_parent: &Path,
+) -> SearchResult<()> {
+    publication_boundary(PublicationBoundary::RestoreRename)
+        .and_then(|()| fs::rename(backup, destination_dir).map_err(SearchError::from))
+        .map_err(|error| {
+            uncertain_publication_error(
+                ModelPublicationUncertainOutcomeV1::SelectionUnknownAfterRestoreFailure,
+                true,
+                &error,
+            )
+        })?;
+    let restored_sync = publication_boundary(PublicationBoundary::RestoredParentSync);
+    #[cfg(unix)]
+    let restored_sync = restored_sync.and_then(|()| sync_directory(destination_parent));
+    #[cfg(not(unix))]
+    let _ = destination_parent;
+    restored_sync.map_err(|error| {
+        uncertain_publication_error(
+            ModelPublicationUncertainOutcomeV1::PriorRestoredDurabilityUnknown,
+            true,
+            &error,
+        )
+    })
+}
+
+fn promote_atomically_with_validation(
+    staged_dir: &Path,
+    destination_dir: &Path,
+    validate_publication: impl Fn() -> SearchResult<()>,
+) -> SearchResult<Option<PathBuf>> {
+    validate_publication()?;
     let destination_parent =
         destination_dir
             .parent()
@@ -3905,6 +4060,10 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
     #[cfg(unix)]
     sync_directory(destination_parent)?;
 
+    // A slow verification or durability sync must not extend a scoped grant.
+    // Refusal here leaves the selected destination untouched and retains the
+    // installing directory for diagnosis or an independently authorized retry.
+    validate_publication()?;
     let backup_path = if destination_dir.exists() {
         let backup = destination_parent.join(format!("{stage_name}.backup.{timestamp}.{pid}"));
         fs::rename(destination_dir, &backup).map_err(SearchError::from)?;
@@ -3912,15 +4071,7 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
         #[cfg(unix)]
         let backup_sync = backup_sync.and_then(|()| sync_directory(destination_parent));
         if let Err(sync_error) = backup_sync {
-            if let Err(rollback_error) = fs::rename(&backup, destination_dir) {
-                tracing::error!(
-                    rollback_error_kind = ?rollback_error.kind(),
-                    "model backup sync failed and the prior generation remains in its backup"
-                );
-            } else {
-                #[cfg(unix)]
-                let _ = sync_directory(destination_parent);
-            }
+            restore_prior_generation(&backup, destination_dir, destination_parent)?;
             return Err(sync_error);
         }
         Some(backup)
@@ -3928,24 +4079,25 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
         None
     };
 
-    let publish = publication_boundary(PublicationBoundary::PublishRename)
+    let publish = validate_publication()
+        .and_then(|()| publication_boundary(PublicationBoundary::PublishRename))
         .and_then(|()| fs::rename(&stage_target, destination_dir).map_err(SearchError::from));
     if let Err(publish_error) = publish {
-        if let Some(backup) = &backup_path
-            && let Err(rollback_error) = fs::rename(backup, destination_dir)
-        {
-            tracing::error!(
-                rollback_error_kind = ?rollback_error.kind(),
-                "model publication failed and prior generation remains in its backup"
-            );
+        if let Some(backup) = &backup_path {
+            restore_prior_generation(backup, destination_dir, destination_parent)?;
         }
-        #[cfg(unix)]
-        let _ = sync_directory(destination_parent);
         return Err(publish_error);
     }
-    publication_boundary(PublicationBoundary::PublishedParentSync)?;
+    let published_sync = publication_boundary(PublicationBoundary::PublishedParentSync);
     #[cfg(unix)]
-    sync_directory(destination_parent)?;
+    let published_sync = published_sync.and_then(|()| sync_directory(destination_parent));
+    published_sync.map_err(|error| {
+        uncertain_publication_error(
+            ModelPublicationUncertainOutcomeV1::SelectedNewDurabilityUnknown,
+            backup_path.is_some(),
+            &error,
+        )
+    })?;
     Ok(backup_path)
 }
 
@@ -6031,6 +6183,7 @@ mod tests {
             ModelState::Verifying,
             ModelState::StagedVerified,
             ModelState::AcquiredNeedsReindex,
+            ModelState::PublicationUncertain,
             ModelState::Ready,
             ModelState::Disabled {
                 reason: "out of disk".to_owned(),
@@ -6372,6 +6525,42 @@ mod tests {
     }
 
     #[test]
+    fn publication_authorization_expiry_after_backup_restores_prior_generation() {
+        let (temp, manifest, staged, destination) = publication_failure_fixture();
+        manifest.verify_dir(&staged).unwrap();
+        let calls = std::cell::Cell::new(0_u8);
+        let error = promote_atomically_with_validation(&staged, &destination, || {
+            let call = calls.get() + 1;
+            calls.set(call);
+            if call == 3 {
+                assert!(
+                    !destination.exists(),
+                    "the old selection has moved to its retained backup"
+                );
+                Err(SearchError::InvalidConfig {
+                    field: "model_acquisition.recovery.authorization".to_owned(),
+                    value: "expired".to_owned(),
+                    reason: "test grant expired at the publication boundary".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(error, SearchError::InvalidConfig { .. }));
+        assert_eq!(
+            fs::read(destination.join("prior.bin")).unwrap(),
+            b"prior model"
+        );
+        assert!(!destination.join("model.bin").exists());
+        assert_eq!(
+            sibling_names_with_prefix(temp.path(), ".final.installing.").len(),
+            1
+        );
+        assert!(sibling_names_with_prefix(temp.path(), "final.backup.").is_empty());
+    }
+
+    #[test]
     fn interrupted_installing_parent_fsync_preserves_prior_generation() {
         let (temp, manifest, staged, destination) = publication_failure_fixture();
         let _fault = PublicationFaultGuard::install(PublicationBoundary::InstallingParentSync);
@@ -6440,7 +6629,20 @@ mod tests {
             .promote_verified_installation(&staged, &destination)
             .unwrap_err();
 
-        assert!(matches!(error, SearchError::Io(_)));
+        let uncertainty = model_publication_uncertainty(&error).expect(
+            "a selected replacement with unconfirmed durability is not verification failure",
+        );
+        assert_eq!(
+            uncertainty.outcome,
+            ModelPublicationUncertainOutcomeV1::SelectedNewDurabilityUnknown
+        );
+        assert!(uncertainty.prior_generation_preserved);
+        assert_eq!(uncertainty.cause_code, "io_error");
+        assert_eq!(uncertainty.io_error_kind.as_deref(), Some("Other"));
+        let wire = serde_json::to_string(uncertainty).unwrap();
+        assert!(wire.contains("selected_new_durability_unknown"));
+        assert!(!wire.contains(temp.path().to_str().unwrap()));
+        assert!(!error.to_string().contains(temp.path().to_str().unwrap()));
         assert_eq!(
             fs::read(destination.join("model.bin")).unwrap(),
             b"new model"
@@ -6451,6 +6653,116 @@ mod tests {
             fs::read(temp.path().join(&backups[0]).join("prior.bin")).unwrap(),
             b"prior model"
         );
+    }
+
+    #[test]
+    fn uncertain_fresh_publication_does_not_invent_a_preserved_predecessor() {
+        let (temp, manifest, staged, untouched) = publication_failure_fixture();
+        let destination = temp.path().join("fresh");
+        let _fault = PublicationFaultGuard::install(PublicationBoundary::PublishedParentSync);
+        let error = manifest
+            .promote_verified_installation(&staged, &destination)
+            .unwrap_err();
+        let uncertainty = model_publication_uncertainty(&error).unwrap();
+        assert_eq!(
+            uncertainty.outcome,
+            ModelPublicationUncertainOutcomeV1::SelectedNewDurabilityUnknown
+        );
+        assert!(!uncertainty.prior_generation_preserved);
+        assert_eq!(
+            fs::read(destination.join("model.bin")).unwrap(),
+            b"new model"
+        );
+        assert_eq!(
+            fs::read(untouched.join("prior.bin")).unwrap(),
+            b"prior model"
+        );
+    }
+
+    #[test]
+    fn refused_publication_with_failed_restoration_reports_uncertainty_and_keeps_bytes() {
+        for boundary in [
+            PublicationBoundary::RestoreRename,
+            PublicationBoundary::RestoredParentSync,
+        ] {
+            let (temp, manifest, staged, destination) = publication_failure_fixture();
+            manifest.verify_dir(&staged).unwrap();
+            let _fault = PublicationFaultGuard::install(boundary);
+            let calls = std::cell::Cell::new(0_u8);
+            let error = promote_atomically_with_validation(&staged, &destination, || {
+                let call = calls.get() + 1;
+                calls.set(call);
+                if call == 3 {
+                    assert!(!destination.exists(), "the predecessor has moved to backup");
+                    Err(SearchError::Cancelled {
+                        phase: "publication-admission".to_owned(),
+                        reason: "cancelled before replacement rename".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            let uncertainty = model_publication_uncertainty(&error)
+                .expect("failed restoration must take precedence over ordinary cancellation");
+            assert!(uncertainty.prior_generation_preserved);
+            let backups = sibling_names_with_prefix(temp.path(), "final.backup.");
+            if boundary == PublicationBoundary::RestoreRename {
+                assert_eq!(
+                    uncertainty.outcome,
+                    ModelPublicationUncertainOutcomeV1::SelectionUnknownAfterRestoreFailure
+                );
+                assert!(!destination.exists());
+                assert_eq!(backups.len(), 1);
+                assert_eq!(
+                    fs::read(temp.path().join(&backups[0]).join("prior.bin")).unwrap(),
+                    b"prior model"
+                );
+            } else {
+                assert_eq!(
+                    uncertainty.outcome,
+                    ModelPublicationUncertainOutcomeV1::PriorRestoredDurabilityUnknown
+                );
+                assert_eq!(
+                    fs::read(destination.join("prior.bin")).unwrap(),
+                    b"prior model"
+                );
+                assert!(backups.is_empty());
+            }
+            let installing = sibling_names_with_prefix(temp.path(), ".final.installing.");
+            assert_eq!(installing.len(), 1);
+            assert_eq!(
+                fs::read(temp.path().join(&installing[0]).join("model.bin")).unwrap(),
+                b"new model"
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_lifecycle_cannot_be_relabelled_as_cancelled_or_retryable() {
+        for consent in [
+            DownloadConsent::granted(ConsentSource::Programmatic),
+            DownloadConsent::denied(None),
+        ] {
+            let mut lifecycle = ModelLifecycle::new(ModelManifest::potion_128m(), consent);
+            lifecycle.mark_publication_uncertain();
+            assert!(!lifecycle.state().is_ready());
+            assert!(!lifecycle.state().is_downloading());
+            assert!(lifecycle.begin_download(100).is_err());
+            assert_eq!(lifecycle.state(), &ModelState::PublicationUncertain);
+            lifecycle.cancel();
+            assert!(lifecycle.recover_after_cancel().is_err());
+            lifecycle
+                .fail_verification("a later handler must not discard the uncertain publication");
+            assert!(lifecycle.mark_acquired_needs_reindex().is_err());
+            assert_eq!(lifecycle.state(), &ModelState::PublicationUncertain);
+            assert!(
+                lifecycle
+                    .state()
+                    .summary()
+                    .contains("publication uncertain")
+            );
+        }
     }
 
     #[test]
