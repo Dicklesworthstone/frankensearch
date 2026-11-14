@@ -4075,16 +4075,13 @@ fn validate_delete_ignore_policy(
         if is_symlink && !discovery.follow_symlinks {
             break;
         }
-        let mut candidate = DiscoveryCandidate::new(&directory, 0)
-            .with_root(root)
-            .with_symlink(is_symlink);
-        if let Some(category) = lookup_mount_category(mount_table, &directory) {
-            candidate = candidate.with_mount_category(category);
-        }
-        if matches!(
-            discovery.evaluate_candidate(&candidate).scope,
-            DiscoveryScopeDecision::Exclude
-        ) || ignore_rules.skips_entry(&directory, true)?
+        // Directory traversal has no file ingestion class. A binary-looking
+        // suffix or the text allowlist must not hide policy beneath a directory
+        // that the index walk enters.
+        if !discovery
+            .evaluate_root(&directory, lookup_mount_category(mount_table, &directory))
+            .include()
+            || ignore_rules.skips_entry(&directory, true)?
         {
             break;
         }
@@ -4793,14 +4790,13 @@ fn collect_snapshot_for_root(
             }
 
             if metadata.is_dir() {
-                let mut directory_candidate = DiscoveryCandidate::new(&path, 0)
-                    .with_root(root)
-                    .with_symlink(is_symlink);
-                if let Some(category) = lookup_mount_category(mount_table, &path) {
-                    directory_candidate = directory_candidate.with_mount_category(category);
-                }
-                let directory_decision = discovery.evaluate_candidate(&directory_candidate);
-                if matches!(directory_decision.scope, DiscoveryScopeDecision::Exclude) {
+                // Match the index walk's directory policy. Applying file
+                // scoring here drops whole subtrees in allowlist mode and
+                // treats directories such as archive.zip as binary files.
+                if !discovery
+                    .evaluate_root(&path, lookup_mount_category(mount_table, &path))
+                    .include()
+                {
                     continue;
                 }
                 stack.push(path);
@@ -6093,6 +6089,121 @@ mod tests {
             assert!(completeness.is_complete());
             assert_eq!(snapshot.contains_key(&root.join("lib.rs")), follow_symlinks);
             assert_eq!(snapshot.len(), usize::from(follow_symlinks));
+        }
+    }
+
+    #[test]
+    fn watcher_directory_traversal_preserves_text_beneath_binary_names_and_allowlists() {
+        for text_selection_mode in [
+            crate::config::TextSelectionMode::Blocklist,
+            crate::config::TextSelectionMode::Allowlist,
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            fs::create_dir_all(root.join(".git")).expect("repository");
+            let root = root.canonicalize().expect("canonical root");
+            let mut discovery = DiscoveryConfig {
+                text_selection_mode,
+                ..DiscoveryConfig::default()
+            };
+            discovery.exclude_patterns.push("custom-cache".to_owned());
+            for directory in [
+                "ordinary",
+                "archive.zip",
+                "data.bin",
+                "generated.min.js",
+                "target",
+                "custom-cache",
+                "ignored",
+            ] {
+                fs::create_dir(root.join(directory)).expect("source directory");
+                fs::write(root.join(directory).join("notes.md"), "searchable source")
+                    .expect("source");
+            }
+            fs::write(root.join("archive.zip/payload.zip"), "binary-looking file")
+                .expect("binary exclusion control");
+            fs::write(root.join(".ignore"), "ignored/\n").expect("ignore policy");
+            // Excluded directories remain pruned before their policy is read.
+            for directory in ["target", "custom-cache", "ignored"] {
+                fs::write(root.join(directory).join(".ignore"), "private[9-0].md\n")
+                    .expect("inapplicable malformed policy");
+            }
+            let expected = ["ordinary", "archive.zip", "data.bin", "generated.min.js"]
+                .map(|directory| root.join(directory).join("notes.md"))
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let watcher = FsWatcher::new(
+                vec![root],
+                discovery.clone(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            let (snapshot, completeness) = watcher.collect_snapshot().expect("source scan");
+            assert!(completeness.is_complete());
+            assert_eq!(
+                snapshot.keys().cloned().collect::<BTreeSet<_>>(),
+                expected,
+                "{text_selection_mode:?}"
+            );
+
+            let events = expected
+                .iter()
+                .map(|path| WatchEvent::modified(path, 100, Some(17)))
+                .collect::<Vec<_>>();
+            let prepared = super::prepare_event_batch(&discovery, watcher.roots(), &events)
+                .expect("event admission agrees with the scan");
+            assert_eq!(prepared.accepted, expected.len());
+            assert_eq!(prepared.skipped, 0);
+
+            // A baseline populated by ordinary indexing/native events must not
+            // lose these still-existing documents on the next full rescan.
+            let previous = expected.into_iter().map(|path| (path, 1)).collect();
+            let changes = FsWatcher::diff_snapshots(&previous, &snapshot, 100, &completeness);
+            assert!(
+                changes
+                    .iter()
+                    .all(|event| event.kind != WatchEventKind::Deleted),
+                "file-only directory classification must not authorize phantom deletes"
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_directory_policy_errors_block_scans_and_deletes_under_file_shaped_names() {
+        for (directory, text_selection_mode) in [
+            ("archive.zip", crate::config::TextSelectionMode::Blocklist),
+            ("ordinary", crate::config::TextSelectionMode::Allowlist),
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            fs::create_dir_all(root.join(".git")).expect("repository");
+            fs::create_dir(root.join(directory)).expect("source directory");
+            let root = root.canonicalize().expect("canonical root");
+            let policy = root.join(directory).join(".ignore");
+            fs::write(&policy, "private[9-0].md\n").expect("malformed relevant policy");
+            let discovery = DiscoveryConfig {
+                text_selection_mode,
+                ..DiscoveryConfig::default()
+            };
+            let watcher = FsWatcher::new(
+                vec![root],
+                discovery.clone(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            assert_incomplete_ignore_policy(
+                watcher.collect_snapshot().expect_err("reject incomplete scan"),
+                &policy,
+            );
+            let deleted = watcher.roots()[0].join(directory).join("deleted.md");
+            assert_incomplete_ignore_policy(
+                super::prepare_event_batch(
+                    &discovery,
+                    watcher.roots(),
+                    &[WatchEvent::deleted(deleted, 100)],
+                )
+                .err()
+                .expect("delete admission must validate every traversed directory"),
+                &policy,
+            );
         }
     }
 
