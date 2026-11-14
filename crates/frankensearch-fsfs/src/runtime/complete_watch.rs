@@ -297,13 +297,18 @@ impl SourceRoot {
         // The walker hides global-ignore errors; use the same fallible policy
         // admission as one-shot indexing and the legacy watcher.
         let mut ignore_rules = crate::watcher::IgnoreRules::new()?;
-        for entry in index_discovery_walker(&self.path, discovery, self.excluded.as_deref()).build()
-        {
+        for entry in index_discovery_walker(&self.path, discovery, self.excluded.as_deref())? {
             retained_search_checkpoint(cx)?;
-            let entry = entry.map_err(|source| SearchError::SubsystemError {
-                subsystem: "fsfs.complete_generation.watch.discovery",
-                source: Box::new(source),
-            })?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(super::IndexDiscoveryError::Policy(error)) => return Err(error),
+                Err(super::IndexDiscoveryError::Walk(source)) => {
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "fsfs.complete_generation.watch.discovery",
+                        source: Box::new(source),
+                    });
+                }
+            };
             if let Some(error) = entry.error() {
                 // A failed ignore-file read/parse is not permission to change
                 // membership under an incomplete discovery policy.

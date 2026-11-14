@@ -4378,7 +4378,7 @@ fn scan_interrupted_error() -> SearchError {
 /// the deepest `.ignore` match, then, inside a git or jj repository, the
 /// deepest `.gitignore` and `.git/info/exclude` at or below the repository
 /// root, then the global gitignore. An entry no rule matches is skipped when
-/// its name starts with a dot.
+/// its name starts with a dot or Windows marks it hidden.
 pub(crate) struct IgnoreRules {
     global: Result<Gitignore, ignore::Error>,
     directories: HashMap<PathBuf, DirectoryIgnoreFiles>,
@@ -4405,12 +4405,8 @@ impl DirectoryIgnoreFiles {
         };
         let git_exclude = match git_type.as_ref() {
             Ok(Some(file_type)) if file_type.is_file() => {
-                git_common_dir(directory).and_then(|common| {
-                    common.map_or_else(
-                        || Ok(Gitignore::empty()),
-                        |common| gitignore_at(directory, &common.join("info/exclude")),
-                    )
-                })
+                git_common_dir(directory)
+                    .and_then(|common| gitignore_at(directory, &common.join("info/exclude")))
             }
             Ok(Some(_)) => gitignore_at(directory, &directory.join(".git/info/exclude")),
             Ok(None) => Ok(Gitignore::empty()),
@@ -4464,30 +4460,71 @@ fn incomplete_ignore_rules(path: &Path, error: &impl std::fmt::Display) -> Searc
     }
 }
 
-/// The common directory of a linked worktree whose `.git` is a file.
-fn git_common_dir(directory: &Path) -> Result<Option<PathBuf>, ignore::Error> {
-    let first_line = |path: &Path| match fs::read_to_string(path) {
-        Ok(text) => Ok(text.lines().next().map(str::to_owned)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(ignore::Error::WithPath {
-            path: path.to_path_buf(),
-            err: Box::new(ignore::Error::Io(error)),
-        }),
+/// Resolve the shared Git metadata directory of a worktree or submodule.
+///
+/// Git resolves a relative `gitdir:` from the directory containing the
+/// `.git` file, and a relative `commondir` from that Git directory. A
+/// repository without `commondir` keeps its own `info/exclude`. Only CR/LF
+/// terminators are removed: spaces are legal path bytes.
+fn git_common_dir(directory: &Path) -> Result<PathBuf, ignore::Error> {
+    let with_path = |path: &Path, error: io::Error| ignore::Error::WithPath {
+        path: path.to_path_buf(),
+        err: Box::new(ignore::Error::Io(error)),
     };
-    let Some(git_file) = first_line(&directory.join(".git"))? else {
-        return Ok(None);
+    let check_directory = |path: &Path, pointer: &Path| {
+        let metadata = fs::metadata(path).map_err(|error| with_path(pointer, error))?;
+        if !metadata.is_dir() {
+            return Err(with_path(
+                pointer,
+                io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "Git metadata path is not a directory",
+                ),
+            ));
+        }
+        Ok(())
     };
-    let Some(git_dir) = git_file.strip_prefix("gitdir: ").map(PathBuf::from) else {
-        return Ok(None);
-    };
-    let Some(common) = first_line(&git_dir.join("commondir"))? else {
-        return Ok(None);
-    };
-    Ok(Some(if common.starts_with('.') {
-        git_dir.join(common)
-    } else {
-        PathBuf::from(common)
-    }))
+    let git_file_path = directory.join(".git");
+    let git_file =
+        fs::read_to_string(&git_file_path).map_err(|error| with_path(&git_file_path, error))?;
+    let git_path = git_file
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix("gitdir: ")
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            with_path(
+                &git_file_path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Git metadata file must contain gitdir: followed by a nonempty path",
+                ),
+            )
+        })?;
+    // Joining an absolute path preserves it; every other spelling is relative
+    // to this worktree, never the process's current working directory.
+    let git_dir = directory.join(git_path);
+    check_directory(&git_dir, &git_file_path)?;
+    let common_file = git_dir.join("commondir");
+    // Absence means this is a standalone Git directory. A present dangling
+    // symlink, or a file that disappears after this check, is unreadable
+    // metadata and must not silently disable the common exclude policy.
+    match fs::symlink_metadata(&common_file) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(git_dir),
+        Err(error) => return Err(with_path(&common_file, error)),
+    }
+    let common =
+        fs::read_to_string(&common_file).map_err(|error| with_path(&common_file, error))?;
+    let common = common.trim_end_matches(['\r', '\n']);
+    if common.is_empty() {
+        return Err(with_path(
+            &common_file,
+            io::Error::new(io::ErrorKind::InvalidData, "Git commondir path is empty"),
+        ));
+    }
+    let common_dir = git_dir.join(common);
+    check_directory(&common_dir, &common_file)?;
+    Ok(common_dir)
 }
 
 impl IgnoreRules {
@@ -4516,16 +4553,31 @@ impl IgnoreRules {
     }
 
     /// Whether a walk that reached `path` would skip it.
-    fn skips_entry(&mut self, path: &Path, is_dir: bool) -> SearchResult<bool> {
+    pub(crate) fn skips_entry(&mut self, path: &Path, is_dir: bool) -> SearchResult<bool> {
         let Some(parent) = path.parent() else {
             return Ok(false);
         };
         Ok(match self.matched(parent, path, is_dir)? {
             Match::Ignore(()) => true,
             Match::Whitelist(()) => false,
-            Match::None => path
-                .file_name()
-                .is_some_and(|name| name.as_encoded_bytes().starts_with(b".")),
+            Match::None => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+                    // Match the walker's Windows hidden-file behavior while
+                    // allowing an explicit ignore-file whitelist to win.
+                    let hidden = fs::metadata(path).is_ok_and(|metadata| {
+                        metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+                    });
+                    if hidden {
+                        return Ok(true);
+                    }
+                }
+                path.file_name()
+                    .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
+            }
         })
     }
 
@@ -6260,6 +6312,248 @@ mod tests {
             } else {
                 out.insert(path);
             }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gitfile_ignore_rules_keep_index_scan_and_events_in_sync() {
+        for (relative_gitdir, common_kind) in [
+            (true, "parent"),
+            (true, "child"),
+            (false, "absolute"),
+            (true, "none"),
+            (false, "none"),
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            let git_dir = temp.path().join("git metadata");
+            fs::create_dir_all(&root).expect("worktree");
+            fs::create_dir_all(&git_dir).expect("Git metadata");
+            // An outer Git rule stops at the gitfile boundary; .ignore keeps
+            // applying across it. No process-global Git configuration changes.
+            fs::create_dir(temp.path().join(".git")).expect("outer repository");
+            fs::write(temp.path().join(".gitignore"), "outer.md\n").unwrap();
+            fs::write(temp.path().join(".ignore"), "across.md\n").unwrap();
+            let git_path = if relative_gitdir {
+                "../git metadata".to_owned()
+            } else {
+                git_dir.display().to_string()
+            };
+            fs::write(root.join(".git"), format!("gitdir: {git_path}\r\n")).unwrap();
+            let common = match common_kind {
+                "parent" => {
+                    fs::write(git_dir.join("commondir"), "../shared metadata\r\n").unwrap();
+                    temp.path().join("shared metadata")
+                }
+                "child" => {
+                    // Neither a leading dot nor whitespace trimming decides
+                    // whether a Git path is relative.
+                    fs::write(git_dir.join("commondir"), " shared metadata\n").unwrap();
+                    git_dir.join(" shared metadata")
+                }
+                "absolute" => {
+                    let common = temp.path().join("shared metadata");
+                    fs::write(
+                        git_dir.join("commondir"),
+                        format!("{}\n", common.display()),
+                    )
+                    .unwrap();
+                    common
+                }
+                "none" => git_dir.clone(),
+                _ => unreachable!("fixture mode"),
+            };
+            fs::create_dir_all(common.join("info")).unwrap();
+            fs::write(
+                common.join("info/exclude"),
+                "private.md\nprivate-dir/\nkeep-local.md\nkeep-dot.md\n!.allowed.md\n",
+            )
+            .unwrap();
+            fs::write(root.join(".gitignore"), "!keep-local.md\n").unwrap();
+            fs::write(root.join(".ignore"), "!keep-dot.md\n").unwrap();
+            fs::create_dir(root.join("private-dir")).unwrap();
+            let sources = [
+                ".allowed.md",
+                "across.md",
+                "keep-dot.md",
+                "keep-local.md",
+                "outer.md",
+                "private-dir/notes.md",
+                "private.md",
+                "public.md",
+            ];
+            for source in sources {
+                fs::write(root.join(source), "source policy witness\n").unwrap();
+            }
+            assert_eq!(
+                fs::canonicalize(super::git_common_dir(&root).unwrap()).unwrap(),
+                fs::canonicalize(&common).unwrap(),
+            );
+            let expected = [
+                ".allowed.md",
+                "keep-dot.md",
+                "keep-local.md",
+                "outer.md",
+                "public.md",
+            ]
+            .into_iter()
+            .map(|path| root.join(path))
+            .collect::<BTreeSet<_>>();
+            let discovery = DiscoveryConfig::default();
+            let indexed = crate::runtime::index_discovery_walker(&root, &discovery, None)
+                .expect("initialize discovery")
+                .map(|entry| entry.expect("valid Git metadata"))
+                .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+                .map(ignore::DirEntry::into_path)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(indexed, expected, "{relative_gitdir}/{common_kind}");
+
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                discovery.clone(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            let (snapshot, completeness) = watcher.collect_snapshot().expect("watch discovery");
+            assert!(completeness.is_complete());
+            assert_eq!(snapshot.keys().cloned().collect::<BTreeSet<_>>(), expected);
+            let events = sources
+                .into_iter()
+                .map(|path| WatchEvent::modified(root.join(path), 100, Some(64)))
+                .collect::<Vec<_>>();
+            let prepared = super::prepare_event_batch(&discovery, &[root], &events)
+                .expect("watch event policy");
+            assert_eq!(prepared.skipped, sources.len() - expected.len());
+            let admitted = prepared
+                .ops
+                .iter()
+                .map(|op| match op {
+                    WatchIngestOp::Upsert { file_key, .. } => file_key.clone(),
+                    WatchIngestOp::Delete { .. } => panic!("only upserts were supplied"),
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                admitted,
+                expected.iter().map(|path| normalize_file_key(path)).collect(),
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gitfile_ignore_rules_refuse_incomplete_metadata() {
+        for invalid in [
+            "empty_gitfile",
+            "malformed_gitfile",
+            "empty_gitdir",
+            "missing_gitdir",
+            "file_gitdir",
+            "empty_commondir",
+            "blank_commondir",
+            "missing_common_target",
+            "file_common_target",
+            "unreadable_commondir",
+            #[cfg(unix)]
+            "dangling_commondir",
+            "malformed_exclude",
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            let git_dir = temp.path().join("metadata");
+            fs::create_dir_all(&root).unwrap();
+            fs::create_dir_all(git_dir.join("info")).unwrap();
+            fs::write(root.join("public.md"), "public witness").unwrap();
+            fs::write(
+                root.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+            let broken = match invalid {
+                "empty_gitfile" => {
+                    fs::write(root.join(".git"), "").unwrap();
+                    root.join(".git")
+                }
+                "malformed_gitfile" => {
+                    fs::write(root.join(".git"), "not a gitdir declaration\n").unwrap();
+                    root.join(".git")
+                }
+                "empty_gitdir" => {
+                    fs::write(root.join(".git"), "gitdir: \r\n").unwrap();
+                    root.join(".git")
+                }
+                "missing_gitdir" => {
+                    fs::write(root.join(".git"), "gitdir: ../missing-metadata\n").unwrap();
+                    root.join(".git")
+                }
+                "file_gitdir" => {
+                    let target = temp.path().join("metadata-file");
+                    fs::write(&target, "not a directory").unwrap();
+                    fs::write(root.join(".git"), format!("gitdir: {}\n", target.display()))
+                        .unwrap();
+                    root.join(".git")
+                }
+                "empty_commondir" => {
+                    fs::write(git_dir.join("commondir"), "").unwrap();
+                    git_dir.join("commondir")
+                }
+                "blank_commondir" => {
+                    fs::write(git_dir.join("commondir"), "\r\n").unwrap();
+                    git_dir.join("commondir")
+                }
+                "missing_common_target" => {
+                    fs::write(git_dir.join("commondir"), "missing-common\n").unwrap();
+                    git_dir.join("commondir")
+                }
+                "file_common_target" => {
+                    fs::write(git_dir.join("common-file"), "not a directory").unwrap();
+                    fs::write(git_dir.join("commondir"), "common-file\n").unwrap();
+                    git_dir.join("commondir")
+                }
+                "unreadable_commondir" => {
+                    // Unlike mode bits this fails even when tests run as root.
+                    fs::create_dir(git_dir.join("commondir")).unwrap();
+                    git_dir.join("commondir")
+                }
+                #[cfg(unix)]
+                "dangling_commondir" => {
+                    std::os::unix::fs::symlink("missing-target", git_dir.join("commondir"))
+                        .unwrap();
+                    git_dir.join("commondir")
+                }
+                "malformed_exclude" => {
+                    fs::write(git_dir.join("info/exclude"), "private[9-0].md\n").unwrap();
+                    git_dir.join("info/exclude")
+                }
+                _ => unreachable!("fixture mode"),
+            };
+            let discovery = DiscoveryConfig::default();
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                discovery.clone(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+            assert_incomplete_ignore_policy(
+                watcher.collect_snapshot().expect_err("incomplete Git policy"),
+                &broken,
+            );
+            assert_incomplete_ignore_policy(
+                super::prepare_event_batch(
+                    &discovery,
+                    std::slice::from_ref(&root),
+                    &[WatchEvent::modified(root.join("public.md"), 100, Some(64))],
+                )
+                .err()
+                .expect("events must reject incomplete Git policy"),
+                &broken,
+            );
+            let error = crate::runtime::index_discovery_walker(&root, &discovery, None)
+                .expect("initialize discovery")
+                .collect::<Result<Vec<_>, _>>()
+                .expect_err("index discovery must reject incomplete Git policy");
+            let crate::runtime::IndexDiscoveryError::Policy(error) = error else {
+                panic!("expected shared policy failure, got {error:?}");
+            };
+            assert_incomplete_ignore_policy(error, &broken);
         }
     }
 

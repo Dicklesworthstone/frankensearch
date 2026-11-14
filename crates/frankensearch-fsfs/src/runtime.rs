@@ -27067,7 +27067,7 @@ impl FsfsRuntime {
                     .as_deref()
                     .unwrap_or(index_root),
             ),
-        );
+        )?;
         // The ignore walker suppresses global-ignore read/parse errors. Share
         // the watcher's fallible policy admission so a partial global matcher
         // cannot silently expand either first-scan or replacement membership.
@@ -27076,11 +27076,12 @@ impl FsfsRuntime {
         #[cfg(unix)]
         let walk_started = SystemTime::now();
 
-        for entry in walker.build() {
+        for entry in walker {
             control.checkpoint(cx, "index.discovery", false)?;
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(error) => {
+                Err(IndexDiscoveryError::Policy(error)) => return Err(error),
+                Err(IndexDiscoveryError::Walk(error)) => {
                     if let Some(io_error) = error.io_error() {
                         if source_policy.can_skip(io_error) {
                             continue;
@@ -34142,22 +34143,35 @@ fn is_ignorable_index_walk_error(error: &std::io::Error) -> bool {
     )
 }
 
-/// The walker `fsfs index` discovers sources with: `.gitignore` inside a
-/// repository, global and repository excludes, `.ignore` files and hidden
-/// entries are skipped (`standard_filters` re-enables `hidden`). Anything that
-/// decides whether the sources changed must look at this same tree.
-fn index_discovery_walker(
+/// A policy failure must not be reduced to an ignored walker entry: callers
+/// must refuse to publish a snapshot built with incomplete ignore rules.
+#[derive(Debug)]
+pub(crate) enum IndexDiscoveryError {
+    Walk(ignore::Error),
+    Policy(SearchError),
+}
+
+/// The walker `fsfs index` and complete-generation observation share.
+///
+/// Keep the walker's high-priority `.ignore` and `.gitignore` pruning. The
+/// shared fallible matcher owns repository excludes, global rules and hidden
+/// entries so relative Git metadata paths work and exclude-file whitelists can
+/// override those lower-priority rules. Filtering everything twice after the
+/// walk would be too late to recover an entry the walker already hid.
+pub(crate) fn index_discovery_walker(
     target_root: &Path,
     discovery: &crate::config::DiscoveryConfig,
     excluded_root: Option<&Path>,
-) -> WalkBuilder {
+) -> SearchResult<impl Iterator<Item = Result<ignore::DirEntry, IndexDiscoveryError>>> {
+    let rules = Mutex::new(crate::watcher::IgnoreRules::new()?);
+    let policy_failure = Arc::new(Mutex::new(None));
+    let filter_failure = Arc::clone(&policy_failure);
     let mut walker = WalkBuilder::new(target_root);
     walker.follow_links(discovery.follow_symlinks);
-    walker.git_ignore(true);
-    walker.git_global(true);
-    walker.git_exclude(true);
-    walker.hidden(false);
     walker.standard_filters(true);
+    walker.git_global(false);
+    walker.git_exclude(false);
+    walker.hidden(false);
     let discovery = discovery.clone();
     let excluded_root = excluded_root.map(Path::to_path_buf);
     let mounts = MountTable::new(read_system_mounts(), &discovery.mount_override_map());
@@ -34168,17 +34182,53 @@ fn index_discovery_walker(
         {
             return false;
         }
-        if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+        if is_dir {
+            // File-only rules such as binary extensions must not prune a
+            // directory named archive.zip. Do not load policy inside an
+            // explicitly excluded directory.
+            let category = mounts.lookup(entry.path()).map(|(mount, _)| mount.category);
+            if !discovery.evaluate_root(entry.path(), category).include() {
+                return false;
+            }
+        }
+        // An explicitly selected hidden root is still a root. Its applicable
+        // policy is validated by the consumer before accepting descendants.
+        if entry.depth() == 0 {
             return true;
         }
-        // Prune directory exclusions before opening their contents or ignore
-        // files. Each visited parent was already admitted, so the directory's
-        // own name plus full-path patterns suffice here. File-only rules such
-        // as binary extensions must not prune a directory named `archive.zip`.
-        let category = mounts.lookup(entry.path()).map(|(mount, _)| mount.category);
-        discovery.evaluate_root(entry.path(), category).include()
+        let mut rules = rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match rules.skips_entry(entry.path(), is_dir) {
+            Ok(skip) => !skip,
+            Err(error) => {
+                *filter_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                // Let the iterator observe this entry, then return the policy
+                // error instead of the entry. A filter callback cannot fail.
+                true
+            }
+        }
     });
-    walker
+    let mut walker = walker.build();
+    let mut failed = false;
+    Ok(std::iter::from_fn(move || {
+        if failed {
+            return None;
+        }
+        let entry = walker.next();
+        if let Some(error) = policy_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            failed = true;
+            return Some(Err(IndexDiscoveryError::Policy(error)));
+        }
+        entry.map(|entry| entry.map_err(IndexDiscoveryError::Walk))
+    }))
 }
 
 const fn map_degradation_override(
@@ -34610,7 +34660,7 @@ mod tests {
         discovery.exclude_patterns.push("custom-cache".to_owned());
         let files =
             super::index_discovery_walker(&root, &discovery, Some(&root.join("index-store")))
-                .build()
+                .expect("initialize discovery policy")
                 .map(|entry| {
                     let entry = entry.expect("excluded subtrees cannot fail the walk");
                     assert!(entry.error().is_none());
@@ -34629,7 +34679,7 @@ mod tests {
         fs::write(root.join(".ignore"), "private[9-0].md\n").unwrap();
         assert!(
             super::index_discovery_walker(&root, &discovery, Some(&root.join("index-store")))
-                .build()
+                .expect("initialize discovery policy")
                 .any(|entry| entry.is_err() || entry.is_ok_and(|entry| entry.error().is_some())),
             "a relevant malformed ignore policy must remain visible to strict discovery"
         );
