@@ -128,6 +128,227 @@ fn command_help_and_usage_errors_do_not_create_a_store() {
 }
 
 #[test]
+fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
+    use frankensearch_fsfs::config::DegradationOverrideMode;
+    use frankensearch_fsfs::{FsCategory, FsfsConfig, MountTable, read_system_mounts};
+
+    run_test_with_cx(|cx| async move {
+        // Production source discovery intentionally refuses virtual mounts.
+        // Choose an admitted fixture mount without changing that policy.
+        let mounts = MountTable::new(read_system_mounts(), &std::collections::HashMap::new());
+        let mut parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        if mounts
+            .lookup(&parent)
+            .is_some_and(|(entry, _)| entry.category.is_virtual())
+        {
+            parent = fs::canonicalize("/dev/shm").unwrap();
+            assert!(mounts.lookup(&parent).is_some_and(|(entry, policy)| {
+                entry.category == FsCategory::Memory && policy.enabled && policy.available
+            }));
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("fsfs-repair-")
+            .tempdir_in(parent)
+            .unwrap();
+        let root = directory.path().join("store");
+        let source = directory.path().join("source");
+        let config_path = directory.path().join("repair.toml");
+        let preparation = directory.path().join("prepared.json");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("alpha.md"),
+            "repairquerytoken alpha durable document",
+        )
+        .unwrap();
+        fs::write(
+            source.join("beta.md"),
+            "repairquerytoken beta searchable document",
+        )
+        .unwrap();
+        let mut config = FsfsConfig::default();
+        config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+        config.indexing.offline = true;
+        config.indexing.watch_mode = false;
+        config.indexing.quality_model.clear();
+        config.search.fast_only = true;
+        config.search.rerank = false;
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+        fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+        let configure = |command: &mut Command| {
+            for (key, _) in std::env::vars_os() {
+                let name = key.to_string_lossy();
+                if name.starts_with("FSFS_") || name.starts_with("FRANKENSEARCH_") {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .current_dir(directory.path())
+                .arg("--index-dir")
+                .arg(&root)
+                .arg("--config")
+                .arg(&config_path)
+                .env("HOME", directory.path())
+                .env("XDG_CONFIG_HOME", directory.path().join("empty-config"))
+                .env(
+                    "FRANKENSEARCH_MODEL_DIR",
+                    directory.path().join("missing-models"),
+                )
+                .env("FRANKENSEARCH_CHECK_UPDATES", "0")
+                .env("FSFS_GENERATION_RETENTION", "off");
+        };
+        let mut index = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+        index.arg("index").arg(&source);
+        configure(&mut index);
+        index
+            .args(["--no-watch-mode", "--format", "json", "--quiet"])
+            .env("FSFS_COMPLETE_GENERATIONS", "1");
+        let indexed = run(&mut index, directory.path(), Duration::from_secs(120));
+        assert!(
+            indexed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+        assert_eq!(body(&indexed)["data"]["indexed_files"], 2);
+        let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+        let original = store.active(&cx).unwrap().unwrap();
+        let healthy = files(original.path());
+        let segment = healthy
+            .keys()
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "fslx")
+            })
+            .unwrap()
+            .clone();
+        let manifest = healthy
+            .keys()
+            .find(|path| path.file_name().is_some_and(|name| name == "MANIFEST"))
+            .unwrap()
+            .clone();
+        assert!(
+            original
+                .path()
+                .join(format!("{}.fec", segment.display()))
+                .is_file()
+        );
+        assert!(
+            original
+                .path()
+                .join(manifest.with_file_name("MANIFEST.fec"))
+                .is_file()
+        );
+        let mut damaged_manifest = healthy[&manifest].clone();
+        damaged_manifest[10] ^= 0x5a;
+        fs::write(original.path().join(&manifest), damaged_manifest).unwrap();
+        fs::rename(
+            original.path().join(&segment),
+            directory.path().join("saved-segment"),
+        )
+        .unwrap();
+        fs::rename(&source, directory.path().join("source-unavailable")).unwrap();
+        let damaged = files(original.path());
+        let selection = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+        let mut search = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+        search.args(["search", "repairquerytoken"]);
+        configure(&mut search);
+        search.args(["--no-daemon", "--format", "json", "--quiet"]);
+        let failed = run(&mut search, directory.path(), Duration::from_secs(30));
+        assert!(!failed.status.success());
+        assert_eq!(body(&failed)["ok"], false);
+        let mut prepare = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+        configure(&mut prepare);
+        prepare
+            .args([
+                "--generation",
+                original.id(),
+                "--manifest-sha256",
+                original.manifest_sha256(),
+                "--prepare",
+                "--repair-artifacts",
+                "--query",
+                "repairquerytoken",
+                "--search-mode",
+                "lexical",
+            ])
+            .arg("--save-preparation")
+            .arg(&preparation);
+        let output = run(&mut prepare, directory.path(), Duration::from_secs(120));
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let prepared = body(&output)["data"].clone();
+        assert_eq!(prepared["state"], "prepared");
+        assert_eq!(prepared["selection_write_performed"], false);
+        assert_eq!(prepared["source_rebuild_performed"], false);
+        assert_eq!(prepared["repaired_from"]["generation_id"], original.id());
+        assert_eq!(
+            prepared["repaired_from"]["manifest_sha256"],
+            original.manifest_sha256()
+        );
+        assert_eq!(prepared["preview"][0]["hits"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+            selection
+        );
+        assert_eq!(files(original.path()), damaged);
+        let target = root
+            .join("generations")
+            .join(prepared["generation_id"].as_str().unwrap());
+        for (path, bytes) in &healthy {
+            if path != Path::new(frankensearch_fsfs::generation_store::COMPLETE_GENERATION_MANIFEST)
+            {
+                assert_eq!(fs::read(target.join(path)).unwrap(), *bytes, "{path:?}");
+            }
+        }
+        let sealed = files(&target);
+        let mut apply = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+        configure(&mut apply);
+        apply.arg("--resume-file").arg(&preparation).args([
+            "--apply",
+            "--query",
+            "repairquerytoken",
+            "--search-mode",
+            "lexical",
+        ]);
+        let output = run(&mut apply, directory.path(), Duration::from_secs(120));
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let applied = body(&output)["data"].clone();
+        assert_eq!(applied["state"], "restored_durable");
+        assert_eq!(applied["generation_id"], prepared["generation_id"]);
+        assert_eq!(applied["repaired_from"], prepared["repaired_from"]);
+        assert_eq!(applied["preview"][0]["hits"].as_array().unwrap().len(), 2);
+        let output = run(&mut search, directory.path(), Duration::from_secs(120));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = body(&output);
+        let mut hits = result["data"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        hits.sort_unstable();
+        assert_eq!(hits, ["alpha.md", "beta.md"]);
+        assert_eq!(files(original.path()), damaged);
+        assert_eq!(files(&target), sealed);
+        assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 2);
+        assert!(!source.exists());
+        assert!(!directory.path().join("missing-models").exists());
+    });
+}
+
+#[test]
 fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() {
     use frankensearch_fsfs::FsfsConfig;
     use frankensearch_fsfs::config::DegradationOverrideMode;

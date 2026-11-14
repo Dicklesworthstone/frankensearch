@@ -1,9 +1,10 @@
-//! Reconstruct damaged vector artifacts into an independent, unselected bundle.
+//! Reconstruct receipted index artifacts into an independent, unselected bundle.
 //!
 //! The trusted old manifest, not a sidecar's checksum, defines the required
-//! bytes. Only the two fsfs vector roles can be repaired. Every other artifact,
-//! including the selected FEC sidecars, must remain intact. No original file
-//! is opened for writing, no source document is reread and no model is invoked.
+//! bytes. Explicit scope selects the two fsfs vector roles alone or additionally
+//! the selected Quill engine's manifests and segments. Every other artifact,
+//! including selection pointers and FEC sidecars, must remain intact. No original
+//! file is opened for writing, no source document is reread and no model is invoked.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -18,6 +19,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FileProtector, FileRecoveryOutcome,
 };
+use frankensearch_quill::{BlueGreenEngine, CurrentPointer};
 use frankensearch_storage::ContentHasher;
 use sha2::{Digest, Sha256};
 
@@ -35,6 +37,13 @@ use super::{
 const VECTOR_PATHS: [&str; 2] = ["vector/index.fsvi", "vector/quality.fsvi"];
 const MAX_REPAIR_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REPAIR_SIDECAR_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LEXICAL_POINTER_BYTES: u64 = 65_535 + 64;
+
+#[derive(Clone, Copy)]
+enum RepairScope {
+    Vectors,
+    IndexArtifacts,
+}
 
 type FileInventory = BTreeMap<String, (u64, String)>;
 
@@ -78,7 +87,60 @@ impl CompleteGenerationStore {
         manifest_sha256: &str,
         max_copy_bytes: u64,
     ) -> SearchResult<PreparedGenerationRestore> {
+        self.prepare_repair(
+            cx,
+            id,
+            manifest_sha256,
+            max_copy_bytes,
+            RepairScope::Vectors,
+        )
+    }
+
+    /// Reconstruct vectors and selected Quill artifacts in a new unselected bundle.
+    ///
+    /// Extends [`Self::prepare_vector_repair`] to the selected Quill engine's
+    /// `MANIFEST`, `MANIFEST.prev` and canonical `seg-<16 hex digits>.fslx` files.
+    /// The original complete-generation receipt must authenticate both each
+    /// damaged artifact and its intact `.fec` sidecar. A blue-green lexical
+    /// selection must remain intact and name Quill; it is never guessed from
+    /// directory names. Direct `lexical/MANIFEST` layouts are also supported.
+    /// Catalogs, selection pointers, metadata, sidecars, and unrelated files
+    /// cannot be reconstructed by this operation.
+    ///
+    /// The original SHA-256 and length still decide success for every copied
+    /// file. The same payload limits, exclusive new inodes, cancellation and
+    /// expected-old publication guard as vector-only repair apply. Consumer
+    /// engine/model admission is required before selecting the returned target.
+    ///
+    /// # Errors
+    /// Returns unsupported damage/layout, inadmissible security profile, invalid
+    /// receipts/limits, insufficient repair symbols, contention, I/O or cancellation.
+    pub fn prepare_artifact_repair(
+        &self,
+        cx: &Cx,
+        id: &str,
+        manifest_sha256: &str,
+        max_copy_bytes: u64,
+    ) -> SearchResult<PreparedGenerationRestore> {
+        self.prepare_repair(
+            cx,
+            id,
+            manifest_sha256,
+            max_copy_bytes,
+            RepairScope::IndexArtifacts,
+        )
+    }
+
+    fn prepare_repair(
+        &self,
+        cx: &Cx,
+        id: &str,
+        manifest_sha256: &str,
+        max_copy_bytes: u64,
+        scope: RepairScope,
+    ) -> SearchResult<PreparedGenerationRestore> {
         checkpoint(cx)?;
+        self.require_mutation_authorized()?;
         if max_copy_bytes == 0 || id.len() != 60 || !hex(manifest_sha256, 64) {
             return Err(invalid(
                 &self.root,
@@ -88,7 +150,7 @@ impl CompleteGenerationStore {
         let pointer = format!("{POINTER_MAGIC}\n{id}\n{manifest_sha256}\n");
         decode_pointer(pointer.as_bytes(), &self.root)?;
         let lease = PublicationLease::acquire(&self.root)?;
-        lease.fence("complete-generation vector repair entry")?;
+        lease.fence("complete-generation artifact repair entry")?;
         let expected_selection = selection_evidence(&self.root)?;
         let parent = self.root.join(GENERATIONS);
         require_directory(&parent)?;
@@ -111,14 +173,14 @@ impl CompleteGenerationStore {
         // Repair cannot use the normal same-process digest memo: media damage
         // may be precisely why the caller asked to read the bytes again.
         let observed = fresh_inventory(cx, &source, max_copy_bytes, true)?;
-        let damaged = damaged_vectors(&source, &manifest, &observed)?;
+        let damaged = damaged_artifacts(&source, &manifest, &observed, scope)?;
         ensure_selection(&self.root, expected_selection.as_deref())?;
         checkpoint(cx)?;
-        lease.fence("complete-generation vector repair copy")?;
+        lease.fence("complete-generation artifact repair copy")?;
         let (candidate, candidate_id) = new_directory(cx, &parent)?;
 
         // Copy EVERY extant input by its freshly observed checksum, including
-        // damaged vectors. The codec sees only exclusively-created local files,
+        // damaged artifacts. The codec sees only exclusively-created local files,
         // never a source pathname that could change while decoding is pending.
         for artifact in &manifest.files {
             checkpoint(cx)?;
@@ -144,11 +206,11 @@ impl CompleteGenerationStore {
             .filter(|file| damaged.contains(&file.path))
         {
             checkpoint(cx)?;
-            lease.fence("complete-generation vector repair decode")?;
-            recover_vector(cx, &candidate, artifact, &protector)?;
+            lease.fence("complete-generation artifact repair decode")?;
+            recover_artifact(cx, &candidate, artifact, &protector)?;
         }
         // A successful RaptorQ decode or CRC is not enough. All files must have
-        // exactly the previously published content, including non-vector arms.
+        // exactly the previously published content, including unrepaired arms.
         if fresh_inventory(cx, &candidate, max_copy_bytes, false)? != expected_files(&manifest) {
             return Err(invalid(
                 &candidate,
@@ -170,7 +232,7 @@ impl CompleteGenerationStore {
         let target = self.open_retained(cx, &candidate_id, &digest(&encoded))?;
         ensure_selection(&self.root, expected_selection.as_deref())?;
         checkpoint(cx)?;
-        lease.fence("complete-generation vector repair prepared")?;
+        lease.fence("complete-generation artifact repair prepared")?;
         drop(source_pin);
         drop(lease);
         Ok(PreparedGenerationRestore {
@@ -245,30 +307,39 @@ fn validate_manifest(
     Ok(())
 }
 
-fn damaged_vectors(
+fn damaged_artifacts(
     root: &Path,
     manifest: &BundleManifest,
     observed: &FileInventory,
+    scope: RepairScope,
 ) -> SearchResult<BTreeSet<String>> {
     let expected = expected_files(manifest);
     if observed.keys().any(|path| !expected.contains_key(path)) {
         return Err(invalid(root, "unreceipted files in the damaged bundle"));
     }
+    let lexical_directory = match scope {
+        RepairScope::Vectors => None,
+        RepairScope::IndexArtifacts => lexical_repair_directory(root, &expected, observed)?,
+    };
     let mut damaged = BTreeSet::new();
     for file in &manifest.files {
         if observed.get(&file.path) == expected.get(&file.path) {
             continue;
         }
-        if !VECTOR_PATHS.contains(&file.path.as_str()) {
+        if !VECTOR_PATHS.contains(&file.path.as_str())
+            && !lexical_directory
+                .as_deref()
+                .is_some_and(|directory| is_quill_repair_artifact(&file.path, directory))
+        {
             return Err(invalid(
                 root,
-                "repair requires intact catalog, lexical, metadata and sidecar files",
+                "repair damage is outside the selected scope; catalog, selection, metadata and sidecar files must remain intact",
             ));
         }
         let sidecar = format!("{}.fec", file.path);
         let protected = expected
             .get(&sidecar)
-            .ok_or_else(|| invalid(root, "damaged vector has no receipted repair sidecar"))?;
+            .ok_or_else(|| invalid(root, "damaged artifact has no receipted repair sidecar"))?;
         if observed.get(&sidecar) != Some(protected)
             || file.bytes > MAX_REPAIR_SOURCE_BYTES
             || observed
@@ -278,7 +349,7 @@ fn damaged_vectors(
         {
             return Err(invalid(
                 root,
-                "repair sidecar changed or vector recovery exceeds its payload bound",
+                "repair sidecar changed or artifact recovery exceeds its payload bound",
             ));
         }
         damaged.insert(file.path.clone());
@@ -286,10 +357,66 @@ fn damaged_vectors(
     if damaged.is_empty() {
         return Err(invalid(
             root,
-            "no vector damage; use ordinary receipt-directed restore without a copy",
+            "no repairable damage; use ordinary receipt-directed restore without a copy",
         ));
     }
     Ok(damaged)
+}
+
+/// Resolve only the original receipted lexical selection. Decoding damaged
+/// MANIFEST bytes or scanning siblings must never broaden repair permission.
+fn lexical_repair_directory(
+    root: &Path,
+    expected: &FileInventory,
+    observed: &FileInventory,
+) -> SearchResult<Option<String>> {
+    let selected = if expected.contains_key("CURRENT") {
+        Some(("CURRENT", ""))
+    } else if expected.contains_key("lexical/CURRENT") {
+        Some(("lexical/CURRENT", "lexical/"))
+    } else {
+        None
+    };
+    if let Some((relative, prefix)) = selected {
+        let receipt = expected
+            .get(relative)
+            .ok_or_else(|| invalid(root, "lexical selection receipt is absent"))?;
+        if observed.get(relative) != Some(receipt) {
+            return Err(invalid(
+                root,
+                "lexical selection must remain intact during repair",
+            ));
+        }
+        let bytes = read_bounded_regular(&root.join(relative), MAX_LEXICAL_POINTER_BYTES)?;
+        if bytes.len() as u64 != receipt.0 || digest(&bytes) != receipt.1 {
+            return Err(invalid(
+                root,
+                "lexical selection changed during repair admission",
+            ));
+        }
+        let pointer = CurrentPointer::decode(&bytes)
+            .map_err(|_| invalid(root, "receipted lexical selection is invalid"))?;
+        return Ok((pointer.engine() == BlueGreenEngine::Quill)
+            .then(|| format!("{prefix}{}", pointer.dir_name())));
+    }
+    Ok(expected
+        .contains_key("lexical/MANIFEST")
+        .then(|| "lexical".to_owned()))
+}
+
+fn is_quill_repair_artifact(path: &str, directory: &str) -> bool {
+    let Some(name) = path
+        .strip_prefix(directory)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    if matches!(name, "MANIFEST" | "MANIFEST.prev") {
+        return true;
+    }
+    name.strip_prefix("seg-")
+        .and_then(|name| name.strip_suffix(".fslx"))
+        .is_some_and(|id| hex(id, 16))
 }
 
 /// Bound the entire filesystem inventory before hashing payloads or allocating
@@ -428,7 +555,7 @@ fn new_directory(cx: &Cx, parent: &Path) -> SearchResult<(PathBuf, String)> {
     ))
 }
 
-fn recover_vector(
+fn recover_artifact(
     cx: &Cx,
     root: &Path,
     artifact: &Artifact,
@@ -442,7 +569,7 @@ fn recover_vector(
         if header.source_len != artifact.bytes {
             return Err(invalid(
                 &sidecar,
-                "repair sidecar does not describe the receipted vector length",
+                "repair sidecar does not describe the receipted artifact length",
             ));
         }
     }
@@ -461,7 +588,7 @@ fn recover_vector(
         FileRecoveryOutcome::Unrecoverable { reason, .. } => {
             return Err(SearchError::IndexCorrupted {
                 path,
-                detail: format!("receipted vector could not be reconstructed: {reason:?}"),
+                detail: format!("receipted artifact could not be reconstructed: {reason:?}"),
             });
         }
     };

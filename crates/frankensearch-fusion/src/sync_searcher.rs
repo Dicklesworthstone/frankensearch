@@ -4,7 +4,6 @@
 //! [`crate::searcher::TwoTierSearcher`] but operates on precomputed query
 //! embeddings and fully in-memory indices.
 
-use std::collections::VecDeque;
 use std::path::Path;
 
 // The per-query `&str`-keyed score maps + `seen` dedup set are `.get()`/`.insert()`
@@ -575,10 +574,15 @@ impl SyncTwoTierSearcher {
         k: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
-        // `search_collect` discards `outcome.phases`, so skip building them — that
+        // `search_collect` discards phase payloads, so skip building them — that
         // avoids cloning the full `Vec<ScoredResult>` (N owned doc_ids each) once
         // per phase (Initial + Refined), pure waste at large `k` (limit_all).
-        let outcome = self.search_internal(query, k, filter, false)?;
+        let prepared = self.search_initial(query, k, filter, false)?;
+        let outcome = if let Some(refinement) = prepared.refinement {
+            self.search_refined(prepared.initial, refinement, filter, false)
+        } else {
+            prepared.initial
+        };
         Ok((outcome.final_results, outcome.metrics))
     }
 
@@ -588,30 +592,38 @@ impl SyncTwoTierSearcher {
     /// a different embedding space than the index was built in, or a dimension
     /// mismatch), this returns an iterator yielding a single
     /// `RefinementFailed` phase carrying an empty `initial_results` payload.
+    /// No retrieval runs until the first `next()`. That call admits both query
+    /// identities and returns Initial; quality retrieval runs only when the
+    /// caller requests the next phase. Dropping the iterator discards pending
+    /// refinement without starting it. Each call uses the caller's thread.
     #[must_use]
-    pub fn search_iter(&self, query: &TieredQueryEmbeddings, k: usize) -> SyncSearchIterator {
+    pub const fn search_iter<'a>(
+        &'a self,
+        query: &'a TieredQueryEmbeddings,
+        k: usize,
+    ) -> SyncSearchIterator<'a> {
         self.search_iter_with_filter(query, k, None)
     }
 
     /// Execute a synchronous filtered search and stream progressive phases.
     #[must_use]
-    pub fn search_iter_with_filter(
-        &self,
-        query: &TieredQueryEmbeddings,
+    pub const fn search_iter_with_filter<'a>(
+        &'a self,
+        query: &'a TieredQueryEmbeddings,
         k: usize,
-        filter: Option<&dyn SearchFilter>,
-    ) -> SyncSearchIterator {
-        // The iterator streams the progressive phases, so build them.
-        match self.search_internal(query, k, filter, true) {
-            Ok(outcome) => SyncSearchIterator::new(outcome.phases),
-            Err(error) => SyncSearchIterator::from_error(error),
+        filter: Option<&'a dyn SearchFilter>,
+    ) -> SyncSearchIterator<'a> {
+        SyncSearchIterator {
+            searcher: self,
+            filter,
+            state: SyncIteratorState::Initial { query, k },
         }
     }
 
     /// Join every tier this search will consult against the query bound to it,
     /// before any vector is read.
     ///
-    /// This runs first in [`Self::search_internal`], ahead of the `k == 0`
+    /// This runs first in [`Self::search_initial`], ahead of the `k == 0`
     /// return and the zero-norm fast-lane check, so a query in the wrong space
     /// is refused even when its vector would never be searched.
     /// A refusal that depended on the search getting far enough to do work
@@ -645,34 +657,29 @@ impl SyncTwoTierSearcher {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn search_internal(
+    fn search_initial<'query>(
         &self,
-        query: &TieredQueryEmbeddings,
+        query: &'query TieredQueryEmbeddings,
         k: usize,
         filter: Option<&dyn SearchFilter>,
-        want_phases: bool,
-    ) -> SearchResult<SyncSearchOutcome> {
+        want_phase: bool,
+    ) -> SearchResult<SyncPreparedSearch<'query>> {
         // Identity first, before k == 0, before the zero-norm check, and
         // before any index is touched.
         let admitted = self.admit(query)?;
         let query_vec = admitted.fast.vector();
         let mut metrics = TwoTierMetrics::default();
-        // Only the streaming iterator path consumes `phases`; `search_collect`
-        // discards them. When they are not wanted, skip the allocation and the
-        // per-phase `Vec<ScoredResult>` clones entirely (see the guarded pushes).
-        let mut phases = if want_phases {
-            Vec::with_capacity(2)
-        } else {
-            Vec::new()
-        };
         // Match the async progressive contract: zero requested results is a
         // successful no-op, not a request to scan the corpus and discard the
         // candidate pool afterwards (bd-k3089).
         if k == 0 {
-            return Ok(SyncSearchOutcome {
-                phases,
-                final_results: Vec::new(),
-                metrics,
+            return Ok(SyncPreparedSearch {
+                initial: SyncSearchOutcome {
+                    phase: None,
+                    final_results: Vec::new(),
+                    metrics,
+                },
+                refinement: None,
             });
         }
         let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
@@ -771,20 +778,23 @@ impl SyncTwoTierSearcher {
         metrics.phase1_total_ms = ms(phase1_latency);
         metrics.fast_embed_ms = 0.0;
 
-        if want_phases {
-            phases.push(SearchPhase::Initial {
-                results: initial_results.clone(),
-                latency: phase1_latency,
-                metrics: PhaseMetrics {
-                    embedder_id: "sync-fast-query".to_owned(),
-                    vectors_searched: phase1_vectors_searched,
-                    lexical_candidates: metrics.lexical_candidates,
-                    fused_count: initial_results.len(),
-                    skip_reason: metrics.skip_reason.clone(),
-                    hash_control_candidates: metrics.hash_control_candidates,
-                },
-            });
-        }
+        let phase = want_phase.then(|| SearchPhase::Initial {
+            results: initial_results.clone(),
+            latency: phase1_latency,
+            metrics: PhaseMetrics {
+                embedder_id: "sync-fast-query".to_owned(),
+                vectors_searched: phase1_vectors_searched,
+                lexical_candidates: metrics.lexical_candidates,
+                fused_count: initial_results.len(),
+                skip_reason: metrics.skip_reason.clone(),
+                hash_control_candidates: metrics.hash_control_candidates,
+            },
+        });
+        let mut initial = SyncSearchOutcome {
+            phase,
+            final_results: initial_results,
+            metrics,
+        };
 
         // The quality arm needs four things: it must not be switched off, the
         // index must have a quality tier, the caller must have bound a
@@ -798,8 +808,8 @@ impl SyncTwoTierSearcher {
             // Same vocabulary as the async searcher (searcher.rs) — the two
             // sides share one skip_reason contract; "fast_only" is the string
             // the fsfs surfaces document (bd-k3089 parity suite pins this).
-            if metrics.skip_reason.is_none() {
-                metrics.skip_reason = Some(if self.config.fast_only {
+            if initial.metrics.skip_reason.is_none() {
+                initial.metrics.skip_reason = Some(if self.config.fast_only {
                     "fast_only".to_owned()
                 } else if self.index.has_quality_index() {
                     "quality_query_embedding_absent".to_owned()
@@ -807,23 +817,58 @@ impl SyncTwoTierSearcher {
                     "quality_index_unavailable".to_owned()
                 });
             }
-            return Ok(SyncSearchOutcome {
-                phases,
-                final_results: initial_results,
-                metrics,
+            return Ok(SyncPreparedSearch {
+                initial,
+                refinement: None,
             });
         };
         if quality_query.vector().iter().all(|&value| value == 0.0) {
             // A zero query has no quality evidence. Scanning or rescoring it
             // would turn arbitrary zero-score ties into semantic results and
             // could displace the useful fast or lexical answer already found.
-            metrics.skip_reason = Some("quality_query_zero_norm".to_owned());
-            return Ok(SyncSearchOutcome {
-                phases,
-                final_results: initial_results,
-                metrics,
+            initial.metrics.skip_reason = Some("quality_query_zero_norm".to_owned());
+            return Ok(SyncPreparedSearch {
+                initial,
+                refinement: None,
             });
         }
+        Ok(SyncPreparedSearch {
+            initial,
+            refinement: Some(SyncRefinement {
+                quality_query,
+                fast_hits,
+                lexical_hits,
+                query_semantic_weight,
+                fetch,
+                k,
+            }),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn search_refined(
+        &self,
+        initial: SyncSearchOutcome,
+        refinement: SyncRefinement<'_>,
+        filter: Option<&dyn SearchFilter>,
+        want_phase: bool,
+    ) -> SyncSearchOutcome {
+        let SyncSearchOutcome {
+            final_results: initial_results,
+            mut metrics,
+            ..
+        } = initial;
+        let SyncRefinement {
+            quality_query,
+            fast_hits,
+            lexical_hits,
+            query_semantic_weight,
+            fetch,
+            k,
+        } = refinement;
+        // Phase 1 schedules this state only for an independently admitted
+        // nonzero quality query and a non-control fast lane. Both retained
+        // indices and both bound embeddings stay borrowed through iteration.
         let quality_index = self
             .index
             .quality_index()
@@ -856,18 +901,16 @@ impl SyncTwoTierSearcher {
                 let latency = phase2_started.elapsed();
                 metrics.phase2_total_ms = ms(latency);
                 metrics.skip_reason = Some(error.diagnostic_code().to_owned());
-                if want_phases {
-                    phases.push(SearchPhase::RefinementFailed {
-                        initial_results: initial_results.clone(),
-                        error,
-                        latency,
-                    });
-                }
-                return Ok(SyncSearchOutcome {
-                    phases,
+                let phase = want_phase.then(|| SearchPhase::RefinementFailed {
+                    initial_results: initial_results.clone(),
+                    error,
+                    latency,
+                });
+                return SyncSearchOutcome {
+                    phase,
                     final_results: initial_results,
                     metrics,
-                });
+                };
             }
         };
 
@@ -955,18 +998,10 @@ impl SyncTwoTierSearcher {
                 k,
                 &self.config,
                 sync_fast_embedder_id(&self.index),
-                hash_control,
+                false,
             )
         } else {
-            unique_vector_hits_to_scored_results_owned(
-                blended,
-                k,
-                if hash_control {
-                    ScoreSource::HashControl
-                } else {
-                    ScoreSource::SemanticQuality
-                },
-            )
+            unique_vector_hits_to_scored_results_owned(blended, k, ScoreSource::SemanticQuality)
         };
 
         // Re-fusion ranks on blended semantic scores, but `fast_score` and
@@ -1026,27 +1061,25 @@ impl SyncTwoTierSearcher {
         metrics.phase2_total_ms = ms(phase2_started.elapsed());
         metrics.kendall_tau = None;
 
-        if want_phases {
-            phases.push(SearchPhase::Refined {
-                results: refined_results.clone(),
-                latency: phase2_started.elapsed(),
-                metrics: PhaseMetrics {
-                    embedder_id: "sync-quality-query".to_owned(),
-                    vectors_searched: quality_count,
-                    lexical_candidates: metrics.lexical_candidates,
-                    fused_count: refined_results.len(),
-                    skip_reason: None,
-                    hash_control_candidates: metrics.hash_control_candidates,
-                },
-                rank_changes,
-            });
-        }
+        let phase = want_phase.then(|| SearchPhase::Refined {
+            results: refined_results.clone(),
+            latency: phase2_started.elapsed(),
+            metrics: PhaseMetrics {
+                embedder_id: "sync-quality-query".to_owned(),
+                vectors_searched: quality_count,
+                lexical_candidates: metrics.lexical_candidates,
+                fused_count: refined_results.len(),
+                skip_reason: None,
+                hash_control_candidates: metrics.hash_control_candidates,
+            },
+            rank_changes,
+        });
 
-        Ok(SyncSearchOutcome {
-            phases,
+        SyncSearchOutcome {
+            phase,
             final_results: refined_results,
             metrics,
-        })
+        }
     }
 
     fn search_fast_hits(
@@ -1141,40 +1174,122 @@ impl std::fmt::Debug for SyncTwoTierSearcher {
 
 #[derive(Debug)]
 struct SyncSearchOutcome {
-    phases: Vec<SearchPhase>,
+    phase: Option<SearchPhase>,
     final_results: Vec<ScoredResult>,
     metrics: TwoTierMetrics,
 }
 
-/// Iterator over progressive phases produced by [`SyncTwoTierSearcher`].
 #[derive(Debug)]
-pub struct SyncSearchIterator {
-    phases: VecDeque<SearchPhase>,
+struct SyncRefinement<'query> {
+    quality_query: &'query BoundQueryEmbedding,
+    fast_hits: Vec<VectorHit>,
+    lexical_hits: Option<Vec<ScoredResult>>,
+    query_semantic_weight: f64,
+    fetch: usize,
+    k: usize,
 }
 
-impl SyncSearchIterator {
-    fn new(phases: Vec<SearchPhase>) -> Self {
-        Self {
-            phases: phases.into(),
-        }
-    }
+#[derive(Debug)]
+struct SyncPreparedSearch<'query> {
+    initial: SyncSearchOutcome,
+    refinement: Option<SyncRefinement<'query>>,
+}
 
-    fn from_error(error: SearchError) -> Self {
-        Self::new(vec![SearchPhase::RefinementFailed {
-            initial_results: Vec::new(),
-            error,
-            latency: Duration::from_millis(0),
-        }])
+struct SyncPendingRefinement<'query> {
+    initial: SyncSearchOutcome,
+    refinement: SyncRefinement<'query>,
+}
+
+enum SyncIteratorState<'query> {
+    Initial {
+        query: &'query TieredQueryEmbeddings,
+        k: usize,
+    },
+    Refine(Box<SyncPendingRefinement<'query>>),
+    Done,
+}
+
+/// Lazy iterator over progressive phases produced by [`SyncTwoTierSearcher`].
+///
+/// The first `next()` validates both query identities and performs only fast
+/// and lexical retrieval. A second `next()` runs quality refinement when that
+/// tier is available and requested. Dropping an unconsumed iterator performs
+/// no search; dropping after Initial performs no quality traversal or blending.
+/// The searcher, bound queries and filter remain borrowed until the iterator is
+/// dropped, keeping both phases on the same retained in-memory index. Filters
+/// should keep their selection policy stable across those phases.
+///
+/// Work runs synchronously on the thread calling `next()`; no background job is
+/// spawned. Phase latency measures that call's work, excluding caller time
+/// between phases. The iterator is exhausted after a terminal phase or refusal.
+pub struct SyncSearchIterator<'a> {
+    searcher: &'a SyncTwoTierSearcher,
+    filter: Option<&'a dyn SearchFilter>,
+    state: SyncIteratorState<'a>,
+}
+
+impl std::fmt::Debug for SyncSearchIterator<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self.state {
+            SyncIteratorState::Initial { .. } => "initial",
+            SyncIteratorState::Refine(_) => "refinement",
+            SyncIteratorState::Done => "done",
+        };
+        formatter
+            .debug_struct("SyncSearchIterator")
+            .field("state", &state)
+            .field("filtered", &self.filter.is_some())
+            .finish_non_exhaustive()
     }
 }
 
-impl Iterator for SyncSearchIterator {
+impl Iterator for SyncSearchIterator<'_> {
     type Item = SearchPhase;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.phases.pop_front()
+        // Consume the pending state before doing work. Errors and terminal
+        // phases cannot replay a retrieval on a subsequent call.
+        match std::mem::replace(&mut self.state, SyncIteratorState::Done) {
+            SyncIteratorState::Initial { query, k } => {
+                match self.searcher.search_initial(query, k, self.filter, true) {
+                    Ok(mut prepared) => {
+                        let phase = prepared.initial.phase.take();
+                        if let Some(refinement) = prepared.refinement {
+                            self.state =
+                                SyncIteratorState::Refine(Box::new(SyncPendingRefinement {
+                                    initial: prepared.initial,
+                                    refinement,
+                                }));
+                        }
+                        phase
+                    }
+                    Err(error) => Some(SearchPhase::RefinementFailed {
+                        initial_results: Vec::new(),
+                        error,
+                        latency: Duration::ZERO,
+                    }),
+                }
+            }
+            SyncIteratorState::Refine(pending) => {
+                self.searcher
+                    .search_refined(pending.initial, pending.refinement, self.filter, true)
+                    .phase
+            }
+            SyncIteratorState::Done => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self.state {
+            SyncIteratorState::Initial { k: 0, .. } => (0, Some(1)),
+            SyncIteratorState::Initial { .. } => (1, Some(2)),
+            SyncIteratorState::Refine(_) => (1, Some(1)),
+            SyncIteratorState::Done => (0, Some(0)),
+        }
     }
 }
+
+impl std::iter::FusedIterator for SyncSearchIterator<'_> {}
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
@@ -3483,6 +3598,211 @@ mod tests {
         assert_eq!(phases.len(), 2);
         assert!(matches!(phases[0], SearchPhase::Initial { .. }));
         assert!(matches!(phases[1], SearchPhase::Refined { .. }));
+    }
+
+    #[test]
+    fn search_iter_defers_quality_until_next_and_drop_stops_pending_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ObservedFilter {
+            total: AtomicUsize,
+            quality_only: AtomicUsize,
+        }
+        impl SearchFilter for ObservedFilter {
+            fn matches(&self, doc_id: &str, _: Option<&serde_json::Value>) -> bool {
+                self.total.fetch_add(1, Ordering::SeqCst);
+                if doc_id == "b" || doc_id == "c" {
+                    self.quality_only.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "observe-tier-traversal"
+            }
+        }
+        struct ObservedLexical(Arc<AtomicUsize>);
+        impl SyncLexicalSearch for ObservedLexical {
+            fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+
+        // These persisted, independently identified tiers contain quality-only
+        // documents. Observing their filter calls measures real quality scans,
+        // not an iterator's own state or a fabricated completion counter.
+        let dir = temp_dir("lazy-sync-quality");
+        let (fast, quality) = persisted_producer_pair(dir.path());
+        let lexical_calls = Arc::new(AtomicUsize::new(0));
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap()),
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                quality_weight: 1.0,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_lexical(Arc::new(ObservedLexical(Arc::clone(&lexical_calls))));
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let observed = ObservedFilter {
+            total: AtomicUsize::new(0),
+            quality_only: AtomicUsize::new(0),
+        };
+
+        let unused = searcher.search_iter_with_filter(&query, 1, Some(&observed));
+        assert_eq!(observed.total.load(Ordering::SeqCst), 0);
+        assert_eq!(lexical_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(unused.size_hint(), (1, Some(2)));
+        drop(unused);
+        assert_eq!(observed.total.load(Ordering::SeqCst), 0);
+        assert_eq!(lexical_calls.load(Ordering::SeqCst), 0);
+
+        let mut stopped = searcher.search_iter_with_filter(&query, 1, Some(&observed));
+        let Some(SearchPhase::Initial { results, .. }) = stopped.next() else {
+            panic!("the first call must expose Initial");
+        };
+        assert_eq!(results[0].doc_id, "a");
+        assert!(observed.total.load(Ordering::SeqCst) > 0);
+        assert_eq!(observed.quality_only.load(Ordering::SeqCst), 0);
+        assert_eq!(lexical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stopped.size_hint(), (1, Some(1)));
+        let before_drop = observed.total.load(Ordering::SeqCst);
+        drop(stopped);
+        assert_eq!(observed.total.load(Ordering::SeqCst), before_drop);
+        assert_eq!(observed.quality_only.load(Ordering::SeqCst), 0);
+        assert_eq!(lexical_calls.load(Ordering::SeqCst), 1);
+
+        let mut complete = searcher.search_iter_with_filter(&query, 1, Some(&observed));
+        assert!(matches!(complete.next(), Some(SearchPhase::Initial { .. })));
+        assert_eq!(observed.quality_only.load(Ordering::SeqCst), 0);
+        let Some(SearchPhase::Refined { results, .. }) = complete.next() else {
+            panic!("the second call must execute independent quality retrieval");
+        };
+        assert_eq!(results[0].doc_id, "b");
+        assert!(observed.quality_only.load(Ordering::SeqCst) > 0);
+        assert_eq!(lexical_calls.load(Ordering::SeqCst), 2);
+        let after_refinement = observed.total.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(complete.next().is_none());
+            assert_eq!(complete.size_hint(), (0, Some(0)));
+        }
+        assert_eq!(observed.total.load(Ordering::SeqCst), after_refinement);
+    }
+
+    #[test]
+    fn search_iter_lazy_refinement_preserves_collect_results_and_evidence() {
+        let dir = temp_dir("lazy-sync-parity");
+        let (fast, quality) = persisted_producer_pair(dir.path());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap());
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        for hybrid in [false, true] {
+            let mut searcher = SyncTwoTierSearcher::new(
+                Arc::clone(&index),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    quality_weight: 1.0,
+                    explain: true,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_nqc_dense_downweight_disabled();
+            if hybrid {
+                searcher = searcher.with_lexical(Arc::new(StaticLexical {
+                    hits: vec![lexical_result("a", 10.0), lexical_result("lex-only", 9.0)],
+                }));
+            }
+            for filter in [None, Some(&ExcludeB as &dyn SearchFilter)] {
+                let (collected, total) = searcher
+                    .search_collect_with_filter(&query, 2, filter)
+                    .unwrap();
+                let mut phases = searcher.search_iter_with_filter(&query, 2, filter);
+                let Some(SearchPhase::Initial {
+                    metrics: initial_metrics,
+                    ..
+                }) = phases.next()
+                else {
+                    panic!("Initial must precede quality work");
+                };
+                let Some(SearchPhase::Refined {
+                    results,
+                    metrics,
+                    rank_changes,
+                    ..
+                }) = phases.next()
+                else {
+                    panic!("a complete query must refine");
+                };
+                // Includes exact score serialization, ordering, per-tier score
+                // provenance, metadata and the optional explanation tree.
+                assert_eq!(
+                    serde_json::to_value(&results).unwrap(),
+                    serde_json::to_value(&collected).unwrap(),
+                );
+                assert_eq!(
+                    initial_metrics.vectors_searched,
+                    total.phase1_vectors_searched
+                );
+                assert_eq!(metrics.vectors_searched, total.phase2_vectors_searched);
+                assert_eq!(metrics.lexical_candidates, total.lexical_candidates);
+                assert_eq!(
+                    metrics.hash_control_candidates,
+                    total.hash_control_candidates
+                );
+                assert_eq!(
+                    serde_json::to_value(rank_changes).unwrap(),
+                    serde_json::to_value(total.rank_changes).unwrap(),
+                );
+                assert!(phases.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn search_iter_refinement_failure_retains_initial_and_is_terminal() {
+        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
+        let query = tiered(vec![1.0, 0.0]);
+        let bad_quality = bound("sync-fixture", vec![1.0, 0.0, 0.0]);
+        let mut phases = searcher.search_iter(&query, 2);
+        let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+            panic!("Initial must be observable before refinement");
+        };
+
+        // Public admission rejects this shape before Initial. Inject the
+        // internal fault only after admission to exercise the real quality
+        // kernel's defensive error and the lazy iterator's terminal handling.
+        let SyncIteratorState::Refine(pending) = &mut phases.state else {
+            panic!("quality work must still be pending");
+        };
+        pending.refinement.quality_query = &bad_quality;
+        let Some(SearchPhase::RefinementFailed {
+            initial_results,
+            error,
+            ..
+        }) = phases.next()
+        else {
+            panic!("a quality error must preserve the already-delivered Initial");
+        };
+        assert!(matches!(
+            error,
+            SearchError::DimensionMismatch {
+                expected: 2,
+                found: 3
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(initial_results).unwrap(),
+            serde_json::to_value(results).unwrap(),
+        );
+        assert_eq!(phases.size_hint(), (0, Some(0)));
+        assert!(phases.next().is_none());
+        assert!(phases.next().is_none());
     }
 
     #[test]

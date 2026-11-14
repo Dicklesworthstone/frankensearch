@@ -421,7 +421,55 @@ Complete-generation stores also support:
 - `fsfs search --expand` (pins one generation across query variants; executes directly in process rather than through daemon forwarding),
 - `fsfs append-batch`, `fsfs delete` (exact IDs and `--prefix`), and `fsfs compact` (each publishes a new complete successor generation while existing readers keep their bundle),
 - `fsfs flush` (revalidates and synchronizes the selected generation, inventory, and selection descriptor), and
-- `fsfs-recover` (`inspect`, `prepare`, `apply`, `confirm-durability`, and `--repair-vectors` from `.fec` RaptorQ sidecars; workspace binary target `crates/frankensearch-fsfs/src/bin/fsfs-recover.rs`).
+- `fsfs-recover` (`inspect`, `prepare`, `apply`, `confirm-durability`, and explicit `.fec` RaptorQ reconstruction with `--repair-vectors` or `--repair-artifacts`; workspace binary target `crates/frankensearch-fsfs/src/bin/fsfs-recover.rs`).
+
+### Repairing keyword and vector artifacts without source files
+
+`fsfs-recover --repair-artifacts` reconstructs protected files in a new complete
+generation. It supports the canonical fast/quality vectors and the selected
+Quill engine's `MANIFEST`, `MANIFEST.prev`, and `seg-<16 hex digits>.fslx`
+segments. This can restore keyword or hybrid search after bitrot, truncation,
+or a missing protected file even when the original source tree is unavailable.
+The narrower `--repair-vectors` option continues to require intact lexical data;
+the two options are mutually exclusive.
+
+Use the generation ID and manifest SHA-256 from the original trusted publication
+receipt. Each repaired file must have an intact `.fec` sidecar authenticated by
+that receipt, and its reconstructed bytes must match the original SHA-256 and
+length. Catalogs, selection pointers, unprotected metadata, and sidecars must
+remain intact. A blue-green lexical `CURRENT` must still identify the exact
+Quill directory; recovery never guesses a sibling or accepts a replacement
+inventory derived from damaged bytes.
+
+For a separate preview and publication step:
+
+```bash
+fsfs-recover --index-dir /data/search-store \
+  --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256" \
+  --repair-artifacts --prepare --query "memory ownership" \
+  --save-preparation /data/recovery-prepared.json
+
+fsfs-recover --index-dir /data/search-store \
+  --resume-file /data/recovery-prepared.json --apply \
+  --query "memory ownership"
+```
+
+Both commands must use the same resolved model and preview policy. Supply the
+same `--config` to each when using an explicit configuration file. Preparation
+keeps the current selection unchanged and returns a new generation receipt plus
+`repaired_from`. Applying that saved preparation re-admits the repaired engine
+and every stored vector producer, then refuses if another publication changed
+the original selection. Repeat neither repair flag on the resume command.
+
+Original damaged files and failed partial copies remain untouched and retained;
+no source reindex, model download, or automatic deletion occurs. Repair requires
+Unix directory durability support. The default total copy budget is 1 GiB
+(`--max-copy-bytes`); each damaged artifact is limited to 128 MiB and its sidecar
+to 256 MiB. These bounds constrain payload and I/O, not peak memory. A missing
+or corrupt sidecar, unsupported artifact, or inadmissible store security profile
+is refused before copying begins.
+
+### Automatic retention and legacy conversion
 
 Every command that publishes a successor (`index`, `watch`, `append-batch`,
 `delete`, `compact`) automatically reclaims older generations: it keeps the
