@@ -2982,11 +2982,8 @@ mod retained_recovery_tests {
             let (mut runtime, _, root) = fixture(directory.path());
             runtime.cli_input.quality_only = true;
             "unused-invalid-fast-producer".clone_into(&mut runtime.config.indexing.fast_model);
-            runtime.config.indexing.model_dir = directory
-                .path()
-                .join("absent-models")
-                .display()
-                .to_string();
+            runtime.config.indexing.model_dir =
+                directory.path().join("absent-models").display().to_string();
             let mut prepared = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
             prepared.search(&cx, REBUILD_QUERY, 10).await.unwrap();
             let (publication, mut retained) = prepared.restore(&cx).unwrap();
@@ -3024,7 +3021,9 @@ mod retained_recovery_tests {
                 let error = result.expect_err("required quality cannot be silently dropped");
                 match failure {
                     "missing" => assert!(matches!(error, SearchError::EmbedderUnavailable { .. })),
-                    "changed" => assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. })),
+                    "changed" => {
+                        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }))
+                    }
                     "inference" => assert!(matches!(error, SearchError::EmbeddingFailed { .. })),
                     _ => assert!(matches!(error, SearchError::Cancelled { .. })),
                 }
@@ -3036,7 +3035,10 @@ mod retained_recovery_tests {
                 assert_eq!(file_bytes(original.path()), before);
             }
             models.quality.changed.store(false, Ordering::Relaxed);
-            models.quality.fail_documents.store(false, Ordering::Relaxed);
+            models
+                .quality
+                .fail_documents
+                .store(false, Ordering::Relaxed);
             set_test_quality_embedder(Some(models.quality.clone()));
             let mut command = fresh_runtime(&runtime);
             command.cli_input.quality_only = false;
@@ -3131,7 +3133,9 @@ mod retained_recovery_tests {
                         .push(REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY.to_owned()),
                     _ => sentinel.schema_version = 2,
                 }
-                runtime.write_index_sentinel(build.path(), &sentinel).unwrap();
+                runtime
+                    .write_index_sentinel(build.path(), &sentinel)
+                    .unwrap();
                 // The container seal certifies these exact bytes, not engine
                 // topology. Manufacture that weaker receipt deliberately:
                 // every real maintenance consumer must reject it independently.
@@ -3145,8 +3149,14 @@ mod retained_recovery_tests {
                 reset_document_counts(&models);
                 let mut command = fresh_runtime(&runtime);
                 command.cli_input.delete_ids = vec!["alpha.md".to_owned()];
-                let delete = command.delete_retained_generation(&cx, &root).await.unwrap_err();
-                let compact = command.compact_retained_generation(&cx, &root).await.unwrap_err();
+                let delete = command
+                    .delete_retained_generation(&cx, &root)
+                    .await
+                    .unwrap_err();
+                let compact = command
+                    .compact_retained_generation(&cx, &root)
+                    .await
+                    .unwrap_err();
                 let batch = command
                     .apply_retained_batch(
                         &cx,

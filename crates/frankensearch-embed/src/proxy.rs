@@ -588,6 +588,39 @@ qYX7QWYbxuf9bIc0ZAxJmP9+N0sGzhpkouzYKrA2OE+4PZp5sSeifVAy
         spawn_tls_proxy_with_options(mode, response_body, None, false)
     }
 
+    /// One actual CONNECT/TLS exchange per artifact or redirect through one proxy.
+    /// Uses the same certificate, HTTP framing and origin serving path as the
+    /// single-artifact qualification. Production never trusts the fixture CA.
+    pub fn spawn_artifact_tls_proxy(
+        responses: Vec<(Vec<u8>, Option<String>)>,
+    ) -> (SocketAddr, JoinHandle<Vec<TlsProxyObservation>>) {
+        let (address_sender, address_receiver) = std::sync::mpsc::channel();
+        let peer = thread::spawn(move || {
+            let mut observations = Vec::new();
+            run_test_with_cx(|_cx| async {
+                assert_completes_within(Duration::from_secs(10), "model artifact TLS peer", || {
+                    Box::pin(async {
+                        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        address_sender.send(listener.local_addr().unwrap()).unwrap();
+                        for (body, redirect) in responses {
+                            let (stream, _) = listener.accept().await.unwrap();
+                            let mut observation = TlsProxyObservation::default();
+                            serve_connect(stream, &body, redirect.as_deref(), &mut observation)
+                                .await;
+                            observations.push(observation);
+                        }
+                    })
+                })
+                .await;
+            });
+            observations
+        });
+        let address = address_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        (address, peer)
+    }
+
     pub fn spawn_redirecting_tls_proxy(
         mode: TlsProxyMode,
         location: String,

@@ -30,8 +30,8 @@ use asupersync::http::h1::{
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::generation::QuantizationFormat;
 use frankensearch_core::recovery_plan::{
-    BoundLocalModelAcquisitionPlan, ModelAcquisitionTarget, ModelDestinationClass,
-    SemanticReadiness,
+    BoundLocalModelAcquisitionPlan, BoundNetworkModelAcquisitionPlan, ModelAcquisitionTarget,
+    ModelDestinationClass, SemanticReadiness,
 };
 use frankensearch_core::traits::ModelTier;
 
@@ -58,7 +58,7 @@ fn local_recovery_error(field: &str) -> SearchError {
     SearchError::InvalidConfig {
         field: format!("model_acquisition.recovery.{field}"),
         value: "rejected".to_owned(),
-        reason: "The exact local acquisition scope, readiness, or authorization changed; derive a fresh plan before importing.".to_owned(),
+        reason: "The exact acquisition scope, readiness, or authorization changed; derive a fresh plan before acquiring model bytes.".to_owned(),
     }
 }
 
@@ -136,6 +136,151 @@ pub fn local_model_acquisition_target(
         expires_at_unix_seconds,
         nonce,
     })
+}
+
+/// Derive an exact standalone HTTPS acquisition target without network or writes.
+///
+/// An empty host list selects only the frozen manifest's initial authorities.
+/// A supplied list includes every initial authority and explicitly names each
+/// additional redirect authority. Hosts are canonicalized, sorted and deduplicated.
+/// Wildcards, credentials, paths and non-HTTPS grants are refused. Explicit ports
+/// form part of the authority; the default 443 is normalized.
+/// The exact artifact total also bounds consumed artifact response-body bytes
+/// across retries. Transport headers and unconsumed redirect bodies are excluded.
+///
+/// # Errors
+///
+/// Refuses unsafe destinations, invalid manifests or invalid/incomplete source
+/// hosts. No DNS, request, cache lock or directory creation occurs.
+#[allow(clippy::too_many_arguments)]
+pub fn network_model_acquisition_target(
+    frozen: &FrozenModelArtifactManifestV1,
+    model_tier: ModelTier,
+    destination: &Path,
+    source_hosts: &[String],
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+    nonce: String,
+) -> SearchResult<ModelAcquisitionTarget> {
+    let mut target = local_model_acquisition_target(
+        frozen,
+        model_tier,
+        destination,
+        issued_at_unix_seconds,
+        expires_at_unix_seconds,
+        nonce,
+    )?;
+    let initial = frozen
+        .manifest
+        .artifacts
+        .iter()
+        .map(|artifact| scoped_https_authority(&artifact.upstream_url))
+        .collect::<SearchResult<BTreeSet<_>>>()?;
+    let approved = if source_hosts.is_empty() {
+        initial.clone()
+    } else {
+        if source_hosts.len() > 32 {
+            return Err(local_recovery_error("source_hosts"));
+        }
+        source_hosts
+            .iter()
+            .map(|host| {
+                if host.len() > 320
+                    || host.contains(['/', '?', '#', '@', '\\'])
+                    || host.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+                {
+                    return Err(local_recovery_error("source_hosts"));
+                }
+                scoped_https_authority(&format!("https://{host}/"))
+            })
+            .collect::<SearchResult<BTreeSet<_>>>()?
+    };
+    if approved.is_empty() || approved.len() > 32 || !initial.is_subset(&approved) {
+        return Err(local_recovery_error("source_hosts"));
+    }
+    target.network_source_hosts = approved.into_iter().collect();
+    Ok(target)
+}
+
+fn scoped_https_authority(url: &str) -> SearchResult<String> {
+    let parsed = ParsedUrl::parse(url).map_err(|_| local_recovery_error("source_hosts"))?;
+    if parsed.scheme != Scheme::Https || parsed.port == 0 {
+        return Err(local_recovery_error("source_hosts"));
+    }
+    let host = if let Some(address) = parsed
+        .host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        let address = address
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| local_recovery_error("source_hosts"))?;
+        format!("[{address}]")
+    } else if let Ok(address) = parsed.host.parse::<std::net::Ipv4Addr>() {
+        address.to_string()
+    } else {
+        if parsed.host.len() > 253
+            || parsed
+                .host
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            || parsed.host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    || !label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    || !label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+            })
+        {
+            return Err(local_recovery_error("source_hosts"));
+        }
+        parsed.host.to_ascii_lowercase()
+    };
+    Ok(if parsed.port == 443 {
+        host
+    } else {
+        format!("{host}:{}", parsed.port)
+    })
+}
+
+struct NetworkAcquisitionGuard<'a> {
+    hosts: &'a [String],
+    bytes_remaining: AtomicU64,
+    validate_time: &'a (dyn Fn() -> SearchResult<Duration> + Send + Sync),
+    make_client: &'a (dyn Fn(HttpClientConfig) -> HttpClient + Send + Sync),
+}
+
+impl NetworkAcquisitionGuard<'_> {
+    fn validate(&self, url: &str) -> SearchResult<Duration> {
+        let remaining = (self.validate_time)()?;
+        if self
+            .hosts
+            .binary_search(&scoped_https_authority(url)?)
+            .is_err()
+        {
+            return Err(local_recovery_error("source_hosts"));
+        }
+        Ok(remaining)
+    }
+
+    fn consume(&self, url: &str, bytes: usize) -> SearchResult<()> {
+        self.validate(url)?;
+        let bytes = u64::try_from(bytes).map_err(|_| local_recovery_error("byte_budget"))?;
+        self.bytes_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(bytes)
+            })
+            .map_err(|_| local_recovery_error("byte_budget"))?;
+        Ok(())
+    }
 }
 
 /// Schema version for durable acquisition receipts.
@@ -625,6 +770,7 @@ impl ModelDownloader {
             on_progress,
             load_self_test,
             |_| Ok(()),
+            None,
         )
         .await
     }
@@ -711,6 +857,136 @@ impl ModelDownloader {
             on_progress,
             load_self_test,
             validate,
+            None,
+        )
+        .await
+    }
+
+    /// Execute one exactly authorized standalone HTTPS model acquisition.
+    ///
+    /// The source-host request independently reproduces the grant, including
+    /// explicitly approved CDN redirects. Every request stays inside that set.
+    /// The frozen total bounds consumed artifact response-body bytes across
+    /// retries, excluding transport headers and unconsumed redirect bodies.
+    /// A partial failed transfer may exhaust the grant. Expiry bounds the entire
+    /// network stage and is checked at each request, chunk and publication.
+    /// The registered producer must pass its real execution self-test before
+    /// publication. Success grants no index or query readiness.
+    ///
+    /// # Errors
+    ///
+    /// Refuses changed scope/readiness, unauthorized hosts, expired/exhausted
+    /// grants, cancellation, invalid artifacts, failed producer execution and
+    /// publication failures. Unknown publication outcomes remain typed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_network_model_recovery(
+        &self,
+        cx: &Cx,
+        plan: &BoundNetworkModelAcquisitionPlan,
+        request: ModelAcquisitionRequest<'_>,
+        source_hosts: &[String],
+        lifecycle: &mut ModelLifecycle,
+        on_progress: impl Fn(&ModelAcquisitionProgressV1) + Send + Sync,
+        load_self_test: impl Fn(&Path, &FrozenModelArtifactManifestV1) -> SearchResult<()> + Send + Sync,
+        current_time: impl Fn() -> SearchResult<u64> + Send + Sync,
+    ) -> SearchResult<ModelAcquisitionReceiptV1> {
+        self.acquire_network_model_recovery_with_client(
+            cx,
+            plan,
+            request,
+            source_hosts,
+            lifecycle,
+            on_progress,
+            load_self_test,
+            current_time,
+            &HttpClient::with_config,
+        )
+        .await
+    }
+
+    // Only the TLS qualification path injects a loopback CA. Actual requests,
+    // redirects, artifact verification, lifecycle and publication remain shared.
+    #[allow(clippy::too_many_arguments)]
+    async fn acquire_network_model_recovery_with_client(
+        &self,
+        cx: &Cx,
+        plan: &BoundNetworkModelAcquisitionPlan,
+        request: ModelAcquisitionRequest<'_>,
+        source_hosts: &[String],
+        lifecycle: &mut ModelLifecycle,
+        on_progress: impl Fn(&ModelAcquisitionProgressV1) + Send + Sync,
+        load_self_test: impl Fn(&Path, &FrozenModelArtifactManifestV1) -> SearchResult<()> + Send + Sync,
+        current_time: impl Fn() -> SearchResult<u64> + Send + Sync,
+        make_client: &(dyn Fn(HttpClientConfig) -> HttpClient + Send + Sync),
+    ) -> SearchResult<ModelAcquisitionReceiptV1> {
+        if !matches!(&request.source, ModelAcquisitionSource::Network) {
+            return Err(local_recovery_error("source"));
+        }
+        let frozen = request.frozen_manifest;
+        let destination = request.destination_dir;
+        let grant = plan.authorization();
+        let model_tier = match lifecycle.manifest().tier {
+            Some(crate::model_manifest::ModelTier::Fast) => ModelTier::Fast,
+            Some(crate::model_manifest::ModelTier::Quality) => ModelTier::Quality,
+            _ => return Err(local_recovery_error("model_tier")),
+        };
+        let actual_target = || {
+            network_model_acquisition_target(
+                frozen,
+                model_tier,
+                destination,
+                source_hosts,
+                grant.issued_at_unix_seconds,
+                grant.expires_at_unix_seconds,
+                grant.nonce.clone(),
+            )
+        };
+        let target = actual_target()?;
+        let validate = |boundary| {
+            plan.validate_binding_at(&actual_target()?, current_time()?)
+                .map_err(|_| local_recovery_error("authorization"))?;
+            if matches!(boundary, AcquisitionBoundary::Locked) {
+                let state = match std::fs::symlink_metadata(destination) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        SemanticReadiness::ModelMissing { tier: model_tier }
+                    }
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {
+                        let artifacts_verified = frozen.manifest.verify_dir(destination).is_ok();
+                        check_acquisition_cancel(cx, "recovery-readiness")?;
+                        if artifacts_verified {
+                            return Err(local_recovery_error("readiness"));
+                        }
+                        SemanticReadiness::ModelUnloadable { tier: model_tier }
+                    }
+                };
+                if plan.plan().state() != &state {
+                    return Err(local_recovery_error("readiness"));
+                }
+            }
+            Ok(())
+        };
+        let validate_time = || {
+            let now = current_time()?;
+            grant
+                .validate_at(now)
+                .map_err(|_| local_recovery_error("authorization"))?;
+            Ok(Duration::from_secs(grant.expires_at_unix_seconds - now))
+        };
+        let network = NetworkAcquisitionGuard {
+            hosts: &target.network_source_hosts,
+            bytes_remaining: AtomicU64::new(target.byte_budget),
+            validate_time: &validate_time,
+            make_client,
+        };
+        self.acquire_frozen_model_guarded(
+            cx,
+            request,
+            lifecycle,
+            on_progress,
+            load_self_test,
+            validate,
+            Some(&network),
         )
         .await
     }
@@ -724,6 +1000,7 @@ impl ModelDownloader {
         on_progress: impl Fn(&ModelAcquisitionProgressV1) + Send + Sync,
         load_self_test: impl Fn(&Path, &FrozenModelArtifactManifestV1) -> SearchResult<()> + Send + Sync,
         validate_boundary: impl Fn(AcquisitionBoundary) -> SearchResult<()> + Send + Sync,
+        network_scope: Option<&NetworkAcquisitionGuard<'_>>,
     ) -> SearchResult<ModelAcquisitionReceiptV1> {
         if matches!(
             lifecycle.state(),
@@ -807,15 +1084,28 @@ impl ModelDownloader {
                             on_progress(&progress);
                         }
                     };
-                    let staging_dir = self
-                        .download_model(
-                            cx,
-                            &download_manifest,
-                            destination_dir,
-                            lifecycle,
-                            forward_progress,
-                        )
-                        .await?;
+                    let download = self.download_model_guarded(
+                        cx,
+                        &download_manifest,
+                        destination_dir,
+                        lifecycle,
+                        forward_progress,
+                        network_scope,
+                    );
+                    let staging_dir = if let Some(scope) = network_scope {
+                        let url = &frozen_manifest.manifest.artifacts[0].upstream_url;
+                        let mut download = std::pin::pin!(download);
+                        let checked_download = poll_fn(|task| {
+                            (scope.validate_time)()?;
+                            download.as_mut().poll(task)
+                        });
+                        // Absolute for the entire transport stage: retries and
+                        // continuous progress cannot extend authorization.
+                        run_download_request(cx, url, scope.validate(url)?, checked_download)
+                            .await?
+                    } else {
+                        download.await?
+                    };
                     VerifiedModelStageV1 {
                         staging_dir,
                         manifest_fingerprint: frozen_manifest.fingerprint.clone(),
@@ -1011,6 +1301,19 @@ impl ModelDownloader {
         lifecycle: &mut ModelLifecycle,
         on_progress: impl Fn(&DownloadProgress) + Send + Sync,
     ) -> SearchResult<PathBuf> {
+        self.download_model_guarded(cx, manifest, dest_dir, lifecycle, on_progress, None)
+            .await
+    }
+
+    async fn download_model_guarded(
+        &self,
+        cx: &Cx,
+        manifest: &ModelManifest,
+        dest_dir: &Path,
+        lifecycle: &mut ModelLifecycle,
+        on_progress: impl Fn(&DownloadProgress) + Send + Sync,
+        network_scope: Option<&NetworkAcquisitionGuard<'_>>,
+    ) -> SearchResult<PathBuf> {
         if let Err(error) = validate_download_config(&self.config) {
             lifecycle.fail_verification(bounded_download_failure_reason(&error));
             return Err(error);
@@ -1081,6 +1384,9 @@ impl ModelDownloader {
                 return Err(error);
             }
             let url = file.download_url(&manifest.repo, &manifest.revision);
+            if let Some(scope) = network_scope {
+                scope.validate(&url)?;
+            }
             let file_dest = staging_dir.join(&file.name);
 
             // Create parent directories for nested paths (e.g., "onnx/model.onnx").
@@ -1100,8 +1406,20 @@ impl ModelDownloader {
                 "downloading model file"
             );
 
-            if let Err(err) = self
-                .download_file_with_retry(
+            let transfer = if let Some(scope) = network_scope {
+                self.download_file_with_retry_guarded(
+                    cx,
+                    &url,
+                    &file_dest,
+                    file,
+                    idx,
+                    files_total,
+                    &on_progress,
+                    Some(scope),
+                )
+                .await
+            } else {
+                self.download_file_with_retry(
                     cx,
                     &url,
                     &file_dest,
@@ -1111,7 +1429,8 @@ impl ModelDownloader {
                     &on_progress,
                 )
                 .await
-            {
+            };
+            if let Err(err) = transfer {
                 if matches!(err, SearchError::Cancelled { .. }) {
                     lifecycle.cancel();
                 } else {
@@ -1167,10 +1486,38 @@ impl ModelDownloader {
         files_total: usize,
         on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
     ) -> SearchResult<()> {
+        self.download_file_with_retry_guarded(
+            cx,
+            url,
+            dest,
+            file,
+            file_idx,
+            files_total,
+            on_progress,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn download_file_with_retry_guarded(
+        &self,
+        cx: &Cx,
+        url: &str,
+        dest: &Path,
+        file: &ModelFile,
+        file_idx: usize,
+        files_total: usize,
+        on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
+        network_scope: Option<&NetworkAcquisitionGuard<'_>>,
+    ) -> SearchResult<()> {
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
             check_acquisition_cancel(cx, "download-retry")?;
+            if let Some(scope) = network_scope {
+                scope.validate(url)?;
+            }
             if attempt > 0 {
                 let delay = self
                     .config
@@ -1185,10 +1532,24 @@ impl ModelDownloader {
                 wait_download_retry(cx, url, delay).await?;
             }
 
-            match self
-                .download_single_file(cx, url, dest, file, file_idx, files_total, on_progress)
+            let transfer = if let Some(scope) = network_scope {
+                self.download_single_file_with_client_guarded(
+                    cx,
+                    url,
+                    dest,
+                    file,
+                    file_idx,
+                    files_total,
+                    on_progress,
+                    &scope.make_client,
+                    Some(scope),
+                )
                 .await
-            {
+            } else {
+                self.download_single_file(cx, url, dest, file, file_idx, files_total, on_progress)
+                    .await
+            };
+            match transfer {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     // A rejected proxy policy is terminal. Retrying must not
@@ -1196,7 +1557,9 @@ impl ModelDownloader {
                     if matches!(&e, SearchError::Cancelled { .. })
                         || matches!(
                             &e,
-                            SearchError::InvalidConfig { field, .. } if field.starts_with("proxy.")
+                            SearchError::InvalidConfig { field, .. }
+                                if field.starts_with("proxy.")
+                                    || field.starts_with("model_acquisition.recovery.")
                         )
                     {
                         return Err(e);
@@ -1258,6 +1621,37 @@ impl ModelDownloader {
         on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
         make_client: &(impl Fn(HttpClientConfig) -> HttpClient + Sync),
     ) -> SearchResult<()> {
+        self.download_single_file_with_client_guarded(
+            cx,
+            url,
+            dest,
+            file,
+            file_idx,
+            files_total,
+            on_progress,
+            make_client,
+            None,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::too_many_lines,
+        clippy::too_many_arguments
+    )]
+    async fn download_single_file_with_client_guarded(
+        &self,
+        cx: &Cx,
+        url: &str,
+        dest: &Path,
+        file: &ModelFile,
+        file_idx: usize,
+        files_total: usize,
+        on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
+        make_client: &(impl Fn(HttpClientConfig) -> HttpClient + Sync),
+        network_scope: Option<&NetworkAcquisitionGuard<'_>>,
+    ) -> SearchResult<()> {
         validate_download_config(&self.config)?;
         let start = Instant::now();
         check_acquisition_cancel(cx, "download-request")?;
@@ -1280,6 +1674,12 @@ impl ModelDownloader {
         let mut redirects = 0_u32;
         let response = loop {
             check_acquisition_cancel(cx, "download-request")?;
+            if let Some(scope) = network_scope {
+                scope.validate(&request_url)?;
+                if scope.bytes_remaining.load(Ordering::Relaxed) == 0 {
+                    return Err(local_recovery_error("byte_budget"));
+                }
+            }
             let response =
                 run_download_request(cx, &request_url, self.config.request_timeout, async {
                     make_client(self.http_client_config_for(&request_url)?)
@@ -1289,6 +1689,9 @@ impl ModelDownloader {
                 })
                 .await?;
             check_acquisition_cancel(cx, "download-response")?;
+            if let Some(scope) = network_scope {
+                scope.validate(&request_url)?;
+            }
             if !matches!(response.head.status, 301 | 302 | 303 | 307 | 308) {
                 break response;
             }
@@ -1340,6 +1743,9 @@ impl ModelDownloader {
         }
 
         let tmp_path = dest.with_extension("tmp");
+        if let Some(scope) = network_scope {
+            scope.validate(&request_url)?;
+        }
         let mut tmp_guard = TempFileGuard::new(tmp_path.clone());
         let mut tmp_file = OpenOptions::new()
             .write(true)
@@ -1356,6 +1762,9 @@ impl ModelDownloader {
         let mut bytes_downloaded: u64 = 0;
 
         stream_download_body(cx, url, response.body, self.config.idle_timeout, |bytes| {
+            if let Some(scope) = network_scope {
+                scope.consume(&request_url, bytes.len())?;
+            }
             let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             let next_size = bytes_downloaded.checked_add(byte_count).ok_or_else(|| {
                 SearchError::HashMismatch {
@@ -1427,6 +1836,9 @@ impl ModelDownloader {
         tmp_file.sync_all().map_err(SearchError::from)?;
         drop(tmp_file);
         check_acquisition_cancel(cx, "download-file-publish")?;
+        if let Some(scope) = network_scope {
+            scope.validate(&request_url)?;
+        }
         std::fs::rename(&tmp_path, dest).map_err(SearchError::from)?;
         tmp_guard.disarm();
 
@@ -2689,6 +3101,657 @@ mod tests {
             manifest,
             DownloadConsent::granted(ConsentSource::Programmatic),
         )
+    }
+
+    fn bound_network_fixture(
+        target: &ModelAcquisitionTarget,
+        state: SemanticReadiness,
+    ) -> BoundNetworkModelAcquisitionPlan {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            TrustedRecoveryContext, plan,
+        };
+        let request = RecoveryRequest {
+            mode: RequestMode::ExplicitSemantic,
+            requested_topology: frankensearch_core::RetrievalTopology::FastOnly,
+        };
+        let mut policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Allowed,
+            acquisition_authorization: None,
+        };
+        let now = target.issued_at_unix_seconds + 1;
+        let preview = plan(TrustedRecoveryContext::new(
+            &state,
+            request,
+            &policy,
+            Some(target),
+            now,
+        ))
+        .unwrap();
+        policy.acquisition_authorization =
+            preview.action().unwrap().required_authorization().cloned();
+        plan(TrustedRecoveryContext::new(
+            &state,
+            request,
+            &policy,
+            Some(target),
+            now,
+        ))
+        .unwrap()
+        .bind_network_model_acquisition(target, now)
+        .unwrap()
+    }
+
+    #[test]
+    fn scoped_network_target_is_read_only_and_binds_canonical_authorities() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("absent/cache/model");
+        let frozen = acquisition_fixture();
+        let derive = |hosts: &[String]| {
+            network_model_acquisition_target(
+                &frozen,
+                ModelTier::Fast,
+                &destination,
+                hosts,
+                100,
+                1000,
+                "0123456789abcdef0123456789abcdef".to_owned(),
+            )
+        };
+        assert_eq!(
+            derive(&[]).unwrap().network_source_hosts,
+            ["models.example.invalid"]
+        );
+        let exact = derive(&[
+            "MODELS.EXAMPLE.INVALID:443".to_owned(),
+            "cdn.example.invalid:8443".to_owned(),
+            "models.example.invalid".to_owned(),
+            "[0:0:0:0:0:0:0:1]:8443".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            exact.network_source_hosts,
+            [
+                "[::1]:8443",
+                "cdn.example.invalid:8443",
+                "models.example.invalid"
+            ]
+        );
+        assert_eq!(exact.byte_budget, total_frozen_bytes(&frozen).unwrap());
+        assert_eq!(exact.document_count, 0);
+        for host in [
+            "*.example.invalid",
+            "user:secret@host",
+            "https://host",
+            "host/path",
+            "host?token=private",
+            "host#fragment",
+            "host:0",
+            "host:",
+            "_host",
+            "bad..host",
+            "[not-ipv6]",
+            "host.",
+            "127.0.0.999",
+            "",
+            " host",
+            "host\\alias",
+        ] {
+            assert!(derive(&["models.example.invalid".to_owned(), host.to_owned()]).is_err());
+        }
+        assert!(derive(&["cdn.example.invalid".to_owned()]).is_err());
+        assert!(derive(&vec!["models.example.invalid".to_owned(); 33]).is_err());
+        assert!(!destination.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn scoped_network_rejects_changed_grants_before_cache_or_transport() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let destination = root.join("absent/model");
+        let frozen = acquisition_fixture();
+        let target = network_model_acquisition_target(
+            &frozen,
+            ModelTier::Fast,
+            &destination,
+            &[],
+            100,
+            1000,
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        )
+        .unwrap();
+        let bound = bound_network_fixture(
+            &target,
+            SemanticReadiness::ModelMissing {
+                tier: ModelTier::Fast,
+            },
+        );
+        let mut changed = target.clone();
+        changed.byte_budget += 1;
+        let wrong_budget = bound_network_fixture(
+            &changed,
+            SemanticReadiness::ModelMissing {
+                tier: ModelTier::Fast,
+            },
+        );
+        run_test_with_cx(|cx| async move {
+            for (grant, hosts, output, now, local) in [
+                (&bound, Vec::new(), destination.clone(), 1000, false),
+                (
+                    &bound,
+                    vec![
+                        "models.example.invalid".to_owned(),
+                        "cdn.example.invalid".to_owned(),
+                    ],
+                    destination.clone(),
+                    101,
+                    false,
+                ),
+                (&bound, Vec::new(), root.join("other/model"), 101, false),
+                (&wrong_budget, Vec::new(), destination.clone(), 101, false),
+                (&bound, Vec::new(), destination.clone(), 101, true),
+            ] {
+                let mut lifecycle = recovery_fixture_lifecycle(&frozen);
+                let error = ModelDownloader::with_defaults()
+                    .acquire_network_model_recovery_with_client(
+                        &cx,
+                        grant,
+                        ModelAcquisitionRequest {
+                            frozen_manifest: &frozen,
+                            source: if local {
+                                ModelAcquisitionSource::LocalBundle(&root)
+                            } else {
+                                ModelAcquisitionSource::Network
+                            },
+                            destination_dir: &output,
+                        },
+                        &hosts,
+                        &mut lifecycle,
+                        |_| {},
+                        verify_fixture_load,
+                        || Ok(now),
+                        &|_| panic!("rejected scope must never construct a network client"),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::InvalidConfig { .. }));
+                assert!(!destination.parent().unwrap().exists());
+                assert!(!root.join("other").exists());
+            }
+        });
+    }
+
+    #[test]
+    fn scoped_network_redirect_denial_never_contacts_unapproved_authority() {
+        use crate::proxy::tls_test_support::{
+            TlsProxyMode, root_certificate, spawn_redirecting_tls_proxy,
+        };
+        let (address, peer) = spawn_redirecting_tls_proxy(
+            TlsProxyMode::HttpConnect,
+            "https://unapproved.invalid/private?token=secret-canary".to_owned(),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("model.bin");
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            proxy: ProxySetting::Url(format!("http://{address}")),
+            ..DownloadConfig::default()
+        });
+        let clients = AtomicUsize::new(0);
+        let factory = |mut config: HttpClientConfig| {
+            clients.fetch_add(1, Ordering::SeqCst);
+            config.tls_root_certificates.push(root_certificate());
+            HttpClient::with_config(config)
+        };
+        let hosts = vec!["model-host.invalid".to_owned()];
+        let scope = NetworkAcquisitionGuard {
+            hosts: &hosts,
+            bytes_remaining: AtomicU64::new(64),
+            validate_time: &|| Ok(Duration::from_secs(30)),
+            make_client: &factory,
+        };
+        let file = ModelFile {
+            name: "model.bin".to_owned(),
+            size: 64,
+            sha256: "a".repeat(64),
+            url: None,
+        };
+        let clients = &clients;
+        let factory = &factory;
+        let scope = &scope;
+        run_test_with_cx(|cx| async move {
+            let error = downloader
+                .download_single_file_with_client_guarded(
+                    &cx,
+                    "https://model-host.invalid/model.bin",
+                    &destination,
+                    &file,
+                    0,
+                    1,
+                    &|_| {},
+                    factory,
+                    Some(scope),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, SearchError::InvalidConfig { field, .. }
+                if field == "model_acquisition.recovery.source_hosts"));
+            assert!(!error.to_string().contains("secret-canary"));
+            assert_eq!(clients.load(Ordering::SeqCst), 1);
+            assert!(!destination.exists());
+            assert!(!destination.with_extension("tmp").exists());
+        });
+        let observed = peer.join().unwrap();
+        assert!(
+            observed
+                .request_headers
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("host: model-host.invalid")
+        );
+    }
+
+    #[test]
+    fn scoped_network_artifact_budget_cannot_reset_between_attempts() {
+        use crate::proxy::tls_test_support::{root_certificate, spawn_artifact_tls_proxy};
+        let bytes = b"one artifact attempt";
+        let (address, peer) =
+            spawn_artifact_tls_proxy(vec![(bytes.to_vec(), None), (bytes.to_vec(), None)]);
+        let temp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            proxy: ProxySetting::Url(format!("http://{address}")),
+            ..DownloadConfig::default()
+        });
+        let factory = |mut config: HttpClientConfig| {
+            config.tls_root_certificates.push(root_certificate());
+            HttpClient::with_config(config)
+        };
+        let hosts = vec!["model-host.invalid".to_owned()];
+        let scope = NetworkAcquisitionGuard {
+            hosts: &hosts,
+            bytes_remaining: AtomicU64::new(u64::try_from(bytes.len() + 1).unwrap()),
+            validate_time: &|| Ok(Duration::from_secs(30)),
+            make_client: &factory,
+        };
+        let file = ModelFile {
+            name: "model.bin".to_owned(),
+            size: u64::try_from(bytes.len()).unwrap(),
+            sha256: sha256_hex(bytes),
+            url: None,
+        };
+        let factory = &factory;
+        let scope = &scope;
+        run_test_with_cx(|cx| async move {
+            let first = temp.path().join("first");
+            downloader
+                .download_single_file_with_client_guarded(
+                    &cx,
+                    "https://model-host.invalid/model.bin",
+                    &first,
+                    &file,
+                    0,
+                    1,
+                    &|_| {},
+                    factory,
+                    Some(scope),
+                )
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(first).unwrap(), bytes);
+            assert_eq!(scope.bytes_remaining.load(Ordering::Relaxed), 1);
+            let second = temp.path().join("second");
+            let error = downloader
+                .download_single_file_with_client_guarded(
+                    &cx,
+                    "https://model-host.invalid/model.bin",
+                    &second,
+                    &file,
+                    0,
+                    1,
+                    &|_| {},
+                    factory,
+                    Some(scope),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, SearchError::InvalidConfig { field, .. }
+                if field == "model_acquisition.recovery.byte_budget"));
+            assert!(!second.exists());
+        });
+        assert_eq!(peer.join().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "model2vec")]
+    fn network_registered_fixture() -> (crate::RegisteredModel2Vec, Vec<(String, Vec<u8>)>) {
+        use crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        use frankensearch_core::generation::GoldenVectorCertificateV1;
+        let tokenizer = serde_json::to_vec(&serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": {"type": "Lowercase"}, "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null, "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"[UNK]": 0, "hello": 1, "world": 2},
+                      "unk_token": "[UNK]"}
+        }))
+        .unwrap();
+        let data = [1.0_f32, 0.0]
+            .repeat(3)
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut header = serde_json::to_vec(&serde_json::json!({
+            "embeddings": {"dtype": "F32", "shape": [3, 2], "data_offsets": [0, data.len()]}
+        }))
+        .unwrap();
+        while header.len() % 8 != 0 {
+            header.push(b' ');
+        }
+        let mut weights = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        weights.extend_from_slice(&header);
+        weights.extend_from_slice(&data);
+        let bodies = vec![
+            ("model.safetensors".to_owned(), weights),
+            ("tokenizer.json".to_owned(), tokenizer),
+        ];
+        let files = bodies
+            .iter()
+            .map(|(name, bytes)| ModelFile {
+                name: name.clone(),
+                sha256: sha256_hex(bytes),
+                size: u64::try_from(bytes.len()).unwrap(),
+                url: Some(format!("https://model-host.invalid/{name}")),
+            })
+            .collect::<Vec<_>>();
+        let manifest = ModelManifest {
+            id: "network-acquisition-fixture".to_owned(),
+            version: "1".to_owned(),
+            display_name: None,
+            description: None,
+            repo: "fixtures/network-acquisition".to_owned(),
+            revision: "a".repeat(40),
+            download_size_bytes: files.iter().map(|file| file.size).sum(),
+            files,
+            license: "MIT".to_owned(),
+            dimension: Some(2),
+            tier: Some(crate::model_manifest::ModelTier::Fast),
+        };
+        // Analytical unit vectors are independent of the loader/tokenizer.
+        let expected = vec![vec![1.0_f32, 0.0]; MODEL_CONFORMANCE_TEXTS_V1.len()];
+        let certificate =
+            GoldenVectorCertificateV1::from_exact_f32(&MODEL_CONFORMANCE_TEXTS_V1, &expected)
+                .unwrap();
+        let registered =
+            crate::RegisteredModel2Vec::new(manifest, "network-acquisition-fixture", certificate)
+                .unwrap();
+        (registered, bodies)
+    }
+
+    #[cfg(feature = "model2vec")]
+    #[test]
+    fn scoped_network_real_tls_registered_loader_and_expiry_preserve_publication_contract() {
+        use crate::proxy::tls_test_support::{root_certificate, spawn_artifact_tls_proxy};
+        use frankensearch_core::Embedder;
+        for expire_after_load in [false, true] {
+            let (registration, bodies) = network_registered_fixture();
+            let frozen = registration.artifact_manifest().freeze().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().canonicalize().unwrap().join("cache/model");
+            std::fs::create_dir_all(&destination).unwrap();
+            std::fs::write(destination.join("prior"), b"exact prior cache").unwrap();
+            let hosts = vec![
+                "model-host.invalid".to_owned(),
+                "embedding-provider.invalid".to_owned(),
+            ];
+            let target = network_model_acquisition_target(
+                &frozen,
+                ModelTier::Fast,
+                &destination,
+                &hosts,
+                100,
+                1000,
+                "0123456789abcdef0123456789abcdef".to_owned(),
+            )
+            .unwrap();
+            let bound = bound_network_fixture(
+                &target,
+                SemanticReadiness::ModelUnloadable {
+                    tier: ModelTier::Fast,
+                },
+            );
+            let mut responses = vec![(
+                Vec::new(),
+                Some("https://embedding-provider.invalid/approved-model".to_owned()),
+            )];
+            for artifact in &frozen.manifest.artifacts {
+                let bytes = bodies
+                    .iter()
+                    .find(|(name, _)| name == &artifact.relative_path)
+                    .unwrap()
+                    .1
+                    .clone();
+                responses.push((bytes, None));
+            }
+            let (address, peer) = spawn_artifact_tls_proxy(responses);
+            let downloader = ModelDownloader::new(DownloadConfig {
+                max_retries: 0,
+                proxy: ProxySetting::Url(format!("http://{address}")),
+                ..DownloadConfig::default()
+            });
+            let factory = |mut config: HttpClientConfig| {
+                config.tls_root_certificates.push(root_certificate());
+                HttpClient::with_config(config)
+            };
+            let clock = AtomicU64::new(101);
+            let loads = AtomicUsize::new(0);
+            let events = Mutex::new(Vec::new());
+            let frozen = &frozen;
+            run_test_with_cx(|cx| async move {
+                let mut lifecycle = ModelLifecycle::new(
+                    registration.download_manifest().clone(),
+                    DownloadConsent::granted(ConsentSource::Programmatic),
+                );
+                let result = downloader
+                    .acquire_network_model_recovery_with_client(
+                        &cx,
+                        &bound,
+                        ModelAcquisitionRequest {
+                            frozen_manifest: frozen,
+                            source: ModelAcquisitionSource::Network,
+                            destination_dir: &destination,
+                        },
+                        &hosts,
+                        &mut lifecycle,
+                        |progress| events.lock().unwrap().push(progress.stage),
+                        |path, contract| {
+                            let loaded =
+                                crate::Model2VecEmbedder::load_registered(path, &registration)?;
+                            let expected = contract.manifest.declared_identity_bundle(
+                                QuantizationFormat::F32,
+                                IN_MEMORY_F32_STORAGE_FORMAT_V1,
+                            )?;
+                            if loaded.identity()? != &expected {
+                                return Err(local_recovery_error("producer_identity"));
+                            }
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            if expire_after_load {
+                                clock.store(1000, Ordering::SeqCst);
+                            }
+                            Ok(())
+                        },
+                        || Ok(clock.load(Ordering::SeqCst)),
+                        &factory,
+                    )
+                    .await;
+                assert_eq!(loads.load(Ordering::SeqCst), 1);
+                if expire_after_load {
+                    assert!(matches!(result, Err(SearchError::InvalidConfig { .. })));
+                    assert_eq!(
+                        std::fs::read(destination.join("prior")).unwrap(),
+                        b"exact prior cache"
+                    );
+                    assert_eq!(
+                        diagnose_model_acquisition(&destination)
+                            .unwrap()
+                            .preserved_backup_generations,
+                        0
+                    );
+                    assert!(matches!(
+                        lifecycle.state(),
+                        ModelState::VerificationFailed { .. }
+                    ));
+                    assert_eq!(
+                        events.lock().unwrap().last(),
+                        Some(&ModelAcquisitionStageV1::Failed)
+                    );
+                } else {
+                    let receipt = result.unwrap();
+                    assert_eq!(receipt.source, ModelAcquisitionSourceKindV1::Network);
+                    assert!(receipt.requires_reindex && receipt.prior_generation_preserved);
+                    assert_eq!(receipt.bytes_verified, target.byte_budget);
+                    assert!(matches!(
+                        lifecycle.state(),
+                        ModelState::AcquiredNeedsReindex
+                    ));
+                    frozen.manifest.verify_dir(&destination).unwrap();
+                    assert_eq!(
+                        diagnose_model_acquisition(&destination)
+                            .unwrap()
+                            .preserved_backup_generations,
+                        1
+                    );
+                    // A verified winner invalidates the old readiness snapshot.
+                    let mut retry = ModelLifecycle::new(
+                        registration.download_manifest().clone(),
+                        DownloadConsent::granted(ConsentSource::Programmatic),
+                    );
+                    let rejected = downloader
+                        .acquire_network_model_recovery_with_client(
+                            &cx,
+                            &bound,
+                            ModelAcquisitionRequest {
+                                frozen_manifest: frozen,
+                                source: ModelAcquisitionSource::Network,
+                                destination_dir: &destination,
+                            },
+                            &hosts,
+                            &mut retry,
+                            |_| {},
+                            |_, _| panic!("stale plan must not load"),
+                            || Ok(101),
+                            &|_| panic!("stale plan must not contact a source"),
+                        )
+                        .await;
+                    assert!(rejected.is_err());
+                }
+            });
+            let observations = peer.join().unwrap();
+            assert_eq!(observations.len(), frozen.manifest.artifacts.len() + 1);
+            assert!(
+                observations
+                    .iter()
+                    .all(|row| !row.tls_rejected && row.request_headers.is_some())
+            );
+            assert!(
+                observations[1]
+                    .connect_headers
+                    .as_ref()
+                    .unwrap()
+                    .contains("CONNECT embedding-provider.invalid:443")
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_network_whole_stage_timeout_closes_connection_and_records_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        assert!(started.elapsed() < Duration::from_secs(5));
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("loopback accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            read_http_headers(&mut stream).unwrap();
+            // Never answer CONNECT. Closing the scoped stage must close this
+            // socket even though the ordinary request timeout is much longer.
+            let mut byte = [0_u8; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().canonicalize().unwrap().join("cache/model");
+        let frozen = acquisition_fixture();
+        let target = network_model_acquisition_target(
+            &frozen,
+            ModelTier::Fast,
+            &destination,
+            &[],
+            100,
+            102,
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        )
+        .unwrap();
+        let bound = bound_network_fixture(
+            &target,
+            SemanticReadiness::ModelMissing {
+                tier: ModelTier::Fast,
+            },
+        );
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            request_timeout: Duration::from_secs(30),
+            proxy: ProxySetting::Url(format!("http://{address}")),
+            ..DownloadConfig::default()
+        });
+        run_test_with_cx(|cx| async move {
+            let mut lifecycle = recovery_fixture_lifecycle(&frozen);
+            let events = Mutex::new(Vec::new());
+            let result = asupersync::test_utils::assert_completes_within(
+                Duration::from_secs(5),
+                "scoped acquisition deadline",
+                || {
+                    Box::pin(downloader.acquire_network_model_recovery(
+                        &cx,
+                        &bound,
+                        ModelAcquisitionRequest {
+                            frozen_manifest: &frozen,
+                            source: ModelAcquisitionSource::Network,
+                            destination_dir: &destination,
+                        },
+                        &[],
+                        &mut lifecycle,
+                        |progress| events.lock().unwrap().push(progress.stage),
+                        |_, _| panic!("deadline must precede loader execution"),
+                        || Ok(101),
+                    ))
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(!destination.exists());
+            assert!(matches!(
+                lifecycle.state(),
+                ModelState::VerificationFailed { .. }
+            ));
+            assert_eq!(
+                events.lock().unwrap().last(),
+                Some(&ModelAcquisitionStageV1::Failed)
+            );
+        });
+        peer.join().unwrap();
     }
 
     #[cfg(unix)]

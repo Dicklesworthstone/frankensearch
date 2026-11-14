@@ -1161,6 +1161,8 @@ pub enum RecoveryContractError {
     ImmutableReindexBindingChanged,
     #[error("recovery plan field `{field}` is unsupported for local model acquisition")]
     UnsupportedLocalAcquisitionPlan { field: &'static str },
+    #[error("unsupported standalone network acquisition plan: {field}")]
+    UnsupportedNetworkAcquisitionPlan { field: &'static str },
 }
 
 /// Whether retrying the original request can succeed, and under what
@@ -1581,6 +1583,58 @@ impl BoundLocalModelAcquisitionPlan {
     }
 }
 
+/// An exactly authorized standalone network acquisition capability.
+///
+/// The executor independently derives the frozen model, cache, byte budget and
+/// finite HTTPS source-host set. Every request and redirect must stay inside
+/// that set before expiry. This grants no corpus, index, or query replay work.
+/// A wire plan cannot recreate this executable capability.
+///
+/// ```compile_fail
+/// use frankensearch_core::recovery_plan::BoundNetworkModelAcquisitionPlan;
+/// let _: BoundNetworkModelAcquisitionPlan = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct BoundNetworkModelAcquisitionPlan {
+    plan: RecoveryPlan,
+}
+
+impl BoundNetworkModelAcquisitionPlan {
+    /// Canonical plan retained by the executor and its terminal response.
+    #[must_use]
+    pub const fn plan(&self) -> &RecoveryPlan {
+        &self.plan
+    }
+
+    /// Exact frozen scope; never a generic download-consent flag.
+    #[must_use]
+    pub fn authorization(&self) -> &ModelAcquisitionAuthorization {
+        self.plan
+            .action
+            .as_ref()
+            .and_then(RecoveryAction::required_authorization)
+            .expect("bound network acquisition retains its exact authorization")
+    }
+
+    /// Recheck actual execution scope and trusted current time.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a changed scope, invalid authorization or expired grant.
+    pub fn validate_binding_at(
+        &self,
+        actual: &ModelAcquisitionTarget,
+        evaluation_time_unix_seconds: u64,
+    ) -> Result<(), RecoveryContractError> {
+        let actual = actual.authorization_for(NetworkPolicy::Allowed)?;
+        if let Some(field) = mismatched_authorization_field(self.authorization(), &actual) {
+            return Err(RecoveryContractError::MismatchedAcquisitionAuthorization { field });
+        }
+        self.plan
+            .validate_for_execution_at(evaluation_time_unix_seconds)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecoveryPlanWire {
@@ -1715,11 +1769,53 @@ impl RecoveryPlan {
     /// Refuses noncanonical plans, unsupported scope, absent or mismatched
     /// consent, and authorization outside its trusted execution-time window.
     pub fn bind_local_model_acquisition(
-        mut self,
+        self,
         target: &ModelAcquisitionTarget,
         evaluation_time_unix_seconds: u64,
     ) -> Result<BoundLocalModelAcquisitionPlan, RecoveryContractError> {
-        let unsupported = |field| RecoveryContractError::UnsupportedLocalAcquisitionPlan { field };
+        let plan = self.bind_standalone_model_acquisition(
+            target,
+            evaluation_time_unix_seconds,
+            NetworkPolicy::Offline,
+        )?;
+        Ok(BoundLocalModelAcquisitionPlan { plan })
+    }
+
+    /// Bind exact standalone network acquisition without enabling a generic
+    /// recovery executor. The consumer enforces HTTPS hosts, cumulative artifact
+    /// byte budget, frozen model, cache destination and expiry.
+    ///
+    /// # Errors
+    ///
+    /// Refuses noncanonical plans, corpus/index work, missing or mismatched
+    /// authorization, unsupported state/topology, and invalid time windows.
+    pub fn bind_network_model_acquisition(
+        self,
+        target: &ModelAcquisitionTarget,
+        evaluation_time_unix_seconds: u64,
+    ) -> Result<BoundNetworkModelAcquisitionPlan, RecoveryContractError> {
+        let plan = self.bind_standalone_model_acquisition(
+            target,
+            evaluation_time_unix_seconds,
+            NetworkPolicy::Allowed,
+        )?;
+        Ok(BoundNetworkModelAcquisitionPlan { plan })
+    }
+
+    fn bind_standalone_model_acquisition(
+        mut self,
+        target: &ModelAcquisitionTarget,
+        evaluation_time_unix_seconds: u64,
+        network: NetworkPolicy,
+    ) -> Result<Self, RecoveryContractError> {
+        let unsupported = |field| match network {
+            NetworkPolicy::Offline => {
+                RecoveryContractError::UnsupportedLocalAcquisitionPlan { field }
+            }
+            NetworkPolicy::Allowed => {
+                RecoveryContractError::UnsupportedNetworkAcquisitionPlan { field }
+            }
+        };
         if !matches!(
             self.state,
             SemanticReadiness::ModelMissing { .. } | SemanticReadiness::ModelUnloadable { .. }
@@ -1733,7 +1829,7 @@ impl RecoveryPlan {
         if self.requested_topology != topology || self.mode != RequestMode::ExplicitSemantic {
             return Err(unsupported("request"));
         }
-        if self.policy.network != NetworkPolicy::Offline
+        if self.policy.network != network
             || target.destination_class != ModelDestinationClass::ManagedCache
             || target.document_count != 0
             || target.estimated_reindex_duration_ms != 0
@@ -1766,12 +1862,24 @@ impl RecoveryPlan {
             } else {
                 "recovery.action.reacquire_model"
             },
-            "Import exactly the authorized frozen local model into its bound cache. Verify \
-             every artifact and the registered producer before publication; preserve any prior \
-             cache as a backup. The verified model still needs a separately admitted compatible \
-             index. This action grants no network, corpus, index mutation, or query replay.",
+            match network {
+                NetworkPolicy::Offline => {
+                    "Import exactly the authorized frozen local model into its bound cache. Verify \
+                    every artifact and the registered producer before publication; preserve any prior \
+                    cache as a backup. The verified model still needs a separately admitted compatible \
+                    index. This action grants no network, corpus, index mutation, or query replay."
+                }
+                NetworkPolicy::Allowed => {
+                    "Download exactly the authorized frozen model into its bound cache. \
+                    Every HTTPS request and redirect must remain within the approved source hosts \
+                    and cumulative artifact byte budget before expiry. Verify every artifact and the \
+                    registered producer before publication; preserve any prior cache as a backup. \
+                    A compatible index still needs separate admission. No corpus, index mutation, \
+                    or query replay is authorized."
+                }
+            },
             &[],
-            false,
+            network == NetworkPolicy::Allowed,
             true,
             true,
             false,
@@ -1780,7 +1888,7 @@ impl RecoveryPlan {
         action.required_authorization = Some(required_authorization);
         self.action = Some(action);
         self.retryability = Retryability::AfterAction;
-        Ok(BoundLocalModelAcquisitionPlan { plan: self })
+        Ok(self)
     }
 
     /// Wire schema version.
@@ -3001,6 +3109,120 @@ mod tests {
             assert!(
                 canonical
                     .bind_local_model_acquisition(&target, TEST_NOW_UNIX_SECONDS)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn network_acquisition_binding_requires_exact_hosts_and_keeps_generic_guards() {
+        for tier in [ModelTier::Fast, ModelTier::Quality] {
+            let topology = match tier {
+                ModelTier::Fast => RetrievalTopology::FastOnly,
+                ModelTier::Quality => RetrievalTopology::QualityOnly,
+            };
+            for state in [missing(tier), unloadable(tier)] {
+                let mut target = target_for(tier);
+                target.document_count = 0;
+                target.estimated_reindex_duration_ms = 0;
+                target.network_source_hosts = vec![
+                    "cdn.example.test:8443".to_owned(),
+                    "models.example.test".to_owned(),
+                ];
+                let mut policy = RecoveryPolicy {
+                    interaction: InteractionPolicy::NonInteractive,
+                    network: NetworkPolicy::Allowed,
+                    acquisition_authorization: None,
+                };
+                let unapproved = plan(
+                    state.clone(),
+                    explicit(topology),
+                    policy.clone(),
+                    Some(&target),
+                )
+                .unwrap();
+                assert!(matches!(
+                    unapproved.bind_network_model_acquisition(&target, TEST_NOW_UNIX_SECONDS),
+                    Err(RecoveryContractError::MissingAcquisitionAuthorization)
+                ));
+                policy.acquisition_authorization =
+                    Some(target.authorization_for(NetworkPolicy::Allowed).unwrap());
+                let canonical = plan(state, explicit(topology), policy, Some(&target)).unwrap();
+                assert_eq!(canonical.retryability(), Retryability::BlockedByCapability);
+                assert!(!canonical.action().unwrap().prerequisites().is_empty());
+                let bound = canonical
+                    .clone()
+                    .bind_network_model_acquisition(&target, TEST_NOW_UNIX_SECONDS)
+                    .unwrap();
+                assert!(!bound.plan().semantic_available());
+                assert!(bound.plan().response_contract().is_none());
+                let action = bound.plan().action().unwrap();
+                assert!(action.network_required());
+                assert!(action.argv().is_empty());
+                assert!(action.prerequisites().is_empty());
+                assert_eq!(
+                    action.expected_postcondition(),
+                    "recovery.post.model_acquired_needs_reindex"
+                );
+                let mut changed = target.clone();
+                changed
+                    .network_source_hosts
+                    .push("unapproved.example.test".to_owned());
+                assert!(matches!(
+                    bound.validate_binding_at(&changed, TEST_NOW_UNIX_SECONDS),
+                    Err(RecoveryContractError::MismatchedAcquisitionAuthorization {
+                        field: "source"
+                    })
+                ));
+                assert!(
+                    bound
+                        .validate_binding_at(&target, target.expires_at_unix_seconds)
+                        .is_err()
+                );
+                let mut forged = canonical;
+                forged.action.as_mut().unwrap().expected_postcondition =
+                    "recovery.state.ready".to_owned();
+                assert!(matches!(
+                    forged.bind_network_model_acquisition(&target, TEST_NOW_UNIX_SECONDS),
+                    Err(RecoveryContractError::UnsupportedNetworkAcquisitionPlan {
+                        field: "canonical_plan"
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn network_acquisition_binding_refuses_offline_and_corpus_authority() {
+        for (network, documents, duration, topology) in [
+            (NetworkPolicy::Offline, 0, 0, RetrievalTopology::FastOnly),
+            (NetworkPolicy::Allowed, 1, 0, RetrievalTopology::FastOnly),
+            (NetworkPolicy::Allowed, 0, 1, RetrievalTopology::FastOnly),
+            (
+                NetworkPolicy::Allowed,
+                0,
+                0,
+                RetrievalTopology::FullProgressive,
+            ),
+        ] {
+            let mut target = target_for(ModelTier::Fast);
+            target.document_count = documents;
+            target.estimated_reindex_duration_ms = duration;
+            let policy = RecoveryPolicy {
+                interaction: InteractionPolicy::NonInteractive,
+                network,
+                acquisition_authorization: Some(target.authorization_for(network).unwrap()),
+            };
+            let canonical = plan(
+                missing(ModelTier::Fast),
+                explicit(topology),
+                policy,
+                Some(&target),
+            )
+            .unwrap();
+            assert!(
+                canonical
+                    .bind_network_model_acquisition(&target, TEST_NOW_UNIX_SECONDS)
                     .is_err()
             );
         }
