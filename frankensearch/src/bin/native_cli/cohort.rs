@@ -307,6 +307,37 @@ impl<'a> Prepared<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn progressive_tier_with_reranker<'q>(
+        &'q self,
+        cx: &'q Cx,
+        text: &'q str,
+        limit: usize,
+        tier: frankensearch_core::generation::EmbedderTierTag,
+        reranker: &'q dyn Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<Progressive<'q>> {
+        match self {
+            Self::Single(query) => Ok(Progressive::Single(Box::new(
+                query.progressive_tier_with_reranker(
+                    cx, text, limit, tier, reranker, window, pool,
+                )?,
+            ))),
+            Self::Sharded { index, scope } => {
+                let stream = match scope {
+                    Some(scope) => scope.progressive_tier_with_reranker(
+                        cx, text, limit, tier, reranker, window, pool,
+                    )?,
+                    None => index.progressive_tier_with_reranker(
+                        cx, text, limit, tier, reranker, window, pool,
+                    )?,
+                };
+                Ok(Progressive::Sharded(Box::new(stream)))
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn progressive_with_reranker<'q>(
         &'q self,

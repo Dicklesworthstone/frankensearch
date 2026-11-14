@@ -114,6 +114,9 @@ Full-mode query tuning (search/serve, not with --lexical-only):\n\
   Example: --full-query '{\"candidate_multiplier\":5,\"quality_ef\":128}'\n\
   Fast/quality-only serve requests retain their ordinary policy. Tuned full\n\
   queries use progressive candidate reuse, including buffered collection.\n\n\
+Reranking supports fast, quality and full requests on single and sharded cohorts.\n\
+Fast/quality use only the selected query model, then lazily rerank retained source.\n\
+The original query deadline covers all requested phases.\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
 Updates use op=upsert with those fields, or {\"op\":\"delete\",\"id\":\"...\"}.\n\
 The last update for an ID wins; every input record must be valid.\n\
@@ -384,14 +387,6 @@ impl Options {
         }
         if seen.contains("--rerank-window") && options.reranker_dir.is_none() {
             return Err(bad("--rerank-window requires --reranker-dir"));
-        }
-        if command == Command::Search
-            && options.reranker_dir.is_some()
-            && options.mode != Mode::Full
-        {
-            return Err(bad(
-                "reranking requires --mode full; primary-tier modes explicitly skip it",
-            ));
         }
         if matches!(
             command,

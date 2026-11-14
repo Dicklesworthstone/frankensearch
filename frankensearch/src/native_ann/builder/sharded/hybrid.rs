@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch_core::ParsedQuery;
-use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
+use frankensearch_core::generation::{
+    ArtifactGenerationIdentityV1, EmbedderTierTag, GenerationComponentReceiptV1,
+};
 use frankensearch_quill::{QuillConfig, QuillSearchIndex};
 use serde::{Deserialize, Serialize};
 
@@ -584,6 +586,71 @@ impl NativeBuiltShardedHybridIndex {
                 pool,
             )
             .map(NativeShardedProgressiveSearch::with_immutable_query)
+    }
+
+    /// Retrieve one complete tier and lazily rerank its retained source window.
+    ///
+    /// The selected query is embedded once across all partitions. Quality-primary
+    /// results keep quality shard coordinates and scores through every phase;
+    /// no fast inference or fabricated refinement runs. The optional caller pool
+    /// retains the same complete inventory during vector traversal.
+    ///
+    /// # Errors
+    /// Refuses absent quality or invalid selected inventory admission even for
+    /// zero-k requests, and propagates rerank-window and cancellation errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn progressive_tier_with_reranker<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        selected: EmbedderTierTag,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.sharded_hybrid.primary_rerank")?;
+        let first = &self.vectors.partitions[0];
+        let (shards, tier) = match selected {
+            EmbedderTierTag::Fast => (&self.vectors.fast, &first.fast),
+            EmbedderTierTag::Quality => {
+                match (self.vectors.quality.as_ref(), first.quality.as_ref()) {
+                    (Some(shards), Some(tier)) => (shards, tier),
+                    _ => {
+                        return Err(rejected(
+                            "quality",
+                            "quality-primary search requires a complete quality tier",
+                        ));
+                    }
+                }
+            }
+        };
+        let query = match pool {
+            Some(pool) => shards.search_hybrid_progressive_with_pool(
+                cx,
+                tier.embedder(),
+                None,
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )?,
+            None => shards.search_hybrid_progressive(
+                cx,
+                tier.embedder(),
+                None,
+                &self.lexical,
+                text,
+                k,
+            )?,
+        }
+        .with_immutable_query();
+        let query = if selected == EmbedderTierTag::Quality {
+            query.with_quality_primary()
+        } else {
+            query
+        };
+        query.with_reranker(reranker, self.text.as_ref(), window)
     }
 
     /// Add lazy cross-encoder ordering of source text from this exact cohort.

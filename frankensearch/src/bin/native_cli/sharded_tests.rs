@@ -89,10 +89,14 @@ impl Embedder for Provider {
         usize::try_from(self.identity.space.dimension).unwrap()
     }
     fn is_semantic(&self) -> bool {
-        false
+        self.identity.space.kind == frankensearch_core::generation::EmbeddingSpaceKindV1::Semantic
     }
     fn category(&self) -> ModelCategory {
-        ModelCategory::HashEmbedder
+        if self.is_semantic() {
+            ModelCategory::TransformerEmbedder
+        } else {
+            ModelCategory::HashEmbedder
+        }
     }
 }
 
@@ -397,6 +401,7 @@ fn sharded_filters_refill_before_cutoffs_and_intersect_without_widening() {
 struct Scorer {
     calls: AtomicUsize,
     seen: Mutex<Vec<RerankDocument>>,
+    fail: AtomicBool,
 }
 impl Reranker for Scorer {
     fn id(&self) -> &'static str {
@@ -414,6 +419,12 @@ impl Reranker for Scorer {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.seen.lock().unwrap() = docs.to_vec();
+            if self.fail.swap(false, Ordering::SeqCst) {
+                return Err(SearchError::RerankFailed {
+                    model: self.id().to_owned(),
+                    source: "injected sharded scorer failure".into(),
+                });
+            }
             Ok(docs
                 .iter()
                 .enumerate()
@@ -531,6 +542,201 @@ fn shared_stream_delivers_before_each_model_and_preserves_reranked_shard_rows() 
                 index.vectors().document(&doc.doc_id).unwrap().content
             );
         }
+    });
+}
+
+#[test]
+fn primary_sharded_reranking_reopens_all_partitions_and_keeps_selected_tier_provenance() {
+    use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
+    use std::time::Duration;
+    run_test_with_cx(|cx| async move {
+        let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 2);
+        for exact in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut opts = options();
+            opts.exact = exact;
+            let mut fast = Provider::new("semantic-shaped-sharded-fast", 2);
+            let mut quality = Provider::new("semantic-shaped-sharded-quality", 3);
+            for provider in [&mut fast, &mut quality] {
+                // Synthetic identity shape, never evidence of model qualification.
+                let identity = &mut Arc::get_mut(provider).unwrap().identity;
+                identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+                identity.space.hash_control = None;
+                identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+                identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+                    role: "weights".to_owned(),
+                    sha256: "b".repeat(64),
+                    size: 1,
+                }];
+                identity.producer.space_fingerprint = identity.space.fingerprint();
+                identity.validate().unwrap();
+            }
+            let models = Models {
+                fast: fast.clone(),
+                quality: Some(quality.clone()),
+            };
+            let (built, selected) = build(
+                &cx,
+                &opts,
+                &root.path().join("index"),
+                documents(),
+                models.clone(),
+                2,
+            )
+            .await
+            .unwrap();
+            drop(built);
+            let Opened::Sharded(index) = Opened::open(&cx, &selected, models).await.unwrap() else {
+                panic!("the persisted receipt must reopen its complete shard inventory");
+            };
+            let scorer = Arc::new(Scorer::default());
+            let public = filter::Filter::parse(r#"{"metadata":{"tenant":"public"}}"#).unwrap();
+            let empty = filter::Filter::parse(r#"{"ids":[]}"#).unwrap();
+            for use_pool in [false, true] {
+                let policy = query::Policy {
+                    rerank: Some(query::Rerank::new(scorer.clone(), 4).unwrap()),
+                    query_pool: use_pool.then(|| pool.handle()),
+                    ..query::Policy::default()
+                };
+                for (mode, selected_model, other) in [
+                    (Mode::Fast, &fast, &quality),
+                    (Mode::Quality, &quality, &fast),
+                ] {
+                    for scope in [None, Some(&public)] {
+                        let before = (
+                            selected_model.queries.load(Ordering::SeqCst),
+                            other.queries.load(Ordering::SeqCst),
+                        );
+                        let page = query::buffered(
+                            &index,
+                            &cx,
+                            "needle -private",
+                            mode,
+                            1,
+                            [scope, None],
+                            &policy,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(page["phase"], "reranked");
+                        assert_eq!(page["results"][0]["doc_id"], "public-last");
+                        assert_eq!(page["evaluated"], 4);
+                        assert_eq!(selected_model.queries.load(Ordering::SeqCst), before.0 + 1);
+                        assert_eq!(other.queries.load(Ordering::SeqCst), before.1);
+                        assert_rows(&index, &page);
+                        let (row, score, absent_row, absent_score) = if mode == Mode::Quality {
+                            ("quality_row", "quality_score", "fast_row", "fast_score")
+                        } else {
+                            ("fast_row", "fast_score", "quality_row", "quality_score")
+                        };
+                        let hit = &page["results"][0];
+                        assert!(hit[row].is_object());
+                        assert!(hit[score].is_number());
+                        assert!(hit[absent_row].is_null());
+                        assert!(hit[absent_score].is_null());
+                        for document in scorer.seen.lock().unwrap().iter() {
+                            assert!(document.doc_id.starts_with("public-"));
+                            assert_eq!(
+                                document.text,
+                                index.vectors().document(&document.doc_id).unwrap().content
+                            );
+                        }
+                    }
+                    let mut request = request();
+                    request.mode = Some(mode);
+                    request.query = "needle -private".to_owned();
+                    let mut output = Vec::new();
+                    assert!(
+                        serve::stream_one(
+                            &index,
+                            &cx,
+                            &request,
+                            1,
+                            (mode, 1),
+                            &mut output,
+                            None,
+                            &policy
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    let result = frames(&output);
+                    assert_eq!(result.len(), 4);
+                    assert_eq!(
+                        result[1]["phase"],
+                        if mode == Mode::Quality {
+                            "quality"
+                        } else {
+                            "initial"
+                        }
+                    );
+                    assert_eq!(result[2]["phase"], "reranked");
+                    let (selected_count, absent_count) = if mode == Mode::Quality {
+                        ("quality", "fast")
+                    } else {
+                        ("fast", "quality")
+                    };
+                    for page in [&result[1], &result[2]] {
+                        assert_eq!(page["candidates"][selected_count], 4);
+                        assert_eq!(page["candidates"][absent_count], 0);
+                        assert_rows(&index, page);
+                    }
+                    scorer.fail.store(true, Ordering::SeqCst);
+                    let mut output = Vec::new();
+                    assert!(
+                        !serve::stream_one(
+                            &index,
+                            &cx,
+                            &request,
+                            2,
+                            (mode, 1),
+                            &mut output,
+                            None,
+                            &policy
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    let result = frames(&output);
+                    assert_eq!(result[2]["phase"], "rerank_failed");
+                    assert_eq!(result[2]["results"], result[1]["results"]);
+                    assert_eq!(result[3]["status"], "degraded");
+                    assert_rows(&index, &result[2]);
+                    scorer.fail.store(true, Ordering::SeqCst);
+                    assert!(
+                        query::buffered(
+                            &index,
+                            &cx,
+                            "needle",
+                            mode,
+                            1,
+                            [Some(&public), None],
+                            &policy
+                        )
+                        .await
+                        .is_err()
+                    );
+                    let before = (
+                        selected_model.queries.load(Ordering::SeqCst),
+                        scorer.calls.load(Ordering::SeqCst),
+                    );
+                    for (text, limit, scope) in [
+                        ("needle", 0, None),
+                        ("needle", 1, Some(&empty)),
+                        ("-private", 3, None),
+                    ] {
+                        let page =
+                            query::buffered(&index, &cx, text, mode, limit, [scope, None], &policy)
+                                .await
+                                .unwrap();
+                        assert_eq!(page["rerank_applied"], false);
+                    }
+                    assert_eq!(selected_model.queries.load(Ordering::SeqCst), before.0);
+                    assert_eq!(scorer.calls.load(Ordering::SeqCst), before.1);
+                }
+            }
+        }
+        assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
     });
 }
 

@@ -2755,6 +2755,441 @@ mod retained_recovery_tests {
 
     #[cfg(feature = "semantic-support")]
     #[test]
+    fn retained_maintenance_preserves_fast_full_and_quality_only_generations() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            for topology in ["fast", "full", "quality"] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut runtime, source, root) = fixture(directory.path());
+                fs::write(source.join("beta.md"), "sharedtoken original beta document").unwrap();
+                runtime.config.search.fast_only = topology == "fast";
+                runtime.cli_input.quality_only = topology == "quality";
+                if topology == "quality" {
+                    "unused-invalid-fast-producer"
+                        .clone_into(&mut runtime.config.indexing.fast_model);
+                    runtime.config.indexing.fast_window_max_per_file = 4;
+                }
+                let mut prepared = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+                prepared.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+                let (publication, mut retained) = prepared.restore(&cx).unwrap();
+                let GenerationPublication::Durable(original) = publication else {
+                    panic!("source fixture must publish durably");
+                };
+                let original_bytes = file_bytes(original.path());
+                let mode = FsfsRuntime::retained_generation_search_mode(original.path()).unwrap();
+                assert_eq!(
+                    mode,
+                    match topology {
+                        "fast" => SearchExecutionMode::FastOnly,
+                        "full" => SearchExecutionMode::Full,
+                        _ => SearchExecutionMode::QualityOnly,
+                    }
+                );
+
+                // Ordinary maintenance commands carry no quality-only search
+                // flag. The admitted generation, not this process's query
+                // preference, determines which independent producers run.
+                let mut command = fresh_runtime(&runtime);
+                command.cli_input.quality_only = false;
+                command.cli_input.command = CliCommand::AppendBatch;
+                let input = directory.path().join("append.jsonl");
+                let long_body = format!(
+                    "sharedtoken replacement alpha {} terminallexicaltoken",
+                    "long document body ".repeat(250),
+                );
+                fs::write(
+                    &input,
+                    format!(
+                        "{}\n{}\n",
+                        serde_json::json!({"id": "alpha.md", "text": long_body}),
+                        serde_json::json!({"id": "gamma.md", "text": "sharedtoken appended gamma"}),
+                    ),
+                )
+                .unwrap();
+                command.cli_input.input_file = Some(input);
+                reset_document_counts(&models);
+                let (publication, added) = command
+                    .append_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                assert_eq!(added, 2);
+                let Some(GenerationPublication::Durable(appended)) = publication else {
+                    panic!("append must publish durably");
+                };
+                assert_eq!(
+                    models.fast.embedded_documents.load(Ordering::Relaxed),
+                    if topology == "quality" { 0 } else { 2 }
+                );
+                assert_eq!(
+                    models.quality.embedded_documents.load(Ordering::Relaxed),
+                    if topology == "fast" { 0 } else { 2 }
+                );
+                assert_eq!(
+                    FsfsRuntime::retained_generation_search_mode(appended.path()).unwrap(),
+                    mode
+                );
+                let appended_bytes = file_bytes(appended.path());
+
+                let operations = [
+                    retained_batch::RetainedMutation::Delete {
+                        id: "beta.md".to_owned(),
+                    },
+                    retained_batch::RetainedMutation::Upsert {
+                        id: "delta.md".to_owned(),
+                        text: "sharedtoken mixed delta".to_owned(),
+                    },
+                ];
+                reset_document_counts(&models);
+                let changed = command
+                    .apply_retained_batch(&cx, &root, &appended, &operations)
+                    .await
+                    .unwrap();
+                assert_eq!((changed.upserted, changed.deleted), (1, 1));
+                let Some(GenerationPublication::Durable(mixed)) = changed.publication else {
+                    panic!("mixed mutation must publish durably");
+                };
+                assert_eq!(
+                    models.fast.embedded_documents.load(Ordering::Relaxed),
+                    usize::from(topology != "quality")
+                );
+                assert_eq!(
+                    models.quality.embedded_documents.load(Ordering::Relaxed),
+                    usize::from(topology != "fast")
+                );
+                assert_eq!(
+                    FsfsRuntime::retained_generation_search_mode(mixed.path()).unwrap(),
+                    mode
+                );
+
+                command.cli_input.command = CliCommand::Delete;
+                command.cli_input.delete_ids = vec!["gamma.md".to_owned()];
+                reset_document_counts(&models);
+                let (publication, deleted) = command
+                    .delete_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                assert_eq!(deleted, 1);
+                let Some(GenerationPublication::Durable(deleted)) = publication else {
+                    panic!("delete must publish durably");
+                };
+                let deleted_bytes = file_bytes(deleted.path());
+                command.cli_input.command = CliCommand::Compact;
+                let (publication, compacted) = command
+                    .compact_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                let Some(GenerationPublication::Durable(compacted_generation)) = publication else {
+                    panic!("compact must publish durably");
+                };
+                assert_eq!(compacted["total_records_after"], 2);
+                if topology == "quality" {
+                    assert_eq!(compacted["primary_tier"], "quality");
+                    assert!(
+                        !compacted_generation
+                            .path()
+                            .join(FSFS_VECTOR_INDEX_FILE)
+                            .exists()
+                    );
+                }
+                assert_eq!(
+                    FsfsRuntime::retained_generation_search_mode(compacted_generation.path())
+                        .unwrap(),
+                    mode
+                );
+                assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+                assert_eq!(models.quality.embedded_documents.load(Ordering::Relaxed), 0);
+                for (relative, present) in [
+                    (FSFS_VECTOR_INDEX_FILE, topology != "quality"),
+                    (FSFS_VECTOR_QUALITY_INDEX_FILE, topology != "fast"),
+                ] {
+                    let path = compacted_generation.path().join(relative);
+                    assert_eq!(path.exists(), present);
+                    if present {
+                        let ids = VectorIndex::open_read_only(&path)
+                            .unwrap()
+                            .live_doc_ids()
+                            .unwrap();
+                        assert_eq!(
+                            ids,
+                            HashSet::from(["alpha.md".to_owned(), "delta.md".to_owned()])
+                        );
+                    }
+                }
+
+                let old = retained.search(&cx, "sharedtoken", 10).await.unwrap();
+                assert_eq!(
+                    old.last()
+                        .unwrap()
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["alpha.md", "beta.md"])
+                );
+                let mut fresh = fresh_runtime(&runtime)
+                    .open_retained_search(&cx, &root)
+                    .await
+                    .unwrap();
+                let current = fresh.search(&cx, "sharedtoken", 10).await.unwrap();
+                assert_eq!(
+                    current
+                        .last()
+                        .unwrap()
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["alpha.md", "delta.md"])
+                );
+                let mut lexical = fresh_runtime(&command);
+                lexical.config.pressure.degradation_override =
+                    crate::config::DegradationOverrideMode::ForceLexicalOnly;
+                let mut lexical_reader = lexical.open_retained_search(&cx, &root).await.unwrap();
+                assert_eq!(
+                    lexical_reader
+                        .search(&cx, "terminallexicaltoken", 10)
+                        .await
+                        .unwrap()[0]
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<Vec<_>>(),
+                    ["alpha.md"]
+                );
+                assert_eq!(file_bytes(original.path()), original_bytes);
+                assert_eq!(file_bytes(appended.path()), appended_bytes);
+                assert_eq!(file_bytes(deleted.path()), deleted_bytes);
+                if topology == "quality" {
+                    assert!(
+                        fresh_runtime(&command)
+                            .open_retained_search(&cx, &root)
+                            .await
+                            .is_err(),
+                        "ordinary Full search still requires its fast producer"
+                    );
+                    assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn quality_only_maintenance_failures_preserve_the_selected_reader() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            runtime.cli_input.quality_only = true;
+            "unused-invalid-fast-producer".clone_into(&mut runtime.config.indexing.fast_model);
+            runtime.config.indexing.model_dir =
+                directory.path().join("absent-models").display().to_string();
+            let mut prepared = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            prepared.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            let (publication, mut retained) = prepared.restore(&cx).unwrap();
+            let GenerationPublication::Durable(original) = publication else {
+                panic!("source fixture must publish durably");
+            };
+            let before = file_bytes(original.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let operations = [retained_batch::RetainedMutation::Upsert {
+                id: "new.md".to_owned(),
+                text: "sharedtoken new document".to_owned(),
+            }];
+            for failure in ["missing", "changed", "inference", "cancelled"] {
+                models
+                    .quality
+                    .changed
+                    .store(failure == "changed", Ordering::Relaxed);
+                models
+                    .quality
+                    .fail_documents
+                    .store(failure == "inference", Ordering::Relaxed);
+                set_test_quality_embedder(if failure == "missing" {
+                    None
+                } else {
+                    Some(models.quality.clone())
+                });
+                let mut command = fresh_runtime(&runtime);
+                command.cli_input.quality_only = false;
+                reset_document_counts(&models);
+                cx.set_cancel_requested(failure == "cancelled");
+                let result = command
+                    .apply_retained_batch(&cx, &root, &original, &operations)
+                    .await;
+                cx.set_cancel_requested(false);
+                let error = result.expect_err("required quality cannot be silently dropped");
+                match failure {
+                    "missing" => assert!(matches!(error, SearchError::EmbedderUnavailable { .. })),
+                    "changed" => {
+                        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }))
+                    }
+                    "inference" => assert!(matches!(error, SearchError::EmbeddingFailed { .. })),
+                    _ => assert!(matches!(error, SearchError::Cancelled { .. })),
+                }
+                assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    pointer
+                );
+                assert_eq!(file_bytes(original.path()), before);
+            }
+            models.quality.changed.store(false, Ordering::Relaxed);
+            models
+                .quality
+                .fail_documents
+                .store(false, Ordering::Relaxed);
+            set_test_quality_embedder(Some(models.quality.clone()));
+            let mut command = fresh_runtime(&runtime);
+            command.cli_input.quality_only = false;
+            command.cli_input.delete_ids = vec!["alpha.md".to_owned()];
+            let failed = command
+                .delete_retained_generation_with_precommit(&cx, &root, |_| {
+                    Err(retained_recovery_error("injected post-seal refusal"))
+                })
+                .await;
+            assert!(failed.is_err());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(file_bytes(original.path()), before);
+            assert_eq!(
+                retained.search(&cx, REBUILD_QUERY, 10).await.unwrap()[0]
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+            command.cli_input.delete_ids = vec!["absent.md".to_owned()];
+            assert!(
+                command
+                    .delete_retained_generation(&cx, &root)
+                    .await
+                    .unwrap()
+                    .0
+                    .is_none()
+            );
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn retained_maintenance_refuses_sealed_but_contradictory_tier_intent() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            for fault in [
+                "missing_fast",
+                "missing_quality",
+                "quality_conflict",
+                "quality_intent",
+                "lexical_conflict",
+                "schema",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let (runtime, _, root) = fixture(directory.path());
+                let original = publish(&runtime, &cx, &root).await;
+                let original_bytes = file_bytes(original.path());
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let build = store.begin(&cx).unwrap();
+                retained_reuse::copy_selected_generation(&cx, &runtime, &store, build.path())
+                    .unwrap();
+                let mut sentinel = FsfsRuntime::read_index_sentinel(build.path())
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    sentinel
+                        .reason_codes
+                        .iter()
+                        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_BUILT)
+                );
+                match fault {
+                    "missing_fast" => {
+                        fs::rename(
+                            build.path().join(FSFS_VECTOR_INDEX_FILE),
+                            build.path().join("saved-fast.fsvi"),
+                        )
+                        .unwrap();
+                    }
+                    "missing_quality" => {
+                        fs::rename(
+                            build.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE),
+                            build.path().join("saved-quality.fsvi"),
+                        )
+                        .unwrap();
+                    }
+                    "quality_conflict" => sentinel
+                        .reason_codes
+                        .push(REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY.to_owned()),
+                    "quality_intent" => sentinel
+                        .reason_codes
+                        .push(REASON_VECTOR_FAST_TIER_SKIPPED_QUALITY_ONLY.to_owned()),
+                    "lexical_conflict" => sentinel
+                        .reason_codes
+                        .push(REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY.to_owned()),
+                    _ => sentinel.schema_version = 2,
+                }
+                runtime
+                    .write_index_sentinel(build.path(), &sentinel)
+                    .unwrap();
+                // The container seal certifies these exact bytes, not engine
+                // topology. Manufacture that weaker receipt deliberately:
+                // every real maintenance consumer must reject it independently.
+                let GenerationPublication::Durable(invalid) =
+                    build.publish(&cx, |_, _| Ok(())).unwrap()
+                else {
+                    panic!("invalid engine fixture still needs a durable container");
+                };
+                let before = file_bytes(invalid.path());
+                let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+                reset_document_counts(&models);
+                let mut command = fresh_runtime(&runtime);
+                command.cli_input.delete_ids = vec!["alpha.md".to_owned()];
+                let delete = command
+                    .delete_retained_generation(&cx, &root)
+                    .await
+                    .unwrap_err();
+                let compact = command
+                    .compact_retained_generation(&cx, &root)
+                    .await
+                    .unwrap_err();
+                let batch = command
+                    .apply_retained_batch(
+                        &cx,
+                        &root,
+                        &invalid,
+                        &[retained_batch::RetainedMutation::Upsert {
+                            id: "new.md".to_owned(),
+                            text: "sharedtoken new document".to_owned(),
+                        }],
+                    )
+                    .await
+                    .unwrap_err();
+                for error in [delete, compact, batch] {
+                    assert!(
+                        matches!(error, SearchError::InvalidConfig { ref field, .. }
+                            if field.ends_with(".topology")),
+                        "{fault}: {error:?}"
+                    );
+                }
+                assert_eq!(models.fast.embedded_documents.load(Ordering::Relaxed), 0);
+                assert_eq!(models.quality.embedded_documents.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    pointer
+                );
+                assert_eq!(file_bytes(invalid.path()), before);
+                assert_eq!(file_bytes(original.path()), original_bytes);
+            }
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
     fn quality_only_rebuild_resume_reuses_quality_rows_under_the_original_guard() {
         on_runtime(|cx| async move {
             let models = RecoveryModels::install();

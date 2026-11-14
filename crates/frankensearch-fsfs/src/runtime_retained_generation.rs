@@ -320,6 +320,75 @@ async fn reclaim_unpublished_lexical_garbage(cx: &Cx, root: &Path) -> SearchResu
 }
 
 impl FsfsRuntime {
+    /// Maintenance preserves the topology recorded by the selected bundle.
+    /// An absent fast file never grants quality-only or lexical-only intent:
+    /// the durable sentinel must explicitly declare that topology, and its
+    /// actual artifacts must agree before a candidate or producer is admitted.
+    fn retained_generation_search_mode(index_root: &Path) -> SearchResult<SearchExecutionMode> {
+        let sentinel = Self::read_index_sentinel(index_root)?.ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "topology",
+                "selected generation has no completion sentinel",
+            )
+        })?;
+        let declared = |reason| sentinel.reason_codes.iter().any(|code| code == reason);
+        let quality_only = declared(REASON_VECTOR_FAST_TIER_SKIPPED_QUALITY_ONLY);
+        let lexical_only = declared(REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY);
+        let fast_present = complete_entry_exists(&index_root.join(FSFS_VECTOR_INDEX_FILE))?;
+        let quality_present =
+            complete_entry_exists(&index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE))?;
+        let quality_built = declared(REASON_VECTOR_QUALITY_TIER_BUILT);
+        if sentinel.schema_version != 1
+            || quality_built
+                && (!quality_present
+                    || sentinel.reason_codes.iter().any(|code| {
+                        code.starts_with("vector.quality_tier.")
+                            && code != REASON_VECTOR_QUALITY_TIER_BUILT
+                    }))
+        {
+            return Err(complete_cli::complete_cli_error(
+                "topology",
+                "selected generation has an unsupported sentinel or contradictory quality-tier evidence",
+            ));
+        }
+        let mode = if quality_only {
+            if lexical_only
+                || fast_present
+                || !quality_present
+                || !quality_built
+                || sentinel.fast_window_max_per_file != 1
+            {
+                return Err(complete_cli::complete_cli_error(
+                    "topology",
+                    "quality-only generation intent disagrees with its retained artifacts or input policy",
+                ));
+            }
+            SearchExecutionMode::QualityOnly
+        } else if lexical_only {
+            if fast_present || quality_present {
+                return Err(complete_cli::complete_cli_error(
+                    "topology",
+                    "lexical-only generation intent disagrees with its retained artifacts",
+                ));
+            }
+            SearchExecutionMode::LexicalOnly
+        } else {
+            if !fast_present {
+                return Err(complete_cli::complete_cli_error(
+                    "topology",
+                    "selected generation requires its retained fast tier; a missing artifact cannot change retrieval topology",
+                ));
+            }
+            if quality_present {
+                SearchExecutionMode::Full
+            } else {
+                SearchExecutionMode::FastOnly
+            }
+        };
+        Self::validate_search_generation_at_root(index_root, mode)?;
+        Ok(mode)
+    }
+
     /// Open a reusable reader that follows complete-generation publication.
     ///
     /// Model state and caller-owned blocking capacity are shared exactly as for
@@ -772,7 +841,7 @@ impl FsfsRuntime {
                 "no complete generation has been published",
             )
         })?;
-        Self::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
+        let candidate_mode = Self::retained_generation_search_mode(predecessor.path())?;
         let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
             .ok_or_else(|| {
                 complete_cli::complete_cli_error(
@@ -912,11 +981,12 @@ impl FsfsRuntime {
         if !lexical_reclaimed {
             reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
         }
-        let candidate_mode = if Self::is_lexical_only_generation(build.path()) {
-            SearchExecutionMode::LexicalOnly
-        } else {
-            SearchExecutionMode::Full
-        };
+        if Self::retained_generation_search_mode(build.path())? != candidate_mode {
+            return Err(complete_cli::complete_cli_error(
+                "delete_topology",
+                "deletion changed the selected generation's retrieval topology",
+            ));
+        }
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
@@ -944,11 +1014,13 @@ impl FsfsRuntime {
         Ok((Some(publication), targets.len()))
     }
 
-    /// Compact both vector tiers into a complete successor while old readers
-    /// keep their original files. Counts and timings use the ordinary compact
-    /// command's payload fields; the caller reports success only after checking
-    /// the returned publication outcome. A lexical-only selection has nothing
-    /// to compact and returns no publication.
+    /// Compact every retained vector tier into a complete successor while old
+    /// readers keep their original files. A quality-only generation needs only
+    /// its quality producer and reports that tier's counts at the top level,
+    /// identified by `primary_tier: "quality"`. Two-tier output keeps its nested
+    /// quality statistics. The caller reports success only after checking the
+    /// publication outcome. A lexical-only selection has nothing to compact
+    /// and returns no publication.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn compact_retained_generation(
         &self,
@@ -966,10 +1038,14 @@ impl FsfsRuntime {
         // A lexical-only generation (built without semantic loaders) has no
         // vector tier to compact, and its keyword index merges itself: as on
         // the legacy layout there is nothing to do, so nothing is published.
-        if store
-            .active(cx)?
-            .is_some_and(|active| Self::is_lexical_only_generation(active.path()))
-        {
+        let active = store.active(cx)?.ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "selection",
+                "no complete generation has been published",
+            )
+        })?;
+        let candidate_mode = Self::retained_generation_search_mode(active.path())?;
+        if candidate_mode == SearchExecutionMode::LexicalOnly {
             return Ok((None, Self::lexical_only_compact_report().1));
         }
         let build = store.begin(cx)?;
@@ -980,13 +1056,19 @@ impl FsfsRuntime {
         let candidate = self.clone().with_cli_input(input);
         let predecessor =
             retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?;
+        if predecessor != active {
+            return Err(complete_cli::complete_cli_error(
+                "compact_selection",
+                "selected predecessor changed while preparing compaction",
+            ));
+        }
         let candidate_lease = crate::lifecycle::PublicationLease::acquire(build.path())?;
         let mut payload = serde_json::Value::Null;
         for (tier, relative) in FSFS_VECTOR_GENERATION_FILES {
             retained_search_checkpoint(cx)?;
             candidate_lease.fence("complete-generation vector compaction")?;
             let path = build.path().join(relative);
-            if tier == "quality" && !path.exists() {
+            if !complete_entry_exists(&path)? {
                 continue;
             }
             let mut index = Self::open_vector_index_for_mutation(&path)?;
@@ -1000,8 +1082,13 @@ impl FsfsRuntime {
                 "compaction_elapsed_ms": compact.elapsed_ms,
                 "vacuum_elapsed_ms": vacuum.duration.as_secs_f64() * 1000.0,
             });
-            if tier == "fast" {
+            if tier == "fast" || candidate_mode == SearchExecutionMode::QualityOnly {
                 payload = stats;
+                if candidate_mode == SearchExecutionMode::QualityOnly
+                    && let Some(object) = payload.as_object_mut()
+                {
+                    object.insert("primary_tier".to_owned(), serde_json::json!("quality"));
+                }
             } else if let Some(object) = payload.as_object_mut() {
                 object.insert("quality".to_owned(), stats);
             }
@@ -1024,12 +1111,18 @@ impl FsfsRuntime {
         candidate_lease.fence("complete-generation compact candidate complete")?;
         drop(candidate_lease);
         reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
+        if Self::retained_generation_search_mode(build.path())? != candidate_mode {
+            return Err(complete_cli::complete_cli_error(
+                "compact_topology",
+                "compaction changed the selected generation's retrieval topology",
+            ));
+        }
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
                 build.path(),
-                SearchExecutionMode::Full,
-                SearchExecutionMode::Full,
+                candidate_mode,
+                candidate_mode,
             ),
         )
         .await?;
@@ -1044,7 +1137,7 @@ impl FsfsRuntime {
             || Ok(checkpoint),
         )?;
         let publication = build.publish(cx, |_, path| {
-            Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
+            Self::validate_search_generation_at_root(path, candidate_mode)
         })?;
         Ok((Some(publication), payload))
     }

@@ -219,7 +219,7 @@ async fn phases<W: Write>(
     deadline: Option<&frankensearch::native_ann::builder::deadline::NativeSearchDeadline>,
     policy: &query::Policy,
 ) -> std::result::Result<bool, Failure> {
-    let rerank = policy.reranker_for(mode);
+    let rerank = policy.rerank.as_ref();
     let scoped = query::within(cx, deadline, async {
         cohort::Prepared::prepare(index, cx, filters)
     })
@@ -234,7 +234,7 @@ async fn phases<W: Write>(
         rerank.annotate(&mut started);
     }
     frames.send(started).map_err(Failure::Delivery)?;
-    if mode != Mode::Full {
+    if mode != Mode::Full && rerank.is_none() {
         let payload = Box::pin(query::within(
             cx,
             deadline,
@@ -247,7 +247,7 @@ async fn phases<W: Write>(
         return Ok(false);
     }
     let mut stream = policy
-        .progressive(&scoped, cx, &request.query, limit)
+        .progressive(&scoped, cx, &request.query, mode, limit)
         .map_err(Failure::Query)?;
     let mut degraded = false;
     while !stream.is_finished() {
@@ -266,7 +266,15 @@ async fn phases<W: Write>(
             NativeSearchPhase::Initial {
                 results,
                 candidates,
-            } => result_frame("initial", &results, candidates),
+            } => result_frame(
+                if mode == Mode::Quality {
+                    "quality"
+                } else {
+                    "initial"
+                },
+                &results,
+                candidates,
+            ),
             NativeSearchPhase::Refined {
                 results,
                 candidates,
@@ -416,7 +424,17 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
         "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),
         "query_tuning_enabled": policy.query_overrides_enabled(),
+        "reranker": policy.rerank.as_ref().map(|r| r.model.id()),
         "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
+        "rerank_modes": if policy.rerank.is_some() {
+            if index.has_quality() {
+                vec![Mode::Fast, Mode::Quality, Mode::Full]
+            } else {
+                vec![Mode::Fast, Mode::Full]
+            }
+        } else {
+            Vec::<Mode>::new()
+        },
         "rerank_window": policy.rerank.as_ref().map(|r| r.window),
         "source_fetch_supported": true,
         "source_fetch_max_documents": source::MAX_DOCUMENTS,

@@ -140,7 +140,7 @@ pub use model_download::{
     ModelAcquisitionReceiptV1, ModelAcquisitionRecoveryV1, ModelAcquisitionRequest,
     ModelAcquisitionSource, ModelAcquisitionSourceKindV1, ModelAcquisitionStageV1,
     ModelAcquisitionVerificationResultV1, ModelDownloader, VerifiedModelStageV1,
-    diagnose_model_acquisition, local_model_acquisition_target,
+    diagnose_model_acquisition, local_model_acquisition_target, network_model_acquisition_target,
 };
 
 #[cfg(feature = "api")]

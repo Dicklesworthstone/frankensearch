@@ -1,4 +1,4 @@
-//! Explicit, offline import of one registered semantic model.
+//! Explicit acquisition of one registered semantic model.
 //! Acquisition verifies artifacts and real producer execution before publication.
 //! An explicit scoped mode executes a bound core `RecoveryPlan`; neither mode
 //! selects or rebuilds an index.
@@ -35,6 +35,7 @@ use frankensearch_embed::{
     ModelAcquisitionRequest, ModelAcquisitionSource, ModelDownloader, ModelLifecycle,
     ModelManifest, ModelPublicationUncertainOutcomeV1, ModelPublicationUncertaintyV1,
     RegisteredQualityModel, local_model_acquisition_target, model_publication_uncertainty,
+    network_model_acquisition_target,
 };
 #[cfg(feature = "semantic-support")]
 use frankensearch_embed::{Model2VecEmbedder, RegisteredModel2Vec};
@@ -47,23 +48,30 @@ const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const HELP: &str = "\
 fsfs-import-model --model MODEL --from-dir BUNDLE --output CACHE_ROOT [OPTIONS]
+fsfs-import-model --model MODEL --network --output CACHE_ROOT --plan [OPTIONS]
+fsfs-import-model --model MODEL --network --output CACHE_ROOT --authorization FILE [OPTIONS]
 
 Import exactly one registered semantic model from a local artifact directory.
-No network request, model fallback, configuration change, or index rebuild occurs.
+Local imports make no network requests. Explicit --network acquisition requires
+an exact scoped authorization; generic consent cannot enable it.
+No model fallback, configuration change, or index rebuild occurs.
 The registered loader must pass its real execution certificate before publication.
 A rejected attempt preserves the prior cache; replacements retain a backup.
 A verified warm cache is load-tested and reused without reading the supplied bundle.
 
 Required:
   --model MODEL       Exact registered model ID or documented quality-model alias
-  --from-dir BUNDLE   Directory containing the model's pinned artifact tree
+  --from-dir BUNDLE   Local pinned artifact tree; mutually exclusive with --network
   --output CACHE_ROOT Model cache root used by fsfs (the model subdirectory is added)
 
 Options:
   --format table|json Output format (default: table)
-  --offline           Explicit acknowledgement; this command is always offline
+  --offline           Explicit local-import acknowledgement; conflicts with --network
+  --network           Authorized HTTPS sources; requires --plan or --authorization
+  --source-hosts LIST  Exact comma-separated HTTPS authorities, including initial hosts
+                      and approved CDN redirects; network only, no wildcards
   --plan              Inspect a missing/corrupt cache and print exact consent; no writes
-  --authorization FILE Execute the exact standalone local-import authorization in FILE
+  --authorization FILE Execute the exact standalone acquisition authorization in FILE
   --help, -h          Show this help
 
 Registered fast models: potion-multilingual-128m, potion-base-8m, potion-base-32m.
@@ -90,7 +98,13 @@ Scoped recovery:
   Byte-valid caches use the ordinary import command for load testing and warm
   reuse; the scoped path cannot infer a backend failure from verified bytes.
   The generic RecoveryPlan acquisition capability guards remain in force; this
-  command executes only the separately bound standalone local-import capability.
+  command executes only its separately bound standalone acquisition capability.
+  With --network, no --source-hosts means only initial manifest authorities.
+  An unapproved redirect is refused before contact. Repeat the same explicit
+  --source-hosts when executing; no host is inferred from authorization JSON.
+  The artifact byte total bounds consumed artifact response-body bytes across
+  retries, excluding transport headers and unconsumed redirect bodies. A partial
+  failure may exhaust the grant. Expiry bounds the complete transport stage.
 ";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,9 +115,15 @@ enum Format {
 }
 
 #[derive(Debug)]
+enum AcquisitionInput {
+    Local(PathBuf),
+    Network(Vec<String>),
+}
+
+#[derive(Debug)]
 struct Options {
     model: String,
-    source: PathBuf,
+    source: AcquisitionInput,
     output: PathBuf,
     format: Format,
     plan_only: bool,
@@ -112,7 +132,7 @@ struct Options {
 
 impl Options {
     fn parse(args: &[OsString]) -> Result<Self, &'static str> {
-        if args.len() > 16
+        if args.len() > 20
             || args
                 .iter()
                 .any(|arg| arg.as_encoded_bytes().len() > MAX_ARGUMENT_BYTES)
@@ -125,6 +145,9 @@ impl Options {
         let mut format = Format::Table;
         let mut plan_only = false;
         let mut authorization = None;
+        let mut network = false;
+        let mut offline = false;
+        let mut source_hosts = None;
         let mut seen = HashSet::new();
         let mut index = 0;
         while index < args.len() {
@@ -133,6 +156,12 @@ impl Options {
                 return Err("Each import option may be supplied only once.");
             }
             if flag == "--offline" {
+                offline = true;
+                index += 1;
+                continue;
+            }
+            if flag == "--network" {
+                network = true;
                 index += 1;
                 continue;
             }
@@ -143,7 +172,12 @@ impl Options {
             }
             if !matches!(
                 flag,
-                "--model" | "--from-dir" | "--output" | "--format" | "--authorization"
+                "--model"
+                    | "--from-dir"
+                    | "--output"
+                    | "--format"
+                    | "--authorization"
+                    | "--source-hosts"
             ) {
                 return Err("Unknown import option. Use --help for the supported syntax.");
             }
@@ -166,6 +200,18 @@ impl Options {
                 "--from-dir" => source = Some(PathBuf::from(value)),
                 "--output" => output = Some(PathBuf::from(value)),
                 "--authorization" => authorization = Some(PathBuf::from(value)),
+                "--source-hosts" => {
+                    let hosts = value.to_str().ok_or("Source hosts must be UTF-8.")?;
+                    let hosts: Vec<_> = hosts.split(',').map(str::to_owned).collect();
+                    if hosts.len() > 32
+                        || hosts.iter().any(|host| host.is_empty() || host.len() > 320)
+                    {
+                        return Err(
+                            "Supply one to 32 exact HTTPS authorities without empty entries.",
+                        );
+                    }
+                    source_hosts = Some(hosts);
+                }
                 "--format" => {
                     format = match value.to_str() {
                         Some("table") => Format::Table,
@@ -180,9 +226,23 @@ impl Options {
         if plan_only && authorization.is_some() {
             return Err("--plan cannot execute or be combined with --authorization.");
         }
+        let source = if network {
+            if source.is_some() || offline {
+                return Err("--network cannot be combined with --from-dir or --offline.");
+            }
+            if !plan_only && authorization.is_none() {
+                return Err("--network requires --plan or an exact --authorization FILE.");
+            }
+            AcquisitionInput::Network(source_hosts.unwrap_or_default())
+        } else {
+            if source_hosts.is_some() {
+                return Err("--source-hosts requires explicit --network acquisition.");
+            }
+            AcquisitionInput::Local(source.ok_or("--from-dir or explicit --network is required.")?)
+        };
         Ok(Self {
             model: model.ok_or("--model is required; bulk import is not supported.")?,
-            source: source.ok_or("--from-dir is required; imports never use the network.")?,
+            source,
             output: output.ok_or("--output must name the explicit model cache root.")?,
             format,
             plan_only,
@@ -463,6 +523,16 @@ fn recovery_import_plan(
     cache_root: &Path,
     authorization: Option<ModelAcquisitionAuthorization>,
 ) -> SearchResult<(RecoveryPlan, ModelAcquisitionTarget)> {
+    recovery_acquisition_plan(cx, selected, cache_root, None, authorization)
+}
+
+fn recovery_acquisition_plan(
+    cx: &Cx,
+    selected: &SelectedModel,
+    cache_root: &Path,
+    source_hosts: Option<&[String]>,
+    authorization: Option<ModelAcquisitionAuthorization>,
+) -> SearchResult<(RecoveryPlan, ModelAcquisitionTarget)> {
     let now = current_time()?;
     if let Some(grant) = &authorization {
         grant.validate_at(now).map_err(|_| {
@@ -494,17 +564,29 @@ fn recovery_import_plan(
     let frozen = selected.frozen_manifest()?;
     let destination = std::path::absolute(cache_root)?.join(selected.install_directory());
     ensure_unsealed_destination(&destination)?;
-    let target = local_model_acquisition_target(
-        &frozen,
-        selected.tier(),
-        &destination,
-        issued,
-        expires,
-        nonce,
-    )?;
+    let target = if let Some(hosts) = source_hosts {
+        network_model_acquisition_target(
+            &frozen,
+            selected.tier(),
+            &destination,
+            hosts,
+            issued,
+            expires,
+            nonce,
+        )?
+    } else {
+        local_model_acquisition_target(
+            &frozen,
+            selected.tier(),
+            &destination,
+            issued,
+            expires,
+            nonce,
+        )?
+    };
     cx.checkpoint().map_err(|_| SearchError::Cancelled {
         phase: "model_import_plan".to_owned(),
-        reason: "Local model import planning cancelled.".to_owned(),
+        reason: "Model acquisition planning cancelled.".to_owned(),
     })?;
     let state = match fs::symlink_metadata(&destination) {
         Err(error) if error.kind() == ErrorKind::NotFound => SemanticReadiness::ModelMissing {
@@ -517,7 +599,7 @@ fn recovery_import_plan(
             let verified = frozen.manifest.verify_dir(&destination).is_ok();
             cx.checkpoint().map_err(|_| SearchError::Cancelled {
                 phase: "model_import_plan".to_owned(),
-                reason: "Local model import planning cancelled.".to_owned(),
+                reason: "Model acquisition planning cancelled.".to_owned(),
             })?;
             if verified {
                 return Err(invalid(
@@ -532,11 +614,15 @@ fn recovery_import_plan(
     };
     cx.checkpoint().map_err(|_| SearchError::Cancelled {
         phase: "model_import_plan".to_owned(),
-        reason: "Local model import planning cancelled.".to_owned(),
+        reason: "Model acquisition planning cancelled.".to_owned(),
     })?;
     let policy = RecoveryPolicy {
         interaction: InteractionPolicy::NonInteractive,
-        network: NetworkPolicy::Offline,
+        network: if source_hosts.is_some() {
+            NetworkPolicy::Allowed
+        } else {
+            NetworkPolicy::Offline
+        },
         acquisition_authorization: authorization,
     };
     let request = RecoveryRequest {
@@ -548,7 +634,7 @@ fn recovery_import_plan(
     };
     let recovery = plan(TrustedRecoveryContext::new(
         &state, request, &policy, Some(&target), current_time()?,
-    )).map_err(|_| invalid("authorization", "The authorization does not match this exact local model and cache; inspect a fresh --plan."))?;
+    )).map_err(|_| invalid("authorization", "The authorization does not match this exact model, source policy and cache; inspect a fresh --plan."))?;
     Ok((recovery, target))
 }
 
@@ -629,6 +715,57 @@ async fn import_authorized_model(
     })
 }
 
+async fn acquire_authorized_network_model(
+    cx: &Cx,
+    selected: &SelectedModel,
+    source_hosts: &[String],
+    cache_root: &Path,
+    authorization: ModelAcquisitionAuthorization,
+) -> SearchResult<ImportOutcome> {
+    let (recovery, target) = recovery_acquisition_plan(
+        cx,
+        selected,
+        cache_root,
+        Some(source_hosts),
+        Some(authorization),
+    )?;
+    let bound = recovery
+        .bind_network_model_acquisition(&target, current_time()?)
+        .map_err(|_| {
+            invalid(
+                "authorization",
+                "The plan cannot execute this exact standalone network acquisition.",
+            )
+        })?;
+    let frozen = selected.frozen_manifest()?;
+    let destination = std::path::absolute(cache_root)?.join(selected.install_directory());
+    let mut lifecycle = import_lifecycle(selected, &frozen);
+    let result = Box::pin(
+        ModelDownloader::with_defaults().acquire_network_model_recovery(
+            cx,
+            &bound,
+            ModelAcquisitionRequest {
+                frozen_manifest: &frozen,
+                source: ModelAcquisitionSource::Network,
+                destination_dir: &destination,
+            },
+            source_hosts,
+            &mut lifecycle,
+            |_| {},
+            |directory, contract| selected.load_self_test(directory, contract),
+            || {
+                ensure_unsealed_destination(&destination)?;
+                current_time()
+            },
+        ),
+    )
+    .await;
+    Ok(match result {
+        Ok(receipt) => ImportOutcome::Imported(Box::new((receipt, Some(bound.plan().clone())))),
+        Err(error) => ImportOutcome::FailedAttempt(Box::new((error, bound.plan().clone()))),
+    })
+}
+
 enum ImportOutcome {
     Planned(Box<(RecoveryPlan, ModelAcquisitionAuthorization)>),
     Imported(Box<(ModelAcquisitionReceiptV1, Option<RecoveryPlan>)>),
@@ -652,7 +789,14 @@ fn run(options: Options) -> SearchResult<ImportOutcome> {
         let cx = Cx::current().expect("runtime installs a request context");
         let _cancellation = worker_shutdown.cancellation_scope(&cx);
         if options.plan_only {
-            let (recovery, _) = recovery_import_plan(&cx, &selected, &options.output, None)?;
+            let (recovery, _) = match &options.source {
+                AcquisitionInput::Local(_) => {
+                    recovery_import_plan(&cx, &selected, &options.output, None)?
+                }
+                AcquisitionInput::Network(hosts) => {
+                    recovery_acquisition_plan(&cx, &selected, &options.output, Some(hosts), None)?
+                }
+            };
             let authorization = recovery
                 .action()
                 .and_then(|action| action.required_authorization())
@@ -661,16 +805,30 @@ fn run(options: Options) -> SearchResult<ImportOutcome> {
             Ok(ImportOutcome::Planned(Box::new((recovery, authorization))))
         } else if let Some(path) = &options.authorization {
             let authorization = read_authorization(path)?;
-            import_authorized_model(
-                &cx,
-                &selected,
-                &options.source,
-                &options.output,
-                authorization,
-            )
-            .await
+            match &options.source {
+                AcquisitionInput::Local(source) => {
+                    import_authorized_model(&cx, &selected, source, &options.output, authorization)
+                        .await
+                }
+                AcquisitionInput::Network(hosts) => {
+                    acquire_authorized_network_model(
+                        &cx,
+                        &selected,
+                        hosts,
+                        &options.output,
+                        authorization,
+                    )
+                    .await
+                }
+            }
         } else {
-            import_model(&cx, &selected, &options.source, &options.output)
+            let AcquisitionInput::Local(source) = &options.source else {
+                return Err(invalid(
+                    "authorization",
+                    "Network acquisition requires exact authorization.",
+                ));
+            };
+            import_model(&cx, &selected, source, &options.output)
                 .await
                 .map(|receipt| ImportOutcome::Imported(Box::new((receipt, None))))
         }
@@ -728,22 +886,22 @@ fn failure_message(error: &SearchError) -> &'static str {
             if field == "cli.import_model.authorization"
                 || field.starts_with("model_acquisition.recovery.") =>
         {
-            "The exact local import grant, scope or readiness was rejected. Run --plan again and approve its current authorization before retrying."
+            "The exact acquisition grant, scope or readiness was rejected. Run --plan again and approve its current authorization before retrying."
         }
         SearchError::EmbedderUnavailable { .. } => {
             "The selected inference backend is absent. Use a compatible loader-capable fsfs build."
         }
         SearchError::ModelLoadFailed { .. } | SearchError::EmbeddingFailed { .. } => {
-            "The registered model failed its load or execution self-test. The prior cache is retained."
+            "The model transport, loading or execution self-test failed. The prior cache is retained."
         }
         SearchError::HashMismatch { .. } | SearchError::ModelNotFound { .. } => {
-            "The local bundle is missing or does not match the exact registered artifacts."
+            "The model artifacts are missing or do not match the exact registered manifest."
         }
         SearchError::InvalidConfig { .. } => {
-            "The model, bundle, destination or execution contract was rejected. Check --help and the exact registered model."
+            "The model, source, destination or execution contract was rejected. Check --help and the exact registered model."
         }
-        SearchError::Cancelled { .. } => "Local model import was cancelled.",
-        _ => "Model import failed. Reverify the selected cache before retrying.",
+        SearchError::Cancelled { .. } => "Model acquisition was cancelled.",
+        _ => "Model acquisition failed. Reverify the selected cache before retrying.",
     }
 }
 
@@ -789,8 +947,16 @@ fn render(response: &Response, format: Format) -> io::Result<Vec<u8>> {
         .into_bytes()
     } else if let Some(authorization) = &response.authorization {
         let exact = serde_json::to_string_pretty(authorization).map_err(io::Error::other)?;
+        let operation = match &authorization.source {
+            frankensearch_core::recovery_plan::ModelAcquisitionSource::Network { .. } => {
+                "HTTPS model acquisition"
+            }
+            frankensearch_core::recovery_plan::ModelAcquisitionSource::LocalBundle => {
+                "offline model import"
+            }
+        };
         format!(
-            "Planned standalone offline import. No cache or index was changed.\n\
+            "Planned standalone {operation}. No cache or index was changed.\n\
              Review and save the following object as consent.json, then repeat the same\n\
              command with --authorization consent.json before expiry.\n{exact}\n"
         )
@@ -913,7 +1079,10 @@ mod tests {
     fn explicit_local_import_requires_one_complete_unambiguous_request() {
         let options = Options::parse(&arguments()).unwrap();
         assert_eq!(options.model, "potion-base-8m");
-        assert_eq!(options.source, Path::new("bundle"));
+        assert!(matches!(
+            options.source,
+            AcquisitionInput::Local(ref path) if path == Path::new("bundle")
+        ));
         for suffix in [
             vec!["--model", "minilm"],
             vec!["--from-dir", "other"],
@@ -952,6 +1121,54 @@ mod tests {
         for name in ["all", "*", "potion", "MiniLM-L6", "ms-marco-minilm-l-6-v2"] {
             assert!(SelectedModel::resolve(name).is_err());
         }
+    }
+
+    #[test]
+    fn network_options_require_explicit_scope_and_cannot_change_local_import() {
+        let network = [
+            "--model",
+            "potion-base-8m",
+            "--network",
+            "--output",
+            "cache",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        assert!(Options::parse(&network).is_err());
+        let mut planned = network.clone();
+        planned.push("--plan".into());
+        let parsed = Options::parse(&planned).unwrap();
+        assert!(parsed.plan_only);
+        assert!(matches!(parsed.source, AcquisitionInput::Network(ref hosts) if hosts.is_empty()));
+        let mut approved = network.clone();
+        approved.extend(
+            [
+                "--authorization",
+                "consent.json",
+                "--source-hosts",
+                "huggingface.co,cdn.example.test:8443",
+            ]
+            .map(OsString::from),
+        );
+        assert!(matches!(Options::parse(&approved).unwrap().source,
+            AcquisitionInput::Network(ref hosts) if hosts.len() == 2));
+        for extra in [
+            vec!["--offline"],
+            vec!["--from-dir", "bundle"],
+            vec!["--source-hosts", "huggingface.co,"],
+            vec!["--authorization", "consent.json"],
+        ] {
+            let mut invalid = planned.clone();
+            invalid.extend(extra.into_iter().map(OsString::from));
+            assert!(Options::parse(&invalid).is_err());
+        }
+        let mut local = arguments();
+        local.extend(["--source-hosts", "huggingface.co"].map(OsString::from));
+        assert!(Options::parse(&local).is_err());
+        assert!(matches!(
+            Options::parse(&arguments()).unwrap().source,
+            AcquisitionInput::Local(_)
+        ));
     }
 
     #[test]
@@ -1158,6 +1375,56 @@ mod tests {
             let registered =
                 RegisteredModel2Vec::new(manifest, "offline-import-fixture", certificate).unwrap();
             (source, SelectedModel::Fast(Box::new(registered)))
+        }
+
+        #[test]
+        fn network_plan_is_read_only_and_host_changes_require_new_authorization() {
+            let (source_fixture, selected) = fixture(0);
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().canonicalize().unwrap().join("cache");
+            let scheduler = RuntimeBuilder::current_thread().build().unwrap();
+            scheduler.block_on(async {
+                let cx = Cx::for_request();
+                let hosts = vec!["huggingface.co".to_owned(), "cdn.example.test".to_owned()];
+                let (preview, target) = recovery_acquisition_plan(
+                    &cx, &selected, &cache, Some(&hosts), None,
+                ).unwrap();
+                assert!(!cache.exists());
+                assert!(!preview.semantic_available());
+                assert!(preview.action().unwrap().network_required());
+                assert_eq!(target.document_count, 0);
+                let grant = preview.action().unwrap().required_authorization().unwrap().clone();
+                assert!(matches!(&grant.source,
+                    frankensearch_core::recovery_plan::ModelAcquisitionSource::Network { source_hosts }
+                    if source_hosts == &target.network_source_hosts));
+                let response = Response {
+                        schema_version: 1,
+                        ok: true,
+                        postcondition: None,
+                        acquisition: None,
+                        recovery_plan: Some(preview),
+                        authorization: Some(grant.clone()),
+                        publication_uncertainty: None,
+                        error: None,
+                    };
+                for format in [Format::Json, Format::Table] {
+                    let rendered = String::from_utf8(render(&response, format).unwrap()).unwrap();
+                    assert!(!rendered.contains(cache.to_str().unwrap()));
+                    assert!(!rendered.contains(source_fixture.path().to_str().unwrap()));
+                    if format == Format::Table {
+                        assert!(rendered.starts_with("Planned standalone HTTPS model acquisition."));
+                        assert!(!rendered.contains("offline import"));
+                    } else {
+                        let wire: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+                        assert_eq!(wire["authorization"]["source"]["kind"], "network");
+                        assert!(wire["acquisition"].is_null());
+                    }
+                }
+                assert!(acquire_authorized_network_model(
+                    &cx, &selected, &[], &cache, grant,
+                ).await.is_err());
+                assert!(!cache.exists());
+            });
         }
 
         #[test]

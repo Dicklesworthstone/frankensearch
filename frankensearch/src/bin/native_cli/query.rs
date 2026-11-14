@@ -45,14 +45,6 @@ impl Policy {
         self.maximum_ms
     }
 
-    pub(super) fn reranker_for(&self, mode: Mode) -> Option<&Rerank> {
-        if mode == Mode::Full {
-            self.rerank.as_ref()
-        } else {
-            None
-        }
-    }
-
     pub(super) fn query_pool(&self) -> Option<BlockingPoolHandle> {
         self.query_pool.clone()
     }
@@ -86,7 +78,7 @@ impl Policy {
     }
 }
 
-/// One explicitly loaded model reused by every full-mode request. Sources come
+/// One explicitly loaded model reused by every semantic-mode request. Sources come
 /// only from the query's retained hybrid cohort, never from mutable file paths.
 #[derive(Clone)]
 pub struct Rerank {
@@ -139,7 +131,7 @@ impl Rerank {
     }
 }
 
-/// Tuned or reranked full-mode collection is strict: all stages must succeed.
+/// Tuned or reranked collection is strict: all configured stages must succeed.
 /// The phase label comes from the phase actually delivered, so an empty pool is
 /// not described as reranked when the native engine correctly skipped inference.
 #[allow(clippy::too_many_arguments)]
@@ -155,7 +147,7 @@ pub async fn buffered<'i>(
     let index = index.into();
     let deadline = policy.start(cx, None)?;
     Box::pin(within(cx, deadline.as_ref(), async {
-        let rerank = policy.reranker_for(mode);
+        let rerank = policy.rerank.as_ref();
         if rerank.is_none() && (mode != Mode::Full || policy.full_query.is_none()) {
             validate_query(text)?;
             return cohort::Prepared::prepare(index, cx, filters)?
@@ -164,12 +156,20 @@ pub async fn buffered<'i>(
         }
         validate_query(text)?;
         let scoped = cohort::Prepared::prepare(index, cx, filters)?;
-        let mut stream = policy.progressive(&scoped, cx, text, limit)?;
+        let mut stream = policy.progressive(&scoped, cx, text, mode, limit)?;
         let mut final_page = None;
         while let Some(mut phase) = stream.next_phase().await? {
             phase.hydrate_metadata(index, cx)?;
             let (phase, results, evaluated) = match phase {
-                NativeSearchPhase::Initial { results, .. } => ("initial", results, 0),
+                NativeSearchPhase::Initial { results, .. } => (
+                    if mode == Mode::Quality {
+                        "quality"
+                    } else {
+                        "initial"
+                    },
+                    results,
+                    0,
+                ),
                 NativeSearchPhase::Refined { results, .. } => ("refined", results, 0),
                 NativeSearchPhase::Reranked {
                     results, evaluated, ..
