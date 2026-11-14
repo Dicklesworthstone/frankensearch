@@ -37776,6 +37776,53 @@ mod tests {
     }
 
     #[test]
+    fn literal_colon_adapter_preserves_quoted_and_escaped_operand_membership() {
+        use std::collections::BTreeSet;
+
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).unwrap();
+            let documents = [
+                IndexableDocument::new(
+                    "literal",
+                    "my title rust prefix title rust inch measurement can't",
+                )
+                .with_title("plain"),
+                IndexableDocument::new("title", "other").with_title("rust"),
+                IndexableDocument::new("inch", "inch").with_title("plain"),
+                IndexableDocument::new("url", "https sqlite org").with_title("plain"),
+            ];
+            index.index_documents(&cx, &documents).await.unwrap();
+            index.commit(&cx).await.unwrap();
+            for (raw, expected) in [
+                ("my-title:rust", &["literal"][..]),
+                (r"prefix\ title:rust", &["literal"]),
+                (
+                    r#"'inch" measurement' OR https://sqlite.org"#,
+                    &["literal", "url"],
+                ),
+                (
+                    r#"inch" OR https://sqlite.org"#,
+                    &["inch", "literal", "url"],
+                ),
+                ("can't OR https://sqlite.org", &["literal", "url"]),
+                ("https://sqlite.org", &["url"]),
+                ("title:rust", &["title"]),
+                ("title : rust", &["title"]),
+                ("(title : rust)", &["title"]),
+            ] {
+                let rendered = index.query_text(raw);
+                let hits = index.search(&cx, &rendered, documents.len()).await.unwrap();
+                let actual = hits
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+                assert_eq!(actual, expected, "{raw} -> {rendered}");
+            }
+        });
+    }
+
+    #[test]
     fn parsed_field_exclusion_census_preserves_adjacency_and_field_scope() {
         use frankensearch_core::ParsedQuery;
 

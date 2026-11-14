@@ -1232,42 +1232,74 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
         return Cow::Borrowed(query);
     }
     let mut escaped_query = String::with_capacity(query.len() + 8);
-    let mut term_start = 0;
+    let mut field_start = Some(0);
     let mut after_whitespace = false;
-    let mut in_quotes = false;
+    let mut operand_start = true;
+    let mut quote = None;
     let mut escaped = false;
     for (index, ch) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            escaped_query.push(ch);
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            escaped_query.push(ch);
+            continue;
+        }
         if after_whitespace && !ch.is_whitespace() {
-            // The parser accepts whitespace before a field separator. Keep
-            // that candidate name until the next non-whitespace character
-            // decides whether it belongs to this field or a new operand.
-            if ch != ':' {
-                term_start = index;
+            // Preserve whitespace around a field separator and before its
+            // value. Otherwise this is the start of a new lexical operand.
+            if ch != ':' && !(operand_start && field_start.is_none()) {
+                field_start = Some(index);
+                operand_start = true;
             }
             after_whitespace = false;
         }
-        if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            in_quotes = !in_quotes;
-        } else if ch == ':' && !in_quotes {
-            let name = query.get(term_start..index).unwrap_or_default().trim_end();
-            let doubled = query
-                .get(index + 1..)
-                .is_some_and(|rest| rest.starts_with(':'));
-            let field = !doubled && schema.fields.iter().any(|field| field.name == name);
-            if !field {
-                escaped_query.push('\\');
+        match ch {
+            '\\' => {
+                escaped = true;
+                operand_start = false;
             }
+            '"' | '\'' if operand_start => {
+                quote = Some(ch);
+                field_start = None;
+                operand_start = false;
+            }
+            '(' | ')' => {
+                field_start = Some(index + ch.len_utf8());
+                operand_start = true;
+            }
+            '+' | '-' if operand_start && field_start.is_some() => {
+                field_start = Some(index + ch.len_utf8());
+            }
+            ':' => {
+                // Use the lexer's field grammar, not a suffix after a dash,
+                // plus sign, escaped space or embedded quote in a bare word.
+                let field = field_start
+                    .and_then(|start| field_prefix(query, start))
+                    .is_some_and(|(name, end)| {
+                        if end != index + 1 || query[end..].starts_with(':') {
+                            return false;
+                        }
+                        let name = unescape_field_name(name);
+                        schema.fields.iter().any(|field| field.name == name)
+                    });
+                if !field {
+                    escaped_query.push('\\');
+                }
+                field_start = None;
+                operand_start = field;
+            }
+            _ if ch.is_whitespace() => after_whitespace = true,
+            _ => operand_start = false,
         }
         escaped_query.push(ch);
-        if ch.is_whitespace() {
-            after_whitespace = true;
-        } else if matches!(ch, '(' | ')' | '+' | '-') {
-            term_start = index + ch.len_utf8();
-        }
     }
     Cow::Owned(escaped_query)
 }
@@ -7166,6 +7198,55 @@ mod tests {
         assert!(parser.parse_lenient("HashMap::new").query.is_empty());
         let escaped = escape_unknown_field_colons("HashMap::new", crate::DEFAULT_SCHEMA);
         assert!(!parser.parse_lenient(&escaped).query.is_empty());
+    }
+
+    #[test]
+    fn escape_unknown_field_colons_respects_quoted_and_escaped_operands() {
+        for (query, expected) in [
+            ("my-title:rust", r"my-title\:rust"),
+            ("foo+title:rust", r"foo+title\:rust"),
+            (r"prefix\ title:rust", r"prefix\ title\:rust"),
+            (r"first \xtitle:rust", r"first \xtitle\:rust"),
+            (r"prefix\(title:rust", r"prefix\(title\:rust"),
+            (r"猫\ title:rust", r"猫\ title\:rust"),
+            (
+                r#"'inch" measurement' OR https://sqlite.org"#,
+                r#"'inch" measurement' OR https\://sqlite.org"#,
+            ),
+            (
+                r#"title:'inch" measurement' OR https://sqlite.org"#,
+                r#"title:'inch" measurement' OR https\://sqlite.org"#,
+            ),
+            (r"'std::io' error", r"'std::io' error"),
+            (
+                r#"'it\'s "quoted:still"' a:b"#,
+                r#"'it\'s "quoted:still"' a\:b"#,
+            ),
+            (r"'unterminated:literal", r"'unterminated:literal"),
+            (r#""alpha\\" a:b"#, r#""alpha\\" a\:b"#),
+            (r#""alpha\\\" inner:a" b:c"#, r#""alpha\\\" inner:a" b\:c"#),
+            (
+                r#"inch" OR https://sqlite.org"#,
+                r#"inch" OR https\://sqlite.org"#,
+            ),
+            (
+                "can't OR https://sqlite.org",
+                r"can't OR https\://sqlite.org",
+            ),
+            (
+                r#"title:bare" OR https://sqlite.org"#,
+                r#"title:bare" OR https\://sqlite.org"#,
+            ),
+            ("title:content:rust", r"title:content\:rust"),
+        ] {
+            let escaped = escape_unknown_field_colons(query, crate::DEFAULT_SCHEMA);
+            assert_eq!(escaped, expected, "{query}");
+            assert_eq!(
+                escape_unknown_field_colons(&escaped, crate::DEFAULT_SCHEMA),
+                expected,
+                "{query} twice",
+            );
+        }
     }
 
     #[test]
