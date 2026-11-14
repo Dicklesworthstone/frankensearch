@@ -375,6 +375,71 @@ fn keyword_exclusions_normalize_phrases_and_fill_boolean_tails_without_models() 
 }
 
 #[test]
+fn keyword_boolean_exclusions_and_normalized_query_bounds_use_real_quill() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lexical");
+        let documents = ["AND", "NOT", "OR", "clean"]
+            .map(|word| IndexableDocument::new(word, format!("needle {word}")))
+            .to_vec();
+        let writer = frankensearch_quill::QuillIndex::create(
+            &cx,
+            &path,
+            frankensearch_quill::QuillConfig::default(),
+        )
+        .await
+        .unwrap();
+        writer.index_documents(&cx, &documents).await.unwrap();
+        writer.commit(&cx).await.unwrap();
+        let index = Opened {
+            generation: ArtifactGenerationIdentityV1::new(1, [38; 16]).unwrap(),
+            reader: QuillSearchIndex::open(&cx, &path, frankensearch_quill::QuillConfig::default())
+                .await
+                .unwrap(),
+            documents,
+            layout: "single",
+        };
+        for word in ["AND", "OR", "NOT"] {
+            let expected = ["AND", "OR", "NOT", "clean"]
+                .into_iter()
+                .filter(|id| *id != word)
+                .collect::<BTreeSet<_>>();
+            for query in [
+                format!("needle -{word} -absent"),
+                format!("\"{word}\" OR needle AND -{word} -absent"),
+                format!("-{word}"),
+            ] {
+                let payload = index.search(&cx, &query, 4, [None, None]).await.unwrap();
+                let hits = payload["results"].as_array().unwrap();
+                assert_eq!(hits.len(), 3, "{query}");
+                let actual = hits
+                    .iter()
+                    .map(|hit| hit["doc_id"].as_str().unwrap())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(actual, expected, "{query}");
+            }
+        }
+        for (query, reason) in [
+            (
+                format!("{}{}", "needle ".repeat(1_000), "-AND ".repeat(500)),
+                "normalized keyword query exceeds",
+            ),
+            (
+                format!("needle {}", "-AND ".repeat(1_998)),
+                "keyword exclusion query exceeds",
+            ),
+        ] {
+            assert!(query.chars().count() < frankensearch_quill::query::MAX_QUERY_LENGTH);
+            let error = index
+                .search(&cx, &query, 4, [None, None])
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+    });
+}
+
+#[test]
 fn keyword_server_intersects_fixed_and_request_scopes_with_global_exclusions() {
     run_test_with_cx(|cx| async move {
         for partitioned in [false, true] {

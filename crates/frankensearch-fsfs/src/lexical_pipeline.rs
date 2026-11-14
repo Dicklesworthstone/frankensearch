@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use asupersync::Cx;
 use compact_str::CompactString;
-use frankensearch_core::parsed_query::normalize_phrase_negation_keywords;
+use frankensearch_core::parsed_query::normalize_query_negations;
 use frankensearch_core::{IndexableDocument, LexicalWrite, SearchError, SearchResult};
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillIndex, indexable_document_content_hash};
 pub use frankensearch_quill::{
@@ -30,11 +30,12 @@ use flush_queue::FlushProgress;
 /// drops the fragment when no such field exists, so `HashMap::new`, `std::io`,
 /// `https://…` or `TODO:` matched nothing at all. Every colon is escaped except
 /// one that ends a real field name at the start of a term (`title:rust`);
-/// quoted phrases are already literal. Case-insensitive phrase-negation
-/// keywords use Quill's uppercase spelling without changing positive text.
+/// quoted phrases are already literal. Recognized phrase-negation keywords
+/// use Quill's uppercase spelling and bare Boolean-word exclusions are quoted
+/// without changing positive text.
 #[must_use]
 pub fn lexical_query_text(query: &str) -> Cow<'_, str> {
-    match normalize_phrase_negation_keywords(query) {
+    match normalize_query_negations(query) {
         Cow::Borrowed(query) => {
             frankensearch_quill::escape_unknown_field_colons(query, DEFAULT_SCHEMA)
         }
@@ -1103,6 +1104,14 @@ mod tests {
                 r#"title:"not \"secret\"" Not "outside secret""#,
                 r#"title:"not \"secret\"" NOT "outside secret""#,
             ),
+            (
+                "needle -AND -OR -NOT -absent",
+                "needle -\"AND\" -\"OR\" -\"NOT\" -absent",
+            ),
+            (
+                r#"title:"-AND" \-OR -NOT HashMap::new"#,
+                r#"title:"-AND" \-OR -"NOT" HashMap\:\:new"#,
+            ),
         ] {
             assert_eq!(super::lexical_query_text(query), expected, "{query}");
         }
@@ -1112,6 +1121,7 @@ mod tests {
             r#"title:'not "secret"'"#,
             r"\-literal",
             "this is not excluded",
+            r#""-AND" title:'-OR' \-NOT --AND -ORganic"#,
         ] {
             assert!(
                 matches!(

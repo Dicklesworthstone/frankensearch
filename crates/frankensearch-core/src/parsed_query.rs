@@ -34,6 +34,11 @@ pub struct ParsedQuery {
     pub negative_phrases: Vec<String>,
 }
 
+enum LexicalNegationEdit {
+    NotKeyword(usize),
+    BooleanWord { start: usize, end: usize },
+}
+
 impl ParsedQuery {
     /// Parse a raw query string into positive and negative components.
     ///
@@ -51,10 +56,13 @@ impl ParsedQuery {
     /// [`quote_query_phrase`] when rendering them into another query.
     #[must_use]
     pub fn parse(raw: &str) -> Self {
-        Self::parse_with_not_positions(raw, None)
+        Self::parse_with_lexical_edits(raw, None)
     }
 
-    fn parse_with_not_positions(raw: &str, mut not_positions: Option<&mut Vec<usize>>) -> Self {
+    fn parse_with_lexical_edits(
+        raw: &str,
+        mut edits: Option<&mut Vec<LexicalNegationEdit>>,
+    ) -> Self {
         // Without syntax characters, only whitespace normalization is needed.
         if !raw
             .bytes()
@@ -97,9 +105,9 @@ impl ParsedQuery {
                     let (phrase, next) = parse_quoted_phrase(&chars, quote);
                     if !phrase.trim().is_empty() {
                         if (chars[i] != 'N' || chars[i + 1] != 'O' || chars[i + 2] != 'T')
-                            && let Some(positions) = not_positions.as_deref_mut()
+                            && let Some(edits) = edits.as_deref_mut()
                         {
-                            positions.push(i);
+                            edits.push(LexicalNegationEdit::NotKeyword(i));
                         }
                         negative_phrases.push(phrase);
                     }
@@ -142,6 +150,11 @@ impl ParsedQuery {
                 }
                 let term: String = chars[start..i].iter().collect();
                 if !term.is_empty() {
+                    if let Some(edits) = edits.as_deref_mut()
+                        && matches!(term.as_str(), "AND" | "OR" | "NOT")
+                    {
+                        edits.push(LexicalNegationEdit::BooleanWord { start, end: i });
+                    }
                     negative_terms.push(term);
                 }
                 continue;
@@ -183,33 +196,50 @@ impl ParsedQuery {
     }
 }
 
-/// Normalize recognized phrase-negation keywords for a lexical parser.
+/// Normalize recognized exclusions for a lexical parser.
 ///
-/// Only case-insensitive `NOT` keywords that the exclusion parser accepts
-/// before a quoted phrase are uppercased. All other source text, including
-/// quoted literals, escaped dashes, fields, and whitespace, is preserved.
+/// Case-insensitive `NOT` keywords before quoted phrases are uppercased, and
+/// bare `-AND`, `-OR`, and `-NOT` operands are quoted so they remain literal
+/// words rather than Boolean operators. The exclusion scanner identifies every
+/// edit; positive text, quoted literals, escaped dashes, fields, and whitespace
+/// are preserved.
 #[must_use]
-pub fn normalize_phrase_negation_keywords(raw: &str) -> Cow<'_, str> {
-    if !raw
-        .as_bytes()
-        .windows(3)
-        .any(|word| word != b"NOT" && word.eq_ignore_ascii_case(b"NOT"))
+pub fn normalize_query_negations(raw: &str) -> Cow<'_, str> {
+    if !raw.contains('-')
+        && !raw
+            .as_bytes()
+            .windows(3)
+            .any(|word| word != b"NOT" && word.eq_ignore_ascii_case(b"NOT"))
     {
         return Cow::Borrowed(raw);
     }
-    let mut positions = Vec::new();
-    let _ = ParsedQuery::parse_with_not_positions(raw, Some(&mut positions));
-    if positions.is_empty() {
+    let mut edits = Vec::new();
+    let _ = ParsedQuery::parse_with_lexical_edits(raw, Some(&mut edits));
+    if edits.is_empty() {
         return Cow::Borrowed(raw);
     }
 
-    let mut chars: Vec<char> = raw.chars().collect();
-    for position in positions {
-        chars[position] = 'N';
-        chars[position + 1] = 'O';
-        chars[position + 2] = 'T';
+    let chars: Vec<char> = raw.chars().collect();
+    let mut normalized = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    for edit in edits {
+        let (start, end) = match edit {
+            LexicalNegationEdit::NotKeyword(start) => (start, start + 3),
+            LexicalNegationEdit::BooleanWord { start, end } => (start, end),
+        };
+        normalized.extend(chars[cursor..start].iter().copied());
+        match edit {
+            LexicalNegationEdit::NotKeyword(_) => normalized.push_str("NOT"),
+            LexicalNegationEdit::BooleanWord { .. } => {
+                normalized.push('"');
+                normalized.extend(chars[start..end].iter().copied());
+                normalized.push('"');
+            }
+        }
+        cursor = end;
     }
-    Cow::Owned(chars.into_iter().collect())
+    normalized.extend(chars[cursor..].iter().copied());
+    Cow::Owned(normalized)
 }
 
 /// Render decoded text as one double-quoted query phrase.
@@ -403,7 +433,7 @@ mod tests {
                 r#"needle NOT "quote \"inside\" and path\\" NOT "other""#,
             ),
         ] {
-            let normalized = normalize_phrase_negation_keywords(raw);
+            let normalized = normalize_query_negations(raw);
             assert_eq!(normalized, expected, "{raw}");
             assert_eq!(ParsedQuery::parse(&normalized), ParsedQuery::parse(raw));
         }
@@ -422,14 +452,46 @@ mod tests {
             r#"cannot "be excluded""#,
             r#"needle -"say not \"secret\"""#,
             r#"(not "secret")"#,
+            r#""-AND" title:"-OR" \-NOT --AND dash-OR -ORganic"#,
+            "needle -and -or -not",
         ] {
             assert!(
                 matches!(
-                    normalize_phrase_negation_keywords(raw),
+                    normalize_query_negations(raw),
                     Cow::Borrowed(value) if value == raw
                 ),
                 "{raw}",
             );
+        }
+    }
+
+    #[test]
+    fn normalize_boolean_exclusions_preserves_positive_source_and_edit_offsets() {
+        for (raw, expected) in [
+            ("-AND", "-\"AND\""),
+            ("-OR ", "-\"OR\" "),
+            ("needle -NOT -absent", "needle -\"NOT\" -absent"),
+            (
+                "\t-AND\u{2003}-OR \n-NOT ",
+                "\t-\"AND\"\u{2003}-\"OR\" \n-\"NOT\" ",
+            ),
+            (
+                r#"title:"say -AND" \-OR -AND OR needle"#,
+                r#"title:"say -AND" \-OR -"AND" OR needle"#,
+            ),
+            (
+                r#"雪猫 not "éclair" -AND αβγ nOt 'another phrase' -OR -NOT"#,
+                r#"雪猫 NOT "éclair" -"AND" αβγ NOT 'another phrase' -"OR" -"NOT""#,
+            ),
+        ] {
+            let normalized = normalize_query_negations(raw);
+            assert_eq!(normalized, expected, "{raw}");
+            assert_eq!(
+                ParsedQuery::parse(&normalized).positive,
+                ParsedQuery::parse(raw).positive,
+                "positive query source: {raw}"
+            );
+            assert_eq!(normalize_query_negations(&normalized), normalized);
         }
     }
 

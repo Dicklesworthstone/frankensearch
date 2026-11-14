@@ -417,6 +417,19 @@ fn exclusion_census_refuses_one_oversized_escaped_phrase_before_inference() {
         let hits = index.search(&cx, &unicode_query, 28).await.unwrap();
         assert_eq!(hits.len(), 28);
         assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+
+        // Quoting literal Boolean operands can expand the complete lexical
+        // query even when each census group fits. Do not let the parser cut
+        // off the trailing positive predicate and broaden the query to All.
+        let expanded_query = format!("{}needle", "-AND ".repeat(1_500));
+        assert!(expanded_query.chars().count() < frankensearch_quill::query::MAX_QUERY_LENGTH);
+        let error = index.search(&cx, &expanded_query, 28).await.unwrap_err();
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { field, value, .. }
+            if field == "native_ann.query.exclusions" && value == "oversized-lexical-query"),
+            "unexpected normalized-query refusal: {error:?}"
+        );
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
     });
 }
 

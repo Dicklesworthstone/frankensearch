@@ -10,7 +10,7 @@ use std::sync::Arc;
 #[cfg(feature = "quill")]
 use frankensearch_core::ParsedQuery;
 #[cfg(feature = "quill")]
-use frankensearch_core::parsed_query::{normalize_phrase_negation_keywords, quote_query_phrase};
+use frankensearch_core::parsed_query::{normalize_query_negations, quote_query_phrase};
 
 use super::{checkpoint, invalid, validate_lexical};
 use crate::{Cx, LexicalCandidateBatch, LexicalRead, SearchResult};
@@ -79,7 +79,7 @@ impl ImmutableTextQuery {
         let lexical = if parsed.is_positive_empty() {
             "*".to_owned()
         } else {
-            normalize_phrase_negation_keywords(text).into_owned()
+            normalize_query_negations(text).into_owned()
         };
         Some(Self {
             semantic: parsed.positive,
@@ -96,6 +96,14 @@ impl ImmutableTextQuery {
         self.ceiling = ceiling;
         if ceiling == 0 {
             return Ok(());
+        }
+        #[cfg(feature = "quill")]
+        if self.lexical.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH {
+            return Err(invalid(
+                "query.exclusions",
+                "oversized-lexical-query",
+                "normalized exclusion query exceeds the lexical parser's query length bound",
+            ));
         }
         // This is a complete membership census, not a top-k sample. Existing
         // source scopes widen their immutable reader before returning this

@@ -11,7 +11,7 @@ use frankensearch::native_ann::builder::sharded::{
 };
 use frankensearch::{LexicalRead, SearchError};
 use frankensearch_core::ParsedQuery;
-use frankensearch_core::parsed_query::{normalize_phrase_negation_keywords, quote_query_phrase};
+use frankensearch_core::parsed_query::{normalize_query_negations, quote_query_phrase};
 use frankensearch_quill::QuillSearchIndex;
 
 use super::{
@@ -128,7 +128,10 @@ impl Opened {
             let query = parsed
                 .negative_terms
                 .iter()
-                .map(|term| self.reader.query_text(term).into_owned())
+                .map(|term| match term.as_str() {
+                    "AND" | "OR" | "NOT" => quote_query_phrase(term),
+                    _ => self.reader.query_text(term).into_owned(),
+                })
                 .chain(
                     parsed
                         .negative_phrases
@@ -137,6 +140,11 @@ impl Opened {
                 )
                 .collect::<Vec<_>>()
                 .join(" OR ");
+            if query.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH {
+                return Err(bad(
+                    "keyword exclusion query exceeds the lexical parser's query length bound",
+                ));
+            }
             let hits = self
                 .reader
                 .search_doc_ids(cx, &query, self.documents.len())?;
@@ -182,8 +190,13 @@ impl Opened {
             } else {
                 self.documents.len()
             };
-            let normalized = normalize_phrase_negation_keywords(text);
+            let normalized = normalize_query_negations(text);
             let query_text = self.reader.query_text(&normalized);
+            if query_text.chars().count() > frankensearch_quill::query::MAX_QUERY_LENGTH {
+                return Err(bad(
+                    "normalized keyword query exceeds the lexical parser's query length bound",
+                ));
+            }
             let batch = self
                 .reader
                 .search_candidates(cx, &query_text, width)

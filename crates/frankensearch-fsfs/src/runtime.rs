@@ -675,7 +675,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v22: registered reranker inputs and execution policy bind reranked answers.
 // v23: successful degraded phases retain canonical lane recovery diagnostics.
 // v24: quoted literals and case-insensitive phrase exclusions agree across lanes.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v24";
+// v25: bare Boolean-word exclusions stay literal in lexical and vector lanes.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v25";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -696,8 +697,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v19 / stream v17: registered reranking cannot load unverified shadow weights.
 // v20 / stream v18: failures retain typed error codes, exit status and recovery.
 // v21 / stream v19: quoted literals and phrase exclusions agree across lanes.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v21";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v19";
+// v22 / stream v20: bare Boolean-word exclusions stay literal across lanes.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v22";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v20";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -26390,7 +26392,11 @@ impl FsfsRuntime {
         let excluded = parsed
             .negative_terms
             .iter()
-            .map(|term| lexical_query_text(term).into_owned())
+            .map(|term| match term.as_str() {
+                // Joining a literal word with OR must not turn it into syntax.
+                "AND" | "OR" | "NOT" => quote_query_phrase(term),
+                _ => lexical_query_text(term).into_owned(),
+            })
             .chain(
                 parsed
                     .negative_phrases
@@ -38022,6 +38028,18 @@ mod tests {
             "the daemon must acknowledge the requested ranking-prior policy"
         );
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        for old_schema in [
+            "fsfs.search.serve.v18",
+            "fsfs.search.serve.v19",
+            "fsfs.search.serve.v20",
+            "fsfs.search.serve.v21",
+        ] {
+            response.schema_version = old_schema.to_owned();
+            assert!(
+                runtime.validate_search_serve_policy(&response).is_err(),
+                "a daemon using an older exclusion or ranking policy cannot attest: {old_schema}"
+            );
+        }
         response.schema_version = "fsfs.search.serve.v17".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -46161,6 +46179,64 @@ mod tests {
                     .unwrap()
                     .expect("expanded query keeps its exclusions");
             assert_eq!(expanded_excluded, excluded);
+        });
+    }
+
+    #[test]
+    fn boolean_word_exclusions_stay_literal_in_census_and_lexical_queries() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("lexical");
+            let writer = create_test_quill(&cx, &path).await;
+            for word in ["AND", "OR", "NOT", "clean"] {
+                writer
+                    .index_document(
+                        &cx,
+                        &IndexableDocument::new(word, format!("needle {word}")),
+                    )
+                    .await
+                    .unwrap();
+            }
+            writer.commit(&cx).await.unwrap();
+            let lexical = QuillSearchIndex::open(&cx, &path, QuillConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(lexical.search_doc_ids(&cx, "needle", 4).unwrap().len(), 4);
+            for word in ["AND", "OR", "NOT"] {
+                let allowed = ["AND", "OR", "NOT", "clean"]
+                    .into_iter()
+                    .filter(|id| *id != word)
+                    .map(str::to_owned)
+                    .collect::<std::collections::HashSet<_>>();
+                for query in [
+                    format!("needle -{word}"),
+                    format!("needle -{word} -absent"),
+                    format!("needle -absent -{word}"),
+                    format!("needle -\"{word}\" -absent"),
+                    format!("-{word}"),
+                ] {
+                    let normalized = FsfsRuntime::normalize_search_query(&query);
+                    let parsed = super::ParsedQuery::parse(&normalized);
+                    let excluded =
+                        FsfsRuntime::query_exclusions(&cx, Some(&lexical), &parsed, 4)
+                            .unwrap()
+                            .expect("explicit exclusion");
+                    assert_eq!(
+                        excluded.as_ref(),
+                        &std::collections::HashSet::from([word.to_owned()]),
+                        "census: {query}"
+                    );
+                    let hits = lexical
+                        .search_doc_ids(&cx, &super::lexical_query_text(&normalized), 4)
+                        .unwrap();
+                    assert_eq!(hits.len(), 3, "lexical: {query}");
+                    let actual = hits
+                        .iter()
+                        .map(|hit| hit.document_id.clone())
+                        .collect::<std::collections::HashSet<_>>();
+                    assert_eq!(actual, allowed, "lexical: {query}");
+                }
+            }
         });
     }
 
@@ -66298,6 +66374,10 @@ mod tests {
                 "fsfs.search.cache.v21",
                 // Dropped canonical recovery from successful degraded phases.
                 "fsfs.search.cache.v22",
+                // Predated quoted-literal and phrase-exclusion agreement.
+                "fsfs.search.cache.v23",
+                // Could reinterpret bare Boolean-word exclusions as operators.
+                "fsfs.search.cache.v24",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
