@@ -28374,12 +28374,12 @@ impl FsfsRuntime {
             if read == 0 {
                 return Ok(());
             }
-            let trimmed = input.trim();
-            if matches!(trimmed, "q" | "Q" | "quit" | "QUIT" | "exit" | "EXIT") {
+            let query = input.trim_end_matches(['\r', '\n']);
+            if matches!(query.trim(), "q" | "Q" | "quit" | "QUIT" | "exit" | "EXIT") {
                 return Ok(());
             }
 
-            state.query_input.set_value(trimmed.to_owned());
+            state.query_input.set_value(query);
             state.mark_query_dirty();
             if search.begin_query(cx, state).await {
                 let (runtime, resources) = search.parts();
@@ -28417,8 +28417,10 @@ impl FsfsRuntime {
         search_limit: usize,
         include_snippets: bool,
     ) -> SearchResult<Vec<SearchPayload>> {
-        let query = state.query_input.value().trim().to_owned();
-        if query.is_empty() {
+        // Whitespace can belong to a quoted or escaped literal. The shared
+        // execution normalizer owns it; trimming here can change the query.
+        let query = state.query_input.value().to_owned();
+        if query.trim().is_empty() {
             state.clear_search_results();
             return Ok(Vec::new());
         }
@@ -38851,6 +38853,29 @@ mod tests {
                 assert_eq!(response.payloads[0].skip_reason, None);
                 assert_eq!(response.payloads[0].query, expected_query);
             }
+
+            let mut state = SearchDashboardState::new(
+                runtime.collect_status_payload().unwrap(),
+                None,
+                10,
+                true,
+            );
+            let dashboard_query = r"  recover failed network requests\ ";
+            state.query_input.set_value(dashboard_query);
+            let payloads = runtime
+                .refresh_search_dashboard_mode_with_limit(
+                    &cx,
+                    &mut state,
+                    SearchExecutionMode::FastOnly,
+                    &mut resources,
+                    10,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(payloads[0].query, r"recover failed network requests\ ");
+            assert!(!payloads[0].hits.is_empty());
+            assert_eq!(state.query_input.value(), dashboard_query);
         });
     }
 

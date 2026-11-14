@@ -37894,6 +37894,7 @@ mod tests {
                 IndexableDocument::new("a  b", "double space"),
                 IndexableDocument::new("a b", "single space"),
                 IndexableDocument::new("a ", "trailing space"),
+                IndexableDocument::new("a", "no trailing space"),
                 IndexableDocument::new("url", "https sqlite org"),
             ];
             index.index_documents(&cx, &documents).await.unwrap();
@@ -37904,6 +37905,7 @@ mod tests {
                 (" id:'a  b' ", &["a  b"]),
                 (r" id:a\ \ b ", &["a  b"]),
                 (r" id:a\ ", &["a "]),
+                (" id:a\\ \r\n", &["a "]),
                 (" id:IN ['a  b'] ", &["a  b"]),
                 (" id:['a  b' TO 'a  b'] ", &["a  b"]),
                 (r#"id:"a  b"   OR https://sqlite.org"#, &["a  b", "url"]),
@@ -37925,6 +37927,13 @@ mod tests {
             let hits = index.search(&cx, &previous, documents.len()).await.unwrap();
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].doc_id, "a b");
+
+            // The previous interactive handoff strips the escaped final
+            // space, turning an exact keyword lookup into the planted decoy.
+            let previous = r" id:a\ ".trim();
+            let hits = index.search(&cx, previous, documents.len()).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "a");
 
             let normalized = normalize_query_whitespace(r#" needle   -id:"a  b"   -absent "#);
             let parsed = ParsedQuery::parse(&normalized);
