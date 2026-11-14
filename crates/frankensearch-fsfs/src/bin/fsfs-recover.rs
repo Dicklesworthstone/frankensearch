@@ -1,6 +1,6 @@
 //! Receipt-directed complete-store recovery, without normal CLI root discovery.
 //! Inspection is the default; only an explicit --apply can change selection.
-//! Vector reconstruction additionally requires --repair-vectors; originals stay intact.
+//! Reconstruction requires --repair-vectors or --repair-artifacts; originals stay intact.
 //! --rebuild-source explicitly prepares a fresh source snapshot and requires a query preview.
 
 #![recursion_limit = "512"]
@@ -69,6 +69,7 @@ No directory scan chooses a recovery target. Models are never downloaded.
                       Save a create-only preparation file BEFORE any selection write
   --resume-file FILE  Read a saved preparation; requires explicit --apply or --confirm-durability
   --repair-vectors    With --prepare or --apply, repair vectors in a NEW copied generation
+  --repair-artifacts  Repair vectors and protected Quill files in a NEW copied generation
   --max-copy-bytes N  Repair payload copy limit (positive integer; default 1073741824)
   --confirm-durability Confirm the exact selected target without models or republication
   --format FORMAT     json (default), jsonl, or table
@@ -78,10 +79,13 @@ Use the generation ID and manifest SHA-256 from a trusted publication receipt.
 All stored vector tiers must admit their configured producers, even in fast-only mode.
 A competing publication refuses restoration; no attempt is automatically retried.
 Predecessors and damaged bundles are retained. No file is deleted.
-Repair requires intact receipted FEC, catalog, lexical and metadata artifacts (Unix only).
-Each damaged vector is limited to 128 MiB and its sidecar to 256 MiB; copy limits are not RSS limits.
+Repair requires intact receipted FEC sidecars, selection pointers, catalog and metadata (Unix only).
+--repair-vectors requires intact lexical data; --repair-artifacts additionally repairs the
+selected Quill engine's MANIFEST, MANIFEST.prev and canonical .fslx segments. The flags
+are mutually exclusive. Catalogs and unprotected/unrelated files are never reconstructed.
+Each damaged artifact is limited to 128 MiB and its sidecar to 256 MiB; copy limits are not RSS limits.
 Failed partial copies remain unselected. Repaired results report a NEW receipt plus repaired_from.
---max-copy-bytes requires --repair-vectors; inspection never creates a repair copy.
+--max-copy-bytes requires --repair-vectors or --repair-artifacts; inspection never creates a repair copy.
 --prepare, --apply and --confirm-durability are mutually exclusive.
 Preparation exports generation_id, manifest_sha256 and expected_selection_sha256 together.
 To resume, use that target receipt and --apply --expected-selection-sha256 HASH, WITHOUT repair.
@@ -89,7 +93,7 @@ Keep all three fields in trusted storage; the guard is not a signature or a rete
 A removed target or changed selection is refused, not rebuilt or automatically rebased.
 Any requested preview must succeed before a prepare report is emitted or selection changes.
 --rebuild-source requires --query and --prepare or --apply; all input is reindexed offline.
-It cannot mix with target receipts, resume/guard fields or vector-repair options.
+It cannot mix with target receipts, resume/guard fields or artifact-repair options.
 It can replace a damaged selected bundle or malformed bounded descriptor, without reusing old artifacts.
 Its preview must return hits and exercise the requested semantic tiers before export or publication.
 Empty sources, unmatched filters, lexical fallback and skipped required quality cannot certify a rebuild.
@@ -198,6 +202,7 @@ struct Options {
     ranking_priors: Option<bool>,
     action: RecoveryAction,
     repair_vectors: bool,
+    repair_artifacts: bool,
     max_copy_bytes: u64,
     expected_selection_sha256: Option<String>,
     save_preparation: Option<PathBuf>,
@@ -237,6 +242,7 @@ impl Options {
         let mut ranking_priors = None;
         let mut action = RecoveryAction::Inspect;
         let mut repair_vectors = false;
+        let mut repair_artifacts = false;
         let mut max_copy_bytes = DEFAULT_REPAIR_COPY_BYTES;
         let mut expected_selection_sha256 = None;
         let mut save_preparation = None;
@@ -271,6 +277,7 @@ impl Options {
                     | "--save-preparation"
                     | "--resume-file"
                     | "--repair-vectors"
+                    | "--repair-artifacts"
                     | "--max-copy-bytes"
                     | "--confirm-durability"
                     | "--format"
@@ -295,8 +302,14 @@ impl Options {
                 action = selected;
                 continue;
             }
-            if flag == "--repair-vectors" {
-                repair_vectors = true;
+            if matches!(flag.as_str(), "--repair-vectors" | "--repair-artifacts") {
+                if repair_vectors || repair_artifacts {
+                    return Err(invalid(
+                        "--repair-vectors and --repair-artifacts are mutually exclusive",
+                    ));
+                }
+                repair_vectors = flag == "--repair-vectors";
+                repair_artifacts = flag == "--repair-artifacts";
                 continue;
             }
             if matches!(flag.as_str(), "--rerank" | "--no-rerank") {
@@ -385,6 +398,7 @@ impl Options {
                 || expected_selection_sha256.is_some()
                 || resume_file.is_some()
                 || repair_vectors
+                || repair_artifacts
                 || seen.contains("--max-copy-bytes")
             {
                 return Err(invalid(
@@ -411,6 +425,7 @@ impl Options {
                 || expected_selection_sha256.is_some()
                 || rebuild_source.is_some()
                 || repair_vectors
+                || repair_artifacts
                 || seen.contains("--max-copy-bytes")
             {
                 return Err(invalid(
@@ -436,6 +451,7 @@ impl Options {
                 || digest.is_some()
                 || expected_selection_sha256.is_some()
                 || repair_vectors
+                || repair_artifacts
                 || seen.contains("--max-copy-bytes")
                 || query.is_none()
             {
@@ -462,6 +478,7 @@ impl Options {
             ranking_priors,
             action,
             repair_vectors,
+            repair_artifacts,
             max_copy_bytes,
             expected_selection_sha256,
             save_preparation,
@@ -532,29 +549,36 @@ impl Options {
                 "preview filter must be nonblank and at most 64 KiB",
             ));
         }
-        if self.repair_vectors
+        if self.repair_vectors && self.repair_artifacts {
+            return Err(invalid(
+                "--repair-vectors and --repair-artifacts are mutually exclusive",
+            ));
+        }
+        if self.repair_requested()
             && !matches!(self.action, RecoveryAction::Prepare | RecoveryAction::Apply)
         {
             return Err(invalid(
-                "--repair-vectors requires --prepare or --apply; inspection cannot allocate a repair copy",
+                "artifact repair requires --prepare or --apply; inspection cannot allocate a repair copy",
             ));
         }
-        if explicit_copy_limit && !self.repair_vectors {
-            return Err(invalid("--max-copy-bytes requires --repair-vectors"));
+        if explicit_copy_limit && !self.repair_requested() {
+            return Err(invalid(
+                "--max-copy-bytes requires --repair-vectors or --repair-artifacts",
+            ));
         }
-        if self.repair_vectors && self.max_copy_bytes == 0 {
-            return Err(invalid("vector repair requires a positive copy budget"));
+        if self.repair_requested() && self.max_copy_bytes == 0 {
+            return Err(invalid("artifact repair requires a positive copy budget"));
         }
         #[cfg(not(unix))]
-        if self.repair_vectors {
+        if self.repair_requested() {
             return Err(invalid(
-                "vector repair requires Unix directory durability support",
+                "artifact repair requires Unix directory durability support",
             ));
         }
         if let Some(expected) = &self.expected_selection_sha256 {
-            if self.action != RecoveryAction::Apply || self.repair_vectors {
+            if self.action != RecoveryAction::Apply || self.repair_requested() {
                 return Err(invalid(
-                    "--expected-selection-sha256 requires --apply without --repair-vectors",
+                    "--expected-selection-sha256 requires --apply without artifact repair",
                 ));
             }
             if expected.len() != 64
@@ -571,7 +595,7 @@ impl Options {
             && (self.config.is_some()
                 || self.query.is_some()
                 || explicit_limit
-                || self.repair_vectors
+                || self.repair_requested()
                 || explicit_copy_limit)
         {
             return Err(invalid(
@@ -579,6 +603,10 @@ impl Options {
             ));
         }
         Ok(self)
+    }
+
+    const fn repair_requested(&self) -> bool {
+        self.repair_vectors || self.repair_artifacts
     }
 
     fn receipt(&self) -> SearchResult<(&str, &str)> {
@@ -884,23 +912,35 @@ async fn execute(
             runtime
                 .resume_retained_recovery(cx, &options.root, generation, digest, expected)
                 .await?
-        } else if options.repair_vectors {
+        } else if options.repair_requested() {
             #[cfg(unix)]
             {
                 let (generation, digest) = options.receipt()?;
-                runtime
-                    .prepare_retained_vector_repair(
-                        cx,
-                        &options.root,
-                        generation,
-                        digest,
-                        options.max_copy_bytes,
-                    )
-                    .await?
+                if options.repair_artifacts {
+                    runtime
+                        .prepare_retained_artifact_repair(
+                            cx,
+                            &options.root,
+                            generation,
+                            digest,
+                            options.max_copy_bytes,
+                        )
+                        .await?
+                } else {
+                    runtime
+                        .prepare_retained_vector_repair(
+                            cx,
+                            &options.root,
+                            generation,
+                            digest,
+                            options.max_copy_bytes,
+                        )
+                        .await?
+                }
             }
             #[cfg(not(unix))]
             return Err(invalid(
-                "vector repair requires Unix directory durability support",
+                "artifact repair requires Unix directory durability support",
             ));
         } else {
             let (generation, digest) = options.receipt()?;
@@ -921,7 +961,7 @@ async fn execute(
         report.preview_requirement = preview_requirement;
         report.source_rebuild_performed = matches!(options.target, RecoveryTarget::Source(_));
         report.repaired_from.clone_from(&options.resume_origin);
-        if options.repair_vectors {
+        if options.repair_requested() {
             let (generation, digest) = options.receipt()?;
             report.repaired_from = Some(RepairSource {
                 generation_id: generation.to_owned(),
@@ -1538,13 +1578,25 @@ mod tests {
 
     #[test]
     fn repair_is_never_implicit_and_conflicting_copy_authority_is_refused() {
-        assert!(!Options::parse(args()).unwrap().repair_vectors);
+        assert!(!Options::parse(args()).unwrap().repair_requested());
         for suffix in [
             vec!["--repair-vectors"],
+            vec!["--repair-artifacts"],
             vec!["--max-copy-bytes", "1"],
             vec!["--apply", "--max-copy-bytes", "1"],
             vec!["--apply", "--repair-vectors", "--repair-vectors"],
             vec!["--apply", "--repair-vectors", "--confirm-durability"],
+            vec!["--apply", "--repair-artifacts", "--confirm-durability"],
+            vec!["--apply", "--repair-artifacts", "--repair-artifacts"],
+            vec!["--apply", "--repair-vectors", "--repair-artifacts"],
+            vec!["--apply", "--repair-artifacts", "--repair-vectors"],
+            vec!["--apply", "--repair-artifacts", "--max-copy-bytes", "0"],
+            vec![
+                "--apply",
+                "--repair-artifacts",
+                "--resume-file",
+                "missing-file",
+            ],
             vec!["--apply", "--repair-vectors", "--max-copy-bytes", "0"],
             vec!["--apply", "--repair-vectors", "--max-copy-bytes", "-1"],
             vec!["--apply", "--repair-vectors", "--max-copy-bytes", "+1"],
@@ -1573,6 +1625,47 @@ mod tests {
         assert!(!parsed.repair_vectors);
         assert_eq!(parsed.action, RecoveryAction::Inspect);
         assert_eq!(parsed.query.as_deref(), Some("--repair-vectors"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_repair_preserves_explicit_copy_scope_and_resume_refusals() {
+        for action in ["--prepare", "--apply"] {
+            let mut input = args();
+            input.extend(
+                [
+                    action,
+                    "--repair-artifacts",
+                    "--max-copy-bytes",
+                    "8192",
+                    "--query",
+                    "recovery",
+                ]
+                .map(OsString::from),
+            );
+            let options = Options::parse(input).unwrap();
+            assert!(options.repair_artifacts);
+            assert!(!options.repair_vectors);
+            assert!(options.repair_requested());
+            assert_eq!(options.max_copy_bytes, 8192);
+            assert_eq!(options.query.as_deref(), Some("recovery"));
+        }
+        let mut input = args();
+        input.extend(
+            [
+                "--apply",
+                "--repair-artifacts",
+                "--expected-selection-sha256",
+            ]
+            .map(OsString::from),
+        );
+        input.push("b".repeat(64).into());
+        assert!(Options::parse(input).is_err());
+        let mut input = args();
+        input.extend(["--query", "--repair-artifacts"].map(OsString::from));
+        let options = Options::parse(input).unwrap();
+        assert!(!options.repair_requested());
+        assert_eq!(options.query.as_deref(), Some("--repair-artifacts"));
     }
 
     #[cfg(unix)]

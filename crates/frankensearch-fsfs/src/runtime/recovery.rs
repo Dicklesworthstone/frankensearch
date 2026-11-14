@@ -596,6 +596,48 @@ impl FsfsRuntime {
         })
     }
 
+    /// Repair receipted vector and Quill damage in a new generation, then admit it.
+    ///
+    /// Like [`Self::prepare_retained_vector_repair`], this never modifies the
+    /// original bundle, rereads sources or selects a target implicitly. It also
+    /// reconstructs the receipt-selected Quill engine's protected manifests and
+    /// segments from intact `.fec` sidecars. Selection pointers, catalogs and
+    /// unrelated metadata must remain intact. The recovered lexical engine and
+    /// every stored vector producer are admitted before returning a previewable
+    /// preparation; decoder success alone cannot authorize selection.
+    ///
+    /// The same payload bounds, explicit `restore`, expected-old guard and
+    /// cooperative-store security boundary as vector-only repair apply.
+    ///
+    /// # Errors
+    /// Returns unsupported damage/layout, invalid receipt, limits, I/O,
+    /// producer/engine admission, configuration or cancellation errors.
+    #[cfg(unix)]
+    pub async fn prepare_retained_artifact_repair(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        generation_id: &str,
+        manifest_sha256: &str,
+        max_copy_bytes: u64,
+    ) -> SearchResult<PreparedRetainedRecovery> {
+        self.preflight_retained_recovery(cx)?;
+        let store = crate::generation_store::CompleteGenerationStore::open(cx, store_root)?;
+        let plan =
+            store.prepare_artifact_repair(cx, generation_id, manifest_sha256, max_copy_bytes)?;
+        let generation = plan.target().clone();
+        let reader = self
+            .open_retained_recovery_target(cx, &store, generation)
+            .await?;
+        retained_search_checkpoint(cx)?;
+        Ok(PreparedRetainedRecovery {
+            plan,
+            reader,
+            preview_ready: true,
+            require_searchable_preview: false,
+        })
+    }
+
     /// Open an explicitly named retained generation without changing selection.
     ///
     /// The ID and manifest SHA-256 must come from a trusted publication receipt,

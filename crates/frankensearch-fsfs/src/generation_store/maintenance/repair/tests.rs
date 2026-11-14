@@ -1,5 +1,7 @@
 use super::*;
 use asupersync::test_utils::run_test_with_cx;
+use frankensearch_core::{GenerationRootSecurityProfileV1, IndexableDocument};
+use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 use std::cell::Cell;
 use std::os::unix::fs::{MetadataExt, symlink};
 
@@ -61,6 +63,358 @@ fn corrupt(path: &Path) -> Vec<u8> {
 
 fn count(store: &CompleteGenerationStore) -> usize {
     fs::read_dir(store.root.join(GENERATIONS)).unwrap().count()
+}
+
+async fn publish_quill(
+    store: &CompleteGenerationStore,
+    cx: &Cx,
+    directory: &str,
+    pointer_root: Option<&str>,
+) -> (PublishedGeneration, String) {
+    let build = store.begin(cx).unwrap();
+    let protector =
+        FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default()).unwrap();
+    let index = QuillIndex::create_durable(
+        cx,
+        build.path().join(directory),
+        QuillConfig {
+            max_ingest_shards: 1,
+            deterministic_ingest: true,
+            ..QuillConfig::default()
+        },
+        protector,
+    )
+    .await
+    .unwrap();
+    index
+        .upsert_documents(
+            cx,
+            &[
+                IndexableDocument::new("alpha", "durable recovery keeps the original documents"),
+                IndexableDocument::new("beta", "another unrelated document"),
+            ],
+        )
+        .await
+        .unwrap();
+    index.commit(cx).await.unwrap();
+    assert_eq!(
+        index.search_doc_ids(cx, "recovery", 10).unwrap()[0].document_id,
+        "alpha"
+    );
+    drop(index);
+    if let Some(pointer_root) = pointer_root {
+        let name = Path::new(directory).file_name().unwrap().to_str().unwrap();
+        let pointer = CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            name,
+            frankensearch_quill::FSLX_FORMAT_VERSION,
+        )
+        .unwrap();
+        fs::write(
+            build.path().join(pointer_root).join("CURRENT"),
+            pointer.encode(),
+        )
+        .unwrap();
+    }
+    let segment = fs::read_dir(build.path().join(directory))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| name.ends_with(".fslx"))
+        .unwrap();
+    let relative = format!("{directory}/{segment}");
+    assert!(build.path().join(format!("{relative}.fec")).is_file());
+    assert!(build.path().join(directory).join("MANIFEST.fec").is_file());
+    assert!(
+        build
+            .path()
+            .join(directory)
+            .join("MANIFEST.prev.fec")
+            .is_file()
+    );
+    let GenerationPublication::Durable(generation) = build.publish(cx, |_, _| Ok(())).unwrap()
+    else {
+        panic!("Quill fixture must be durable"); // ubs:ignore — test assertion.
+    };
+    (generation, relative)
+}
+
+#[test]
+fn artifact_repair_restores_real_quill_manifests_and_missing_segments_in_every_layout() {
+    run_test_with_cx(|cx| async move {
+        for (lexical, pointer_root) in [
+            ("lexical", None),
+            ("lexical/quill-v1", Some("lexical")),
+            ("quill-v1", Some("")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let (original, segment) = publish_quill(&store, &cx, lexical, pointer_root).await;
+            let healthy = fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap();
+            corrupt(&original.path().join(lexical).join("MANIFEST"));
+            corrupt(&original.path().join(lexical).join("MANIFEST.prev"));
+            fs::rename(
+                original.path().join(&segment),
+                directory.path().join("saved-segment"),
+            )
+            .unwrap();
+            let damaged = fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap();
+            let pointer = fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            assert!(
+                store
+                    .prepare_vector_repair(
+                        &cx,
+                        original.id(),
+                        original.manifest_sha256(),
+                        COPY_BUDGET
+                    )
+                    .is_err(),
+                "vector-only permission must not repair lexical data"
+            );
+            assert_eq!(count(&store), 1);
+            let plan = store
+                .prepare_artifact_repair(
+                    &cx,
+                    original.id(),
+                    original.manifest_sha256(),
+                    COPY_BUDGET,
+                )
+                .unwrap();
+            assert_eq!(
+                fresh_inventory(&cx, plan.target().path(), COPY_BUDGET, true).unwrap(),
+                healthy
+            );
+            assert_eq!(
+                fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap(),
+                damaged
+            );
+            assert_eq!(
+                fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            let repaired = plan.target().clone();
+            let reader =
+                QuillSearchIndex::open(&cx, repaired.path().join(lexical), QuillConfig::default())
+                    .await
+                    .unwrap();
+            let hits = reader.search_doc_ids(&cx, "recovery", 10).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].document_id, "alpha");
+            assert!(matches!(plan.restore(&cx, |_, _| Ok(())).unwrap(),
+                GenerationPublication::Durable(ref selected) if selected == &repaired));
+            assert_eq!(store.active(&cx).unwrap(), Some(repaired));
+            assert_eq!(
+                fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap(),
+                damaged
+            );
+        }
+    });
+}
+
+#[test]
+fn artifact_repair_refuses_missing_changed_sidecars_and_untrusted_lexical_selection() {
+    run_test_with_cx(|cx| async move {
+        for damage in [
+            "missing-sidecar",
+            "changed-sidecar",
+            "selection",
+            "unreceipted",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let (original, segment) =
+                publish_quill(&store, &cx, "lexical/quill-v1", Some("lexical")).await;
+            corrupt(&original.path().join(&segment));
+            let sidecar = original.path().join(format!("{segment}.fec"));
+            match damage {
+                "missing-sidecar" => {
+                    fs::rename(sidecar, directory.path().join("saved-sidecar")).unwrap()
+                }
+                "changed-sidecar" => {
+                    corrupt(&sidecar);
+                }
+                "selection" => {
+                    corrupt(&original.path().join("lexical/CURRENT"));
+                }
+                "unreceipted" => {
+                    fs::write(original.path().join("extra.fslx"), b"unreceipted").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            let before = fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap();
+            let pointer = fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            assert!(
+                store
+                    .prepare_artifact_repair(
+                        &cx,
+                        original.id(),
+                        original.manifest_sha256(),
+                        COPY_BUDGET
+                    )
+                    .is_err(),
+                "{damage}"
+            );
+            assert_eq!(count(&store), 1, "refuse {damage} before copying");
+            assert_eq!(
+                fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap(),
+                before
+            );
+            assert_eq!(
+                fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+        }
+    });
+}
+
+#[test]
+fn artifact_repair_refuses_other_engines_and_unselected_lexical_siblings() {
+    run_test_with_cx(|cx| async move {
+        // Role admission must refuse before decoding or opening a consumer
+        // engine, even when an unrelated file has a valid receipted sidecar.
+        for (engine, damaged_directory) in [
+            (BlueGreenEngine::Tantivy, "selected"),
+            (BlueGreenEngine::Quill, "unselected"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let protector =
+                FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
+                    .unwrap();
+            for lexical in ["selected", "unselected"] {
+                let path = build.path().join("lexical").join(lexical);
+                fs::create_dir_all(&path).unwrap();
+                let segment = path.join("seg-0000000000000001.fslx");
+                fs::write(&segment, vector_bytes(3)).unwrap();
+                protector.protect_file(&segment).unwrap();
+            }
+            let pointer =
+                CurrentPointer::new(engine, "selected", frankensearch_quill::FSLX_FORMAT_VERSION)
+                    .unwrap();
+            fs::write(build.path().join("lexical/CURRENT"), pointer.encode()).unwrap();
+            let GenerationPublication::Durable(original) =
+                build.publish(&cx, |_, _| Ok(())).unwrap()
+            else {
+                panic!("role fixture must be durable"); // ubs:ignore — test assertion.
+            };
+            corrupt(
+                &original
+                    .path()
+                    .join("lexical")
+                    .join(damaged_directory)
+                    .join("seg-0000000000000001.fslx"),
+            );
+            let before = fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap();
+            let selection = fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let error = store
+                .prepare_artifact_repair(
+                    &cx,
+                    original.id(),
+                    original.manifest_sha256(),
+                    COPY_BUDGET,
+                )
+                .err()
+                .expect("unselected or non-Quill damage must be refused");
+            assert!(error.to_string().contains("outside the selected scope"));
+            assert_eq!(count(&store), 1);
+            assert_eq!(
+                fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap(),
+                before
+            );
+            assert_eq!(
+                fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                selection
+            );
+        }
+    });
+}
+
+#[test]
+fn repair_requires_mutation_authority_before_allocating_or_copying() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+        let original = publish(&store, &cx, 4);
+        corrupt(&original.path().join(VECTOR_PATHS[0]));
+        let before = fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap();
+        let pointer = fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+        let root_before = fresh_inventory(&cx, &store.root, COPY_BUDGET, false).unwrap();
+        for profile in [
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+            GenerationRootSecurityProfileV1::RequiredExternal,
+        ] {
+            let restricted = store.clone().with_security_profile(profile);
+            assert!(
+                restricted
+                    .prepare_vector_repair(
+                        &cx,
+                        original.id(),
+                        original.manifest_sha256(),
+                        COPY_BUDGET
+                    )
+                    .is_err()
+            );
+            assert!(
+                restricted
+                    .prepare_artifact_repair(
+                        &cx,
+                        original.id(),
+                        original.manifest_sha256(),
+                        COPY_BUDGET
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                count(&store),
+                1,
+                "profile {profile:?} must refuse before allocation"
+            );
+            assert_eq!(
+                fresh_inventory(&cx, original.path(), COPY_BUDGET, true).unwrap(),
+                before
+            );
+            assert_eq!(
+                fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(
+                fresh_inventory(&cx, &store.root, COPY_BUDGET, false).unwrap(),
+                root_before,
+                "profile {profile:?} must refuse before rewriting any lease record"
+            );
+        }
+    });
+}
+
+#[test]
+fn artifact_repair_cannot_replace_a_concurrent_winner() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+        let (original, segment) = publish_quill(&store, &cx, "lexical", None).await;
+        let _previous = publish(&store, &cx, 1);
+        let damaged = corrupt(&original.path().join(&segment));
+        let plan = store
+            .prepare_artifact_repair(&cx, original.id(), original.manifest_sha256(), COPY_BUDGET)
+            .unwrap();
+        let repaired = plan.target().clone();
+        let winner = publish(&store, &cx, 2);
+        let selected = fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+        assert!(plan.restore(&cx, |_, _| Ok(())).is_err());
+        assert_eq!(store.active(&cx).unwrap(), Some(winner));
+        assert_eq!(
+            fs::read(store.root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+            selected
+        );
+        assert_eq!(fs::read(original.path().join(segment)).unwrap(), damaged);
+        let reader =
+            QuillSearchIndex::open(&cx, repaired.path().join("lexical"), QuillConfig::default())
+                .await
+                .unwrap();
+        let hits = reader.search_doc_ids(&cx, "recovery", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document_id, "alpha");
+    });
 }
 
 #[test]
