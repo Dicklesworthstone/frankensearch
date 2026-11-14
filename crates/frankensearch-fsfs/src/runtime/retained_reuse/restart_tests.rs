@@ -30,6 +30,9 @@ const CHILD_ROOT: &str = "FSFS_REUSE_CHILD_ROOT";
 const CHILD_MODE: &str = "FSFS_REUSE_CHILD_MODE";
 const CHILD_REPORT: &str = "FSFS_REUSE_CHILD_REPORT";
 const CHILD_UPGRADE_POLICY: &str = "FSFS_REUSE_CHILD_UPGRADE_POLICY";
+// The bounded ETXTBSY policy of `spawn_verifying_executable` in runtime.rs.
+const ETXTBSY_RETRY_BUDGET: usize = 50;
+const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 struct CountedHash {
     inner: HashEmbedder,
@@ -344,7 +347,24 @@ fn child_with_policy_outcome(
     if let Some(policy) = policy {
         command.env(CHILD_UPGRADE_POLICY, policy);
     }
-    let mut child = OwnedChild(command.spawn().unwrap());
+    // `execve` of the freshly written upgrade image can fail with ETXTBSY when a
+    // sibling test thread forked while the image's write descriptor was still
+    // open, the race documented at `spawn_verifying_executable` in runtime.rs.
+    // Retry only that error, bounded; return every other error unchanged.
+    let mut attempt = 0usize;
+    let spawned = loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < ETXTBSY_RETRY_BUDGET =>
+            {
+                attempt += 1;
+                std::thread::sleep(ETXTBSY_RETRY_DELAY);
+            }
+            result => break result,
+        }
+    };
+    let mut child = OwnedChild(spawned.unwrap());
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
