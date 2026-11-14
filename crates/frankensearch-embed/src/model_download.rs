@@ -10,7 +10,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::{Future, poll_fn};
 use std::io::{BufReader, ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
@@ -29,16 +29,114 @@ use asupersync::http::h1::{
 };
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::generation::QuantizationFormat;
+use frankensearch_core::recovery_plan::{
+    BoundLocalModelAcquisitionPlan, ModelAcquisitionTarget, ModelDestinationClass,
+    SemanticReadiness,
+};
+use frankensearch_core::traits::ModelTier;
 
 use crate::model_manifest::{
     FrozenModelArtifactManifestV1, ModelArtifactFileV1, ModelArtifactRoleV1, ModelFile,
-    ModelLifecycle, ModelManifest,
+    ModelLifecycle, ModelManifest, model_publication_uncertainty,
 };
 use crate::proxy::{ProxySetting, proxy_from_environment};
 
 static STAGING_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOCAL_COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const IN_MEMORY_F32_STORAGE_FORMAT_V1: &str = "in-memory-f32-v1";
+
+#[derive(Clone, Copy)]
+enum AcquisitionBoundary {
+    BeforeLock,
+    Locked,
+    BeforeStage,
+    BeforePublication,
+    WarmComplete,
+}
+
+fn local_recovery_error(field: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: format!("model_acquisition.recovery.{field}"),
+        value: "rejected".to_owned(),
+        reason: "The exact local acquisition scope, readiness, or authorization changed; derive a fresh plan before importing.".to_owned(),
+    }
+}
+
+/// Derive one standalone local-import target from trusted execution inputs.
+///
+/// The destination fingerprint binds its absolute, normalized, symlink-free
+/// spelling. Every existing component must be a directory; absent cache
+/// components are permitted without creating them. Like the acquisition lock,
+/// this is a cooperative cache contract, not hostile-directory authority.
+/// The executor rechecks the same path at its mutation boundaries.
+/// No corpus or reindex work is granted by this target.
+///
+/// # Errors
+///
+/// Refuses invalid manifests, unsupported paths and unreadable existing path
+/// components. The canonical planner validates the supplied authorization
+/// metadata. No filesystem mutation occurs.
+pub fn local_model_acquisition_target(
+    frozen: &FrozenModelArtifactManifestV1,
+    model_tier: ModelTier,
+    destination: &Path,
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+    nonce: String,
+) -> SearchResult<ModelAcquisitionTarget> {
+    frozen.validate()?;
+    let destination = std::path::absolute(destination)?;
+    let mut prefix = PathBuf::new();
+    for component in destination.components() {
+        if matches!(component, Component::ParentDir | Component::CurDir) {
+            return Err(local_recovery_error("destination"));
+        }
+        prefix.push(component.as_os_str());
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(local_recovery_error("destination"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if destination.file_name().is_none() {
+        return Err(local_recovery_error("destination"));
+    }
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(b"frankensearch.local-model-cache-destination.v1\0");
+    fingerprint.update(destination.as_os_str().as_encoded_bytes());
+    let destination_fingerprint =
+        fingerprint
+            .finalize()
+            .iter()
+            .fold(String::with_capacity(64), |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            });
+    let identity = frozen
+        .manifest
+        .declared_identity_bundle(QuantizationFormat::F32, IN_MEMORY_F32_STORAGE_FORMAT_V1)?;
+    Ok(ModelAcquisitionTarget {
+        model_id: frozen.manifest.logical_model_id.clone(),
+        model_tier,
+        embedding_space: identity.space,
+        manifest_fingerprint: frozen.fingerprint.clone(),
+        upstream_revision: frozen.manifest.upstream_revision.clone(),
+        license_spdx: frozen.manifest.license_spdx.clone(),
+        network_source_hosts: Vec::new(),
+        byte_budget: total_frozen_bytes(frozen)?,
+        destination_class: ModelDestinationClass::ManagedCache,
+        destination_fingerprint,
+        document_count: 0,
+        estimated_reindex_duration_ms: 0,
+        issued_at_unix_seconds,
+        expires_at_unix_seconds,
+        nonce,
+    })
+}
 
 /// Schema version for durable acquisition receipts.
 pub const MODEL_ACQUISITION_RECEIPT_SCHEMA_V1: u16 = 1;
@@ -213,6 +311,9 @@ pub enum ModelAcquisitionStageV1 {
     LoadSelfTestPassed,
     /// The verified generation was durably published.
     Published,
+    /// Publication crossed a rename boundary, but the selected state or its
+    /// durability remains uncertain. The typed error retains the exact outcome.
+    PublicationUncertain,
     /// The existing destination passed verification and load self-test.
     WarmCacheVerified,
     /// Acquisition failed without declaring semantic readiness.
@@ -517,6 +618,123 @@ impl ModelDownloader {
         on_progress: impl Fn(&ModelAcquisitionProgressV1) + Send + Sync,
         load_self_test: impl Fn(&Path, &FrozenModelArtifactManifestV1) -> SearchResult<()> + Send + Sync,
     ) -> SearchResult<ModelAcquisitionReceiptV1> {
+        self.acquire_frozen_model_guarded(
+            cx,
+            request,
+            lifecycle,
+            on_progress,
+            load_self_test,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Execute one canonical, exactly authorized offline acquisition plan.
+    ///
+    /// Reconstructs the model, byte budget and destination scope independently
+    /// from the actual frozen request. The supplied clock must be trusted current
+    /// time; it is called before cache/lock creation, after lock admission, before
+    /// staging and immediately before publication. Readiness is independently
+    /// reprobed while holding the model-cache lease. An already verified cache
+    /// requires a new readiness decision, not reuse of a stale mutation plan.
+    ///
+    /// The load callback must execute the registered producer's self-test and
+    /// compare its full identity with the frozen manifest. Successful acquisition
+    /// never admits semantic search or grants reindex/replay authority.
+    ///
+    /// # Errors
+    ///
+    /// Refuses network sources, changed scope/readiness, expired grants, invalid
+    /// artifacts and failed execution tests before replacing the prior cache.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_local_model_recovery(
+        &self,
+        cx: &Cx,
+        plan: &BoundLocalModelAcquisitionPlan,
+        request: ModelAcquisitionRequest<'_>,
+        lifecycle: &mut ModelLifecycle,
+        on_progress: impl Fn(&ModelAcquisitionProgressV1) + Send + Sync,
+        load_self_test: impl Fn(&Path, &FrozenModelArtifactManifestV1) -> SearchResult<()> + Send + Sync,
+        current_time: impl Fn() -> SearchResult<u64> + Send + Sync,
+    ) -> SearchResult<ModelAcquisitionReceiptV1> {
+        if !matches!(&request.source, ModelAcquisitionSource::LocalBundle(_)) {
+            return Err(local_recovery_error("source"));
+        }
+        let frozen = request.frozen_manifest;
+        let destination = request.destination_dir;
+        let grant = plan.authorization();
+        let model_tier = match lifecycle.manifest().tier {
+            Some(crate::model_manifest::ModelTier::Fast) => ModelTier::Fast,
+            Some(crate::model_manifest::ModelTier::Quality) => ModelTier::Quality,
+            _ => return Err(local_recovery_error("model_tier")),
+        };
+        let validate = |boundary| {
+            let actual = local_model_acquisition_target(
+                frozen,
+                model_tier,
+                destination,
+                grant.issued_at_unix_seconds,
+                grant.expires_at_unix_seconds,
+                grant.nonce.clone(),
+            )?;
+            plan.validate_binding_at(&actual, current_time()?)
+                .map_err(|_| local_recovery_error("authorization"))?;
+            if matches!(boundary, AcquisitionBoundary::Locked) {
+                let state = match std::fs::symlink_metadata(destination) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        SemanticReadiness::ModelMissing {
+                            tier: actual.model_tier,
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {
+                        let artifacts_verified = frozen.manifest.verify_dir(destination).is_ok();
+                        check_acquisition_cancel(cx, "recovery-readiness")?;
+                        if artifacts_verified {
+                            return Err(local_recovery_error("readiness"));
+                        }
+                        SemanticReadiness::ModelUnloadable {
+                            tier: actual.model_tier,
+                        }
+                    }
+                };
+                if plan.plan().state() != &state {
+                    return Err(local_recovery_error("readiness"));
+                }
+            }
+            Ok(())
+        };
+        self.acquire_frozen_model_guarded(
+            cx,
+            request,
+            lifecycle,
+            on_progress,
+            load_self_test,
+            validate,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn acquire_frozen_model_guarded(
+        &self,
+        cx: &Cx,
+        request: ModelAcquisitionRequest<'_>,
+        lifecycle: &mut ModelLifecycle,
+        on_progress: impl Fn(&ModelAcquisitionProgressV1) + Send + Sync,
+        load_self_test: impl Fn(&Path, &FrozenModelArtifactManifestV1) -> SearchResult<()> + Send + Sync,
+        validate_boundary: impl Fn(AcquisitionBoundary) -> SearchResult<()> + Send + Sync,
+    ) -> SearchResult<ModelAcquisitionReceiptV1> {
+        if matches!(
+            lifecycle.state(),
+            crate::model_manifest::ModelState::PublicationUncertain
+        ) {
+            // A new acquisition cannot reconcile an uncertain prior operation.
+            // Do not touch disk, run a loader, or replace its terminal progress
+            // with an ordinary failure. The caller retains the original typed
+            // uncertainty and must independently inspect the selected cache.
+            return Err(local_recovery_error("publication_uncertain"));
+        }
         let started = Instant::now();
         let ModelAcquisitionRequest {
             frozen_manifest,
@@ -532,9 +750,11 @@ impl ModelDownloader {
             frozen_manifest.validate()?;
             validate_lifecycle_manifest(frozen_manifest, lifecycle.manifest())?;
             check_acquisition_cancel(cx, "acquisition-start")?;
+            validate_boundary(AcquisitionBoundary::BeforeLock)?;
 
             let _lock = AcquisitionLock::acquire(destination_dir)?;
             check_acquisition_cancel(cx, "acquisition-lock")?;
+            validate_boundary(AcquisitionBoundary::Locked)?;
 
             let cache_reason = if destination_dir.is_dir()
                 && frozen_manifest.manifest.verify_dir(destination_dir).is_ok()
@@ -551,6 +771,7 @@ impl ModelDownloader {
                 check_acquisition_cancel(cx, "warm-cache-self-test")?;
                 load_self_test(destination_dir, frozen_manifest)?;
                 check_acquisition_cancel(cx, "warm-cache-complete")?;
+                validate_boundary(AcquisitionBoundary::WarmComplete)?;
                 lifecycle.mark_acquired_needs_reindex()?;
                 on_progress(&acquisition_phase_progress(
                     frozen_manifest,
@@ -571,6 +792,7 @@ impl ModelDownloader {
                 );
             }
 
+            validate_boundary(AcquisitionBoundary::BeforeStage)?;
             let stage = match source {
                 ModelAcquisitionSource::Network => {
                     let download_manifest = legacy_manifest_from_frozen(frozen_manifest)?;
@@ -652,9 +874,17 @@ impl ModelDownloader {
                 ModelAcquisitionVerificationResultV1::Passed,
             )?);
             check_acquisition_cancel(cx, "atomic-publication")?;
+            validate_boundary(AcquisitionBoundary::BeforePublication)?;
             let backup = frozen_manifest
                 .manifest
-                .promote_verified_installation(stage.path(), destination_dir)?;
+                .promote_verified_installation_with_validation(
+                    stage.path(),
+                    destination_dir,
+                    || {
+                        check_acquisition_cancel(cx, "atomic-publication")?;
+                        validate_boundary(AcquisitionBoundary::BeforePublication)
+                    },
+                )?;
             lifecycle.mark_acquired_needs_reindex()?;
             on_progress(&acquisition_phase_progress(
                 frozen_manifest,
@@ -679,7 +909,10 @@ impl ModelDownloader {
 
         if let Err(error) = &operation {
             let cancelled = matches!(error, SearchError::Cancelled { .. });
-            if cancelled {
+            let uncertain = model_publication_uncertainty(error).is_some();
+            if uncertain {
+                lifecycle.mark_publication_uncertain();
+            } else if cancelled {
                 lifecycle.cancel();
             } else {
                 lifecycle.fail_verification(bounded_download_failure_reason(error));
@@ -687,14 +920,18 @@ impl ModelDownloader {
             if let Ok(progress) = acquisition_phase_progress(
                 frozen_manifest,
                 requested_source,
-                if cancelled {
+                if uncertain {
+                    ModelAcquisitionStageV1::PublicationUncertain
+                } else if cancelled {
                     ModelAcquisitionStageV1::Cancelled
                 } else {
                     ModelAcquisitionStageV1::Failed
                 },
                 started.elapsed(),
                 observed_cache_reason,
-                if cancelled {
+                if uncertain {
+                    ModelAcquisitionVerificationResultV1::Passed
+                } else if cancelled {
                     ModelAcquisitionVerificationResultV1::Cancelled
                 } else {
                     ModelAcquisitionVerificationResultV1::Failed
@@ -1781,6 +2018,7 @@ fn acquisition_phase_progress(
         ModelAcquisitionStageV1::StagedVerified
             | ModelAcquisitionStageV1::LoadSelfTestPassed
             | ModelAcquisitionStageV1::Published
+            | ModelAcquisitionStageV1::PublicationUncertain
             | ModelAcquisitionStageV1::WarmCacheVerified
     );
     Ok(ModelAcquisitionProgressV1 {
@@ -2402,6 +2640,410 @@ mod tests {
         frozen: &FrozenModelArtifactManifestV1,
     ) -> SearchResult<()> {
         frozen.manifest.verify_dir(path).map(|_| ())
+    }
+
+    fn bound_local_fixture(
+        target: &ModelAcquisitionTarget,
+        state: SemanticReadiness,
+    ) -> BoundLocalModelAcquisitionPlan {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            TrustedRecoveryContext, plan,
+        };
+        let request = RecoveryRequest {
+            mode: RequestMode::ExplicitSemantic,
+            requested_topology: frankensearch_core::RetrievalTopology::FastOnly,
+        };
+        let mut policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        let now = target.issued_at_unix_seconds + 1;
+        let preview = plan(TrustedRecoveryContext::new(
+            &state,
+            request,
+            &policy,
+            Some(target),
+            now,
+        ))
+        .unwrap();
+        policy.acquisition_authorization =
+            preview.action().unwrap().required_authorization().cloned();
+        plan(TrustedRecoveryContext::new(
+            &state,
+            request,
+            &policy,
+            Some(target),
+            now,
+        ))
+        .unwrap()
+        .bind_local_model_acquisition(target, now)
+        .unwrap()
+    }
+
+    fn recovery_fixture_lifecycle(frozen: &FrozenModelArtifactManifestV1) -> ModelLifecycle {
+        let mut manifest = legacy_manifest_from_frozen(frozen).unwrap();
+        manifest.tier = Some(crate::model_manifest::ModelTier::Fast);
+        ModelLifecycle::new(
+            manifest,
+            DownloadConsent::granted(ConsentSource::Programmatic),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_local_target_rejects_alias_and_parent_traversal_without_creating_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let frozen = acquisition_fixture();
+        for destination in [
+            alias.join("cache/model"),
+            root.join("missing/../cache/model"),
+        ] {
+            assert!(
+                local_model_acquisition_target(
+                    &frozen,
+                    ModelTier::Fast,
+                    &destination,
+                    100,
+                    1000,
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                )
+                .is_err()
+            );
+            assert!(!root.join("cache").exists());
+            assert!(!root.join("missing").exists());
+        }
+    }
+
+    #[test]
+    fn scoped_acquisition_reports_visible_new_cache_with_unconfirmed_durability() {
+        use crate::model_manifest::{
+            ModelPublicationUncertainOutcomeV1, PublicationBoundary, PublicationFaultGuard,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().canonicalize().unwrap().join("cache/model");
+        let source = temp.path().join("source");
+        let frozen = acquisition_fixture();
+        write_acquisition_fixture(&source, &frozen);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("prior"), b"prior cache retained").unwrap();
+        let target = local_model_acquisition_target(
+            &frozen,
+            ModelTier::Fast,
+            &destination,
+            100,
+            1000,
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        )
+        .unwrap();
+        let bound = bound_local_fixture(
+            &target,
+            SemanticReadiness::ModelUnloadable {
+                tier: ModelTier::Fast,
+            },
+        );
+        run_test_with_cx(|cx| async move {
+            let _fault = PublicationFaultGuard::install(PublicationBoundary::PublishedParentSync);
+            let mut lifecycle = recovery_fixture_lifecycle(&frozen);
+            let events = Mutex::new(Vec::new());
+            let error = ModelDownloader::with_defaults()
+                .acquire_local_model_recovery(
+                    &cx,
+                    &bound,
+                    ModelAcquisitionRequest {
+                        frozen_manifest: &frozen,
+                        source: ModelAcquisitionSource::LocalBundle(&source),
+                        destination_dir: &destination,
+                    },
+                    &mut lifecycle,
+                    |progress| events.lock().unwrap().push(progress.clone()),
+                    verify_fixture_load,
+                    || Ok(101),
+                )
+                .await
+                .unwrap_err();
+            let uncertainty = model_publication_uncertainty(&error).unwrap();
+            assert_eq!(
+                uncertainty.outcome,
+                ModelPublicationUncertainOutcomeV1::SelectedNewDurabilityUnknown
+            );
+            assert!(uncertainty.prior_generation_preserved);
+            assert!(matches!(
+                lifecycle.state(),
+                ModelState::PublicationUncertain
+            ));
+            frozen.manifest.verify_dir(&destination).unwrap();
+            assert_eq!(
+                diagnose_model_acquisition(&destination)
+                    .unwrap()
+                    .preserved_backup_generations,
+                1
+            );
+            let events = events.into_inner().unwrap();
+            let terminal = events.last().unwrap();
+            assert_eq!(
+                terminal.stage,
+                ModelAcquisitionStageV1::PublicationUncertain
+            );
+            assert_eq!(
+                terminal.verification_result,
+                ModelAcquisitionVerificationResultV1::Passed
+            );
+            assert!(events.iter().all(|event| !matches!(
+                event.stage,
+                ModelAcquisitionStageV1::Failed
+                    | ModelAcquisitionStageV1::Cancelled
+                    | ModelAcquisitionStageV1::Published
+            )));
+            let serialized = serde_json::to_string(uncertainty).unwrap();
+            assert!(!serialized.contains(&destination.to_string_lossy().to_string()));
+            assert!(!serialized.contains(&source.to_string_lossy().to_string()));
+            let retry_progress = AtomicUsize::new(0);
+            let retry_loads = AtomicUsize::new(0);
+            assert!(
+                ModelDownloader::with_defaults()
+                    .acquire_frozen_model(
+                        &cx,
+                        ModelAcquisitionRequest {
+                            frozen_manifest: &frozen,
+                            source: ModelAcquisitionSource::Network,
+                            destination_dir: &destination,
+                        },
+                        &mut lifecycle,
+                        |_| {
+                            retry_progress.fetch_add(1, Ordering::SeqCst);
+                        },
+                        |_, _| {
+                            retry_loads.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(retry_progress.load(Ordering::SeqCst), 0);
+            assert_eq!(retry_loads.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                lifecycle.state(),
+                ModelState::PublicationUncertain
+            ));
+            assert_eq!(
+                diagnose_model_acquisition(&destination)
+                    .unwrap()
+                    .preserved_backup_generations,
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn scoped_local_acquisition_rejects_expiry_destination_budget_and_network_before_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("absent-cache/model");
+        let source = temp.path().join("source");
+        let frozen = acquisition_fixture();
+        write_acquisition_fixture(&source, &frozen);
+        let target = local_model_acquisition_target(
+            &frozen,
+            ModelTier::Fast,
+            &destination,
+            100,
+            1000,
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        )
+        .unwrap();
+        let plan = bound_local_fixture(
+            &target,
+            SemanticReadiness::ModelMissing {
+                tier: ModelTier::Fast,
+            },
+        );
+        let mut oversized = target.clone();
+        oversized.byte_budget += 1;
+        let wrong_budget = bound_local_fixture(
+            &oversized,
+            SemanticReadiness::ModelMissing {
+                tier: ModelTier::Fast,
+            },
+        );
+        run_test_with_cx(|cx| async move {
+            let downloader = ModelDownloader::with_defaults();
+            let other_destination = temp
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("other-cache/model");
+            for (bound, output, network, now) in [
+                (&plan, &destination, false, 1000),
+                (&plan, &other_destination, false, 101),
+                (&wrong_budget, &destination, false, 101),
+                (&plan, &destination, true, 101),
+            ] {
+                let mut lifecycle = recovery_fixture_lifecycle(&frozen);
+                let error = downloader
+                    .acquire_local_model_recovery(
+                        &cx,
+                        bound,
+                        ModelAcquisitionRequest {
+                            frozen_manifest: &frozen,
+                            source: if network {
+                                ModelAcquisitionSource::Network
+                            } else {
+                                ModelAcquisitionSource::LocalBundle(&source)
+                            },
+                            destination_dir: output,
+                        },
+                        &mut lifecycle,
+                        |_| {},
+                        verify_fixture_load,
+                        || Ok(now),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::InvalidConfig { .. }));
+                assert!(!destination.parent().unwrap().exists());
+                assert!(!other_destination.parent().unwrap().exists());
+            }
+        });
+    }
+
+    #[test]
+    fn scoped_local_acquisition_expiry_after_load_preserves_prior_then_fresh_grant_publishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().canonicalize().unwrap().join("cache/model");
+        let source = temp.path().join("source");
+        let frozen = acquisition_fixture();
+        write_acquisition_fixture(&source, &frozen);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("prior"), b"preserve exact incumbent").unwrap();
+        let target = local_model_acquisition_target(
+            &frozen,
+            ModelTier::Fast,
+            &destination,
+            100,
+            1000,
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        )
+        .unwrap();
+        let bound = bound_local_fixture(
+            &target,
+            SemanticReadiness::ModelUnloadable {
+                tier: ModelTier::Fast,
+            },
+        );
+        run_test_with_cx(|cx| async move {
+            let downloader = ModelDownloader::with_defaults();
+            let clock = AtomicU64::new(101);
+            let mut lifecycle = recovery_fixture_lifecycle(&frozen);
+            let error = downloader
+                .acquire_local_model_recovery(
+                    &cx,
+                    &bound,
+                    ModelAcquisitionRequest {
+                        frozen_manifest: &frozen,
+                        source: ModelAcquisitionSource::LocalBundle(&source),
+                        destination_dir: &destination,
+                    },
+                    &mut lifecycle,
+                    |_| {},
+                    |path, frozen| {
+                        verify_fixture_load(path, frozen)?;
+                        clock.store(1000, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    || Ok(clock.load(Ordering::SeqCst)),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            assert_eq!(
+                std::fs::read(destination.join("prior")).unwrap(),
+                b"preserve exact incumbent"
+            );
+            assert!(!matches!(
+                lifecycle.state(),
+                ModelState::AcquiredNeedsReindex
+            ));
+            let recovery = diagnose_model_acquisition(&destination).unwrap();
+            assert_eq!(recovery.preserved_backup_generations, 0);
+            assert!(recovery.orphan_staging_generations > 0);
+
+            // A new operation with its own still-valid grant may consume the
+            // same immutable bundle; the failed operation published nothing.
+            let mut fresh = target.clone();
+            fresh.nonce = "1123456789abcdef0123456789abcdef".to_owned();
+            fresh.issued_at_unix_seconds = 1000;
+            fresh.expires_at_unix_seconds = 1900;
+            let fresh = bound_local_fixture(
+                &fresh,
+                SemanticReadiness::ModelUnloadable {
+                    tier: ModelTier::Fast,
+                },
+            );
+            let mut lifecycle = recovery_fixture_lifecycle(&frozen);
+            let receipt = downloader
+                .acquire_local_model_recovery(
+                    &cx,
+                    &fresh,
+                    ModelAcquisitionRequest {
+                        frozen_manifest: &frozen,
+                        source: ModelAcquisitionSource::LocalBundle(&source),
+                        destination_dir: &destination,
+                    },
+                    &mut lifecycle,
+                    |_| {},
+                    verify_fixture_load,
+                    || Ok(1001),
+                )
+                .await
+                .unwrap();
+            assert!(receipt.prior_generation_preserved);
+            assert!(receipt.requires_reindex);
+            assert_eq!(receipt.source, ModelAcquisitionSourceKindV1::LocalBundle);
+            frozen.manifest.verify_dir(&destination).unwrap();
+            assert_eq!(
+                diagnose_model_acquisition(&destination)
+                    .unwrap()
+                    .preserved_backup_generations,
+                1
+            );
+
+            // The old readiness snapshot cannot authorize replacing a winner
+            // that now verifies, even though its grant has not expired.
+            let mut lifecycle = recovery_fixture_lifecycle(&frozen);
+            assert!(
+                downloader
+                    .acquire_local_model_recovery(
+                        &cx,
+                        &fresh,
+                        ModelAcquisitionRequest {
+                            frozen_manifest: &frozen,
+                            source: ModelAcquisitionSource::LocalBundle(&source),
+                            destination_dir: &destination
+                        },
+                        &mut lifecycle,
+                        |_| {},
+                        verify_fixture_load,
+                        || Ok(1002),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                diagnose_model_acquisition(&destination)
+                    .unwrap()
+                    .preserved_backup_generations,
+                1
+            );
+        });
     }
 
     #[test]

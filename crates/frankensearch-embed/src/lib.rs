@@ -91,10 +91,11 @@ pub use model_manifest::{
     ConsentSource, DOWNLOAD_CONSENT_ENV, DownloadConsent, FrozenModelArtifactManifestV1,
     MANIFEST_SCHEMA_VERSION, MODEL_ARTIFACT_MANIFEST_SCHEMA_V1, ModelArtifactFileV1,
     ModelArtifactManifestV1, ModelArtifactRoleV1, ModelExecutionContractV1, ModelFile,
-    ModelLifecycle, ModelManifest, ModelManifestCatalog, ModelState, ModelTier,
-    PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, RegisteredQualityModel, VerificationMarker,
-    VerifiedModelArtifactsV1, is_verification_cached, resolve_download_consent,
-    verify_dir_and_record, verify_dir_cached, verify_file_sha256,
+    ModelLifecycle, ModelManifest, ModelManifestCatalog, ModelPublicationUncertainOutcomeV1,
+    ModelPublicationUncertaintyV1, ModelState, ModelTier, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD,
+    RegisteredQualityModel, VerificationMarker, VerifiedModelArtifactsV1, is_verification_cached,
+    model_publication_uncertainty, resolve_download_consent, verify_dir_and_record,
+    verify_dir_cached, verify_file_sha256,
 };
 pub use model_registry::{
     BAKEOFF_CUTOFF_DATE, EmbedderRegistry, RegisteredEmbedder, RegisteredReranker,
@@ -139,7 +140,7 @@ pub use model_download::{
     ModelAcquisitionReceiptV1, ModelAcquisitionRecoveryV1, ModelAcquisitionRequest,
     ModelAcquisitionSource, ModelAcquisitionSourceKindV1, ModelAcquisitionStageV1,
     ModelAcquisitionVerificationResultV1, ModelDownloader, VerifiedModelStageV1,
-    diagnose_model_acquisition,
+    diagnose_model_acquisition, local_model_acquisition_target,
 };
 
 #[cfg(feature = "api")]
