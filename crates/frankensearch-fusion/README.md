@@ -17,7 +17,8 @@ This crate is the search orchestration layer of frankensearch. It combines resul
 
 ### Search Orchestration
 
-- `TwoTierSearcher` - progressive iterator orchestrator yielding `SearchPhase` results
+- `TwoTierSearcher` - asynchronous progressive search delivering `SearchPhase` callbacks
+- `SyncTwoTierSearcher` / `SyncSearchIterator` - demand-driven progressive retrieval with precomputed, independently bound query embeddings
 - `IncrementalSearcher` - incremental search with configurable strategy and budget
 - `FederatedSearcher` / `FederatedFusion` - search across multiple indices with result merging
 
@@ -71,6 +72,35 @@ let fused = rrf_fuse(&vector_hits, &lexical_hits, &config);
 // let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 // let (results, metrics) = searcher.search_collect(&cx, "query", 10).await?;
 ```
+
+### Synchronous progressive retrieval
+
+`SyncTwoTierSearcher::search_iter` starts work when the iterator is consumed.
+The first `next()` validates the query identities and returns the fast/lexical
+`Initial` phase. Only a subsequent `next()` performs quality retrieval and
+blending, so a UI can display the initial results before asking for refinement.
+Dropping the iterator after the initial phase avoids that remaining work.
+
+```rust
+use frankensearch_core::{SearchPhase, TieredQueryEmbeddings};
+use frankensearch_fusion::SyncTwoTierSearcher;
+
+fn display_progressively(searcher: &SyncTwoTierSearcher, query: &TieredQueryEmbeddings) {
+    for phase in searcher.search_iter(query, 10) {
+        match phase {
+            SearchPhase::Initial { results, .. } => println!("Initial results: {results:?}"),
+            SearchPhase::Refined { results, .. } => println!("Refined results: {results:?}"),
+            SearchPhase::RefinementFailed { error, .. } => eprintln!("{error}"),
+        }
+    }
+}
+```
+
+The iterator borrows its searcher, query and optional filter for its lifetime.
+Identity or initial-retrieval failures yield `RefinementFailed` with an empty
+initial result set; a refinement failure retains the already delivered results.
+Fast-only and zero-quality-signal searches stop after the initial phase. Use
+`search_collect` when only the final result set and aggregate metrics are needed.
 
 ### Federation with separate document stores
 
