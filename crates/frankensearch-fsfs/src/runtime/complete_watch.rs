@@ -373,13 +373,26 @@ impl SourceRoot {
                 } else {
                     link
                 };
-                let mut candidate = DiscoveryCandidate::new(
-                    &path,
-                    if metadata.is_dir() { 0 } else { metadata.len() },
-                )
-                .with_root(&self.path)
-                .with_symlink(is_symlink);
                 let mount = mounts.lookup_entry(directory_mount, &path);
+                if metadata.is_dir() {
+                    // Match the discovery walker's directory policy. File
+                    // extensions and utility scores cannot prune a directory:
+                    // `archive.zip/notes.md`, `logs/notes.md`, and ordinary
+                    // extensionless directories in allowlist mode can all hold
+                    // sources the indexer admits. Omitting them here would
+                    // make later edits invisible to both hints and polling.
+                    let category = mount.map(|(mount, _)| mount.category);
+                    if discovery.evaluate_root(&path, category).include() {
+                        stack.push((path, metadata, mount));
+                    }
+                    continue;
+                }
+                if !metadata.is_file() {
+                    continue;
+                }
+                let mut candidate = DiscoveryCandidate::new(&path, metadata.len())
+                    .with_root(&self.path)
+                    .with_symlink(is_symlink);
                 if let Some((mount, _)) = mount {
                     candidate = candidate.with_mount_category(mount.category);
                 }
@@ -387,9 +400,7 @@ impl SourceRoot {
                 if matches!(decision.scope, DiscoveryScopeDecision::Exclude) {
                     continue;
                 }
-                if metadata.is_dir() {
-                    stack.push((path, metadata, mount));
-                } else if metadata.is_file() && decision.ingestion_class.is_indexed() {
+                if decision.ingestion_class.is_indexed() {
                     let stamp = SourceStamp::from_metadata(&metadata);
                     files.push((path, decision.ingestion_class, stamp));
                 }
@@ -1607,6 +1618,64 @@ mod tests {
     }
 
     #[test]
+    fn complete_watch_observation_applies_file_policies_only_to_files() {
+        use crate::config::TextSelectionMode;
+
+        run_test_with_cx(|cx| async move {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = SourceRoot::open(fs::canonicalize(fixture.path()).unwrap()).unwrap();
+            fs::create_dir(source.path.join(".git")).unwrap();
+            fs::write(source.path.join(".gitignore"), "ignored.md\n").unwrap();
+            let mut expected = BTreeSet::new();
+            for directory in ["archive.zip", "logs", "src"] {
+                let parent = source.path.join(directory);
+                fs::create_dir_all(parent.join("target")).unwrap();
+                let document = parent.join("notes.md");
+                fs::write(&document, "searchable source").unwrap();
+                expected.insert(document);
+                for rejected in ["blocked.zip", "ignored.md", "target/private.md"] {
+                    fs::write(parent.join(rejected), "excluded source").unwrap();
+                }
+            }
+            for mode in [TextSelectionMode::Blocklist, TextSelectionMode::Allowlist] {
+                let discovery = DiscoveryConfig {
+                    text_selection_mode: mode,
+                    ..DiscoveryConfig::default()
+                };
+                let before = source.observe(&cx, &discovery).unwrap();
+                assert_eq!(
+                    before.stamps.keys().cloned().collect::<BTreeSet<_>>(),
+                    expected,
+                    "directory names must not apply file-only rules in {mode:?} mode"
+                );
+                for directory in ["archive.zip", "logs", "src"] {
+                    assert!(before.directories.contains_key(&source.path.join(directory)));
+                    assert!(
+                        !before
+                            .directories
+                            .contains_key(&source.path.join(directory).join("target"))
+                    );
+                }
+                for path in &expected {
+                    let mut changes = Changes::default();
+                    changes.record(Instant::now(), false);
+                    changes.record_path(path);
+                    assert!(touches_observed_files(
+                        changes.dirty.as_ref().unwrap(),
+                        &before,
+                        Some(&before)
+                    ));
+                }
+                let changed = source.path.join("archive.zip/notes.md");
+                let mut text = fs::read_to_string(&changed).unwrap();
+                text.push_str(" changed source");
+                fs::write(changed, text).unwrap();
+                assert_ne!(source.observe(&cx, &discovery).unwrap(), before);
+            }
+        });
+    }
+
+    #[test]
     fn complete_watch_root_replacement_is_not_an_empty_authoritative_source() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source");
@@ -1910,6 +1979,100 @@ mod lifecycle_tests {
 
     fn candidate_count(root: &Path) -> usize {
         fs::read_dir(root.join("generations")).unwrap().count()
+    }
+
+    #[test]
+    fn complete_watch_file_policy_directories_publish_edits_and_preserve_old_readers() {
+        use crate::config::{DegradationOverrideMode, TextSelectionMode};
+
+        run_test_with_cx(|cx| async move {
+            for mode in [TextSelectionMode::Blocklist, TextSelectionMode::Allowlist] {
+                let directory = tempfile::tempdir().unwrap();
+                let (runtime, source, root) = fixture(directory.path());
+                let mut config = runtime.config.clone();
+                config.discovery.text_selection_mode = mode;
+                config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+                let runtime = FsfsRuntime::new(config).with_cli_input(runtime.cli_input);
+                let mut paths = Vec::new();
+                for name in ["archive.zip", "logs", "src"] {
+                    let parent = source.join(name);
+                    fs::create_dir(&parent).unwrap();
+                    let path = parent.join("notes.md");
+                    fs::write(&path, "beforetoken original searchable document").unwrap();
+                    paths.push(path);
+                }
+                let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+                controlled_notifications(&mut session);
+                let first = publish_tick(&mut session, &cx).await;
+                let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+                assert_eq!(
+                    pinned
+                        .search(&cx, "beforetoken", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
+                    paths.len(),
+                    "the ordinary indexer admits every nested source"
+                );
+                for (index, path) in paths.iter().enumerate() {
+                    fs::write(path, "aftertoken updated searchable document with new bytes").unwrap();
+                    let now = Instant::now();
+                    {
+                        let mut changes = lock_changes(&session.changes).unwrap();
+                        changes.record(now, false);
+                        changes.record_path(path);
+                    }
+                    let publication = session
+                        .advance(&cx, now + DEBOUNCE)
+                        .await
+                        .unwrap()
+                        .expect("an admitted nested source edit must publish");
+                    let selected = require_durable_publication(publication).unwrap();
+                    assert_ne!(selected, first);
+                    let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+                    assert_eq!(
+                        fresh
+                            .search(&cx, "aftertoken", 10)
+                            .await
+                            .unwrap()
+                            .last()
+                            .unwrap()
+                            .hits
+                            .len(),
+                        index + 1,
+                        "edited nested documents must be searchable in {mode:?} mode"
+                    );
+                    assert_eq!(
+                        fresh
+                            .search(&cx, "beforetoken", 10)
+                            .await
+                            .unwrap()
+                            .last()
+                            .unwrap()
+                            .hits
+                            .len(),
+                        paths.len() - index - 1,
+                        "superseded nested content must disappear from new readers"
+                    );
+                }
+                assert_eq!(pinned.generation(), &first);
+                assert_eq!(
+                    pinned
+                        .search(&cx, "beforetoken", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
+                    paths.len(),
+                    "the old retained generation keeps its original nested content"
+                );
+            }
+        });
     }
 
     #[test]
