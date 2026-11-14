@@ -32,11 +32,15 @@ impl ImmutableTextQuery {
         }
         // Match the lexical engine's own analyzer, fields, and phrase rules.
         // Decode and requote phrases so escapes cannot become query syntax;
-        // prepare bare terms exactly as the ordinary user-query boundary does.
+        // preserve the ordinary user-query boundary's field rules. Boolean
+        // words are literal exclusion operands, even when followed by OR.
         let clauses = parsed
             .negative_terms
             .iter()
-            .map(|term| lexical.query_text(term).into_owned())
+            .map(|term| match term.as_str() {
+                "AND" | "OR" | "NOT" => quote_query_phrase(term),
+                _ => lexical.query_text(term).into_owned(),
+            })
             .chain(
                 parsed
                     .negative_phrases
