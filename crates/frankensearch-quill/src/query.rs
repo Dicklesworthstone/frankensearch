@@ -7266,6 +7266,14 @@ mod tests {
             ("title:content:rust", r"title:content\:rust"),
             ("<kind:value", r"<kind\:value"),
             (
+                r#"id:(< "literal) OR https://sqlite.org"#,
+                r#"id:(< "literal) OR https\://sqlite.org"#,
+            ),
+            (
+                r#"id:(>= x:"literal) OR https://sqlite.org"#,
+                r#"id:(>= x:"literal) OR https\://sqlite.org"#,
+            ),
+            (
                 r#"id:['a " b' TO b] OR https://sqlite.org"#,
                 r#"id:['a " b' TO b] OR https\://sqlite.org"#,
             ),

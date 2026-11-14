@@ -37816,8 +37816,15 @@ mod tests {
                 ("id:> literal", &["title", "url"]),
                 ("id:< literal", &["a \" b", "inch"]),
                 ("id:<= literal", &["a \" b", "inch", "literal"]),
+                ("id:(>= literal)", &["literal", "title", "url"]),
+                ("id:(> literal)", &["title", "url"]),
+                ("id:(< literal)", &["a \" b", "inch"]),
+                ("id:(<= literal)", &["a \" b", "inch", "literal"]),
+                ("id:(>= -b)", &["a \" b", "inch", "literal", "title", "url"]),
                 (r#"id:<"literal OR https://sqlite.org"#, &["url"]),
                 (r#"id:< "literal OR https://sqlite.org"#, &["url"]),
+                (r#"id:(< "literal) OR https://sqlite.org"#, &["url"]),
+                (r#"id:(>= x:"literal) OR https://sqlite.org"#, &["url"]),
                 (
                     r#"id:['a " b' TO b] OR https://sqlite.org"#,
                     &["a \" b", "url"],
@@ -37843,6 +37850,15 @@ mod tests {
                 ("id:> literal", &["title", "url"]),
                 ("id:< literal", &["a \" b", "inch"]),
                 ("id:<= literal", &["a \" b", "inch", "literal"]),
+                ("id:(>= literal)", &["literal", "title", "url"]),
+                ("id:(> literal)", &["title", "url"]),
+                ("id:(< literal)", &["a \" b", "inch"]),
+                ("id:(<= literal)", &["a \" b", "inch", "literal"]),
+                ("id:(>= -b)", &["a \" b", "inch", "literal", "title", "url"]),
+                (
+                    r#"id:(< x:"literal)"#,
+                    &["a \" b", "inch", "literal", "title", "url"],
+                ),
             ] {
                 let raw = format!("needle -{operand} -absent");
                 let parsed = ParsedQuery::parse(&raw);

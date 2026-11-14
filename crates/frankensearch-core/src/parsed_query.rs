@@ -315,11 +315,12 @@ fn query_fragment_end(chars: &[char], start: usize) -> usize {
             }
         } else {
             if operand_start
-                && field_start.is_none()
                 && let Some(value) = query_comparison_value_start(chars, cursor)
+                && (field_start.is_none() || !query_has_field_prefix(chars, cursor))
             {
                 cursor = value;
                 operand_start = false;
+                field_start = None;
                 continue;
             }
             if operand_start && let Some(open) = query_set_open(chars, cursor) {
@@ -400,6 +401,43 @@ fn query_set_open(chars: &[char], start: usize) -> Option<usize> {
         open += 1;
     }
     (open > after_in && chars.get(open) == Some(&'[')).then_some(open)
+}
+
+/// Match the lexical field-prefix grammar before treating an unqualified
+/// comparison as a bare operand, including inside a field-scoped group.
+fn query_has_field_prefix(chars: &[char], start: usize) -> bool {
+    if chars.get(start) == Some(&'-') {
+        return false;
+    }
+    let mut escaped = false;
+    let mut name_end = None;
+    for (offset, &ch) in chars[start..].iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == ':' {
+            return name_end.unwrap_or(offset) > 0;
+        }
+        if matches!(
+            ch,
+            '+' | '^' | '`' | '{' | '}' | '"' | '\'' | '[' | ']' | '(' | ')' | '!' | '*'
+        ) {
+            return false;
+        }
+        if ch.is_whitespace() {
+            name_end.get_or_insert(offset);
+            continue;
+        }
+        if name_end.is_some() {
+            return false;
+        }
+    }
+    false
 }
 
 fn query_comparison_value_start(chars: &[char], start: usize) -> Option<usize> {
@@ -623,6 +661,15 @@ mod tests {
                 r#"<kind:"alpha -banned" -outside"#,
                 r#"<kind:"alpha -banned""#,
             ),
+            (r#">=:"alpha -banned" -outside"#, r#">=:"alpha -banned""#),
+            (
+                r#">= : "alpha -banned" -outside"#,
+                r#">= : "alpha -banned""#,
+            ),
+            (
+                r#">\:kind:"alpha -banned" -outside"#,
+                r#">\:kind:"alpha -banned""#,
+            ),
             (
                 r#"title : "alpha -banned" -outside"#,
                 r#"title : "alpha -banned""#,
@@ -675,6 +722,15 @@ mod tests {
             "id : < -b",
             "id:<=\t-猫",
             r"id:> a\ b",
+            "id:(>= literal)",
+            "id:(> literal)",
+            "id:(< literal)",
+            "id:(<= literal)",
+            "id:(>= -b)",
+            "id:((<=\t-猫))",
+            r"id:(> a\ b)",
+            r#"id:(< "literal)"#,
+            r#"id:(>= x:"literal)"#,
         ] {
             let raw = format!("needle -{operand}");
             let parsed = ParsedQuery::parse(&raw);
@@ -710,6 +766,12 @@ mod tests {
             r"id:> a\ b",
             r#"id:< "literal"#,
             r#"id:>= not "a phrase""#,
+            "id:(>= -b)",
+            "id:((<=\t-猫))",
+            r"id:(> a\ b)",
+            r#"id:(< "literal)"#,
+            r#"id:(>= x:"literal)"#,
+            ">= -b",
             "filename>=thing",
         ] {
             let raw = format!("{operand} -outside");
