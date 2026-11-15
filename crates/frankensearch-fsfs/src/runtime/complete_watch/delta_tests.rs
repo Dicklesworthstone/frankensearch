@@ -504,7 +504,10 @@ fn directory_replaced_by_a_file_rebuilds_without_losing_old_or_new_readers() {
             ["alpha.md", "branch.md/entry.md", "stable.md"]
         );
         let reader_runtime = lexical_reader(&runtime);
-        let mut pinned = reader_runtime.open_retained_search(&cx, &root).await.unwrap();
+        let mut pinned = reader_runtime
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
         let mut live = reader_runtime
             .open_live_retained_search(&cx, &root)
             .await
@@ -530,7 +533,10 @@ fn directory_replaced_by_a_file_rebuilds_without_losing_old_or_new_readers() {
             new_rows.keys().map(String::as_str).collect::<Vec<_>>(),
             ["alpha.md", "branch.md", "stable.md"]
         );
-        let mut cold = reader_runtime.open_retained_search(&cx, &root).await.unwrap();
+        let mut cold = reader_runtime
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
         for (query, expected) in [
             ("replacementword", vec!["branch.md"]),
             ("oldnestedword", Vec::new()),
@@ -574,6 +580,106 @@ fn directory_replaced_by_a_file_rebuilds_without_losing_old_or_new_readers() {
         assert_eq!(
             fs::read_to_string(preserved.join("entry.md")).unwrap(),
             "oldnestedword source"
+        );
+    });
+}
+
+#[test]
+fn followed_link_target_race_retries_settling_and_preserves_readers() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut runtime, source, root) = fixture(directory.path());
+        runtime.config.discovery.follow_symlinks = true;
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let target = outside.join("entry.md");
+        fs::write(&target, "beforelinktoken original linked source").unwrap();
+        let link = source.join("linked.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut session = controlled_session(&runtime, &cx, &root);
+        let old = initial(&mut session, &cx).await;
+        let reader_runtime = lexical_reader(&runtime);
+        let mut pinned = reader_runtime
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+        for _ in 0..super::super::MAX_UNSTABLE_BUILDS {
+            session
+                .record_unstable_source(Instant::now(), None)
+                .unwrap();
+        }
+        let probe = session.settling.as_ref().unwrap().next_probe;
+        let preserved = directory.path().join("preserved-target");
+        let mut replaced = false;
+        session
+            .probe_settling_source_with_entry_check(&cx, probe, |path| {
+                if path == link.as_path() {
+                    fs::rename(&outside, &preserved)?;
+                    fs::write(&outside, "non-directory replacement")?;
+                    replaced = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(replaced);
+        assert!(session.settling.is_some());
+        assert_eq!(session.publication.as_ref(), Some(&old));
+        let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+        assert_eq!(store.active(&cx).unwrap(), Some(old.clone()));
+        drop(store);
+
+        fs::rename(&outside, directory.path().join("preserved-replacement")).unwrap();
+        fs::rename(&preserved, &outside).unwrap();
+        fs::rename(&target, outside.join("previous.md")).unwrap();
+        fs::write(&target, "afterlinktoken updated linked source").unwrap();
+        for _ in 0..2 {
+            let probe = session.settling.as_ref().unwrap().next_probe;
+            session.probe_settling_source(&cx, probe).unwrap();
+        }
+        assert!(session.settling.is_none());
+        let now = session.last_reconcile + MAX_DEBOUNCE;
+        let next =
+            require_durable_publication(session.advance(&cx, now).await.unwrap().unwrap()).unwrap();
+        assert_ne!(old, next);
+        let rows = FsfsRuntime::read_matching_manifest_generation(next.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rows.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["alpha.md", "linked.md", "stable.md"]
+        );
+        let mut current = reader_runtime
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+        for (reader, before, after) in [
+            (&mut pinned, vec!["linked.md"], Vec::new()),
+            (&mut current, Vec::new(), vec!["linked.md"]),
+        ] {
+            for (query, expected) in [
+                ("beforelinktoken", before),
+                ("afterlinktoken", after),
+                ("stableword", vec!["stable.md"]),
+            ] {
+                let phases = reader.search(&cx, query, 10).await.unwrap();
+                assert_eq!(
+                    phases
+                        .last()
+                        .unwrap()
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{query}"
+                );
+            }
+        }
+        assert_eq!(pinned.generation(), &old);
+        assert_eq!(current.generation(), &next);
+        assert_eq!(
+            fs::read_to_string(outside.join("previous.md")).unwrap(),
+            "beforelinktoken original linked source"
         );
     });
 }

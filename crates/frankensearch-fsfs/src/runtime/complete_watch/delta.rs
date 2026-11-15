@@ -1091,11 +1091,9 @@ mod metadata_tests {
             symlink(&retained, &second).unwrap();
 
             let result = read_text_batch(&cx, vec![request(&first), stale]).await;
-            assert!(is_source_changed(
-                &result
-                    .err()
-                    .expect("a replacement link must refuse the whole batch for reconciliation")
-            ));
+            assert!(is_source_changed(&result.err().expect(
+                "a replacement link must refuse the whole batch for reconciliation"
+            )));
             assert_eq!(fs::read_to_string(&retained).unwrap(), "second valid text");
         });
     }

@@ -376,7 +376,7 @@ impl SourceRoot {
                     match fs::metadata(&path) {
                         Ok(metadata) => metadata,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(observation_io(error)),
                     }
                 } else {
                     link
@@ -1659,7 +1659,11 @@ mod tests {
                     "directory names must not apply file-only rules in {mode:?} mode"
                 );
                 for directory in ["archive.zip", "logs", "src"] {
-                    assert!(before.directories.contains_key(&source.path.join(directory)));
+                    assert!(
+                        before
+                            .directories
+                            .contains_key(&source.path.join(directory))
+                    );
                     assert!(
                         !before
                             .directories
@@ -2028,7 +2032,11 @@ mod lifecycle_tests {
                     "the ordinary indexer admits every nested source"
                 );
                 for (index, path) in paths.iter().enumerate() {
-                    fs::write(path, "aftertoken updated searchable document with new bytes").unwrap();
+                    fs::write(
+                        path,
+                        "aftertoken updated searchable document with new bytes",
+                    )
+                    .unwrap();
                     let now = Instant::now();
                     {
                         let mut changes = lock_changes(&session.changes).unwrap();
