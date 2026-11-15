@@ -182,7 +182,15 @@ fn read_source(cx: &Cx, path: &Path, expected: &SourceStamp) -> SearchResult<(Ve
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(observation_io)?;
+        .map_err(|error| {
+            // O_NOFOLLOW reports a replacement symlink before we can compare
+            // its stamp. Reconcile this source race just like a vanished file.
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                source_changed()
+            } else {
+                observation_io(error)
+            }
+        })?;
     let opened = file.metadata()?;
     if !opened.is_file() || &SourceStamp::from_metadata(&opened) != expected {
         return Err(source_changed());
@@ -1062,6 +1070,31 @@ mod metadata_tests {
                         .is_none()
                 );
             }
+        });
+    }
+
+    #[test]
+    fn text_batch_retries_a_symlink_replacement_without_partial_success() {
+        use std::os::unix::fs::symlink;
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let first = directory.path().join("first.md");
+            let second = directory.path().join("second.md");
+            fs::write(&first, "first valid text").unwrap();
+            fs::write(&second, "second valid text").unwrap();
+            let stale = request(&second);
+            let retained = directory.path().join("preserved-second.md");
+            fs::rename(&second, &retained).unwrap();
+            symlink(&retained, &second).unwrap();
+
+            let result = read_text_batch(&cx, vec![request(&first), stale]).await;
+            assert!(is_source_changed(
+                &result
+                    .err()
+                    .expect("a replacement link must refuse the whole batch for reconciliation")
+            ));
+            assert_eq!(fs::read_to_string(&retained).unwrap(), "second valid text");
         });
     }
 
