@@ -2797,6 +2797,7 @@ mod retained_recovery_tests {
                     "sharedtoken replacement alpha {} terminallexicaltoken",
                     "long document body ".repeat(250),
                 );
+                let long_chars = LEXICAL_CANONICALIZER.canonicalize(&long_body).chars().count();
                 fs::write(
                     &input,
                     format!(
@@ -2818,7 +2819,8 @@ mod retained_recovery_tests {
                 };
                 assert_eq!(
                     models.fast.embedded_documents.load(Ordering::Relaxed),
-                    if topology == "quality" { 0 } else { 2 }
+                    // Three 2000-character alpha windows plus short gamma.
+                    if topology == "quality" { 0 } else { 4 }
                 );
                 assert_eq!(
                     models.quality.embedded_documents.load(Ordering::Relaxed),
@@ -2829,6 +2831,33 @@ mod retained_recovery_tests {
                     mode
                 );
                 let appended_bytes = file_bytes(appended.path());
+                let manifests = FsfsRuntime::read_matching_manifest_generation(appended.path())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    manifests.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["alpha.md", "beta.md", "gamma.md"])
+                );
+                if topology == "quality" {
+                    assert!(manifests.values().all(|entry| entry.fast_windows.is_none()));
+                } else {
+                    let alpha = manifests["alpha.md"].fast_windows.as_ref().unwrap();
+                    assert_eq!(alpha.max_per_file, 128);
+                    assert_eq!(alpha.source_chars, long_chars);
+                    assert_eq!(
+                        alpha
+                            .windows
+                            .iter()
+                            .map(|range| (range.ordinal, range.start_char, range.end_char))
+                            .collect::<Vec<_>>(),
+                        [(0, 0, 2_000), (1, 1_800, 3_800), (2, long_chars - 2_000, long_chars)]
+                    );
+                    for id in ["beta.md", "gamma.md"] {
+                        let plan = manifests[id].fast_windows.as_ref().unwrap();
+                        assert_eq!(plan.max_per_file, 128);
+                        assert_eq!(plan.windows.len(), 1);
+                    }
+                }
 
                 let operations = [
                     retained_batch::RetainedMutation::Delete {
@@ -2881,7 +2910,13 @@ mod retained_recovery_tests {
                 let Some(GenerationPublication::Durable(compacted_generation)) = publication else {
                     panic!("compact must publish durably");
                 };
-                assert_eq!(compacted["total_records_after"], 2);
+                assert_eq!(
+                    compacted["total_records_after"],
+                    if topology == "quality" { 2 } else { 4 }
+                );
+                if topology == "full" {
+                    assert_eq!(compacted["quality"]["total_records_after"], 2);
+                }
                 if topology == "quality" {
                     assert_eq!(compacted["primary_tier"], "quality");
                     assert!(
@@ -2909,8 +2944,21 @@ mod retained_recovery_tests {
                             .unwrap()
                             .live_doc_ids()
                             .unwrap();
+                        let expected_rows = if relative == FSFS_VECTOR_INDEX_FILE {
+                            HashSet::from([
+                                "alpha.md".to_owned(),
+                                "alpha.md\0fsfs-window-v1:1".to_owned(),
+                                "alpha.md\0fsfs-window-v1:2".to_owned(),
+                                "delta.md".to_owned(),
+                            ])
+                        } else {
+                            HashSet::from(["alpha.md".to_owned(), "delta.md".to_owned()])
+                        };
+                        assert_eq!(ids, expected_rows);
                         assert_eq!(
-                            ids,
+                            ids.iter()
+                                .map(|row| semantic_windows::source_id(row).to_owned())
+                                .collect::<HashSet<_>>(),
                             HashSet::from(["alpha.md".to_owned(), "delta.md".to_owned()])
                         );
                     }

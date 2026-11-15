@@ -1060,14 +1060,10 @@ mod tests {
                 .unwrap()
             };
             let mut resources = runtime.prepare_search_serve_resources(&cx).await.unwrap();
-            assert_eq!(
-                resources
-                    .fast_window_mapping
-                    .as_ref()
-                    .unwrap()
-                    .source_count(),
-                2
-            );
+            assert!(resources.vector_index.is_none());
+            assert!(resources.fast_window_mapping.is_none());
+            assert!(resources.quality_vector_index.is_none());
+            assert!(!resources.fast_embedder_attempted);
             let mut hot_cache = HashMap::new();
             let healthy = runtime
                 .execute_search_serve_request(
@@ -1080,6 +1076,15 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(healthy.payloads[0].hits[0].path, "deep.md");
+            assert!(resources.vector_index.is_some());
+            assert_eq!(
+                resources
+                    .fast_window_mapping
+                    .as_ref()
+                    .unwrap()
+                    .source_count(),
+                2
+            );
             let full_key = runtime
                 .search_cache_key("thermal safety", 2, SearchExecutionMode::Full)
                 .unwrap();
@@ -1214,15 +1219,8 @@ mod tests {
                 .unwrap();
             assert!(!recovered_lexical.cached);
             assert_ne!(resources.generation_fingerprint, deferred_fingerprint);
-            assert!(resources.vector_index.is_some());
-            assert_eq!(
-                resources
-                    .fast_window_mapping
-                    .as_ref()
-                    .unwrap()
-                    .source_count(),
-                2
-            );
+            assert!(resources.vector_index.is_none());
+            assert!(resources.fast_window_mapping.is_none());
             assert!(!hot_cache.contains_key(&full_key));
             assert!(!hot_cache.contains_key(&fast_key));
             let recovered = runtime
@@ -1236,6 +1234,15 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!recovered.cached);
+            assert!(resources.vector_index.is_some());
+            assert_eq!(
+                resources
+                    .fast_window_mapping
+                    .as_ref()
+                    .unwrap()
+                    .source_count(),
+                2
+            );
             assert_eq!(recovered.payloads[0].hits[0].path, "deep.md");
             assert!(
                 recovered.payloads[0].hits[0]

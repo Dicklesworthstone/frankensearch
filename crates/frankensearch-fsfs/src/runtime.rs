@@ -56690,7 +56690,7 @@ mod tests {
     #[cfg(all(feature = "semantic-support", unix))]
     #[test]
     fn search_serve_lexical_admission_survives_unrequested_semantic_corruption() {
-        run_test_with_cx(|cx| async move {
+        run_on_runtime_task(|cx| async move {
             let _restore = AppendEmbedderOverrides::install();
             for warmed in [false, true] {
                 for damaged in ["fast", "quality", "windows"] {
