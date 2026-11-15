@@ -685,6 +685,101 @@ fn followed_link_target_race_retries_settling_and_preserves_readers() {
 }
 
 #[test]
+fn traversal_target_race_retries_without_publishing_partial_sources() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut runtime, source, root) = fixture(directory.path());
+        runtime.config.discovery.follow_symlinks = true;
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let target = outside.join("entry.md");
+        fs::write(&target, "traversaloldtoken original source").unwrap();
+        let link = source.join("linked.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut session = controlled_session(&runtime, &cx, &root);
+        let old = initial(&mut session, &cx).await;
+        let reader_runtime = lexical_reader(&runtime);
+        let mut pinned = reader_runtime
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+
+        let preserved = directory.path().join("preserved-target");
+        fs::rename(&outside, &preserved).unwrap();
+        fs::write(&outside, "non-directory replacement").unwrap();
+        for _ in 0..super::super::MAX_UNSTABLE_BUILDS {
+            let now = Instant::now();
+            {
+                let mut changes = lock_changes(&session.changes).unwrap();
+                changes.record(now, false);
+                changes.record_path(&link);
+            }
+            let publication = session.advance(&cx, now + DEBOUNCE).await.unwrap();
+            assert!(publication.is_none());
+            assert_eq!(session.publication.as_ref(), Some(&old));
+        }
+        assert!(session.settling.is_some());
+        let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+        assert_eq!(store.active(&cx).unwrap(), Some(old.clone()));
+        drop(store);
+
+        fs::rename(&outside, directory.path().join("preserved-replacement")).unwrap();
+        fs::rename(&preserved, &outside).unwrap();
+        fs::rename(&target, outside.join("previous.md")).unwrap();
+        fs::write(&target, "traversalnewtoken restored source").unwrap();
+        for _ in 0..2 {
+            let probe = session.settling.as_ref().unwrap().next_probe;
+            session.probe_settling_source(&cx, probe).unwrap();
+        }
+        assert!(session.settling.is_none());
+        let now = session.last_reconcile + MAX_DEBOUNCE;
+        let next =
+            require_durable_publication(session.advance(&cx, now).await.unwrap().unwrap()).unwrap();
+        assert_ne!(old, next);
+        let rows = FsfsRuntime::read_matching_manifest_generation(next.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rows.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["alpha.md", "linked.md", "stable.md"]
+        );
+        let mut current = reader_runtime
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+        for (reader, before, after) in [
+            (&mut pinned, vec!["linked.md"], Vec::new()),
+            (&mut current, Vec::new(), vec!["linked.md"]),
+        ] {
+            for (query, expected) in [
+                ("traversaloldtoken", before),
+                ("traversalnewtoken", after),
+                ("stableword", vec!["stable.md"]),
+            ] {
+                let phases = reader.search(&cx, query, 10).await.unwrap();
+                assert_eq!(
+                    phases
+                        .last()
+                        .unwrap()
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{query}"
+                );
+            }
+        }
+        assert_eq!(pinned.generation(), &old);
+        assert_eq!(current.generation(), &next);
+        assert_eq!(
+            fs::read_to_string(outside.join("previous.md")).unwrap(),
+            "traversaloldtoken original source"
+        );
+    });
+}
+
+#[test]
 fn periodic_scan_finds_missed_edits_while_forced_and_unsupported_changes_rebuild() {
     run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();

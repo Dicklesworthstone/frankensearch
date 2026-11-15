@@ -165,11 +165,15 @@ fn is_source_changed(error: &SearchError) -> bool {
         if source.is::<SourceChanged>() || source.is::<super::IndexSourceChanged>())
 }
 
-fn observation_io(error: std::io::Error) -> SearchError {
-    if matches!(
+fn is_observation_race(error: &std::io::Error) -> bool {
+    matches!(
         error.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-    ) {
+    )
+}
+
+fn observation_io(error: std::io::Error) -> SearchError {
+    if is_observation_race(&error) {
         source_changed()
     } else {
         error.into()
@@ -306,6 +310,9 @@ impl SourceRoot {
                 Ok(entry) => entry,
                 Err(super::IndexDiscoveryError::Policy(error)) => return Err(error),
                 Err(super::IndexDiscoveryError::Walk(source)) => {
+                    if source.io_error().is_some_and(is_observation_race) {
+                        return Err(source_changed());
+                    }
                     return Err(SearchError::SubsystemError {
                         subsystem: "fsfs.complete_generation.watch.discovery",
                         source: Box::new(source),
@@ -1858,6 +1865,17 @@ mod tests {
             assert!(matches!(error, SearchError::Io(source)
                 if source.kind() == std::io::ErrorKind::PermissionDenied
                     && source.to_string().contains("injected denied entry")));
+
+            std::os::unix::fs::symlink(directory.path(), directory.path().join("loop")).unwrap();
+            let discovery = DiscoveryConfig {
+                follow_symlinks: true,
+                ..DiscoveryConfig::default()
+            };
+            let error = source.observe(&cx, &discovery).unwrap_err();
+            assert!(!is_source_changed(&error), "{error:?}");
+            assert!(matches!(error, SearchError::SubsystemError { source, .. }
+                if source.downcast_ref::<ignore::Error>()
+                    .is_some_and(|error| error.io_error().is_none())));
         });
     }
 
