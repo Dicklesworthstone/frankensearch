@@ -752,11 +752,24 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
     assert_ne!(prior_sha, current_sha);
 
     for (quality, legacy_seed) in [(false, false), (false, true), (true, false), (true, true)] {
-        for policy in ["same-executable", "compatible-contract"] {
+        for (policy, drift) in [
+            ("same-executable", "none"),
+            ("compatible-contract", "none"),
+            ("compatible-contract", "window"),
+            ("compatible-contract", "tier"),
+        ] {
             eprintln!(
-                "watch upgrade prior={prior_sha} current={current_sha} quality={quality} legacy_seed={legacy_seed} policy={policy}"
+                "watch upgrade prior={prior_sha} current={current_sha} quality={quality} legacy_seed={legacy_seed} policy={policy} drift={drift}"
             );
             let mut fixture = Fixture::new(Some(&models), quality);
+            if drift == "tier" && !quality {
+                // Keep the selected producer fixed across A and B. Only the
+                // effective tier-coverage switch changes after the A build.
+                let mut settings: FsfsConfig =
+                    toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+                settings.indexing.quality_model = FsfsConfig::default().indexing.quality_model;
+                fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
+            }
             fixture.executable.clone_from(&prior);
             let predecessor = if legacy_seed {
                 fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
@@ -795,9 +808,10 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 .map_or(fixture.store.as_path(), PublishedGeneration::path)
                 .to_path_buf();
             let old_artifacts = artifacts(&old_root);
-            if quality {
-                assert!(old_artifacts.contains_key(Path::new("vector/quality.fsvi")));
-            }
+            assert_eq!(
+                old_artifacts.contains_key(Path::new("vector/quality.fsvi")),
+                quality
+            );
             let old_evidence_path = old_root.join(if legacy_seed {
                 "FSFS-LEGACY-REUSE.json"
             } else {
@@ -806,6 +820,33 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
             let old_evidence = fs::read(&old_evidence_path).unwrap();
             let mut expected_artifacts = old_artifacts.clone();
             let mut expected_ranks = ranks(&fixture);
+            if drift != "none" {
+                let mut settings: FsfsConfig =
+                    toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+                let before = serde_json::to_value(&settings).unwrap();
+                let (section, field) = if drift == "window" {
+                    let cap = settings.indexing.fast_window_max_per_file;
+                    settings.indexing.fast_window_max_per_file = if cap == 1 { 2 } else { 1 };
+                    ("indexing", "fast_window_max_per_file")
+                } else {
+                    assert_eq!(drift, "tier");
+                    assert!(!settings.indexing.quality_model.is_empty());
+                    assert_eq!(settings.search.fast_only, !quality);
+                    settings.search.fast_only = quality;
+                    fixture.quality = !quality;
+                    ("search", "fast_only")
+                };
+                let after = serde_json::to_value(&settings).unwrap();
+                assert_ne!(after, before);
+                let mut restored = after.clone();
+                restored[section][field] = before[section][field].clone();
+                assert_eq!(restored, before, "only {section}.{field} may change");
+                fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
+                eprintln!(
+                    "watch upgrade drift {section}.{field}: {} -> {}",
+                    before[section][field], after[section][field]
+                );
+            }
             let mut previous = predecessor
                 .as_ref()
                 .map(|generation| generation.id().to_owned());
@@ -822,7 +863,7 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 let actual_ranks = ranks(&fixture);
                 process.assert_alive();
                 let output = process.stop_gracefully();
-                let warm = restart || policy == "compatible-contract";
+                let warm = restart || (policy == "compatible-contract" && drift == "none");
                 assert_carried(&output, if warm { 2 } else { 0 });
                 let batches = document_batches(&output);
                 assert_eq!(batches == 0, warm);
@@ -835,15 +876,16 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                         .filter_map(|field| field.strip_prefix("model="))
                         .collect::<BTreeSet<_>>();
                     let mut expected = BTreeSet::from(["\"potion-multilingual-128M\""]);
-                    if quality {
+                    if fixture.quality {
                         expected.insert("\"all-minilm-l6-v2\"");
                     }
                     assert_eq!(models, expected, "cold document embedding tiers: {stderr}");
                 }
                 let actual_artifacts = artifacts(selected.path());
-                if quality {
-                    assert!(actual_artifacts.contains_key(Path::new("vector/quality.fsvi")));
-                }
+                assert_eq!(
+                    actual_artifacts.contains_key(Path::new("vector/quality.fsvi")),
+                    fixture.quality
+                );
                 if warm {
                     assert_eq!(actual_artifacts, expected_artifacts);
                     assert_eq!(actual_ranks, expected_ranks);
@@ -862,7 +904,8 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 let manifest = fs::read(selected.path().join("FSFS-BUNDLE.json")).unwrap();
                 readers.push((selected, manifest));
                 eprintln!(
-                    "watch upgrade result quality={quality} legacy_seed={legacy_seed} policy={policy} restart={restart} carried={} document_batches={batches}",
+                    "watch upgrade result quality={quality} requested_quality={} legacy_seed={legacy_seed} policy={policy} drift={drift} restart={restart} carried={} document_batches={batches}",
+                    fixture.quality,
                     if warm { 2 } else { 0 }
                 );
             }
