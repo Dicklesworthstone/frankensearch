@@ -59,6 +59,8 @@ impl NativeAnnIndex {
     /// per-source ranks, which [`ScoredResult`] cannot represent separately.
     /// Execution and cross-reader generation requirements are the same as for
     /// [`Self::search_hybrid_candidates`].
+    /// Exclusions require a retained immutable cohort; see that method's error
+    /// contract for the supported query boundary.
     ///
     /// # Errors
     ///
@@ -129,6 +131,11 @@ impl NativeAnnIndex {
     ///
     /// Propagates identity, inference, lexical, graph, and cancellation errors.
     /// Non-finite lexical scores are rejected before they reach fusion.
+    /// `-term` and `NOT "phrase"` exclusions are refused before inference or
+    /// lexical retrieval, including zero-k requests. A generic `LexicalRead`
+    /// cannot bind a complete exclusion census to one immutable population.
+    /// Use an admitted native snapshot or a built/reopened immutable source
+    /// cohort to apply exclusions across both lexical and vector candidates.
     pub async fn search_hybrid_candidates(
         &self,
         cx: &Cx,
@@ -139,6 +146,7 @@ impl NativeAnnIndex {
     ) -> SearchResult<(Vec<FusedHit>, LexicalCandidateBatch)> {
         checkpoint(cx, "native_ann.hybrid_start")?;
         self.admit_identity(embedder.identity()?)?;
+        query::reject_unbound_exclusions(cx, text)?;
         if k == 0 {
             return Ok((Vec::new(), LexicalCandidateBatch::eager(Vec::new())));
         }
@@ -176,6 +184,8 @@ impl NativeAnnIndex {
     /// # Errors
     ///
     /// Propagates the ordinary hybrid candidate errors plus blocking-pool admission failure.
+    /// Exclusion queries have the same immutable-cohort requirement as
+    /// [`Self::search_hybrid_candidates`].
     pub async fn search_hybrid_candidates_with_pool(
         self: &Arc<Self>,
         cx: &Cx,
@@ -187,6 +197,7 @@ impl NativeAnnIndex {
     ) -> SearchResult<(Vec<FusedHit>, LexicalCandidateBatch)> {
         checkpoint(cx, "native_ann.hybrid_pool_start")?;
         self.admit_identity(embedder.identity()?)?;
+        query::reject_unbound_exclusions(cx, text)?;
         if k == 0 {
             return Ok((Vec::new(), LexicalCandidateBatch::eager(Vec::new())));
         }
@@ -816,6 +827,265 @@ mod tests {
         let bytes: Arc<[u8]> = std::fs::read(path).unwrap().into();
         let owner = Arc::new(ValidatedFsviBytes::from_arc(bytes, &binding).unwrap());
         NativeAnnIndex::build(cx, owner, HnswParams::default(), 7).unwrap()
+    }
+
+    fn assert_unbound_exclusion<T>(result: SearchResult<T>) {
+        match result {
+            Err(SearchError::InvalidConfig { field, value, .. }) => {
+                assert_eq!(field, "native_ann.query.exclusions");
+                assert_eq!(value, "immutable-cohort-required");
+            }
+            Err(error) => panic!("expected immutable exclusion cohort refusal, got {error:?}"),
+            Ok(_) => {
+                panic!("generic hybrid retrieval must not return unfiltered vector candidates")
+            }
+        }
+    }
+
+    #[test]
+    fn direct_hybrid_exclusions_refuse_before_any_source_work() {
+        use asupersync::runtime::blocking_pool::BlockingPool;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let pool = BlockingPool::new(0, 1);
+            for empty in [false, true] {
+                let index = Arc::new(index(&cx, empty));
+                let provider = Provider::new(false);
+                let lexical = Lexical::new();
+                for text in [
+                    "needle -private",
+                    "needle NOT \"private source\"",
+                    "-private",
+                ] {
+                    for k in [0, 3] {
+                        assert_unbound_exclusion(
+                            index
+                                .search_hybrid_candidates(&cx, &provider, &lexical, text, k)
+                                .await,
+                        );
+                        assert_unbound_exclusion(
+                            index
+                                .search_hybrid_candidates_with_pool(
+                                    &cx,
+                                    &provider,
+                                    &lexical,
+                                    text,
+                                    k,
+                                    pool.handle(),
+                                )
+                                .await,
+                        );
+                        assert_unbound_exclusion(
+                            index
+                                .search_hybrid_refined_text(
+                                    &cx,
+                                    &provider,
+                                    (&index, &provider),
+                                    &lexical,
+                                    text,
+                                    k,
+                                )
+                                .await,
+                        );
+                        assert_unbound_exclusion(
+                            index
+                                .search_hybrid_refined_text_with_pool(
+                                    &cx,
+                                    &provider,
+                                    (&index, &provider),
+                                    &lexical,
+                                    text,
+                                    k,
+                                    pool.handle(),
+                                )
+                                .await,
+                        );
+                    }
+                }
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(lexical.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn direct_sharded_hybrid_exclusions_refuse_before_any_source_work() {
+        use crate::native_ann::NativeShardSet;
+        use asupersync::runtime::blocking_pool::BlockingPool;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let pool = BlockingPool::new(0, 1);
+            for empty in [false, true] {
+                let index = Arc::new(index(&cx, empty));
+                let witness = index.owner_witness().clone();
+                let shards = NativeShardSet::admit(&cx, &[witness], vec![index]).unwrap();
+                let provider = Provider::new(false);
+                let lexical = Lexical::new();
+                for text in [
+                    "needle -private",
+                    "needle NOT \"private source\"",
+                    "-private",
+                ] {
+                    for k in [0, 3] {
+                        assert_unbound_exclusion(
+                            shards
+                                .search_hybrid_text(&cx, &provider, &lexical, text, k)
+                                .await,
+                        );
+                        assert_unbound_exclusion(
+                            shards
+                                .search_hybrid_text_with_pool(
+                                    &cx,
+                                    &provider,
+                                    &lexical,
+                                    text,
+                                    k,
+                                    pool.handle(),
+                                )
+                                .await,
+                        );
+                        assert_unbound_exclusion(
+                            shards
+                                .search_hybrid_refined_text(
+                                    &cx,
+                                    &provider,
+                                    (&shards, &provider),
+                                    &lexical,
+                                    text,
+                                    k,
+                                )
+                                .await,
+                        );
+                        assert_unbound_exclusion(
+                            shards
+                                .search_hybrid_refined_text_with_pool(
+                                    &cx,
+                                    &provider,
+                                    (&shards, &provider),
+                                    &lexical,
+                                    text,
+                                    k,
+                                    pool.handle(),
+                                )
+                                .await,
+                        );
+                    }
+                }
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(lexical.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn progressive_unbound_exclusions_fail_once_without_running_sources() {
+        use crate::native_ann::NativeShardSet;
+        use asupersync::runtime::blocking_pool::BlockingPool;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = Arc::new(index(&cx, false));
+            let witness = index.owner_witness().clone();
+            let shards = NativeShardSet::admit(&cx, &[witness], vec![Arc::clone(&index)]).unwrap();
+            let provider = Provider::new(false);
+            let lexical = Lexical::new();
+            let pool = BlockingPool::new(0, 1);
+            for text in [
+                "needle -private",
+                "needle NOT \"private source\"",
+                "-private",
+            ] {
+                for k in [0, 3] {
+                    for mut stream in [
+                        index
+                            .search_hybrid_progressive(
+                                &cx,
+                                &provider,
+                                Some((&index, &provider)),
+                                &lexical,
+                                text,
+                                k,
+                            )
+                            .unwrap(),
+                        index
+                            .search_hybrid_progressive_with_pool(
+                                &cx,
+                                &provider,
+                                Some((&index, &provider)),
+                                &lexical,
+                                text,
+                                k,
+                                pool.handle(),
+                            )
+                            .unwrap(),
+                    ] {
+                        assert_unbound_exclusion(stream.next_phase().await);
+                        assert!(stream.is_finished());
+                        assert!(stream.next_phase().await.unwrap().is_none());
+                    }
+                    for mut stream in [
+                        shards
+                            .search_hybrid_progressive(
+                                &cx,
+                                &provider,
+                                Some((&shards, &provider)),
+                                &lexical,
+                                text,
+                                k,
+                            )
+                            .unwrap(),
+                        shards
+                            .search_hybrid_progressive_with_pool(
+                                &cx,
+                                &provider,
+                                Some((&shards, &provider)),
+                                &lexical,
+                                text,
+                                k,
+                                pool.handle(),
+                            )
+                            .unwrap(),
+                    ] {
+                        assert_unbound_exclusion(stream.next_phase().await);
+                        assert!(stream.is_finished());
+                        assert!(stream.next_phase().await.unwrap().is_none());
+                    }
+                }
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn generic_hybrid_queries_preserve_literal_dashes_and_quoted_negations() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let lexical = Lexical::new();
+            for text in [
+                "ordinary query",
+                "dash-separated",
+                "--literal",
+                r"needle \-private",
+                r#""needle -private""#,
+                r#"title:"needle -private""#,
+                "NOT literal",
+            ] {
+                assert_eq!(
+                    index
+                        .search_hybrid_text(&cx, &provider, &lexical, text, 3)
+                        .await
+                        .unwrap()
+                        .len(),
+                    3,
+                );
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 7);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 7);
+        });
     }
 
     #[test]

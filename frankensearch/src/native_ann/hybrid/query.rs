@@ -7,13 +7,36 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-#[cfg(feature = "quill")]
 use frankensearch_core::ParsedQuery;
 #[cfg(feature = "quill")]
 use frankensearch_core::parsed_query::{normalize_query_negations, quote_query_phrase};
 
 use super::{checkpoint, invalid, validate_lexical};
 use crate::{Cx, LexicalCandidateBatch, LexicalRead, SearchResult};
+
+/// An arbitrary reader cannot bind an exclusion census to the population that
+/// supplies its later candidate batch. Passing exclusions only to that batch
+/// would leave vector-only matches eligible, and embedding the negative text
+/// would turn a hard constraint into a similarity hint. Complete retained
+/// cohorts opt into `ImmutableTextQuery` instead of crossing this boundary.
+pub(super) fn reject_unbound_exclusions(cx: &Cx, text: &str) -> SearchResult<()> {
+    checkpoint(cx, "native_ann.query_exclusions")?;
+    // Exclusions need a dash or a quoted NOT operand. Keep ordinary positive
+    // text allocation-free while delegating every syntax decision to the core
+    // parser (including escaped dashes and quoted literal exclusions).
+    if !text.bytes().any(|byte| matches!(byte, b'-' | b'\'' | b'"')) {
+        return Ok(());
+    }
+    if ParsedQuery::parse(text).has_negations() {
+        return Err(invalid(
+            "query.exclusions",
+            "immutable-cohort-required",
+            "exclusion queries require an admitted native snapshot or a built/reopened \
+             immutable source cohort so every retrieval tier uses the same exclusion membership",
+        ));
+    }
+    Ok(())
+}
 
 pub(super) struct ImmutableTextQuery {
     pub(super) semantic: String,

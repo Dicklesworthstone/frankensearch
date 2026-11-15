@@ -90,6 +90,10 @@ impl NativeShardSet {
     ///
     /// Propagates admission, provider, shard, lexical, hydration and cancellation
     /// failures. No failing partition is omitted from a successful result.
+    /// Exclusions are refused before source work, including zero-k requests:
+    /// a generic lexical reader cannot prove one immutable exclusion population.
+    /// Use a built/reopened immutable sharded source cohort to apply exclusions
+    /// across every lexical and vector candidate.
     pub async fn search_hybrid_text(
         &self,
         cx: &Cx,
@@ -99,6 +103,7 @@ impl NativeShardSet {
         k: usize,
     ) -> SearchResult<Vec<NativeShardedResult>> {
         let is_hash = admit_tiers(cx, self, embedder, None)?;
+        super::query::reject_unbound_exclusions(cx, text)?;
         let budget = candidate_budget(k)?;
         if k == 0 {
             return Ok(Vec::new());
@@ -129,6 +134,8 @@ impl NativeShardSet {
     /// # Errors
     ///
     /// Propagates the ordinary sharded hybrid errors plus blocking-pool admission failure.
+    /// Exclusions have the same immutable-cohort requirement as
+    /// [`Self::search_hybrid_text`].
     pub async fn search_hybrid_text_with_pool(
         &self,
         cx: &Cx,
@@ -139,6 +146,7 @@ impl NativeShardSet {
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<NativeShardedResult>> {
         let is_hash = admit_tiers(cx, self, embedder, None)?;
+        super::query::reject_unbound_exclusions(cx, text)?;
         let budget = candidate_budget(k)?;
         if k == 0 {
             return Ok(Vec::new());
@@ -235,6 +243,8 @@ impl NativeShardSet {
     ///
     /// Rejects tier generation/identity disagreement before inference. All
     /// provider, shard, lexical, hydration and cancellation errors propagate.
+    /// Exclusions require an immutable source cohort, as for
+    /// [`Self::search_hybrid_text`].
     pub async fn search_hybrid_refined_text(
         &self,
         cx: &Cx,
@@ -245,6 +255,7 @@ impl NativeShardSet {
         k: usize,
     ) -> SearchResult<Vec<NativeShardedResult>> {
         let is_hash = admit_tiers(cx, self, fast_embedder, Some(quality))?;
+        super::query::reject_unbound_exclusions(cx, text)?;
         let budget = candidate_budget(k)?;
         if k == 0 {
             return Ok(Vec::new());
@@ -279,6 +290,8 @@ impl NativeShardSet {
     /// # Errors
     ///
     /// Propagates tier admission, inference, blocking-pool, shard, lexical, and hydration errors.
+    /// Exclusions require an immutable source cohort, as for
+    /// [`Self::search_hybrid_text`].
     pub async fn search_hybrid_refined_text_with_pool(
         &self,
         cx: &Cx,
@@ -290,6 +303,7 @@ impl NativeShardSet {
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<NativeShardedResult>> {
         let is_hash = admit_tiers(cx, self, fast_embedder, Some(quality))?;
+        super::query::reject_unbound_exclusions(cx, text)?;
         let budget = candidate_budget(k)?;
         if k == 0 {
             return Ok(Vec::new());
@@ -345,6 +359,9 @@ impl NativeShardSet {
     /// dropping an unpolled future does not consume a phase. No tasks are spawned.
     /// Attach [`NativeShardedProgressiveSearch::with_reranker`] before the first
     /// phase to add lazy cross-encoder ordering of a larger candidate window.
+    /// Exclusion queries fail on the first phase unless this stream belongs to
+    /// a built/reopened immutable source cohort. A generic lexical reader
+    /// cannot bind the exclusion census and candidate batch to one population.
     ///
     /// # Errors
     ///
@@ -716,6 +733,9 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
 
     async fn initial(&mut self) -> SearchResult<NativeShardedSearchPhase> {
         let is_hash = admit_tiers(self.cx, self.fast, self.fast_embedder, self.quality)?;
+        if self.immutable_query.is_none() {
+            super::query::reject_unbound_exclusions(self.cx, self.text)?;
+        }
         if self.k == 0
             || self
                 .allowed_documents

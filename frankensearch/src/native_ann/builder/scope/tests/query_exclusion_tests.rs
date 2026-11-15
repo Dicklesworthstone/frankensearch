@@ -19,6 +19,23 @@ fn exclusions_refill_native_tiers_and_intersect_explicit_scopes() {
                 Some(&quality),
             )
             .await;
+            // Erasing the immutable cohort into a generic lexical reader must
+            // not expose the high-scoring private vectors to an excluded query.
+            // The complete cohort's public routes below still answer it.
+            let fast_tier = index.vectors().fast();
+            assert!(matches!(
+                fast_tier.index().search_hybrid_text(
+                    &cx,
+                    fast_tier.embedder(),
+                    index.lexical(),
+                    "needle -private",
+                    3,
+                ).await,
+                Err(SearchError::InvalidConfig { field, value, .. })
+                    if field == "native_ann.query.exclusions"
+                        && value == "immutable-cohort-required"
+            ));
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
             for query in [
                 "needle -private",
                 "needle not \"needle private\"",

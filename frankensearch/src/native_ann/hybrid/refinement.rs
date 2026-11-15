@@ -109,6 +109,8 @@ impl NativeAnnIndex {
     ///
     /// Propagates admission, inference, graph, lexical and hydration errors.
     /// A failed or cancelled arm never becomes a partial-success fallback.
+    /// Exclusion queries require a retained immutable cohort and are refused
+    /// before any source work; see [`Self::search_hybrid_candidates`].
     pub async fn search_hybrid_refined_text(
         &self,
         cx: &Cx,
@@ -119,6 +121,7 @@ impl NativeAnnIndex {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         let is_hash = admit_pair(cx, self, fast_embedder, quality)?;
+        super::query::reject_unbound_exclusions(cx, text)?;
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -157,6 +160,8 @@ impl NativeAnnIndex {
     /// # Errors
     ///
     /// Propagates admission, inference, blocking-pool, lexical, and hydration errors.
+    /// Exclusions have the same immutable-cohort requirement as
+    /// [`Self::search_hybrid_refined_text`].
     pub async fn search_hybrid_refined_text_with_pool(
         self: &Arc<Self>,
         cx: &Cx,
@@ -173,6 +178,7 @@ impl NativeAnnIndex {
             fast_embedder,
             (quality.0.as_ref(), quality.1),
         )?;
+        super::query::reject_unbound_exclusions(cx, text)?;
         if k == 0 {
             return Ok(Vec::new());
         }

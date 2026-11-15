@@ -35,6 +35,12 @@ impl NativeAnnIndex {
     /// This does not prove a composite lexical/vector generation or change the
     /// default searcher. Graph work remains synchronous on the polling executor.
     ///
+    /// A generic lexical reader cannot bind exclusion membership to one
+    /// immutable population. Queries containing `-term` or `NOT "phrase"`
+    /// therefore fail on the first requested phase, before any source work.
+    /// Use a retained native snapshot or built/reopened immutable source cohort
+    /// for progressive queries whose exclusions apply to every retrieval tier.
+    ///
     /// # Errors
     ///
     /// Refuses invalid admission or overflow of the three-times candidate
@@ -709,6 +715,9 @@ impl<'a> NativeProgressiveSearch<'a> {
 
     async fn initial(&mut self) -> SearchResult<NativeSearchPhase> {
         let is_hash = self.admit()?;
+        if self.immutable_query.is_none() {
+            super::query::reject_unbound_exclusions(self.cx, self.text)?;
+        }
         if self.k == 0
             || self
                 .allowed_documents

@@ -1306,6 +1306,11 @@ impl TwoTierSearcher {
     /// lexical backend is available as fallback.
     /// Returns `SearchError::QueryParseError` for an exclusion-only query
     /// without a lexical backend or text for an examined lexical candidate.
+    /// Returns `SearchError::InvalidConfig` when a mixed positive/exclusion
+    /// query cannot obtain text for an examined initial candidate. Missing
+    /// quality-candidate text instead emits [`SearchPhase::RefinementFailed`],
+    /// preserving the verified initial results. Missing text never authorizes
+    /// a result whose exclusions could not be checked.
     /// Returns `SearchError::InvalidConfig` before retrieval or model work if
     /// the enabled MMR candidate pool exceeds 1,000.
     #[instrument(skip_all, fields(query_len = query.len(), k))]
@@ -2160,18 +2165,16 @@ impl TwoTierSearcher {
             )
             .await;
             let lex_res = match (lex_res, normalized_exclusions) {
-                (Ok(results), Some(exclusions)) => {
-                    refill_lexical_after_exclusions(
-                        cx,
-                        lex.as_ref(),
-                        &lexical_query,
-                        lexical_budget,
-                        LexicalCandidateBatch::eager(results),
-                        exclusions,
-                        text_fn,
-                    )
-                    .await
-                }
+                (Ok(results), Some(exclusions)) => Ok(refill_lexical_after_exclusions(
+                    cx,
+                    lex.as_ref(),
+                    &lexical_query,
+                    lexical_budget,
+                    LexicalCandidateBatch::eager(results),
+                    exclusions,
+                    text_fn,
+                )
+                .await?),
                 (Ok(results), None) => Ok(LexicalCandidateBatch::eager(results)),
                 (Err(error), _) => Err(error),
             };
@@ -2375,8 +2378,8 @@ impl TwoTierSearcher {
                     exclusions,
                     text_fn,
                 )
-                .await;
-                (Some(result), elapsed + start.elapsed())
+                .await?;
+                (Some(Ok(result)), elapsed + start.elapsed())
             }
             (timed, _, _) => timed,
         };
@@ -2627,13 +2630,17 @@ impl TwoTierSearcher {
                 } else {
                     None
                 };
-                let graph_candidates = graph_candidates.map(|results| {
-                    if let Some(exclusions) = normalized_exclusions {
-                        filter_scored_results_by_negations(results, exclusions, text_fn, "graph")
-                    } else {
-                        results
-                    }
-                });
+                let graph_candidates = graph_candidates
+                    .map(|results| {
+                        if let Some(exclusions) = normalized_exclusions {
+                            filter_scored_results_by_negations(
+                                cx, results, exclusions, text_fn, "graph",
+                            )
+                        } else {
+                            Ok(results)
+                        }
+                    })
+                    .transpose()?;
 
                 // RRF fusion if lexical results are available.
                 let fuse_start = Instant::now();
@@ -4666,7 +4673,7 @@ async fn refill_lexical_after_exclusions(
     refill_lexical_candidates(cx, lexical, query, target, batch, |doc_id| {
         Ok(!should_exclude_document(
             doc_id, exclusions, text_fn, "lexical",
-        ))
+        )?)
     })
     .await
 }
@@ -4725,15 +4732,24 @@ async fn refill_lexical_candidates(
 // The optional graph-pool filter is compiled even without graph support.
 // Keep its helper available in every build, including non-test libraries.
 fn filter_scored_results_by_negations(
+    cx: &Cx,
     mut results: Vec<ScoredResult>,
     exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
-) -> Vec<ScoredResult> {
-    // In-place retain avoids allocating a new Vec (fff.nvim pattern:
-    // never allocate when you can mutate in-place).
-    results.retain(|result| !should_exclude_document(&result.doc_id, exclusions, text_fn, source));
-    results
+) -> SearchResult<Vec<ScoredResult>> {
+    let mut retained = 0;
+    for rank in 0..results.len() {
+        cancellation_checkpoint(cx, "graph_candidates_to_exclusions")?;
+        let excluded = should_exclude_document(&results[rank].doc_id, exclusions, text_fn, source);
+        cancellation_checkpoint(cx, "graph_exclusions_to_search")?;
+        if !excluded? {
+            results.swap(retained, rank);
+            retained += 1;
+        }
+    }
+    results.truncate(retained);
+    Ok(results)
 }
 
 /// Fill an eligible semantic pool from one retained tier without changing its
@@ -4769,9 +4785,9 @@ fn refill_vector_after_exclusions(
                 break;
             }
             cancellation_checkpoint(cx, "vector_candidates_to_exclusions")?;
-            let include = !should_exclude_document(&hits[rank].doc_id, exclusions, text_fn, source);
+            let excluded = should_exclude_document(&hits[rank].doc_id, exclusions, text_fn, source);
             cancellation_checkpoint(cx, "vector_exclusions_to_search")?;
-            if include {
+            if !excluded? {
                 hits.swap(retained, rank);
                 retained += 1;
             }
@@ -4798,9 +4814,16 @@ fn filter_vector_hits_by_negations(
     exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
-) -> Vec<VectorHit> {
-    hits.retain(|hit| !should_exclude_document(&hit.doc_id, exclusions, text_fn, source));
-    hits
+) -> SearchResult<Vec<VectorHit>> {
+    let mut retained = 0;
+    for rank in 0..hits.len() {
+        if !should_exclude_document(&hits[rank].doc_id, exclusions, text_fn, source)? {
+            hits.swap(retained, rank);
+            retained += 1;
+        }
+    }
+    hits.truncate(retained);
+    Ok(hits)
 }
 
 fn should_exclude_document(
@@ -4808,15 +4831,17 @@ fn should_exclude_document(
     exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
-) -> bool {
-    let Some(text) = text_fn(doc_id) else {
-        return false;
-    };
+) -> SearchResult<bool> {
+    let text = text_fn(doc_id).ok_or_else(|| SearchError::InvalidConfig {
+        field: "search.exclusion_text".to_owned(),
+        value: source.to_owned(),
+        reason: "exclusion queries require document text for every examined candidate".to_owned(),
+    })?;
     if find_negative_match(&text, exclusions).is_none() {
-        return false;
+        return Ok(false);
     }
     tracing::debug!(source, "doc_excluded");
-    true
+    Ok(true)
 }
 
 fn find_negative_match(text: &str, exclusions: &NormalizedExclusions) -> Option<String> {
@@ -13539,6 +13564,140 @@ mod tests {
     }
 
     #[test]
+    fn mixed_exclusions_refuse_missing_text_before_initial_or_fallback() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for source in ["semantic", "lexical", "hash-lexical"] {
+                let (_index_dir, index) = build_test_index(4);
+                let fast: Arc<dyn Embedder> = if source == "hash-lexical" {
+                    Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4))
+                } else {
+                    Arc::new(StubEmbedder::new("fast", 4))
+                };
+                let mut searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+                let (missing, expected_source) = if source == "semantic" {
+                    ("doc-1", "semantic")
+                } else {
+                    searcher = searcher.with_lexical(Arc::new(StubLexical));
+                    ("lex-doc-1", "lexical")
+                };
+                let mut phases = Vec::new();
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find related records -private",
+                        10,
+                        |id| (id != missing).then(|| "eligible source text".to_owned()),
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .expect_err("missing text cannot authorize an exclusion-filtered result");
+                assert!(matches!(
+                    &error,
+                    SearchError::InvalidConfig { field, value, .. }
+                        if field == "search.exclusion_text" && value == expected_source
+                ));
+                assert!(phases.is_empty(), "no partial Initial for {source}");
+                assert!(!error.to_string().contains(missing));
+                assert!(!error.to_string().contains("private"));
+
+                let (results, _) = searcher
+                    .search_collect_with_text(&cx, "find related records -private", 10, |_| {
+                        Some("eligible source text".to_owned())
+                    })
+                    .await
+                    .unwrap();
+                assert!(!results.is_empty(), "complete evidence remains searchable");
+            }
+        });
+    }
+
+    #[test]
+    fn missing_quality_exclusion_text_never_emits_unverified_refined_results() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, index) = semantic_exclusion_index("native-v2");
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(query_admission_embedder("fast")),
+                TwoTierConfig::default(),
+            )
+            .with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+            let mut phases = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "find related records -private",
+                    2,
+                    |id| {
+                        id.starts_with("fast-")
+                            .then(|| "eligible source text".to_owned())
+                    },
+                    |phase| phases.push(phase),
+                )
+                .await
+                .unwrap();
+            let [
+                SearchPhase::Initial { results, .. },
+                SearchPhase::RefinementFailed { error, .. },
+            ] = phases.as_slice()
+            else {
+                panic!("expected safe Initial followed by typed refusal: {phases:?}");
+            };
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|hit| hit.doc_id.starts_with("fast-")));
+            assert!(matches!(error,
+                SearchError::InvalidConfig { field, .. } if field == "search.exclusion_text"
+            ));
+        });
+    }
+
+    #[test]
+    fn exclusion_text_cancellation_dominates_missing_evidence_for_every_source() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for lexical in [false, true] {
+                let (_index_dir, index) = build_test_index(4);
+                let mut searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(StubEmbedder::new("fast", 4)),
+                    TwoTierConfig::default(),
+                );
+                if lexical {
+                    searcher = searcher.with_lexical(Arc::new(StubLexical));
+                }
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find related records -private",
+                        10,
+                        |_| {
+                            cx.set_cancel_requested(true);
+                            None
+                        },
+                        |_| panic!("cancelled exclusions cannot publish a phase"),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::Cancelled { .. }));
+                cx.set_cancel_requested(false);
+            }
+            let results = StubLexical.search(&cx, "records", 3).await.unwrap();
+            let exclusions = to_exclusions(&ParsedQuery::parse("records -private"));
+            let error = filter_scored_results_by_negations(
+                &cx,
+                results,
+                &exclusions,
+                &|_| {
+                    cx.set_cancel_requested(true);
+                    None
+                },
+                "graph",
+            )
+            .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+        });
+    }
+
+    #[test]
     fn exclusion_filters_semantic_results_case_insensitive() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_index_dir, index) = build_test_index(4);
@@ -13959,12 +14118,15 @@ mod tests {
             terms: vec!["private-exclusion".to_owned()],
             phrases: Vec::new(),
         };
-        assert!(should_exclude_document(
-            "private-document-id",
-            &exclusions,
-            &|_| Some("contains private-exclusion text".to_owned()),
-            "lexical",
-        ));
+        assert!(
+            should_exclude_document(
+                "private-document-id",
+                &exclusions,
+                &|_| Some("contains private-exclusion text".to_owned()),
+                "lexical",
+            )
+            .unwrap()
+        );
         assert!(logs_contain("doc_excluded"));
         assert!(!logs_contain("private-exclusion"));
         assert!(!logs_contain("private-document-id"));
@@ -16067,11 +16229,14 @@ mod tests {
     }
 
     #[test]
-    fn should_exclude_document_returns_false_when_text_fn_returns_none() {
+    fn should_exclude_document_refuses_unverifiable_exclusions() {
         let parsed = ParsedQuery::parse("query -unsafe");
         let exclusions = to_exclusions(&parsed);
         let result = should_exclude_document("doc-1", &exclusions, &|_| None, "test");
-        assert!(!result);
+        assert!(matches!(result,
+            Err(SearchError::InvalidConfig { field, value, .. })
+                if field == "search.exclusion_text" && value == "test"
+        ));
     }
 
     #[test]
@@ -16084,7 +16249,7 @@ mod tests {
             &|_| Some("unsafe code".to_owned()),
             "test",
         );
-        assert!(result);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -16097,22 +16262,27 @@ mod tests {
             &|_| Some("safe code".to_owned()),
             "test",
         );
-        assert!(!result);
+        assert!(!result.unwrap());
     }
 
     #[test]
     fn filter_scored_results_by_negations_empty_input() {
-        let parsed = ParsedQuery::parse("query -foo");
-        let exclusions = to_exclusions(&parsed);
-        let results = filter_scored_results_by_negations(vec![], &exclusions, &|_| None, "test");
-        assert!(results.is_empty());
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parsed = ParsedQuery::parse("query -foo");
+            let exclusions = to_exclusions(&parsed);
+            let results =
+                filter_scored_results_by_negations(&cx, vec![], &exclusions, &|_| None, "test")
+                    .unwrap();
+            assert!(results.is_empty());
+        });
     }
 
     #[test]
     fn filter_vector_hits_by_negations_empty_input() {
         let parsed = ParsedQuery::parse("query -foo");
         let exclusions = to_exclusions(&parsed);
-        let results = filter_vector_hits_by_negations(vec![], &exclusions, &|_| None, "test");
+        let results =
+            filter_vector_hits_by_negations(vec![], &exclusions, &|_| None, "test").unwrap();
         assert!(results.is_empty());
     }
 

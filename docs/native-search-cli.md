@@ -51,9 +51,16 @@ entry points on `NativeBuiltHybridIndex`, `NativeBuiltShardedHybridIndex`,
 `NativeGenerationSnapshot`, their source scopes, and the fenced
 `NativeQuillSnapshot` share this preparation. The lower-level
 `NativeAnnIndex::search_hybrid_*` and `NativeShardSet::search_hybrid_*` operations
-accept independently supplied readers and text; they do not infer an immutable
-source cohort or add global exclusion handling. Direct `LexicalRead` access
-continues to expose the underlying lexical query grammar.
+accept independently supplied readers and text. They reject recognized
+exclusions with `native_ann.query.exclusions: immutable-cohort-required` before
+embedding or lexical retrieval, including zero-result requests. For progressive
+queries the refusal occurs on the first requested phase and finishes the stream.
+An arbitrary reader cannot guarantee that its exclusion census and candidate
+batch share one population; applying the constraint only to lexical results
+would still allow excluded vector matches. Use one of the complete cohort or
+snapshot entry points above for exclusion queries. Quoted literals and escaped
+dashes keep their ordinary meaning, and direct `LexicalRead` access continues to
+expose the underlying lexical query grammar.
 
 ## Build and index
 
