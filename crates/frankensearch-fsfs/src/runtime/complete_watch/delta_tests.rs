@@ -191,6 +191,25 @@ fn bounded_read_binds_opened_bytes_and_refuses_a_replaced_or_cancelled_source() 
         let result = read_source(&cx, &path, &stamp);
         cx.set_cancel_requested(false);
         assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+
+        let folder = parent.path().join("nested");
+        fs::create_dir(&folder).unwrap();
+        let child = folder.join("notes.md");
+        fs::write(&child, "nested source text").unwrap();
+        let stamp = SourceStamp::from_metadata(&fs::symlink_metadata(&child).unwrap());
+        fs::rename(&folder, parent.path().join("preserved-nested")).unwrap();
+        fs::write(&folder, "replacement regular file").unwrap();
+        for result in [
+            read_source(&cx, &child, &stamp).map(|_| ()),
+            metadata_modified_ms(&cx, &child, &stamp).map(|_| ()),
+        ] {
+            let error = result.expect_err("a replaced parent cannot supply the observed child");
+            assert!(is_source_changed(&error), "{error:?}");
+        }
+        assert!(matches!(
+            observation_io(std::io::Error::from(ErrorKind::PermissionDenied)),
+            SearchError::Io(error) if error.kind() == ErrorKind::PermissionDenied
+        ));
     });
 }
 
@@ -468,6 +487,98 @@ fn watcher_batches_edit_add_delete_and_rename_without_reindexing_unchanged_rows(
 }
 
 #[test]
+fn directory_replaced_by_a_file_rebuilds_without_losing_old_or_new_readers() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, source, root) = fixture(directory.path());
+        let branch = source.join("branch.md");
+        fs::create_dir(&branch).unwrap();
+        fs::write(branch.join("entry.md"), "oldnestedword source").unwrap();
+        let mut session = controlled_session(&runtime, &cx, &root);
+        let old = initial(&mut session, &cx).await;
+        let old_rows = FsfsRuntime::read_matching_manifest_generation(old.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            old_rows.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["alpha.md", "branch.md/entry.md", "stable.md"]
+        );
+        let reader_runtime = lexical_reader(&runtime);
+        let mut pinned = reader_runtime.open_retained_search(&cx, &root).await.unwrap();
+        let mut live = reader_runtime
+            .open_live_retained_search(&cx, &root)
+            .await
+            .unwrap();
+
+        let preserved = directory.path().join("preserved-branch");
+        fs::rename(&branch, &preserved).unwrap();
+        fs::write(&branch, "replacementword regular source").unwrap();
+        let next = change(&mut session, &cx, &branch).await;
+        assert_ne!(next, old);
+        assert_ne!(
+            FsfsRuntime::read_index_sentinel(next.path())
+                .unwrap()
+                .unwrap()
+                .command,
+            "retained-batch",
+            "an unproven child removal must use the full rebuild route"
+        );
+        let new_rows = FsfsRuntime::read_matching_manifest_generation(next.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new_rows.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["alpha.md", "branch.md", "stable.md"]
+        );
+        let mut cold = reader_runtime.open_retained_search(&cx, &root).await.unwrap();
+        for (query, expected) in [
+            ("replacementword", vec!["branch.md"]),
+            ("oldnestedword", Vec::new()),
+            ("stableword", vec!["stable.md"]),
+        ] {
+            let live_phases = live.search(&cx, query, 10).await.unwrap();
+            let cold_phases = cold.search(&cx, query, 10).await.unwrap();
+            for phases in [&live_phases, &cold_phases] {
+                assert_eq!(
+                    phases
+                        .last()
+                        .unwrap()
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.as_str())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{query}"
+                );
+            }
+        }
+        for (query, expected) in [
+            ("oldnestedword", vec!["branch.md/entry.md"]),
+            ("replacementword", Vec::new()),
+        ] {
+            let phases = pinned.search(&cx, query, 10).await.unwrap();
+            assert_eq!(
+                phases
+                    .last()
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{query}"
+            );
+        }
+        assert_eq!(pinned.generation(), &old);
+        assert_eq!(cold.generation(), &next);
+        assert_eq!(
+            fs::read_to_string(preserved.join("entry.md")).unwrap(),
+            "oldnestedword source"
+        );
+    });
+}
+
+#[test]
 fn periodic_scan_finds_missed_edits_while_forced_and_unsupported_changes_rebuild() {
     run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -647,9 +758,10 @@ fn removal_absence_requires_not_found_and_preserves_cancellation() {
                 &recheck_removals(&cx, std::slice::from_ref(path)).unwrap_err()
             ));
         }
-        assert!(matches!(
-            physically_absent(&cx, &file.join("child")),
-            Err(SearchError::Io(error)) if error.kind() != ErrorKind::NotFound
+        let child = file.join("child");
+        assert!(!physically_absent(&cx, &child).unwrap());
+        assert!(is_source_changed(
+            &recheck_removals(&cx, std::slice::from_ref(&child)).unwrap_err()
         ));
         cx.set_cancel_requested(true);
         let cancelled = physically_absent(&cx, &missing);

@@ -166,7 +166,10 @@ fn is_source_changed(error: &SearchError) -> bool {
 }
 
 fn observation_io(error: std::io::Error) -> SearchError {
-    if error.kind() == std::io::ErrorKind::NotFound {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) {
         source_changed()
     } else {
         error.into()
@@ -1052,8 +1055,10 @@ impl FsfsRuntime {
     /// coalesce for 500 ms (at most 5 s); a 30 s metadata/membership reconciliation
     /// recovers missed observable changes. Bounded path hints also preserve edits
     /// with unchanged coarse timestamps. Every build reuses full-search admission and
-    /// validates source membership/metadata before selection. Source and store
-    /// must be disjoint; an incomplete scan is never an authoritative deletion.
+    /// validates source membership/metadata before selection. A store inside the
+    /// source requires a hidden path component and is excluded from discovery.
+    /// The store must not contain the source. Incomplete scans never authorize
+    /// deletion.
     ///
     /// On restart, an eligible selected quality backlog is completed from its
     /// retained inputs before rebuilding sources, once pressure permits work.

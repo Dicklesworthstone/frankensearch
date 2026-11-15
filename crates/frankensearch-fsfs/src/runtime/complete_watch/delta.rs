@@ -125,13 +125,15 @@ fn source_id(root: &Path, path: &Path) -> Option<String> {
 
 /// Discovery exclusion is not physical absence. A directory, special file or
 /// dangling symlink replacing an indexed source keeps the full indexer's policy
-/// path; only `NotFound` admits an incremental removal. Never swallow I/O errors.
+/// path. A non-directory ancestor also needs full reconciliation; only `NotFound`
+/// admits an incremental removal. Other I/O errors propagate.
 fn physically_absent(cx: &Cx, path: &Path) -> SearchResult<bool> {
     retained_search_checkpoint(cx)?;
     let metadata = fs::symlink_metadata(path);
     retained_search_checkpoint(cx)?;
     match metadata {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotADirectory => Ok(false),
         Err(error) => Err(error.into()),
         Ok(_) => Ok(false),
     }
