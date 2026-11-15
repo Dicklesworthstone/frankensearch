@@ -917,6 +917,131 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
             }
         }
     }
+
+    // Interrupt real document work after a genuine executable upgrade. Model
+    // health probes do not emit this indexing-only event. No timing sleep or
+    // destructor kill is evidence that cancellation reached a build.
+    let pending = [
+        "pending-00.md",
+        "pending-01.md",
+        "pending-02.md",
+        "pending-03.md",
+        "pending-04.md",
+        "pending-05.md",
+        "pending-06.md",
+        "pending-07.md",
+    ];
+    eprintln!("watch interrupt prior={prior_sha} current={current_sha}");
+    let mut fixture = Fixture::new(Some(&models), true);
+    fixture.executable.clone_from(&prior);
+    fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
+    let mut seed = watch(&fixture, "same-executable");
+    let original = wait_for_visible_paths(&fixture, &mut seed, &["alpha.md", "beta.md"], None);
+    seed.stop_gracefully();
+    let original_artifacts = artifacts(original.path());
+    assert!(original_artifacts.contains_key(Path::new("vector/quality.fsvi")));
+    let pointer = fs::read(fixture.store.join("FSFS-CURRENT")).unwrap();
+    let manifest = fs::read(original.path().join("FSFS-BUNDLE.json")).unwrap();
+    fixture.executable.clone_from(&current);
+    let original_ranks = ranks(&fixture);
+    let paragraph = "A relevant document explains transactional indexing, durable snapshots, cancellation, file discovery, semantic retrieval, lexical ranking, and stable search results.\n";
+    for (ordinal, path) in pending.iter().enumerate() {
+        fs::write(
+            fixture.source.join(path),
+            format!("Pending document {ordinal}\n{}", paragraph.repeat(256)),
+        )
+        .unwrap();
+    }
+    let reader_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let cx = reader_runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+    let store = CompleteGenerationStore::open(&cx, &fixture.store).unwrap();
+    let mut interrupted = watch(&fixture, "compatible-contract");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        interrupted.assert_alive();
+        let stderr = fs::read_to_string(interrupted.capture.path().join("stderr")).unwrap();
+        if let Some(witness) = stderr
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+            .find(|line| {
+                line.contains("fsfs admitted indexing embedding batch")
+                    && line.contains("model=\"all-minilm-l6-v2\"")
+            })
+        {
+            assert!(
+                witness
+                    .split_ascii_whitespace()
+                    .any(|field| field == "inputs=8")
+            );
+            assert_eq!(store.active(&cx).unwrap(), Some(original.clone()));
+            eprintln!("watch interrupt document batch: {witness}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no quality document batch: {stderr}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let signal = Command::new("kill")
+        .args(["-INT", &interrupted.child.id().to_string()])
+        .status()
+        .expect("interrupt own indexing watcher");
+    assert!(signal.success());
+    let cancelled = interrupted.finish(Duration::from_secs(30));
+    assert!(cancelled.status.success(), "{cancelled:?}");
+    assert!(
+        std::str::from_utf8(&cancelled.stderr)
+            .unwrap()
+            .lines()
+            .any(
+                |line| line.contains("complete-generation command stopped on request")
+                    && line.contains("Signal(2)")
+            ),
+        "{cancelled:?}"
+    );
+    for line in cancelled
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let receipt: Value = serde_json::from_slice(line).unwrap();
+        assert_ne!(receipt["data"]["publication"], "durable");
+    }
+    assert_eq!(store.active(&cx).unwrap(), Some(original.clone()));
+    assert_eq!(
+        fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(),
+        pointer
+    );
+    assert_eq!(artifacts(original.path()), original_artifacts);
+    assert_eq!(
+        fs::read(original.path().join("FSFS-BUNDLE.json")).unwrap(),
+        manifest
+    );
+    assert_eq!(ranks(&fixture), original_ranks);
+    eprintln!(
+        "watch interrupt preserved original={} signal=SIGINT pending=8",
+        original.id()
+    );
+
+    let mut retry = watch(&fixture, "compatible-contract");
+    let mut expected = vec!["alpha.md", "beta.md"];
+    expected.extend(pending);
+    let recovered = wait_for_visible_paths(&fixture, &mut retry, &expected, Some(original.id()));
+    let recovered_output = retry.stop_gracefully();
+    assert!(document_batches(&recovered_output) > 0);
+    assert_eq!(artifacts(original.path()), original_artifacts);
+    assert_eq!(
+        fs::read(original.path().join("FSFS-BUNDLE.json")).unwrap(),
+        manifest
+    );
+    assert_eq!(store.active(&cx).unwrap(), Some(recovered.clone()));
+    eprintln!(
+        "watch interrupt recovered generation={} visible_documents=10",
+        recovered.id()
+    );
 }
 
 #[cfg(feature = "semantic-support")]
