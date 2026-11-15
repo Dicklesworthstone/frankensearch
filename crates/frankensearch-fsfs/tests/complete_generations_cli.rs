@@ -1313,28 +1313,33 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
         .build()
         .unwrap();
     let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
-    for (policy, drift, carried, embeds) in [
-        ("same-executable", "none", 0, true),
-        ("compatible-contract", "none", 2, false),
-        ("compatible-contract", "source", 1, true),
-        ("compatible-contract", "window", 0, true),
+    for (seed_complete, policy, drift, carried, embeds) in [
+        (true, "same-executable", "none", 0, true),
+        (true, "compatible-contract", "none", 2, false),
+        (true, "compatible-contract", "source", 1, true),
+        (true, "compatible-contract", "window", 0, true),
+        (false, "same-executable", "none", 0, true),
+        (false, "compatible-contract", "none", 2, false),
     ] {
         eprintln!(
-            "cross-executable case prior={prior_sha} current={current_sha} policy={policy} drift={drift}"
+            "cross-executable case prior={prior_sha} current={current_sha} seed_complete={seed_complete} policy={policy} drift={drift}"
         );
         let mut fixture = Fixture::new();
         fixture.write_config(Some(&models), "{index_dir}/catalog.sqlite");
         fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
         fixture.executable.clone_from(&prior);
-        let indexing = |fixture: &Fixture, policy: &str| {
+        let indexing = |fixture: &Fixture, policy: &str, complete: bool| {
+            let mut command = fixture.command("index", "json");
+            if !complete {
+                command.env("FSFS_COMPLETE_GENERATIONS", "false");
+            }
             execute(
-                fixture
-                    .command("index", "json")
+                command
                     .env("FRANKENSEARCH_LOG", "frankensearch_fsfs::indexing=debug")
                     .args(["--no-color", "--upgrade-reuse", policy]),
             )
         };
-        let first_output = indexing(&fixture, "same-executable");
+        let first_output = indexing(&fixture, "same-executable", seed_complete);
         let first = json_output(&first_output, true);
         assert_eq!(first["data"]["generation_complete"], true);
         assert_eq!(first["data"]["semantic_indexed_files"], 2);
@@ -1344,17 +1349,27 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
             "the log control must observe document inference"
         );
         let before_ranks = search_ranks(&fixture);
-        let store = frankensearch_fsfs::generation_store::CompleteGenerationStore::open(
-            &cx,
-            &fixture.store,
-        )
-        .unwrap();
-        let pinned = store.active(&cx).unwrap().unwrap();
-        assert_eq!(
-            pinned.id(),
-            first["data"]["generation_id"].as_str().unwrap()
-        );
-        let before = generation_files(pinned.path());
+        let pinned = if seed_complete {
+            let store = frankensearch_fsfs::generation_store::CompleteGenerationStore::open(
+                &cx,
+                &fixture.store,
+            )
+            .unwrap();
+            let pinned = store.active(&cx).unwrap().unwrap();
+            assert_eq!(
+                pinned.id(),
+                first["data"]["generation_id"].as_str().unwrap()
+            );
+            Some(pinned)
+        } else {
+            assert!(!fixture.store.join(COMPLETE_GENERATION_POINTER).exists());
+            assert!(fixture.store.join("FSFS-LEGACY-REUSE.json").is_file());
+            None
+        };
+        let predecessor = pinned
+            .as_ref()
+            .map_or(fixture.store.as_path(), |generation| generation.path());
+        let before = generation_files(predecessor);
 
         if drift == "source" {
             fs::write(
@@ -1385,7 +1400,7 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
         }
 
         fixture.executable.clone_from(&current);
-        let second_output = indexing(&fixture, policy);
+        let second_output = indexing(&fixture, policy, true);
         let second = json_output(&second_output, true);
         assert_eq!(second["data"]["generation_complete"], true);
         assert_eq!(second["data"]["semantic_indexed_files"], 2);
@@ -1399,7 +1414,20 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
         );
         let batches = document_embedding_batches(&second_output);
         assert_eq!(batches > 0, embeds, "{policy}/{drift}: {second}");
-        assert_eq!(generation_files(pinned.path()), before);
+        if seed_complete {
+            assert_eq!(generation_files(predecessor), before);
+        } else {
+            for (path, bytes) in &before {
+                if path == Path::new("FSFS-LEGACY-REUSE.json")
+                    || matches!(
+                        path.extension().and_then(|ext| ext.to_str()),
+                        Some("fsvi" | "fslx")
+                    )
+                {
+                    assert_eq!(fs::read(predecessor.join(path)).unwrap(), *bytes);
+                }
+            }
+        }
         let after_ranks = search_ranks(&fixture);
         if policy == "compatible-contract" && drift == "none" {
             assert_eq!(after_ranks, before_ranks);
@@ -1431,7 +1459,7 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
             assert_eq!(index_artifacts(after), expected);
         }
         eprintln!(
-            "cross-executable reuse prior={prior_sha} current={current_sha} policy={policy} drift={drift} carried={carried} seed_document_batches={seed_batches} current_document_batches={batches}"
+            "cross-executable reuse prior={prior_sha} current={current_sha} seed_complete={seed_complete} policy={policy} drift={drift} carried={carried} seed_document_batches={seed_batches} current_document_batches={batches}"
         );
     }
 }
