@@ -6514,16 +6514,13 @@ impl KeeperWriter {
             }
             pending
         } else {
-            let pending = PendingCompaction {
+            PendingCompaction {
                 from_generation,
                 policy,
                 selected_segment_id,
                 created_unix_s,
                 last_publish_unix_s: current_manifest_publish_unix_s()?,
-            };
-            // Store before the first await that can produce retry artifacts.
-            self.pending_compaction = Some(Box::new(pending));
-            pending
+            }
         };
         let snapshot = self.snapshot.clone();
         let artifact = spawn_blocking(move || {
@@ -6549,6 +6546,10 @@ impl KeeperWriter {
             report,
         } = artifact;
         manifest.last_publish_unix_s = pending.last_publish_unix_s;
+        // The build above only reads the snapshot. Pin retry inputs when
+        // publication can first leave artifacts, so a build failure alone
+        // does not prevent a later attempt with a different policy.
+        self.pending_compaction = Some(Box::new(pending));
         for segment in encoded {
             self.publish_encoded_segment_retryable(cx, Arc::new(segment))
                 .await?;
@@ -28044,6 +28045,50 @@ mod tests {
     }
 
     #[test]
+    fn compaction_build_failure_allows_a_different_policy_without_writing() {
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempdir().expect("compaction build failure directory");
+            let mut writer = KeeperWriter::create(&cx, directory.path(), DEFAULT_SCHEMA)
+                .await
+                .expect("create fixture index");
+            // This recovery fixture has valid framing and IDMAP, but an
+            // intentionally invalid DOCLEN payload. Rewriting must fail.
+            let encoded = encoded_identity_test_segment(0xc0fa, 0, &[Some("keep"), Some("drop")])
+                .expect("encode source fixture");
+            let mut segment = manifest_segment(&encoded, 1);
+            segment.tombstones = array_tombstones(0, &[1]);
+            let manifest = durable_test_manifest(2, vec![segment]);
+            let pending = encoded.write_temp(directory.path()).unwrap();
+            writer.publish_segment(&cx, pending).await.unwrap();
+            writer.publish(&cx, &manifest).await.unwrap();
+            let before = directory_bytes(directory.path()).unwrap();
+
+            assert!(matches!(
+                writer.compact(&cx, CompactionPolicy::new(0.25), 111).await,
+                Err(KeeperError::Compaction {
+                    source: CompactionError::SourceValidation { .. }
+                })
+            ));
+            assert_eq!(directory_bytes(directory.path()).unwrap(), before);
+            let report = writer
+                .compact(&cx, CompactionPolicy::new(1.0), 222)
+                .await
+                .expect("a failed pure build must not pin the previous policy");
+            assert!(!report.changed());
+            assert_eq!(report.generation_before, 2);
+            assert_eq!(report.generation_after, 2);
+            assert_eq!(directory_bytes(directory.path()).unwrap(), before);
+            let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA).unwrap();
+            assert_eq!(reopened.doc_count(), 1);
+            assert_eq!(
+                reopened.materialize_document_id(0),
+                Some(DocId::new("keep"))
+            );
+            assert_eq!(reopened.materialize_document_id(1), None);
+        });
+    }
+
+    #[test]
     fn compaction_retry_preserves_timestamps_and_exact_manifest_temp() {
         let _pause_serial = manifest_publish_pause_test_serial_guard();
         run_with_blocking_cx(|cx| async move {
@@ -28105,6 +28150,17 @@ mod tests {
             let retained = std::fs::read(&temp_path).expect("read retained compaction proposal");
             let proposed = Manifest::from_bytes(&retained).unwrap();
             assert_eq!(proposed.last_publish_unix_s, pending.last_publish_unix_s);
+            assert!(matches!(
+                writer.compact(&cx, CompactionPolicy::new(1.0), 222).await,
+                Err(KeeperError::InvalidTransition { .. })
+            ));
+            assert!(matches!(
+                writer
+                    .compact_with_selection(&cx, policy, Some(u64::MAX), 222)
+                    .await,
+                Err(KeeperError::InvalidTransition { .. })
+            ));
+            assert_eq!(std::fs::read(&temp_path).unwrap(), retained);
 
             // Rebuilding with later creation/publication times, as the old
             // retry did, must still fail the unchanged exact-temp guard.
