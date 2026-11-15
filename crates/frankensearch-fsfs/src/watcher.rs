@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -3975,53 +3975,82 @@ fn event_to_ingest_op(
     // The initial indexer skips non-UTF-8 source names. Do the same before
     // constructing either mutation: lossy conversion can alias an unrelated
     // valid Unicode path, including on a deletion after the source is gone.
-    if event.path.to_str().is_none() {
+    if event.path.to_str().is_none()
+        || event
+            .path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
         return Ok(None);
     }
+
+    // Judge the path from the innermost root that holds it, as the walk that
+    // `fsfs index` runs from that root would. A native rename can name an
+    // outside destination, and explicit event batches can contain any path:
+    // neither grants permission to index or delete beyond the watched roots.
+    // Reject unresolved traversal spellings without following symlinks or
+    // inspecting policy/files outside the selected scope.
+    let Some(root) = roots
+        .iter()
+        .filter(|root| {
+            !root.as_os_str().is_empty()
+                && !root
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+                && event.path.starts_with(root)
+        })
+        .max_by_key(|root| root.components().count())
+    else {
+        return Ok(None);
+    };
     let revision = i64::try_from(event.observed_at_ms).unwrap_or(i64::MAX);
     let file_key = normalize_file_key(&event.path);
 
-    // Judge the path from the innermost root that holds it, as the walk that
-    // `fsfs index` runs from that root would.
-    let root = roots
-        .iter()
-        .filter(|root| event.path.starts_with(root))
-        .max_by_key(|root| root.components().count());
     // Deletes still remove previously indexed paths even when today's rules
     // exclude them, but an unreadable policy must reject the entire batch.
     if matches!(event.kind, WatchEventKind::Deleted) {
-        if let Some(root) = root {
-            validate_delete_ignore_policy(discovery, root, &event.path, ignore_rules, mount_table)?;
-        }
+        validate_delete_ignore_policy(discovery, root, &event.path, ignore_rules, mount_table)?;
         return Ok(Some(WatchIngestOp::Delete { file_key, revision }));
     }
 
-    let byte_len = event.byte_len.unwrap_or_else(|| {
-        std::fs::symlink_metadata(&event.path)
-            .map(|m| m.len())
-            .unwrap_or(0)
-    });
-    let mut candidate =
-        DiscoveryCandidate::new(&event.path, byte_len).with_symlink(event.is_symlink);
-    if let Some(root) = root {
-        candidate = candidate.with_root(root);
-    }
+    let mut candidate = DiscoveryCandidate::new(&event.path, event.byte_len.unwrap_or_default())
+        .with_root(root)
+        .with_symlink(event.is_symlink);
     if let Some(category) = event.mount_category {
         candidate = candidate.with_mount_category(category);
     }
 
-    let decision = discovery.evaluate_candidate(&candidate);
+    let mut decision = discovery.evaluate_candidate(&candidate);
     if matches!(decision.scope, DiscoveryScopeDecision::Exclude)
         || !decision.ingestion_class.is_indexed()
     {
         return Ok(None);
     }
 
+    // Native notifications describe the leaf, not symlinked directories on
+    // the way to it. Explicit events may carry no symlink metadata at all.
+    // Check from the selected root before reading descendant policy or source
+    // metadata, retaining the configured spelling instead of canonicalizing.
+    if !discovery.follow_symlinks
+        && watch_no_follow_path_is_excluded(root, &event.path, ignore_rules)?
+    {
+        return Ok(None);
+    }
+    if event.byte_len.is_none() {
+        candidate.byte_len = fs::symlink_metadata(&event.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        decision = discovery.evaluate_candidate(&candidate);
+        if matches!(decision.scope, DiscoveryScopeDecision::Exclude)
+            || !decision.ingestion_class.is_indexed()
+        {
+            return Ok(None);
+        }
+    }
+
     // A scope or safety exclusion already settled above must not activate
     // ignore files inside a subtree the snapshot walk would never enter.
-    if let Some(root) = root
-        && ignore_rules.skips_under(root, &event.path, false)?
-    {
+    if ignore_rules.skips_under(root, &event.path, false)? {
         return Ok(None);
     }
 
@@ -4030,6 +4059,86 @@ fn event_to_ingest_op(
         revision,
         ingestion_class: decision.ingestion_class,
     }))
+}
+
+/// Inspect each component from the selected boundary, stopping at the first
+/// symlink rather than resolving it to inspect a descendant outside the walk.
+fn watch_no_follow_path_is_excluded(
+    root: &Path,
+    path: &Path,
+    ignore_rules: &mut IgnoreRules,
+) -> SearchResult<bool> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(true);
+    };
+    let mut current = root.to_path_buf();
+    let mut components = relative.components();
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_symlink() => return Ok(true),
+            Ok(_) => {}
+            // The source may have vanished before its event is consumed; the
+            // ingest pipeline owns that outcome. No deeper path can currently
+            // be followed through a missing or non-directory ancestor.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                // A walk prunes ignored directories before probing their
+                // unreadable descendants. Only inspect policy through this
+                // already checked prefix, never beneath the unresolved entry.
+                let is_dir = !components.as_path().as_os_str().is_empty();
+                if ignore_rules.skips_under(root, &current, is_dir)? {
+                    return Ok(true);
+                }
+                return Err(error.into());
+            }
+        }
+        let Some(component) = components.next() else {
+            return Ok(false);
+        };
+        current.push(component);
+    }
+}
+
+/// A removed or replaced directory can still have indexed descendants to
+/// delete, but it no longer supplies descendant ignore policy to validate.
+fn watch_directory_can_be_entered(path: &Path, follow_symlinks: bool) -> SearchResult<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_symlink() {
+        return Ok(metadata.is_dir());
+    }
+    if !follow_symlinks {
+        return Ok(false);
+    }
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// A deletion may clean up an excluded old document, but its policy scope ends
@@ -4048,6 +4157,9 @@ fn validate_delete_ignore_policy(
     // Explicit file roots bypass descendant ignore policy just as the scan and
     // upsert paths do; do not try to read `selected-file/.ignore`.
     if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if !watch_directory_can_be_entered(root, discovery.follow_symlinks)? {
         return Ok(());
     }
     ignore_rules.validate_directory(root)?;
@@ -6111,6 +6223,78 @@ mod tests {
         assert!(prepared.ops.is_empty());
     }
 
+    #[test]
+    fn watcher_scope_rejects_outside_and_traversing_events_before_policy_or_sink() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("source");
+            let sibling = temp.path().join("source-other");
+            fs::create_dir_all(root.join("nested")).expect("selected root");
+            fs::create_dir(&sibling).expect("unselected sibling");
+            let outside = sibling.join("private.md");
+            fs::write(&outside, "Outside the selected discovery scope.\n").expect("outside source");
+            // An irrelevant event must not even activate the selected root's
+            // policy. An ordinary in-scope event below is the negative control.
+            fs::write(root.join(".ignore"), "private[9-0].md\n")
+                .expect("malformed selected policy");
+            let paths = [
+                outside,
+                temp.path().join("elsewhere.md"),
+                root.join("../elsewhere.md"),
+                root.join("nested/../../elsewhere.md"),
+                PathBuf::from("unselected.md"),
+                PathBuf::new(),
+            ];
+            let events = paths
+                .iter()
+                .flat_map(|path| {
+                    [
+                        WatchEvent::created(path, 1_000, None),
+                        WatchEvent::modified(path, 1_001, None),
+                        WatchEvent::deleted(path, 1_002),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            for roots in [Vec::new(), vec![PathBuf::new()], vec![root.clone()]] {
+                let pipeline = Arc::new(RecordingPipeline::default());
+                let watcher = FsWatcher::new(roots, DiscoveryConfig::default(), pipeline.clone());
+                let outcome = watcher
+                    .process_events_now(&cx, &events)
+                    .await
+                    .expect("outside events do not read selected policy or reach ingest");
+                assert_eq!(
+                    outcome,
+                    WatchBatchOutcome {
+                        accepted: 0,
+                        reindexed: 0,
+                        skipped: events.len(),
+                    }
+                );
+                assert!(pipeline.all_ops().is_empty());
+                assert!(lock_or_recover(&pipeline.attempts).is_empty());
+            }
+
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                pipeline.clone(),
+            );
+            let error = watcher
+                .process_events_now(
+                    &cx,
+                    &[WatchEvent::modified(root.join("notes.md"), 1_003, Some(10))],
+                )
+                .await
+                .expect_err("an in-scope event must still admit its ignore policy");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, .. } if field == "discovery.ignore_rules"
+            ));
+            assert!(lock_or_recover(&pipeline.attempts).is_empty());
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn watcher_scope_parent_resolution_preserves_root_symlink_policy() {
@@ -6139,7 +6323,164 @@ mod tests {
             assert!(completeness.is_complete());
             assert_eq!(snapshot.contains_key(&root.join("lib.rs")), follow_symlinks);
             assert_eq!(snapshot.len(), usize::from(follow_symlinks));
+            let events = super::map_notify_event(
+                Event::new(EventKind::Modify(ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )))
+                .add_path(root.join("lib.rs")),
+            );
+            assert!(!events[0].is_symlink, "the native event describes the leaf");
+            let prepared = super::prepare_event_batch(&watcher.discovery, watcher.roots(), &events)
+                .expect("event admission follows the root symlink policy");
+            assert_eq!(prepared.accepted, usize::from(follow_symlinks));
+            assert_eq!(prepared.skipped, usize::from(!follow_symlinks));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_scope_descendant_symlinks_match_snapshot_policy() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("source");
+        let target = temp.path().join("external");
+        fs::create_dir(&root).expect("selected root");
+        fs::create_dir(&target).expect("unselected target");
+        fs::write(
+            target.join("public.md"),
+            "Symlink policy must match initial indexing.\n",
+        )
+        .expect("external source");
+        let linked_dir = root.join("linked");
+        let linked_file = root.join("linked.md");
+        std::os::unix::fs::symlink(&target, &linked_dir).expect("directory symlink");
+        std::os::unix::fs::symlink(target.join("public.md"), &linked_file).expect("file symlink");
+        for (selected, paths) in [
+            (
+                root,
+                vec![linked_dir.join("public.md"), linked_file.clone()],
+            ),
+            (linked_file.clone(), vec![linked_file]),
+        ] {
+            for follow_symlinks in [false, true] {
+                let watcher = FsWatcher::new(
+                    vec![selected.clone()],
+                    DiscoveryConfig {
+                        follow_symlinks,
+                        ..DiscoveryConfig::default()
+                    },
+                    Arc::new(NoopWatchIngestPipeline),
+                );
+                let mut native = Event::new(EventKind::Modify(ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )));
+                for path in &paths {
+                    native = native.add_path(path.clone());
+                }
+                let mut events = super::map_notify_event(native);
+                // Caller-supplied events need the same protection even when
+                // their leaf metadata was never captured or has gone stale.
+                events.extend(
+                    paths
+                        .iter()
+                        .map(|path| WatchEvent::modified(path, 100, None)),
+                );
+                let prepared =
+                    super::prepare_event_batch(&watcher.discovery, watcher.roots(), &events)
+                        .expect("event admission follows symlink policy");
+                let expected = if follow_symlinks { events.len() } else { 0 };
+                assert_eq!(prepared.accepted, expected);
+                assert_eq!(prepared.skipped, events.len() - expected);
+                let (snapshot, completeness) = watcher.collect_snapshot().expect("snapshot");
+                assert!(completeness.is_complete());
+                for path in &paths {
+                    assert_eq!(snapshot.contains_key(path), follow_symlinks);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_no_follow_skips_target_policy_but_preserves_cleanup_deletes() {
+        run_test_with_cx(|cx| async move {
+            for link_is_root in [true, false] {
+                let temp = tempdir().expect("tempdir");
+                let root = temp.path().join("source");
+                let target = temp.path().join("external");
+                fs::create_dir(&target).expect("unselected target");
+                fs::write(target.join("public.md"), "An excluded symlink target.\n")
+                    .expect("external source");
+                fs::write(target.join(".ignore"), "private[9-0].md\n")
+                    .expect("malformed outside policy");
+                let link = if link_is_root {
+                    root.clone()
+                } else {
+                    fs::create_dir(&root).expect("selected root");
+                    root.join("linked")
+                };
+                std::os::unix::fs::symlink(&target, &link).expect("directory symlink");
+                let source = link.join("public.md");
+                let pipeline = Arc::new(RecordingPipeline::default());
+                let watcher = FsWatcher::new(
+                    vec![root.clone()],
+                    DiscoveryConfig::default(),
+                    pipeline.clone(),
+                );
+                let outcome = watcher
+                    .process_events_now(
+                        &cx,
+                        &[
+                            WatchEvent::modified(&source, 100, None),
+                            WatchEvent::deleted(&source, 101),
+                        ],
+                    )
+                    .await
+                    .expect("no-follow never loads policy beyond the symlink");
+                assert_eq!(outcome.accepted, 1);
+                assert_eq!(outcome.skipped, 1);
+                assert!(matches!(
+                    pipeline.all_ops().as_slice(),
+                    [WatchIngestOp::Delete { file_key, .. }]
+                        if file_key == &normalize_file_key(&source)
+                ));
+
+                let follows = FsWatcher::new(
+                    vec![root],
+                    DiscoveryConfig {
+                        follow_symlinks: true,
+                        ..DiscoveryConfig::default()
+                    },
+                    pipeline.clone(),
+                );
+                let error = follows
+                    .process_events_now(&cx, &[WatchEvent::modified(&source, 102, None)])
+                    .await
+                    .expect_err("following the target must validate its policy");
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, .. } if field == "discovery.ignore_rules"
+                ));
+                assert_eq!(lock_or_recover(&pipeline.attempts).len(), 1);
+
+                fs::rename(&link, temp.path().join("retired-link")).expect("move symlink away");
+                let prepared = super::prepare_event_batch(
+                    &watcher.discovery,
+                    watcher.roots(),
+                    &[
+                        WatchEvent::deleted(&source, 103),
+                        WatchEvent::deleted(&link, 104),
+                    ],
+                )
+                .expect("a vanished root, ancestor, or symlink still permits row cleanup");
+                assert_eq!(prepared.accepted, 2);
+                assert!(
+                    prepared
+                        .ops
+                        .iter()
+                        .all(|op| matches!(op, WatchIngestOp::Delete { .. }))
+                );
+            }
+        });
     }
 
     #[test]
@@ -7005,6 +7346,63 @@ mod tests {
     }
 
     #[test]
+    fn watcher_delete_policy_accepts_missing_or_replaced_roots() {
+        for replace_with_file in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            fs::create_dir(&root).expect("initial root");
+            let deleted = root.join("old.md");
+            fs::write(&deleted, "previous source").expect("previous source");
+            fs::write(root.join(".ignore"), "private[9-0].md\n")
+                .expect("policy belonging to the moved root");
+            fs::rename(&root, temp.path().join("retired-root")).expect("move selected root");
+            if replace_with_file {
+                fs::write(&root, "replacement file").expect("replace root with file");
+            }
+            let prepared = super::prepare_event_batch(
+                &DiscoveryConfig::default(),
+                &[root],
+                &[WatchEvent::deleted(&deleted, 100)],
+            )
+            .expect("a vanished root does not turn row cleanup into a policy read");
+            assert!(matches!(
+                prepared.ops.as_slice(),
+                [WatchIngestOp::Delete { file_key, .. }]
+                    if file_key == &normalize_file_key(&deleted)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_delete_policy_does_not_enter_non_directory_root_symlink_targets() {
+        for target_exists in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            let target = temp.path().join("target-file");
+            if target_exists {
+                fs::write(&target, "replacement file").expect("symlink target file");
+            }
+            std::os::unix::fs::symlink(&target, &root).expect("replacement root symlink");
+            let deleted = root.join("old.md");
+            let prepared = super::prepare_event_batch(
+                &DiscoveryConfig {
+                    follow_symlinks: true,
+                    ..DiscoveryConfig::default()
+                },
+                &[root],
+                &[WatchEvent::deleted(&deleted, 100)],
+            )
+            .expect("broken or file symlink targets have no descendant policy");
+            assert!(matches!(
+                prepared.ops.as_slice(),
+                [WatchIngestOp::Delete { file_key, .. }]
+                    if file_key == &normalize_file_key(&deleted)
+            ));
+        }
+    }
+
+    #[test]
     fn watcher_ignore_policy_failure_keeps_queued_batch_for_retry() {
         for stopping in [false, true] {
             run_on_local_runtime_task(move |cx| async move {
@@ -7420,6 +7818,64 @@ mod tests {
         });
     }
 
+    #[test]
+    fn rename_notify_event_mutates_only_the_endpoints_inside_watched_roots() {
+        run_test_with_cx(|cx| async move {
+            for (from_inside, to_inside) in
+                [(true, false), (false, true), (false, false), (true, true)]
+            {
+                let temp = tempdir().expect("tempdir");
+                let root = temp.path().join("source");
+                let outside = temp.path().join("source-other");
+                fs::create_dir(&root).expect("selected source directory");
+                fs::create_dir(&outside).expect("unselected source directory");
+                let from = if from_inside { &root } else { &outside }.join("before.md");
+                let to = if to_inside { &root } else { &outside }.join("after.md");
+                fs::write(&from, "A document moving across a discovery boundary.\n")
+                    .expect("rename source");
+                fs::rename(&from, &to).expect("real cross-boundary rename");
+                let mapped = super::map_notify_event(
+                    Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                        .add_path(from.clone())
+                        .add_path(to.clone()),
+                );
+                assert_eq!(mapped.len(), 2);
+
+                let pipeline = Arc::new(RecordingPipeline::default());
+                let watcher =
+                    FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+                let outcome = watcher
+                    .process_events_now(&cx, &mapped)
+                    .await
+                    .expect("scope the native rename before ingest");
+                let expected = usize::from(from_inside) + usize::from(to_inside);
+                assert_eq!(outcome.accepted, expected);
+                assert_eq!(outcome.reindexed, expected);
+                assert_eq!(outcome.skipped, 2 - expected);
+                let ops = pipeline.all_ops();
+                let mut wanted = Vec::new();
+                if from_inside {
+                    wanted.push(WatchIngestOp::Delete {
+                        file_key: normalize_file_key(&from),
+                        revision: i64::try_from(mapped[0].observed_at_ms).unwrap(),
+                    });
+                }
+                if to_inside {
+                    wanted.push(WatchIngestOp::Upsert {
+                        file_key: normalize_file_key(&to),
+                        revision: i64::try_from(mapped[1].observed_at_ms).unwrap(),
+                        ingestion_class: crate::config::IngestionClass::FullSemanticLexical,
+                    });
+                }
+                assert_eq!(ops, wanted, "inside endpoints: {from_inside}/{to_inside}");
+                let (snapshot, completeness) = watcher.collect_snapshot().expect("current scope");
+                assert!(completeness.is_complete());
+                assert_eq!(snapshot.contains_key(&to), to_inside);
+                assert_eq!(snapshot.len(), usize::from(to_inside));
+            }
+        });
+    }
+
     /// The caller's `Cx` must reach the ingest sink itself.
     ///
     /// This is the regression guard for the defect this conversion fixes: the
@@ -7467,7 +7923,7 @@ mod tests {
                 WatchEvent::modified(temp.path().join("lib.rs"), now_millis(), Some(128));
             if let Some(op) = super::event_to_ingest_op(
                 &DiscoveryConfig::default(),
-                &[],
+                watcher.roots(),
                 &mut super::IgnoreRules::new().expect("load ignore policy"),
                 &lineage_event,
                 None,
@@ -12273,6 +12729,16 @@ mod tests {
 
         let hostile = collect_snapshot_from_roots(&roots, &discovery, &|| false);
 
+        // Event admission must also honor pruning before surfacing a denied
+        // descendant stat from its no-follow checks. The directory itself is
+        // stat-able; only probing the child crosses the permission boundary.
+        fs::write(root.join(".ignore"), "closed/\n").expect("prune unreadable subtree");
+        let ignored_event = super::prepare_event_batch(
+            &discovery,
+            &roots,
+            &[WatchEvent::modified(&hidden_file, 1_000, None)],
+        );
+
         // Restore before asserting so a failure cannot leave the temp tree
         // undeletable for the harness.
         fs::set_permissions(&closed_dir, original).expect("restore subtree permissions");
@@ -12283,6 +12749,9 @@ mod tests {
             "fixture precondition failed: mode 0o000 did not deny read_dir (running as root?), \
              so this test could not hide anything and proves nothing"
         );
+        let ignored_event = ignored_event.expect("ignored unreadable descendants are pruned");
+        assert_eq!(ignored_event.accepted, 0);
+        assert_eq!(ignored_event.skipped, 1);
         assert!(
             !short_completeness.is_complete(),
             "an unreadable directory must be reported as unresolved, not as an empty one"
