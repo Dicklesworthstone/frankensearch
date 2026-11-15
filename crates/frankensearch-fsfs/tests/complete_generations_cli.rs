@@ -1230,6 +1230,214 @@ fn complete_cli_binary_rejects_malformed_opt_in_before_writing() {
 
 #[cfg(feature = "semantic-support")]
 #[test]
+#[ignore = "requires verified models and a source-bound prior executable in FSFS_UPGRADE_REUSE_PRIOR_EXECUTABLE"]
+fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
+    fn executable_sha256(path: &Path) -> String {
+        use std::io::Read;
+
+        use sha2::{Digest, Sha256};
+
+        let mut file = fs::File::open(path).unwrap();
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        frankensearch_storage::ContentHasher::to_hex(&digest.finalize().into())
+    }
+
+    fn document_embedding_batches(output: &Output) -> usize {
+        std::str::from_utf8(&output.stderr)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("fsfs admitted indexing embedding batch"))
+            .inspect(|line| eprintln!("document embedding witness: {line}"))
+            .count()
+    }
+
+    fn search_ranks(fixture: &Fixture) -> Vec<(Value, Value, Value)> {
+        let output = execute(fixture.command("s", "json").args([
+            "find a relevant document",
+            "--fast-only",
+            "--no-daemon",
+            "--limit",
+            "10",
+        ]));
+        let result = json_output(&output, true);
+        let hits = result["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "{result}");
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit["path"].as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["alpha.md", "beta.md"])
+        );
+        hits.iter()
+            .map(|hit| {
+                assert!(hit["semantic_rank"].is_number(), "{result}");
+                assert!(hit["score"].is_number(), "{result}");
+                (
+                    hit["path"].clone(),
+                    hit["semantic_rank"].clone(),
+                    hit["score"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    let models = fs::canonicalize(
+        std::env::var_os("FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR")
+            .expect("provide verified real models"),
+    )
+    .unwrap();
+    let prior = fs::canonicalize(
+        std::env::var_os("FSFS_UPGRADE_REUSE_PRIOR_EXECUTABLE")
+            .expect("provide a genuine source-bound prior executable"),
+    )
+    .unwrap();
+    let current = PathBuf::from(env!("CARGO_BIN_EXE_fsfs"));
+    let prior_sha = executable_sha256(&prior);
+    assert_eq!(
+        prior_sha,
+        std::env::var("FSFS_UPGRADE_REUSE_PRIOR_SHA256")
+            .expect("provide the independently verified prior executable SHA-256")
+    );
+    let current_sha = executable_sha256(&current);
+    assert_ne!(prior_sha, current_sha, "the executables must differ");
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+    for (policy, drift, carried, embeds) in [
+        ("same-executable", "none", 0, true),
+        ("compatible-contract", "none", 2, false),
+        ("compatible-contract", "source", 1, true),
+        ("compatible-contract", "window", 0, true),
+    ] {
+        eprintln!(
+            "cross-executable case prior={prior_sha} current={current_sha} policy={policy} drift={drift}"
+        );
+        let mut fixture = Fixture::new();
+        fixture.write_config(Some(&models), "{index_dir}/catalog.sqlite");
+        fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
+        fixture.executable.clone_from(&prior);
+        let indexing = |fixture: &Fixture, policy: &str| {
+            execute(
+                fixture
+                    .command("index", "json")
+                    .env("FRANKENSEARCH_LOG", "frankensearch_fsfs::indexing=debug")
+                    .args(["--no-color", "--upgrade-reuse", policy]),
+            )
+        };
+        let first_output = indexing(&fixture, "same-executable");
+        let first = json_output(&first_output, true);
+        assert_eq!(first["data"]["generation_complete"], true);
+        assert_eq!(first["data"]["semantic_indexed_files"], 2);
+        let seed_batches = document_embedding_batches(&first_output);
+        assert!(
+            seed_batches > 0,
+            "the log control must observe document inference"
+        );
+        let before_ranks = search_ranks(&fixture);
+        let store = frankensearch_fsfs::generation_store::CompleteGenerationStore::open(
+            &cx,
+            &fixture.store,
+        )
+        .unwrap();
+        let pinned = store.active(&cx).unwrap().unwrap();
+        assert_eq!(
+            pinned.id(),
+            first["data"]["generation_id"].as_str().unwrap()
+        );
+        let before = generation_files(pinned.path());
+
+        if drift == "source" {
+            fs::write(
+                fixture.source.join("alpha.md"),
+                "sharedtoken alpha revised document",
+            )
+            .unwrap();
+        } else if drift == "window" {
+            let mut config: FsfsConfig =
+                toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+            let old_cap = config.indexing.fast_window_max_per_file;
+            config.indexing.fast_window_max_per_file = if old_cap == 1 { 2 } else { 1 };
+            assert_ne!(config.indexing.fast_window_max_per_file, old_cap);
+            let serialized = config.to_toml().unwrap();
+            let validated = frankensearch_fsfs::config::load_from_str(
+                Some(&serialized),
+                Some(&fixture.config),
+                &HashMap::new(),
+                &frankensearch_fsfs::config::CliOverrides::default(),
+                fixture.directory.path(),
+            )
+            .expect("the changed window contract must remain a valid config");
+            assert_eq!(
+                validated.config.indexing.fast_window_max_per_file,
+                config.indexing.fast_window_max_per_file
+            );
+            fs::write(&fixture.config, serialized).unwrap();
+        }
+
+        fixture.executable.clone_from(&current);
+        let second_output = indexing(&fixture, policy);
+        let second = json_output(&second_output, true);
+        assert_eq!(second["data"]["generation_complete"], true);
+        assert_eq!(second["data"]["semantic_indexed_files"], 2);
+        assert_eq!(
+            second["data"]["unchanged_files"], carried,
+            "{policy}/{drift}: {second}"
+        );
+        assert_ne!(
+            first["data"]["generation_id"],
+            second["data"]["generation_id"]
+        );
+        let batches = document_embedding_batches(&second_output);
+        assert_eq!(batches > 0, embeds, "{policy}/{drift}: {second}");
+        assert_eq!(generation_files(pinned.path()), before);
+        let after_ranks = search_ranks(&fixture);
+        if policy == "compatible-contract" && drift == "none" {
+            assert_eq!(after_ranks, before_ranks);
+            let after = generation_files(Path::new(
+                second["data"]["generation_path"].as_str().unwrap(),
+            ));
+            let index_artifacts = |files: BTreeMap<PathBuf, Vec<u8>>| {
+                files
+                    .into_iter()
+                    .filter(|(path, _)| {
+                        matches!(
+                            path.extension().and_then(|ext| ext.to_str()),
+                            Some("fsvi" | "fslx")
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let expected = index_artifacts(before);
+            assert!(
+                expected
+                    .keys()
+                    .any(|path| path.extension().unwrap() == "fsvi")
+            );
+            assert!(
+                expected
+                    .keys()
+                    .any(|path| path.extension().unwrap() == "fslx")
+            );
+            assert_eq!(index_artifacts(after), expected);
+        }
+        eprintln!(
+            "cross-executable reuse prior={prior_sha} current={current_sha} policy={policy} drift={drift} carried={carried} seed_document_batches={seed_batches} current_document_batches={batches}"
+        );
+    }
+}
+
+#[cfg(feature = "semantic-support")]
+#[test]
 #[ignore = "requires FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR with a verified Potion cache"]
 fn complete_cli_binary_semantic_rebuild_search_and_stream() {
     let models = PathBuf::from(
