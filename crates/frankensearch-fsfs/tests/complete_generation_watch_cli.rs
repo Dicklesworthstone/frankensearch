@@ -617,7 +617,7 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                     pending.push(entry.path());
                 } else if matches!(
                     entry.path().extension().and_then(|ext| ext.to_str()),
-                    Some("fsvi" | "fslx")
+                    Some("fsvi" | "fslx" | "wal")
                 ) {
                     result.insert(
                         entry.path().strip_prefix(root).unwrap().to_path_buf(),
@@ -633,38 +633,64 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                     .any(|path| path.extension().unwrap() == extension)
             );
         }
+        eprintln!(
+            "watch upgrade artifacts: {:?}",
+            result
+                .iter()
+                .map(|(path, bytes)| (path, bytes.len()))
+                .collect::<Vec<_>>()
+        );
         result
     }
 
-    fn ranks(fixture: &Fixture) -> Vec<(Value, Value, Value)> {
-        let output = Process::start(fixture.command("search", "json").args([
-            "find a relevant document",
-            "--fast-only",
-            "--no-daemon",
-            "--limit",
-            "10",
-        ]))
-        .finish(Duration::from_secs(60));
-        assert!(output.status.success(), "{output:?}");
-        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_search_hits(&result["data"], &["alpha.md", "beta.md"], "semantic_rank");
-        let hits = result["data"]["hits"].as_array().unwrap();
-        assert_eq!(
-            hits.iter()
-                .map(|hit| hit["path"].as_str().unwrap())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["alpha.md", "beta.md"])
-        );
-        hits.iter()
-            .map(|hit| {
-                assert!(hit["score"].is_number());
-                (
-                    hit["path"].clone(),
-                    hit["semantic_rank"].clone(),
-                    hit["score"].clone(),
-                )
-            })
-            .collect()
+    fn ranks(fixture: &Fixture) -> BTreeMap<&'static str, Vec<Value>> {
+        let mut result = BTreeMap::new();
+        let mut fast_producer = Value::Null;
+        for mode in ["--fast-only", "--quality-only"] {
+            if mode == "--quality-only" && !fixture.quality {
+                continue;
+            }
+            let output = Process::start(fixture.command("search", "json").args([
+                "find a relevant document",
+                mode,
+                "--no-daemon",
+                "--limit",
+                "10",
+            ]))
+            .finish(Duration::from_secs(60));
+            assert!(output.status.success(), "{mode}: {output:?}");
+            let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let payload = &response["data"];
+            assert_search_hits(payload, &["alpha.md", "beta.md"], "semantic_rank");
+            assert!(payload["vector_generation_id"].is_string());
+            if mode == "--fast-only" {
+                fast_producer = payload["vector_generation_id"].clone();
+            } else {
+                assert_eq!(payload["skip_reason"], "quality_only");
+                assert_ne!(payload["vector_generation_id"], fast_producer);
+            }
+            let hits = payload["hits"].as_array().unwrap();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit["path"].as_str().unwrap())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["alpha.md", "beta.md"])
+            );
+            result.insert(
+                mode,
+                hits.iter()
+                    .map(|hit| {
+                        assert!(hit["score"].is_number());
+                        serde_json::json!([hit["path"], hit["semantic_rank"], hit["score"]])
+                    })
+                    .collect(),
+            );
+            eprintln!(
+                "watch upgrade ranking mode={mode} producer={} hits={hits:?}",
+                payload["vector_generation_id"]
+            );
+        }
+        result
     }
 
     fn document_batches(output: &Output) -> usize {
@@ -725,12 +751,12 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
     let current_sha = executable_sha256(&current);
     assert_ne!(prior_sha, current_sha);
 
-    for legacy_seed in [false, true] {
+    for (quality, legacy_seed) in [(false, false), (false, true), (true, false), (true, true)] {
         for policy in ["same-executable", "compatible-contract"] {
             eprintln!(
-                "watch upgrade prior={prior_sha} current={current_sha} legacy_seed={legacy_seed} policy={policy}"
+                "watch upgrade prior={prior_sha} current={current_sha} quality={quality} legacy_seed={legacy_seed} policy={policy}"
             );
-            let mut fixture = Fixture::new(Some(&models), false);
+            let mut fixture = Fixture::new(Some(&models), quality);
             fixture.executable.clone_from(&prior);
             let predecessor = if legacy_seed {
                 fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
@@ -769,6 +795,9 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 .map_or(fixture.store.as_path(), PublishedGeneration::path)
                 .to_path_buf();
             let old_artifacts = artifacts(&old_root);
+            if quality {
+                assert!(old_artifacts.contains_key(Path::new("vector/quality.fsvi")));
+            }
             let old_evidence_path = old_root.join(if legacy_seed {
                 "FSFS-LEGACY-REUSE.json"
             } else {
@@ -797,7 +826,24 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 assert_carried(&output, if warm { 2 } else { 0 });
                 let batches = document_batches(&output);
                 assert_eq!(batches == 0, warm);
+                if !warm {
+                    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+                    let models = stderr
+                        .lines()
+                        .filter(|line| line.contains("fsfs admitted indexing embedding batch"))
+                        .flat_map(str::split_ascii_whitespace)
+                        .filter_map(|field| field.strip_prefix("model="))
+                        .collect::<BTreeSet<_>>();
+                    let mut expected = BTreeSet::from(["\"potion-multilingual-128M\""]);
+                    if quality {
+                        expected.insert("\"all-minilm-l6-v2\"");
+                    }
+                    assert_eq!(models, expected, "cold document embedding tiers: {stderr}");
+                }
                 let actual_artifacts = artifacts(selected.path());
+                if quality {
+                    assert!(actual_artifacts.contains_key(Path::new("vector/quality.fsvi")));
+                }
                 if warm {
                     assert_eq!(actual_artifacts, expected_artifacts);
                     assert_eq!(actual_ranks, expected_ranks);
@@ -816,7 +862,7 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 let manifest = fs::read(selected.path().join("FSFS-BUNDLE.json")).unwrap();
                 readers.push((selected, manifest));
                 eprintln!(
-                    "watch upgrade result legacy_seed={legacy_seed} policy={policy} restart={restart} carried={} document_batches={batches}",
+                    "watch upgrade result quality={quality} legacy_seed={legacy_seed} policy={policy} restart={restart} carried={} document_batches={batches}",
                     if warm { 2 } else { 0 }
                 );
             }
