@@ -3022,7 +3022,7 @@ mod retained_recovery_tests {
                 match failure {
                     "missing" => assert!(matches!(error, SearchError::EmbedderUnavailable { .. })),
                     "changed" => {
-                        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }))
+                        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
                     }
                     "inference" => assert!(matches!(error, SearchError::EmbeddingFailed { .. })),
                     _ => assert!(matches!(error, SearchError::Cancelled { .. })),

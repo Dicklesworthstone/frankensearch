@@ -608,7 +608,7 @@ fn primary_sharded_reranking_reopens_all_partitions_and_keeps_selected_tier_prov
                             other.queries.load(Ordering::SeqCst),
                         );
                         let page = query::buffered(
-                            &index,
+                            index.as_ref(),
                             &cx,
                             "needle -private",
                             mode,
@@ -624,14 +624,15 @@ fn primary_sharded_reranking_reopens_all_partitions_and_keeps_selected_tier_prov
                         assert_eq!(selected_model.queries.load(Ordering::SeqCst), before.0 + 1);
                         assert_eq!(other.queries.load(Ordering::SeqCst), before.1);
                         assert_rows(&index, &page);
-                        let (row, score, absent_row, absent_score) = if mode == Mode::Quality {
+                        let (row, score_field, absent_row, absent_score) = if mode == Mode::Quality
+                        {
                             ("quality_row", "quality_score", "fast_row", "fast_score")
                         } else {
                             ("fast_row", "fast_score", "quality_row", "quality_score")
                         };
                         let hit = &page["results"][0];
                         assert!(hit[row].is_object());
-                        assert!(hit[score].is_number());
+                        assert!(hit[score_field].is_number());
                         assert!(hit[absent_row].is_null());
                         assert!(hit[absent_score].is_null());
                         for document in scorer.seen.lock().unwrap().iter() {
@@ -648,7 +649,7 @@ fn primary_sharded_reranking_reopens_all_partitions_and_keeps_selected_tier_prov
                     let mut output = Vec::new();
                     assert!(
                         serve::stream_one(
-                            &index,
+                            index.as_ref(),
                             &cx,
                             &request,
                             1,
@@ -685,7 +686,7 @@ fn primary_sharded_reranking_reopens_all_partitions_and_keeps_selected_tier_prov
                     let mut output = Vec::new();
                     assert!(
                         !serve::stream_one(
-                            &index,
+                            index.as_ref(),
                             &cx,
                             &request,
                             2,
@@ -705,7 +706,7 @@ fn primary_sharded_reranking_reopens_all_partitions_and_keeps_selected_tier_prov
                     scorer.fail.store(true, Ordering::SeqCst);
                     assert!(
                         query::buffered(
-                            &index,
+                            index.as_ref(),
                             &cx,
                             "needle",
                             mode,
@@ -725,10 +726,17 @@ fn primary_sharded_reranking_reopens_all_partitions_and_keeps_selected_tier_prov
                         ("needle", 1, Some(&empty)),
                         ("-private", 3, None),
                     ] {
-                        let page =
-                            query::buffered(&index, &cx, text, mode, limit, [scope, None], &policy)
-                                .await
-                                .unwrap();
+                        let page = query::buffered(
+                            index.as_ref(),
+                            &cx,
+                            text,
+                            mode,
+                            limit,
+                            [scope, None],
+                            &policy,
+                        )
+                        .await
+                        .unwrap();
                         assert_eq!(page["rerank_applied"], false);
                     }
                     assert_eq!(selected_model.queries.load(Ordering::SeqCst), before.0);

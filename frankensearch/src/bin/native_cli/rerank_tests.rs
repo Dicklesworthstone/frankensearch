@@ -196,7 +196,7 @@ fn primary_reranking_retains_persisted_tier_rows_scope_and_strict_noop_admission
                     assert_eq!(selected.inner.calls.load(Ordering::SeqCst), before.0 + 1);
                     assert_eq!(other.inner.calls.load(Ordering::SeqCst), before.1);
                     let hit = &page["results"][0];
-                    let (tier, score, absent) = if mode == Mode::Quality {
+                    let (tier, score_field, absent) = if mode == Mode::Quality {
                         (
                             index.vectors().quality().unwrap(),
                             "quality_score",
@@ -205,7 +205,7 @@ fn primary_reranking_retains_persisted_tier_rows_scope_and_strict_noop_admission
                     } else {
                         (index.vectors().fast(), "fast_score", "quality_score")
                     };
-                    assert!(hit[score].is_number());
+                    assert!(hit[score_field].is_number());
                     assert!(hit[absent].is_null());
                     let owner = ValidatedFsviBytes::from_arc(
                         fs::read(tier.vector_path()).unwrap().into(),
