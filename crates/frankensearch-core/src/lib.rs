@@ -191,7 +191,10 @@ pub use shadow::{
     append_shadow_degradation, compute_shadow_corpus_hash,
 };
 pub use simd::scale_f32_in_place;
-pub use time_travel::{GenerationHistory, RetainedGeneration, RetentionPolicy, TimeTravelResult};
+pub use time_travel::{
+    GenerationHistory, RetainedGeneration, RetentionPolicy, TimeTravelError, TimeTravelGeneration,
+    TimeTravelResult,
+};
 
 pub use asupersync::Cx;
 pub use query_class::QueryClass;

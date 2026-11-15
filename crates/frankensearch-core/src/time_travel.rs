@@ -2,12 +2,15 @@
 //!
 //! Allows querying historical search generations by commit sequence number.
 //! Each retained generation covers a contiguous commit range; the
-//! [`GenerationHistory`] resolves an `as_of_commit_seq` to the appropriate
-//! generation snapshot, ensuring stable per-request reads.
+//! [`GenerationHistory`] resolves an `as_of_commit_seq` only when exactly one
+//! retained snapshot covers it. Overlapping rebuilds and rollback activations
+//! require an explicit manifest or activation selection, never insertion order.
 //!
-//! Integrates with [`GenerationController`](crate::activation::GenerationController):
-//! when a new generation is activated, the previous one is retained in history
-//! (subject to the configured [`RetentionPolicy`]).
+//! Callers can retain snapshots from
+//! [`GenerationController`](crate::activation::GenerationController), subject to
+//! the configured [`RetentionPolicy`]. This in-process registry neither changes
+//! durable authority nor authenticates or deletes artifact files. Retaining an
+//! `Arc` alone is not a cross-process retention root.
 
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -15,6 +18,63 @@ use std::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::activation::ActiveGeneration;
+
+/// Identity and coverage of one retained activation.
+///
+/// The manifest hash distinguishes rebuilds with the same generation name or
+/// source range. The activation sequence additionally distinguishes rollback
+/// activations of the same manifest. This is an in-process history selector,
+/// not proof that the referenced artifact files remain present or unmodified.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TimeTravelGeneration {
+    /// The generation identifier recorded in the manifest.
+    pub generation_id: String,
+    /// The canonical manifest hash recorded by activation admission.
+    pub manifest_hash: String,
+    /// The sequence of the retained activation.
+    pub activation_seq: u64,
+    /// Inclusive lower source commit bound.
+    pub commit_low: u64,
+    /// Inclusive upper source commit bound.
+    pub commit_high: u64,
+}
+
+impl TimeTravelGeneration {
+    fn from_generation(generation: &ActiveGeneration) -> Self {
+        Self {
+            generation_id: generation.manifest.generation_id.clone(),
+            manifest_hash: generation.manifest.manifest_hash.to_ascii_lowercase(),
+            activation_seq: generation.activation_seq,
+            commit_low: generation.manifest.commit_range.low,
+            commit_high: generation.manifest.commit_range.high,
+        }
+    }
+
+    fn matches(&self, generation: &ActiveGeneration) -> bool {
+        self.generation_id == generation.manifest.generation_id
+            && self
+                .manifest_hash
+                .eq_ignore_ascii_case(&generation.manifest.manifest_hash)
+            && self.activation_seq == generation.activation_seq
+            && self.commit_low == generation.manifest.commit_range.low
+            && self.commit_high == generation.manifest.commit_range.high
+    }
+}
+
+/// A historical query must choose between multiple retained snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum TimeTravelError {
+    /// More than one retained snapshot matches the request and its selector.
+    #[error(
+        "commit sequence {requested_seq} matches multiple retained generations; select an exact retained generation"
+    )]
+    Ambiguous {
+        /// The requested commit sequence.
+        requested_seq: u64,
+        /// Matching activations in deterministic identity order.
+        candidates: Vec<TimeTravelGeneration>,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // Retention policy
@@ -65,10 +125,21 @@ pub enum TimeTravelResult {
     Found {
         /// The generation identifier.
         generation_id: String,
+        /// The canonical manifest hash, usable for explicit selection.
+        manifest_hash: String,
+        /// The retained activation sequence.
+        activation_seq: u64,
         /// Commit range covered.
         commit_low: u64,
         /// Commit range high bound.
         commit_high: u64,
+    },
+    /// More than one retained snapshot covers the requested commit sequence.
+    Ambiguous {
+        /// The requested commit sequence.
+        requested_seq: u64,
+        /// Matching activations in deterministic identity order.
+        candidates: Vec<TimeTravelGeneration>,
     },
     /// No retained generation covers the requested commit sequence.
     NotFound {
@@ -112,12 +183,23 @@ impl GenerationHistory {
     /// Add a generation to the retention history.
     ///
     /// Inserts in commit-range order (by `commit_range.high`) and prunes
-    /// excess generations per the retention policy.
+    /// excess generations per the retention policy. Re-retaining the same
+    /// `Arc` is idempotent and does not renew its original retention age.
     pub fn retain(&self, generation: Arc<ActiveGeneration>, now_millis: u64) {
         let mut retained = self
             .retained
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Re-retaining the same owner does not create a second possible
+        // answer, consume another retention slot, or renew its age lease.
+        if retained
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.generation, &generation))
+        {
+            self.prune_locked(&mut retained, now_millis);
+            return;
+        }
 
         let entry = RetainedGeneration {
             generation,
@@ -138,22 +220,74 @@ impl GenerationHistory {
 
     /// Resolve the generation that covers `as_of_commit_seq`.
     ///
-    /// Returns the retained generation whose commit range includes the
-    /// requested sequence number (`low <= as_of_commit_seq <= high`).
-    #[must_use]
-    pub fn resolve(&self, as_of_commit_seq: u64) -> Option<Arc<ActiveGeneration>> {
+    /// Returns the unique retained generation whose inclusive commit range
+    /// contains the requested sequence, or `Ok(None)` when none is retained.
+    /// The returned `Arc` stays valid when this history is pruned or cleared.
+    ///
+    /// # Errors
+    /// Returns [`TimeTravelError::Ambiguous`] for overlapping snapshots. Use
+    /// [`Self::resolve_manifest`] or [`Self::resolve_generation`] to select one.
+    pub fn resolve(
+        &self,
+        as_of_commit_seq: u64,
+    ) -> Result<Option<Arc<ActiveGeneration>>, TimeTravelError> {
         let retained = self
             .retained
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        retained
-            .iter()
-            .find(|r| {
-                let range = &r.generation.manifest.commit_range;
-                range.low <= as_of_commit_seq && as_of_commit_seq <= range.high
-            })
-            .map(|r| Arc::clone(&r.generation))
+        Self::resolve_matching(&retained, as_of_commit_seq, |_| true)
+    }
+
+    /// Resolve an explicit manifest within the requested commit range.
+    ///
+    /// This matches the hash recorded in the admitted manifest; it does not
+    /// reauthenticate files on disk. Comparison accepts either hexadecimal case.
+    /// An absent hash or a
+    /// manifest that does not cover the sequence returns `Ok(None)`; selection
+    /// never falls back to another retained manifest.
+    ///
+    /// # Errors
+    /// Returns ambiguity when multiple activations of this manifest cover the
+    /// sequence. Select their exact identity with [`Self::resolve_generation`].
+    pub fn resolve_manifest(
+        &self,
+        as_of_commit_seq: u64,
+        manifest_hash: &str,
+    ) -> Result<Option<Arc<ActiveGeneration>>, TimeTravelError> {
+        let retained = self
+            .retained
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::resolve_matching(&retained, as_of_commit_seq, |generation| {
+            generation
+                .manifest
+                .manifest_hash
+                .eq_ignore_ascii_case(manifest_hash)
+        })
+    }
+
+    /// Resolve the exact retained identity reported in an ambiguity result.
+    ///
+    /// All identity fields and the requested inclusive commit range must match.
+    /// Missing or pruned selections return `Ok(None)`, without following a later
+    /// activation or another snapshot that reused the generation name.
+    ///
+    /// # Errors
+    /// Returns ambiguity if distinct retained owners advertise the same exact
+    /// identity. The caller must repair the history rather than choose by order.
+    pub fn resolve_generation(
+        &self,
+        as_of_commit_seq: u64,
+        selected: &TimeTravelGeneration,
+    ) -> Result<Option<Arc<ActiveGeneration>>, TimeTravelError> {
+        let retained = self
+            .retained
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::resolve_matching(&retained, as_of_commit_seq, |generation| {
+            selected.matches(generation)
+        })
     }
 
     /// Resolve with detailed result information.
@@ -164,16 +298,27 @@ impl GenerationHistory {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Look for exact match.
-        for r in retained.iter() {
-            let range = &r.generation.manifest.commit_range;
-            if range.low <= as_of_commit_seq && as_of_commit_seq <= range.high {
+        match Self::resolve_matching(&retained, as_of_commit_seq, |_| true) {
+            Ok(Some(generation)) => {
+                let range = &generation.manifest.commit_range;
                 return TimeTravelResult::Found {
-                    generation_id: r.generation.manifest.generation_id.clone(),
+                    generation_id: generation.manifest.generation_id.clone(),
+                    manifest_hash: generation.manifest.manifest_hash.to_ascii_lowercase(),
+                    activation_seq: generation.activation_seq,
                     commit_low: range.low,
                     commit_high: range.high,
                 };
             }
+            Err(TimeTravelError::Ambiguous {
+                requested_seq,
+                candidates,
+            }) => {
+                return TimeTravelResult::Ambiguous {
+                    requested_seq,
+                    candidates,
+                };
+            }
+            Ok(None) => {}
         }
 
         // Find closest range for the error message.
@@ -183,7 +328,7 @@ impl GenerationHistory {
                 let range = &r.generation.manifest.commit_range;
                 let below = as_of_commit_seq.saturating_sub(range.high);
                 let above = range.low.saturating_sub(as_of_commit_seq);
-                below.max(above)
+                (below.max(above), range.low, range.high)
             })
             .map(|r| {
                 let range = &r.generation.manifest.commit_range;
@@ -249,6 +394,35 @@ impl GenerationHistory {
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
+
+    fn resolve_matching(
+        retained: &[RetainedGeneration],
+        as_of_commit_seq: u64,
+        selected: impl Fn(&ActiveGeneration) -> bool,
+    ) -> Result<Option<Arc<ActiveGeneration>>, TimeTravelError> {
+        let mut matches = retained.iter().filter(|entry| {
+            let generation = &entry.generation;
+            let range = &generation.manifest.commit_range;
+            range.low <= as_of_commit_seq && as_of_commit_seq <= range.high && selected(generation)
+        });
+        let Some(first) = matches.next() else {
+            return Ok(None);
+        };
+        let Some(second) = matches.next() else {
+            return Ok(Some(Arc::clone(&first.generation)));
+        };
+        let mut candidates = vec![
+            TimeTravelGeneration::from_generation(&first.generation),
+            TimeTravelGeneration::from_generation(&second.generation),
+        ];
+        candidates
+            .extend(matches.map(|entry| TimeTravelGeneration::from_generation(&entry.generation)));
+        candidates.sort_unstable();
+        Err(TimeTravelError::Ambiguous {
+            requested_seq: as_of_commit_seq,
+            candidates,
+        })
+    }
 
     /// Prune retained generations per policy (must hold write lock).
     fn prune_locked(&self, retained: &mut Vec<RetainedGeneration>, now_millis: u64) {
@@ -319,7 +493,7 @@ mod tests {
     fn empty_history() {
         let history = GenerationHistory::default();
         assert_eq!(history.retained_count(), 0);
-        assert!(history.resolve(50).is_none());
+        assert!(history.resolve(50).unwrap().is_none());
     }
 
     #[test]
@@ -331,16 +505,16 @@ mod tests {
         assert_eq!(history.retained_count(), 1);
 
         // Within range.
-        let resolved = history.resolve(50).unwrap();
+        let resolved = history.resolve(50).unwrap().unwrap();
         assert_eq!(resolved.manifest.generation_id, "gen-1");
 
         // At boundaries.
-        assert!(history.resolve(1).is_some());
-        assert!(history.resolve(100).is_some());
+        assert!(history.resolve(1).unwrap().is_some());
+        assert!(history.resolve(100).unwrap().is_some());
 
         // Outside range.
-        assert!(history.resolve(0).is_none());
-        assert!(history.resolve(101).is_none());
+        assert!(history.resolve(0).unwrap().is_none());
+        assert!(history.resolve(101).unwrap().is_none());
     }
 
     #[test]
@@ -353,17 +527,17 @@ mod tests {
 
         assert_eq!(history.retained_count(), 3);
 
-        let r1 = history.resolve(50).unwrap();
+        let r1 = history.resolve(50).unwrap().unwrap();
         assert_eq!(r1.manifest.generation_id, "gen-1");
 
-        let r2 = history.resolve(150).unwrap();
+        let r2 = history.resolve(150).unwrap().unwrap();
         assert_eq!(r2.manifest.generation_id, "gen-2");
 
-        let r3 = history.resolve(250).unwrap();
+        let r3 = history.resolve(250).unwrap().unwrap();
         assert_eq!(r3.manifest.generation_id, "gen-3");
 
         // Gap — no generation covers seq 0.
-        assert!(history.resolve(0).is_none());
+        assert!(history.resolve(0).unwrap().is_none());
     }
 
     #[test]
@@ -378,6 +552,7 @@ mod tests {
                 generation_id,
                 commit_low: 1,
                 commit_high: 100,
+                ..
             } if generation_id == "gen-1"
         ));
     }
@@ -428,9 +603,9 @@ mod tests {
 
         // Should keep only the 2 most recent.
         assert_eq!(history.retained_count(), 2);
-        assert!(history.resolve(50).is_none()); // gen-1 pruned
-        assert!(history.resolve(150).is_some()); // gen-2 kept
-        assert!(history.resolve(250).is_some()); // gen-3 kept
+        assert!(history.resolve(50).unwrap().is_none()); // gen-1 pruned
+        assert!(history.resolve(150).unwrap().is_some()); // gen-2 kept
+        assert!(history.resolve(250).unwrap().is_some()); // gen-3 kept
     }
 
     #[test]
@@ -448,9 +623,9 @@ mod tests {
         history.retain(make_generation("gen-3", 201, 300), 7000);
 
         // gen-1 should be pruned by age.
-        assert!(history.resolve(50).is_none());
-        assert!(history.resolve(150).is_some());
-        assert!(history.resolve(250).is_some());
+        assert!(history.resolve(50).unwrap().is_none());
+        assert!(history.resolve(150).unwrap().is_some());
+        assert!(history.resolve(250).unwrap().is_some());
     }
 
     #[test]
@@ -534,8 +709,17 @@ mod tests {
         let results = vec![
             TimeTravelResult::Found {
                 generation_id: "gen-1".into(),
+                manifest_hash: "a".repeat(64),
+                activation_seq: 1,
                 commit_low: 1,
                 commit_high: 100,
+            },
+            TimeTravelResult::Ambiguous {
+                requested_seq: 100,
+                candidates: vec![
+                    TimeTravelGeneration::from_generation(&make_generation("gen-1", 1, 100)),
+                    TimeTravelGeneration::from_generation(&make_generation("gen-2", 100, 200)),
+                ],
             },
             TimeTravelResult::NotFound {
                 requested_seq: 150,
@@ -557,16 +741,45 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_ranges_resolve_first_match() {
+    fn overlapping_ranges_require_explicit_selection() {
         let history = GenerationHistory::default();
+        let first = make_generation("gen-1", 1, 150);
+        let second = make_generation("gen-2", 100, 200);
+        history.retain(Arc::clone(&first), 1000);
+        history.retain(Arc::clone(&second), 2000);
 
-        // Two generations with overlapping ranges.
-        history.retain(make_generation("gen-1", 1, 150), 1000);
-        history.retain(make_generation("gen-2", 100, 200), 2000);
-
-        // Seq 120 is covered by both — should return first match (gen-1).
-        let resolved = history.resolve(120).unwrap();
-        assert_eq!(resolved.manifest.generation_id, "gen-1");
+        let expected = vec![
+            TimeTravelGeneration::from_generation(&first),
+            TimeTravelGeneration::from_generation(&second),
+        ];
+        for seq in [100, 120, 150] {
+            assert_eq!(
+                history.resolve(seq).unwrap_err(),
+                TimeTravelError::Ambiguous {
+                    requested_seq: seq,
+                    candidates: expected.clone(),
+                }
+            );
+            assert_eq!(
+                history.resolve_detailed(seq),
+                TimeTravelResult::Ambiguous {
+                    requested_seq: seq,
+                    candidates: expected.clone(),
+                }
+            );
+            for generation in [&first, &second] {
+                let selected = history
+                    .resolve_manifest(seq, &generation.manifest.manifest_hash)
+                    .unwrap()
+                    .unwrap();
+                assert!(Arc::ptr_eq(&selected, generation));
+            }
+        }
+        assert!(Arc::ptr_eq(&history.resolve(99).unwrap().unwrap(), &first));
+        assert!(Arc::ptr_eq(
+            &history.resolve(151).unwrap().unwrap(),
+            &second
+        ));
     }
 
     #[test]
@@ -692,6 +905,8 @@ mod tests {
     fn time_travel_result_debug_format() {
         let found = TimeTravelResult::Found {
             generation_id: "g1".into(),
+            manifest_hash: "a".repeat(64),
+            activation_seq: 1,
             commit_low: 1,
             commit_high: 10,
         };
@@ -711,19 +926,153 @@ mod tests {
     }
 
     #[test]
-    fn retain_same_high_bound_inserts_both() {
+    fn equal_high_bounds_are_ambiguous_in_either_insertion_order() {
+        let first = make_generation("gen-a", 1, 100);
+        let second = make_generation("gen-b", 50, 100);
+        let mut outcomes = Vec::new();
+        for generations in [[&first, &second], [&second, &first]] {
+            let history = GenerationHistory::default();
+            for generation in generations {
+                history.retain(Arc::clone(generation), 1000);
+            }
+            assert_eq!(history.retained_count(), 2);
+            outcomes.push(history.resolve(75).unwrap_err());
+            assert!(matches!(
+                history.resolve_detailed(100),
+                TimeTravelResult::Ambiguous { .. }
+            ));
+            assert!(Arc::ptr_eq(&history.resolve(49).unwrap().unwrap(), &first));
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    #[test]
+    fn manifest_selection_distinguishes_rebuilt_generation_names_without_fallback() {
         let history = GenerationHistory::default();
+        let first = make_generation("reused-name", 1, 100);
+        let mut rebuilt = first.as_ref().clone();
+        rebuilt
+            .manifest
+            .metadata
+            .insert("build".into(), "replacement".into());
+        rebuilt.manifest.manifest_hash = compute_manifest_hash(&rebuilt.manifest).unwrap();
+        let rebuilt = Arc::new(rebuilt);
+        history.retain(Arc::clone(&first), 1000);
+        history.retain(Arc::clone(&rebuilt), 1000);
 
-        // Two generations sharing the same commit_range.high.
-        history.retain(make_generation("gen-a", 1, 100), 1000);
-        history.retain(make_generation("gen-b", 50, 100), 2000);
+        assert!(matches!(
+            history.resolve(50),
+            Err(TimeTravelError::Ambiguous { .. })
+        ));
+        for generation in [&first, &rebuilt] {
+            let selected = history
+                .resolve_manifest(50, &generation.manifest.manifest_hash.to_ascii_uppercase())
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&selected, generation));
+            assert!(
+                history
+                    .resolve_manifest(101, &generation.manifest.manifest_hash)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            history
+                .resolve_manifest(50, &"0".repeat(64))
+                .unwrap()
+                .is_none()
+        );
+    }
 
-        assert_eq!(history.retained_count(), 2);
+    #[test]
+    fn repeated_manifest_activation_requires_the_exact_activation() {
+        let history = GenerationHistory::default();
+        let original = make_generation("gen-1", 1, 100);
+        let mut rollback = original.as_ref().clone();
+        rollback.activation_seq = original.activation_seq + 2;
+        rollback.activated_at += 2000;
+        let rollback = Arc::new(rollback);
+        history.retain(Arc::clone(&original), 1000);
+        history.retain(Arc::clone(&rollback), 3000);
 
-        // Both in history; binary_search inserts gen-b before gen-a (same key),
-        // so resolve (iterating from start) finds gen-b first for the overlap.
-        let resolved = history.resolve(75).unwrap();
-        assert_eq!(resolved.manifest.generation_id, "gen-b");
+        let error = history
+            .resolve_manifest(50, &original.manifest.manifest_hash)
+            .unwrap_err();
+        let TimeTravelError::Ambiguous { candidates, .. } = &error;
+        assert_eq!(candidates.len(), 2);
+        for (candidate, expected) in candidates.iter().zip([&original, &rollback]) {
+            let resolved = history.resolve_generation(50, candidate).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&resolved, expected));
+            let mut stale = candidate.clone();
+            stale.activation_seq += 100;
+            assert!(history.resolve_generation(50, &stale).unwrap().is_none());
+            assert!(history.resolve_generation(0, candidate).unwrap().is_none());
+        }
+        let json = serde_json::to_string(&error).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TimeTravelError>(&json).unwrap(),
+            error
+        );
+    }
+
+    #[test]
+    fn distinct_owners_with_duplicate_identity_are_never_chosen_by_order() {
+        let history = GenerationHistory::default();
+        let original = make_generation("gen-1", 1, 100);
+        let mut conflicting = original.as_ref().clone();
+        conflicting
+            .vector_paths
+            .insert("fast".into(), "/different-owner".into());
+        history.retain(Arc::clone(&original), 1000);
+        history.retain(Arc::new(conflicting), 1000);
+        let selected = TimeTravelGeneration::from_generation(&original);
+        assert!(matches!(
+            history.resolve_generation(50, &selected),
+            Err(TimeTravelError::Ambiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn retaining_the_same_owner_does_not_duplicate_or_renew_its_lease() {
+        let history = GenerationHistory::new(RetentionPolicy {
+            max_retained: 2,
+            max_age_ms: 1000,
+        });
+        let first = make_generation("gen-1", 1, 100);
+        history.retain(Arc::clone(&first), 1000);
+        history.retain(Arc::clone(&first), 1500);
+        assert_eq!(history.retained_count(), 1);
+        let pinned = history.resolve(50).unwrap().unwrap();
+        assert_eq!(history.prune(2001), 1);
+        assert!(history.resolve(50).unwrap().is_none());
+        assert_eq!(pinned.manifest.generation_id, "gen-1");
+        assert!(Arc::ptr_eq(&pinned, &first));
+    }
+
+    #[test]
+    fn concurrent_retention_reports_every_matching_owner_and_pinned_read_survives_clear() {
+        let history = GenerationHistory::default();
+        let original = make_generation("gen-original", 1, 100);
+        history.retain(Arc::clone(&original), 1000);
+        let pinned = history.resolve(50).unwrap().unwrap();
+        std::thread::scope(|scope| {
+            for id in ["gen-a", "gen-b", "gen-c"] {
+                let history = &history;
+                scope.spawn(move || history.retain(make_generation(id, 1, 100), 1000));
+            }
+        });
+        let TimeTravelError::Ambiguous { candidates, .. } = history.resolve(50).unwrap_err();
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
+        history.clear();
+        assert!(
+            history
+                .resolve_generation(50, &TimeTravelGeneration::from_generation(&pinned))
+                .unwrap()
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(&pinned, &original));
     }
 
     #[test]
