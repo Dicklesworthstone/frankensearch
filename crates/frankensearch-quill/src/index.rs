@@ -13589,6 +13589,37 @@ impl QuillSearchIndex {
         self.reader.search_doc_ids(cx, query, limit)
     }
 
+    /// Check whether selected document identities are live in one pinned publication.
+    ///
+    /// Results follow the input order, including repeated identities. Membership
+    /// is independent of stored content or metadata, and performs no scoring or
+    /// stored-field hydration. A concurrent refresh cannot mix generations
+    /// within this batch; consumers combining it with other reads must retain
+    /// an immutable reader across those calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, publication-state, dictionary or allocation
+    /// failures. No partial membership batch is returned on error.
+    pub fn contains_documents(
+        &self,
+        cx: &Cx,
+        document_ids: &[&str],
+    ) -> Result<Vec<bool>, QuillIndexError> {
+        check_cancel(cx, "selected document membership")?;
+        let snapshot = self.reader.checked_published_snapshot()?;
+        let mut membership = Vec::new();
+        membership
+            .try_reserve(document_ids.len())
+            .map_err(|_| invalid_state("could not reserve selected membership batch"))?;
+        for document_id in document_ids {
+            check_cancel(cx, "selected document membership")?;
+            membership.push(snapshot.resolve_document_id(document_id)?.is_some());
+        }
+        check_cancel(cx, "selected document membership")?;
+        Ok(membership)
+    }
+
     /// Hydrate only the chosen document identities from one pinned publication.
     ///
     /// Results follow the input order, including repeated identities. Missing
@@ -35770,6 +35801,71 @@ mod tests {
                     ),
                     other => panic!("unexpected document id {other}"), // ubs:ignore -- Wrong identity must fail this hydration test.
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn selected_membership_preserves_live_ids_order_and_reader_generation() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("membership directory");
+            let config = deterministic_config();
+            let writer = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("membership writer");
+            writer
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("bare", "alpha"),
+                        IndexableDocument::new("deleted", "beta"),
+                    ],
+                )
+                .await
+                .expect("index membership fixtures");
+            writer.commit(&cx).await.expect("publish first membership");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("admit first membership");
+            let ids = ["missing", "bare", "deleted", "bare", "later", "BARE", ""];
+            let before = vec![false, true, true, true, false, false, false];
+            assert_eq!(reader.contains_documents(&cx, &ids).unwrap(), before);
+            assert!(reader.contains_documents(&cx, &[]).unwrap().is_empty());
+            assert!(
+                reader.metadata_for_documents(&cx, &["bare"]).unwrap()[0].is_none(),
+                "a live document with no metadata must still pass membership",
+            );
+
+            assert!(writer.delete_document(&cx, "deleted").await.unwrap());
+            writer
+                .index_documents(&cx, &[IndexableDocument::new("later", "gamma")])
+                .await
+                .expect("index successor membership");
+            writer
+                .commit(&cx)
+                .await
+                .expect("publish successor membership");
+            assert_eq!(
+                reader.contains_documents(&cx, &ids).unwrap(),
+                before,
+                "a retained reader keeps its admitted membership until refresh",
+            );
+            assert!(reader.refresh(&cx).await.unwrap());
+            assert_eq!(
+                reader.contains_documents(&cx, &ids).unwrap(),
+                vec![false, true, false, true, true, false, false],
+                "refresh must observe both deletion and addition",
+            );
+            assert!(!reader.refresh(&cx).await.unwrap());
+
+            cx.set_cancel_requested(true);
+            for ids in [&ids[..], &[][..]] {
+                assert!(matches!(
+                    reader.contains_documents(&cx, ids),
+                    Err(QuillIndexError::Cancelled {
+                        phase: "selected document membership"
+                    }),
+                ));
             }
         });
     }
