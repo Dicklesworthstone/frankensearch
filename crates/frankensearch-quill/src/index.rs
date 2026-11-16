@@ -10122,9 +10122,13 @@ impl QuillWriterState {
             check_cancel(cx, "upsert admission preflight")?;
             document.write_canonical_metadata(&mut shard.scratch_metadata)?;
             let accumulator = &mut shard.accumulator;
-            document.with_projected_values(0, &shard.scratch_metadata, |indexed, numeric, stored| {
-                accumulator.validate_document_values(0, indexed, numeric, stored)
-            })?;
+            document.with_projected_values(
+                0,
+                &shard.scratch_metadata,
+                |indexed, numeric, stored| {
+                    accumulator.validate_document_values(0, indexed, numeric, stored)
+                },
+            )?;
         }
         Ok(())
     }
@@ -16516,9 +16520,13 @@ impl<'a> IngestDoc<'a> {
         global_docid: u64,
         canonical_metadata: &[u8],
     ) -> Result<DocumentAccumulation, AccumulatorError> {
-        self.with_projected_values(global_docid, canonical_metadata, |indexed, numeric, stored| {
-            accumulator.add_document_with_values(doc_ord, indexed, numeric, stored)
-        })
+        self.with_projected_values(
+            global_docid,
+            canonical_metadata,
+            |indexed, numeric, stored| {
+                accumulator.add_document_with_values(doc_ord, indexed, numeric, stored)
+            },
+        )
     }
 
     /// Share the exact field projection between admission and accumulation.
@@ -26613,11 +26621,12 @@ mod tests {
                         .await
                         .expect("read durable authority before explicit commit");
                     assert_eq!(retained.doc_count().expect("durable count"), 1);
-                    assert!(
-                        pending_upsert_fixture_hits(&retained.reader, &cx, "beta").is_empty()
-                    );
+                    assert!(pending_upsert_fixture_hits(&retained.reader, &cx, "beta").is_empty());
 
-                    index.commit(&cx).await.expect("publish original pending work");
+                    index
+                        .commit(&cx)
+                        .await
+                        .expect("publish original pending work");
                     assert_eq!(index.doc_count().expect("committed count"), 2);
                     assert_eq!(hit_count(&index, &cx, "alpha"), 1);
                     assert_eq!(hit_count(&index, &cx, "beta"), 1);
@@ -26631,9 +26640,7 @@ mod tests {
                         pending_upsert_fixture_hits(&reopened.reader, &cx, "beta").len(),
                         1
                     );
-                    assert!(
-                        pending_upsert_fixture_hits(&reopened.reader, &cx, "gamma").is_empty()
-                    );
+                    assert!(pending_upsert_fixture_hits(&reopened.reader, &cx, "gamma").is_empty());
                 }
             }
         });
