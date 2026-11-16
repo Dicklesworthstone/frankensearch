@@ -687,7 +687,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v31: grouped comparison bounds retain their operand and field scope.
 // v32: normalization preserves whitespace inside literal query values.
 // v33: reranking scores the planned candidate window before the display cutoff.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v33";
+// v34: reranking admits only complete, finite responses for the exact inputs.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v34";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -717,8 +718,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v28 / stream v26: grouped comparison bounds retain their field scope.
 // v29 / stream v27: normalization preserves literal query whitespace.
 // v30 / stream v28: reranking can promote candidates outside the displayed page.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v30";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v28";
+// v31 / stream v29: reranking rejects malformed and non-finite score evidence.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v31";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v29";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -24844,7 +24846,9 @@ impl FsfsRuntime {
                     .workload_scheduler
                     .acquire(cx, WorkloadClass::Embed)
                     .await?;
-                reranker.rerank(cx, query, &documents).await.map(Some)
+                let scores = reranker.rerank(cx, query, &documents).await?;
+                frankensearch_core::RerankScore::validate_response(cx, &documents, &scores)?;
+                Ok(Some(scores))
             };
             let mut timed = std::pin::pin!(asupersync::time::timeout_at(deadline, work));
             std::future::poll_fn(|task_cx| {
@@ -24885,7 +24889,13 @@ impl FsfsRuntime {
             }
             Err(error) => return Self::rerank_stage_failure(fused, budget, started, error),
         };
-        scores.sort_by(|left, right| right.score.total_cmp(&left.score));
+        scores.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.original_rank.cmp(&right.original_rank))
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+        });
 
         let original_rank = fused
             .iter()
@@ -24922,6 +24932,7 @@ impl FsfsRuntime {
         }
         reordered.extend(fused[depth..].iter().cloned());
 
+        let model = reranker.model_name().to_owned();
         if let Err(error) =
             Self::rerank_deadline_checkpoint(cx, deadline, started, stage.timeout_ms)
         {
@@ -24935,7 +24946,7 @@ impl FsfsRuntime {
             head = depth,
             elapsed_ms,
             budget_timeout_ms = stage.timeout_ms,
-            model = reranker.model_name(),
+            model = %model,
             "fsfs search rerank stage applied"
         );
         Ok(RerankStageOutcome {
@@ -24946,7 +24957,7 @@ impl FsfsRuntime {
                 candidate_budget: budget,
                 reranked_hits: hit_scores.len(),
                 elapsed_ms,
-                model: Some(reranker.model_name().to_owned()),
+                model: Some(model),
                 scores: hit_scores,
             },
         })
@@ -45621,6 +45632,297 @@ mod tests {
             FsfsRuntime::search_payloads_cacheable(&[payload]),
             "successful reranking remains cacheable"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RerankAdmissionReply {
+        Valid,
+        Tied,
+        Empty,
+        Short,
+        Long,
+        DuplicateRank,
+        DuplicateId,
+        WrongRank,
+        UnsubmittedId,
+        ForeignId,
+        InvalidScore(f32),
+        InvalidLogit(f32),
+        CancelSuccess,
+        CancelError,
+    }
+
+    struct RerankAdmissionProbe {
+        reply: RerankAdmissionReply,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        cancel_on_model_name: Option<Cx>,
+    }
+
+    impl frankensearch_core::Reranker for RerankAdmissionProbe {
+        fn rerank<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _query: &'a str,
+            documents: &'a [frankensearch_core::RerankDocument],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::RerankScore>> {
+            Box::pin(async move {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(
+                    documents
+                        .iter()
+                        .map(|document| document.doc_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["a.md", "b.md"],
+                    "unavailable text compacts the input; the tail is outside the scoring budget",
+                );
+                let mut scores = documents
+                    .iter()
+                    .enumerate()
+                    .map(|(index, document)| frankensearch_core::RerankScore {
+                        doc_id: document.doc_id.clone(),
+                        score: f32::from(u8::try_from(index + 1).unwrap()) / 4.0,
+                        original_rank: index,
+                        raw_logit: Some(0.0),
+                    })
+                    .rev()
+                    .collect::<Vec<_>>();
+                match self.reply {
+                    RerankAdmissionReply::Valid => {}
+                    RerankAdmissionReply::Tied => {
+                        for score in &mut scores {
+                            score.score = 0.5;
+                        }
+                    }
+                    RerankAdmissionReply::Empty => scores.clear(),
+                    RerankAdmissionReply::Short => {
+                        let _ = scores.pop();
+                    }
+                    RerankAdmissionReply::Long => scores.push(scores[0].clone()),
+                    RerankAdmissionReply::DuplicateRank => {
+                        scores[1].original_rank = scores[0].original_rank;
+                    }
+                    RerankAdmissionReply::DuplicateId => {
+                        scores[1].doc_id = scores[0].doc_id.clone();
+                    }
+                    RerankAdmissionReply::WrongRank => scores[0].original_rank = usize::MAX,
+                    RerankAdmissionReply::UnsubmittedId => {
+                        scores[0].doc_id = "missing.md".to_owned();
+                    }
+                    RerankAdmissionReply::ForeignId => {
+                        scores[0].doc_id = "foreign-private-document".to_owned();
+                    }
+                    RerankAdmissionReply::InvalidScore(value) => scores[0].score = value,
+                    RerankAdmissionReply::InvalidLogit(value) => {
+                        scores[0].raw_logit = Some(value);
+                    }
+                    RerankAdmissionReply::CancelSuccess | RerankAdmissionReply::CancelError => {
+                        cx.set_cancel_requested(true);
+                        if matches!(self.reply, RerankAdmissionReply::CancelError) {
+                            return Err(SearchError::RerankFailed {
+                                model: "admission-probe".to_owned(),
+                                source: "provider failed after cancellation".into(),
+                            });
+                        }
+                    }
+                }
+                Ok(scores)
+            })
+        }
+
+        fn id(&self) -> &'static str {
+            "response-admission-test"
+        }
+
+        fn model_name(&self) -> &'static str {
+            if let Some(cx) = &self.cancel_on_model_name {
+                cx.set_cancel_requested(true);
+            }
+            "response admission probe"
+        }
+    }
+
+    fn rerank_admission_fixture(
+        root: &Path,
+    ) -> (FsfsRuntime, super::StageDirective, Vec<FusedCandidate>) {
+        for name in ["a.md", "b.md", "tail.md"] {
+            fs::write(root.join(name), "Recover failed requests with bounded retries.").unwrap();
+        }
+        let fused = ["a.md", "missing.md", "b.md", "tail.md"]
+            .into_iter()
+            .enumerate()
+            .map(|(rank, name)| FusedCandidate {
+                doc_id: name.to_owned(),
+                fused_score: 1.0 / f64::from(u8::try_from(rank + 1).unwrap()),
+                prior_boost: 0.0,
+                lexical_rank: Some(rank + 1),
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: Some(1.0),
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+            })
+            .collect();
+        let mut config = FsfsConfig::default();
+        config.search.rerank = true;
+        (
+            FsfsRuntime::new(config),
+            super::StageDirective {
+                enabled: true,
+                candidate_budget: 3,
+                timeout_ms: 10_000,
+                reason_code: "query.stage.rerank.enabled",
+            },
+            fused,
+        )
+    }
+
+    #[test]
+    fn rerank_stage_malformed_responses_preserve_the_entire_order_and_are_not_cached() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, stage, fused) = rerank_admission_fixture(temp.path());
+            for reply in [
+                RerankAdmissionReply::Empty,
+                RerankAdmissionReply::Short,
+                RerankAdmissionReply::Long,
+                RerankAdmissionReply::DuplicateRank,
+                RerankAdmissionReply::DuplicateId,
+                RerankAdmissionReply::WrongRank,
+                RerankAdmissionReply::UnsubmittedId,
+                RerankAdmissionReply::ForeignId,
+                RerankAdmissionReply::InvalidScore(f32::NAN),
+                RerankAdmissionReply::InvalidScore(f32::INFINITY),
+                RerankAdmissionReply::InvalidScore(f32::NEG_INFINITY),
+                RerankAdmissionReply::InvalidLogit(f32::NAN),
+                RerankAdmissionReply::InvalidLogit(f32::INFINITY),
+                RerankAdmissionReply::InvalidLogit(f32::NEG_INFINITY),
+            ] {
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let provider = RerankAdmissionProbe {
+                    reply,
+                    calls: Arc::clone(&calls),
+                    cancel_on_model_name: None,
+                };
+                let outcome = runtime
+                    .apply_rerank_stage(
+                        &cx,
+                        Some(&provider),
+                        &stage,
+                        temp.path(),
+                        "recover failed requests",
+                        fused.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.fused, fused, "{reply:?}");
+                assert_eq!(outcome.payload.status, RerankStageStatus::Failed, "{reply:?}");
+                assert_eq!(
+                    outcome.payload.reason_code,
+                    super::REASON_RERANK_FAILED,
+                    "{reply:?}",
+                );
+                assert_eq!(outcome.payload.reranked_hits, 0, "{reply:?}");
+                assert!(outcome.payload.scores.is_empty(), "{reply:?}");
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let mut payload = SearchPayload::new(
+                    "recover failed requests",
+                    SearchOutputPhase::Refined,
+                    fused.len(),
+                    Vec::new(),
+                );
+                payload.rerank = Some(outcome.payload);
+                assert!(!FsfsRuntime::search_payloads_cacheable(&[payload]), "{reply:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn rerank_stage_valid_permutation_and_ties_keep_compacted_provenance_and_tail() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, stage, fused) = rerank_admission_fixture(temp.path());
+            for (reply, first, second, original_ranks) in [
+                (RerankAdmissionReply::Valid, 2, 0, [3, 1]),
+                (RerankAdmissionReply::Tied, 0, 2, [1, 3]),
+            ] {
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let provider = RerankAdmissionProbe {
+                    reply,
+                    calls: Arc::clone(&calls),
+                    cancel_on_model_name: None,
+                };
+                let outcome = runtime
+                    .apply_rerank_stage(
+                        &cx,
+                        Some(&provider),
+                        &stage,
+                        temp.path(),
+                        "recover failed requests",
+                        fused.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome.fused,
+                    vec![
+                        fused[first].clone(),
+                        fused[second].clone(),
+                        fused[1].clone(),
+                        fused[3].clone(),
+                    ],
+                    "{reply:?}",
+                );
+                assert_eq!(outcome.payload.status, RerankStageStatus::Applied, "{reply:?}");
+                assert_eq!(outcome.payload.reranked_hits, 2, "{reply:?}");
+                assert_eq!(
+                    outcome
+                        .payload
+                        .scores
+                        .iter()
+                        .map(|score| score.original_rank)
+                        .collect::<Vec<_>>(),
+                    original_ranks,
+                    "{reply:?}",
+                );
+                assert_eq!(outcome.payload.scores[0].rank, 1);
+                assert_eq!(outcome.payload.scores[1].rank, 2);
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn rerank_stage_response_and_model_label_cancellation_remain_terminal() {
+        for (reply, cancel_on_model_name) in [
+            (RerankAdmissionReply::CancelSuccess, false),
+            (RerankAdmissionReply::CancelError, false),
+            (RerankAdmissionReply::Valid, true),
+        ] {
+            run_on_runtime_task(move |cx| async move {
+                let temp = tempfile::tempdir().unwrap();
+                let (runtime, stage, fused) = rerank_admission_fixture(temp.path());
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let provider = RerankAdmissionProbe {
+                    reply,
+                    calls: Arc::clone(&calls),
+                    cancel_on_model_name: cancel_on_model_name.then(|| cx.clone()),
+                };
+                let result = runtime
+                    .apply_rerank_stage(
+                        &cx,
+                        Some(&provider),
+                        &stage,
+                        temp.path(),
+                        "recover failed requests",
+                        fused,
+                    )
+                    .await;
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })), "{reply:?}");
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            });
+        }
     }
 
     /// A cross-encoder that scores a document by its input position, so the

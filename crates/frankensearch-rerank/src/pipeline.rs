@@ -11,7 +11,7 @@ use tracing::instrument;
 
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::explanation::{ExplainedSource, ScoreComponent};
-use frankensearch_core::traits::{RerankDocument, Reranker};
+use frankensearch_core::traits::{RerankDocument, RerankScore, Reranker};
 use frankensearch_core::types::{ScoreSource, ScoredResult};
 
 /// Default maximum number of candidates to rerank per query.
@@ -213,35 +213,14 @@ pub async fn rerank_step_with_combine(
         }
     };
 
-    // Validate score count matches
-    if scores.len() != rerank_docs.len() {
-        tracing::warn!(
-            expected = rerank_docs.len(),
-            got = scores.len(),
-            "reranker score count mismatch — skipping rerank"
-        );
-        return Ok(());
-    }
-
-    // Equal cardinality alone does not prove coverage: duplicates can conceal
-    // an omitted input. Check the complete permutation before clearing even a
-    // single stale score, including when text lookup compacted the input list.
-    let mut seen = vec![false; rerank_docs.len()];
-    for score in &scores {
-        rerank_checkpoint(cx, "reranker_score_validation")?;
-        let Some(document) = rerank_docs.get(score.original_rank) else {
-            tracing::warn!("reranker returned an invalid input rank — skipping rerank");
-            return Ok(());
-        };
-        if seen[score.original_rank]
-            || document.doc_id != score.doc_id
-            || !score.score.is_finite()
-            || score.raw_logit.is_some_and(|logit| !logit.is_finite())
-        {
-            tracing::warn!("reranker returned an invalid response — skipping rerank");
-            return Ok(());
+    // Admission is shared with fsfs, whose output and cache path must enforce
+    // the same complete permutation before publishing a reordered window.
+    if let Err(error) = RerankScore::validate_response(cx, &rerank_docs, &scores) {
+        if matches!(error, SearchError::Cancelled { .. }) {
+            return Err(error);
         }
-        seen[score.original_rank] = true;
+        tracing::warn!(error = %error, "reranker returned an invalid response — skipping rerank");
+        return Ok(());
     }
 
     // Resolve the last provider callback before the commit checkpoint. Nothing

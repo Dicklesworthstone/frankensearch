@@ -1434,7 +1434,7 @@ pub struct RerankScore {
     pub doc_id: String,
     /// Cross-encoder relevance score (typically sigmoid-activated logit).
     pub score: f32,
-    /// Position before reranking (for rank-change tracking).
+    /// Zero-based position in the exact document slice supplied for reranking.
     pub original_rank: usize,
     /// Raw pre-sigmoid logit, when the backend exposes it.
     ///
@@ -1442,6 +1442,68 @@ pub struct RerankScore {
     /// activation). When the raw logit is unavailable, this field is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_logit: Option<f32>,
+}
+
+impl RerankScore {
+    /// Admit one complete response against the exact documents sent to a reranker.
+    ///
+    /// Every input must have exactly one score whose zero-based `original_rank`
+    /// and document ID agree with that input. Scores may arrive in any order;
+    /// scores and optional logits must be finite. Validate before changing any
+    /// candidate order or publishing score evidence, including when unavailable
+    /// text compacted the original candidate window.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RerankFailed` for malformed output, without including document
+    /// IDs or model output in diagnostics. Caller cancellation remains terminal.
+    pub fn validate_response(
+        cx: &Cx,
+        documents: &[RerankDocument],
+        scores: &[Self],
+    ) -> SearchResult<()> {
+        let checkpoint = || -> SearchResult<()> {
+            let checkpoint = cx.checkpoint();
+            if checkpoint.is_err() || cx.is_cancel_requested() {
+                return Err(SearchError::Cancelled {
+                    phase: "reranker_score_validation".to_owned(),
+                    reason: cx.cancel_reason().map_or_else(
+                        || "rerank operation cancelled".to_owned(),
+                        |reason| reason.to_string(),
+                    ),
+                });
+            }
+            Ok(())
+        };
+        checkpoint()?;
+        let invalid = |reason: &'static str| SearchError::RerankFailed {
+            model: "rerank.response".to_owned(),
+            source: reason.into(),
+        };
+        if scores.len() != documents.len() {
+            return Err(invalid(
+                "reranker response must score every submitted document exactly once",
+            ));
+        }
+        let mut seen = vec![false; documents.len()];
+        for score in scores {
+            checkpoint()?;
+            let Some(document) = documents.get(score.original_rank) else {
+                return Err(invalid("reranker response contains an invalid input rank"));
+            };
+            if seen[score.original_rank]
+                || document.doc_id != score.doc_id
+                || !score.score.is_finite()
+                || score.raw_logit.is_some_and(|logit| !logit.is_finite())
+            {
+                return Err(invalid(
+                    "reranker response has duplicate, mismatched or non-finite scores",
+                ));
+            }
+            seen[score.original_rank] = true;
+        }
+        checkpoint()
+    }
 }
 
 /// Core trait for cross-encoder reranking models.
@@ -2818,5 +2880,114 @@ mod tests {
             ));
             assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         });
+    }
+}
+
+#[cfg(test)]
+mod rerank_response_contract_tests {
+    use asupersync::test_utils::run_test_with_cx;
+
+    use super::{RerankDocument, RerankScore, SearchError};
+
+    fn inputs() -> Vec<RerankDocument> {
+        ["private-input-alpha", "private-input-beta"]
+            .into_iter()
+            .map(|doc_id| RerankDocument {
+                doc_id: doc_id.to_owned(),
+                text: "private-input-text".to_owned(),
+            })
+            .collect()
+    }
+
+    fn scores(documents: &[RerankDocument]) -> Vec<RerankScore> {
+        documents
+            .iter()
+            .enumerate()
+            .map(|(original_rank, document)| RerankScore {
+                doc_id: document.doc_id.clone(),
+                score: 0.5,
+                original_rank,
+                raw_logit: Some(0.0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unordered_positional_permutations_allow_repeated_input_ids() {
+        run_test_with_cx(|cx| async move {
+            let mut documents = inputs();
+            documents[1].doc_id = documents[0].doc_id.clone();
+            let mut response = scores(&documents);
+            response.reverse();
+            response[0].score = -2.0;
+            response[0].raw_logit = None;
+            RerankScore::validate_response(&cx, &documents, &response).unwrap();
+            assert_eq!(response[0].original_rank, 1);
+            RerankScore::validate_response(&cx, &[], &[]).unwrap();
+        });
+    }
+
+    #[test]
+    fn malformed_responses_are_rejected_without_input_or_output_identifiers() {
+        run_test_with_cx(|cx| async move {
+            let documents = inputs();
+            let valid = scores(&documents);
+            let mut cases = vec![
+                Vec::new(),
+                vec![valid[0].clone()],
+                vec![valid[0].clone(), valid[1].clone(), valid[1].clone()],
+                vec![valid[0].clone(), valid[0].clone()],
+            ];
+            let mut wrong_rank = valid.clone();
+            wrong_rank[1].original_rank = usize::MAX;
+            cases.push(wrong_rank);
+            let mut duplicate_id = valid.clone();
+            duplicate_id[1].doc_id = duplicate_id[0].doc_id.clone();
+            cases.push(duplicate_id);
+            let mut wrong_id = valid.clone();
+            wrong_id[1].doc_id = "private-response-id".to_owned();
+            cases.push(wrong_id);
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut invalid_score = valid.clone();
+                invalid_score[0].score = value;
+                cases.push(invalid_score);
+                let mut invalid_logit = valid.clone();
+                invalid_logit[0].raw_logit = Some(value);
+                cases.push(invalid_logit);
+            }
+            for response in cases {
+                let error = RerankScore::validate_response(&cx, &documents, &response)
+                    .expect_err("malformed response must fail admission");
+                let diagnostic = error.to_string();
+                assert!(matches!(error, SearchError::RerankFailed { .. }));
+                for private in [
+                    "private-input-alpha",
+                    "private-input-beta",
+                    "private-input-text",
+                    "private-response-id",
+                ] {
+                    assert!(!diagnostic.contains(private));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cancellation_precedes_empty_and_malformed_response_admission() {
+        for empty_input in [false, true] {
+            run_test_with_cx(move |cx| async move {
+                let documents = if empty_input { Vec::new() } else { inputs() };
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel before validation"),
+                );
+                let expected_reason = cx.cancel_reason().expect("cancel reason").to_string();
+                assert!(matches!(
+                    RerankScore::validate_response(&cx, &documents, &[]),
+                    Err(SearchError::Cancelled { phase, reason })
+                        if phase == "reranker_score_validation" && reason == expected_reason
+                ));
+            });
+        }
     }
 }
