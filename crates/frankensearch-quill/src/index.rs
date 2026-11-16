@@ -9999,7 +9999,7 @@ impl QuillWriterState {
             // published snapshot, and publishing is exactly what changes that
             // answer, so those are left to the full admission pass that runs
             // after the commit against the re-derived snapshot.
-            if let Err(error) = Self::validate_commit_invariant_batch_shape(cx, documents) {
+            if let Err(error) = self.validate_commit_invariant_batch(cx, documents) {
                 return QuillObservedUpsert::new(Err(error), None);
             }
             if let Err(error) = self.commit(cx).await {
@@ -10102,7 +10102,34 @@ impl QuillWriterState {
         QuillObservedUpsert::new(post_result, Some(witness))
     }
 
-    /// The admission conditions that publishing cannot change.
+    /// Refuse every payload error that committing pending work cannot fix.
+    ///
+    /// Reuse Scribe's field validation and the ingestion projection without
+    /// tokenizing, allocating document IDs, or touching any document columns.
+    /// Only the shard's reusable validation and metadata buffers change.
+    /// Ordinal zero is diagnostic here; no document ordinal has been allocated.
+    fn validate_commit_invariant_batch(
+        &mut self,
+        cx: &Cx,
+        documents: IngestBatch<'_>,
+    ) -> Result<(), QuillIndexError> {
+        Self::validate_commit_invariant_batch_shape(cx, documents)?;
+        let shard = self
+            .shards
+            .first_mut()
+            .ok_or_else(|| invalid_state("upsert preflight requires an ingest shard"))?;
+        for document in documents {
+            check_cancel(cx, "upsert admission preflight")?;
+            document.write_canonical_metadata(&mut shard.scratch_metadata)?;
+            let accumulator = &mut shard.accumulator;
+            document.with_projected_values(0, &shard.scratch_metadata, |indexed, numeric, stored| {
+                accumulator.validate_document_values(0, indexed, numeric, stored)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The identity admission conditions that publishing cannot change.
     ///
     /// An empty identifier and an in-batch repeat are invalid against every
     /// possible published state, so they can be refused before an implicit
@@ -16489,15 +16516,26 @@ impl<'a> IngestDoc<'a> {
         global_docid: u64,
         canonical_metadata: &[u8],
     ) -> Result<DocumentAccumulation, AccumulatorError> {
+        self.with_projected_values(global_docid, canonical_metadata, |indexed, numeric, stored| {
+            accumulator.add_document_with_values(doc_ord, indexed, numeric, stored)
+        })
+    }
+
+    /// Share the exact field projection between admission and accumulation.
+    fn with_projected_values<T>(
+        self,
+        global_docid: u64,
+        canonical_metadata: &[u8],
+        apply: impl FnOnce(
+            &[IndexedFieldValue<'_>],
+            &[IndexedNumericValue],
+            &[StoredFieldValue<'_>],
+        ) -> T,
+    ) -> T {
         match self {
             Self::Default(document) => {
                 let values = default_schema_values(document, global_docid, canonical_metadata);
-                accumulator.add_document_with_values(
-                    doc_ord,
-                    &values.indexed,
-                    &values.numeric,
-                    &values.stored,
-                )
+                apply(&values.indexed, &values.numeric, &values.stored)
             }
             Self::Schema(document) => {
                 let indexed = document
@@ -16518,7 +16556,7 @@ impl<'a> IngestDoc<'a> {
                     .iter()
                     .map(|(field_ord, bytes)| StoredFieldValue::new(*field_ord, bytes))
                     .collect::<Vec<_>>();
-                accumulator.add_document_with_values(doc_ord, &indexed, &numeric, &stored)
+                apply(&indexed, &numeric, &stored)
             }
         }
     }
@@ -26485,6 +26523,118 @@ mod tests {
                     index.has_uncommitted_changes(),
                     "{label} must leave the pending batch staged"
                 );
+            }
+        });
+    }
+
+    /// Invalid field payloads must be refused before a replacement can commit
+    /// unrelated pending work. Check both published and pending replacement
+    /// targets, and durable authority before and after a later explicit commit.
+    #[test]
+    fn schema_rejected_replacement_preserves_pending_work_before_publication() {
+        run_with_cx(|cx| async move {
+            let invalid_documents = [
+                SchemaDocument {
+                    indexed: vec![(u16::MAX, "unknown".to_owned())],
+                    ..SchemaDocument::default()
+                },
+                SchemaDocument {
+                    indexed: vec![(CONTENT_FIELD, "duplicate".to_owned())],
+                    stored: vec![(CONTENT_FIELD, b"duplicate".to_vec())],
+                    ..SchemaDocument::default()
+                },
+                SchemaDocument {
+                    indexed: vec![(METADATA_FIELD, "non-string".to_owned())],
+                    ..SchemaDocument::default()
+                },
+                SchemaDocument {
+                    numeric: vec![(ORD_FIELD, NumericValue::I64(-1))],
+                    ..SchemaDocument::default()
+                },
+                SchemaDocument {
+                    numeric: vec![(CONTENT_FIELD, NumericValue::U64(1))],
+                    ..SchemaDocument::default()
+                },
+                SchemaDocument {
+                    stored: vec![(ORD_FIELD, vec![0; 7])],
+                    ..SchemaDocument::default()
+                },
+                SchemaDocument {
+                    stored: vec![(u16::MAX, b"unknown".to_vec())],
+                    ..SchemaDocument::default()
+                },
+            ];
+            for (case, invalid) in invalid_documents.iter().enumerate() {
+                for replaced_id in ["seeded", "pending"] {
+                    let directory = tempfile::tempdir().expect("fixture directory");
+                    let config = deterministic_config();
+                    let index = QuillIndex::create(&cx, directory.path(), config.clone())
+                        .await
+                        .expect("create durable index");
+                    index
+                        .upsert_documents(&cx, &[IndexableDocument::new("seeded", "alpha")])
+                        .await
+                        .expect("stage original revision");
+                    index.commit(&cx).await.expect("publish original revision");
+                    let generation = published_generation(&index);
+                    index
+                        .upsert_documents(&cx, &[IndexableDocument::new("pending", "beta")])
+                        .await
+                        .expect("stage unrelated pending work");
+                    let replacement = SchemaDocument {
+                        id: replaced_id.to_owned(),
+                        indexed: vec![(CONTENT_FIELD, "gamma".to_owned())],
+                        ..SchemaDocument::default()
+                    };
+                    let mut invalid = invalid.clone();
+                    invalid.id = "invalid".to_owned();
+                    let rejected = index
+                        .upsert_documents_batch_observed(
+                            &cx,
+                            IngestBatch::Schema(&[replacement, invalid]),
+                        )
+                        .await;
+                    assert!(
+                        matches!(&rejected.result, Err(QuillIndexError::Accumulator(_))),
+                        "case {case}, replacing {replaced_id}: preserve the typed schema error"
+                    );
+                    assert_eq!(
+                        published_generation(&index),
+                        generation,
+                        "case {case}, replacing {replaced_id}: rejection must not publish"
+                    );
+                    assert!(rejected.witness().is_none(), "no ingest driver was entered");
+                    assert!(index.has_uncommitted_changes(), "pending work stays staged");
+                    assert_eq!(hit_count(&index, &cx, "alpha"), 1);
+                    assert_eq!(hit_count(&index, &cx, "beta"), 0);
+                    assert_eq!(hit_count(&index, &cx, "gamma"), 0);
+
+                    let retained = QuillSearchIndex::open(&cx, directory.path(), config.clone())
+                        .await
+                        .expect("read durable authority before explicit commit");
+                    assert_eq!(retained.doc_count().expect("durable count"), 1);
+                    assert!(
+                        pending_upsert_fixture_hits(&retained.reader, &cx, "beta").is_empty()
+                    );
+
+                    index.commit(&cx).await.expect("publish original pending work");
+                    assert_eq!(index.doc_count().expect("committed count"), 2);
+                    assert_eq!(hit_count(&index, &cx, "alpha"), 1);
+                    assert_eq!(hit_count(&index, &cx, "beta"), 1);
+                    assert_eq!(hit_count(&index, &cx, "gamma"), 0);
+                    drop(index);
+                    let reopened = QuillSearchIndex::open(&cx, directory.path(), config)
+                        .await
+                        .expect("reopen accepted documents after explicit commit");
+                    assert_eq!(reopened.doc_count().expect("reopened count"), 2);
+                    assert_eq!(
+                        pending_upsert_fixture_hits(&reopened.reader, &cx, "beta").len(),
+                        1
+                    );
+                    assert!(
+                        pending_upsert_fixture_hits(&reopened.reader, &cx, "gamma").is_empty()
+                    );
+                }
             }
         });
     }

@@ -2959,153 +2959,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             return Err(AccumulatorError::TooManyDocuments);
         }
 
-        self.seen_fields.fill(false);
-        for value in values {
-            let field_index = usize::from(value.field_ord);
-            let Some(field) = self.schema.fields.get(field_index) else {
-                return Err(AccumulatorError::UnknownField {
-                    field_ord: value.field_ord,
-                });
-            };
-            if field.id != value.field_ord {
-                return Err(AccumulatorError::UnknownField {
-                    field_ord: value.field_ord,
-                });
-            }
-            if std::mem::replace(&mut self.seen_fields[field_index], true) {
-                return Err(AccumulatorError::DuplicateField {
-                    doc_ord,
-                    field_ord: value.field_ord,
-                });
-            }
-            match field.kind {
-                FieldKind::Keyword => {}
-                FieldKind::Text { analyzer, .. } if self.analyzer.supports(analyzer) => {}
-                FieldKind::Text { analyzer, .. } => {
-                    return Err(AccumulatorError::UnsupportedAnalyzer {
-                        field_ord: field.id,
-                        field_name: field.name,
-                        analyzer,
-                    });
-                }
-                FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => {
-                    return Err(AccumulatorError::NonStringField {
-                        field_ord: field.id,
-                        field_name: field.name,
-                    });
-                }
-            }
-            if u32::try_from(value.text.len()).is_err() {
-                return Err(AccumulatorError::SourceTooLarge {
-                    field_ord: field.id,
-                    bytes: value.text.len(),
-                });
-            }
-        }
-
-        for value in numeric_values {
-            let field_index = usize::from(value.field_ord);
-            let Some(field) = self.schema.fields.get(field_index) else {
-                return Err(AccumulatorError::UnknownField {
-                    field_ord: value.field_ord,
-                });
-            };
-            if field.id != value.field_ord {
-                return Err(AccumulatorError::UnknownField {
-                    field_ord: value.field_ord,
-                });
-            }
-            if std::mem::replace(&mut self.seen_fields[field_index], true) {
-                return Err(AccumulatorError::DuplicateField {
-                    doc_ord,
-                    field_ord: value.field_ord,
-                });
-            }
-            match (field.kind, value.value) {
-                (FieldKind::I64 { indexed, fast }, NumericValue::I64(_)) if indexed || fast => {}
-                (FieldKind::U64 { indexed, fast }, NumericValue::U64(_)) if indexed || fast => {}
-                (
-                    FieldKind::I64 {
-                        indexed: false,
-                        fast: false,
-                    }
-                    | FieldKind::U64 {
-                        indexed: false,
-                        fast: false,
-                    },
-                    _,
-                ) => {
-                    return Err(AccumulatorError::NonIndexedNumericField {
-                        field_ord: field.id,
-                        field_name: field.name,
-                    });
-                }
-                (FieldKind::I64 { .. }, actual) => {
-                    return Err(AccumulatorError::NumericTypeMismatch {
-                        field_ord: field.id,
-                        field_name: field.name,
-                        expected: "i64",
-                        actual: numeric_value_type_name(actual),
-                    });
-                }
-                (FieldKind::U64 { .. }, actual) => {
-                    return Err(AccumulatorError::NumericTypeMismatch {
-                        field_ord: field.id,
-                        field_name: field.name,
-                        expected: "u64",
-                        actual: numeric_value_type_name(actual),
-                    });
-                }
-                _ => {
-                    return Err(AccumulatorError::NonNumericField {
-                        field_ord: field.id,
-                        field_name: field.name,
-                    });
-                }
-            }
-        }
-
-        for value in stored_values {
-            let field_index = usize::from(value.field_ord);
-            let Some(field) = self.schema.fields.get(field_index) else {
-                return Err(AccumulatorError::UnknownField {
-                    field_ord: value.field_ord,
-                });
-            };
-            if field.id != value.field_ord {
-                return Err(AccumulatorError::UnknownField {
-                    field_ord: value.field_ord,
-                });
-            }
-            if std::mem::replace(&mut self.seen_fields[field_index], true) {
-                return Err(AccumulatorError::DuplicateField {
-                    doc_ord,
-                    field_ord: value.field_ord,
-                });
-            }
-            if !field.stored {
-                return Err(AccumulatorError::NonStoredField {
-                    field_ord: field.id,
-                    field_name: field.name,
-                });
-            }
-            if matches!(field.kind, FieldKind::I64 { .. } | FieldKind::U64 { .. })
-                && value.bytes.len() != std::mem::size_of::<u64>()
-            {
-                return Err(AccumulatorError::InvalidNumericBytes {
-                    field_ord: field.id,
-                    field_name: field.name,
-                    expected: std::mem::size_of::<u64>(),
-                    actual: value.bytes.len(),
-                });
-            }
-            if u32::try_from(value.bytes.len()).is_err() {
-                return Err(AccumulatorError::StoredValueTooLarge {
-                    field_ord: field.id,
-                    bytes: value.bytes.len(),
-                });
-            }
-        }
+        self.validate_document_values(doc_ord, values, numeric_values, stored_values)?;
 
         for field in &self.stored_fields {
             let value_len = stored_values
@@ -3301,6 +3155,174 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             bytes_reserved: arena_bytes_reserved,
             bytes_used: arena_bytes_used,
         })
+    }
+
+    /// Validate field payloads without accumulating a document.
+    ///
+    /// This shares all schema, field uniqueness, scalar width, and per-value
+    /// size checks with ingestion. It changes only reusable validation scratch.
+    /// Document ordering and aggregate stored-column bounds belong to the
+    /// accumulator transaction and are checked by `add_document_with_values`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same field validation errors as [`Self::add_document_with_values`].
+    pub(crate) fn validate_document_values(
+        &mut self,
+        doc_ord: u32,
+        values: &[IndexedFieldValue<'_>],
+        numeric_values: &[IndexedNumericValue],
+        stored_values: &[StoredFieldValue<'_>],
+    ) -> Result<(), AccumulatorError> {
+        self.seen_fields.fill(false);
+        for value in values {
+            let field_index = usize::from(value.field_ord);
+            let Some(field) = self.schema.fields.get(field_index) else {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            };
+            if field.id != value.field_ord {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            }
+            if std::mem::replace(&mut self.seen_fields[field_index], true) {
+                return Err(AccumulatorError::DuplicateField {
+                    doc_ord,
+                    field_ord: value.field_ord,
+                });
+            }
+            match field.kind {
+                FieldKind::Keyword => {}
+                FieldKind::Text { analyzer, .. } if self.analyzer.supports(analyzer) => {}
+                FieldKind::Text { analyzer, .. } => {
+                    return Err(AccumulatorError::UnsupportedAnalyzer {
+                        field_ord: field.id,
+                        field_name: field.name,
+                        analyzer,
+                    });
+                }
+                FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => {
+                    return Err(AccumulatorError::NonStringField {
+                        field_ord: field.id,
+                        field_name: field.name,
+                    });
+                }
+            }
+            if u32::try_from(value.text.len()).is_err() {
+                return Err(AccumulatorError::SourceTooLarge {
+                    field_ord: field.id,
+                    bytes: value.text.len(),
+                });
+            }
+        }
+
+        for value in numeric_values {
+            let field_index = usize::from(value.field_ord);
+            let Some(field) = self.schema.fields.get(field_index) else {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            };
+            if field.id != value.field_ord {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            }
+            if std::mem::replace(&mut self.seen_fields[field_index], true) {
+                return Err(AccumulatorError::DuplicateField {
+                    doc_ord,
+                    field_ord: value.field_ord,
+                });
+            }
+            match (field.kind, value.value) {
+                (FieldKind::I64 { indexed, fast }, NumericValue::I64(_)) if indexed || fast => {}
+                (FieldKind::U64 { indexed, fast }, NumericValue::U64(_)) if indexed || fast => {}
+                (
+                    FieldKind::I64 {
+                        indexed: false,
+                        fast: false,
+                    }
+                    | FieldKind::U64 {
+                        indexed: false,
+                        fast: false,
+                    },
+                    _,
+                ) => {
+                    return Err(AccumulatorError::NonIndexedNumericField {
+                        field_ord: field.id,
+                        field_name: field.name,
+                    });
+                }
+                (FieldKind::I64 { .. }, actual) => {
+                    return Err(AccumulatorError::NumericTypeMismatch {
+                        field_ord: field.id,
+                        field_name: field.name,
+                        expected: "i64",
+                        actual: numeric_value_type_name(actual),
+                    });
+                }
+                (FieldKind::U64 { .. }, actual) => {
+                    return Err(AccumulatorError::NumericTypeMismatch {
+                        field_ord: field.id,
+                        field_name: field.name,
+                        expected: "u64",
+                        actual: numeric_value_type_name(actual),
+                    });
+                }
+                _ => {
+                    return Err(AccumulatorError::NonNumericField {
+                        field_ord: field.id,
+                        field_name: field.name,
+                    });
+                }
+            }
+        }
+
+        for value in stored_values {
+            let field_index = usize::from(value.field_ord);
+            let Some(field) = self.schema.fields.get(field_index) else {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            };
+            if field.id != value.field_ord {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            }
+            if std::mem::replace(&mut self.seen_fields[field_index], true) {
+                return Err(AccumulatorError::DuplicateField {
+                    doc_ord,
+                    field_ord: value.field_ord,
+                });
+            }
+            if !field.stored {
+                return Err(AccumulatorError::NonStoredField {
+                    field_ord: field.id,
+                    field_name: field.name,
+                });
+            }
+            if matches!(field.kind, FieldKind::I64 { .. } | FieldKind::U64 { .. })
+                && value.bytes.len() != std::mem::size_of::<u64>()
+            {
+                return Err(AccumulatorError::InvalidNumericBytes {
+                    field_ord: field.id,
+                    field_name: field.name,
+                    expected: std::mem::size_of::<u64>(),
+                    actual: value.bytes.len(),
+                });
+            }
+            if u32::try_from(value.bytes.len()).is_err() {
+                return Err(AccumulatorError::StoredValueTooLarge {
+                    field_ord: field.id,
+                    bytes: value.bytes.len(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Validated schema associated with the accumulator.
