@@ -111,7 +111,8 @@ pub struct IndexBuildStats {
     /// Documents successfully indexed into the quality vector tier.
     /// Zero when no quality embedder is configured.
     pub quality_indexed: usize,
-    /// Per-document quality-embedding errors (`doc_id`, error message).
+    /// Per-document quality-embedding or record-admission errors
+    /// (`doc_id`, error message).
     /// These documents remain in the fast tier (fast-only degradation).
     pub quality_errors: Vec<(String, String)>,
     /// Receipt for the lexical arm. `None` when lexical indexing is compiled
@@ -1038,8 +1039,9 @@ impl IndexBuilder {
     ///
     /// Returns `Ok(None)` when every attempted arm succeeded, and
     /// `Ok(Some(message))` when the fast tier succeeded but the quality
-    /// embedding failed (fast-only degradation for this document). A fast
-    /// embedding failure is a hard `Err`: the document enters no vector tier.
+    /// embedding or record admission failed (fast-only degradation for this
+    /// document). A fast embedding failure is a hard `Err`: the document enters
+    /// no vector tier.
     async fn embed_and_add(
         cx: &Cx,
         fast_embedder: &Arc<dyn Embedder>,
@@ -1079,7 +1081,9 @@ impl IndexBuilder {
             }
         };
         build_checkpoint(cx, "fast document embedding completion")?;
-        builder.add_fast_record(&doc.id, &fast_vec)?;
+        builder
+            .add_fast_record(&doc.id, &fast_vec)
+            .inspect_err(|error| export_error(metrics_exporter, error))?;
 
         // Quality embedding (optional).
         if let Some(qe) = quality_embedder {
@@ -1090,7 +1094,13 @@ impl IndexBuilder {
                     build_checkpoint(cx, "quality document embedding completion")?;
                     let duration_ms = quality_start.elapsed().as_secs_f64() * 1000.0;
                     export_embedding_completed(metrics_exporter, qe, 1, duration_ms);
-                    builder.add_quality_record(&doc.id, &quality_vec)?;
+                    if let Err(error) = builder.add_quality_record(&doc.id, &quality_vec) {
+                        export_error(metrics_exporter, &error);
+                        if is_terminal_build_error(&error) {
+                            return Err(error);
+                        }
+                        return Ok(Some(error.to_string()));
+                    }
                 }
                 Err(
                     error @ (SearchError::Cancelled { .. }
@@ -1234,7 +1244,9 @@ impl IndexBuilder {
         let mut embedded = Vec::with_capacity(docs.len());
         for (index, (doc, result)) in docs.iter().zip(fast).enumerate() {
             let added = match result {
-                Ok(values) => builder.add_fast_record(&doc.id, &values),
+                Ok(values) => builder
+                    .add_fast_record(&doc.id, &values)
+                    .inspect_err(|error| export_error(metrics_exporter, error)),
                 Err(error) => {
                     export_error(metrics_exporter, &error);
                     Err(error)
@@ -1272,13 +1284,15 @@ impl IndexBuilder {
         for (&index, result) in embedded.iter().zip(results) {
             match result {
                 Ok(values) => {
-                    // As on the per-document path, a quality record the
-                    // builder refuses fails the whole document.
+                    // The fast record is already admitted. A rejected optional
+                    // quality record must not misreport that source as absent
+                    // from both tiers or undercount the persisted fast corpus.
                     if let Err(error) = builder.add_quality_record(&docs[index].id, &values) {
+                        export_error(metrics_exporter, &error);
                         if is_terminal_build_error(&error) {
                             return Err(error);
                         }
-                        outcomes[index] = BatchDocOutcome::Failed(error.to_string());
+                        outcomes[index] = BatchDocOutcome::Added(Some(error.to_string()));
                     }
                 }
                 Err(error) => {
@@ -1434,6 +1448,20 @@ async fn embed_build_document(
         response?
     };
     validate_build_producer(embedder, identity, tier)?;
+    // Bound responses already validate their declared dimension. Explicit
+    // legacy providers lack that wrapper, but a malformed first response must
+    // not establish the writer's dimension for every following document.
+    // Numeric retrieval-signal admission belongs to the index builder for
+    // every provider; its record failure remains local to the attempted tier.
+    if identity.is_none() {
+        let expected = embedder.dimension();
+        if values.len() != expected {
+            return Err(SearchError::DimensionMismatch {
+                expected,
+                found: values.len(),
+            });
+        }
+    }
     Ok(values)
 }
 
@@ -1549,6 +1577,15 @@ async fn embed_build_bound_batch(
     }
     validate_build_producer(embedder, Some(expected), tier)?;
     let bound = response?;
+    // A foreign producer response is terminal even when its cardinality is
+    // also malformed. Splitting on length first would discard that refusal
+    // and let a provider answer the single-input retries under another space.
+    if bound.iter().any(|response| &response.identity != expected) {
+        return Err(SearchError::UnverifiableRemoteSpace {
+            producer: format!("index_builder.{tier}"),
+            reason: "embedding response does not carry the admitted producer identity".to_owned(),
+        });
+    }
     if bound.len() != texts.len() {
         return Err(SearchError::EmbeddingFailed {
             model: embedder.id().to_owned(),
@@ -1558,12 +1595,6 @@ async fn embed_build_bound_batch(
                 texts.len()
             )
             .into(),
-        });
-    }
-    if bound.iter().any(|response| &response.identity != expected) {
-        return Err(SearchError::UnverifiableRemoteSpace {
-            producer: format!("index_builder.{tier}"),
-            reason: "embedding response does not carry the admitted producer identity".to_owned(),
         });
     }
     for response in &bound {
@@ -3585,9 +3616,10 @@ mod tests {
     /// document at a time would fail every document. When `faulty`, texts
     /// steer faults: `reject` fails any batch holding it; `nan`, `short` and
     /// `surplus` corrupt that row or the batch's cardinality; `foreign`
-    /// answers under another identity; `drift` changes the producer's own
-    /// identity while failing the batch; `cancel` cancels the caller and
-    /// fails, `racing` cancels it and succeeds.
+    /// answers under another identity; `foreign-short` / `foreign-surplus`
+    /// combine both violations only for multi-input batches; `drift` changes
+    /// the producer's own identity while failing the batch; `cancel` cancels
+    /// the caller and fails, `racing` cancels it and succeeds.
     struct BatchNativeEmbedder {
         inner: IdentityStubEmbedder,
         native: bool,
@@ -3683,15 +3715,25 @@ mod tests {
                     if self.faulty && *text == "nan" {
                         bound.values[0] = f32::NAN;
                     }
-                    if self.faulty && *text == "foreign" {
+                    if self.faulty && *text == "zero" {
+                        bound.values.fill(0.0);
+                    }
+                    if self.faulty && *text == "overflow" {
+                        bound.values.fill(f32::MAX);
+                    }
+                    if self.faulty
+                        && (*text == "foreign"
+                            || (texts.len() > 1
+                                && matches!(*text, "foreign-short" | "foreign-surplus")))
+                    {
                         bound.identity = self.foreign_identity.clone();
                     }
                     outputs.push(bound);
                 }
-                if faulted("short") {
+                if faulted("short") || (texts.len() > 1 && faulted("foreign-short")) {
                     outputs.pop();
                 }
-                if faulted("surplus") {
+                if faulted("surplus") || (texts.len() > 1 && faulted("foreign-surplus")) {
                     outputs.push(outputs[0].clone());
                 }
                 Ok(outputs)
@@ -3920,6 +3962,109 @@ mod tests {
         });
     }
 
+    #[test]
+    fn batch_native_build_keeps_valid_rows_after_numeric_record_refusals() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                for fault in ["zero", "overflow"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let exporter = Arc::new(RecordingExporter::default());
+                    let (stack, fast, quality) = batch_native_stack([true, true], tier);
+                    let stats = IndexBuilder::new(dir.path())
+                        .with_config(
+                            TwoTierConfig::default().with_metrics_exporter(exporter.clone()),
+                        )
+                        .with_embedder_stack(stack)
+                        .with_batch_size(4)
+                        .add_document("bad", fault)
+                        .add_document("good", "survivor")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+                    let fast_failed = tier == "fast";
+                    assert_eq!(stats.doc_count, if fast_failed { 1 } else { 2 });
+                    assert_eq!(stats.error_count, usize::from(fast_failed));
+                    assert_eq!(stats.quality_indexed, 1);
+                    assert_eq!(stats.quality_errors.len(), usize::from(!fast_failed));
+                    assert_eq!(exporter.errors.lock().unwrap().len(), 1);
+                    // The bound batch remains valid as a producer response.
+                    // Its unusable row is isolated at the storage admission
+                    // boundary, without repeating otherwise valid inference.
+                    assert_eq!(fast.batch_widths(), [2]);
+                    assert_eq!(quality.batch_widths(), [if fast_failed { 1 } else { 2 }]);
+                    for (name, expected) in [
+                        (
+                            VECTOR_INDEX_FAST_FILENAME,
+                            if fast_failed {
+                                vec!["good"]
+                            } else {
+                                vec!["bad", "good"]
+                            },
+                        ),
+                        (VECTOR_INDEX_QUALITY_FILENAME, vec!["good"]),
+                    ] {
+                        let vectors = indexed_vectors(&dir.path().join(name));
+                        assert_eq!(
+                            vectors.keys().map(String::as_str).collect::<Vec<_>>(),
+                            expected
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn all_quality_record_refusals_replace_the_corpus_with_fast_only_coverage() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("retired", "old complete corpus")
+                .build(&cx)
+                .await
+                .unwrap();
+            let (stack, _, _) = batch_native_stack([true, true], "quality");
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stack)
+                .add_document("zero", "zero")
+                .add_document("overflow", "overflow")
+                .build(&cx)
+                .await
+                .expect("every fast row remains usable when every quality record is refused");
+            assert_eq!(stats.doc_count, 2);
+            assert_eq!(stats.error_count, 0);
+            assert_eq!(stats.quality_indexed, 0);
+            assert_eq!(stats.quality_errors.len(), 2);
+            assert!(!stats.has_quality_index);
+            let reopened = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+            assert_eq!(reopened.doc_count(), 2);
+            assert!(!reopened.has_quality_index());
+            for doc_id in ["zero", "overflow"] {
+                assert!(reopened.fast_vector_for_doc_id(doc_id).unwrap().is_some());
+                assert!(
+                    reopened
+                        .quality_vector_for_doc_id(doc_id)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(
+                reopened
+                    .fast_vector_for_doc_id("retired")
+                    .unwrap()
+                    .is_none()
+            );
+            #[cfg(feature = "quill")]
+            {
+                let receipt = stats.lexical.as_ref().unwrap();
+                assert_eq!(receipt.indexed, 2);
+                assert_quill_source_body(&cx, receipt, "zero", "zero").await;
+                assert_quill_source_body(&cx, receipt, "overflow", "overflow").await;
+            }
+        });
+    }
+
     /// A native batch must never embed a later duplicate, including when the
     /// first occurrence is rejected by batch bisection. Both tiers keep the
     /// same source owner across batch boundaries.
@@ -3999,7 +4144,14 @@ mod tests {
     fn batch_native_build_stops_on_foreign_identity_or_cancellation() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for tier in ["fast", "quality"] {
-                for fault in ["foreign", "drift", "cancel", "racing"] {
+                for fault in [
+                    "foreign",
+                    "foreign-short",
+                    "foreign-surplus",
+                    "drift",
+                    "cancel",
+                    "racing",
+                ] {
                     let dir = tempfile::tempdir().unwrap();
                     let exporter = Arc::new(RecordingExporter::default());
                     let (stack, fast, quality) = batch_native_stack([true, true], tier);
@@ -5376,6 +5528,140 @@ mod tests {
             assert_eq!(stats.quality_indexed, 1);
             assert_eq!(stats.quality_errors.len(), 1);
             assert_eq!(stats.quality_errors[0].0, "doc-marked");
+        });
+    }
+
+    /// An explicitly supplied legacy provider still has to honor its numeric
+    /// output contract. Reject one malformed response before it enters a
+    /// writer, so a bad fast row cannot abort otherwise valid documents and
+    /// a bad quality row cannot erase its already accepted fast counterpart.
+    #[test]
+    fn malformed_legacy_outputs_preserve_healthy_rows_and_quality_receipts() {
+        struct MalformedLegacyEmbedder;
+
+        impl Embedder for MalformedLegacyEmbedder {
+            fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                Box::pin(async move {
+                    Ok(match text {
+                        "short" => vec![1.0, 0.0, 0.0],
+                        "empty" => Vec::new(),
+                        "nan" => vec![f32::NAN, 0.0, 0.0, 0.0],
+                        "infinity" => vec![f32::INFINITY, 0.0, 0.0, 0.0],
+                        "zero" => vec![0.0; 4],
+                        "overflow" => vec![f32::MAX; 4],
+                        _ => vec![1.0, 0.0, 0.0, 0.0],
+                    })
+                })
+            }
+
+            fn dimension(&self) -> usize {
+                4
+            }
+
+            fn id(&self) -> &'static str {
+                "malformed-legacy"
+            }
+
+            fn model_name(&self) -> &'static str {
+                self.id()
+            }
+
+            fn is_semantic(&self) -> bool {
+                true
+            }
+
+            fn category(&self) -> ModelCategory {
+                ModelCategory::StaticEmbedder
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in ["fast", "quality"] {
+                for native_other_tier in [false, true] {
+                    for malformed in ["short", "empty", "nan", "infinity", "zero", "overflow"] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let exporter = Arc::new(RecordingExporter::default());
+                        let healthy =
+                            BatchNativeEmbedder::new("healthy", 4, native_other_tier, false);
+                        let bad: Arc<dyn Embedder> = Arc::new(MalformedLegacyEmbedder);
+                        let stack = if tier == "fast" {
+                            EmbedderStack::from_parts(
+                                bad,
+                                Some(Arc::clone(&healthy) as Arc<dyn Embedder>),
+                            )
+                        } else {
+                            EmbedderStack::from_parts(
+                                Arc::clone(&healthy) as Arc<dyn Embedder>,
+                                Some(bad),
+                            )
+                        };
+                        // The invalid response comes first: it must not define
+                        // the tier dimension for every subsequent document.
+                        let stats = IndexBuilder::new(dir.path())
+                            .with_config(
+                                TwoTierConfig::default().with_metrics_exporter(exporter.clone()),
+                            )
+                            .with_embedder_stack(stack)
+                            .with_batch_size(2)
+                            .add_document("bad", malformed)
+                            .add_document("good", "healthy document")
+                            .build(&cx)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("{tier}/{native_other_tier}/{malformed}: {error}")
+                            });
+                        let fast_failed = tier == "fast";
+                        assert_eq!(stats.source_count, 2);
+                        assert_eq!(stats.doc_count, if fast_failed { 1 } else { 2 });
+                        assert_eq!(stats.error_count, usize::from(fast_failed));
+                        assert_eq!(stats.errors.len(), usize::from(fast_failed));
+                        assert_eq!(stats.quality_indexed, 1);
+                        assert_eq!(stats.quality_errors.len(), usize::from(!fast_failed));
+                        assert_eq!(exporter.errors.lock().unwrap().len(), 1);
+                        let errors = if fast_failed {
+                            &stats.errors
+                        } else {
+                            &stats.quality_errors
+                        };
+                        assert_eq!(errors[0].0, "bad");
+
+                        let reopened =
+                            TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+                        assert_eq!(reopened.doc_count(), stats.doc_count);
+                        assert!(reopened.fast_vector_for_doc_id("good").unwrap().is_some());
+                        assert!(
+                            reopened
+                                .quality_vector_for_doc_id("good")
+                                .unwrap()
+                                .is_some()
+                        );
+                        assert_eq!(
+                            reopened.fast_vector_for_doc_id("bad").unwrap().is_some(),
+                            !fast_failed
+                        );
+                        assert!(reopened.quality_vector_for_doc_id("bad").unwrap().is_none());
+                        for name in [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME] {
+                            for vector in indexed_vectors(&dir.path().join(name)).values() {
+                                assert_eq!(vector.len(), 4);
+                                assert!(vector.iter().all(|value| value.is_finite()));
+                            }
+                        }
+                        #[cfg(feature = "quill")]
+                        {
+                            let receipt = stats.lexical.as_ref().unwrap();
+                            assert_eq!(receipt.indexed, 2);
+                            assert_quill_source_body(&cx, receipt, "bad", malformed).await;
+                        }
+                        if native_other_tier {
+                            assert_eq!(healthy.single_calls.load(Ordering::SeqCst), 0);
+                            assert_eq!(
+                                healthy.batch_widths(),
+                                vec![if fast_failed { 1 } else { 2 }]
+                            );
+                        }
+                    }
+                }
+            }
         });
     }
 
