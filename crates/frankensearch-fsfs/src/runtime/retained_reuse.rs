@@ -1482,6 +1482,7 @@ fn copy_file(cx: &Cx, source: &Path, target: &Path, stats: &mut CopyStats) -> Se
 mod copy_tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
+    use frankensearch_core::LexicalWrite as _;
     use std::os::unix::fs::MetadataExt;
 
     fn inventory_fixture(
@@ -1693,21 +1694,63 @@ mod copy_tests {
             let parent = tempfile::tempdir().unwrap();
             let store = CompleteGenerationStore::create(&cx, parent.path()).unwrap();
             let first = store.begin(&cx).unwrap();
-            fs::create_dir(first.path().join("lexical")).unwrap();
-            // The layout detector needs only this legacy marker. The refusal
-            // must happen before any loader, source rebuild or candidate copy.
-            fs::write(first.path().join("lexical/meta.json"), b"{}").unwrap();
+            let legacy =
+                frankensearch_lexical::TantivyIndex::create(&first.path().join("lexical")).unwrap();
+            legacy
+                .index_document(
+                    &cx,
+                    &frankensearch_core::IndexableDocument::new(
+                        "retained.md",
+                        "retained legacy content",
+                    ),
+                )
+                .await
+                .unwrap();
+            legacy.commit(&cx).await.unwrap();
+            drop(legacy);
+            let runtime = FsfsRuntime::new(crate::config::FsfsConfig::default());
+            runtime
+                .write_index_sentinel(first.path(), &super::super::IndexSentinel {
+                    schema_version: 1,
+                    generation_complete: true,
+                    generated_at_ms: 1,
+                    command: "index".to_owned(),
+                    target_root: parent.path().display().to_string(),
+                    index_root: first.path().display().to_string(),
+                    discovered_files: 1,
+                    indexed_files: 1,
+                    skipped_files: 0,
+                    reason_codes: vec![
+                        super::super::REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY.to_owned(),
+                    ],
+                    total_canonical_bytes: 23,
+                    source_hash_hex: content_sha256_hex(b"retained legacy content"),
+                    fast_window_max_per_file: 1,
+                })
+                .unwrap();
             let publication = first.publish(&cx, |_, _| Ok(())).unwrap();
             let crate::generation_store::GenerationPublication::Durable(predecessor) = publication
             else {
                 panic!("fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
             };
+            // Establish admission prerequisites before testing the migration
+            // fence. A marker-only fixture would fail on missing topology first.
+            assert_eq!(
+                FsfsRuntime::retained_generation_search_mode(predecessor.path()).unwrap(),
+                SearchExecutionMode::LexicalOnly
+            );
+            assert_eq!(
+                FsfsRuntime::resolve_lexical_engine(predecessor.path())
+                    .unwrap()
+                    .engine(),
+                Some(frankensearch_quill::BlueGreenEngine::Tantivy)
+            );
             let build = store.begin(&cx).unwrap();
-            let runtime = FsfsRuntime::new(crate::config::FsfsConfig::default());
             let error = copy_selected_generation(&cx, &runtime, &store, build.path()).unwrap_err();
             assert!(
-                matches!(error, SearchError::InvalidConfig { field, reason, .. }
-                if field == "complete_generation.reuse" && reason.contains("legacy lexical generation"))
+                matches!(&error, SearchError::InvalidConfig { field, reason, .. }
+                if field == "complete_generation.reuse" && reason.contains("legacy lexical generation")),
+                "{error:?}"
             );
             assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor));
@@ -2109,6 +2152,9 @@ mod generation_tests {
                 runtime.config.indexing.embedding_batch_size = 2;
             }
             if operation == "query_tuning" {
+                runtime.config.search.default_limit = 1;
+                runtime.config.search.explain = true;
+                runtime.config.search.rerank = true;
                 runtime.config.search.quality_weight = 0.25;
                 runtime.config.search.rrf_k = 30.0;
                 runtime.config.search.quality_timeout_ms = 10_000;
@@ -2959,6 +3005,9 @@ mod generation_tests {
             runtime.config.search.quality_timeout_ms = 5_000;
             "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
             if operation == "query_tuning" {
+                runtime.config.search.default_limit = 1;
+                runtime.config.search.explain = true;
+                runtime.config.search.rerank = true;
                 runtime.config.search.quality_weight = 0.25;
                 runtime.config.search.rrf_k = 30.0;
                 runtime.config.search.quality_timeout_ms = 10_000;

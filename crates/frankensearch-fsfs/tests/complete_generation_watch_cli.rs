@@ -357,6 +357,7 @@ fn wait_for_visible_paths(
                     "find a relevant document",
                     "--fast-only",
                     "--no-daemon",
+                    "--no-rerank",
                     "--limit",
                     "10",
                 ]))
@@ -386,6 +387,7 @@ fn wait_for_visible_paths(
                             "find a relevant document",
                             "--quality-only",
                             "--no-daemon",
+                            "--no-rerank",
                             "--limit",
                             "10",
                         ]))
@@ -655,6 +657,7 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 "find a relevant document",
                 mode,
                 "--no-daemon",
+                "--no-rerank",
                 "--limit",
                 "10",
             ]))
@@ -758,6 +761,9 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
             ("compatible-contract", "none"),
             ("compatible-contract", "window"),
             ("compatible-contract", "tier"),
+            ("compatible-contract", "query_limit"),
+            ("compatible-contract", "query_explain"),
+            ("compatible-contract", "query_rerank"),
         ] {
             eprintln!(
                 "watch upgrade prior={prior_sha} current={current_sha} quality={quality} legacy_seed={legacy_seed} policy={policy} drift={drift}"
@@ -825,17 +831,32 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 let mut settings: FsfsConfig =
                     toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
                 let before = serde_json::to_value(&settings).unwrap();
-                let (section, field) = if drift == "window" {
-                    let cap = settings.indexing.fast_window_max_per_file;
-                    settings.indexing.fast_window_max_per_file = if cap == 1 { 2 } else { 1 };
-                    ("indexing", "fast_window_max_per_file")
-                } else {
-                    assert_eq!(drift, "tier");
-                    assert!(!settings.indexing.quality_model.is_empty());
-                    assert_eq!(settings.search.fast_only, !quality);
-                    settings.search.fast_only = quality;
-                    fixture.quality = !quality;
-                    ("search", "fast_only")
+                let (section, field) = match drift {
+                    "window" => {
+                        let cap = settings.indexing.fast_window_max_per_file;
+                        settings.indexing.fast_window_max_per_file = if cap == 1 { 2 } else { 1 };
+                        ("indexing", "fast_window_max_per_file")
+                    }
+                    "tier" => {
+                        assert!(!settings.indexing.quality_model.is_empty());
+                        assert_eq!(settings.search.fast_only, !quality);
+                        settings.search.fast_only = quality;
+                        fixture.quality = !quality;
+                        ("search", "fast_only")
+                    }
+                    "query_limit" => {
+                        settings.search.default_limit = 1;
+                        ("search", "default_limit")
+                    }
+                    "query_explain" => {
+                        settings.search.explain = true;
+                        ("search", "explain")
+                    }
+                    "query_rerank" => {
+                        settings.search.rerank = true;
+                        ("search", "rerank")
+                    }
+                    _ => panic!("unexpected upgrade fixture mutation: {drift}"),
                 };
                 let after = serde_json::to_value(&settings).unwrap();
                 assert_ne!(after, before);
@@ -864,7 +885,9 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 let actual_ranks = ranks(&fixture);
                 process.assert_alive();
                 let output = process.stop_gracefully();
-                let warm = restart || (policy == "compatible-contract" && drift == "none");
+                let query_only = matches!(drift, "query_limit" | "query_explain" | "query_rerank");
+                let warm =
+                    restart || (policy == "compatible-contract" && (drift == "none" || query_only));
                 assert_carried(&output, if warm { 2 } else { 0 });
                 let batches = document_batches(&output);
                 assert_eq!(batches == 0, warm);

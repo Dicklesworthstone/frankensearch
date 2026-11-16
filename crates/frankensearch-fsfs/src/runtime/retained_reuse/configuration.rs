@@ -93,11 +93,14 @@ pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
     config.indexing.upgrade_reuse = UpgradeReusePolicy::SameExecutable;
     config.search.ranking_priors = false;
 
-    // These controls apply after query-time Initial publication, or to query
-    // ranking. They do not select documents, producers or indexing coverage.
+    // These controls change query presentation, ranking or deadlines. They do
+    // not select indexed documents, producers or indexing coverage.
     // In particular, do NOT replace SearchConfig wholesale: fast_only affects
     // which tiers are indexed, and unknown future fields must stay conservative.
     let defaults = SearchConfig::default();
+    config.search.default_limit = defaults.default_limit;
+    config.search.explain = defaults.explain;
+    config.search.rerank = defaults.rerank;
     config.search.quality_weight = defaults.quality_weight;
     config.search.rrf_k = defaults.rrf_k;
     config.search.quality_timeout_ms = defaults.quality_timeout_ms;
@@ -172,6 +175,9 @@ mod tests {
         let expected = digest(&config).unwrap();
         let expected_contract = contract_digest(&config).unwrap();
         let changes: &[Change] = &[
+            ("default_limit", |c| c.search.default_limit = 1),
+            ("explain", |c| c.search.explain = true),
+            ("rerank", |c| c.search.rerank = true),
             ("quality_weight", |c| c.search.quality_weight = 0.25),
             ("rrf_k", |c| c.search.rrf_k = 30.0),
             ("quality_timeout_ms", |c| {
@@ -304,6 +310,9 @@ mod tests {
     fn fingerprinting_does_not_change_the_callers_query_policy() {
         let mut config = FsfsConfig::default();
         config.indexing.watch_mode = true;
+        config.search.default_limit = 1;
+        config.search.explain = true;
+        config.search.rerank = true;
         config.search.quality_weight = 0.25;
         config.search.rrf_k = 30.0;
         config.search.quality_timeout_ms = 4_000;
@@ -395,9 +404,6 @@ mod tests {
         let config = FsfsConfig::default();
         let expected = digest(&config).unwrap();
         let changes: &[Change] = &[
-            ("default_limit", |c| c.search.default_limit += 1),
-            ("explain", |c| c.search.explain = true),
-            ("rerank", |c| c.search.rerank = true),
             ("shadow", |c| c.search.shadow_mode = true),
             ("shadow_rate", |c| {
                 c.search.shadow_sample_rate_basis_points += 1;

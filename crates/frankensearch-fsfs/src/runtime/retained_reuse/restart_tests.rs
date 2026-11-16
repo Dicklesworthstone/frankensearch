@@ -229,9 +229,8 @@ fn restart_child() {
             rebuild(&runtime, &cx, &root).await
         } else {
             if mode == "seed_changed_config" {
-                // The default limit is unlimited (usize::MAX); any finite value
-                // changes the configuration without overflowing.
-                runtime.config.search.default_limit = 17;
+                // Change indexing work rather than a reviewed query-only knob.
+                runtime.config.indexing.embedding_batch_size += 1;
             } else if matches!(mode.as_str(), "seed_full" | "seed_force") {
                 assert!(runtime.cli_input.full_reindex);
             } else {
