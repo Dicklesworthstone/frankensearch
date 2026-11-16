@@ -14576,6 +14576,11 @@ impl FsfsRuntime {
         payloads: &[SearchPayload],
     ) -> SearchResult<bool> {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
+        // The request owns the query identity. A cache key alone cannot attest
+        // that every stored phase answered it, including its exclusions.
+        if payloads.iter().any(|payload| payload.query != normalized_query) {
+            return Ok(false);
+        }
         if let Err(error) = Self::validate_cached_query_exclusions(cx, resources, payloads) {
             Self::exclusion_membership_checkpoint(cx)?;
             if matches!(&error, SearchError::InvalidConfig { field, value, .. }
@@ -15080,7 +15085,9 @@ impl FsfsRuntime {
         if record.complete_generation != complete_generation {
             return Ok(None);
         }
-        if !Self::search_payloads_cacheable(&record.payloads) {
+        if !Self::search_payloads_cacheable(&record.payloads)
+            || record.payloads.iter().any(|payload| payload.query != key.query)
+        {
             return Ok(None);
         }
         Ok(Some(record.payloads))
@@ -15092,7 +15099,9 @@ impl FsfsRuntime {
         payloads: &[SearchPayload],
         index_fingerprint: &str,
     ) -> SearchResult<()> {
-        if !Self::search_payloads_cacheable(payloads) {
+        if !Self::search_payloads_cacheable(payloads)
+            || payloads.iter().any(|payload| payload.query != key.query)
+        {
             return Ok(());
         }
         let cache_path = self.search_cache_path(key)?;
@@ -67336,6 +67345,155 @@ mod tests {
                 .unwrap(),
             replacement
         );
+    }
+
+    #[test]
+    fn search_caches_bind_every_payload_to_the_requested_query() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("index");
+            let lexical = create_test_quill(&cx, &root.join(super::FSFS_QUILL_ENGINE_DIR)).await;
+            for (id, text) in [
+                ("kept.rs", "catalog safe"),
+                ("excluded.rs", "catalog banned"),
+            ] {
+                lexical
+                    .index_document(&cx, &IndexableDocument::new(id, text))
+                    .await
+                    .unwrap();
+            }
+            lexical.commit(&cx).await.unwrap();
+            drop(lexical);
+            let pointer = CurrentPointer::new(
+                BlueGreenEngine::Quill,
+                super::FSFS_QUILL_ENGINE_DIR,
+                frankensearch_quill::FSLX_FORMAT_VERSION,
+            )
+            .unwrap();
+            publish_current(&root, &pointer).unwrap();
+            let mut config = FsfsConfig::default();
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(root.clone()),
+                ..CliInput::default()
+            });
+            let mode = SearchExecutionMode::LexicalOnly;
+            let mut resources = runtime
+                .prepare_search_execution_resources_at_root_with_modes(&cx, &root, mode, mode)
+                .await
+                .unwrap();
+            let flags = SearchExecutionFlags {
+                include_snippets: false,
+                persist_explain_session: false,
+            };
+            let positive = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx, "catalog", 10, mode, &mut resources, flags,
+                )
+                .await
+                .unwrap();
+            assert_eq!(positive.len(), 1);
+            let positive_ids = positive[0]
+                .hits
+                .iter()
+                .map(|hit| hit.path.as_str())
+                .collect::<HashSet<_>>();
+            assert_eq!(positive_ids, HashSet::from(["kept.rs", "excluded.rs"]));
+            let request_query = "  catalog\t-banned  ";
+            let key = runtime.search_cache_key(request_query, 10, mode).unwrap();
+            assert_eq!(key.query, "catalog -banned");
+            let valid = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx, request_query, 10, mode, &mut resources, flags,
+                )
+                .await
+                .unwrap();
+            assert_eq!(valid.len(), 1);
+            assert_eq!(valid[0].query, key.query);
+            assert_eq!(valid[0].hits.len(), 1);
+            assert_eq!(valid[0].hits[0].path, "kept.rs");
+            assert!(runtime
+                .admit_cached_search_producers(&cx, &mut resources, mode, &key.query, &valid)
+                .await
+                .unwrap());
+            // The key and generation can agree while the stored answer names
+            // a different query. Its positive query must not bypass exclusions.
+            assert!(!runtime
+                .admit_cached_search_producers(&cx, &mut resources, mode, &key.query, &positive)
+                .await
+                .unwrap());
+
+            let fingerprint = resources.generation_fingerprint.clone();
+            runtime.write_search_payload_cache(&key, &valid, &fingerprint).unwrap();
+            let path = runtime.search_cache_path(&key).unwrap();
+            let original_bytes = fs::read(&path).unwrap();
+            assert_eq!(
+                runtime.try_load_search_payload_cache(&key, &fingerprint).unwrap(),
+                Some(valid.clone())
+            );
+            let mut mixed = valid.clone();
+            mixed.extend(positive.clone());
+            mixed[1].phase = SearchOutputPhase::Refined;
+            for mismatched in [positive.clone(), mixed] {
+                runtime
+                    .write_search_payload_cache(&key, &mismatched, &fingerprint)
+                    .unwrap();
+                assert_eq!(fs::read(&path).unwrap(), original_bytes);
+                let mut record: SearchCacheRecord = serde_json::from_slice(&original_bytes).unwrap();
+                record.payloads = mismatched.clone();
+                fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+                assert!(runtime
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap()
+                    .is_none());
+                let mut emitted = Vec::new();
+                let recovered = runtime
+                    .execute_search_payloads_cached_for_cli_with_phase_sink(
+                        &cx, request_query, 10, &mut |payload| {
+                            emitted.push(payload.clone());
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(emitted, recovered);
+                assert_eq!(recovered.len(), 1);
+                assert_eq!(recovered[0].query, key.query);
+                assert_eq!(recovered[0].hits.len(), 1);
+                assert_eq!(recovered[0].hits[0].path, "kept.rs");
+                assert!(runtime.try_load_search_payload_cache(&key, &fingerprint).unwrap().is_some());
+
+                let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                    "query": request_query,
+                    "limit": 10,
+                    "mode": mode.label(),
+                }))
+                .unwrap();
+                let mut hot_cache = HashMap::from([(key.clone(), mismatched)]);
+                for expected_cached in [false, true] {
+                    let response = runtime
+                        .execute_search_serve_request(
+                            &cx, request.clone(), &mut resources, &mut hot_cache, true,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.cached, expected_cached);
+                    assert_eq!(response.payloads.len(), 1);
+                    assert_eq!(response.payloads[0].query, key.query);
+                    assert_eq!(response.payloads[0].hits.len(), 1);
+                    assert_eq!(response.payloads[0].hits[0].path, "kept.rs");
+                }
+                // Restore the exact valid record for the next invalid-write control.
+                fs::write(&path, &original_bytes).unwrap();
+            }
+            cx.cancel_with(asupersync::CancelKind::User, Some("cancel mismatched cache admission"));
+            assert!(matches!(
+                runtime
+                    .admit_cached_search_producers(&cx, &mut resources, mode, &key.query, &positive)
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
+        });
     }
 
     #[test]
