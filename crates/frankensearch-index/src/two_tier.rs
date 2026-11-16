@@ -2572,7 +2572,8 @@ impl TwoTierIndexBuilder {
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` if this record dimension differs
-    /// from previously added fast-tier vectors.
+    /// from previously added fast-tier vectors, or `SearchError::InvalidConfig`
+    /// for duplicate identifiers, non-finite coordinates, or an unusable norm.
     pub fn add_fast_record(
         &mut self,
         doc_id: impl Into<String>,
@@ -2581,7 +2582,7 @@ impl TwoTierIndexBuilder {
         let doc_id = doc_id.into();
         validate_record_admission(
             &doc_id,
-            embedding.len(),
+            embedding,
             self.fast_dimension,
             &self.fast_ids,
             "fast",
@@ -2606,7 +2607,7 @@ impl TwoTierIndexBuilder {
         let doc_id = doc_id.into();
         validate_record_admission(
             &doc_id,
-            embedding.len(),
+            &embedding,
             self.fast_dimension,
             &self.fast_ids,
             "fast",
@@ -2620,7 +2621,8 @@ impl TwoTierIndexBuilder {
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` if this record dimension differs
-    /// from previously added quality-tier vectors.
+    /// from previously added quality-tier vectors, or `SearchError::InvalidConfig`
+    /// for duplicate identifiers, non-finite coordinates, or an unusable norm.
     pub fn add_quality_record(
         &mut self,
         doc_id: impl Into<String>,
@@ -2629,7 +2631,7 @@ impl TwoTierIndexBuilder {
         let doc_id = doc_id.into();
         validate_record_admission(
             &doc_id,
-            embedding.len(),
+            embedding,
             self.quality_dimension,
             &self.quality_ids,
             "quality",
@@ -2646,8 +2648,9 @@ impl TwoTierIndexBuilder {
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` if either tier dimension is
-    /// inconsistent, or `SearchError::InvalidConfig` for a duplicate identifier
-    /// in either supplied tier. Every returned error leaves both tiers unchanged.
+    /// inconsistent, or `SearchError::InvalidConfig` for a duplicate identifier,
+    /// non-finite coordinates, or an unusable norm in either supplied tier.
+    /// Every returned error leaves both tiers unchanged.
     pub fn add_record(
         &mut self,
         doc_id: impl Into<String>,
@@ -2657,7 +2660,7 @@ impl TwoTierIndexBuilder {
         let doc_id = doc_id.into();
         validate_record_admission(
             &doc_id,
-            fast_embedding.len(),
+            fast_embedding,
             self.fast_dimension,
             &self.fast_ids,
             "fast",
@@ -2665,7 +2668,7 @@ impl TwoTierIndexBuilder {
         if let Some(quality_embedding) = quality_embedding {
             validate_record_admission(
                 &doc_id,
-                quality_embedding.len(),
+                quality_embedding,
                 self.quality_dimension,
                 &self.quality_ids,
                 "quality",
@@ -2836,11 +2839,12 @@ impl TwoTierIndexBuilder {
 
 fn validate_record_admission(
     doc_id: &str,
-    dimension: usize,
+    embedding: &[f32],
     expected_dimension: Option<usize>,
     doc_ids: &std::collections::HashSet<String>,
     tier: &str,
 ) -> SearchResult<()> {
+    let dimension = embedding.len();
     if let Some(expected) = expected_dimension
         && expected != dimension
     {
@@ -2854,6 +2858,23 @@ fn validate_record_admission(
             field: "doc_id".to_owned(),
             value: doc_id.to_owned(),
             reason: format!("duplicate doc_id in {tier} tier; each document must have a unique id"),
+        });
+    }
+    // Admit the same numeric domain as the FSVI writer before changing the
+    // buffered corpus. Deferring this until finish would let one rejected
+    // record poison otherwise valid documents and reserve its ID/dimension.
+    if embedding.iter().any(|value| !value.is_finite()) {
+        return Err(SearchError::InvalidConfig {
+            field: "embedding".to_owned(),
+            value: "<contains non-finite values>".to_owned(),
+            reason: "all embedding values must be finite".to_owned(),
+        });
+    }
+    if !crate::vector_signal_usable(embedding) {
+        return Err(SearchError::InvalidConfig {
+            field: "embedding".to_owned(),
+            value: "<zero-or-nonfinite-norm vector>".to_owned(),
+            reason: "embedding squared norm must be non-zero and finite".to_owned(),
         });
     }
     Ok(())
@@ -4556,12 +4577,13 @@ mod tests {
             let before = paths.each_ref().map(|path| fs::read(path).unwrap());
 
             let mut replacement = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
-            replacement
+            let error = replacement
                 .add_record("refused", &[0.0, 1.0], Some(quality))
-                .expect("buffer the pair before FSVI writer validation");
+                .expect_err("refuse invalid quality before buffering either tier");
+            assert!(matches!(error, SearchError::InvalidConfig { .. }), "{case}");
             replacement
                 .finish()
-                .expect_err("invalid quality data cannot publish a replacement");
+                .expect_err("a refused pair leaves no replacement to publish");
 
             for (path, bytes) in paths.iter().zip(before) {
                 assert_eq!(
@@ -4578,6 +4600,51 @@ mod tests {
             let hits = index.search_fast(&[1.0, 0.0], 10).unwrap();
             assert_eq!(hits.len(), 1, "{case}");
             assert_eq!(hits[0].doc_id, "retained", "{case}");
+        }
+    }
+
+    #[test]
+    fn builder_invalid_numeric_records_leave_identifiers_and_dimensions_available() {
+        let malformed: [(&str, &[f32]); 6] = [
+            ("zero", &[0.0, 0.0]),
+            ("nan", &[f32::NAN, 1.0]),
+            ("infinite", &[f32::INFINITY, 1.0]),
+            ("overflow", &[f32::MAX, f32::MAX]),
+            ("underflow", &[f32::MIN_POSITIVE, f32::MIN_POSITIVE]),
+            ("empty", &[]),
+        ];
+        for (case, embedding) in malformed {
+            for route in ["fast", "quality", "pair-fast", "pair-quality"] {
+                let dir = temp_index_dir(&format!("record-numeric-admission-{route}-{case}"));
+                let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+                let rejected = match route {
+                    "fast" => builder.add_fast_record("retried", embedding),
+                    "quality" => builder.add_quality_record("retried", embedding),
+                    "pair-fast" => builder.add_record("retried", embedding, Some(&[1.0, 0.0])),
+                    _ => builder.add_record("retried", &[1.0, 0.0], Some(embedding)),
+                };
+                assert!(
+                    matches!(rejected, Err(SearchError::InvalidConfig { .. })),
+                    "{route}/{case}: {rejected:?}"
+                );
+                // Different dimensions expose accidental shape reservation;
+                // the same ID exposes a partially accepted paired record.
+                builder
+                    .add_record("retried", &[0.0, 1.0, 0.0], Some(&[1.0, 0.0, 0.0, 0.0]))
+                    .expect("a refused record must leave both tiers unchanged");
+                drop(builder.finish().expect("valid retry must persist"));
+                let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+                assert_eq!(reopened.doc_count(), 1);
+                let hits = reopened.search_fast(&[0.0, 1.0, 0.0], 10).unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id, "retried");
+                assert_eq!(
+                    reopened
+                        .quality_scores_for_hits(&[1.0, 0.0, 0.0, 0.0], &hits)
+                        .unwrap(),
+                    vec![Some(1.0)]
+                );
+            }
         }
     }
 
