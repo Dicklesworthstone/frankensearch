@@ -17268,7 +17268,11 @@ impl FsfsRuntime {
     /// with [`ConsentSource::Interactive`]. Declining, offline mode, a
     /// non-interactive terminal, or a machine output format leaves the
     /// existing typed readiness error in charge.
-    async fn maybe_offer_interactive_model_provisioning(&self, cx: &Cx) -> SearchResult<()> {
+    async fn maybe_offer_interactive_model_provisioning(
+        &self,
+        cx: &Cx,
+        require_missing_fast: bool,
+    ) -> SearchResult<()> {
         let offline = self.config.indexing.offline;
         let interactive_terminal =
             std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
@@ -17285,6 +17289,19 @@ impl FsfsRuntime {
         }
         let model_root = self.resolve_download_model_root()?;
         let missing = self.missing_interactive_model_downloads(&model_root)?;
+        // Early legacy admission needs only the required fast producer. Leave
+        // optional-only offers to the indexer, so a declined quality download
+        // does not prompt again after fast admission succeeds. When fast is
+        // missing, offer every selected missing model together as usual.
+        if require_missing_fast {
+            let fast = self.selected_fast_model_id()?;
+            if !missing
+                .iter()
+                .any(|(manifest, _)| manifest.id == fast)
+            {
+                return Ok(());
+            }
+        }
 
         let decision = interactive_model_provisioning_decision(
             offline,
@@ -21715,7 +21732,8 @@ impl FsfsRuntime {
             Some(embedder)
         } else {
             control.admit_work(cx, "index.model_provisioning").await?;
-            self.maybe_offer_interactive_model_provisioning(cx).await?;
+            self.maybe_offer_interactive_model_provisioning(cx, false)
+                .await?;
             control.admit_work(cx, "index.fast_model_load").await?;
             let embedder = self.resolve_fast_embedder()?;
             control.checkpoint(cx, "index.fast_model_loaded", true)?;
@@ -34685,9 +34703,7 @@ fn emit_model_free_build_hint() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "semantic-support")]
-    use std::collections::HashSet;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
     use std::future::{Future, poll_fn};
 

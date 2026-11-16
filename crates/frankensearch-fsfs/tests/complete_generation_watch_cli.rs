@@ -866,6 +866,143 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
     let current_sha = file_sha256(&current);
     assert_ne!(prior_sha, current_sha);
 
+    // A terminal operator can decline downloads once. A verified fast producer
+    // permits promotion; a missing required producer must preserve the legacy.
+    for missing_fast in [false, true] {
+        let mut fixture = Fixture::new(None, false);
+        let private = private_models(&fixture, &models);
+        let mut settings: FsfsConfig =
+            toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+        settings.indexing.model_dir = private.display().to_string();
+        settings.indexing.quality_model = FsfsConfig::default().indexing.quality_model;
+        settings.search.fast_only = false;
+        fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
+        fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
+        fixture.executable.clone_from(&prior);
+        let seed = Process::start(
+            fixture
+                .command("index", "json")
+                .env("FSFS_COMPLETE_GENERATIONS", "false"),
+        )
+        .finish(Duration::from_secs(180));
+        assert!(seed.status.success(), "{seed:?}");
+        let summary: Value = serde_json::from_slice(&seed.stdout).unwrap();
+        assert_eq!(summary["data"]["semantic_indexed_files"], 2);
+        assert_eq!(summary["data"]["generation_complete"], true);
+        assert!(!fixture.store.join("FSFS-CURRENT").exists());
+        assert!(!private.join("all-MiniLM-L6-v2").exists());
+        let old_artifacts = artifacts(&fixture.store);
+        let old_receipt = fs::read(fixture.store.join("FSFS-LEGACY-REUSE.json")).unwrap();
+        let old_ranks = ranks(&fixture);
+
+        settings.indexing.offline = false;
+        let empty_models = fixture.directory.path().join("missing-models");
+        if missing_fast {
+            fs::create_dir(&empty_models).unwrap();
+            settings.indexing.model_dir = empty_models.display().to_string();
+        }
+        fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
+        fixture.executable.clone_from(&current);
+        let mut invocation = fixture.command("index", "table");
+        invocation.args(["--upgrade-reuse", "compatible-contract", "--no-color"]);
+        let arguments = std::iter::once(invocation.get_program())
+            .chain(invocation.get_args())
+            .map(|argument| argument.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        // Python supplies actual terminal descriptors to the production binary;
+        // no fsfs terminal check or consent policy is replaced by a test hook.
+        let mut terminal = Command::new("python3");
+        terminal
+            .arg("-c")
+            .arg(
+                r"import errno, json, os, pty, select, subprocess, sys, time
+master, slave = pty.openpty()
+child = subprocess.Popen(json.loads(sys.argv[1]), stdin=slave, stdout=slave, stderr=slave)
+os.close(slave)
+transcript = bytearray()
+answers = 0
+deadline = time.monotonic() + 120
+try:
+    while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError('terminal index deadline')
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if not readable:
+            if child.poll() is not None:
+                break
+            continue
+        try:
+            chunk = os.read(master, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        transcript.extend(chunk)
+        if len(transcript) > 1048576:
+            raise RuntimeError('unexpected terminal output volume')
+        prompts = transcript.count(b'consent>')
+        if prompts > 4:
+            raise RuntimeError('unexpected consent loop')
+        if prompts > answers:
+            os.write(master, b'n\n' * (prompts - answers))
+            answers = prompts
+    status = child.wait(timeout=5)
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.wait()
+    os.close(master)
+print(json.dumps({'exit_code': status, 'prompts': answers,
+                  'transcript': transcript.decode('utf-8', errors='replace')}))
+",
+            )
+            .arg(serde_json::to_string(&arguments).unwrap())
+            .current_dir(invocation.get_current_dir().unwrap());
+        for (name, value) in invocation.get_envs() {
+            if let Some(value) = value {
+                terminal.env(name, value);
+            } else {
+                terminal.env_remove(name);
+            }
+        }
+        let output = Process::start(&mut terminal).finish(Duration::from_secs(180));
+        assert!(output.status.success(), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["prompts"], 1, "{result}");
+        let transcript = result["transcript"].as_str().unwrap();
+        if missing_fast {
+            assert_eq!(
+                result["exit_code"],
+                frankensearch_fsfs::adapters::cli::exit_code::MODEL_UNAVAILABLE,
+                "{result}"
+            );
+            assert!(transcript.contains("Download 2 ("), "{result}");
+            assert!(!fixture.store.join("FSFS-CURRENT").exists());
+            assert_eq!(fs::read_dir(&empty_models).unwrap().count(), 0);
+            settings.indexing.model_dir = private.display().to_string();
+            fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
+        } else {
+            assert_eq!(result["exit_code"], 0, "{result}");
+            assert!(transcript.contains("Download 1 ("), "{result}");
+            assert!(fixture.store.join("FSFS-CURRENT").is_file());
+        }
+        assert!(!private.join("all-MiniLM-L6-v2").exists());
+        for (relative, bytes) in &old_artifacts {
+            assert_eq!(fs::read(fixture.store.join(relative)).unwrap(), *bytes);
+        }
+        assert_eq!(
+            fs::read(fixture.store.join("FSFS-LEGACY-REUSE.json")).unwrap(),
+            old_receipt
+        );
+        assert_eq!(ranks(&fixture), old_ranks);
+        eprintln!(
+            "legacy consent terminal missing_fast={missing_fast} prompts=1 exit={} fast_hits=2 optional_quality_installed=false",
+            result["exit_code"]
+        );
+    }
+
     for (quality, legacy_seed) in [(false, false), (false, true), (true, false), (true, true)] {
         for (policy, drift) in [
             ("same-executable", "none"),

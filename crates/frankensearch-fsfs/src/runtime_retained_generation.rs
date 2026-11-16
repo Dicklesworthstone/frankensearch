@@ -611,7 +611,8 @@ impl FsfsRuntime {
         self.validate_semantic_model_selection(self.indexing_search_mode())?;
         let mut control = IndexRunControl::new(&self.config)?;
         control.admit_work(cx, "index.model_provisioning").await?;
-        self.maybe_offer_interactive_model_provisioning(cx).await?;
+        self.maybe_offer_interactive_model_provisioning(cx, true)
+            .await?;
         control.admit_work(cx, "index.fast_model_load").await?;
         let resolved = if cx.blocking_pool_handle().is_some() {
             let runtime = self.clone();
