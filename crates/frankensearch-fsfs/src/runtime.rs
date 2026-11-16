@@ -686,7 +686,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v30: spaced comparison bounds retain their complete bare operand.
 // v31: grouped comparison bounds retain their operand and field scope.
 // v32: normalization preserves whitespace inside literal query values.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v32";
+// v33: reranking scores the planned candidate window before the display cutoff.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v33";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -715,8 +716,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v27 / stream v25: comparison bounds retain whitespace and bare context.
 // v28 / stream v26: grouped comparison bounds retain their field scope.
 // v29 / stream v27: normalization preserves literal query whitespace.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v29";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v27";
+// v30 / stream v28: reranking can promote candidates outside the displayed page.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v30";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v28";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -15929,6 +15931,17 @@ impl FsfsRuntime {
         let plan =
             planner.execution_plan_for_query(&normalized_query, Some(planning_limit), capabilities);
 
+        // A cross-encoder needs its planned candidate window before the
+        // displayed page is selected. Keep Initial's existing ranking head,
+        // but retain enough eligible candidates for Refined to promote
+        // a document that was not shown in Initial (including --limit 1).
+        let rerank_candidate_limit = if plan.rerank_stage.enabled {
+            plan.rerank_stage.candidate_budget
+        } else {
+            0
+        };
+        let refinement_limit = output_limit.max(rerank_candidate_limit);
+
         info!(
             phase = "query_parse",
             query = normalized_query,
@@ -15981,6 +15994,7 @@ impl FsfsRuntime {
                     planned_budget
                 }
             };
+        let lexical_budget = lexical_budget.max(rerank_candidate_limit);
         // Payload snippets are plain text: every surface (CLI table, JSON,
         // TUI) highlights query terms itself. Without markup the engine output
         // is the fragment with only its HTML escaping left to undo.
@@ -16006,7 +16020,7 @@ impl FsfsRuntime {
                         snippet_limit,
                     )?;
 
-                    let needs_full_lexical = output_limit > snippet_limit
+                    let needs_full_lexical = refinement_limit > snippet_limit
                         || filter_expr.is_some()
                         || excluded_doc_ids.is_some()
                         || snippet_hits.is_empty();
@@ -16015,7 +16029,7 @@ impl FsfsRuntime {
                             cx,
                             lexical,
                             &normalized_query,
-                            output_limit,
+                            refinement_limit,
                             filter_expr.as_ref(),
                             excluded_doc_ids.as_deref(),
                             lexical_doc_count.unwrap_or(0),
@@ -16046,7 +16060,7 @@ impl FsfsRuntime {
                         cx,
                         lexical,
                         &normalized_query,
-                        output_limit,
+                        refinement_limit,
                         filter_expr.as_ref(),
                         excluded_doc_ids.as_deref(),
                         lexical_doc_count.unwrap_or(0),
@@ -16123,6 +16137,21 @@ impl FsfsRuntime {
         } else {
             lexical_candidates
         };
+        let rerank_lexical_candidates = (rerank_candidate_limit > planning_limit).then(|| {
+            lexical_candidates
+                .iter()
+                .filter(|candidate| {
+                    filter_expr
+                        .as_ref()
+                        .is_none_or(|filter| filter.matches_doc_id(&candidate.doc_id))
+                })
+                .take(rerank_candidate_limit)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let refinement_lexical_candidates = rerank_lexical_candidates
+            .as_deref()
+            .unwrap_or(&lexical_head_candidates);
         let semantic_start = Instant::now();
         let force_full_semantic_recall =
             Self::should_force_full_semantic_recall(SemanticRecallDecisionInput {
@@ -16325,7 +16354,7 @@ impl FsfsRuntime {
                         let windowed = semantic_windows::search_top_k(
                             index,
                             &query_embedding,
-                            semantic_budget,
+                            semantic_budget.max(rerank_candidate_limit),
                             vector_filter,
                             resources.fast_window_mapping.as_deref(),
                         );
@@ -16400,9 +16429,11 @@ impl FsfsRuntime {
         let orchestrator = QueryExecutionOrchestrator::new(QueryFusionPolicy {
             rrf_k: plan.fusion_policy.rrf_k.unwrap_or(self.config.search.rrf_k),
         });
+        let initial_semantic_candidates =
+            &semantic_candidates[..semantic_candidates.len().min(semantic_budget)];
         let fusion_budget = lexical_head_candidates
             .len()
-            .saturating_add(semantic_candidates.len())
+            .saturating_add(initial_semantic_candidates.len())
             .max(planning_limit);
         let retrieval_degradation_mode = if matches!(mode, SearchExecutionMode::LexicalOnly)
             || matches!(
@@ -16424,7 +16455,7 @@ impl FsfsRuntime {
                 &normalized_query,
                 Some(resources.index_root.to_string_lossy().as_ref()),
                 &lexical_head_candidates,
-                &semantic_candidates,
+                initial_semantic_candidates,
                 fusion_budget,
                 0,
                 Self::vector_generation_is_hash_control(resources),
@@ -16432,7 +16463,7 @@ impl FsfsRuntime {
         } else {
             orchestrator.fuse_rankings_for_vector_lane(
                 &lexical_head_candidates,
-                &semantic_candidates,
+                initial_semantic_candidates,
                 fusion_budget,
                 0,
                 Self::vector_generation_is_hash_control(resources),
@@ -16540,6 +16571,7 @@ impl FsfsRuntime {
                     },
                 )
             };
+            let quality_budget = quality_budget.max(rerank_candidate_limit);
             // The window starts after Initial has been published and includes
             // cold initialization, waiting for model capacity, inference and
             // independent quality retrieval. Optional reranking has its own
@@ -16587,7 +16619,7 @@ impl FsfsRuntime {
                         &quality_candidates,
                         resources.fast_window_mapping.as_deref(),
                     );
-                    let refined_budget = lexical_head_candidates
+                    let refined_budget = refinement_lexical_candidates
                         .len()
                         .saturating_add(blended_candidates.len())
                         .max(planning_limit);
@@ -16598,7 +16630,7 @@ impl FsfsRuntime {
                             self.config.pressure.profile,
                             &normalized_query,
                             Some(resources.index_root.to_string_lossy().as_ref()),
-                            &lexical_head_candidates,
+                            refinement_lexical_candidates,
                             &blended_candidates,
                             refined_budget,
                             0,
@@ -16606,7 +16638,7 @@ impl FsfsRuntime {
                         )
                     } else {
                         orchestrator.fuse_rankings(
-                            &lexical_head_candidates,
+                            refinement_lexical_candidates,
                             &blended_candidates,
                             refined_budget,
                             0,
@@ -16617,10 +16649,10 @@ impl FsfsRuntime {
                     let fused_refined = Self::merge_with_fallback_tail(
                         &filtered_refined_head,
                         &fused_initial,
-                        output_limit,
+                        refinement_limit,
                     );
                     let RerankStageOutcome {
-                        fused: fused_refined,
+                        fused: mut fused_refined,
                         payload: rerank_payload,
                     } = self
                         .apply_rerank_stage(
@@ -16632,6 +16664,9 @@ impl FsfsRuntime {
                             fused_refined,
                         )
                         .await?;
+                    // The ranking window is internal: only the final page
+                    // enters payloads and persisted explanation artifacts.
+                    fused_refined.truncate(output_limit);
                     if flags.include_snippets
                         && let Some(lexical) = resources.lexical_index.as_ref()
                     {
@@ -46015,6 +46050,121 @@ mod tests {
             );
             assert_eq!(stage.reason_code, "query.stage.rerank.disabled.no_quality");
 
+            super::set_test_reranker(None);
+            super::set_test_quality_embedder(None);
+            super::set_test_fast_embedder(None);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rerank_stage_promotes_undisplayed_filtered_candidates_without_changing_initial() {
+        async fn search(
+            cx: &Cx,
+            config: FsfsConfig,
+            index_root: &Path,
+            query: &str,
+            limit: usize,
+            include_snippets: bool,
+        ) -> Vec<super::SearchPhaseArtifact> {
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root.to_path_buf()),
+                query: Some(query.to_owned()),
+                filter: Some("ext:rs".to_owned()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
+                .await
+                .unwrap();
+            runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    cx,
+                    query,
+                    limit,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+        }
+
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let body = "Recover failed network requests with bounded retries.";
+            for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+                fs::write(project.join(name), body).unwrap();
+            }
+            // More ineligible lexical hits than the ranking window force
+            // prefix widening before the eligible candidates are selected.
+            for index in 0..8 {
+                fs::write(project.join(format!("00-{index}.md")), body).unwrap();
+            }
+            fs::write(project.join("00-blocked.rs"), format!("{body} forbidden")).unwrap();
+            let index_root = project.join(".frankensearch");
+            let mut config = FsfsConfig::default();
+            config.indexing.watch_mode = false;
+            config.indexing.model_dir = temp.path().join("no-models").display().to_string();
+            config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
+            config.search.quality_timeout_ms = 5_000;
+            config.search.rerank_timeout_ms = 5_000;
+            super::set_test_fast_embedder(Some(Arc::new(SemanticFastEmbedder)));
+            super::set_test_quality_embedder(Some(Arc::new(SemanticQualityStub)));
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project),
+                    ..CliInput::default()
+                })
+                .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                .await
+                .unwrap();
+            let query = "recover failed network requests -forbidden";
+
+            for include_snippets in [false, true] {
+                super::set_test_reranker(None);
+                let original =
+                    search(&cx, config.clone(), &index_root, query, 1, include_snippets).await;
+                let wider =
+                    search(&cx, config.clone(), &index_root, query, 3, include_snippets).await;
+                assert_eq!(original.len(), 2);
+                assert_eq!(wider.len(), 2);
+                assert_eq!(wider[1].payload.hits.len(), 3);
+                let expected = &wider[1].payload.hits[2].path;
+                assert_ne!(&original[1].payload.hits[0].path, expected);
+
+                super::set_test_reranker(Some(Arc::new(frankensearch_core::SyncRerankerAdapter(
+                    ReverseReranker,
+                ))));
+                let mut rerank_config = config.clone();
+                rerank_config.search.rerank = true;
+                let reranked =
+                    search(&cx, rerank_config, &index_root, query, 1, include_snippets).await;
+                assert_eq!(reranked.len(), 2);
+                assert_eq!(reranked[0].phase, SearchOutputPhase::Initial);
+                assert_eq!(reranked[0].payload.hits, original[0].payload.hits);
+                assert_eq!(reranked[1].phase, SearchOutputPhase::Refined);
+                assert_eq!(reranked[1].payload.hits.len(), 1);
+                assert_eq!(reranked[1].fused.len(), 1);
+                assert_eq!(&reranked[1].payload.hits[0].path, expected);
+                let stage = reranked[1].payload.rerank.as_ref().unwrap();
+                assert_eq!(stage.status, RerankStageStatus::Applied);
+                assert_eq!(stage.candidate_budget, 3);
+                assert_eq!(stage.reranked_hits, 3);
+                assert_eq!(stage.scores.len(), 3);
+                assert_eq!(stage.scores[0].original_rank, 3);
+                assert!(stage.scores.iter().all(|score| {
+                    score.path.ends_with(".rs") && !score.path.ends_with("00-blocked.rs")
+                }));
+            }
             super::set_test_reranker(None);
             super::set_test_quality_embedder(None);
             super::set_test_fast_embedder(None);

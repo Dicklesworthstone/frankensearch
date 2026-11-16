@@ -56,7 +56,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 19: registered reranking cannot load unverified shadow weights.
 // 20: degraded search phases carry canonical per-lane recovery diagnostics.
 // 21: quoted literals and case-insensitive phrase exclusions agree across lanes.
-const VERSION: u32 = 21;
+// 22: reranking scores its candidate window before the displayed page is cut.
+const VERSION: u32 = 22;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
