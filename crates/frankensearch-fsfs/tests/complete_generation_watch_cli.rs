@@ -590,6 +590,7 @@ fn assert_content_edit_visible(
 fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
 
     use sha2::{Digest, Sha256};
 
@@ -957,74 +958,82 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
         .unwrap();
     let cx = reader_runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
     let store = CompleteGenerationStore::open(&cx, &fixture.store).unwrap();
-    let mut interrupted = watch(&fixture, "compatible-contract");
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        interrupted.assert_alive();
-        let stderr = fs::read_to_string(interrupted.capture.path().join("stderr")).unwrap();
-        if let Some(witness) = stderr
-            .split_inclusive('\n')
-            .filter(|line| line.ends_with('\n'))
-            .find(|line| {
-                line.contains("fsfs admitted indexing embedding batch")
-                    && line.contains("model=\"all-minilm-l6-v2\"")
-            })
-        {
+    for (signal_flag, termination_signal) in [("-INT", None), ("-KILL", Some(9))] {
+        let mut interrupted = watch(&fixture, "compatible-contract");
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            interrupted.assert_alive();
+            let stderr = fs::read_to_string(interrupted.capture.path().join("stderr")).unwrap();
+            if let Some(witness) = stderr
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .find(|line| {
+                    line.contains("fsfs admitted indexing embedding batch")
+                        && line.contains("model=\"all-minilm-l6-v2\"")
+                })
+            {
+                assert!(
+                    witness
+                        .split_ascii_whitespace()
+                        .any(|field| field == "inputs=8")
+                );
+                assert_eq!(store.active(&cx).unwrap(), Some(original.clone()));
+                eprintln!("watch interrupt document batch signal={signal_flag}: {witness}");
+                break;
+            }
             assert!(
-                witness
-                    .split_ascii_whitespace()
-                    .any(|field| field == "inputs=8")
+                Instant::now() < deadline,
+                "no quality document batch: {stderr}"
             );
-            assert_eq!(store.active(&cx).unwrap(), Some(original.clone()));
-            eprintln!("watch interrupt document batch: {witness}");
-            break;
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(
-            Instant::now() < deadline,
-            "no quality document batch: {stderr}"
+        let signal = Command::new("kill")
+            .args([signal_flag, &interrupted.child.id().to_string()])
+            .status()
+            .expect("stop own indexing watcher");
+        assert!(signal.success());
+        let stopped = interrupted.finish(Duration::from_secs(30));
+        if let Some(expected) = termination_signal {
+            assert!(!stopped.status.success(), "{stopped:?}");
+            assert_eq!(stopped.status.signal(), Some(expected), "{stopped:?}");
+        } else {
+            assert!(stopped.status.success(), "{stopped:?}");
+            assert!(
+                std::str::from_utf8(&stopped.stderr)
+                    .unwrap()
+                    .lines()
+                    .any(
+                        |line| line.contains("complete-generation command stopped on request")
+                            && line.contains("Signal(2)")
+                    ),
+                "{stopped:?}"
+            );
+        }
+        for line in stopped
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let receipt: Value = serde_json::from_slice(line).unwrap();
+            assert_ne!(receipt["data"]["publication"], "durable");
+        }
+        assert_eq!(store.active(&cx).unwrap(), Some(original.clone()));
+        assert_eq!(
+            fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(),
+            pointer
         );
-        std::thread::sleep(Duration::from_millis(1));
+        assert_eq!(artifacts(original.path()), original_artifacts);
+        assert_eq!(
+            fs::read(original.path().join("FSFS-BUNDLE.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(ranks(&fixture), original_ranks);
+        eprintln!(
+            "watch interrupt preserved original={} signal={signal_flag} pending=8 status={:?}",
+            original.id(),
+            stopped.status
+        );
     }
-    let signal = Command::new("kill")
-        .args(["-INT", &interrupted.child.id().to_string()])
-        .status()
-        .expect("interrupt own indexing watcher");
-    assert!(signal.success());
-    let cancelled = interrupted.finish(Duration::from_secs(30));
-    assert!(cancelled.status.success(), "{cancelled:?}");
-    assert!(
-        std::str::from_utf8(&cancelled.stderr)
-            .unwrap()
-            .lines()
-            .any(
-                |line| line.contains("complete-generation command stopped on request")
-                    && line.contains("Signal(2)")
-            ),
-        "{cancelled:?}"
-    );
-    for line in cancelled
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let receipt: Value = serde_json::from_slice(line).unwrap();
-        assert_ne!(receipt["data"]["publication"], "durable");
-    }
-    assert_eq!(store.active(&cx).unwrap(), Some(original.clone()));
-    assert_eq!(
-        fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(),
-        pointer
-    );
-    assert_eq!(artifacts(original.path()), original_artifacts);
-    assert_eq!(
-        fs::read(original.path().join("FSFS-BUNDLE.json")).unwrap(),
-        manifest
-    );
-    assert_eq!(ranks(&fixture), original_ranks);
-    eprintln!(
-        "watch interrupt preserved original={} signal=SIGINT pending=8",
-        original.id()
-    );
 
     let mut retry = watch(&fixture, "compatible-contract");
     let mut expected = vec!["alpha.md", "beta.md"];
