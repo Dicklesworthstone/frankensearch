@@ -607,6 +607,32 @@ impl SyncTwoTierSearcher {
         self.rrf_semantic_weight * f64::from(factor)
     }
 
+    fn search_optional_lexical(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Option<Vec<ScoredResult>>> {
+        let Some(lexical) = &self.lexical else {
+            return Ok(None);
+        };
+        match search_filtered_lexical(lexical.as_ref(), query_vec, limit, filter) {
+            Ok(results) => Ok(Some(results)),
+            Err(error @ SearchError::Cancelled { .. }) => Err(error),
+            Err(error) => {
+                // Match the async searcher's optional-arm contract. Discard
+                // even a partially fetched prefix after a refill failure; it
+                // cannot stand in for a successful lexical retrieval. A caller
+                // cancellation still terminates the whole request above.
+                tracing::warn!(
+                    error_code = error.diagnostic_code(),
+                    "lexical search failed, continuing without lexical"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Execute a synchronous search and return the final result set + metrics.
     ///
     /// `query` carries one bound embedding PER TIER. The former signature took
@@ -619,13 +645,15 @@ impl SyncTwoTierSearcher {
     /// arm; that adapter receives the quality query vector. A quality-only request
     /// requires semantic quality with an admitted owner or persisted producer
     /// fingerprint, and is incompatible with `config.fast_only`.
+    /// Failure of an optional lexical backend leaves semantic retrieval active,
+    /// including quality refinement. Lexical cancellation still ends the request.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] when the requested tier is absent
     /// or unauthorized, or when a query fails its retained space and producer
     /// admission; plus dimension/filter errors from vector search and
-    /// lexical backend failures (when lexical fusion is enabled).
+    /// cancellation from an optional lexical backend.
     pub fn search_collect(
         &self,
         query: &TieredQueryEmbeddings,
@@ -841,11 +869,7 @@ impl SyncTwoTierSearcher {
         };
 
         let lexical_started = Instant::now();
-        let lexical_hits = self
-            .lexical
-            .as_ref()
-            .map(|lexical| search_filtered_lexical(lexical.as_ref(), query_vec, fetch, filter))
-            .transpose()?;
+        let lexical_hits = self.search_optional_lexical(query_vec, fetch, filter)?;
         metrics.lexical_search_ms = ms(lexical_started.elapsed());
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
 
@@ -1007,11 +1031,7 @@ impl SyncTwoTierSearcher {
         let target = self.final_candidate_target(k);
         let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
         let lexical_started = Instant::now();
-        let lexical_hits = self
-            .lexical
-            .as_ref()
-            .map(|lexical| search_filtered_lexical(lexical.as_ref(), query.vector(), fetch, filter))
-            .transpose()?;
+        let lexical_hits = self.search_optional_lexical(query.vector(), fetch, filter)?;
         metrics.lexical_search_ms = ms(lexical_started.elapsed());
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
 
@@ -3529,6 +3549,158 @@ mod tests {
     impl SyncLexicalSearch for StaticLexical {
         fn search_sync(&self, _query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
             Ok(self.hits.iter().take(limit).cloned().collect())
+        }
+    }
+
+    struct UnavailableLexical {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_after_first: bool,
+    }
+
+    impl SyncLexicalSearch for UnavailableLexical {
+        fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+            let previous = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_after_first && previous == 0 {
+                // A full prefix with no eligible result forces another fetch.
+                return Ok((0..limit)
+                    .map(|rank| lexical_result(&format!("excluded-{rank}"), 1.0))
+                    .collect());
+            }
+            Err(SearchError::SubsystemError {
+                subsystem: "test.lexical",
+                source: "private-lexical-query secret-token\nforged-log-line".into(),
+            })
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn lexical_backend_failures_preserve_sync_semantic_results() {
+        use frankensearch_core::filter::BitsetFilter;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for fast_only in [false, true] {
+            for fail_after_first in [false, true] {
+                let config = TwoTierConfig {
+                    fast_only,
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                };
+                let index = make_index();
+                let baseline = SyncTwoTierSearcher::new(Arc::clone(&index), config.clone());
+                let lexical = Arc::new(UnavailableLexical {
+                    calls: AtomicUsize::new(0),
+                    fail_after_first,
+                });
+                let searcher =
+                    SyncTwoTierSearcher::new(index, config).with_lexical(lexical.clone());
+                let query = tiered(vec![1.0, 0.0]);
+                let allowed = BitsetFilter::from_doc_ids(["a", "c"]);
+                let (expected, expected_metrics) = baseline
+                    .search_collect_with_filter(&query, 2, Some(&allowed))
+                    .unwrap();
+                let (actual, metrics) = searcher
+                    .search_collect_with_filter(&query, 2, Some(&allowed))
+                    .expect("optional lexical failure must retain the semantic answer");
+                assert_eq!(
+                    serde_json::to_value(&actual).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                );
+                assert!(!actual.is_empty());
+                assert!(actual.iter().all(|hit| hit.doc_id != "b"));
+                assert_eq!(metrics.lexical_candidates, 0);
+                assert_eq!(
+                    metrics.semantic_candidates,
+                    expected_metrics.semantic_candidates
+                );
+                assert_eq!(
+                    lexical.calls.load(Ordering::SeqCst),
+                    if fail_after_first { 2 } else { 1 }
+                );
+
+                lexical.calls.store(0, Ordering::SeqCst);
+                let phases = searcher.search_iter_with_filter(&query, 2, Some(&allowed));
+                assert_eq!(
+                    lexical.calls.load(Ordering::SeqCst),
+                    0,
+                    "iteration stays lazy"
+                );
+                let phases = phases.collect::<Vec<_>>();
+                assert_eq!(phases.len(), if fast_only { 1 } else { 2 });
+                assert!(matches!(phases.first(), Some(SearchPhase::Initial { .. })));
+                let final_results = match phases.last().unwrap() {
+                    SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+                        results
+                    }
+                    other => {
+                        panic!("a lexical outage must not fail semantic refinement: {other:?}")
+                    }
+                };
+                assert_eq!(
+                    serde_json::to_value(final_results).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                );
+            }
+        }
+        assert!(logs_contain("lexical search failed"));
+        assert!(!logs_contain("private-lexical-query"));
+        assert!(!logs_contain("secret-token"));
+        assert!(!logs_contain("forged-log-line"));
+    }
+
+    #[test]
+    fn lexical_backend_failures_preserve_direct_quality_results() {
+        use frankensearch_core::filter::BitsetFilter;
+        use std::sync::atomic::AtomicUsize;
+
+        for attested in [false, true] {
+            for fail_after_first in [false, true] {
+                let directory = temp_dir("quality-only-lexical-outage");
+                let (index, identity) = quality_only_index(directory.path(), attested);
+                let query = TieredQueryEmbeddings::quality_only(
+                    BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], identity).unwrap(),
+                );
+                let allowed = BitsetFilter::from_doc_ids(["b", "c"]);
+                let baseline =
+                    SyncTwoTierSearcher::new(Arc::clone(&index), TwoTierConfig::default());
+                let (expected, _) = baseline
+                    .search_collect_with_filter(&query, 2, Some(&allowed))
+                    .unwrap();
+                let lexical = Arc::new(UnavailableLexical {
+                    calls: AtomicUsize::new(0),
+                    fail_after_first,
+                });
+                let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+                    .with_lexical(lexical.clone());
+                let (actual, metrics) = searcher
+                    .search_collect_with_filter(&query, 2, Some(&allowed))
+                    .expect("quality-only retrieval must survive an optional lexical outage");
+                assert_eq!(
+                    serde_json::to_value(&actual).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+                assert!(!actual.is_empty());
+                assert_eq!(metrics.lexical_candidates, 0);
+                assert!(
+                    actual
+                        .iter()
+                        .all(|hit| hit.source == ScoreSource::SemanticQuality
+                            && hit.fast_score.is_none()
+                            && hit.quality_score.is_some())
+                );
+
+                lexical.calls.store(0, std::sync::atomic::Ordering::SeqCst);
+                let phases = searcher
+                    .search_iter_with_filter(&query, 2, Some(&allowed))
+                    .collect::<Vec<_>>();
+                let [SearchPhase::Initial { results, .. }] = phases.as_slice() else {
+                    panic!("direct quality must retain exactly one successful phase");
+                };
+                assert_eq!(
+                    serde_json::to_value(results).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+            }
         }
     }
 

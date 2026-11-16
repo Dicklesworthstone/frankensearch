@@ -313,6 +313,14 @@ fn terminal_query_embedding_error(error: &SearchError) -> bool {
     )
 }
 
+fn terminal_lexical_candidate_error(error: &SearchError) -> bool {
+    matches!(error, SearchError::Cancelled { .. })
+        || matches!(
+            error,
+            SearchError::InvalidConfig { field, .. } if field == "search.exclusion_text"
+        )
+}
+
 /// Compare a v1 producer fingerprint without manufacturing an admitted owner.
 /// Empty, identity-less indexes retain their explicit legacy/control behavior;
 /// an identified semantic model needs an index built with its whole identity.
@@ -2165,16 +2173,18 @@ impl TwoTierSearcher {
             )
             .await;
             let lex_res = match (lex_res, normalized_exclusions) {
-                (Ok(results), Some(exclusions)) => Ok(refill_lexical_after_exclusions(
-                    cx,
-                    lex.as_ref(),
-                    &lexical_query,
-                    lexical_budget,
-                    LexicalCandidateBatch::eager(results),
-                    exclusions,
-                    text_fn,
-                )
-                .await?),
+                (Ok(results), Some(exclusions)) => {
+                    refill_lexical_after_exclusions(
+                        cx,
+                        lex.as_ref(),
+                        &lexical_query,
+                        lexical_budget,
+                        LexicalCandidateBatch::eager(results),
+                        exclusions,
+                        text_fn,
+                    )
+                    .await
+                }
                 (Ok(results), None) => Ok(LexicalCandidateBatch::eager(results)),
                 (Err(error), _) => Err(error),
             };
@@ -2205,7 +2215,7 @@ impl TwoTierSearcher {
                 }
                 Err(e) => {
                     metrics.lexical_search_ms = start_lex.elapsed().as_secs_f64() * 1000.0;
-                    if matches!(e, SearchError::Cancelled { .. }) {
+                    if terminal_lexical_candidate_error(&e) {
                         return Err(e);
                     }
                     self.export_error(&e);
@@ -2378,8 +2388,8 @@ impl TwoTierSearcher {
                     exclusions,
                     text_fn,
                 )
-                .await?;
-                (Some(Ok(result)), elapsed + start.elapsed())
+                .await;
+                (Some(result), elapsed + start.elapsed())
             }
             (timed, _, _) => timed,
         };
@@ -2398,8 +2408,9 @@ impl TwoTierSearcher {
             }
             (Some(Err(e)), elapsed) => {
                 metrics.lexical_search_ms = elapsed.as_secs_f64() * 1000.0;
-                // Propagate cancellation errors — the caller must see them.
-                if matches!(e, SearchError::Cancelled { .. }) {
+                // Optional backend failure can degrade, but cancellation and
+                // incomplete exclusion evidence cannot authorize a response.
+                if terminal_lexical_candidate_error(&e) {
                     return Err(e);
                 }
                 self.export_error(&e);
@@ -5561,6 +5572,68 @@ mod tests {
 
         fn doc_count(&self) -> SearchResult<usize> {
             Ok(18)
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingRefillLexical {
+        retained: RetainedMetadataLexical,
+        limits: Mutex<Vec<usize>>,
+        cancel: bool,
+    }
+
+    impl LexicalRead for FailingRefillLexical {
+        fn search<'a>(
+            &'a self,
+            cx: &'a Cx,
+            query: &'a str,
+            limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            Box::pin(async move {
+                let batch = self.search_candidates(cx, query, limit).await?;
+                Ok(batch.into_parts().0)
+            })
+        }
+
+        fn search_candidates<'a>(
+            &'a self,
+            cx: &'a Cx,
+            query: &'a str,
+            limit: usize,
+        ) -> SearchFuture<'a, LexicalCandidateBatch> {
+            Box::pin(async move {
+                let first = {
+                    let mut limits = self.limits.lock().unwrap();
+                    limits.push(limit);
+                    limits.len() == 1
+                };
+                if first {
+                    self.retained.search_candidates(cx, query, limit).await
+                } else if self.cancel {
+                    Err(SearchError::Cancelled {
+                        phase: "lexical_refill".to_owned(),
+                        reason: "provider cancelled its widened search".to_owned(),
+                    })
+                } else {
+                    Err(SearchError::SubsystemError {
+                        subsystem: "lexical_refill",
+                        source: "widened lexical search unavailable".into(),
+                    })
+                }
+            })
+        }
+
+        fn hydrate_candidates<'a>(
+            &'a self,
+            cx: &'a Cx,
+            context: Option<&'a LexicalHydrationContext>,
+            results: &'a mut [ScoredResult],
+        ) -> SearchFuture<'a, ()> {
+            self.retained.hydrate_candidates(cx, context, results)
+        }
+
+        fn doc_count(&self) -> SearchResult<usize> {
+            self.retained.doc_count()
         }
     }
 
@@ -13350,6 +13423,180 @@ mod tests {
             LexicalWrite::commit(&tantivy, &cx).await.unwrap();
             verify_backend_lexical_complement(&cx, Arc::new(tantivy), &docs).await;
         });
+    }
+
+    #[test]
+    fn lexical_exclusion_refill_failure_preserves_semantic_and_quality_rescue() {
+        for zero_fast in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_directory, index) = query_admission_index("exact-v2");
+                let fast = query_admission_embedder("fast");
+                let fast = if zero_fast {
+                    fast.with_bound_response_values(vec![0.0; 4])
+                } else {
+                    fast
+                };
+                let quality = Arc::new(query_admission_embedder("quality"));
+                let lexical = Arc::new(FailingRefillLexical::default());
+                let exporter = Arc::new(RecordingExporter::default());
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(fast),
+                    TwoTierConfig::default().with_metrics_exporter(exporter.clone()),
+                )
+                .with_quality_embedder(quality.clone())
+                .with_lexical(lexical.clone());
+                let mut phases = Vec::new();
+                let metrics = searcher
+                    .search(
+                        &cx,
+                        "find related records -blocked",
+                        2,
+                        |id| {
+                            Some(
+                                if (id.starts_with("lex-") && id != "lex-00") || id == "doc-b" {
+                                    "blocked"
+                                } else {
+                                    "eligible"
+                                }
+                                .to_owned(),
+                            )
+                        },
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .expect("an optional refill failure must preserve healthy semantic tiers");
+                let [
+                    SearchPhase::Initial {
+                        results: initial, ..
+                    },
+                    SearchPhase::Refined {
+                        results: refined, ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("expected successful search and refinement: {phases:?}");
+                };
+                assert_eq!(initial.is_empty(), zero_fast);
+                if !zero_fast {
+                    assert_eq!(initial.len(), 1);
+                    assert_eq!(initial[0].doc_id, "doc-a");
+                }
+                assert!(refined.iter().any(|hit| {
+                    hit.doc_id == "doc-quality-only" && hit.quality_score.is_some()
+                }));
+                assert!(initial.iter().chain(refined).all(|hit| {
+                    !hit.doc_id.starts_with("lex-")
+                        && hit.doc_id != "doc-b"
+                        && hit.lexical_score.is_none()
+                        && hit.metadata.is_none()
+                }));
+                assert_eq!(metrics.lexical_candidates, 0);
+                assert!(metrics.phase2_vectors_searched > 0);
+                assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
+                assert_eq!(exporter.errors.lock().unwrap().len(), 1);
+                let limits = lexical.limits.lock().unwrap();
+                assert_eq!(limits.len(), 2);
+                assert!(limits[0] > 1, "the initial batch retains a partial prefix");
+                assert_eq!(limits[1], limits[0] * 2);
+                assert!(lexical.retained.hydrated.lock().unwrap().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn lexical_exclusion_refill_failure_preserves_hash_control() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = build_test_index(4);
+            let lexical = Arc::new(FailingRefillLexical::default());
+            let exporter = Arc::new(RecordingExporter::default());
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4)),
+                TwoTierConfig::default().with_metrics_exporter(exporter.clone()),
+            )
+            .with_lexical(lexical.clone());
+            let (results, metrics) = searcher
+                .search_collect_with_text(&cx, "find related records -blocked", 2, |id| {
+                    Some(
+                        if (id.starts_with("lex-") && id != "lex-00") || id == "doc-0" {
+                            "blocked"
+                        } else {
+                            "eligible"
+                        }
+                        .to_owned(),
+                    )
+                })
+                .await
+                .expect("hash control remains available after optional lexical refill fails");
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|hit| {
+                hit.source == ScoreSource::HashControl
+                    && !hit.doc_id.starts_with("lex-")
+                    && hit.doc_id != "doc-0"
+                    && hit.lexical_score.is_none()
+                    && hit.metadata.is_none()
+            }));
+            assert_eq!(metrics.lexical_candidates, 0);
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert!(metrics.hash_control_candidates > 0);
+            let limits = lexical.limits.lock().unwrap();
+            assert!(limits.len() >= 2);
+            assert_eq!(limits[0], 2);
+            assert_eq!(limits[1], 4);
+            // The existing fallback may retry the lexical lane beside hash
+            // embedding; each failed backend operation is reported once.
+            assert_eq!(exporter.errors.lock().unwrap().len(), limits.len() - 1);
+            assert!(lexical.retained.hydrated.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn lexical_exclusion_refill_cancellation_remains_terminal() {
+        for hash_only in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_index_dir, index) = build_test_index_with_quality(4);
+                let fast: Arc<dyn Embedder> = if hash_only {
+                    Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4))
+                } else {
+                    Arc::new(StubEmbedder::new("fast", 4))
+                };
+                let lexical = Arc::new(FailingRefillLexical {
+                    cancel: true,
+                    ..FailingRefillLexical::default()
+                });
+                let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                    .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
+                    .with_lexical(lexical.clone());
+                let mut phases = Vec::new();
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find related records -blocked",
+                        2,
+                        |id| {
+                            Some(
+                                if id == "lex-00" {
+                                    "eligible"
+                                } else {
+                                    "blocked"
+                                }
+                                .to_owned(),
+                            )
+                        },
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .expect_err("a widened backend cancellation must stop both fallback routes");
+                assert!(matches!(
+                    error,
+                    SearchError::Cancelled { phase, .. } if phase == "lexical_refill"
+                ));
+                assert!(phases.is_empty());
+                assert_eq!(lexical.limits.lock().unwrap().len(), 2);
+                assert!(lexical.retained.hydrated.lock().unwrap().is_empty());
+            });
+        }
     }
 
     #[test]
