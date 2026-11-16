@@ -1211,12 +1211,24 @@ impl QuillSearchSnapshot {
         global_docid: u32,
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        copy_stored_field_bounded(
+            field_ord,
+            self.stored_field_bytes(field_ord, global_docid)?,
+            max_bytes,
+        )
+    }
+
+    /// Borrow a live stored field through the same validated lookup used by
+    /// owned materialization. The snapshot keeps its immutable backing alive.
+    fn stored_field_bytes(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+    ) -> Result<Option<&[u8]>, QuillIndexError> {
         if let Some(delta) = self.delta_for_docid(global_docid) {
             match delta.materialize_stored_value(field_ord, global_docid) {
                 DeltaStoredMaterialization::NotLive => {}
-                DeltaStoredMaterialization::Live(stored) => {
-                    return copy_stored_field_bounded(field_ord, stored, max_bytes);
-                }
+                DeltaStoredMaterialization::Live(stored) => return Ok(stored),
             }
         }
 
@@ -1225,13 +1237,9 @@ impl QuillSearchSnapshot {
         };
         let stored =
             segment.stored_meta_lookup(required_section(segment, SectionKind::STOREDMETA)?)?;
-        copy_stored_field_bounded(
-            field_ord,
-            stored
-                .field(field_ord)
-                .and_then(|field| field.get(u64::from(global_docid))),
-            max_bytes,
-        )
+        Ok(stored
+            .field(field_ord)
+            .and_then(|field| field.get(u64::from(global_docid))))
     }
 
     /// Clone the pinned immutable Keeper component.
@@ -12697,13 +12705,12 @@ impl QuillReader {
             // sized for this query cannot be refused here.
             checkpoint.admit(QueryWorkKind::PositionDocument, 1)?;
             let snippet = snapshot
-                .materialize_stored_value(CONTENT_FIELD, hit.global_docid)?
+                .stored_field_bytes(CONTENT_FIELD, hit.global_docid)?
                 .map(|content| {
-                    String::from_utf8(content)
+                    std::str::from_utf8(content)
                         .map_err(|_| invalid_state("stored content contains non-UTF-8 bytes"))
                 })
                 .transpose()?
-                .as_deref()
                 .and_then(|content| generator.snippet(content));
             results.push(QuillSnippetHit {
                 document_id: hit.document_id.clone(),
@@ -12794,14 +12801,17 @@ impl QuillReader {
                 snippets.push(None);
                 continue;
             };
+            // A preview cap must not copy the entire source before slicing it.
+            // Keep full UTF-8 validation (including bytes beyond the preview)
+            // and the ordinary stored-section integrity checks.
             let content = snapshot
-                .materialize_stored_value(CONTENT_FIELD, global_docid)?
+                .stored_field_bytes(CONTENT_FIELD, global_docid)?
                 .map(|content| {
-                    String::from_utf8(content)
+                    std::str::from_utf8(content)
                         .map_err(|_| invalid_state("stored content contains non-UTF-8 bytes"))
                 })
                 .transpose()?;
-            snippets.push(content.as_deref().and_then(|content| {
+            snippets.push(content.and_then(|content| {
                 let mut end = content.len().min(max_source_bytes);
                 while !content.is_char_boundary(end) {
                     end -= 1;
@@ -13638,9 +13648,11 @@ impl QuillSearchIndex {
     /// [`Self::search_with_snippets`] uses, so a document it returns gets the
     /// same snippet here — but only the listed documents are materialized, so
     /// a caller that ranks with [`Self::search_doc_ids`] pays for snippets
-    /// only on what it shows. At most `max_source_bytes` of each stored text
-    /// are scanned (cut on a character boundary). A document holding no query
-    /// term gets its opening fragment; one that is not live gets `None`.
+    /// only on what it shows. Stored source bytes are borrowed rather than
+    /// copied. Full-field UTF-8 and stored-section integrity checks remain;
+    /// snippet analysis examines at most `max_source_bytes` of each text
+    /// (cut on a character boundary). A document holding no query term gets
+    /// its opening fragment; one that is not live gets `None`.
     ///
     /// # Errors
     ///
@@ -25813,6 +25825,132 @@ mod tests {
                 "{:?}",
                 extra[2]
             );
+        });
+    }
+
+    #[test]
+    fn snippets_for_documents_borrow_large_sources_at_utf8_boundaries() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                delta_budget_bytes: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            })
+            .unwrap();
+            let source = format!("é🙂Z {}", "padding ".repeat(32_768));
+            let documents = [
+                SchemaDocument {
+                    id: "large".into(),
+                    indexed: vec![(TITLE_FIELD, "needle".into())],
+                    stored: vec![(CONTENT_FIELD, source.as_bytes().to_vec())],
+                    ..SchemaDocument::default()
+                },
+                SchemaDocument {
+                    id: "empty".into(),
+                    indexed: vec![(TITLE_FIELD, "needle".into())],
+                    stored: vec![(CONTENT_FIELD, Vec::new())],
+                    ..SchemaDocument::default()
+                },
+                SchemaDocument {
+                    id: "missing-source".into(),
+                    indexed: vec![(TITLE_FIELD, "needle".into())],
+                    ..SchemaDocument::default()
+                },
+            ];
+            index
+                .index_schema_documents_visible(&cx, &documents)
+                .await
+                .unwrap();
+            let config = crate::SnippetConfig::default();
+            for sealed in [false, true] {
+                if sealed {
+                    index.commit(&cx).await.unwrap();
+                }
+                assert_eq!(
+                    index.search_snapshot().unwrap().delta_count(),
+                    usize::from(!sealed)
+                );
+                for (limit, expected) in [
+                    (0, None),
+                    (1, None),
+                    (2, Some("é")),
+                    (3, Some("é")),
+                    (4, Some("é")),
+                    (5, Some("é")),
+                    (6, Some("é🙂")),
+                    (7, Some("é🙂Z")),
+                ] {
+                    let snippets = index
+                        .snippets_for_documents(
+                            &cx,
+                            "needle",
+                            &["large", "empty", "missing-source", "missing-id"],
+                            &config,
+                            limit,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        snippets[0].as_deref(),
+                        expected,
+                        "sealed={sealed}, limit={limit}"
+                    );
+                    assert!(snippets[1..].iter().all(Option::is_none));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn borrowed_snippet_sources_keep_full_utf8_validation() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                delta_budget_bytes: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            })
+            .unwrap();
+            // Schema-projected stored values may be opaque bytes. A tiny
+            // preview must still refuse a malformed tail, as before.
+            index
+                .index_schema_documents_visible(
+                    &cx,
+                    &[SchemaDocument {
+                        id: "malformed".into(),
+                        indexed: vec![(TITLE_FIELD, "needle".into())],
+                        stored: vec![(CONTENT_FIELD, b"safe prefix \xff invalid tail".to_vec())],
+                        ..SchemaDocument::default()
+                    }],
+                )
+                .await
+                .unwrap();
+            let config = crate::SnippetConfig::default();
+            for sealed in [false, true] {
+                if sealed {
+                    index.commit(&cx).await.unwrap();
+                }
+                assert_eq!(
+                    index.search_snapshot().unwrap().delta_count(),
+                    usize::from(!sealed)
+                );
+                assert!(matches!(
+                    index.search_with_snippets(&cx, "needle", 1, &config),
+                    Err(QuillIndexError::InvalidState { detail })
+                        if detail == "stored content contains non-UTF-8 bytes"
+                ));
+                for limit in [0, 4, usize::MAX] {
+                    assert!(matches!(
+                        index.snippets_for_documents(
+                            &cx,
+                            "needle",
+                            &["malformed"],
+                            &config,
+                            limit,
+                        ),
+                        Err(QuillIndexError::InvalidState { detail })
+                            if detail == "stored content contains non-UTF-8 bytes"
+                    ));
+                }
+            }
         });
     }
 
