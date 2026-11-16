@@ -688,7 +688,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v32: normalization preserves whitespace inside literal query values.
 // v33: reranking scores the planned candidate window before the display cutoff.
 // v34: reranking admits only complete, finite responses for the exact inputs.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v34";
+// v35: negated queries require lexical membership for every vector candidate.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v35";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -719,8 +720,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v29 / stream v27: normalization preserves literal query whitespace.
 // v30 / stream v28: reranking can promote candidates outside the displayed page.
 // v31 / stream v29: reranking rejects malformed and non-finite score evidence.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v31";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v29";
+// v32 / stream v30: negated queries reject candidates without lexical evidence.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v32";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v30";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -14574,7 +14576,18 @@ impl FsfsRuntime {
         payloads: &[SearchPayload],
     ) -> SearchResult<bool> {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
-        Self::validate_cached_query_exclusions(resources, payloads)?;
+        if let Err(error) = Self::validate_cached_query_exclusions(cx, resources, payloads) {
+            Self::exclusion_membership_checkpoint(cx)?;
+            if matches!(&error, SearchError::InvalidConfig { field, value, .. }
+                if field == "cli.search_query"
+                    && value == "exclusion_candidate_evidence_missing")
+            {
+                // A stale cached refinement must not suppress a usable Initial.
+                // Fresh execution can apply the ordinary optional-quality fallback.
+                return Ok(false);
+            }
+            return Err(error);
+        }
         if !Self::search_payloads_cacheable(payloads) {
             // A cache created before the current admission policy may retain
             // a transient stage failure. Retry retrieval before publishing any
@@ -14720,7 +14733,7 @@ impl FsfsRuntime {
         payloads: &[SearchPayload],
     ) -> SearchResult<()> {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
-        Self::validate_cached_query_exclusions(resources, payloads)?;
+        Self::validate_cached_query_exclusions(cx, resources, payloads)?;
         Self::validate_bound_search_resources(resources, mode)?;
         if Self::cached_search_requires_fast(resources, mode, payloads) {
             Self::validate_cached_fast_producer(resources)?;
@@ -16425,6 +16438,15 @@ impl FsfsRuntime {
         } else {
             Vec::new()
         };
+        if excluded_doc_ids.is_some() {
+            // Check the full retrieved window before any display cutoff:
+            // refinement can later promote a candidate outside Initial's page.
+            Self::validate_exclusion_candidate_membership(
+                cx,
+                resources.lexical_index.as_ref(),
+                semantic_candidates.iter().map(|candidate| candidate.doc_id.as_str()),
+            )?;
+        }
         let semantic_elapsed_ms = semantic_start.elapsed().as_millis();
 
         let fusion_start = Instant::now();
@@ -26439,6 +26461,7 @@ impl FsfsRuntime {
         let query_embedding = embedder.embed_admitted(cx, query).await?;
         let index = Arc::clone(index);
         let filter_expr = filter_expr.cloned();
+        let requires_exclusion_evidence = excluded_doc_ids.is_some();
         let mut fast_ids = fast_candidates
             .iter()
             .map(|candidate| candidate.doc_id.clone())
@@ -26500,6 +26523,15 @@ impl FsfsRuntime {
             Ok::<_, SearchError>((hits, zero_signal))
         })
         .await??;
+        if requires_exclusion_evidence {
+            // Keep this failure inside the quality outcome: progressive search
+            // retains its admitted Initial, while quality-only search refuses.
+            Self::validate_exclusion_candidate_membership(
+                cx,
+                resources.lexical_index.as_ref(),
+                hits.iter().map(|hit| hit.doc_id.as_str()),
+            )?;
+        }
         Ok(Some(QualityCandidateBatch {
             candidates: hits
                 .into_iter()
@@ -26526,16 +26558,67 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    fn exclusion_membership_checkpoint(cx: &Cx) -> SearchResult<()> {
+        let checkpoint = cx.checkpoint();
+        if checkpoint.is_err() || cx.is_cancel_requested() {
+            return Err(SearchError::Cancelled {
+                phase: "fsfs.search.exclusions".to_owned(),
+                reason: cx.cancel_reason().map_or_else(
+                    || "query exclusion validation cancelled".to_owned(),
+                    |reason| reason.to_string(),
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Absence from the exclusion census only admits a document whose live
+    /// lexical membership is known. Vector generations can contain extra IDs.
+    /// Probe just the retrieved candidate window, without scoring or loading text.
+    fn validate_exclusion_candidate_membership<'a>(
+        cx: &Cx,
+        lexical: Option<&QuillSearchIndex>,
+        document_ids: impl IntoIterator<Item = &'a str>,
+    ) -> SearchResult<()> {
+        Self::exclusion_membership_checkpoint(cx)?;
+        let missing_evidence = || SearchError::InvalidConfig {
+            field: "cli.search_query".to_owned(),
+            value: "exclusion_candidate_evidence_missing".to_owned(),
+            reason: "query exclusions cannot be verified for every retrieved document in the lexical index; rebuild the index before retrying this query"
+                .to_owned(),
+        };
+        let Some(lexical) = lexical else {
+            return Err(missing_evidence());
+        };
+        let document_ids = document_ids.into_iter().collect::<Vec<_>>();
+        let membership = lexical.contains_documents(cx, &document_ids);
+        // Cancellation wins over an ordinary lookup failure or missing member.
+        Self::exclusion_membership_checkpoint(cx)?;
+        let membership = membership?;
+        if membership.len() != document_ids.len() || membership.contains(&false) {
+            return Err(missing_evidence());
+        }
+        Ok(())
+    }
+
     fn validate_cached_query_exclusions(
+        cx: &Cx,
         resources: &SearchExecutionResources,
         payloads: &[SearchPayload],
     ) -> SearchResult<()> {
-        if resources.lexical_index.is_none() {
-            for payload in payloads {
-                Self::validate_query_exclusions(&ParsedQuery::parse(&payload.query), false)?;
+        Self::exclusion_membership_checkpoint(cx)?;
+        for payload in payloads {
+            let parsed = ParsedQuery::parse(&payload.query);
+            if parsed.has_negations() {
+                Self::validate_query_exclusions(&parsed, resources.lexical_index.is_some())?;
+                Self::validate_exclusion_candidate_membership(
+                    cx,
+                    resources.lexical_index.as_ref(),
+                    payload.hits.iter().map(|hit| hit.path.as_str()),
+                )?;
             }
         }
-        Ok(())
+        Self::exclusion_membership_checkpoint(cx)
     }
 
     /// Every live document the lexical engine matches for the query's
@@ -55545,6 +55628,284 @@ mod tests {
                 let expected = if winner == "a-target.rs" { 0.1 } else { 0.9 };
                 assert!((fast_raw - expected).abs() < 1e-3, "{winner}: {fast_raw}");
             }
+        });
+    }
+
+    async fn exclusion_membership_fixture(
+        cx: &Cx,
+        root: &Path,
+        known_ids: &[&str],
+    ) -> (FsfsRuntime, SearchExecutionResources) {
+        let mut resources = disagreeing_blend_resources(root);
+        let lexical = create_test_quill(cx, &root.join("lexical")).await;
+        for id in known_ids {
+            lexical
+                .index_document(cx, &IndexableDocument::new(*id, "catalog retained content"))
+                .await
+                .unwrap();
+        }
+        lexical.commit(cx).await.unwrap();
+        drop(lexical);
+        resources.lexical_index = Some(
+            QuillSearchIndex::open(cx, root.join("lexical"), QuillConfig::default())
+                .await
+                .unwrap(),
+        );
+        resources.generation_fingerprint =
+            FsfsRuntime::search_index_fingerprint_at_root(root).unwrap();
+        let mut config = FsfsConfig::default();
+        config.search.quality_timeout_ms = 10_000;
+        config.search.ranking_priors = false;
+        (FsfsRuntime::new(config), resources)
+    }
+
+    fn assert_exclusion_candidate_evidence_missing<T>(result: SearchResult<T>) {
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("missing lexical membership must refuse an excluded query"),
+        };
+        assert!(matches!(&error, SearchError::InvalidConfig { field, value, .. }
+            if field == "cli.search_query"
+                && value == "exclusion_candidate_evidence_missing"));
+        let diagnostic = error.to_string();
+        for private in [
+            "a.rs",
+            "b.rs",
+            "fast-only.rs",
+            "quality-only.rs",
+            "how do alpha documents rank",
+        ] {
+            assert!(!diagnostic.contains(private));
+        }
+    }
+
+    #[test]
+    fn negated_search_requires_membership_for_the_full_fast_candidate_window() {
+        run_on_runtime_task(|cx| async move {
+            for complete in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let known_ids = if complete {
+                    vec!["a.rs", "b.rs", "fast-only.rs", "quality-only.rs"]
+                } else {
+                    vec!["a.rs", "b.rs", "quality-only.rs"]
+                };
+                let (runtime, mut resources) =
+                    exclusion_membership_fixture(&cx, temp.path(), &known_ids).await;
+                let flags = SearchExecutionFlags {
+                    include_snippets: false,
+                    persist_explain_session: false,
+                };
+                for mode in [SearchExecutionMode::FastOnly, SearchExecutionMode::Full] {
+                    for limit in [1, 10] {
+                        let positive = runtime
+                            .execute_search_payloads_with_mode_using_resources(
+                                &cx,
+                                "how do alpha documents rank",
+                                limit,
+                                mode,
+                                &mut resources,
+                                flags,
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(positive[0].hits[0].path, "a.rs");
+                        let mut emitted = Vec::new();
+                        let result = runtime
+                            .execute_search_phase_artifacts_with_mode_using_resources(
+                                &cx,
+                                "how do alpha documents rank -banned",
+                                limit,
+                                mode,
+                                &mut resources,
+                                flags,
+                                Some(&mut |payload: &SearchPayload| {
+                                    emitted.push(payload.phase);
+                                    Ok(())
+                                }),
+                            )
+                            .await;
+                        if complete {
+                            let phases = result.unwrap();
+                            assert_eq!(emitted[0], SearchOutputPhase::Initial);
+                            assert_eq!(phases[0].payload.hits, positive[0].hits);
+                        } else {
+                            assert_exclusion_candidate_evidence_missing(result);
+                            assert!(emitted.is_empty(), "{mode:?}, limit={limit}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn missing_quality_exclusion_membership_preserves_initial_only_when_optional() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, mut resources) = exclusion_membership_fixture(
+                &cx,
+                temp.path(),
+                &["a.rs", "b.rs", "fast-only.rs"],
+            )
+            .await;
+            let flags = SearchExecutionFlags {
+                include_snippets: false,
+                persist_explain_session: false,
+            };
+            let positive = runtime
+                .execute_quality_only_search(
+                    &cx,
+                    "how do alpha documents rank",
+                    10,
+                    &mut resources,
+                    flags,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                positive[0]
+                    .payload
+                    .hits
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["b.rs", "quality-only.rs", "a.rs"],
+            );
+            let mut emitted = Vec::new();
+            let phases = runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "how do alpha documents rank -banned",
+                    10,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    flags,
+                    Some(&mut |payload: &SearchPayload| {
+                        emitted.push(payload.phase);
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                emitted,
+                [SearchOutputPhase::Initial, SearchOutputPhase::RefinementFailed],
+            );
+            assert_eq!(phases[0].payload.hits, phases[1].payload.hits);
+            assert!(!FsfsRuntime::search_payloads_cacheable(
+                &phases.iter().map(|phase| phase.payload.clone()).collect::<Vec<_>>(),
+            ));
+            let mut required_emitted = 0;
+            let required = runtime
+                .execute_quality_only_search(
+                    &cx,
+                    "how do alpha documents rank -banned",
+                    10,
+                    &mut resources,
+                    flags,
+                    Some(&mut |_| {
+                        required_emitted += 1;
+                        Ok(())
+                    }),
+                )
+                .await;
+            assert_exclusion_candidate_evidence_missing(required);
+            assert_eq!(required_emitted, 0);
+        });
+    }
+
+    #[test]
+    fn cached_negations_require_membership_before_replay_and_keep_cancellation_terminal() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, mut resources) = exclusion_membership_fixture(
+                &cx,
+                temp.path(),
+                &["a.rs", "b.rs", "fast-only.rs"],
+            )
+            .await;
+            let mut payloads = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    "how do alpha documents rank",
+                    10,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(payloads.last().unwrap().phase, SearchOutputPhase::Refined);
+            assert!(
+                payloads.last().unwrap().hits.iter().any(|hit| hit.path == "quality-only.rs"),
+            );
+            FsfsRuntime::validate_cached_query_exclusions(&cx, &resources, &payloads).unwrap();
+            let query = "how do alpha documents rank -banned";
+            for payload in &mut payloads {
+                payload.query = query.to_owned();
+            }
+            FsfsRuntime::validate_cached_query_exclusions(&cx, &resources, &payloads[..1])
+                .unwrap();
+            assert!(!runtime
+                .admit_cached_search_producers(
+                    &cx,
+                    &mut resources,
+                    SearchExecutionMode::Full,
+                    query,
+                    &payloads,
+                )
+                .await
+                .unwrap());
+            let generation = resources.generation_fingerprint.clone();
+            let mut emitted = 0;
+            let replay = runtime
+                .replay_cached_search_payloads(
+                    &cx,
+                    &mut resources,
+                    SearchExecutionMode::Full,
+                    &generation,
+                    &payloads,
+                    Some(&mut |_| {
+                        emitted += 1;
+                        Ok(())
+                    }),
+                )
+                .await;
+            assert_exclusion_candidate_evidence_missing(replay);
+            assert_eq!(emitted, 0);
+            let lexical = resources.lexical_index.take();
+            assert!(matches!(
+                runtime
+                    .admit_cached_search_producers(
+                        &cx, &mut resources, SearchExecutionMode::Full, query, &payloads,
+                    )
+                    .await,
+                Err(SearchError::InvalidConfig { value, .. })
+                    if value == "exclusions_without_lexical_index"
+            ));
+            resources.lexical_index = lexical;
+            cx.cancel_with(asupersync::CancelKind::User, Some("cancel exclusion replay"));
+            assert!(matches!(
+                runtime
+                    .admit_cached_search_producers(
+                        &cx, &mut resources, SearchExecutionMode::Full, query, &payloads,
+                    )
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                runtime
+                    .replay_cached_search_payloads(
+                        &cx, &mut resources, SearchExecutionMode::Full,
+                        &generation, &payloads, None,
+                    )
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
         });
     }
 
