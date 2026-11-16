@@ -587,6 +587,57 @@ impl FsfsRuntime {
         .await
     }
 
+    async fn admit_legacy_upgrade_fast_producer(
+        &self,
+        cx: &Cx,
+        root: &Path,
+    ) -> SearchResult<Option<Arc<dyn Embedder>>> {
+        use crate::generation_store::COMPLETE_GENERATION_POINTER;
+
+        if !matches!(
+            build_search_mode(self.indexing_search_mode()),
+            SearchExecutionMode::Full | SearchExecutionMode::FastOnly
+        ) || matches!(
+            self.config.pressure.degradation_override,
+            DegradationOverrideMode::ForceLexicalOnly
+                | DegradationOverrideMode::ForceMetadataOnly
+                | DegradationOverrideMode::ForcePaused
+        ) || complete_cli::complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
+            || complete_cli::complete_entry_exists(&root.join("generations"))?
+            || !Self::read_index_sentinel(root)?.is_some_and(|sentinel| sentinel.generation_complete)
+        {
+            return Ok(None);
+        }
+        self.validate_semantic_model_selection(self.indexing_search_mode())?;
+        let mut control = IndexRunControl::new(&self.config)?;
+        control.admit_work(cx, "index.model_provisioning").await?;
+        self.maybe_offer_interactive_model_provisioning(cx).await?;
+        control.admit_work(cx, "index.fast_model_load").await?;
+        let resolved = if cx.blocking_pool_handle().is_some() {
+            let runtime = self.clone();
+            #[cfg(test)]
+            let selected_test_provider = runtime.resolve_fast_embedder();
+            Self::search_blocking(cx, move || {
+                #[cfg(not(test))]
+                {
+                    runtime.resolve_fast_embedder()
+                }
+                #[cfg(test)]
+                {
+                    selected_test_provider
+                }
+            })
+            .await?
+        } else {
+            self.resolve_fast_embedder()
+        };
+        let embedder = resolved?;
+        control.checkpoint(cx, "index.fast_model_loaded", true)?;
+        Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
+        retained_search_checkpoint(cx)?;
+        Ok(Some(embedder))
+    }
+
     #[allow(clippy::future_not_send)]
     async fn build_retained_generation_with_progress<F>(
         &self,
@@ -624,6 +675,18 @@ impl FsfsRuntime {
         if let RetainedRebuildStart::Resume(receipt) = &start {
             receipt.admit_scope(cx, self).await?;
         }
+        // Creating `generations` makes complete-store routing authoritative.
+        // Admit the required fast producer before first promoting a searchable
+        // legacy index, so a rejected model leaves that index readable. Retain
+        // the producer through the build: the shared model cache holds Weak
+        // references, and the indexer still owns its single readiness probe.
+        let _legacy_fast_producer =
+            if kind == RetainedBuildKind::Index && matches!(start, RetainedRebuildStart::Fresh) {
+                self.admit_legacy_upgrade_fast_producer(cx, &canonical_root)
+                    .await?
+            } else {
+                None
+            };
         let resumed = matches!(start, RetainedRebuildStart::Resume(_));
         let store = if resumed {
             CompleteGenerationStore::open(cx, store_root)?

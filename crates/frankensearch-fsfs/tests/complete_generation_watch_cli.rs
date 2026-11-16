@@ -591,12 +591,13 @@ fn assert_content_edit_visible(
 #[ignore = "requires verified models and a source-bound prior executable in FSFS_UPGRADE_REUSE_PRIOR_EXECUTABLE"]
 fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::process::ExitStatusExt;
 
     use sha2::{Digest, Sha256};
 
-    fn executable_sha256(path: &Path) -> String {
+    fn file_sha256(path: &Path) -> String {
         let mut file = fs::File::open(path).unwrap();
         let mut digest = Sha256::new();
         let mut buffer = vec![0_u8; 64 * 1024];
@@ -608,6 +609,116 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
             digest.update(&buffer[..count]);
         }
         frankensearch_storage::ContentHasher::to_hex(&digest.finalize().into())
+    }
+
+    fn private_models(fixture: &Fixture, original: &Path) -> PathBuf {
+        let destination = fixture.directory.path().join("models");
+        let mut files = vec![
+            "potion-multilingual-128M/tokenizer.json",
+            "potion-multilingual-128M/model.safetensors",
+        ];
+        if fixture.quality {
+            files.extend([
+                "all-MiniLM-L6-v2/onnx/model.onnx",
+                "all-MiniLM-L6-v2/tokenizer.json",
+                "all-MiniLM-L6-v2/config.json",
+                "all-MiniLM-L6-v2/special_tokens_map.json",
+                "all-MiniLM-L6-v2/tokenizer_config.json",
+            ]);
+        }
+        for relative in files {
+            let source = original.join(relative);
+            let target = destination.join(relative);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(&source, &target).unwrap();
+            let source = fs::metadata(source).unwrap();
+            let target = fs::metadata(target).unwrap();
+            assert_ne!((source.dev(), source.ino()), (target.dev(), target.ino()));
+        }
+        frankensearch_embed::verify_dir_and_record(
+            &frankensearch_embed::ModelManifest::potion_128m(),
+            &destination.join("potion-multilingual-128M"),
+        )
+        .unwrap();
+        if fixture.quality {
+            frankensearch_embed::verify_dir_and_record(
+                &frankensearch_embed::ModelManifest::minilm_v2(),
+                &destination.join("all-MiniLM-L6-v2"),
+            )
+            .unwrap();
+        }
+        destination
+    }
+
+    fn replace_byte(path: &Path, offset: u64, byte: u8) {
+        let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[byte]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// Keep a valid tokenizer tree or F32 tensor layout while changing one byte.
+    fn drift_fast_artifact(path: &Path, artifact: &str) -> (u64, u8) {
+        if artifact == "tokenizer" {
+            let mut bytes = fs::read(path).unwrap();
+            let mut expected: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(expected["normalizer"]["normalizers"][1]["content"], " ! ");
+            let needle = b"\"content\":\" ! \"";
+            let matches = bytes
+                .windows(needle.len())
+                .enumerate()
+                .filter_map(|(offset, value)| (value == needle).then_some(offset))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1);
+            let offset = matches[0] + needle.iter().position(|byte| *byte == b'!').unwrap();
+            bytes[offset] = b'?';
+            expected["normalizer"]["normalizers"][1]["content"] = Value::String(" ? ".to_owned());
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+            let offset = u64::try_from(offset).unwrap();
+            replace_byte(path, offset, b'?');
+            (offset, b'!')
+        } else {
+            assert_eq!(artifact, "weights");
+            let mut file = fs::File::open(path).unwrap();
+            let mut prefix = [0_u8; 8];
+            file.read_exact(&mut prefix).unwrap();
+            let header_len = u64::from_le_bytes(prefix);
+            assert!(header_len <= 1_000_000);
+            let mut header = vec![0; usize::try_from(header_len).unwrap()];
+            file.read_exact(&mut header).unwrap();
+            let header: Value = serde_json::from_slice(&header).unwrap();
+            let tensor = &header["embeddings"];
+            assert_eq!(tensor["dtype"], "F32");
+            let shape = tensor["shape"].as_array().unwrap();
+            assert_eq!(shape.len(), 2);
+            let elements = shape[0]
+                .as_u64()
+                .unwrap()
+                .checked_mul(shape[1].as_u64().unwrap())
+                .unwrap();
+            let start = tensor["data_offsets"][0].as_u64().unwrap();
+            let end = tensor["data_offsets"][1].as_u64().unwrap();
+            assert_eq!(
+                end.checked_sub(start).unwrap(),
+                elements.checked_mul(4).unwrap()
+            );
+            let payload = 8_u64.checked_add(header_len).unwrap();
+            assert_eq!(
+                payload.checked_add(end).unwrap(),
+                file.metadata().unwrap().len()
+            );
+            assert!(elements > 0);
+            let offset = payload.checked_add(start).unwrap();
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut value = [0_u8; 4];
+            file.read_exact(&mut value).unwrap();
+            assert!(f32::from_le_bytes(value).is_finite());
+            let original = value[0];
+            value[0] ^= 1;
+            assert!(f32::from_le_bytes(value).is_finite());
+            replace_byte(path, offset, value[0]);
+            (offset, original)
+        }
     }
 
     fn artifacts(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -746,13 +857,13 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
     )
     .unwrap();
     let current = PathBuf::from(env!("CARGO_BIN_EXE_fsfs"));
-    let prior_sha = executable_sha256(&prior);
+    let prior_sha = file_sha256(&prior);
     assert_eq!(
         prior_sha,
         std::env::var("FSFS_UPGRADE_REUSE_PRIOR_SHA256")
             .expect("provide the independently verified prior executable SHA-256")
     );
-    let current_sha = executable_sha256(&current);
+    let current_sha = file_sha256(&current);
     assert_ne!(prior_sha, current_sha);
 
     for (quality, legacy_seed) in [(false, false), (false, true), (true, false), (true, true)] {
@@ -937,6 +1048,175 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
                 assert_eq!(
                     fs::read(reader.path().join("FSFS-BUNDLE.json")).unwrap(),
                     manifest
+                );
+            }
+        }
+    }
+
+    // Real artifact drift must not borrow the predecessor's verified producer,
+    // even when its display ID, configuration, size and mtime still agree.
+    for quality in [false, true] {
+        for legacy_seed in [false, true] {
+            for artifact in ["tokenizer", "weights"] {
+                let mut fixture = Fixture::new(None, quality);
+                let private = private_models(&fixture, &models);
+                let mut settings: FsfsConfig =
+                    toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+                settings.indexing.model_dir = private.display().to_string();
+                fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
+                let configuration = fs::read(&fixture.config).unwrap();
+                fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
+                fixture.executable.clone_from(&prior);
+                let predecessor = if legacy_seed {
+                    let output = Process::start(
+                        fixture
+                            .command("index", "json")
+                            .env("FSFS_COMPLETE_GENERATIONS", "false")
+                            .env("FRANKENSEARCH_LOG", "frankensearch_fsfs::indexing=debug"),
+                    )
+                    .finish(Duration::from_secs(180));
+                    assert!(output.status.success(), "{output:?}");
+                    assert!(document_batches(&output) > 0);
+                    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(response["data"]["semantic_indexed_files"], 2);
+                    assert_eq!(response["data"]["generation_complete"], true);
+                    None
+                } else {
+                    let mut process = watch(&fixture, "same-executable");
+                    let generation = wait_for_visible_paths(
+                        &fixture,
+                        &mut process,
+                        &["alpha.md", "beta.md"],
+                        None,
+                    );
+                    let output = process.stop_gracefully();
+                    assert!(document_batches(&output) > 0);
+                    Some(generation)
+                };
+                let old_root = predecessor
+                    .as_ref()
+                    .map_or(fixture.store.as_path(), PublishedGeneration::path);
+                let old_artifacts = artifacts(old_root);
+                let old_ranks = ranks(&fixture);
+                let evidence_path = old_root.join(if legacy_seed {
+                    "FSFS-LEGACY-REUSE.json"
+                } else {
+                    "FSFS-BUNDLE.json"
+                });
+                let evidence = fs::read(&evidence_path).unwrap();
+                let pointer = fixture.store.join("FSFS-CURRENT");
+                let selection = pointer.exists().then(|| fs::read(&pointer).unwrap());
+                let fast = private.join("potion-multilingual-128M");
+                let manifest = frankensearch_embed::ModelManifest::potion_128m();
+                assert!(frankensearch_embed::is_verification_cached(
+                    &manifest, &fast
+                ));
+                let receipt = fs::read(fast.join(".verified")).unwrap();
+                let filename = if artifact == "tokenizer" {
+                    "tokenizer.json"
+                } else {
+                    "model.safetensors"
+                };
+                let path = fast.join(filename);
+                let metadata = fs::metadata(&path).unwrap();
+                let original_sha = file_sha256(&path);
+                let source_path = models.join("potion-multilingual-128M").join(filename);
+                assert_eq!(file_sha256(&source_path), original_sha);
+                let (offset, byte) = drift_fast_artifact(&path, artifact);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+                    .unwrap();
+                let changed = fs::metadata(&path).unwrap();
+                assert_eq!(
+                    (
+                        changed.len(),
+                        changed.modified().unwrap(),
+                        changed.dev(),
+                        changed.ino()
+                    ),
+                    (
+                        metadata.len(),
+                        metadata.modified().unwrap(),
+                        metadata.dev(),
+                        metadata.ino()
+                    )
+                );
+                let drifted_sha = file_sha256(&path);
+                assert_ne!(drifted_sha, original_sha);
+                assert!(!frankensearch_embed::is_verification_cached(
+                    &manifest, &fast
+                ));
+                let error = frankensearch_embed::verify_dir_cached(&manifest, &fast).unwrap_err();
+                assert!(
+                    matches!(&error, frankensearch_core::SearchError::HashMismatch { path: refused, .. } if refused == &path),
+                    "{error:?}"
+                );
+                fixture.executable.clone_from(&current);
+                let output =
+                    watch(&fixture, "compatible-contract").finish(Duration::from_secs(180));
+                assert!(!output.status.success(), "{output:?}");
+                assert_eq!(document_batches(&output), 0);
+                let responses = std::str::from_utf8(&output.stdout)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Vec<_>>();
+                assert!(
+                    responses.iter().any(|response| response["ok"] == false
+                        && response["error"]["code"]
+                            == frankensearch_fsfs::output_schema::OutputErrorCode::EMBEDDER_UNAVAILABLE),
+                    "{output:?}"
+                );
+                assert!(
+                    !responses
+                        .iter()
+                        .any(|response| response["data"]["publication"] == "durable")
+                );
+                assert_eq!(
+                    pointer.exists().then(|| fs::read(&pointer).unwrap()),
+                    selection
+                );
+                assert_eq!(fs::read(&fixture.config).unwrap(), configuration);
+                assert_eq!(fs::read(fast.join(".verified")).unwrap(), receipt);
+                for (relative, bytes) in &old_artifacts {
+                    assert_eq!(fs::read(old_root.join(relative)).unwrap(), *bytes);
+                }
+                assert_eq!(fs::read(&evidence_path).unwrap(), evidence);
+                eprintln!(
+                    "producer drift refused quality={quality} legacy_seed={legacy_seed} artifact={artifact} original={original_sha} drifted={drifted_sha} size={} mtime_unchanged=true",
+                    metadata.len()
+                );
+
+                replace_byte(&path, offset, byte);
+                assert_eq!(file_sha256(&path), original_sha);
+                assert_eq!(
+                    file_sha256(&source_path),
+                    original_sha,
+                    "original cache remains untouched"
+                );
+                frankensearch_embed::verify_dir_and_record(&manifest, &fast).unwrap();
+                assert_eq!(ranks(&fixture), old_ranks);
+                let mut retry = watch(&fixture, "compatible-contract");
+                let recovered = wait_for_visible_paths(
+                    &fixture,
+                    &mut retry,
+                    &["alpha.md", "beta.md"],
+                    predecessor.as_ref().map(PublishedGeneration::id),
+                );
+                let output = retry.stop_gracefully();
+                assert_carried(&output, 2);
+                assert_eq!(document_batches(&output), 0);
+                assert_eq!(artifacts(recovered.path()), old_artifacts);
+                assert_eq!(ranks(&fixture), old_ranks);
+                for (relative, bytes) in &old_artifacts {
+                    assert_eq!(fs::read(old_root.join(relative)).unwrap(), *bytes);
+                }
+                assert_eq!(fs::read(&evidence_path).unwrap(), evidence);
+                eprintln!(
+                    "producer drift recovered quality={quality} legacy_seed={legacy_seed} artifact={artifact} carried=2 document_batches=0"
                 );
             }
         }

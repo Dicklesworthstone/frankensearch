@@ -1848,48 +1848,65 @@ mod tests {
         impl std::error::Error for PrivateSource {}
 
         run_test_with_cx(|cx| async move {
-            for streamed in [false, true] {
-                for mode in ["full", "fast_only", "quality_only", "lexical_only"] {
-                    let raw =
-                        format!("{{\"query\":\"q\",\"stream\":{streamed},\"mode\":\"{mode}\"}}\n");
-                    let (client, mut server) = pair(raw.as_bytes());
-                    serve_peer::<serde_json::Value, _, _>(
-                        &cx,
-                        &mut server,
-                        Duration::from_secs(2),
-                        |_, _| async {
-                            Err(SearchError::ModelLoadFailed {
-                                path: PathBuf::from("/private/provider-artifacts"),
-                                source: Box::new(PrivateSource),
-                            })
-                        },
-                    )
-                    .await
-                    .unwrap();
-                    let failure = response(client);
-                    assert_eq!(
-                        failure["schema_version"],
-                        super::super::super::FSFS_SEARCH_SERVE_SCHEMA_VERSION
-                    );
-                    assert_eq!(failure["ok"], false);
-                    assert_eq!(failure["mode"], mode);
-                    assert_eq!(failure["error"]["code"], "model_load_failed");
-                    assert_eq!(
-                        failure["error"]["exit_code"],
-                        crate::adapters::cli::exit_code::MODEL_UNAVAILABLE
-                    );
-                    assert!(!failure.to_string().contains("/private/"));
-                    assert!(failure.get("event").is_none());
-                    if mode == "lexical_only"
-                        || (!super::super::super::SEMANTIC_LOADERS_COMPILED
-                            && mode != "quality_only")
-                    {
-                        assert!(failure["error"]["recovery_plan"].is_null());
-                    } else {
-                        let plan = &failure["error"]["recovery_plan"];
-                        assert_eq!(plan["policy"]["interaction"], "non_interactive");
-                        assert_eq!(plan["semantic_available"], false);
-                        assert!(plan["policy"]["acquisition_authorization"].is_null());
+            // Canonical diagnostics expose bounded structured model paths,
+            // while refusing unprintable paths and opaque provider bodies.
+            for (artifact_path, expected_path) in [
+                ("/private/provider-artifacts", "/private/provider-artifacts"),
+                ("/private/\nprovider-token-canary", "<redacted-model-path>"),
+            ] {
+                for streamed in [false, true] {
+                    for mode in ["full", "fast_only", "quality_only", "lexical_only"] {
+                        let raw =
+                            format!("{{\"query\":\"q\",\"stream\":{streamed},\"mode\":\"{mode}\"}}\n");
+                        let (client, mut server) = pair(raw.as_bytes());
+                        serve_peer::<serde_json::Value, _, _>(
+                            &cx,
+                            &mut server,
+                            Duration::from_secs(2),
+                            |_, _| async {
+                                Err(SearchError::ModelLoadFailed {
+                                    path: PathBuf::from(artifact_path),
+                                    source: Box::new(PrivateSource),
+                                })
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let failure = response(client);
+                        assert_eq!(
+                            failure["schema_version"],
+                            super::super::super::FSFS_SEARCH_SERVE_SCHEMA_VERSION
+                        );
+                        assert_eq!(failure["ok"], false);
+                        assert_eq!(failure["mode"], mode);
+                        assert_eq!(failure["error"]["code"], "model_load_failed");
+                        assert_eq!(
+                            failure["error"]["exit_code"],
+                            crate::adapters::cli::exit_code::MODEL_UNAVAILABLE
+                        );
+                        assert_eq!(
+                            failure["error"]["message"],
+                            "The selected model failed to load. Verify its artifacts and build support."
+                        );
+                        assert!(
+                            failure["error"]["suggestion"]
+                                .as_str()
+                                .unwrap()
+                                .contains(expected_path)
+                        );
+                        assert!(!failure.to_string().contains("provider-token-canary"));
+                        assert!(failure.get("event").is_none());
+                        if mode == "lexical_only"
+                            || (!super::super::super::SEMANTIC_LOADERS_COMPILED
+                                && mode != "quality_only")
+                        {
+                            assert!(failure["error"]["recovery_plan"].is_null());
+                        } else {
+                            let plan = &failure["error"]["recovery_plan"];
+                            assert_eq!(plan["policy"]["interaction"], "non_interactive");
+                            assert_eq!(plan["semantic_available"], false);
+                            assert!(plan["policy"]["acquisition_authorization"].is_null());
+                        }
                     }
                 }
             }
