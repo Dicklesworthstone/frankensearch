@@ -112,9 +112,17 @@ enum ShardCompletion {
         shard: ShardResult,
         refinement_timed_out: bool,
     },
-    Failed { index: String, error: SearchError },
-    TimedOut { index: String },
-    Cancelled { phase: String, reason: String },
+    Failed {
+        index: String,
+        error: SearchError,
+    },
+    TimedOut {
+        index: String,
+    },
+    Cancelled {
+        phase: String,
+        reason: String,
+    },
 }
 
 type ShardFuture<'a> = Pin<Box<dyn Future<Output = ShardCompletion> + Send + 'a>>;
@@ -1240,16 +1248,13 @@ mod tests {
         });
     }
 
-
     #[test]
     fn deadline_retains_initial_results_for_the_response_floor() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_healthy_dir, healthy) = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
             let quality = Arc::new(PendingEmbedder::new("stub-quality", 2));
-            let (_slow_dir, slow) = build_refining_searcher(
-                &[("doc-slow", &[1.0, 0.0], &[1.0, 0.0])],
-                quality.clone(),
-            );
+            let (_slow_dir, slow) =
+                build_refining_searcher(&[("doc-slow", &[1.0, 0.0], &[1.0, 0.0])], quality.clone());
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
                     per_index_timeout_ms: 80,
@@ -1307,7 +1312,10 @@ mod tests {
                     ..FederatedConfig::default()
                 })
                 .add_index("pending-fast", searcher, 1.0);
-            let error = federated.search(&cx, "query", 1, |_| None).await.unwrap_err();
+            let error = federated
+                .search(&cx, "query", 1, |_| None)
+                .await
+                .unwrap_err();
             assert!(matches!(
                 error,
                 SearchError::FederatedInsufficientResponses {
@@ -1327,17 +1335,18 @@ mod tests {
                 cancel_on_drop: true,
                 ..PendingEmbedder::new("stub-quality", 2)
             });
-            let (_dir, searcher) = build_refining_searcher(
-                &[("doc", &[1.0, 0.0], &[1.0, 0.0])],
-                quality.clone(),
-            );
+            let (_dir, searcher) =
+                build_refining_searcher(&[("doc", &[1.0, 0.0], &[1.0, 0.0])], quality.clone());
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
                     per_index_timeout_ms: 80,
                     ..FederatedConfig::default()
                 })
                 .add_index("cancelled", searcher, 1.0);
-            let error = federated.search(&cx, "query", 1, |_| None).await.unwrap_err();
+            let error = federated
+                .search(&cx, "query", 1, |_| None)
+                .await
+                .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             assert_eq!(quality.started.load(Ordering::SeqCst), 1);
             assert_eq!(quality.dropped.load(Ordering::SeqCst), 1);
@@ -1368,7 +1377,10 @@ mod tests {
                 .add_index("pending", pending, 1.0)
                 .add_index("healthy", healthy, 1.0);
 
-            let error = federated.search(&cx, "query", 1, |_| None).await.unwrap_err();
+            let error = federated
+                .search(&cx, "query", 1, |_| None)
+                .await
+                .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             assert_eq!(provider.started.load(Ordering::SeqCst), 1);
             assert_eq!(provider.dropped.load(Ordering::SeqCst), 1);
