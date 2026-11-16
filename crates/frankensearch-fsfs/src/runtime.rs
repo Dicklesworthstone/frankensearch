@@ -46162,7 +46162,12 @@ mod tests {
                 assert_eq!(stage.scores.len(), 3);
                 assert_eq!(stage.scores[0].original_rank, 3);
                 assert!(stage.scores.iter().all(|score| {
-                    score.path.ends_with(".rs") && !score.path.ends_with("00-blocked.rs")
+                    matches!(
+                        Path::new(&score.path)
+                            .file_name()
+                            .and_then(|name| name.to_str()),
+                        Some("a.rs" | "b.rs" | "c.rs" | "d.rs")
+                    )
                 }));
             }
             super::set_test_reranker(None);

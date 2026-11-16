@@ -5562,7 +5562,7 @@ mod tests {
                 "malformed-legacy"
             }
 
-            fn model_name(&self) -> &'static str {
+            fn model_name(&self) -> &str {
                 self.id()
             }
 
