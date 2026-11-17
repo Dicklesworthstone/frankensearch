@@ -32,6 +32,7 @@ use crate::native_hnsw::{
     HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
     native_hnsw_generation_receipt_path,
 };
+use crate::search::classified_candidates;
 use crate::{
     ClassifiedHits, FsviAdmissionError, FsviUpgradeRequired, FsviV2IdentityBinding, Quantization,
     SearchParams, ValidatedFsviBytes, VectorIndex, VectorMetadata, dot_product_f32_f32,
@@ -1685,7 +1686,8 @@ impl TwoTierIndex {
     /// Behaves like [`Self::search_fast`] with the fail-closed differences
     /// of the classified exact lane
     /// ([`VectorIndex::search_top_k_classified`]): non-finite queries are
-    /// rejected instead of silently scoring garbage, and an empty result
+    /// rejected instead of silently scoring garbage, unusable stored vectors
+    /// cannot contribute ranks, and an empty result
     /// always carries a typed [`ZeroSignalReason`]. Availability transitions
     /// are logged once per state change, never per query.
     ///
@@ -1721,31 +1723,34 @@ impl TwoTierIndex {
             self.note_zero_signal(classified.zero_signal);
             return Ok(classified);
         }
-        let hits = self.search_fast(query_vec, k)?;
-        let zero_signal = hits.is_empty().then(|| self.classify_fast_empty());
-        self.note_zero_signal(zero_signal);
-        Ok(ClassifiedHits { hits, zero_signal })
+        let fast = self.fast_tier();
+        let classified = classified_candidates(
+            k,
+            fast.record_count().saturating_add(fast.wal_entries.len()),
+            |candidate_limit| self.search_fast(query_vec, candidate_limit),
+            |hit| fast.classified_hit_is_usable(hit),
+            || self.classified_fast_census(),
+        )?;
+        self.note_zero_signal(classified.zero_signal);
+        Ok(classified)
     }
 
     /// Classify why a well-formed fast-tier search returned nothing.
     ///
-    /// Mirrors [`VectorIndex::classify_empty_result`], with one refinement:
+    /// Mirrors [`VectorIndex::search_top_k_classified`], with one refinement:
     /// when ANN owns candidate retrieval and the census still shows usable
     /// live vectors, the empty result is the ANN-availability anomaly rather
     /// than a data problem.
-    fn classify_fast_empty(&self) -> ZeroSignalReason {
-        let state = self.fast_tier().zero_signal_state();
-        if let Some(reason) = state.state_reason() {
-            return reason;
-        }
-        if state.is_wal_only() {
-            return ZeroSignalReason::WalOnlyNoLiveRecords;
-        }
+    fn classified_fast_census(&self) -> (bool, ZeroSignalReason) {
+        let (has_usable, reason) = self.fast_tier().classified_search_census(false);
         #[cfg(feature = "ann")]
-        if self.fast_ann.is_some() {
-            return ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors;
+        if has_usable && self.fast_ann.is_some() {
+            return (
+                has_usable,
+                ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors,
+            );
         }
-        ZeroSignalReason::NoUsableVectors
+        (has_usable, reason)
     }
 
     /// Record a zero-signal observation and log state transitions exactly

@@ -46,7 +46,7 @@ use rayon::prelude::*;
 #[cfg(any(test, target_os = "linux"))]
 use sha2::{Digest, Sha256};
 
-use crate::search::{ClassifiedHits, PARALLEL_CHUNK_SIZE, SearchParams};
+use crate::search::{ClassifiedHits, PARALLEL_CHUNK_SIZE, SearchParams, classified_candidates};
 use crate::simd::{dot_4bit_prepared, dot_i8_i8, dot_product_f16_f32, prepare_4bit_query};
 use crate::{FsviV2IdentityBinding, FsviV2Witness, ValidatedFsviBytes, VectorIndex};
 
@@ -2606,6 +2606,18 @@ impl InMemoryVectorIndex {
         &self.vectors[start..start + self.dimension]
     }
 
+    fn vector_is_usable(&self, index: usize) -> bool {
+        let mut norm_sq = 0.0_f32;
+        for &value in self.vector_slice(index) {
+            let value = value.to_f32();
+            if !value.is_finite() {
+                return false;
+            }
+            norm_sq += value * value;
+        }
+        norm_sq > 0.0 && norm_sq.is_finite()
+    }
+
     /// Brute-force cosine-similarity top-k search.
     ///
     /// Query must be pre-normalized. Uses f16→f32 SIMD dot product.
@@ -2633,19 +2645,7 @@ impl InMemoryVectorIndex {
         let record_count = self.record_count();
         let mut usable_vector_count = 0usize;
         for row in 0..record_count {
-            let start = row * self.dimension;
-            let row_slice = &self.vectors[start..start + self.dimension];
-            let mut norm_sq = 0.0_f32;
-            let mut finite = true;
-            for &value in row_slice {
-                let value = value.to_f32();
-                if !value.is_finite() {
-                    finite = false;
-                    break;
-                }
-                norm_sq += value * value;
-            }
-            if finite && norm_sq > 0.0 && norm_sq.is_finite() {
+            if self.vector_is_usable(row) {
                 usable_vector_count += 1;
             }
         }
@@ -2696,12 +2696,19 @@ impl InMemoryVectorIndex {
         if query.iter().all(|&value| value == 0.0) {
             return Ok(ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery));
         }
-        let hits = self.search_top_k(query, limit, filter)?;
-        let zero_signal = hits.is_empty().then(|| {
-            self.zero_signal_state()
-                .empty_result_reason(filter.is_some())
-        });
-        Ok(ClassifiedHits { hits, zero_signal })
+        classified_candidates(
+            limit,
+            self.record_count(),
+            |candidate_limit| self.search_top_k(query, candidate_limit, filter),
+            |hit| usize::try_from(hit.index).is_ok_and(|row| self.vector_is_usable(row)),
+            || {
+                let state = self.zero_signal_state();
+                (
+                    state.usable_vector_count > 0,
+                    state.empty_result_reason(filter.is_some()),
+                )
+            },
+        )
     }
 
     /// Brute-force top-k search with configurable parallelism.

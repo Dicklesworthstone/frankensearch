@@ -860,8 +860,8 @@ impl SyncTwoTierSearcher {
             // hits and they do not schedule quality refinement.
             metrics.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
         }
-        // Typed zero-signal classification (bd-tqhc): an empty semantic lane
-        // must carry why. Lazy — the non-empty path pays nothing.
+        // Default exact retrieval validates its winning vectors. An empty
+        // semantic lane also needs a census to explain its missing signal.
         metrics.zero_signal = if fast_hits.is_empty() {
             Some(self.classify_fast_empty(query_vec, fetch, filter))
         } else {
@@ -1544,9 +1544,11 @@ impl SyncTwoTierSearcher {
                 SyncFastRetrieval::Exact => {
                     // The public default is exact whether the optional cache is
                     // attached or unavailable. A verified sidecar may prune only
-                    // inside `search_top_k`; it must never select a different
+                    // inside classified exact search; it must never select a different
                     // candidate-generation algorithm or change visible results.
-                    fast_index.search_top_k(query_vec, fetch, filter)
+                    fast_index
+                        .search_top_k_classified(query_vec, fetch, filter)
+                        .map(|classified| classified.hits)
                 }
                 SyncFastRetrieval::ApproximateInt8ForBench {
                     candidate_multiplier,
@@ -1567,11 +1569,8 @@ impl SyncTwoTierSearcher {
     ///
     /// Request-scoped defects are classified from the request itself, in the
     /// documented precedence order; state-scoped reasons come from the
-    /// index's own classified lane so in-memory and persistent paths agree.
-    /// The classified re-scan runs only on the (already cheap) empty path,
-    /// and its hits are never used for result production. Classification is
-    /// diagnostic and must never fail the search: errors degrade to an
-    /// unclassified lane at debug level rather than a fabricated reason.
+    /// index's census so in-memory and persistent paths agree. This never
+    /// repeats retrieval or substitutes a second search's hits.
     fn classify_fast_empty(
         &self,
         query_vec: &[f32],
@@ -4398,6 +4397,69 @@ mod tests {
             Some(ZeroSignalReason::NewlyCreatedEmpty),
             "an empty semantic lane must say why, not just return nothing"
         );
+    }
+
+    #[test]
+    fn persisted_corrupt_vectors_are_not_published_as_sync_candidates() {
+        for all_unusable in [false, true] {
+            let dir = temp_dir("corrupt-sync-candidates");
+            let path = dir.path().join("fast.fsvi");
+            let mut writer = frankensearch_index::VectorIndex::create(&path, "test", 2).unwrap();
+            for (id, vector) in [
+                ("bad-zero", [1.0, 0.0]),
+                ("negative-high", [-0.5, 0.5]),
+                ("negative-low", [-1.0, 0.0]),
+            ] {
+                writer.write_record(id, &vector).unwrap();
+            }
+            writer.finish().unwrap();
+            let file = frankensearch_index::VectorIndex::open_read_only(&path).unwrap();
+            let offset = usize::try_from(file.metadata().vectors_offset).unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            for row in 0..file.record_count() {
+                if all_unusable || file.doc_id_at(row).unwrap() == "bad-zero" {
+                    // Valid writer input, followed by corruption of its F16 slab.
+                    bytes[offset + row * 4..offset + (row + 1) * 4].fill(0);
+                }
+            }
+            drop(file);
+            std::fs::write(&path, bytes).unwrap();
+            let fast = InMemoryVectorIndex::from_fsvi(&path).unwrap();
+            let index = Arc::new(InMemoryTwoTierIndex::new(fast, None).unwrap());
+            let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+            let query = fast_only_query(vec![1.0, 0.0]);
+            let expected_ids = if all_unusable {
+                vec![]
+            } else {
+                vec!["negative-high", "negative-low"]
+            };
+            let expected_reason = all_unusable.then_some(ZeroSignalReason::NoUsableVectors);
+            let (results, metrics) = searcher.search_collect(&query, 2).unwrap();
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+            assert_eq!(metrics.zero_signal, expected_reason);
+            let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+            assert_eq!(phases.len(), 1);
+            let SearchPhase::Initial {
+                results, metrics, ..
+            } = &phases[0]
+            else {
+                panic!("a fast-only fixture must publish an Initial phase");
+            };
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+            assert_eq!(metrics.vectors_searched, 3);
+        }
     }
 
     #[test]

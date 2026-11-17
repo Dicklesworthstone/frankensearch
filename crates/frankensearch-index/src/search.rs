@@ -130,6 +130,44 @@ impl ClassifiedHits {
     }
 }
 
+/// Validate winners without changing the raw numeric kernels. Only corrupt
+/// winners require a generation census and wider retrieval; valid negative
+/// scores must not stay hidden behind unusable zero-score rows.
+pub(crate) fn classified_candidates(
+    limit: usize,
+    candidate_count: usize,
+    mut search: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
+    mut usable: impl FnMut(&VectorHit) -> bool,
+    mut census: impl FnMut() -> (bool, ZeroSignalReason),
+) -> SearchResult<ClassifiedHits> {
+    let mut candidate_limit = limit.min(candidate_count);
+    let mut repairing = false;
+    let mut signal_state = None;
+    loop {
+        let mut hits = search(candidate_limit)?;
+        let before = hits.len();
+        hits.retain(|hit| hit.score.is_finite() && usable(hit));
+        repairing |= hits.len() != before;
+        if repairing {
+            let (has_usable, reason) = *signal_state.get_or_insert_with(&mut census);
+            if !has_usable {
+                return Ok(ClassifiedHits::empty(reason));
+            }
+        }
+        if !repairing || hits.len() >= limit || candidate_limit >= candidate_count {
+            hits.truncate(limit);
+            let zero_signal = hits
+                .is_empty()
+                .then(|| signal_state.get_or_insert_with(&mut census).1);
+            return Ok(ClassifiedHits { hits, zero_signal });
+        }
+        candidate_limit = candidate_limit
+            .saturating_mul(2)
+            .max(candidate_limit.saturating_add(1))
+            .min(candidate_count);
+    }
+}
+
 static PARALLEL_SEARCH_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
@@ -279,18 +317,20 @@ impl VectorIndex {
 
     /// Brute-force top-k with typed zero-signal classification.
     ///
-    /// Behaves like [`Self::search_top_k`] with two fail-closed differences
+    /// Behaves like [`Self::search_top_k`] with three fail-closed differences
     /// that align the exact path with the ANN path:
     /// - a query containing NaN or infinite components is rejected with
     ///   [`SearchError::InvalidConfig`] instead of silently scoring garbage
     ///   (parity with `HnswIndex`);
+    /// - unusable stored vectors cannot contribute ranks or hide usable
+    ///   neighbors;
     /// - an empty result always carries a typed
     ///   [`ZeroSignalReason`], so a legitimate empty answer is
     ///   distinguishable from an unusable semantic lane.
     ///
-    /// Classification is lazy: the non-empty path costs nothing extra, and
-    /// an empty result pays one census pass comparable to the scan that
-    /// just ran.
+    /// Winning vectors are checked for a finite, non-zero norm. Corrupt
+    /// winners trigger bounded widening so they cannot hide valid neighbors;
+    /// a generation census is needed only for empty or corrupt results.
     ///
     /// # Errors
     ///
@@ -318,25 +358,60 @@ impl VectorIndex {
         if query.iter().all(|&value| value == 0.0) {
             return Ok(ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery));
         }
-        let hits = self.search_top_k(query, limit, filter)?;
-        if hits.is_empty() {
-            let reason = self.classify_empty_result(filter.is_some());
-            return Ok(ClassifiedHits {
-                hits,
-                zero_signal: Some(reason),
-            });
-        }
-        Ok(ClassifiedHits {
-            hits,
-            zero_signal: None,
+        classified_candidates(
+            limit,
+            self.record_count().saturating_add(self.wal_entries.len()),
+            |candidate_limit| self.search_top_k(query, candidate_limit, filter),
+            |hit| self.classified_hit_is_usable(hit),
+            || self.classified_search_census(filter.is_some()),
+        )
+    }
+
+    pub(crate) fn classified_hit_is_usable(&self, hit: &VectorHit) -> bool {
+        usize::try_from(hit.index).is_ok_and(|index| {
+            // Resolved hits use a contiguous public index space;
+            // only the internal heap uses the WAL sentinel bit.
+            if index >= self.record_count() {
+                self.wal_entries
+                    .get(index - self.record_count())
+                    .is_some_and(|entry| crate::vector_signal_usable(&entry.embedding))
+            } else {
+                self.is_vector_usable(index)
+            }
         })
     }
 
-    /// Classify why a well-formed search (k > 0, finite non-zero query)
-    /// returned nothing, following the precedence documented on
-    /// [`ZeroSignalReason`].
-    pub(crate) fn classify_empty_result(&self, had_filter: bool) -> ZeroSignalReason {
-        self.zero_signal_state().empty_result_reason(had_filter)
+    pub(crate) fn classified_search_census(&self, had_filter: bool) -> (bool, ZeroSignalReason) {
+        if self.wal_entries.is_empty() {
+            let state = self.zero_signal_state();
+            return (
+                state.usable_vector_count > 0,
+                state.empty_result_reason(had_filter),
+            );
+        }
+        // A durable replacement can precede the old main row's tombstone.
+        // Neither that stale vector nor main-only counts may attest the
+        // availability of the current WAL-resident generation.
+        let replaced: AHashSet<_> = self
+            .wal_entries
+            .iter()
+            .map(|entry| entry.doc_id.as_str())
+            .collect();
+        let has_usable = self
+            .wal_entries
+            .iter()
+            .any(|entry| crate::vector_signal_usable(&entry.embedding))
+            || (0..self.record_count()).any(|row| {
+                !self.is_deleted(row)
+                    && self.doc_id_at(row).is_ok_and(|id| !replaced.contains(id))
+                    && self.is_vector_usable(row)
+            });
+        let reason = if has_usable && had_filter {
+            ZeroSignalReason::FilterEliminatedAll
+        } else {
+            ZeroSignalReason::NoUsableVectors
+        };
+        (has_usable, reason)
     }
 
     /// Exact top-k over the persisted main slab only.
@@ -3173,8 +3248,14 @@ mod tests {
     #[test]
     fn classified_corrupt_vectors_do_not_hide_valid_negative_scores() {
         for quantization in [Quantization::F16, Quantization::F32] {
-            let (_path, index) =
+            let (path, index) =
                 corrupt_classified_index("classified-corrupt-mixed", quantization, false);
+            let memory = crate::InMemoryVectorIndex::from_fsvi(&path).unwrap();
+            let two_tier = crate::TwoTierIndex::open_with_paths(
+                &crate::TwoTierIndexPaths::new(path.to_path_buf()),
+                frankensearch_core::TwoTierConfig::default(),
+            )
+            .unwrap();
             let raw = index.search_top_k(&[1.0, 0.0], 1, None).unwrap();
             assert_eq!(hit_ids(&raw), ["bad-zero"], "raw numeric contract");
             for limit in [1, 2, usize::MAX] {
@@ -3192,6 +3273,32 @@ mod tests {
                     "{quantization:?} k={limit}"
                 );
                 assert_eq!(classified.zero_signal, None);
+                let in_memory = memory
+                    .search_top_k_classified(&[1.0, 0.0], limit, None)
+                    .unwrap();
+                assert_eq!(
+                    hit_ids(&in_memory.hits),
+                    expected,
+                    "in-memory {quantization:?}"
+                );
+                assert_eq!(in_memory.zero_signal, None);
+                let fast = two_tier.search_fast_classified(&[1.0, 0.0], limit).unwrap();
+                assert_eq!(hit_ids(&fast.hits), expected, "fast tier {quantization:?}");
+                assert_eq!(fast.zero_signal, None);
+            }
+            let low_only = PredicateFilter::new("negative-low-and-corrupt", |id| {
+                id == "negative-low" || id.starts_with("bad-")
+            });
+            for classified in [
+                index
+                    .search_top_k_classified(&[1.0, 0.0], 1, Some(&low_only))
+                    .unwrap(),
+                memory
+                    .search_top_k_classified(&[1.0, 0.0], 1, Some(&low_only))
+                    .unwrap(),
+            ] {
+                assert_eq!(hit_ids(&classified.hits), ["negative-low"]);
+                assert_eq!(classified.zero_signal, None);
             }
         }
     }
@@ -3199,11 +3306,28 @@ mod tests {
     #[test]
     fn classified_unusable_persisted_vectors_report_availability_failure() {
         for quantization in [Quantization::F16, Quantization::F32] {
-            let (_path, index) =
+            let (path, index) =
                 corrupt_classified_index("classified-corrupt-all", quantization, true);
             assert_eq!(index.zero_signal_state().usable_vector_count, 0);
             let classified = index.search_top_k_classified(&[1.0, 0.0], 2, None).unwrap();
             assert!(classified.hits.is_empty(), "{quantization:?}");
+            assert_eq!(
+                classified.zero_signal,
+                Some(ZeroSignalReason::NoUsableVectors)
+            );
+            let two_tier = crate::TwoTierIndex::open_with_paths(
+                &crate::TwoTierIndexPaths::new(path.to_path_buf()),
+                frankensearch_core::TwoTierConfig::default(),
+            )
+            .unwrap();
+            let fast = two_tier.search_fast_classified(&[1.0, 0.0], 2).unwrap();
+            assert!(fast.hits.is_empty(), "fast tier {quantization:?}");
+            assert_eq!(fast.zero_signal, Some(ZeroSignalReason::NoUsableVectors));
+            let memory = crate::InMemoryVectorIndex::from_fsvi(&path).unwrap();
+            let classified = memory
+                .search_top_k_classified(&[1.0, 0.0], 2, None)
+                .unwrap();
+            assert!(classified.hits.is_empty());
             assert_eq!(
                 classified.zero_signal,
                 Some(ZeroSignalReason::NoUsableVectors)
@@ -3220,6 +3344,22 @@ mod tests {
         assert_eq!(hit_ids(&classified.hits), ["orthogonal"]);
         assert_eq!(classified.hits[0].score, 0.0);
         assert_eq!(classified.zero_signal, None);
+        let memory = crate::InMemoryVectorIndex::from_fsvi(&path).unwrap();
+        let classified = memory
+            .search_top_k_classified(&[1.0, 0.0], 1, None)
+            .unwrap();
+        assert_eq!(hit_ids(&classified.hits), ["orthogonal"]);
+        assert_eq!(classified.hits[0].score.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(classified.zero_signal, None);
+        let two_tier = crate::TwoTierIndex::open_with_paths(
+            &crate::TwoTierIndexPaths::new(path.to_path_buf()),
+            frankensearch_core::TwoTierConfig::default(),
+        )
+        .unwrap();
+        let fast = two_tier.search_fast_classified(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(hit_ids(&fast.hits), ["orthogonal"]);
+        assert_eq!(fast.hits[0].score.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(fast.zero_signal, None);
     }
 
     #[test]
@@ -3236,6 +3376,74 @@ mod tests {
         let classified = index.search_top_k_classified(&[1.0, 0.0], 1, None).unwrap();
         assert_eq!(hit_ids(&classified.hits), ["negative"]);
         assert_eq!(classified.zero_signal, None);
+    }
+
+    #[test]
+    fn classified_finite_but_unusable_norms_are_not_ranked() {
+        let (path, index) =
+            corrupt_classified_index("classified-corrupt-norms", Quantization::F32, false);
+        let offset = usize::try_from(index.metadata().vectors_offset).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        for row in 0..index.record_count() {
+            let value: f32 = match index.doc_id_at(row).unwrap() {
+                "bad-nan" => 1.0e30,
+                "bad-zero" => 1.0e-30,
+                _ => continue,
+            };
+            bytes[offset + row * 8..offset + row * 8 + 4].copy_from_slice(&value.to_le_bytes());
+            bytes[offset + row * 8 + 4..offset + (row + 1) * 8].fill(0);
+        }
+        drop(index);
+        fs::write(&path, bytes).unwrap();
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let memory = crate::InMemoryVectorIndex::from_fsvi(&path).unwrap();
+        let two_tier = crate::TwoTierIndex::open_with_paths(
+            &crate::TwoTierIndexPaths::new(path.to_path_buf()),
+            frankensearch_core::TwoTierConfig::default(),
+        )
+        .unwrap();
+        for classified in [
+            index.search_top_k_classified(&[1.0, 0.0], 2, None).unwrap(),
+            memory
+                .search_top_k_classified(&[1.0, 0.0], 2, None)
+                .unwrap(),
+            two_tier.search_fast_classified(&[1.0, 0.0], 2).unwrap(),
+        ] {
+            assert_eq!(hit_ids(&classified.hits), ["negative-high", "negative-low"]);
+            assert_eq!(classified.zero_signal, None);
+        }
+    }
+
+    #[test]
+    fn classified_healthy_wal_survives_an_unusable_main_slab() {
+        let (path, index) =
+            corrupt_classified_index("classified-healthy-wal", Quantization::F16, true);
+        drop(index);
+        let mut index = VectorIndex::open(&path).unwrap();
+        index.append("live-wal", &[-0.25, 0.0]).unwrap();
+        let classified = index.search_top_k_classified(&[1.0, 0.0], 1, None).unwrap();
+        assert_eq!(hit_ids(&classified.hits), ["live-wal"]);
+        assert_eq!(classified.zero_signal, None);
+        let reject_all = PredicateFilter::new("reject-healthy-wal", |_| false);
+        let classified = index
+            .search_top_k_classified(&[1.0, 0.0], 1, Some(&reject_all))
+            .unwrap();
+        assert!(classified.hits.is_empty());
+        assert_eq!(
+            classified.zero_signal,
+            Some(ZeroSignalReason::FilterEliminatedAll)
+        );
+        // The writer retains the exclusive mapping lock until it is dropped.
+        // Reopen the persisted WAL through the wrapper only after releasing it.
+        drop(index);
+        let two_tier = crate::TwoTierIndex::open_with_paths(
+            &crate::TwoTierIndexPaths::new(path.to_path_buf()),
+            frankensearch_core::TwoTierConfig::default(),
+        )
+        .unwrap();
+        let fast = two_tier.search_fast_classified(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(hit_ids(&fast.hits), ["live-wal"]);
+        assert_eq!(fast.zero_signal, None);
     }
 
     #[test]

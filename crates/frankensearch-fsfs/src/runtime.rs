@@ -689,7 +689,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v33: reranking scores the planned candidate window before the display cutoff.
 // v34: reranking admits only complete, finite responses for the exact inputs.
 // v35: negated queries require lexical membership for every vector candidate.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v35";
+// v36: corrupt stored vectors cannot contribute semantic ranks or hide recovery.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v36";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -721,8 +722,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v30 / stream v28: reranking can promote candidates outside the displayed page.
 // v31 / stream v29: reranking rejects malformed and non-finite score evidence.
 // v32 / stream v30: negated queries reject candidates without lexical evidence.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v32";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v30";
+// v33 / stream v31: unusable stored vectors cannot attest semantic ranks.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v33";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v31";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -67715,6 +67717,8 @@ mod tests {
                 "fsfs.search.cache.v30",
                 // Could collapse distinct quoted keyword values together.
                 "fsfs.search.cache.v31",
+                // Could return arbitrary ranks from corrupt stored vectors.
+                "fsfs.search.cache.v35",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
