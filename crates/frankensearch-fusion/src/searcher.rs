@@ -10277,11 +10277,13 @@ mod tests {
             let dir = owner_backed_dir("owner-fast-rounded-zero");
             let path = dir.join("fast.fsvi");
             let binding = artifact_binding("owner-fast-rounded-zero", 4, 79);
-            write_v2_tier(
+            // Sealed by the pre-validation writer in 8ff1a225. The original
+            // nonzero F32 input rounded to zero in the stored F16 vector.
+            std::fs::write(
                 &path,
-                &binding,
-                &[("rounded-zero", &[1.0e-9, 0.0, 0.0, 0.0])],
-            );
+                include_bytes!("../tests/fixtures/fsvi-v2-rounded-zero.fsvi"),
+            )
+            .unwrap();
             let config = TwoTierConfig::default();
             let mut index = TwoTierIndex::open_admitted_v2_with_paths(
                 &frankensearch_index::TwoTierIndexPaths::new(path),

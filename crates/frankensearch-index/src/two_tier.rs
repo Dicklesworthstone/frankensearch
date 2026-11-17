@@ -2571,7 +2571,7 @@ impl TwoTierIndexBuilder {
     ///
     /// Returns `SearchError::DimensionMismatch` if this record dimension differs
     /// from previously added fast-tier vectors, or `SearchError::InvalidConfig`
-    /// for duplicate identifiers, non-finite coordinates, or an unusable norm.
+    /// for duplicate identifiers or vectors unusable before or after F16 encoding.
     pub fn add_fast_record(
         &mut self,
         doc_id: impl Into<String>,
@@ -2620,7 +2620,7 @@ impl TwoTierIndexBuilder {
     ///
     /// Returns `SearchError::DimensionMismatch` if this record dimension differs
     /// from previously added quality-tier vectors, or `SearchError::InvalidConfig`
-    /// for duplicate identifiers, non-finite coordinates, or an unusable norm.
+    /// for duplicate identifiers or vectors unusable before or after F16 encoding.
     pub fn add_quality_record(
         &mut self,
         doc_id: impl Into<String>,
@@ -2646,8 +2646,8 @@ impl TwoTierIndexBuilder {
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` if either tier dimension is
-    /// inconsistent, or `SearchError::InvalidConfig` for a duplicate identifier,
-    /// non-finite coordinates, or an unusable norm in either supplied tier.
+    /// inconsistent, or `SearchError::InvalidConfig` for a duplicate identifier
+    /// or a vector unusable before or after F16 encoding in either supplied tier.
     /// Every returned error leaves both tiers unchanged.
     pub fn add_record(
         &mut self,
@@ -2861,21 +2861,7 @@ fn validate_record_admission(
     // Admit the same numeric domain as the FSVI writer before changing the
     // buffered corpus. Deferring this until finish would let one rejected
     // record poison otherwise valid documents and reserve its ID/dimension.
-    if embedding.iter().any(|value| !value.is_finite()) {
-        return Err(SearchError::InvalidConfig {
-            field: "embedding".to_owned(),
-            value: "<contains non-finite values>".to_owned(),
-            reason: "all embedding values must be finite".to_owned(),
-        });
-    }
-    if !crate::vector_signal_usable(embedding) {
-        return Err(SearchError::InvalidConfig {
-            field: "embedding".to_owned(),
-            value: "<zero-or-nonfinite-norm vector>".to_owned(),
-            reason: "embedding squared norm must be non-zero and finite".to_owned(),
-        });
-    }
-    Ok(())
+    crate::validate_stored_embedding(embedding, Quantization::F16)
 }
 
 /// A completely written tier whose unique temporary name is owned until
@@ -4590,10 +4576,12 @@ mod tests {
 
     #[test]
     fn builder_invalid_quality_records_preserve_existing_generation() {
-        let malformed: [(&str, &[f32]); 4] = [
+        let malformed: [(&str, &[f32]); 6] = [
             ("zero", &[0.0, 0.0]),
             ("nan", &[f32::NAN, 1.0]),
             ("infinite", &[f32::INFINITY, 1.0]),
+            ("f16-overflow", &[70_000.0, 1.0]),
+            ("f16-underflow", &[1.0e-9, 0.0]),
             ("empty", &[]),
         ];
         for (case, quality) in malformed {
@@ -4636,12 +4624,14 @@ mod tests {
 
     #[test]
     fn builder_invalid_numeric_records_leave_identifiers_and_dimensions_available() {
-        let malformed: [(&str, &[f32]); 6] = [
+        let malformed: [(&str, &[f32]); 8] = [
             ("zero", &[0.0, 0.0]),
             ("nan", &[f32::NAN, 1.0]),
             ("infinite", &[f32::INFINITY, 1.0]),
             ("overflow", &[f32::MAX, f32::MAX]),
             ("underflow", &[f32::MIN_POSITIVE, f32::MIN_POSITIVE]),
+            ("f16-overflow", &[70_000.0, 1.0]),
+            ("f16-underflow", &[1.0e-9, 0.0]),
             ("empty", &[]),
         ];
         for (case, embedding) in malformed {
@@ -9339,18 +9329,23 @@ mod tests {
             let (quality_binding, quality_identity) = fsvi_v2_binding("signal-quality", 4, 101);
             let fast_path = directory.path().join("fast.fsvi");
             let quality_path = directory.path().join("quality.fsvi");
-            let mut fast_rows: Vec<(&str, &[f32])> = Vec::new();
-            let mut quality_rows: Vec<(&str, &[f32])> = Vec::new();
+            let mut fast_writer = VectorIndex::create_v2(&fast_path, fast_binding.clone()).unwrap();
+            let mut quality_writer =
+                VectorIndex::create_v2(&quality_path, quality_binding.clone()).unwrap();
             if state != "empty" {
-                fast_rows.push(("fast-rounded-zero", &[1.0e-9, 0.0, 0.0, 0.0]));
-                quality_rows.push(("quality-rounded-zero", &[1.0e-9, 0.0, 0.0, 0.0]));
+                fast_writer.write_legacy_f16_zero_fixture("fast-rounded-zero");
+                quality_writer.write_legacy_f16_zero_fixture("quality-rounded-zero");
             }
             if state == "mixed" {
-                fast_rows.push(("fast-negative", &[-0.5, 0.5, 0.0, 0.0]));
-                quality_rows.push(("quality-negative", &[-0.25, 0.5, 0.0, 0.0]));
+                fast_writer
+                    .write_record("fast-negative", &[-0.5, 0.5, 0.0, 0.0])
+                    .unwrap();
+                quality_writer
+                    .write_record("quality-negative", &[-0.25, 0.5, 0.0, 0.0])
+                    .unwrap();
             }
-            write_v2_tier(&fast_path, &fast_binding, &fast_rows);
-            write_v2_tier(&quality_path, &quality_binding, &quality_rows);
+            fast_writer.finish().unwrap();
+            quality_writer.finish().unwrap();
             let mut index = TwoTierIndex::open_admitted_v2_with_paths(
                 &TwoTierIndexPaths::new(fast_path).with_quality_index(quality_path),
                 TwoTierConfig::default(),
@@ -9367,6 +9362,11 @@ mod tests {
                 "mixed" => (None, &["quality-negative", "fast-negative"]),
                 "unusable" => (Some(ZeroSignalReason::NoUsableVectors), &[]),
                 _ => (Some(ZeroSignalReason::NewlyCreatedEmpty), &[]),
+            };
+            let live_count = match state {
+                "mixed" => 2,
+                "unusable" => 1,
+                _ => 0,
             };
             for native in [false, true] {
                 if native {
@@ -9407,7 +9407,7 @@ mod tests {
                 let coverage = activated.coverage(&union, 1).unwrap();
                 let witnessed = TierQueryCoverageV1::Witnessed {
                     generation_sequence: 101,
-                    live_count: u64::try_from(fast_rows.len()).unwrap(),
+                    live_count,
                     contributed_candidates: u64::from(state == "mixed"),
                 };
                 assert_eq!(coverage.fast, witnessed);
@@ -9421,7 +9421,7 @@ mod tests {
                         activated.coverage(&raw, 1).unwrap().fast,
                         TierQueryCoverageV1::Witnessed {
                             generation_sequence: 101,
-                            live_count: u64::try_from(fast_rows.len()).unwrap(),
+                            live_count,
                             contributed_candidates: 0,
                         }
                     );

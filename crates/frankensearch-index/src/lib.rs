@@ -2865,8 +2865,7 @@ impl VectorIndex {
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::DimensionMismatch` for wrong embedding lengths
-    /// and `SearchError::Io` for filesystem failures.
+    /// Returns the same validation and I/O errors as [`Self::append_batch`].
     pub fn append(&mut self, doc_id: &str, vector: &[f32]) -> SearchResult<()> {
         self.append_batch(&[(doc_id.to_owned(), vector.to_vec())])
     }
@@ -2879,7 +2878,8 @@ impl VectorIndex {
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` for wrong embedding lengths,
-    /// `SearchError::InvalidConfig` for invalid values, and
+    /// `SearchError::InvalidConfig` for invalid values or vectors that become
+    /// unusable in the index's stored precision, and
     /// `SearchError::Io` for filesystem failures.
     pub fn append_batch(&mut self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
         self.append_batch_impl(entries)
@@ -2904,39 +2904,40 @@ impl VectorIndex {
         self.append_batch_impl(entries)
     }
 
-    fn append_batch_impl(&mut self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
-        self.ensure_legacy_mutation_format("append_batch")?;
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        // Validate all entries before writing anything.
+    /// Check the shape, stored precision, and identifiers of a proposed append batch.
+    ///
+    /// This is available on read-only handles so callers can validate multiple
+    /// tiers before publishing any of them. Use [`Self::append_batch`] to write.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` for wrong embedding lengths
+    /// and `SearchError::InvalidConfig` for invalid embeddings or identifiers.
+    pub fn validate_append_entries(&self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
+        let dimension = self.dimension();
+        let quantization = self.quantization();
         for (doc_id, vector) in entries {
-            if vector.len() != self.dimension() {
+            if vector.len() != dimension {
                 return Err(SearchError::DimensionMismatch {
-                    expected: self.dimension(),
+                    expected: dimension,
                     found: vector.len(),
                 });
             }
-            if vector.iter().any(|v| !v.is_finite()) {
-                return Err(SearchError::InvalidConfig {
-                    field: "embedding".to_owned(),
-                    value: "<contains non-finite values>".to_owned(),
-                    reason: "all embedding values must be finite".to_owned(),
-                });
-            }
-            if !vector_signal_usable(vector) {
-                return Err(SearchError::InvalidConfig {
-                    field: "embedding".to_owned(),
-                    value: "<zero-norm vector>".to_owned(),
-                    reason: "embedding norm must be non-zero and finite; a zero vector can never match any query".to_owned(),
-                });
-            }
+            validate_stored_embedding(vector, quantization)?;
             let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
                 field: "doc_id".to_owned(),
                 value: doc_id.clone(),
                 reason: "doc_id byte length must fit in u16".to_owned(),
             })?;
+        }
+        Ok(())
+    }
+
+    fn append_batch_impl(&mut self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
+        self.ensure_legacy_mutation_format("append_batch")?;
+        self.validate_append_entries(entries)?;
+        if entries.is_empty() {
+            return Ok(());
         }
 
         let mut wal_entries: Vec<wal::WalEntry> = Vec::with_capacity(entries.len());
@@ -3985,7 +3986,8 @@ impl VectorIndexWriter {
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` for wrong embedding lengths
-    /// and `SearchError::InvalidConfig` for invalid values.
+    /// and `SearchError::InvalidConfig` for invalid values or embeddings that
+    /// become unusable in the writer's stored precision.
     pub fn write_record(&mut self, doc_id: &str, embedding: &[f32]) -> SearchResult<()> {
         self.write_record_with_flags(doc_id, embedding, FsviRecordFlags::LIVE)
     }
@@ -4026,20 +4028,7 @@ impl VectorIndexWriter {
                 found: embedding.len(),
             });
         }
-        if embedding.iter().any(|value| !value.is_finite()) {
-            return Err(SearchError::InvalidConfig {
-                field: "embedding".to_owned(),
-                value: "<contains non-finite values>".to_owned(),
-                reason: "all embedding values must be finite".to_owned(),
-            });
-        }
-        if !vector_signal_usable(embedding) {
-            return Err(SearchError::InvalidConfig {
-                field: "embedding".to_owned(),
-                value: "<zero-norm vector>".to_owned(),
-                reason: "embedding norm must be non-zero and finite; a zero vector can never match any query".to_owned(),
-            });
-        }
+        validate_stored_embedding(embedding, self.quantization)?;
         let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
             field: "doc_id".to_owned(),
             value: doc_id.to_owned(),
@@ -4052,6 +4041,18 @@ impl VectorIndexWriter {
             embedding: embedding.to_vec(),
         });
         Ok(())
+    }
+
+    // Model a row sealed by a writer that admitted pre-quantization signal.
+    #[cfg(test)]
+    fn write_legacy_f16_zero_fixture(&mut self, doc_id: &str) {
+        assert_eq!(self.quantization, Quantization::F16);
+        self.records.push(PendingRecord {
+            doc_id: doc_id.into(),
+            doc_id_hash: fnv1a_hash(doc_id.as_bytes()),
+            flags: FsviRecordFlags::LIVE.bits(),
+            embedding: vec![0.0; self.dimension],
+        });
     }
 
     /// Bench-only access to the owned record handoff used by `TwoTierIndexBuilder`.
@@ -4073,20 +4074,7 @@ impl VectorIndexWriter {
                 found: embedding.len(),
             });
         }
-        if embedding.iter().any(|value| !value.is_finite()) {
-            return Err(SearchError::InvalidConfig {
-                field: "embedding".to_owned(),
-                value: "<contains non-finite values>".to_owned(),
-                reason: "all embedding values must be finite".to_owned(),
-            });
-        }
-        if !vector_signal_usable(&embedding) {
-            return Err(SearchError::InvalidConfig {
-                field: "embedding".to_owned(),
-                value: "<zero-norm vector>".to_owned(),
-                reason: "embedding norm must be non-zero and finite; a zero vector can never match any query".to_owned(),
-            });
-        }
+        validate_stored_embedding(&embedding, self.quantization)?;
         let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
             field: "doc_id".to_owned(),
             value: doc_id.clone(),
@@ -6571,6 +6559,33 @@ pub(crate) fn vector_signal_usable(vector: &[f32]) -> bool {
     vector_components_usable(vector.iter().copied())
 }
 
+fn validate_stored_embedding(embedding: &[f32], quantization: Quantization) -> SearchResult<()> {
+    if embedding.iter().any(|value| !value.is_finite()) {
+        return Err(SearchError::InvalidConfig {
+            field: "embedding".to_owned(),
+            value: "<contains non-finite values>".to_owned(),
+            reason: "all embedding values must be finite".to_owned(),
+        });
+    }
+    if !vector_signal_usable(embedding) {
+        return Err(SearchError::InvalidConfig {
+            field: "embedding".to_owned(),
+            value: "<zero-norm vector>".to_owned(),
+            reason: "embedding norm must be non-zero and finite; a zero vector can never match any query".to_owned(),
+        });
+    }
+    if quantization == Quantization::F16
+        && !vector_components_usable(embedding.iter().map(|&value| f16::from_f32(value).to_f32()))
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "embedding".to_owned(),
+            value: "<unusable after F16 quantization>".to_owned(),
+            reason: "F16 encoding must retain finite components and a non-zero norm".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn vector_components_usable(vector: impl Iterator<Item = f32>) -> bool {
     let mut norm_sq = 0.0f32;
     for value in vector {
@@ -6866,9 +6881,13 @@ mod tests {
             writer
                 .write_record("live", &[0.125, -0.75, 0.0, 1.0])
                 .expect("live row");
-            writer
-                .write_record("underflow", &[1.0e-9, 0.0, 0.0, 0.0])
-                .expect("nonzero f32 input that rounds to zero in f16");
+            if precision == Quantization::F16 {
+                writer.write_legacy_f16_zero_fixture("underflow");
+            } else {
+                writer
+                    .write_record("underflow", &[1.0e-9, 0.0, 0.0, 0.0])
+                    .expect("tiny nonzero F32 row");
+            }
             writer
                 .write_tombstone_record("deleted", &[0.0, 0.5, 0.0, 0.0])
                 .expect("retained tombstone");
@@ -11187,6 +11206,133 @@ mod tests {
         assert!(
             err.contains("non-zero"),
             "expected zero-norm rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn writers_validate_the_precision_of_persisted_embeddings() {
+        let below_f16 = [1.0e-9, 0.0];
+        let above_f16 = [70_000.0, 1.0];
+        let f16_min = [f16::from_bits(1).to_f32(), 0.0];
+        let f16_max = [0.0, f16::from_bits(0x7bff).to_f32()];
+        let mixed_rounding = [1.0e-9, 1.0];
+        let query = [1.0, 1.0];
+        for precision in [Quantization::F16, Quantization::F32] {
+            for identity_complete in [false, true] {
+                let path = temp_index_path("writer-encoded-signal");
+                let binding = fsvi_v2_binding("signal", 2, precision, 62, 0x62);
+                let mut writer = if identity_complete {
+                    VectorIndex::create_v2(&path, binding.clone()).unwrap()
+                } else {
+                    VectorIndex::create_with_revision(&path, "signal", "", 2, precision).unwrap()
+                };
+                for (doc_id, vector) in [("tiny", below_f16), ("large", above_f16)] {
+                    let result = writer.write_record(doc_id, &vector);
+                    if precision == Quantization::F16 {
+                        assert!(
+                            matches!(result, Err(SearchError::InvalidConfig { field, reason, .. })
+                                if field == "embedding" && reason.contains("F16 encoding"))
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                }
+                writer.write_record("f16-min", &f16_min).unwrap();
+                writer.write_record("f16-max", &f16_max).unwrap();
+                writer
+                    .write_record("mixed-rounding", &mixed_rounding)
+                    .unwrap();
+                writer.finish().unwrap();
+
+                let classified = if identity_complete {
+                    admit_owned_v2_fixture(&path, &binding)
+                        .unwrap()
+                        .search_top_k_classified(&query, 10, None)
+                        .unwrap()
+                } else {
+                    VectorIndex::open(&path)
+                        .unwrap()
+                        .search_top_k_classified(&query, 10, None)
+                        .unwrap()
+                };
+                assert_eq!(classified.zero_signal, None);
+                let ids: Vec<_> = classified
+                    .hits
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect();
+                let expected = if precision == Quantization::F16 {
+                    &["f16-max", "mixed-rounding", "f16-min"][..]
+                } else {
+                    &["large", "f16-max", "mixed-rounding", "f16-min", "tiny"][..]
+                };
+                assert_eq!(ids, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn f16_wal_rejection_preserves_main_and_wal_rows_across_restart() {
+        let path = temp_index_path("f16-rejection-restart");
+        let wal_path = wal::wal_path_for(&path);
+        let query = [1.0, 0.0];
+        VectorIndex::create(&path, "signal", 2)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let mut index = VectorIndex::open(&path).unwrap();
+        assert_eq!(
+            index
+                .search_top_k_classified(&query, 10, None)
+                .unwrap()
+                .zero_signal,
+            Some(ZeroSignalReason::NewlyCreatedEmpty)
+        );
+        index.append("main", &[1.0, 0.0]).unwrap();
+        assert_eq!(index.compact().unwrap().wal_records, 1);
+        index.append("wal", &[0.5, 0.0]).unwrap();
+        let main_before = fs::read(&path).unwrap();
+        let wal_before = fs::read(&wal_path).unwrap();
+
+        for (doc_id, invalid) in [("main", [1.0e-9, 0.0]), ("wal", [70_000.0, 1.0])] {
+            let refused = index.append_batch(&[
+                ("partial-write".into(), vec![2.0, 0.0]),
+                (doc_id.into(), invalid.to_vec()),
+            ]);
+            assert!(
+                matches!(refused, Err(SearchError::InvalidConfig { field, reason, .. })
+                    if field == "embedding" && reason.contains("F16 encoding"))
+            );
+            assert_eq!(fs::read(&path).unwrap(), main_before);
+            assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
+        }
+        let check_original_rows = |index: &VectorIndex| {
+            let classified = index.search_top_k_classified(&query, 10, None).unwrap();
+            assert_eq!(classified.zero_signal, None);
+            let ids: Vec<_> = classified
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect();
+            assert_eq!(ids, ["main", "wal"]);
+        };
+        check_original_rows(&index);
+        drop(index);
+        let mut reopened = VectorIndex::open(&path).unwrap();
+        check_original_rows(&reopened);
+        assert_eq!(reopened.compact().unwrap().wal_records, 1);
+        assert_eq!(reopened.wal_record_count(), 0);
+        check_original_rows(&reopened);
+        assert_eq!(reopened.soft_delete_batch(&["main", "wal"]).unwrap(), 2);
+        drop(reopened);
+        let tombstoned = VectorIndex::open(&path).unwrap();
+        let classified = tombstoned
+            .search_top_k_classified(&query, 10, None)
+            .unwrap();
+        assert!(classified.hits.is_empty());
+        assert_eq!(
+            classified.zero_signal,
+            Some(ZeroSignalReason::AllTombstoned)
         );
     }
 
