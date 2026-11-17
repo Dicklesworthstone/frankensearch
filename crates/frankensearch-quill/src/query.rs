@@ -1232,7 +1232,8 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
     if !query.contains(':') {
         return Cow::Borrowed(query);
     }
-    let mut escaped_query = String::with_capacity(query.len() + 8);
+    let mut escaped_query: Option<String> = None;
+    let mut copied = 0;
     let mut field_start = Some(0);
     let mut after_whitespace = false;
     let mut operand_start = true;
@@ -1241,12 +1242,10 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
     let mut typed_end = 0;
     for (index, ch) in query.char_indices() {
         if index < typed_end {
-            escaped_query.push(ch);
             continue;
         }
         if escaped {
             escaped = false;
-            escaped_query.push(ch);
             continue;
         }
         if let Some(delimiter) = quote {
@@ -1255,7 +1254,6 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
             } else if ch == delimiter {
                 quote = None;
             }
-            escaped_query.push(ch);
             continue;
         }
         if after_whitespace && !ch.is_whitespace() {
@@ -1276,7 +1274,6 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
             // precedence and copy the bound without opening phrase context.
             typed_end = scan_fragment_end(query, skip_whitespace(query, index + length));
             field_start = Some(typed_end);
-            escaped_query.push(ch);
             continue;
         }
         match ch {
@@ -1317,7 +1314,12 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
                         schema.fields.iter().any(|field| field.name == name)
                     });
                 if !field {
-                    escaped_query.push('\\');
+                    let output = escaped_query.get_or_insert_with(|| {
+                        String::with_capacity(query.len().saturating_add(8))
+                    });
+                    output.push_str(&query[copied..index]);
+                    output.push('\\');
+                    copied = index;
                 }
                 field_start = None;
                 operand_start = field;
@@ -1325,8 +1327,14 @@ pub fn escape_unknown_field_colons(query: &str, schema: SchemaDescriptor) -> Cow
             _ if ch.is_whitespace() => after_whitespace = true,
             _ => operand_start = false,
         }
-        escaped_query.push(ch);
     }
+    // Keep unchanged fields, phrases and already escaped literals borrowed.
+    // Allocate output only when an escape is required, then copy original
+    // byte spans once rather than inserting into a growing string repeatedly.
+    let Some(mut escaped_query) = escaped_query else {
+        return Cow::Borrowed(query);
+    };
+    escaped_query.push_str(&query[copied..]);
     Cow::Owned(escaped_query)
 }
 
@@ -7181,8 +7189,10 @@ mod tests {
             ("https://sqlite.org", r"https\://sqlite.org"),
             ("TODO: flaky", r"TODO\: flaky"),
             ("lang:rust", r"lang\:rust"),
+            ("猫:rust", r"猫\:rust"),
             // A real field keeps its prefix, also after a group or negation.
             ("title:rust", "title:rust"),
+            (r#"title:'not "secret"'"#, r#"title:'not "secret"'"#),
             ("(title:rust) -content:beta", "(title:rust) -content:beta"),
             (
                 r#"title : "internal secret""#,
@@ -7204,10 +7214,21 @@ mod tests {
         ] {
             let escaped = escape_unknown_field_colons(query, crate::DEFAULT_SCHEMA);
             assert_eq!(escaped, expected, "{query}");
-            assert_eq!(
-                escape_unknown_field_colons(&escaped, crate::DEFAULT_SCHEMA),
-                expected,
-                "{query} twice"
+            if query == expected {
+                let Cow::Borrowed(value) = &escaped else {
+                    panic!("unchanged query must keep its original borrow: {query}");
+                };
+                assert_eq!(value.len(), query.len());
+                assert!(std::ptr::eq(value.as_ptr(), query.as_ptr()), "{query}");
+            } else {
+                assert!(matches!(&escaped, Cow::Owned(_)), "{query}");
+            }
+            let repeated = escape_unknown_field_colons(&escaped, crate::DEFAULT_SCHEMA);
+            assert_eq!(repeated, expected, "{query} twice");
+            assert!(
+                matches!(repeated, Cow::Borrowed(value)
+                if value.len() == escaped.len() && std::ptr::eq(value.as_ptr(), escaped.as_ptr())),
+                "{query} twice must preserve the adapted borrow"
             );
         }
         // Field names come from the schema at hand.
