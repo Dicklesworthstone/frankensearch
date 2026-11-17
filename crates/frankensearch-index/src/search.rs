@@ -3129,6 +3129,115 @@ mod tests {
         assert_eq!(classified.zero_signal, None);
     }
 
+    fn corrupt_classified_index(
+        name: &str,
+        quantization: Quantization,
+        all_unusable: bool,
+    ) -> (TempFixturePath, VectorIndex) {
+        let path = temp_index_path(name);
+        let mut writer = VectorIndex::create_with_revision(&path, "hash", "test", 2, quantization)
+            .expect("corruption fixture writer");
+        for (id, vector) in [
+            ("bad-zero", [1.0, 0.0]),
+            ("bad-nan", [1.0, 0.0]),
+            ("negative-high", [-0.5, 0.5]),
+            ("negative-low", [-1.0, 0.0]),
+        ] {
+            writer
+                .write_record(id, &vector)
+                .expect("valid source vector");
+        }
+        writer.finish().expect("finish valid fixture");
+        let index = VectorIndex::open_read_only(&path).expect("open valid fixture");
+        let offset = usize::try_from(index.metadata().vectors_offset).unwrap();
+        let stride = match quantization {
+            Quantization::F16 => 4,
+            Quantization::F32 => 8,
+        };
+        let mut bytes = fs::read(&path).expect("read persisted fixture");
+        for row in 0..index.record_count() {
+            let id = index.doc_id_at(row).unwrap();
+            if all_unusable || id.starts_with("bad-") {
+                // Mutate only the slab after the writer has admitted valid
+                // vectors. All-one bytes encode NaNs in both IEEE formats.
+                bytes[offset + row * stride..offset + (row + 1) * stride]
+                    .fill(if id == "bad-nan" { 0xff } else { 0 });
+            }
+        }
+        drop(index);
+        fs::write(&path, bytes).expect("persist vector corruption");
+        let index = VectorIndex::open_read_only(&path).expect("open corrupt vector slab");
+        (path, index)
+    }
+
+    #[test]
+    fn classified_corrupt_vectors_do_not_hide_valid_negative_scores() {
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let (_path, index) =
+                corrupt_classified_index("classified-corrupt-mixed", quantization, false);
+            let raw = index.search_top_k(&[1.0, 0.0], 1, None).unwrap();
+            assert_eq!(hit_ids(&raw), ["bad-zero"], "raw numeric contract");
+            for limit in [1, 2, usize::MAX] {
+                let classified = index
+                    .search_top_k_classified(&[1.0, 0.0], limit, None)
+                    .unwrap();
+                let expected = if limit == 1 {
+                    vec!["negative-high"]
+                } else {
+                    vec!["negative-high", "negative-low"]
+                };
+                assert_eq!(
+                    hit_ids(&classified.hits),
+                    expected,
+                    "{quantization:?} k={limit}"
+                );
+                assert_eq!(classified.zero_signal, None);
+            }
+        }
+    }
+
+    #[test]
+    fn classified_unusable_persisted_vectors_report_availability_failure() {
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let (_path, index) =
+                corrupt_classified_index("classified-corrupt-all", quantization, true);
+            assert_eq!(index.zero_signal_state().usable_vector_count, 0);
+            let classified = index.search_top_k_classified(&[1.0, 0.0], 2, None).unwrap();
+            assert!(classified.hits.is_empty(), "{quantization:?}");
+            assert_eq!(
+                classified.zero_signal,
+                Some(ZeroSignalReason::NoUsableVectors)
+            );
+        }
+    }
+
+    #[test]
+    fn classified_orthogonal_vectors_remain_usable() {
+        let path = temp_index_path("classified-orthogonal");
+        write_index(&path, &[("orthogonal", vec![0.0, 1.0])]).unwrap();
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let classified = index.search_top_k_classified(&[1.0, 0.0], 1, None).unwrap();
+        assert_eq!(hit_ids(&classified.hits), ["orthogonal"]);
+        assert_eq!(classified.hits[0].score, 0.0);
+        assert_eq!(classified.zero_signal, None);
+    }
+
+    #[test]
+    fn classified_unusable_wal_replacement_does_not_resurrect_main() {
+        let path = temp_index_path("classified-corrupt-wal");
+        write_index(
+            &path,
+            &[("replaced", vec![1.0, 0.0]), ("negative", vec![-1.0, 0.0])],
+        )
+        .unwrap();
+        let mut index = VectorIndex::open(&path).unwrap();
+        index.append("replaced", &[0.0, 1.0]).unwrap();
+        index.wal_entries[0].embedding.fill(0.0);
+        let classified = index.search_top_k_classified(&[1.0, 0.0], 1, None).unwrap();
+        assert_eq!(hit_ids(&classified.hits), ["negative"]);
+        assert_eq!(classified.zero_signal, None);
+    }
+
     #[test]
     fn classified_in_memory_parity_on_request_scoped_states() {
         // The bead requires equivalent states to classify identically across
