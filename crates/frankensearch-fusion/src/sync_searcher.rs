@@ -407,7 +407,7 @@ impl SyncTwoTierSearcher {
         self
     }
 
-    /// Override brute-force parallel search parameters for fast-tier retrieval.
+    /// Override brute-force parallel search for fast and direct quality-only retrieval.
     #[must_use]
     pub const fn with_search_params(mut self, params: SearchParams) -> Self {
         self.search_params = Some(params);
@@ -1033,26 +1033,18 @@ impl SyncTwoTierSearcher {
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
 
         let quality_started = Instant::now();
-        let hits = if query.vector().iter().all(|&value| value == 0.0) {
-            metrics.zero_signal = Some(ZeroSignalReason::ZeroNormQuery);
-            Vec::new()
-        } else {
-            let hits = self.search_params.map_or_else(
-                || index.search_top_k(query.vector(), fetch, filter),
-                |params| index.search_top_k_with_params(query.vector(), fetch, filter, params),
-            )?;
+        let ClassifiedHits { hits, zero_signal } = index.search_top_k_classified_with_params(
+            query.vector(),
+            fetch,
+            filter,
+            self.search_params.unwrap_or_default(),
+        )?;
+        if zero_signal != Some(ZeroSignalReason::ZeroNormQuery) {
             // These are Phase-1 vectors because direct quality is the first
             // and only phase. The embedder and quality timing identify its tier.
             metrics.phase1_vectors_searched = index.record_count();
-            if hits.is_empty() {
-                metrics.zero_signal = Some(
-                    index
-                        .zero_signal_state()
-                        .empty_result_reason(filter.is_some()),
-                );
-            }
-            hits
-        };
+        }
+        metrics.zero_signal = zero_signal;
         metrics.quality_search_ms = ms(quality_started.elapsed());
         metrics.vector_search_ms = metrics.quality_search_ms;
         metrics.semantic_candidates = hits.len();
@@ -1200,8 +1192,8 @@ impl SyncTwoTierSearcher {
         let independent_quality = independently_retrievable_quality(quality_index);
         let quality_pool = if independent_quality {
             quality_index
-                .search_top_k(quality_query.vector(), fetch, filter)
-                .and_then(|mut hits| {
+                .search_top_k_classified(quality_query.vector(), fetch, filter)
+                .and_then(|ClassifiedHits { mut hits, .. }| {
                     complete_quality_evidence(&fast_hits, &mut hits, |missing| {
                         self.index
                             .quality_scores_for_hits(quality_query.vector(), missing)
@@ -1536,29 +1528,26 @@ impl SyncTwoTierSearcher {
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<ClassifiedHits> {
         let fast_index = self.index.fast_index();
-        let hits = match self.search_params {
-            Some(params) => {
-                fast_index.search_top_k_with_params(query_vec, fetch, filter, params)?
+        if let Some(params) = self.search_params {
+            return fast_index
+                .search_top_k_classified_with_params(query_vec, fetch, filter, params);
+        }
+        let hits = match self.fast_retrieval {
+            SyncFastRetrieval::Exact => {
+                // A verified sidecar may prune exact work without changing
+                // candidate selection or visible results.
+                return fast_index.search_top_k_classified(query_vec, fetch, filter);
             }
-            None => match self.fast_retrieval {
-                SyncFastRetrieval::Exact => {
-                    // The public default is exact whether the optional cache is
-                    // attached or unavailable. A verified sidecar may prune only
-                    // inside classified exact search; it must never select a different
-                    // candidate-generation algorithm or change visible results.
-                    return fast_index.search_top_k_classified(query_vec, fetch, filter);
-                }
-                SyncFastRetrieval::ApproximateInt8ForBench {
-                    candidate_multiplier,
-                } => fast_index.search_top_k_int8_two_pass_filtered(
-                    query_vec,
-                    fetch,
-                    candidate_multiplier,
-                    filter,
-                )?,
-            },
+            SyncFastRetrieval::ApproximateInt8ForBench {
+                candidate_multiplier,
+            } => fast_index.search_top_k_int8_two_pass_filtered(
+                query_vec,
+                fetch,
+                candidate_multiplier,
+                filter,
+            )?,
         };
-        // Explicit scan overrides return raw hits. Classify an empty batch
+        // The benchmark control returns raw hits. Classify an empty batch
         // once, after search_initial has handled zero k and zero-norm input.
         let zero_signal = hits.is_empty().then(|| {
             if query_vec.iter().any(|value| !value.is_finite()) {
@@ -4370,34 +4359,48 @@ mod tests {
         );
     }
 
+    fn write_corrupt_sync_fixture(path: &Path, model: &str, revision: &str, all_unusable: bool) {
+        use frankensearch_index::{Quantization, VectorIndex};
+
+        let mut writer =
+            VectorIndex::create_with_revision(path, model, revision, 2, Quantization::F16).unwrap();
+        for (id, vector) in [
+            ("bad-zero", [1.0, 0.0]),
+            ("negative-high", [-0.5, 0.5]),
+            ("negative-low", [-1.0, 0.0]),
+        ] {
+            writer.write_record(id, &vector).unwrap();
+        }
+        writer.finish().unwrap();
+        let file = VectorIndex::open_read_only(path).unwrap();
+        let offset = usize::try_from(file.metadata().vectors_offset).unwrap();
+        let row_bytes = file.dimension() * std::mem::size_of::<u16>();
+        let mut bytes = std::fs::read(path).unwrap();
+        for row in 0..file.record_count() {
+            if all_unusable || file.doc_id_at(row).unwrap() == "bad-zero" {
+                // Corrupt a previously valid persisted F16 row.
+                bytes[offset + row * row_bytes..offset + (row + 1) * row_bytes].fill(0);
+            }
+        }
+        drop(file);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn persisted_corrupt_vectors_are_not_published_as_sync_candidates() {
         for all_unusable in [false, true] {
             let dir = temp_dir("corrupt-sync-candidates");
             let path = dir.path().join("fast.fsvi");
-            let mut writer = frankensearch_index::VectorIndex::create(&path, "test", 2).unwrap();
-            for (id, vector) in [
-                ("bad-zero", [1.0, 0.0]),
-                ("negative-high", [-0.5, 0.5]),
-                ("negative-low", [-1.0, 0.0]),
-            ] {
-                writer.write_record(id, &vector).unwrap();
-            }
-            writer.finish().unwrap();
-            let file = frankensearch_index::VectorIndex::open_read_only(&path).unwrap();
-            let offset = usize::try_from(file.metadata().vectors_offset).unwrap();
-            let mut bytes = std::fs::read(&path).unwrap();
-            for row in 0..file.record_count() {
-                if all_unusable || file.doc_id_at(row).unwrap() == "bad-zero" {
-                    // Valid writer input, followed by corruption of its F16 slab.
-                    bytes[offset + row * 4..offset + (row + 1) * 4].fill(0);
-                }
-            }
-            drop(file);
-            std::fs::write(&path, bytes).unwrap();
+            write_corrupt_sync_fixture(&path, "test", "", all_unusable);
             let fast = InMemoryVectorIndex::from_fsvi(&path).unwrap();
             let index = Arc::new(InMemoryTwoTierIndex::new(fast, None).unwrap());
-            let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+            let searcher = SyncTwoTierSearcher::new(
+                index,
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                },
+            );
             let query = fast_only_query(vec![1.0, 0.0]);
             let expected_ids = if all_unusable {
                 vec![]
@@ -4430,6 +4433,161 @@ mod tests {
                 expected_ids
             );
             assert_eq!(metrics.vectors_searched, 3);
+
+            let tuned = searcher.with_search_params(SearchParams {
+                parallel_enabled: true,
+                parallel_threshold: 0,
+                parallel_chunk_size: 1,
+            });
+            let (results, metrics) = tuned.search_collect(&query, 2).unwrap();
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+            assert_eq!(metrics.zero_signal, expected_reason);
+        }
+    }
+
+    #[test]
+    fn persisted_corrupt_vectors_are_not_published_by_sync_quality_only() {
+        for all_unusable in [false, true] {
+            let dir = temp_dir("corrupt-sync-quality-only");
+            let path = dir.path().join("quality.fsvi");
+            let quality_query =
+                BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("quality", 2)).unwrap();
+            write_corrupt_sync_fixture(
+                &path,
+                "quality",
+                quality_query.identity_fingerprint(),
+                all_unusable,
+            );
+            let quality = InMemoryVectorIndex::from_fsvi(&path).unwrap();
+            let fast = InMemoryVectorIndex::from_vectors(
+                vec!["fast-only".to_owned()],
+                vec![vec![1.0, 0.0]],
+                2,
+            )
+            .unwrap();
+            let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap());
+            let query = TieredQueryEmbeddings::quality_only(quality_query);
+            let expected_ids: &[&str] = if all_unusable {
+                &[]
+            } else {
+                &["negative-high"]
+            };
+            let expected_reason = all_unusable.then_some(ZeroSignalReason::NoUsableVectors);
+            for params in [
+                None,
+                Some(SearchParams {
+                    parallel_enabled: true,
+                    parallel_threshold: 0,
+                    parallel_chunk_size: 1,
+                }),
+            ] {
+                let mut searcher = SyncTwoTierSearcher::new(
+                    Arc::clone(&index),
+                    TwoTierConfig {
+                        candidate_multiplier: 1,
+                        ..TwoTierConfig::default()
+                    },
+                );
+                if let Some(params) = params {
+                    searcher = searcher.with_search_params(params);
+                }
+                let (results, metrics) = searcher.search_collect(&query, 1).unwrap();
+                assert_eq!(
+                    results
+                        .iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>(),
+                    expected_ids
+                );
+                assert_eq!(metrics.zero_signal, expected_reason);
+                assert_eq!(metrics.phase1_vectors_searched, 3);
+                for hit in &results {
+                    assert_eq!(hit.source, ScoreSource::SemanticQuality);
+                    assert_eq!(hit.fast_score, None);
+                    assert_eq!(hit.quality_score, Some(-0.5));
+                }
+
+                let phases = searcher.search_iter(&query, 1).collect::<Vec<_>>();
+                let [
+                    SearchPhase::Initial {
+                        results, metrics, ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("quality-only search must publish one Initial phase: {phases:?}");
+                };
+                assert_eq!(
+                    results
+                        .iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>(),
+                    expected_ids
+                );
+                assert_eq!(
+                    metrics.skip_reason.as_deref(),
+                    expected_reason.map(ZeroSignalReason::reason_code)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_corrupt_vectors_are_not_published_as_sync_refinement_evidence() {
+        use frankensearch_index::{Quantization, VectorIndex};
+
+        let dir = temp_dir("corrupt-sync-refinement");
+        let fast_path = dir.path().join("fast.fsvi");
+        let fast_query =
+            BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("fast", 2)).unwrap();
+        let mut writer = VectorIndex::create_with_revision(
+            &fast_path,
+            "fast",
+            fast_query.identity_fingerprint(),
+            2,
+            Quantization::F16,
+        )
+        .unwrap();
+        // This document has valid fast evidence and an unusable quality row.
+        writer.write_record("bad-zero", &[1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let quality_path = dir.path().join("quality.fsvi");
+        let quality_query =
+            BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("quality", 2)).unwrap();
+        write_corrupt_sync_fixture(
+            &quality_path,
+            "quality",
+            quality_query.identity_fingerprint(),
+            false,
+        );
+        let fast = InMemoryVectorIndex::from_fsvi(&fast_path).unwrap();
+        let quality = InMemoryVectorIndex::from_fsvi(&quality_path).unwrap();
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap()),
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                ..TwoTierConfig::default()
+            },
+        );
+        let query = TieredQueryEmbeddings::progressive(fast_query, quality_query);
+        let (results, metrics) = searcher.search_collect(&query, 3).unwrap();
+        assert_eq!(metrics.phase2_vectors_searched, 2);
+        assert_eq!(metrics.incomplete_embeddings, 1);
+        assert_eq!(results.len(), 3);
+        for (id, fast_score, quality_score) in [
+            ("bad-zero", Some(1.0), None),
+            ("negative-high", None, Some(-0.5)),
+            ("negative-low", None, Some(-1.0)),
+        ] {
+            let hit = results.iter().find(|hit| hit.doc_id == id).unwrap();
+            assert_eq!(hit.fast_score, fast_score, "{id}");
+            assert_eq!(hit.quality_score, quality_score, "{id}");
         }
     }
 
