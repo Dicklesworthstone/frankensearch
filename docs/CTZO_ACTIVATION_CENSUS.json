@@ -55,10 +55,11 @@
     {
       "crate": "frankensearch-fusion",
       "file": "crates/frankensearch-fusion/src/sync_searcher.rs",
-      "symbol": "fn admit_tier_space",
+      "symbol": "fn admit_tier_query",
       "kind": "pre-read-identity-admission",
-      "consumes": ["BoundQueryEmbedding"],
-      "slice": "4c (bd-sync-searcher-tiered-query-embeddings-dbp10)"
+      "consumes": ["BoundQueryEmbedding", "SpaceIdentityAdmission"],
+      "slice": "4c (bd-sync-searcher-tiered-query-embeddings-dbp10)",
+      "note": "695792a1 renamed this guard and added producer-conformance checks against the retained in-memory owner binding."
     },
     {
       "crate": "frankensearch-fusion",
