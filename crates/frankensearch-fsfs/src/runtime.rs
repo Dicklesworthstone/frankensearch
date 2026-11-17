@@ -17318,6 +17318,31 @@ impl FsfsRuntime {
             return Ok(());
         }
 
+        #[cfg(unix)]
+        let terminal = {
+            use rustix::fs::{Mode, OFlags, fstat, open};
+
+            Self::semantic_retry_checkpoint(cx, "interactive_model_provisioning")?;
+            let stdin = std::io::stdin();
+            let name = rustix::termios::ttyname(&stdin, Vec::new())
+                .map_err(std::io::Error::from)?;
+            // Open a separate file description: duplicating stdin would share
+            // NONBLOCK with the shell, including after an ungraceful exit.
+            let terminal = open(
+                &name,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let original = fstat(&stdin).map_err(std::io::Error::from)?;
+            let opened = fstat(&terminal).map_err(std::io::Error::from)?;
+            if (original.st_dev, original.st_ino, original.st_rdev)
+                != (opened.st_dev, opened.st_ino, opened.st_rdev)
+            {
+                return Err(std::io::Error::other("model consent terminal changed").into());
+            }
+            terminal
+        };
         let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
         let total_bytes: u64 = missing
             .iter()
@@ -17349,10 +17374,57 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
         write!(stdout, "{} ", paint("consent>", "1;38;5;45", no_color)).map_err(tui_io_error)?;
         stdout.flush().map_err(tui_io_error)?;
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(SearchError::Io)?;
+        #[cfg(unix)]
+        let input = {
+            use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+            // Readiness can disappear when the terminal flushes its input.
+            // Every read must stay nonblocking even after a successful poll.
+            // The owned descriptor closes here; stdin's shared flags remain
+            // unchanged and no background reader delays pool shutdown.
+            let terminal_reader = terminal;
+            let mut bytes = Vec::new();
+            loop {
+                Self::semantic_retry_checkpoint(cx, "interactive_model_provisioning")?;
+                let mut descriptors = [PollFd::new(&terminal_reader, PollFlags::IN)];
+                match poll(&mut descriptors, Some(&Timespec::default())) {
+                    Ok(0) => {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => return Err(std::io::Error::from(error).into()),
+                }
+                if descriptors[0]
+                    .revents()
+                    .intersects(PollFlags::ERR | PollFlags::NVAL)
+                {
+                    return Err(std::io::Error::other("model consent terminal unavailable").into());
+                }
+                let mut byte = [0_u8; 1];
+                match rustix::io::read(&terminal_reader, &mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        bytes.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {}
+                    Err(error) => return Err(std::io::Error::from(error).into()),
+                }
+            }
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?
+        };
+        #[cfg(not(unix))]
+        let input = {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            input
+        };
+        Self::semantic_retry_checkpoint(cx, "interactive_model_provisioning")?;
         if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes" | "YES") {
             println!(
                 "Not downloading. Run `fsfs download-models` when ready; semantic results never use the hash control embedder."

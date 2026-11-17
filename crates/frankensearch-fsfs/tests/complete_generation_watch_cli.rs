@@ -868,7 +868,7 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
 
     // A terminal operator can decline downloads once. A verified fast producer
     // permits promotion; a missing required producer must preserve the legacy.
-    for missing_fast in [false, true] {
+    for (missing_fast, interrupt) in [(false, false), (true, false), (true, true)] {
         let mut fixture = Fixture::new(None, false);
         let private = private_models(&fixture, &models);
         let mut settings: FsfsConfig =
@@ -915,12 +915,15 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
         terminal
             .arg("-c")
             .arg(
-                r"import errno, json, os, pty, select, subprocess, sys, time
+                r"import errno, fcntl, json, os, pathlib, pty, select, signal, subprocess, sys, time
 master, slave = pty.openpty()
+original_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
+terminal_identity = os.fstat(slave)
 child = subprocess.Popen(json.loads(sys.argv[1]), stdin=slave, stdout=slave, stderr=slave)
-os.close(slave)
 transcript = bytearray()
 answers = 0
+interrupt = json.loads(sys.argv[2])
+private_readers = None
 deadline = time.monotonic() + 120
 try:
     while True:
@@ -946,19 +949,52 @@ try:
         if prompts > 4:
             raise RuntimeError('unexpected consent loop')
         if prompts > answers:
-            os.write(master, b'n\n' * (prompts - answers))
+            if fcntl.fcntl(slave, fcntl.F_GETFL) != original_flags:
+                raise RuntimeError('consent changed shared stdin flags')
+            if sys.platform.startswith('linux'):
+                private_readers = 0
+                for descriptor in pathlib.Path(f'/proc/{child.pid}/fd').iterdir():
+                    if int(descriptor.name) <= 2:
+                        continue
+                    try:
+                        info = descriptor.stat()
+                        flags = next(line.split()[1] for line in pathlib.Path(
+                            f'/proc/{child.pid}/fdinfo/{descriptor.name}').read_text().splitlines()
+                            if line.startswith('flags:'))
+                    except FileNotFoundError:
+                        continue
+                    same_terminal = (info.st_dev, info.st_ino, info.st_rdev) == (
+                        terminal_identity.st_dev, terminal_identity.st_ino, terminal_identity.st_rdev)
+                    flags = int(flags, 8)
+                    if same_terminal and (flags & os.O_ACCMODE) == os.O_RDONLY and flags & os.O_NONBLOCK:
+                        private_readers += 1
+                if private_readers == 0:
+                    raise RuntimeError('consent has no private nonblocking terminal reader')
+            if interrupt:
+                # A partial affirmative is not permission to acquire a model.
+                os.write(master, b'y')
+                child.send_signal(signal.SIGINT)
+                deadline = time.monotonic() + 5
+            else:
+                os.write(master, b'n\n' * (prompts - answers))
             answers = prompts
     status = child.wait(timeout=5)
 finally:
     if child.poll() is None:
         child.kill()
         child.wait()
+    flags_preserved = fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags
+    os.close(slave)
     os.close(master)
+    if not flags_preserved:
+        raise RuntimeError('consent left shared stdin flags changed')
 print(json.dumps({'exit_code': status, 'prompts': answers,
+                  'stdin_flags_preserved': flags_preserved, 'private_terminal_readers': private_readers,
                   'transcript': transcript.decode('utf-8', errors='replace')}))
 ",
             )
             .arg(serde_json::to_string(&arguments).unwrap())
+            .arg(serde_json::to_string(&interrupt).unwrap())
             .current_dir(invocation.get_current_dir().unwrap());
         for (name, value) in invocation.get_envs() {
             if let Some(value) = value {
@@ -971,11 +1007,21 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
         assert!(output.status.success(), "{output:?}");
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["prompts"], 1, "{result}");
+        assert_eq!(result["stdin_flags_preserved"], true, "{result}");
+        #[cfg(target_os = "linux")]
+        assert!(
+            result["private_terminal_readers"].as_u64().unwrap() > 0,
+            "{result}"
+        );
         let transcript = result["transcript"].as_str().unwrap();
         if missing_fast {
             assert_eq!(
                 result["exit_code"],
-                frankensearch_fsfs::adapters::cli::exit_code::MODEL_UNAVAILABLE,
+                if interrupt {
+                    frankensearch_fsfs::adapters::cli::exit_code::INTERRUPTED
+                } else {
+                    frankensearch_fsfs::adapters::cli::exit_code::MODEL_UNAVAILABLE
+                },
                 "{result}"
             );
             assert!(transcript.contains("Download 2 ("), "{result}");
@@ -998,7 +1044,11 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
         );
         assert_eq!(ranks(&fixture), old_ranks);
         eprintln!(
-            "legacy consent terminal missing_fast={missing_fast} prompts=1 exit={} fast_hits=2 optional_quality_installed=false",
+            "legacy consent terminal descriptor missing_fast={missing_fast} interrupt={interrupt} private_readers={} stdin_flags_preserved=true",
+            result["private_terminal_readers"]
+        );
+        eprintln!(
+            "legacy consent terminal missing_fast={missing_fast} interrupt={interrupt} prompts=1 exit={} fast_hits=2 optional_quality_installed=false",
             result["exit_code"]
         );
     }
