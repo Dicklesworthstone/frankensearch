@@ -1563,6 +1563,7 @@ impl TwoTierIndex {
         }
         tier_checkpoint(cx, "search_activation")?;
         Ok(ActivatedTierSearch {
+            index: self,
             fast,
             quality,
             topology,
@@ -3005,14 +3006,6 @@ pub struct ActivatedTier<'index, 'query> {
 }
 
 impl ActivatedTier<'_, '_> {
-    // Activation already checked the query's identity, finite coordinates,
-    // and dimension. An all-zero embedding carries no retrieval signal;
-    // inspecting coordinates preserves tiny nonzero queries whose squared
-    // norm would underflow. Raw vector kernels retain their scoring semantics.
-    fn has_query_signal(&self) -> bool {
-        self.query.vector().iter().any(|&value| value != 0.0)
-    }
-
     /// Exact top-k over the retained owner's own bytes.
     /// An admitted all-zero query returns no candidates.
     ///
@@ -3022,16 +3015,7 @@ impl ActivatedTier<'_, '_> {
     /// cooperative cancellation during the exact scan. Cancellation never
     /// returns a partially selected result page.
     pub fn search_top_k(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
-        tier_checkpoint(&self.cx, "search_activation.exact")?;
-        if !self.has_query_signal() {
-            return Ok(Vec::new());
-        }
-        let result =
-            self.owner
-                .index
-                .search_top_k_cancellable(&self.cx, self.query.vector(), k, None);
-        tier_checkpoint(&self.cx, "search_activation.exact")?;
-        result
+        Ok(self.search_exact_classified(k, None)?.hits)
     }
 
     /// Exact top-k with explicit parallelism settings over the retained owner.
@@ -3048,31 +3032,45 @@ impl ActivatedTier<'_, '_> {
         k: usize,
         params: SearchParams,
     ) -> SearchResult<Vec<VectorHit>> {
-        tier_checkpoint(&self.cx, "search_activation.exact")?;
-        if !self.has_query_signal() {
-            return Ok(Vec::new());
-        }
-        let result = self.owner.index.search_top_k_with_params_cancellable(
-            &self.cx,
-            self.query.vector(),
-            k,
-            None,
-            params,
-        );
-        tier_checkpoint(&self.cx, "search_activation.exact")?;
-        result
+        Ok(self.search_exact_classified(k, Some(params))?.hits)
+    }
+
+    fn search_exact_classified(
+        &self,
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<ClassifiedHits> {
+        let index = &self.owner.index;
+        let query = self.query.vector();
+        index.classify_owner_search(&self.cx, query, k, false, |limit| {
+            params.map_or_else(
+                || index.search_top_k_cancellable(&self.cx, query, limit, None),
+                |params| {
+                    index.search_top_k_with_params_cancellable(&self.cx, query, limit, None, params)
+                },
+            )
+        })
     }
 
     /// Retrieve with this activation's configured backend. Exact rescoring
     /// reads the same retained allocation and uses the exact lane's scorer.
-    fn search_candidates(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
-        tier_checkpoint(&self.cx, "search_activation.candidates")?;
-        if !self.has_query_signal() {
-            return Ok(Vec::new());
-        }
+    fn search_candidates(&self, k: usize) -> SearchResult<ClassifiedHits> {
         let Some((graph, ef_search)) = self.native_hnsw else {
-            return self.search_top_k(k);
+            return self.search_exact_classified(k, None);
         };
+        self.owner
+            .index
+            .classify_owner_search(&self.cx, self.query.vector(), k, true, |limit| {
+                self.search_native_candidates(graph, ef_search, limit)
+            })
+    }
+
+    fn search_native_candidates(
+        &self,
+        graph: &ValidatedNativeHnsw,
+        ef_search: usize,
+        k: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
         let target = k.min(self.owner.live_count());
         if target == 0 {
             return Ok(Vec::new());
@@ -3089,13 +3087,6 @@ impl ActivatedTier<'_, '_> {
                 reason: "native graph row does not fit usize".to_owned(),
             })?;
             let score = self.owner.index.dot_query_at(row, self.query.vector())?;
-            if !score.is_finite() {
-                return Err(SearchError::InvalidConfig {
-                    field: format!("search_activation.{}.score", self.tier),
-                    value: "non-finite".to_owned(),
-                    reason: "native candidate rescoring must produce a finite score".to_owned(),
-                });
-            }
             hits.push(VectorHit {
                 index,
                 score,
@@ -3141,6 +3132,7 @@ impl ActivatedTier<'_, '_> {
 /// rather than an assertion.
 #[derive(Debug)]
 pub struct ActivatedTierSearch<'index, 'query> {
+    index: &'index TwoTierIndex,
     fast: Option<ActivatedTier<'index, 'query>>,
     quality: Option<ActivatedTier<'index, 'query>>,
     topology: RetrievalTopology,
@@ -3187,6 +3179,15 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     /// Returns [`SearchError::InvalidConfig`] when no quality tier was
     /// activated, and propagates typed decode failures.
     pub fn search_quality(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        Ok(self.search_quality_classified(k)?.hits)
+    }
+
+    /// Retrieve classified candidates from the activated quality owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_quality`].
+    pub fn search_quality_classified(&self, k: usize) -> SearchResult<ClassifiedHits> {
         self.quality
             .as_ref()
             .ok_or_else(|| SearchError::InvalidConfig {
@@ -3204,14 +3205,46 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     /// Returns [`SearchError::InvalidConfig`] when no fast tier was
     /// activated, and propagates typed decode failures.
     pub fn search_fast(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
-        self.fast
+        Ok(self.search_fast_classified(k)?.hits)
+    }
+
+    /// Retrieve classified candidates from the activated fast owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_fast`].
+    pub fn search_fast_classified(&self, k: usize) -> SearchResult<ClassifiedHits> {
+        self.search_fast_classified_with_params(k, None)
+    }
+
+    /// Retrieve classified fast candidates with optional exact-scan settings.
+    ///
+    /// Explicit settings choose the exact scan. Otherwise retrieval uses the
+    /// activated backend. Record availability for the backend that served
+    /// this request so coverage replay cannot introduce another observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_fast`].
+    pub fn search_fast_classified_with_params(
+        &self,
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<ClassifiedHits> {
+        let tier = self
+            .fast
             .as_ref()
             .ok_or_else(|| SearchError::InvalidConfig {
                 field: "search_activation.fast".to_owned(),
                 value: format!("{:?}", self.topology),
                 reason: "fast retrieval requires an activated fast tier".to_owned(),
-            })?
-            .search_candidates(k)
+            })?;
+        let classified = params.map_or_else(
+            || tier.search_candidates(k),
+            |params| tier.search_exact_classified(k, Some(params)),
+        )?;
+        self.index.note_zero_signal(classified.zero_signal);
+        Ok(classified)
     }
 
     /// Reconstruct this query's per-tier coverage from the retained owner
@@ -3252,6 +3285,7 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
         };
         let served: BTreeSet<String> = tier
             .search_candidates(k)?
+            .hits
             .into_iter()
             .map(|hit| hit.doc_id.to_string())
             .collect();
@@ -3285,7 +3319,7 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
             .into_iter()
             .flatten()
         {
-            for hit in tier.search_candidates(k)? {
+            for hit in tier.search_candidates(k)?.hits {
                 tier_checkpoint(&tier.cx, "search_activation.union")?;
                 merged
                     .entry(hit.doc_id.to_string())
@@ -9288,6 +9322,111 @@ mod tests {
                 before_hits
             );
             assert!(index.has_native_quality_hnsw());
+        }
+    }
+
+    #[test]
+    fn admitted_classified_tiers_exclude_f16_underflow_from_coverage() {
+        let params = SearchParams {
+            parallel_enabled: true,
+            parallel_threshold: 0,
+            parallel_chunk_size: 1,
+        };
+        let cx = Cx::for_testing();
+        for state in ["mixed", "unusable", "empty"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (fast_binding, fast_identity) = fsvi_v2_binding("signal-fast", 4, 101);
+            let (quality_binding, quality_identity) = fsvi_v2_binding("signal-quality", 4, 101);
+            let fast_path = directory.path().join("fast.fsvi");
+            let quality_path = directory.path().join("quality.fsvi");
+            let mut fast_rows: Vec<(&str, &[f32])> = Vec::new();
+            let mut quality_rows: Vec<(&str, &[f32])> = Vec::new();
+            if state != "empty" {
+                fast_rows.push(("fast-rounded-zero", &[1.0e-9, 0.0, 0.0, 0.0]));
+                quality_rows.push(("quality-rounded-zero", &[1.0e-9, 0.0, 0.0, 0.0]));
+            }
+            if state == "mixed" {
+                fast_rows.push(("fast-negative", &[-0.5, 0.5, 0.0, 0.0]));
+                quality_rows.push(("quality-negative", &[-0.25, 0.5, 0.0, 0.0]));
+            }
+            write_v2_tier(&fast_path, &fast_binding, &fast_rows);
+            write_v2_tier(&quality_path, &quality_binding, &quality_rows);
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &TwoTierIndexPaths::new(fast_path).with_quality_index(quality_path),
+                TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .unwrap();
+            let query = [1.0, 0.0, 0.0, 0.0];
+            let embeddings = TieredQueryEmbeddings::progressive(
+                bound_query(&fast_identity, &query),
+                bound_query(&quality_identity, &query),
+            );
+            let (reason, expected_ids): (_, &[&str]) = match state {
+                "mixed" => (None, &["quality-negative", "fast-negative"]),
+                "unusable" => (Some(ZeroSignalReason::NoUsableVectors), &[]),
+                _ => (Some(ZeroSignalReason::NewlyCreatedEmpty), &[]),
+            };
+            for native in [false, true] {
+                if native {
+                    if state == "empty" {
+                        continue;
+                    }
+                    index
+                        .enable_native_fast_hnsw(&cx, HnswParams::default(), 71)
+                        .unwrap();
+                    index
+                        .enable_native_quality_hnsw(&cx, HnswParams::default(), 73)
+                        .unwrap();
+                }
+                let activated = index
+                    .activate_owner_backed_search(&cx, &embeddings)
+                    .unwrap();
+                assert_eq!(
+                    activated.search_fast_classified(0).unwrap().zero_signal,
+                    Some(ZeroSignalReason::CallerRequestedZeroK)
+                );
+                let fast = activated.search_fast_classified(1).unwrap();
+                let quality = activated.search_quality_classified(1).unwrap();
+                let tuned = activated
+                    .search_fast_classified_with_params(1, Some(params))
+                    .unwrap();
+                assert_eq!(fast.zero_signal, reason);
+                assert_eq!(quality.zero_signal, reason);
+                assert_eq!(tuned.zero_signal, reason);
+                assert_eq!(
+                    index.last_zero_signal.load(AtomicOrdering::Relaxed),
+                    reason.map_or(ZERO_SIGNAL_NONE, zero_signal_code)
+                );
+                assert_eq!(fast.hits, tuned.hits);
+                let union = activated.search_union(2).unwrap();
+                let ids: Vec<_> = union.iter().map(|hit| hit.doc_id.as_str()).collect();
+                assert_eq!(ids, expected_ids);
+
+                let coverage = activated.coverage(&union, 1).unwrap();
+                let witnessed = TierQueryCoverageV1::Witnessed {
+                    generation_sequence: 101,
+                    live_count: u64::try_from(fast_rows.len()).unwrap(),
+                    contributed_candidates: u64::from(state == "mixed"),
+                };
+                assert_eq!(coverage.fast, witnessed);
+                assert_eq!(coverage.quality, witnessed);
+                if state != "empty" {
+                    // Raw numeric search provides an independent negative
+                    // control. Its zero-scoring F16 row must earn no coverage.
+                    let raw = index.fast_tier().search_top_k(&query, 1, None).unwrap();
+                    assert_eq!(raw[0].doc_id, "fast-rounded-zero");
+                    assert_eq!(
+                        activated.coverage(&raw, 1).unwrap().fast,
+                        TierQueryCoverageV1::Witnessed {
+                            generation_sequence: 101,
+                            live_count: u64::try_from(fast_rows.len()).unwrap(),
+                            contributed_candidates: 0,
+                        }
+                    );
+                }
+            }
         }
     }
 

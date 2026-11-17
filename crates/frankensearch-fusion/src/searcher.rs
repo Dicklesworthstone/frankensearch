@@ -1091,23 +1091,6 @@ impl TwoTierSearcher {
         }
     }
 
-    /// Diagnose an empty result from owner-activated fast retrieval.
-    ///
-    /// The activated backend owns candidate selection and coverage replay.
-    /// This secondary search supplies a reason only if it also returns empty.
-    fn classify_fast_empty(&self, query_vec: &[f32], k: usize) -> Option<ZeroSignalReason> {
-        match self.index.search_fast_classified(query_vec, k) {
-            Ok(classified) => classified.zero_signal,
-            Err(error) => {
-                tracing::debug!(
-                    error_code = error.diagnostic_code(),
-                    "fast-tier zero-signal classification failed; lane left unclassified"
-                );
-                None
-            }
-        }
-    }
-
     /// Decide whether this query may touch this index's vectors, before it is
     /// embedded (bd-ctzo C1).
     ///
@@ -2485,52 +2468,25 @@ impl TwoTierSearcher {
                 // check before any backend can manufacture tied zero scores.
                 let search_start = Instant::now();
                 let zero_fast_query = query_vec.iter().all(|&value| value == 0.0);
+                let activated_fast = native_embeddings
+                    .as_ref()
+                    .map(|embeddings| self.index.activate_owner_backed_search(cx, embeddings))
+                    .transpose()?;
                 let retrieve_fast = |limit| -> SearchResult<_> {
-                    Ok(match (self.search_params, native_embeddings.as_ref()) {
-                        _ if zero_fast_query => {
-                            let classified =
-                                self.index.search_fast_classified(&query_vec, limit)?;
-                            (classified.hits, classified.zero_signal)
-                        }
-                        (None, Some(embeddings)) => {
-                            let hits = self
-                                .index
-                                .activate_owner_backed_search(cx, embeddings)?
-                                .search_fast(limit)?;
-                            cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
-                            let zero_signal = if hits.is_empty() {
-                                self.classify_fast_empty(&query_vec, limit)
-                            } else {
-                                None
-                            };
-                            (hits, zero_signal)
-                        }
-                        (params, None) => {
-                            let classified = self
-                                .index
-                                .search_fast_classified_with_params(&query_vec, limit, params)?;
-                            (classified.hits, classified.zero_signal)
-                        }
-                        (Some(params), Some(embeddings)) => {
-                            let activated =
-                                self.index.activate_owner_backed_search(cx, embeddings)?;
-                            let fast =
-                                activated.fast().ok_or_else(|| SearchError::InvalidConfig {
-                                    field: "search_activation.fast".to_owned(),
-                                    value: "missing".to_owned(),
-                                    reason: "exact native override requires the admitted fast tier"
-                                        .to_owned(),
-                                })?;
-                            let hits = fast.search_top_k_with_params(limit, params)?;
-                            cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
-                            let zero_signal = if hits.is_empty() {
-                                self.classify_fast_empty(&query_vec, limit)
-                            } else {
-                                None
-                            };
-                            (hits, zero_signal)
-                        }
-                    })
+                    let classified = activated_fast.as_ref().map_or_else(
+                        || {
+                            self.index.search_fast_classified_with_params(
+                                &query_vec,
+                                limit,
+                                self.search_params,
+                            )
+                        },
+                        |activated| {
+                            activated.search_fast_classified_with_params(limit, self.search_params)
+                        },
+                    )?;
+                    cancellation_checkpoint(cx, "fast_search_to_filter")?;
+                    Ok((classified.hits, classified.zero_signal))
                 };
                 let (fast_hits, index_zero_signal) = retrieve_fast(semantic_budget)?;
                 let prefilter_empty = fast_hits.is_empty();
@@ -2552,10 +2508,9 @@ impl TwoTierSearcher {
                 let fast_hits = self.correct_phase1_pool(fast_hits);
                 if self.search_params.is_none()
                     && index_zero_signal != Some(ZeroSignalReason::ZeroNormQuery)
-                    && let Some(embeddings) = native_embeddings.as_ref()
+                    && let Some(activated) = activated_fast.as_ref()
                 {
                     cancellation_checkpoint(cx, "native_fast_filter_to_coverage")?;
-                    let activated = self.index.activate_owner_backed_search(cx, embeddings)?;
                     metrics.coverage = Some(activated.coverage(&fast_hits, fast_retrieval_limit)?);
                     cancellation_checkpoint(cx, "native_fast_coverage_to_fusion")?;
                 }
@@ -2572,10 +2527,8 @@ impl TwoTierSearcher {
                 };
                 metrics.zero_signal = if fast_hits.is_empty() {
                     if prefilter_empty {
-                        // The index itself produced nothing; carry its typed
-                        // classification (None only if diagnostic
-                        // classification failed, which degrades to an
-                        // unclassified lane rather than a fabricated reason).
+                        // The backend that produced the empty answer carries
+                        // its classification through to public metrics.
                         index_zero_signal
                     } else {
                         // The index produced candidates; caller-supplied
@@ -10315,6 +10268,62 @@ mod tests {
             assert!(matches!(error, SearchError::Cancelled { phase, .. }
                 if phase == "vector_exclusions_to_search"));
             assert_single_cancelled_session_stop(&adapter, "vector_exclusions_to_search");
+        });
+    }
+
+    #[test]
+    fn owner_backed_fast_availability_comes_from_the_selected_backend() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("owner-fast-rounded-zero");
+            let path = dir.join("fast.fsvi");
+            let binding = artifact_binding("owner-fast-rounded-zero", 4, 79);
+            write_v2_tier(
+                &path,
+                &binding,
+                &[("rounded-zero", &[1.0e-9, 0.0, 0.0, 0.0])],
+            );
+            let config = TwoTierConfig::default();
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &frankensearch_index::TwoTierIndexPaths::new(path),
+                config.clone(),
+                &binding,
+                None,
+            )
+            .unwrap();
+            index
+                .enable_native_fast_hnsw(
+                    &cx,
+                    frankensearch_index::native_hnsw::HnswParams::default(),
+                    17,
+                )
+                .unwrap();
+            let index = Arc::new(index);
+            for exact_override in [false, true] {
+                let fast = Arc::new(IdentityCountingEmbedder::new(
+                    "fast",
+                    in_memory_identity("owner-fast-rounded-zero", 4),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ));
+                let mut searcher = TwoTierSearcher::new(Arc::clone(&index), fast, config.clone());
+                if exact_override {
+                    searcher = searcher.with_search_params(SearchParams::default());
+                }
+                let (hits, metrics) = searcher.search_collect(&cx, "query", 1).await.unwrap();
+                assert!(hits.is_empty());
+                assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::NoUsableVectors));
+                if exact_override {
+                    assert!(metrics.coverage.is_none());
+                } else {
+                    assert_eq!(
+                        metrics.coverage.unwrap().fast,
+                        frankensearch_core::TierQueryCoverageV1::Witnessed {
+                            generation_sequence: 79,
+                            live_count: 1,
+                            contributed_candidates: 0,
+                        }
+                    );
+                }
+            }
         });
     }
 

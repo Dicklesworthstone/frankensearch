@@ -136,29 +136,57 @@ impl ClassifiedHits {
 pub(crate) fn classified_candidates(
     limit: usize,
     candidate_count: usize,
+    search: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
+    usable: impl FnMut(&VectorHit) -> bool,
+    mut census: impl FnMut() -> (bool, ZeroSignalReason),
+) -> SearchResult<ClassifiedHits> {
+    classified_candidates_controlled(
+        limit,
+        candidate_count,
+        search,
+        usable,
+        || Ok(census()),
+        UncancelledScan,
+    )
+}
+
+fn classified_candidates_controlled(
+    limit: usize,
+    candidate_count: usize,
     mut search: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
     mut usable: impl FnMut(&VectorHit) -> bool,
-    mut census: impl FnMut() -> (bool, ZeroSignalReason),
+    mut census: impl FnMut() -> SearchResult<(bool, ZeroSignalReason)>,
+    cancel: impl ScanCancellation,
 ) -> SearchResult<ClassifiedHits> {
     let mut candidate_limit = limit.min(candidate_count);
     let mut repairing = false;
     let mut signal_state = None;
     loop {
+        cancel.checkpoint()?;
         let mut hits = search(candidate_limit)?;
         let before = hits.len();
-        hits.retain(|hit| hit.score.is_finite() && usable(hit));
-        repairing |= hits.len() != before;
-        if repairing {
-            let (has_usable, reason) = *signal_state.get_or_insert_with(&mut census);
-            if !has_usable {
-                return Ok(ClassifiedHits::empty(reason));
+        let mut offset = 0;
+        let mut checkpoint = Ok(());
+        hits.retain(|hit| {
+            if checkpoint.is_ok() {
+                checkpoint = cancel.checkpoint_at(offset);
+                offset += 1;
             }
+            checkpoint.is_ok() && hit.score.is_finite() && usable(hit)
+        });
+        checkpoint?;
+        repairing |= hits.len() != before;
+        if signal_state.is_none() && (repairing || hits.is_empty()) {
+            signal_state = Some(census()?);
+        }
+        if let Some((false, reason)) = signal_state {
+            return Ok(ClassifiedHits::empty(reason));
         }
         if !repairing || hits.len() >= limit || candidate_limit >= candidate_count {
             hits.truncate(limit);
-            let zero_signal = hits
-                .is_empty()
-                .then(|| signal_state.get_or_insert_with(&mut census).1);
+            let zero_signal = signal_state
+                .filter(|_| hits.is_empty())
+                .map(|(_, reason)| reason);
             return Ok(ClassifiedHits { hits, zero_signal });
         }
         candidate_limit = candidate_limit
@@ -313,6 +341,66 @@ impl VectorIndex {
         // boundary, and no success can escape after the final filter callback.
         ScanCancellation::checkpoint(cx)?;
         result
+    }
+
+    /// Classify a search over a retained, admitted v2 owner. Admission has
+    /// already checked the query and the owner cannot have a resident WAL.
+    pub(crate) fn classify_owner_search(
+        &self,
+        cx: &Cx,
+        query: &[f32],
+        limit: usize,
+        native_ann: bool,
+        search: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
+    ) -> SearchResult<ClassifiedHits> {
+        ScanCancellation::checkpoint(cx)?;
+        if limit == 0 {
+            return Ok(ClassifiedHits::empty(
+                ZeroSignalReason::CallerRequestedZeroK,
+            ));
+        }
+        if query.iter().all(|&component| component == 0.0) {
+            return Ok(ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery));
+        }
+        let result = classified_candidates_controlled(
+            limit,
+            self.record_count(),
+            search,
+            |hit| self.classified_hit_is_usable(hit),
+            || self.owner_search_census(cx, native_ann),
+            cx,
+        );
+        ScanCancellation::checkpoint(cx)?;
+        result
+    }
+
+    fn owner_search_census(
+        &self,
+        cx: &Cx,
+        native_ann: bool,
+    ) -> SearchResult<(bool, ZeroSignalReason)> {
+        let mut reason = if self.record_count() == 0 {
+            ZeroSignalReason::NewlyCreatedEmpty
+        } else {
+            ZeroSignalReason::AllTombstoned
+        };
+        for row in 0..self.record_count() {
+            cx.checkpoint_at(row)?;
+            if !self.is_deleted(row) {
+                reason = ZeroSignalReason::NoUsableVectors;
+                if self.is_vector_usable(row) {
+                    return Ok((
+                        true,
+                        if native_ann {
+                            ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors
+                        } else {
+                            reason
+                        },
+                    ));
+                }
+            }
+        }
+        Ok((false, reason))
     }
 
     /// Brute-force top-k with typed zero-signal classification.
