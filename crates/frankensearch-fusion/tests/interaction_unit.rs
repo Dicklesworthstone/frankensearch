@@ -146,6 +146,25 @@ impl LexicalRead for StubLexical {
 
 const DIM: usize = 4;
 
+// Text for every ID returned by the fixture's lexical and vector backends.
+// Resolve by ID alone so a document's text is the same for every query.
+fn fixture_document_text(doc_id: &str) -> Option<String> {
+    let text = match doc_id {
+        "doc-0" => "Rust borrowing through an unsafe pointer",
+        "doc-1" => "Rust ownership with borrowed references",
+        "doc-2" => "A deprecated SearchIndex constructor",
+        "doc-3" => "ONNX Runtime inference in Python",
+        "doc-4" => "BM25 scoring with Lucene",
+        "doc-5" => "Sentence transformers with a large model",
+        "doc-6" => "Euclidean distance for vector search",
+        "doc-7" => "Docker Swarm container deployment",
+        "doc-8" => "Tokio scheduling and GPT embeddings",
+        "doc-9" => "Rust unwrap and panic behavior in a gluten recipe example",
+        _ => return None,
+    };
+    Some(text.to_owned())
+}
+
 /// The index and the guard that removes its directory; keep the guard bound
 /// for as long as the index is used.
 fn build_test_index() -> (tempfile::TempDir, Arc<TwoTierIndex>) {
@@ -347,7 +366,7 @@ async fn run_lane_oracles(
     // Execute search.
     let mut collector = PhaseCollector::default();
     let search_result = searcher
-        .search(cx, query, k, |_doc_id| None, collector.callback())
+        .search(cx, query, k, fixture_document_text, collector.callback())
         .await;
 
     match search_result {
@@ -388,15 +407,21 @@ async fn check_determinism(
     k: usize,
     report: &mut LaneTestReport,
 ) {
-    let mut collector_a = PhaseCollector::default();
-    let _ = searcher
-        .search(cx, query, k, |_| None, collector_a.callback())
-        .await;
-
-    let mut collector_b = PhaseCollector::default();
-    let _ = searcher
-        .search(cx, query, k, |_| None, collector_b.callback())
-        .await;
+    let mut collectors = [PhaseCollector::default(), PhaseCollector::default()];
+    for (run, collector) in collectors.iter_mut().enumerate() {
+        if let Err(error) = searcher
+            .search(cx, query, k, fixture_document_text, collector.callback())
+            .await
+        {
+            report.add(OracleVerdict::fail(
+                "deterministic_ordering",
+                lane.id,
+                format!("run {} failed: {error}", run + 1),
+            ));
+            return;
+        }
+    }
+    let [collector_a, collector_b] = collectors;
 
     let results_a = collector_a.best_results();
     let results_b = collector_b.best_results();

@@ -154,6 +154,25 @@ impl LexicalRead for StubLexical {
 
 const DIM: usize = 4;
 
+// Text for every ID returned by the fixture's lexical and vector backends.
+// Resolve by ID alone so a document's text is the same for every query.
+fn fixture_document_text(doc_id: &str) -> Option<String> {
+    let text = match doc_id {
+        "doc-0" => "Rust borrowing through an unsafe pointer",
+        "doc-1" => "Rust ownership with borrowed references",
+        "doc-2" => "A deprecated SearchIndex constructor",
+        "doc-3" => "ONNX Runtime inference in Python",
+        "doc-4" => "BM25 scoring with Lucene",
+        "doc-5" => "Sentence transformers with a large model",
+        "doc-6" => "Euclidean distance for vector search",
+        "doc-7" => "Docker Swarm container deployment",
+        "doc-8" => "Tokio scheduling and GPT embeddings",
+        "doc-9" => "Rust unwrap and panic behavior in a gluten recipe example",
+        _ => return None,
+    };
+    Some(text.to_owned())
+}
+
 fn build_test_index() -> (tempfile::TempDir, Arc<TwoTierIndex>) {
     // A mkdtemp directory, not pid + clock nanos: parallel tests in this binary
     // read the same clock value and then built into one directory, and the
@@ -431,7 +450,13 @@ async fn run_template_driven_test_with_tiebreak(
 
         let mut collector = PhaseCollector::default();
         let search_result = searcher
-            .search(cx, query_text, k, |_| None, collector.callback())
+            .search(
+                cx,
+                query_text,
+                k,
+                fixture_document_text,
+                collector.callback(),
+            )
             .await;
 
         match search_result {
@@ -1128,6 +1153,52 @@ fn integration_explain_negation_template_driven() {
 }
 
 #[test]
+fn negated_interaction_requires_text_and_excludes_a_planted_document() {
+    run_test_with_cx(|cx| async move {
+        let lane = lane_by_id("explain_negation").unwrap();
+        let (searcher, _, _index_dir) = build_searcher_for_lane(&lane, None);
+        let positive = "how does Rust enforce its borrowing rules";
+        let negated = "how does Rust enforce its borrowing rules -unsafe";
+
+        let error = searcher
+            .search(
+                &cx,
+                negated,
+                10,
+                |_| None,
+                |_| panic!("missing evidence emitted a phase"),
+            )
+            .await
+            .expect_err("negative queries require document text");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, .. } if field == "search.exclusion_text"
+        ));
+
+        for (query, includes_unsafe) in [(positive, true), (negated, false)] {
+            let mut phases = PhaseCollector::default();
+            searcher
+                .search(&cx, query, 10, fixture_document_text, phases.callback())
+                .await
+                .expect("run with fixture document text");
+            assert!(phases.initial_received);
+            for results in [
+                phases.initial_results.as_slice(),
+                phases
+                    .refined_results
+                    .as_deref()
+                    .expect("quality refinement"),
+            ] {
+                let ids: HashSet<_> = results.iter().map(|hit| hit.doc_id.as_str()).collect();
+                assert_eq!(ids.contains("doc-0"), includes_unsafe, "{query}");
+                assert!(ids.contains("doc-1"), "{query}");
+                assert_eq!(ids.len(), if includes_unsafe { 10 } else { 9 }, "{query}");
+            }
+        }
+    });
+}
+
+#[test]
 fn integration_prf_negation_template_driven() {
     run_test_with_cx(|cx| async move {
         let (report, template) = run_template_driven_test(&cx, "prf_negation").await;
@@ -1540,7 +1611,7 @@ fn initial_then_refined_lanes_always_produce_phase2() {
                 let query = fq.query_for_lane(lane.query_slice.include_negated);
                 let mut collector = PhaseCollector::default();
                 let result = searcher
-                    .search(&cx, query, 5, |_| None, collector.callback())
+                    .search(&cx, query, 5, fixture_document_text, collector.callback())
                     .await;
 
                 assert!(
@@ -1585,7 +1656,7 @@ fn maybe_refined_lanes_tolerate_both_outcomes() {
                 let query = fq.query_for_lane(lane.query_slice.include_negated);
                 let mut collector = PhaseCollector::default();
                 let result = searcher
-                    .search(&cx, query, 5, |_| None, collector.callback())
+                    .search(&cx, query, 5, fixture_document_text, collector.callback())
                     .await;
 
                 assert!(
