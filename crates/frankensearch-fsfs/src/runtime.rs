@@ -17899,12 +17899,19 @@ impl FsfsRuntime {
         // A provider may change its advertised identity during inference.
         // Re-admit both tiers before publishing even the lexical arm, and bind
         // that admission to the identities that produced this batch.
-        for (path, producer, identity, is_quality) in [
-            (&vector_path, Some(&embedder), Some(&fast_identity), false),
+        for (path, producer, identity, rows, is_quality) in [
+            (
+                &vector_path,
+                Some(&embedder),
+                Some(&fast_identity),
+                &entries,
+                false,
+            ),
             (
                 &quality_vector_path,
                 quality.as_ref().map(|(producer, _)| producer),
                 quality.as_ref().map(|(_, identity)| identity),
+                &quality_entries,
                 true,
             ),
         ] {
@@ -17925,6 +17932,7 @@ impl FsfsRuntime {
                     reason: "the producer or generation changed after batch embedding".to_owned(),
                 });
             }
+            index.validate_append_entries(rows)?;
         }
 
         // Re-check the lease, then reopen a write handle and re-admit so a
@@ -58648,6 +58656,8 @@ mod tests {
     enum AppendProviderFault {
         ForeignBoundIdentity,
         NonFinite,
+        F16Underflow,
+        F16Overflow,
         ChangedAdvertisedIdentity,
         Cancelled,
     }
@@ -58705,6 +58715,11 @@ mod tests {
                         response.identity = self.changed_identity.clone();
                     }
                     AppendProviderFault::NonFinite => response.values[0] = f32::NAN,
+                    AppendProviderFault::F16Underflow => {
+                        response.values.fill(0.0);
+                        response.values[0] = 1.0e-9;
+                    }
+                    AppendProviderFault::F16Overflow => response.values[0] = 70_000.0,
                     AppendProviderFault::ChangedAdvertisedIdentity => {
                         self.changed.store(true, Ordering::SeqCst);
                     }
@@ -58745,6 +58760,8 @@ mod tests {
                 for fault in [
                     AppendProviderFault::ForeignBoundIdentity,
                     AppendProviderFault::NonFinite,
+                    AppendProviderFault::F16Underflow,
+                    AppendProviderFault::F16Overflow,
                     AppendProviderFault::ChangedAdvertisedIdentity,
                     AppendProviderFault::Cancelled,
                 ] {
@@ -58791,6 +58808,10 @@ mod tests {
                         AppendProviderFault::NonFinite => {
                             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                                 if field == "identity_bound_embedding.values"));
+                        }
+                        AppendProviderFault::F16Underflow | AppendProviderFault::F16Overflow => {
+                            assert!(matches!(error, SearchError::InvalidConfig { field, reason, .. }
+                                if field == "embedding" && reason.contains("F16 encoding")));
                         }
                         AppendProviderFault::Cancelled => {
                             assert!(matches!(error, SearchError::Cancelled { .. }));
