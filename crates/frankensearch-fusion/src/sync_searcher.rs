@@ -25,7 +25,7 @@ use frankensearch_core::{
     SpaceIdentityAdmission, TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
 };
 use frankensearch_index::{
-    InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams, ValidatedFsviBytes,
+    ClassifiedHits, InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams, ValidatedFsviBytes,
 };
 
 use crate::blend::{
@@ -839,11 +839,11 @@ impl SyncTwoTierSearcher {
         let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
 
         let phase1_started = Instant::now();
-        let (fast_hits, phase1_vectors_searched) = if query_vec.iter().all(|&value| value == 0.0) {
+        let (classified, phase1_vectors_searched) = if query_vec.iter().all(|&value| value == 0.0) {
             // Zero signal belongs to this semantic lane (bd-tqhc), not the
             // whole query. Lexical matches and an independently admitted
             // quality query can still answer it without any fast-vector work.
-            (Vec::new(), 0)
+            (ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery), 0)
         } else {
             // Count the vectors evaluated, not the bounded candidate pool.
             (
@@ -851,7 +851,12 @@ impl SyncTwoTierSearcher {
                 self.index.doc_count(),
             )
         };
+        let ClassifiedHits {
+            hits: fast_hits,
+            zero_signal,
+        } = classified;
         metrics.phase1_vectors_searched = phase1_vectors_searched;
+        metrics.zero_signal = zero_signal;
         let hash_control = sync_fast_is_hash_control(&self.index);
         metrics.publish_vector_candidates(fast_hits.len(), hash_control);
         if hash_control && metrics.skip_reason.is_none() {
@@ -860,14 +865,6 @@ impl SyncTwoTierSearcher {
             // hits and they do not schedule quality refinement.
             metrics.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
         }
-        // Default exact retrieval validates its winning vectors. An empty
-        // semantic lane also needs a census to explain its missing signal.
-        metrics.zero_signal = if fast_hits.is_empty() {
-            Some(self.classify_fast_empty(query_vec, fetch, filter))
-        } else {
-            None
-        };
-
         let lexical_started = Instant::now();
         let lexical_hits = self.search_optional_lexical(query_vec, fetch, filter)?;
         metrics.lexical_search_ms = ms(lexical_started.elapsed());
@@ -1537,18 +1534,19 @@ impl SyncTwoTierSearcher {
         query_vec: &[f32],
         fetch: usize,
         filter: Option<&dyn SearchFilter>,
-    ) -> SearchResult<Vec<VectorHit>> {
+    ) -> SearchResult<ClassifiedHits> {
         let fast_index = self.index.fast_index();
-        self.search_params.map_or_else(
-            || match self.fast_retrieval {
+        let hits = match self.search_params {
+            Some(params) => {
+                fast_index.search_top_k_with_params(query_vec, fetch, filter, params)?
+            }
+            None => match self.fast_retrieval {
                 SyncFastRetrieval::Exact => {
                     // The public default is exact whether the optional cache is
                     // attached or unavailable. A verified sidecar may prune only
                     // inside classified exact search; it must never select a different
                     // candidate-generation algorithm or change visible results.
-                    fast_index
-                        .search_top_k_classified(query_vec, fetch, filter)
-                        .map(|classified| classified.hits)
+                    return fast_index.search_top_k_classified(query_vec, fetch, filter);
                 }
                 SyncFastRetrieval::ApproximateInt8ForBench {
                     candidate_multiplier,
@@ -1557,48 +1555,21 @@ impl SyncTwoTierSearcher {
                     fetch,
                     candidate_multiplier,
                     filter,
-                ),
+                )?,
             },
-            // Explicit params: honour the exact scan + parallelism configuration.
-            |params| fast_index.search_top_k_with_params(query_vec, fetch, filter, params),
-        )
-    }
-
-    /// Classify an empty fast-tier result with its typed
-    /// [`ZeroSignalReason`] (bd-tqhc).
-    ///
-    /// Request-scoped defects are classified from the request itself, in the
-    /// documented precedence order; state-scoped reasons come from the
-    /// index's census so in-memory and persistent paths agree. This never
-    /// repeats retrieval or substitutes a second search's hits.
-    fn classify_fast_empty(
-        &self,
-        query_vec: &[f32],
-        fetch: usize,
-        filter: Option<&dyn SearchFilter>,
-    ) -> ZeroSignalReason {
-        // Request-scoped conditions take precedence over index state, in the
-        // order documented on `ZeroSignalReason`.
-        if fetch == 0 {
-            return ZeroSignalReason::CallerRequestedZeroK;
-        }
-        if query_vec.iter().any(|value| !value.is_finite()) {
-            return ZeroSignalReason::NonFiniteQuery;
-        }
-        if query_vec.iter().all(|&value| value == 0.0) {
-            return ZeroSignalReason::ZeroNormQuery;
-        }
-        // State-scoped reasons come from the index census rather than from a
-        // second search. Re-scanning would cost a full extra pass on a path
-        // that has already answered. The production and classified routes are
-        // both exact, but the second scan could still observe a concurrent
-        // index state change and fabricate a reason for a result it did not
-        // produce. The census cannot disagree with itself, and always yields
-        // a reason.
-        self.index
-            .fast_index()
-            .zero_signal_state()
-            .empty_result_reason(filter.is_some())
+        };
+        // Explicit scan overrides return raw hits. Classify an empty batch
+        // once, after search_initial has handled zero k and zero-norm input.
+        let zero_signal = hits.is_empty().then(|| {
+            if query_vec.iter().any(|value| !value.is_finite()) {
+                ZeroSignalReason::NonFiniteQuery
+            } else {
+                fast_index
+                    .zero_signal_state()
+                    .empty_result_reason(filter.is_some())
+            }
+        });
+        Ok(ClassifiedHits { hits, zero_signal })
     }
 }
 
