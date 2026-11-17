@@ -1700,6 +1700,23 @@ impl TwoTierIndex {
         query_vec: &[f32],
         k: usize,
     ) -> SearchResult<ClassifiedHits> {
+        self.search_fast_classified_with_params(query_vec, k, None)
+    }
+
+    /// Classified fast-tier retrieval with optional exact-scan parallelism settings.
+    ///
+    /// ANN and dimension truncation retain the backend precedence of
+    /// [`Self::search_fast_with_params`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_fast_classified`].
+    pub fn search_fast_classified_with_params(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<ClassifiedHits> {
         if query_vec.len() != self.fast_tier().dimension() {
             return Err(SearchError::DimensionMismatch {
                 expected: self.fast_tier().dimension(),
@@ -1727,7 +1744,7 @@ impl TwoTierIndex {
         let classified = classified_candidates(
             k,
             fast.record_count().saturating_add(fast.wal_entries.len()),
-            |candidate_limit| self.search_fast(query_vec, candidate_limit),
+            |candidate_limit| self.search_fast_with_params(query_vec, candidate_limit, params),
             |hit| fast.classified_hit_is_usable(hit),
             || self.classified_fast_census(),
         )?;
@@ -1946,14 +1963,13 @@ impl TwoTierIndex {
                     .to_owned(),
             });
         }
-        index.search_top_k(query.vector(), k, None)
+        Ok(index.search_top_k_classified(query.vector(), k, None)?.hits)
     }
 
     /// Compute quality-tier scores for fast-index document positions.
     ///
-    /// Missing quality entries produce `None`, allowing downstream blending
-    /// to use fast-only scores without penalizing documents that lack quality
-    /// vectors.
+    /// Missing or unusable vectors and non-finite scores produce `None`.
+    /// A resident WAL row shadows the main row even when it has no usable score.
     ///
     /// # Errors
     ///
@@ -1996,37 +2012,39 @@ impl TwoTierIndex {
 
         let mut scores = Vec::with_capacity(hits.len());
         for hit in hits {
-            let mut found_score = if let Some(&i) = wal_latest.get(hit.doc_id.as_str()) {
-                Some(dot_product_f32_f32(
-                    &quality_index.wal_entries[i].embedding,
-                    query_vec,
-                )?)
-            } else {
-                None
-            };
-
-            if found_score.is_none() {
-                let fast_idx = if hit.index == u32::MAX {
-                    self.fast_tier().find_index_by_doc_id(&hit.doc_id)?
-                } else if (hit.index as usize) < self.fast_tier().record_count() {
-                    Some(hit.index as usize)
+            if let Some(&i) = wal_latest.get(hit.doc_id.as_str()) {
+                let embedding = &quality_index.wal_entries[i].embedding;
+                let score = if crate::vector_signal_usable(embedding) {
+                    let score = dot_product_f32_f32(embedding, query_vec)?;
+                    score.is_finite().then_some(score)
                 } else {
                     None
                 };
-
-                if let Some(idx) = fast_idx {
-                    found_score =
-                        self.score_quality_for_fast_index(quality_index, query_vec, idx)?;
-                }
+                scores.push(score);
+                continue;
             }
 
-            if found_score.is_none() {
-                if let Some(qual_idx) = quality_index.find_index_by_doc_id(&hit.doc_id)? {
-                    found_score = Some(quality_index.dot_query_at(qual_idx, query_vec)?);
+            let fast_idx = hit.index as usize;
+            let mapped = if fast_idx < self.fast_tier().record_count()
+                && self.fast_tier().doc_id_at(fast_idx)? == hit.doc_id
+            {
+                self.quality_index_for_fast_index(fast_idx)
+                    .filter(|&row| !quality_index.is_deleted(row))
+            } else {
+                None
+            };
+            let quality_row = match mapped {
+                Some(row) => Some(row),
+                None => quality_index.find_index_by_doc_id(&hit.doc_id)?,
+            };
+            let score = match quality_row {
+                Some(row) if quality_index.vector_has_signal(row)? => {
+                    let score = quality_index.dot_query_at(row, query_vec)?;
+                    score.is_finite().then_some(score)
                 }
-            }
-
-            scores.push(found_score);
+                _ => None,
+            };
+            scores.push(score);
         }
         Ok(scores)
     }
@@ -2297,7 +2315,7 @@ impl TwoTierIndex {
         self.fast_tier().find_index_by_doc_id(doc_id)
     }
 
-    /// Fast-tier vector for the given document id.
+    /// Usable fast-tier vector for the given document id.
     ///
     /// # Errors
     ///
@@ -2306,18 +2324,19 @@ impl TwoTierIndex {
         let hash = crate::fnv1a_hash(doc_id.as_bytes());
         for entry in self.fast_tier().wal_entries.iter().rev() {
             if entry.doc_id_hash == hash && entry.doc_id == doc_id {
-                return Ok(Some(entry.embedding.clone()));
+                let usable = crate::vector_signal_usable(&entry.embedding);
+                return Ok(usable.then(|| entry.embedding.clone()));
             }
         }
 
         if let Some(index) = self.fast_tier().find_index_by_doc_id(doc_id)? {
-            return self.fast_tier().vector_at_f32(index).map(Some);
+            return self.fast_tier().signal_vector_at(index);
         }
 
         Ok(None)
     }
 
-    /// Quality-tier vector for the given document id when available.
+    /// Usable quality-tier vector for the given document id.
     ///
     /// # Errors
     ///
@@ -2330,18 +2349,20 @@ impl TwoTierIndex {
         let hash = crate::fnv1a_hash(doc_id.as_bytes());
         for entry in quality_index.wal_entries.iter().rev() {
             if entry.doc_id_hash == hash && entry.doc_id == doc_id {
-                return Ok(Some(entry.embedding.clone()));
+                let usable = crate::vector_signal_usable(&entry.embedding);
+                return Ok(usable.then(|| entry.embedding.clone()));
             }
         }
 
-        if let Some(fast_index) = self.fast_tier().find_index_by_doc_id(doc_id)? {
-            if let Some(quality_index_pos) = self.quality_index_for_fast_index(fast_index) {
-                return quality_index.vector_at_f32(quality_index_pos).map(Some);
-            }
+        if let Some(fast_index) = self.fast_tier().find_index_by_doc_id(doc_id)?
+            && let Some(quality_index_pos) = self.quality_index_for_fast_index(fast_index)
+            && !quality_index.is_deleted(quality_index_pos)
+        {
+            return quality_index.signal_vector_at(quality_index_pos);
         }
 
         if let Some(qual_idx) = quality_index.find_index_by_doc_id(doc_id)? {
-            return quality_index.vector_at_f32(qual_idx).map(Some);
+            return quality_index.signal_vector_at(qual_idx);
         }
 
         Ok(None)
@@ -2414,35 +2435,6 @@ impl TwoTierIndex {
     #[must_use]
     pub const fn config(&self) -> &TwoTierConfig {
         &self.config
-    }
-
-    fn score_quality_for_fast_index(
-        &self,
-
-        quality_index: &VectorIndex,
-
-        query_vec: &[f32],
-
-        fast_idx: usize,
-    ) -> SearchResult<Option<f32>> {
-        if fast_idx >= self.doc_count() {
-            return Ok(None);
-        }
-        let quality_idx = match &self.quality_alignment {
-            QualityAlignment::None => return Ok(None),
-
-            QualityAlignment::Aligned => fast_idx,
-
-            QualityAlignment::Mapping(map) => match map.get(fast_idx).copied().flatten() {
-                Some(idx) => idx,
-
-                None => return Ok(None),
-            },
-        };
-
-        // Fused byte-based dot (no per-hit `Vec<f32>` decode), matching the
-        // brute-force scan's scorer; bit-identical for `dim % 32 == 0`.
-        quality_index.dot_query_at(quality_idx, query_vec).map(Some)
     }
 
     fn quality_index_for_fast_index(&self, fast_idx: usize) -> Option<usize> {
@@ -6318,6 +6310,74 @@ mod tests {
     }
 
     // ─── bd-3nsq: NaN score in WAL merge ───
+
+    #[test]
+    fn classified_quality_scores_keep_durable_wal_shadowing_and_live_zero_scores() {
+        use crate::wal::{WalEntry, append_wal_batch, wal_path_for};
+
+        let dir = temp_index_dir("classified-quality-wal");
+        fs::create_dir_all(&dir).unwrap();
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let rows: &[(&str, &[f32])] = &[
+            ("shadowed", &[1.0, 0.0]),
+            ("wal-winner", &[-1.0, 0.0]),
+            ("orthogonal", &[0.0, 1.0]),
+            ("deleted", &[1.0, 0.0]),
+        ];
+        write_index_file(&fast_path, rows).unwrap();
+        write_index_file(&quality_path, rows).unwrap();
+        let mut quality = VectorIndex::open(&quality_path).unwrap();
+        assert!(quality.soft_delete("deleted").unwrap());
+        let wal = [("shadowed", vec![0.0, 0.0]), ("wal-winner", vec![0.5, 0.5])].map(
+            |(doc_id, embedding)| WalEntry {
+                doc_id: doc_id.to_owned(),
+                doc_id_hash: crate::fnv1a_hash(doc_id.as_bytes()),
+                embedding,
+            },
+        );
+        // Persist the replacement before updating the main flags, as a
+        // reopen can observe after an interrupted publication.
+        append_wal_batch(
+            &wal_path_for(&quality_path),
+            &wal,
+            quality.dimension(),
+            quality.quantization(),
+            crate::next_generation(quality.metadata().compaction_gen),
+            true,
+        )
+        .unwrap();
+        drop(quality);
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+        let quality = index.quality_tier().unwrap();
+        assert_eq!(quality.wal_record_count(), 2);
+        assert!(quality.find_index_by_doc_id("shadowed").unwrap().is_some());
+        assert_eq!(index.quality_vector_for_doc_id("shadowed").unwrap(), None);
+        assert_eq!(index.quality_vector_for_doc_id("deleted").unwrap(), None);
+        assert_eq!(
+            index.quality_vector_for_doc_id("wal-winner").unwrap(),
+            Some(vec![0.5, 0.5])
+        );
+        for (id, expected) in [
+            ("shadowed", None),
+            ("deleted", None),
+            ("orthogonal", Some(0.0)),
+            ("wal-winner", Some(0.5)),
+        ] {
+            let row = index.fast_index_for_doc_id(id).unwrap().unwrap();
+            let hit = VectorHit {
+                index: u32::try_from(row).unwrap(),
+                doc_id: id.into(),
+                score: 1.0,
+            };
+            assert_eq!(
+                index.quality_scores_for_hits(&[1.0, 0.0], &[hit]).unwrap(),
+                [expected],
+                "{id}"
+            );
+        }
+    }
 
     #[test]
     fn search_fast_skips_nan_score_wal_entries() {

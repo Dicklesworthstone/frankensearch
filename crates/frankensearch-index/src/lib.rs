@@ -2740,8 +2740,33 @@ impl VectorIndex {
     /// a vector that cannot be read cannot contribute signal.
     #[must_use]
     pub fn is_vector_usable(&self, record_index: usize) -> bool {
-        self.vector_at_f32(record_index)
-            .is_ok_and(|vector| vector_signal_usable(&vector))
+        self.vector_has_signal(record_index).unwrap_or(false)
+    }
+
+    fn vector_has_signal(&self, record_index: usize) -> SearchResult<bool> {
+        let bytes = self.vector_bytes(record_index)?;
+        Ok(match self.quantization() {
+            Quantization::F32 => vector_components_usable(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(f32::from_le_bytes),
+            ),
+            Quantization::F16 => vector_components_usable(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| f16::from_le_bytes(*chunk).to_f32()),
+            ),
+        })
+    }
+
+    fn signal_vector_at(&self, record_index: usize) -> SearchResult<Option<Vec<f32>>> {
+        let vector = self.vector_at_f32(record_index)?;
+        Ok(vector_signal_usable(&vector).then_some(vector))
     }
 
     /// Compute the zero-signal census for this index generation.
@@ -6543,8 +6568,12 @@ pub(crate) fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// scores 0.0 against everything, so ranking it is arbitrary tie-breaking;
 /// a norm that overflows to infinity poisons downstream scores.
 pub(crate) fn vector_signal_usable(vector: &[f32]) -> bool {
+    vector_components_usable(vector.iter().copied())
+}
+
+fn vector_components_usable(vector: impl Iterator<Item = f32>) -> bool {
     let mut norm_sq = 0.0f32;
-    for &value in vector {
+    for value in vector {
         if !value.is_finite() {
             return false;
         }

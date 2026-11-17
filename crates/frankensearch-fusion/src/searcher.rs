@@ -1091,27 +1091,10 @@ impl TwoTierSearcher {
         }
     }
 
-    /// Classify an empty fast-tier result produced by the explicit
-    /// `search_params` lane (bd-tqhc).
+    /// Diagnose an empty result from owner-activated fast retrieval.
     ///
-    /// Runs the classified fast lane purely for its state census — hit
-    /// production stays with the params lane that already answered, and the
-    /// two lanes scan the same records, so an empty params result implies an
-    /// empty (classified) default result. Classification is diagnostic and
-    /// must never fail the search: errors degrade to an unclassified lane at
-    /// debug level rather than a fabricated reason.
-    ///
-    /// Known narrow gap: if the classified lane were to find hits where the
-    /// params lane found none, this returns `None` and the empty result
-    /// carries no reason. That needs the two lanes to disagree about
-    /// *emptiness* specifically — the params lane is the exact scan and the
-    /// classified lane's int8 two-pass is a candidate superset of it, so an
-    /// empty exact result implies an empty int8 result and the disagreement
-    /// cannot occur in that direction. Closing it properly wants a public
-    /// census on `TwoTierIndex` (as `InMemoryVectorIndex` already exposes,
-    /// which is how the sync searcher avoids both this gap and the second
-    /// scan); that lives in `two_tier.rs` and is deferred rather than
-    /// entangled with the in-flight ANN tranche.
+    /// The activated backend owns candidate selection and coverage replay.
+    /// This secondary search supplies a reason only if it also returns empty.
     fn classify_fast_empty(&self, query_vec: &[f32], k: usize) -> Option<ZeroSignalReason> {
         match self.index.search_fast_classified(query_vec, k) {
             Ok(classified) => classified.zero_signal,
@@ -2522,33 +2505,24 @@ impl TwoTierSearcher {
                             };
                             (hits, zero_signal)
                         }
-                        (None, None) => {
-                            let classified =
-                                self.index.search_fast_classified(&query_vec, limit)?;
+                        (params, None) => {
+                            let classified = self
+                                .index
+                                .search_fast_classified_with_params(&query_vec, limit, params)?;
                             (classified.hits, classified.zero_signal)
                         }
-                        (Some(params), embeddings) => {
-                            let hits = if let Some(embeddings) = embeddings {
-                                let activated =
-                                    self.index.activate_owner_backed_search(cx, embeddings)?;
-                                let fast =
-                                    activated.fast().ok_or_else(|| SearchError::InvalidConfig {
-                                        field: "search_activation.fast".to_owned(),
-                                        value: "missing".to_owned(),
-                                        reason:
-                                            "exact native override requires the admitted fast tier"
-                                                .to_owned(),
-                                    })?;
-                                let hits = fast.search_top_k_with_params(limit, params)?;
-                                cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
-                                hits
-                            } else {
-                                self.index.search_fast_with_params(
-                                    &query_vec,
-                                    limit,
-                                    Some(params),
-                                )?
-                            };
+                        (Some(params), Some(embeddings)) => {
+                            let activated =
+                                self.index.activate_owner_backed_search(cx, embeddings)?;
+                            let fast =
+                                activated.fast().ok_or_else(|| SearchError::InvalidConfig {
+                                    field: "search_activation.fast".to_owned(),
+                                    value: "missing".to_owned(),
+                                    reason: "exact native override requires the admitted fast tier"
+                                        .to_owned(),
+                                })?;
+                            let hits = fast.search_top_k_with_params(limit, params)?;
+                            cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
                             let zero_signal = if hits.is_empty() {
                                 self.classify_fast_empty(&query_vec, limit)
                             } else {
@@ -6935,6 +6909,130 @@ mod tests {
                 vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             )
         }
+    }
+
+    fn write_corrupt_classified_async_tier(
+        path: &std::path::Path,
+        model: &str,
+        dimension: u32,
+        rows: &[(&str, &[f32])],
+        unusable: &[&str],
+    ) {
+        use frankensearch_index::{Quantization, VectorIndex};
+
+        let identity = query_admission_identity(model, dimension);
+        let mut writer = VectorIndex::create_with_revision(
+            path,
+            model,
+            &identity.fingerprint(),
+            usize::try_from(dimension).unwrap(),
+            Quantization::F16,
+        )
+        .unwrap();
+        for (id, vector) in rows {
+            writer.write_record(id, vector).unwrap();
+        }
+        writer.finish().unwrap();
+        let index = VectorIndex::open_read_only(path).unwrap();
+        let offset = usize::try_from(index.metadata().vectors_offset).unwrap();
+        let row_bytes = index.dimension() * std::mem::size_of::<u16>();
+        let mut bytes = std::fs::read(path).unwrap();
+        for row in 0..index.record_count() {
+            if unusable.contains(&index.doc_id_at(row).unwrap()) {
+                bytes[offset + row * row_bytes..offset + (row + 1) * row_bytes].fill(0);
+            }
+        }
+        drop(index);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn corrupt_persisted_async_vectors_do_not_supply_fast_or_quality_evidence() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for all_fast_unusable in [false, true] {
+                let dir = owner_backed_dir("classified-async-retrieval");
+                let fast_rows: &[(&str, &[f32])] = &[
+                    ("invalid-fast", &[1.0, 0.0, 0.0, 0.0]),
+                    ("shared-fast", &[-0.5, 0.5, 0.0, 0.0]),
+                    ("fast-tail", &[-1.0, 0.0, 0.0, 0.0]),
+                ];
+                let unusable_fast: &[&str] = if all_fast_unusable {
+                    &["invalid-fast", "shared-fast", "fast-tail"]
+                } else {
+                    &["invalid-fast"]
+                };
+                write_corrupt_classified_async_tier(
+                    &dir.join("vector.fast.idx"),
+                    "response-fast",
+                    4,
+                    fast_rows,
+                    unusable_fast,
+                );
+                write_corrupt_classified_async_tier(
+                    &dir.join("vector.quality.idx"),
+                    "response-quality",
+                    6,
+                    &[
+                        ("invalid-quality", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                        ("shared-fast", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                        ("quality-only", &[0.0, -0.5, 0.5, 0.0, 0.0, 0.0]),
+                    ],
+                    &["invalid-quality", "shared-fast"],
+                );
+                let config = TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                };
+                let index = Arc::new(TwoTierIndex::open(&dir, config.clone()).unwrap());
+                assert_eq!(index.fast_vector_for_doc_id("invalid-fast").unwrap(), None);
+                assert_eq!(
+                    index.quality_vector_for_doc_id("shared-fast").unwrap(),
+                    None
+                );
+                let searcher =
+                    TwoTierSearcher::new(index, Arc::new(query_admission_embedder("fast")), config)
+                        .with_search_params(SearchParams {
+                            parallel_enabled: true,
+                            parallel_threshold: 0,
+                            parallel_chunk_size: 1,
+                        });
+                let (fast_only, metrics) = searcher
+                    .search_collect(&cx, "related records", 1)
+                    .await
+                    .unwrap();
+                if all_fast_unusable {
+                    assert!(fast_only.is_empty());
+                    assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::NoUsableVectors));
+                } else {
+                    assert_eq!(fast_only[0].doc_id, "shared-fast");
+                    assert_eq!(metrics.zero_signal, None);
+                }
+
+                let searcher =
+                    searcher.with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+                let (refined, metrics) = searcher
+                    .search_collect(&cx, "related records", 3)
+                    .await
+                    .unwrap();
+                let mut ids: Vec<_> = refined.iter().map(|hit| hit.doc_id.as_str()).collect();
+                ids.sort_unstable();
+                if all_fast_unusable {
+                    assert_eq!(ids, ["quality-only"]);
+                } else {
+                    assert_eq!(ids, ["fast-tail", "quality-only", "shared-fast"]);
+                    let shared = refined
+                        .iter()
+                        .find(|hit| hit.doc_id == "shared-fast")
+                        .unwrap();
+                    assert_eq!(shared.quality_score, None);
+                }
+                assert_eq!(metrics.zero_signal, None);
+                assert!(
+                    metrics.coverage.is_none(),
+                    "a v1 stamp cannot attest v2 coverage"
+                );
+            }
+        });
     }
 
     fn semantic_exclusion_index(layout: &str) -> (OwnerBackedDir, Arc<TwoTierIndex>) {
