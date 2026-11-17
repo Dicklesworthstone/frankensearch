@@ -2675,6 +2675,21 @@ impl InMemoryVectorIndex {
         limit: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<ClassifiedHits> {
+        self.search_top_k_classified_with_params(query, limit, filter, SearchParams::default())
+    }
+
+    /// Classified brute-force top-k with configurable parallelism.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_top_k_classified`].
+    pub fn search_top_k_classified_with_params(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
+    ) -> SearchResult<ClassifiedHits> {
         if query.len() != self.dimension {
             return Err(SearchError::DimensionMismatch {
                 expected: self.dimension,
@@ -2699,7 +2714,7 @@ impl InMemoryVectorIndex {
         classified_candidates(
             limit,
             self.record_count(),
-            |candidate_limit| self.search_top_k(query, candidate_limit, filter),
+            |candidate_limit| self.search_top_k_with_params(query, candidate_limit, filter, params),
             |hit| usize::try_from(hit.index).is_ok_and(|row| self.vector_is_usable(row)),
             || {
                 let state = self.zero_signal_state();
@@ -3946,7 +3961,8 @@ impl InMemoryTwoTierIndex {
 
     /// Compute quality-tier scores for fast-index hits.
     ///
-    /// Missing quality entries produce `0.0`.
+    /// Missing or unusable quality vectors and non-finite scores produce
+    /// `None`. A usable vector orthogonal to the query can produce `Some(0.0)`.
     ///
     /// # Errors
     ///
@@ -3970,8 +3986,10 @@ impl InMemoryTwoTierIndex {
         for hit in hits {
             let score = quality
                 .index_of_doc_id(&hit.doc_id)
+                .filter(|&idx| quality.vector_is_usable(idx))
                 .map(|idx| dot_product_f16_f32(quality.vector_slice(idx), query_vec))
-                .transpose()?;
+                .transpose()?
+                .filter(|score| score.is_finite());
             scores.push(score);
         }
         Ok(scores)
@@ -6132,6 +6150,24 @@ mod tests {
                 "quality score should be Some and finite"
             );
         }
+    }
+
+    #[test]
+    fn two_tier_quality_scores_discard_overflow_but_keep_a_zero_dot_product() {
+        let ids = vec!["overflow".to_owned(), "orthogonal".to_owned()];
+        let fast =
+            InMemoryVectorIndex::from_vectors(ids.clone(), vec![vec![1.0, 0.0]; 2], 2).unwrap();
+        let quality =
+            InMemoryVectorIndex::from_vectors(ids, vec![vec![1.0, 1.0], vec![1.0, -1.0]], 2)
+                .unwrap();
+        let index = InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap();
+        let hits = index.search_fast(&[1.0, 0.0], 2).unwrap();
+        let scores = index
+            .quality_scores_for_hits(&[f32::MAX, f32::MAX], &hits)
+            .unwrap();
+        assert_eq!(hits[0].doc_id, "overflow");
+        assert_eq!(hits[1].doc_id, "orthogonal");
+        assert_eq!(scores, [None, Some(0.0)]);
     }
 
     #[test]
