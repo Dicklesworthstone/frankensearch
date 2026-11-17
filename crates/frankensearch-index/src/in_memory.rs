@@ -3691,9 +3691,11 @@ impl InMemoryVectorIndex {
     /// # Errors
     ///
     /// Returns a vector access error if the retained lookup is inconsistent.
-    /// A document absent from this tier returns `Ok(None)`.
+    /// A document absent from this tier or with an unusable vector returns
+    /// `Ok(None)`.
     pub fn vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
         self.index_of_doc_id(doc_id)
+            .filter(|&index| self.vector_is_usable(index))
             .map(|index| self.vector_at_f32(index))
             .transpose()
     }

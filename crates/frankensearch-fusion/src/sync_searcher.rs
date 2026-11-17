@@ -4589,6 +4589,29 @@ mod tests {
             assert_eq!(hit.fast_score, fast_score, "{id}");
             assert_eq!(hit.quality_score, quality_score, "{id}");
         }
+
+        // Neither tier has usable vectors for every retained candidate.
+        let searcher = searcher.with_mmr_config(sync_mmr_config());
+        let phases = searcher.search_iter(&query, 3).collect::<Vec<_>>();
+        let [
+            SearchPhase::Initial { .. },
+            SearchPhase::Refined {
+                results: refined, ..
+            },
+        ] = phases.as_slice()
+        else {
+            panic!("a corrupt row must not license diversity reranking: {phases:?}");
+        };
+        assert_eq!(
+            refined
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
