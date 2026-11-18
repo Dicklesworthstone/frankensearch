@@ -3848,14 +3848,14 @@ mod tests {
             let start = usize::try_from(index.metadata().vectors_offset).unwrap();
             let mut expected = Vec::new();
             let mut unusable = Vec::new();
-            let mut states = assignment;
+            let mut remaining = assignment;
             for id in ["doc-0000", "doc-0001", "doc-0002"] {
-                match states % 3 {
+                match remaining % 3 {
                     0 => expected.push(id),
                     1 => unusable.push(index.find_index_by_doc_id(id).unwrap().unwrap()),
                     _ => assert!(index.soft_delete(id).unwrap()),
                 }
-                states /= 3;
+                remaining /= 3;
             }
             drop(index);
             let mut bytes = std::fs::read(&path).unwrap();
