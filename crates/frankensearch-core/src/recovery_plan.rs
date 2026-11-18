@@ -2763,23 +2763,23 @@ fn plan_for_empty(
     requested_topology: RetrievalTopology,
 ) -> Option<RecoveryAction> {
     match reason {
-        ZeroSignalReason::NewlyCreatedEmpty
-        | ZeroSignalReason::AllTombstoned
-        | ZeroSignalReason::WalOnlyNoLiveRecords => Some(block_unbound_semantic_index_action(
-            simple_action(
-                "recovery.action.ingest_content",
-                "The index holds no live records. Populate it only through an executor bound to \
+        ZeroSignalReason::NewlyCreatedEmpty | ZeroSignalReason::AllTombstoned => {
+            Some(block_unbound_semantic_index_action(
+                simple_action(
+                    "recovery.action.ingest_content",
+                    "The index holds no live records. Populate it only through an executor bound to \
                  the attested semantic space and requested topology.",
-                &[],
-                false,
-                false,
-                true,
-                false,
-                "recovery.post.index_populated",
-            ),
-            requested_topology,
-            "recovery.capability.ingest_quality_tier",
-        )),
+                    &[],
+                    false,
+                    false,
+                    true,
+                    false,
+                    "recovery.post.index_populated",
+                ),
+                requested_topology,
+                "recovery.capability.ingest_quality_tier",
+            ))
+        }
         ZeroSignalReason::NoUsableVectors => Some(block_unbound_semantic_index_action(
             simple_action(
                 "recovery.action.reindex_full",
@@ -2812,7 +2812,9 @@ fn plan_for_empty(
             push_prerequisite(&mut action, "recovery.capability.rebuild_ann_generation");
             Some(action)
         }
-        ZeroSignalReason::CallerRequestedZeroK
+        // Live WAL entries can answer another query even when this one missed.
+        ZeroSignalReason::WalOnlyNoLiveRecords
+        | ZeroSignalReason::CallerRequestedZeroK
         | ZeroSignalReason::FilterEliminatedAll
         | ZeroSignalReason::NonFiniteQuery
         | ZeroSignalReason::ZeroNormQuery => None,
@@ -3765,6 +3767,26 @@ mod tests {
             assert!(plan.action.is_none(), "{reason:?}");
             assert_eq!(plan.retryability, Retryability::AfterRequestChange);
             assert!(!plan.semantic_available);
+        }
+    }
+
+    #[test]
+    fn wal_only_miss_does_not_require_ingesting_more_content() {
+        for request in semantic_requests() {
+            let plan = planned(
+                SemanticReadiness::IndexEmpty(ZeroSignalReason::WalOnlyNoLiveRecords),
+                request,
+                permissive(),
+            );
+            assert!(plan.action.is_none());
+            assert_eq!(plan.retryability, Retryability::AfterRequestChange);
+            for reason in [
+                ZeroSignalReason::NewlyCreatedEmpty,
+                ZeroSignalReason::AllTombstoned,
+            ] {
+                let empty = planned(SemanticReadiness::IndexEmpty(reason), request, permissive());
+                assert_eq!(empty.action.unwrap().code, "recovery.action.ingest_content");
+            }
         }
     }
 

@@ -2127,10 +2127,11 @@ impl VectorIndex {
                 "discarding stale/mismatched WAL entries"
             );
             wal_entries.clear();
-            if writer && wal_path.exists() {
-                let _ = std::fs::remove_file(&wal_path);
+            if writer {
+                // Future appends must not land behind a stale generation header.
+                wal::remove_wal(&wal_path)?;
             }
-        } else if writer && wal_path.exists() {
+        } else if writer && wal_path.try_exists()? {
             let actual_len = std::fs::metadata(&wal_path).map_err(SearchError::Io)?.len();
             if actual_len > valid_len {
                 tracing::warn!(
@@ -2139,10 +2140,7 @@ impl VectorIndex {
                     valid_len,
                     "truncating corrupted WAL trailer"
                 );
-                let file = OpenOptions::new()
-                    .write(true)
-                    .open(&wal_path)
-                    .map_err(SearchError::Io)?;
+                let file = open_fsvi_regular_file(&wal_path, File::options().write(true))?;
                 file.set_len(valid_len).map_err(SearchError::Io)?;
                 file.sync_all().map_err(SearchError::Io)?;
             }
@@ -2584,7 +2582,7 @@ impl VectorIndex {
     ///
     /// Returns the first IO/corruption error encountered while updating flags.
     pub fn soft_delete_batch(&mut self, doc_ids: &[&str]) -> SearchResult<usize> {
-        self.ensure_legacy_mutation_format("soft_delete_batch")?;
+        self.legacy_writer_file("soft_delete_batch")?;
         let mut deleted = 0usize;
         let mut wal_changed = false;
 
@@ -2795,7 +2793,7 @@ impl VectorIndex {
     /// Returns `SearchError::Io` for filesystem failures and
     /// `SearchError::IndexCorrupted` for malformed data.
     pub fn vacuum(&mut self) -> SearchResult<VacuumStats> {
-        self.ensure_legacy_mutation_format("vacuum")?;
+        self.legacy_writer_file("vacuum")?;
         let start = Instant::now();
         let records_before = self.record_count();
         let bytes_before = self.data.len();
@@ -2905,7 +2903,7 @@ impl VectorIndex {
     }
 
     fn append_batch_impl(&mut self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
-        self.ensure_legacy_mutation_format("append_batch")?;
+        self.legacy_writer_file("append_batch")?;
         self.validate_append_entries(entries)?;
         if entries.is_empty() {
             return Ok(());
@@ -3051,7 +3049,7 @@ impl VectorIndex {
     /// `SearchError::InvalidConfig` for encoding issues.
     #[allow(clippy::cast_precision_loss)]
     pub fn compact(&mut self) -> SearchResult<CompactionStats> {
-        self.ensure_legacy_mutation_format("compact")?;
+        self.legacy_writer_file("compact")?;
         let start = Instant::now();
         let main_before = self.record_count();
         let wal_count = self.wal_entries.len();
@@ -3188,7 +3186,7 @@ impl VectorIndex {
 
     #[allow(clippy::too_many_lines)]
     fn rewrite_index(&mut self, sources: &[MergeSource], new_gen: u8) -> SearchResult<()> {
-        self.ensure_legacy_mutation_format("rewrite_index")?;
+        self.legacy_writer_file("rewrite_index")?;
         let record_count = sources.len();
         let records_bytes = record_count.checked_mul(RECORD_SIZE_BYTES).ok_or_else(|| {
             SearchError::InvalidConfig {
@@ -3812,16 +3810,13 @@ impl VectorIndex {
     /// serving tombstoned records. Bump the timestamp explicitly after such a
     /// write; ext4 does this on the write fault, tmpfs does not.
     fn touch_main_file(&self) -> SearchResult<()> {
-        let file = OpenOptions::new()
-            .write(true)
-            .open(&self.path)
-            .map_err(SearchError::Io)?;
-        file.set_modified(SystemTime::now())
+        self.legacy_writer_file("touch_main_file")?
+            .set_modified(SystemTime::now())
             .map_err(SearchError::Io)
     }
 
     fn rewrite_wal_sidecar(&self) -> SearchResult<()> {
-        self.ensure_legacy_mutation_format("rewrite_wal_sidecar")?;
+        self.legacy_writer_file("rewrite_wal_sidecar")?;
         let wal_path = wal::wal_path_for(&self.path);
         if self.wal_entries.is_empty() {
             wal::remove_wal(&wal_path)?;
@@ -3924,10 +3919,10 @@ impl VectorIndex {
         Ok(())
     }
 
-    fn ensure_legacy_mutation_format(&self, operation: &str) -> SearchResult<()> {
+    fn legacy_writer_file(&self, operation: &str) -> SearchResult<&File> {
         self.ensure_mutable_format(operation)?;
-        if self.map_lock.as_ref().is_some_and(FsviMapLock::is_writer) {
-            return Ok(());
+        if let Some(FsviMapLock::Exclusive { file, .. }) = &self.map_lock {
+            return Ok(file);
         }
         Err(SearchError::InvalidConfig {
             field: "fsvi.writer_lock".to_owned(),
@@ -4493,8 +4488,10 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
 }
 
 fn open_fsvi_main_file(path: &Path, writable: bool) -> std::io::Result<File> {
-    let mut options = File::options();
-    options.read(true).write(writable);
+    open_fsvi_regular_file(path, File::options().read(true).write(writable))
+}
+
+fn open_fsvi_regular_file(path: &Path, options: &mut OpenOptions) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -4505,7 +4502,7 @@ fn open_fsvi_main_file(path: &Path, writable: bool) -> std::io::Result<File> {
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "FSVI main file must be a regular file",
+            "FSVI artifact must be a regular file",
         ));
     }
     Ok(file)
@@ -11838,6 +11835,31 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timestamp_update_follows_the_mapped_file_after_a_rename() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("index.fsvi");
+        let moved = directory.path().join("previous.fsvi");
+        VectorIndex::create(&path, "test", 2)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let index = VectorIndex::open_writer(&path).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        let replacement = File::create_new(&path).unwrap();
+        let old_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+        replacement.set_modified(old_time).unwrap();
+        File::open(&moved).unwrap().set_modified(old_time).unwrap();
+
+        index.touch_main_file().unwrap();
+        assert!(fs::metadata(&moved).unwrap().modified().unwrap() > old_time);
+        assert_eq!(
+            replacement.metadata().unwrap().modified().unwrap(),
+            old_time
+        );
     }
 
     // ─── is_deleted accessor ────────────────────────────────────────────

@@ -509,6 +509,17 @@ impl VectorIndex {
         (has_usable, reason)
     }
 
+    #[cfg(feature = "ann")]
+    pub(crate) fn classified_ann_census(&self) -> (bool, ZeroSignalReason) {
+        let (has_usable, reason) = self.classified_search_census(false);
+        // A WAL-only miss comes from exact WAL scoring, outside the graph.
+        if has_usable && reason == ZeroSignalReason::NoUsableVectors {
+            (true, ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors)
+        } else {
+            (has_usable, reason)
+        }
+    }
+
     /// Exact top-k over the persisted main slab only.
     ///
     /// HNSW uses this crate-private lane to repair a native underfill with the

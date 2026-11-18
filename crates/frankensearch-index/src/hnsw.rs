@@ -1015,6 +1015,9 @@ impl HnswIndex {
 
     /// Run ANN query and return hits plus query diagnostics.
     ///
+    /// With the correct dimension, a zero result limit takes precedence over
+    /// query values. An all-zero query returns no hits.
+    ///
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` if query dimension differs,
@@ -1037,6 +1040,9 @@ impl HnswIndex {
 
     /// Run ANN query with an authoritative `VectorIndex` available for exact
     /// underfill repair.
+    ///
+    /// Results cover the main slab. Resident WAL entries inform empty-result
+    /// diagnostics; the two-tier search merges WAL hits with graph candidates.
     ///
     /// The source is borrowed only for this query. It verifies the physical
     /// main-slab extent and returned row identities, filters post-build
@@ -1123,23 +1129,32 @@ impl HnswIndex {
             });
         }
 
-        if query.iter().any(|value| !value.is_finite()) {
+        let public = resolution == HnswHitResolution::CanonicalPublic;
+        if (k > 0 || !public) && query.iter().any(|value| !value.is_finite()) {
             return Err(SearchError::InvalidConfig {
                 field: "query".to_owned(),
                 value: "non-finite".to_owned(),
                 reason: "all query vector values must be finite".to_owned(),
             });
         }
-
-        if k == 0 || self.doc_ids.is_empty() {
-            // k = 0 and empty-graph are distinct zero-signal states and must
-            // not collapse into one indistinguishable empty result (bd-tqhc).
-            // k = 0 takes precedence: it is request-scoped.
-            let zero_signal = if k == 0 {
-                ZeroSignalReason::CallerRequestedZeroK
-            } else {
-                ZeroSignalReason::NewlyCreatedEmpty
-            };
+        let zero_signal = if k == 0 {
+            Some(ZeroSignalReason::CallerRequestedZeroK)
+        } else if public && query.iter().all(|&value| value == 0.0) {
+            Some(ZeroSignalReason::ZeroNormQuery)
+        } else if self.is_empty() {
+            // Raw retrieval covers only the main slab. Its caller classifies
+            // the combined result after it has searched the resident WAL.
+            Some(match (resolution, source) {
+                (HnswHitResolution::CanonicalPublic, Some(index)) => {
+                    index.classified_ann_census().1
+                }
+                _ if self.source_record_count == 0 => ZeroSignalReason::NewlyCreatedEmpty,
+                _ => ZeroSignalReason::AllTombstoned,
+            })
+        } else {
+            None
+        };
+        if zero_signal.is_some() {
             let stats = AnnSearchStats {
                 index_size: self.len(),
                 dimension: self.dimension,
@@ -1150,7 +1165,7 @@ impl HnswIndex {
                 is_approximate: true,
                 fallback_reason: None,
                 estimated_recall: 1.0,
-                zero_signal: Some(zero_signal),
+                zero_signal,
             };
             return Ok((Vec::new(), stats));
         }
@@ -1226,24 +1241,14 @@ impl HnswIndex {
         )?;
         let search_time_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
 
-        // An empty result here means the exact repair also found nothing, so
-        // classify from the authoritative source census. When the census says
-        // usable vectors exist yet even exact repair produced nothing, that is
-        // the ANN-availability anomaly rather than a benign state.
-        let zero_signal = if hits.is_empty() {
-            source.map(|source_index| {
-                let state = source_index.zero_signal_state();
-                state.state_reason().unwrap_or_else(|| {
-                    if state.is_wal_only() {
-                        ZeroSignalReason::WalOnlyNoLiveRecords
-                    } else {
-                        ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors
-                    }
-                })
-            })
-        } else {
-            None
-        };
+        // An underfill requires an authoritative source before it can return
+        // any result. Exact repair may have exhausted that source's live rows.
+        let zero_signal = hits.is_empty().then(|| {
+            source.map_or(
+                ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors,
+                |index| index.classified_ann_census().1,
+            )
+        });
 
         let stats = AnnSearchStats {
             index_size: self.len(),
@@ -3686,10 +3691,47 @@ mod tests {
 
         let index = VectorIndex::open(&path).expect("open index");
         let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
-        let hits = ann
-            .knn_search(&normalized_vector(7, 8), 10, HNSW_DEFAULT_EF_SEARCH)
+        let (hits, stats) = ann
+            .knn_search_with_stats(&normalized_vector(7, 8), 10, HNSW_DEFAULT_EF_SEARCH)
             .expect("search");
         assert!(hits.is_empty());
+        assert_eq!(stats.zero_signal, Some(ZeroSignalReason::NewlyCreatedEmpty));
+    }
+
+    #[test]
+    fn direct_ann_empty_graph_distinguishes_tombstones_and_reopened_wal() {
+        let path = temp_path("empty-graph-with-history", "fsvi");
+        let query = [1.0, 0.0];
+        let mut index = write_index(&path, &[query.to_vec()]).unwrap();
+        assert!(index.soft_delete("doc-0000").unwrap());
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).unwrap();
+        assert!(ann.is_empty());
+        for (hits, stats) in [
+            ann.knn_search_with_stats(&query, 1, HNSW_DEFAULT_EF_SEARCH)
+                .unwrap(),
+            ann.knn_search_with_stats_against(&index, &query, 1, HNSW_DEFAULT_EF_SEARCH)
+                .unwrap(),
+        ] {
+            assert!(hits.is_empty());
+            assert_eq!(stats.zero_signal, Some(ZeroSignalReason::AllTombstoned));
+        }
+
+        index.append("wal-winner", &[2.0, 0.0]).unwrap();
+        drop(index);
+        let reopened = VectorIndex::open_read_only(&path).unwrap();
+        let exact = reopened.search_top_k_classified(&query, 1, None).unwrap();
+        assert_eq!(exact.hits.len(), 1);
+        assert_eq!(exact.hits[0].doc_id, "wal-winner");
+        assert_eq!(exact.hits[0].score.to_bits(), 2.0_f32.to_bits());
+        let overflow = [f32::MAX, 0.0];
+        let (hits, stats) = ann
+            .knn_search_with_stats_against(&reopened, &overflow, 1, HNSW_DEFAULT_EF_SEARCH)
+            .unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(
+            stats.zero_signal,
+            Some(ZeroSignalReason::WalOnlyNoLiveRecords)
+        );
     }
 
     #[test]
@@ -4204,9 +4246,50 @@ mod tests {
         assert!(hits.is_empty());
         assert_eq!(stats.k_requested, 0);
         assert_eq!(stats.k_returned, 0);
+        assert_eq!(
+            stats.zero_signal,
+            Some(ZeroSignalReason::CallerRequestedZeroK)
+        );
         assert!(stats.is_approximate);
         assert_eq!(stats.fallback_reason, None);
         assert!((stats.estimated_recall - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn direct_ann_query_reasons_precede_scoring() {
+        let path = temp_path("ann-query-precedence", "fsvi");
+        let source = write_index(&path, &[vec![1.0, 0.0]]).unwrap();
+        let ann = HnswIndex::build_from_vector_index(&source, HnswConfig::default()).unwrap();
+        for (query, k, reason) in [
+            ([f32::NAN, 0.0], 0, ZeroSignalReason::CallerRequestedZeroK),
+            ([0.0, -0.0], 1, ZeroSignalReason::ZeroNormQuery),
+        ] {
+            for (hits, stats) in [
+                ann.knn_search_with_stats(&query, k, HNSW_DEFAULT_EF_SEARCH)
+                    .unwrap(),
+                ann.knn_search_with_stats_against(&source, &query, k, HNSW_DEFAULT_EF_SEARCH)
+                    .unwrap(),
+            ] {
+                assert!(hits.is_empty());
+                assert_eq!(stats.zero_signal, Some(reason));
+                assert_eq!(stats.fallback_reason, None);
+            }
+        }
+        let (hits, stats) = ann
+            .knn_search_with_stats(&[0.0, 1.0], 1, HNSW_DEFAULT_EF_SEARCH)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-0000");
+        assert_eq!(stats.zero_signal, None);
+        let (raw, _) = ann
+            .knn_search_raw_with_stats_against(&source, &[0.0; 2], 1, HNSW_DEFAULT_EF_SEARCH)
+            .unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].doc_id, "doc-0000");
+        assert!(matches!(
+            ann.knn_search_raw_with_stats_against(&source, &[f32::NAN, 0.0], 0, 1),
+            Err(SearchError::InvalidConfig { .. })
+        ));
     }
 
     #[test]

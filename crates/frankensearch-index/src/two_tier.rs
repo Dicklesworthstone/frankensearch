@@ -1762,16 +1762,11 @@ impl TwoTierIndex {
     /// live vectors, the empty result is the ANN-availability anomaly rather
     /// than a data problem.
     fn classified_fast_census(&self) -> (bool, ZeroSignalReason) {
-        let (has_usable, reason) = self.fast_tier().classified_search_census(false);
         #[cfg(feature = "ann")]
-        // Resident WAL entries are scored exactly, outside the ANN graph.
-        if has_usable && reason == ZeroSignalReason::NoUsableVectors && self.fast_ann.is_some() {
-            return (
-                has_usable,
-                ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors,
-            );
+        if self.fast_ann.is_some() {
+            return self.fast_tier().classified_ann_census();
         }
-        (has_usable, reason)
+        self.fast_tier().classified_search_census(false)
     }
 
     /// Record a zero-signal observation and log state transitions exactly

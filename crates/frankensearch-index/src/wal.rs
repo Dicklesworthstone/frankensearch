@@ -42,9 +42,9 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::{
-    FsviAdmissionError, FsviSnapshotRejectionReason, Quantization, open_readonly_noatime_nofollow,
-    snapshot_parent_or_current, snapshot_rejected, stable_file_identity,
-    validate_single_link_regular_file,
+    FsviAdmissionError, FsviSnapshotRejectionReason, Quantization, open_fsvi_regular_file,
+    open_readonly_noatime_nofollow, snapshot_parent_or_current, snapshot_rejected,
+    stable_file_identity, validate_single_link_regular_file,
 };
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -854,10 +854,15 @@ pub(crate) fn read_wal(
     expected_dimension: usize,
     quantization: Quantization,
 ) -> SearchResult<(Vec<WalEntry>, u8, u64)> {
-    if !path.exists() {
-        return Ok((Vec::new(), 0, 0));
-    }
-    let data = std::fs::read(path)?;
+    let mut file = match open_fsvi_regular_file(path, OpenOptions::new().read(true)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), 0, 0));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
     if data.len() < WAL_HEADER_SIZE {
         warn!(path = %path.display(), len = data.len(), "WAL file too small, ignoring");
         return Ok((Vec::new(), 0, 0));
@@ -909,7 +914,7 @@ pub(crate) fn read_wal_recovering_torn_header(
 
 /// Move a sidecar with an unusable header aside, preserving every byte.
 fn quarantine_torn_wal_header(path: &Path, cause: SearchError) -> SearchResult<()> {
-    let live = match OpenOptions::new().write(true).open(path) {
+    let live = match open_fsvi_regular_file(path, OpenOptions::new().write(true)) {
         Ok(file) => file,
         // The sidecar vanished under us; there is nothing left to quarantine
         // and nothing was lost that a fresh append cannot recreate.
@@ -1216,11 +1221,10 @@ pub(crate) fn append_wal_batch(
             // create_new check above and this open. If that happens, we create
             // a new empty file, which `existing_len` check below will catch
             // and initialize with a header.
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(wal_path)?;
+            let file = open_fsvi_regular_file(
+                wal_path,
+                OpenOptions::new().write(true).create(true).truncate(false),
+            )?;
             // Before any length is observed or offset resolved: a second
             // appender that reads the end offset concurrently would clobber
             // this batch, and the refusal must happen before a single byte
@@ -1333,10 +1337,11 @@ fn encode_vector(buf: &mut Vec<u8>, embedding: &[f32], quantization: Quantizatio
 
 /// Remove the WAL sidecar file.
 pub(crate) fn remove_wal(path: &Path) -> SearchResult<()> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -2187,6 +2192,33 @@ mod tests {
         let path = temp_wal_path("nonexistent");
         let (loaded, _, _) = read_wal(&path, 4, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_wal_replay_and_retirement_preserve_lookup_errors() {
+        let ordinary_file = tempfile::NamedTempFile::new().unwrap();
+        let invalid_path = ordinary_file.path().join("index.fsvi.wal");
+        for result in [
+            read_wal(&invalid_path, 4, Quantization::F16),
+            read_wal_recovering_torn_header(&invalid_path, 4, Quantization::F16),
+        ] {
+            assert!(matches!(result, Err(SearchError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotADirectory));
+        }
+        assert!(
+            matches!(remove_wal(&invalid_path), Err(SearchError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotADirectory)
+        );
+    }
+
+    #[test]
+    fn legacy_wal_replay_requires_a_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_wal(directory.path(), 4, Quantization::F16),
+            Err(SearchError::Io(_))
+        ));
     }
 
     #[test]
