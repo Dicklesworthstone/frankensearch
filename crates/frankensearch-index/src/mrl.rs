@@ -37,7 +37,9 @@ use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD};
+use crate::search::{
+    PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, classified_candidates, query_zero_signal,
+};
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
     VectorIndex, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
@@ -66,7 +68,8 @@ pub struct MrlConfig {
     /// Default: 0 (full dimension).
     pub rescore_dims: usize,
 
-    /// Number of top candidates to re-score with full dimensions.
+    /// Initial number of top candidates to re-score with full dimensions.
+    /// An unusable stored winner can trigger a wider scan to find a valid replacement.
     ///
     /// Set to 0 to use `3 * limit`.
     /// Default: 0 (auto = 3x limit).
@@ -126,7 +129,7 @@ pub struct MrlSearchStats {
     pub rescore_dims: usize,
     /// Number of candidates passed to the rescore phase.
     pub candidates_rescored: usize,
-    /// Total records scanned in the initial phase.
+    /// Records considered by the truncated scans, or source rows for a full-scan fallback.
     pub records_scanned: usize,
     /// Whether the search fell back to standard full-dimension scan.
     pub fell_back_to_full: bool,
@@ -231,13 +234,14 @@ impl VectorIndex {
     /// Search using MRL-accelerated truncated scan with full-dimension rescore.
     ///
     /// If `config.search_dims >= self.dimension()`, this falls back to the
-    /// standard `search_top_k` (no truncation benefit).
+    /// standard classified exact search (no truncation benefit).
     ///
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` when `query.len()` does not
     /// match index dimensionality, `SearchError::InvalidConfig` for invalid
-    /// config values, and `SearchError::IndexCorrupted` for malformed data.
+    /// config values or a non-finite query with a nonzero limit, and
+    /// `SearchError::IndexCorrupted` for malformed data.
     pub fn mrl_search(
         &self,
         query: &[f32],
@@ -282,38 +286,74 @@ impl VectorIndex {
 
         // Fall back to standard search if truncation wouldn't help.
         if config.search_dims >= dim {
-            let hits = self.search_top_k(query, limit, filter)?;
-            let zero_signal = self.classify_mrl_empty(&hits, limit, filter.is_some());
+            let classified = self.search_top_k_classified(query, limit, filter)?;
             let stats = MrlSearchStats {
                 scan_dims: dim,
                 rescore_dims: dim,
                 candidates_rescored: 0,
-                records_scanned: self.record_count() + self.wal_entries.len(),
+                records_scanned: if matches!(
+                    classified.zero_signal,
+                    Some(ZeroSignalReason::CallerRequestedZeroK | ZeroSignalReason::ZeroNormQuery)
+                ) {
+                    0
+                } else {
+                    self.record_count() + self.wal_entries.len()
+                },
                 fell_back_to_full: true,
-                zero_signal,
+                zero_signal: classified.zero_signal,
             };
-            return Ok((hits, stats));
+            return Ok((classified.hits, stats));
         }
 
-        if limit == 0 || (self.record_count() == 0 && self.wal_entries.is_empty()) {
-            // k = 0 and empty-index are distinct zero-signal states; k = 0 is
-            // request-scoped and takes precedence (bd-tqhc).
-            let zero_signal = if limit == 0 {
-                ZeroSignalReason::CallerRequestedZeroK
-            } else {
-                self.zero_signal_state()
-                    .empty_result_reason(filter.is_some())
-            };
+        let row_count = self.record_count().saturating_add(self.wal_entries.len());
+        if let Some(reason) = query_zero_signal(query, limit)?
+            .or((row_count == 0).then_some(ZeroSignalReason::NewlyCreatedEmpty))
+        {
             let stats = MrlSearchStats {
-                zero_signal: Some(zero_signal),
+                zero_signal: Some(reason),
                 ..MrlSearchStats::default()
             };
             return Ok((Vec::new(), stats));
         }
 
-        let search_dims = config.search_dims;
-        let rescore_dims = config.effective_rescore_dims(dim);
         let rescore_top_k = config.effective_rescore_top_k(limit);
+        let mut stats = MrlSearchStats {
+            scan_dims: config.search_dims,
+            rescore_dims: config.effective_rescore_dims(dim),
+            ..MrlSearchStats::default()
+        };
+        let classified = classified_candidates(
+            limit.min(rescore_top_k),
+            row_count,
+            |candidate_limit| {
+                let (hits, rescored) = self.mrl_ranked_candidates(
+                    query,
+                    candidate_limit,
+                    rescore_top_k.max(candidate_limit),
+                    config,
+                    filter,
+                )?;
+                stats.records_scanned = stats.records_scanned.saturating_add(row_count);
+                stats.candidates_rescored = stats.candidates_rescored.saturating_add(rescored);
+                Ok(hits)
+            },
+            |hit| self.classified_hit_is_usable(hit),
+            || self.classified_search_census(filter.is_some()),
+        )?;
+        stats.zero_signal = classified.zero_signal;
+        Ok((classified.hits, stats))
+    }
+
+    fn mrl_ranked_candidates(
+        &self,
+        query: &[f32],
+        limit: usize,
+        rescore_top_k: usize,
+        config: &MrlConfig,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<(Vec<VectorHit>, usize)> {
+        let search_dims = config.search_dims;
+        let rescore_dims = config.effective_rescore_dims(self.dimension());
 
         // A durable WAL replacement can outlive the main row's tombstone.
         // Exclude every superseded main identity BEFORE either the truncated
@@ -344,7 +384,6 @@ impl VectorIndex {
         )?;
 
         let candidates: Vec<MrlHeapEntry> = heap.into_vec();
-        let records_scanned = self.record_count() + self.wal_entries.len();
         let candidates_rescored = candidates.len();
 
         // Phase 2: rescore candidates with full (or rescore_dims) dimensions.
@@ -384,36 +423,7 @@ impl VectorIndex {
         rescored.truncate(limit);
 
         // Resolve doc_ids.
-        let hits = self.resolve_mrl_hits(&rescored)?;
-
-        let zero_signal = self.classify_mrl_empty(&hits, limit, filter.is_some());
-        let stats = MrlSearchStats {
-            scan_dims: search_dims,
-            rescore_dims,
-            candidates_rescored,
-            records_scanned,
-            fell_back_to_full: false,
-            zero_signal,
-        };
-
-        Ok((hits, stats))
-    }
-
-    /// Maintain the `zero_signal.is_some() == hits.is_empty()` invariant for
-    /// MRL results (k = 0 cannot reach here; the guard classifies it).
-    fn classify_mrl_empty(
-        &self,
-        hits: &[VectorHit],
-        limit: usize,
-        had_filter: bool,
-    ) -> Option<ZeroSignalReason> {
-        if !hits.is_empty() {
-            return None;
-        }
-        if limit == 0 {
-            return Some(ZeroSignalReason::CallerRequestedZeroK);
-        }
-        Some(self.zero_signal_state().empty_result_reason(had_filter))
+        Ok((self.resolve_mrl_hits(&rescored)?, candidates_rescored))
     }
 
     // ── Internal: truncated scan ─────────────────────────────────────
@@ -1268,6 +1278,39 @@ mod tests {
             .mrl_search(&query, 0, &config, None)
             .expect("mrl search");
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn mrl_request_reasons_precede_candidate_scoring() {
+        let path = temp_index_path("mrl-request-signal");
+        write_index(&path, &[("tail-signal", vec![0.0, 1.0])]).unwrap();
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        for search_dims in [1, 2] {
+            let config = MrlConfig {
+                search_dims,
+                ..MrlConfig::default()
+            };
+            for (query, limit, reason) in [
+                ([f32::NAN, 0.0], 0, ZeroSignalReason::CallerRequestedZeroK),
+                ([0.0, -0.0], 1, ZeroSignalReason::ZeroNormQuery),
+            ] {
+                let (hits, stats) = index
+                    .mrl_search_with_stats(&query, limit, &config, None)
+                    .unwrap();
+                assert!(hits.is_empty());
+                assert_eq!(stats.zero_signal, Some(reason));
+                assert_eq!(stats.records_scanned, 0);
+            }
+            assert!(matches!(
+                index.mrl_search(&[1.0, f32::INFINITY], 1, &config, None),
+                Err(SearchError::InvalidConfig { field, .. }) if field == "query"
+            ));
+            // Only the query's prefix is zero; the full vector has a signal.
+            let hits = index.mrl_search(&[0.0, 1.0], 1, &config, None).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "tail-signal");
+            assert_eq!(hits[0].score.to_bits(), 1.0_f32.to_bits());
+        }
     }
 
     // ── Verify truncated scan uses only search_dims ──────────────────

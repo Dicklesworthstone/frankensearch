@@ -130,6 +130,27 @@ impl ClassifiedHits {
     }
 }
 
+/// Classify request-scoped reasons after the caller has checked the dimension.
+pub(crate) fn query_zero_signal(
+    query: &[f32],
+    limit: usize,
+) -> SearchResult<Option<ZeroSignalReason>> {
+    if limit == 0 {
+        return Ok(Some(ZeroSignalReason::CallerRequestedZeroK));
+    }
+    if query.iter().any(|value| !value.is_finite()) {
+        return Err(SearchError::InvalidConfig {
+            field: "query".to_owned(),
+            value: "<contains non-finite values>".to_owned(),
+            reason: "query vector must be finite".to_owned(),
+        });
+    }
+    Ok(query
+        .iter()
+        .all(|&value| value == 0.0)
+        .then_some(ZeroSignalReason::ZeroNormQuery))
+}
+
 /// Validate winners without changing the raw numeric kernels. Only corrupt
 /// winners require a generation census and wider retrieval; valid negative
 /// scores must not stay hidden behind unusable zero-score rows.
@@ -431,20 +452,8 @@ impl VectorIndex {
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<ClassifiedHits> {
         self.ensure_query_dimension(query)?;
-        if limit == 0 {
-            return Ok(ClassifiedHits::empty(
-                ZeroSignalReason::CallerRequestedZeroK,
-            ));
-        }
-        if query.iter().any(|value| !value.is_finite()) {
-            return Err(SearchError::InvalidConfig {
-                field: "query".to_owned(),
-                value: "<contains non-finite values>".to_owned(),
-                reason: "query vector must be finite".to_owned(),
-            });
-        }
-        if query.iter().all(|&value| value == 0.0) {
-            return Ok(ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery));
+        if let Some(reason) = query_zero_signal(query, limit)? {
+            return Ok(ClassifiedHits::empty(reason));
         }
         classified_candidates(
             limit,
@@ -3379,6 +3388,18 @@ mod tests {
                     "{quantization:?} k={limit}"
                 );
                 assert_eq!(classified.zero_signal, None);
+                for search_dims in [1, 2] {
+                    let config = crate::MrlConfig {
+                        search_dims,
+                        rescore_top_k: limit,
+                        ..crate::MrlConfig::default()
+                    };
+                    let (hits, stats) = index
+                        .mrl_search_with_stats(&[1.0, 0.0], limit, &config, None)
+                        .unwrap();
+                    assert_eq!(hit_ids(&hits), expected, "MRL dims={search_dims} k={limit}");
+                    assert_eq!(stats.zero_signal, None);
+                }
                 let in_memory = memory
                     .search_top_k_classified(&[1.0, 0.0], limit, None)
                     .unwrap();
@@ -3421,6 +3442,17 @@ mod tests {
                 classified.zero_signal,
                 Some(ZeroSignalReason::NoUsableVectors)
             );
+            for search_dims in [1, 2] {
+                let config = crate::MrlConfig {
+                    search_dims,
+                    ..crate::MrlConfig::default()
+                };
+                let (hits, stats) = index
+                    .mrl_search_with_stats(&[1.0, 0.0], 2, &config, None)
+                    .unwrap();
+                assert!(hits.is_empty());
+                assert_eq!(stats.zero_signal, Some(ZeroSignalReason::NoUsableVectors));
+            }
             let two_tier = crate::TwoTierIndex::open_with_paths(
                 &crate::TwoTierIndexPaths::new(path.to_path_buf()),
                 frankensearch_core::TwoTierConfig::default(),
