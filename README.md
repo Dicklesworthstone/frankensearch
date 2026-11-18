@@ -443,6 +443,9 @@ The same opt-in is available as `[indexing] upgrade_reuse = "compatible_contract
 or `FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract`; disable it with
 `--upgrade-reuse same-executable`. Source, producer, topology and artifact checks
 still apply, and old receipts without the contract cannot use this path.
+The first index run after upgrading from indexing contract v3 rebuilds the
+index. Contract v4 records the fsfs catalog schema and both FSVI format
+versions, including the format used by the stock writer.
 Reuse skips document embedding. Model verification and startup health probes
 still run. With `compatible-contract`, an absent optional quality model allows
 fast-only indexing. If the run requests an installed quality model and that
@@ -1394,7 +1397,8 @@ dsr quality --tool frankensearch            # the same gate plus configured pack
 
 The full `e2e` stage runs the two-executable upgrade-reuse regression. Supply a
 previous `fsfs` built from a different source revision with the same registered
-producer protocols and indexing contract, and retain its source and SHA-256
+producer protocols and indexing contract in `FSFS_UPGRADE_REUSE_PREVIOUS_BINARY`
+(an absolute path), and retain its source and SHA-256
 receipt. The test requires a different executable hash and exercises compatible
 reuse, default cold rebuilding, and independent source, producer, and artifact drift.
 

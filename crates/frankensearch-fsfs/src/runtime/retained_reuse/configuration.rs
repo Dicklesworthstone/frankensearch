@@ -12,27 +12,28 @@ use crate::config::{FsfsConfig, SearchConfig, UpgradeReusePolicy};
 
 use super::content_sha256_hex;
 
-pub(super) const INDEXING_CONTRACT_VERSION_V3: &str = "fsfs.indexing_contract.v3";
+pub(super) const INDEXING_CONTRACT_VERSION_V4: &str = "fsfs.indexing_contract.v4";
 
 /// Explicit, versioned indexing-pipeline contract (`bd-ky0j2`).
-/// V3 retains exact JSON number parsing and binds native source-key spelling:
-/// Unix backslashes are filename bytes, while Windows separators become '/'.
-/// Earlier contracts could conflate two source paths, so even an opted-in
-/// compatible executable upgrade must rebuild their lexical metadata.
+/// V4 records the catalog and both vector formats. V3 recorded only the
+/// identity-bound vector format, even when the stock writer emitted FSVI v1.
+/// A receipt from an earlier contract requires a fresh build.
 ///
 /// Binds every compile-time and configuration-derived contract that shapes
 /// persisted lexical segments, vector rows, window plans, and catalog records:
 /// - checkpoint schema version (`INDEXING_CHECKPOINT_SCHEMA_VERSION`)
-/// - FSVI binary format version (`frankensearch_index::FSVI_V2_VERSION`)
+/// - fsfs catalog schema and both FSVI binary format versions
 /// - Quill lexical engine/segment/manifest format versions and canonicalizer limits
 /// - embedding canonicalizer limits (`DefaultCanonicalizer::default()`)
 /// - fast semantic windowing contract (`WINDOW_CHARS`, `MAX_WINDOWS_PER_FILE`)
 /// - indexing configuration digest (`digest(config)`)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct IndexingContractDigestV3 {
+pub(super) struct IndexingContractDigestV4 {
     pub contract_version: String,
     pub checkpoint_schema_version: u16,
+    pub catalog_schema_version: i64,
     pub fsvi_format_version: u16,
+    pub fsvi_v2_format_version: u16,
     pub quill_engine_version: u32,
     pub quill_fslx_format_version: u32,
     pub quill_manifest_format_version: u32,
@@ -47,14 +48,16 @@ pub(super) struct IndexingContractDigestV3 {
     pub configuration_sha256: String,
 }
 
-impl IndexingContractDigestV3 {
+impl IndexingContractDigestV4 {
     pub(super) fn from_config(config: &FsfsConfig) -> SearchResult<Self> {
         let embedding_canonicalizer = DefaultCanonicalizer::default();
         let lexical_canonicalizer = crate::runtime::LEXICAL_CANONICALIZER;
         Ok(Self {
-            contract_version: INDEXING_CONTRACT_VERSION_V3.to_owned(),
+            contract_version: INDEXING_CONTRACT_VERSION_V4.to_owned(),
             checkpoint_schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
-            fsvi_format_version: frankensearch_index::FSVI_V2_VERSION,
+            catalog_schema_version: crate::catalog::CATALOG_SCHEMA_VERSION,
+            fsvi_format_version: frankensearch_index::FSVI_VERSION,
+            fsvi_v2_format_version: frankensearch_index::FSVI_V2_VERSION,
             quill_engine_version: frankensearch_quill::CURRENT_ENGINE_VERSION,
             quill_fslx_format_version: frankensearch_quill::FSLX_FORMAT_VERSION,
             quill_manifest_format_version: frankensearch_quill::MANIFEST_FORMAT_VERSION,
@@ -80,7 +83,7 @@ impl IndexingContractDigestV3 {
 }
 
 pub(super) fn contract_digest(config: &FsfsConfig) -> SearchResult<String> {
-    IndexingContractDigestV3::from_config(config)?.sha256_hex()
+    IndexingContractDigestV4::from_config(config)?.sha256_hex()
 }
 
 pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
@@ -210,19 +213,25 @@ mod tests {
     #[test]
     fn indexing_contract_digest_changes_when_schema_or_window_or_canonicalizer_contract_drifts() {
         let config = FsfsConfig::default();
-        let baseline = IndexingContractDigestV3::from_config(&config).unwrap();
+        let baseline = IndexingContractDigestV4::from_config(&config).unwrap();
         let expected = baseline.sha256_hex().unwrap();
         assert_eq!(expected.len(), 64);
 
         let mut changed_version = baseline.clone();
-        // The previous contract admitted lossy Unix source-key aliases.
-        // Equal file bytes and timestamps cannot authorize carrying its metadata.
-        changed_version.contract_version = "fsfs.indexing_contract.v2".to_owned();
+        changed_version.contract_version = "fsfs.indexing_contract.v3".to_owned();
         assert_ne!(changed_version.sha256_hex().unwrap(), expected);
+
+        let mut changed_catalog = baseline.clone();
+        changed_catalog.catalog_schema_version += 1;
+        assert_ne!(changed_catalog.sha256_hex().unwrap(), expected);
 
         let mut changed_fsvi = baseline.clone();
         changed_fsvi.fsvi_format_version += 1;
         assert_ne!(changed_fsvi.sha256_hex().unwrap(), expected);
+
+        let mut changed_v2 = baseline.clone();
+        changed_v2.fsvi_v2_format_version += 1;
+        assert_ne!(changed_v2.sha256_hex().unwrap(), expected);
 
         let mut changed_quill = baseline.clone();
         changed_quill.quill_fslx_format_version += 1;
