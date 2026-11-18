@@ -307,7 +307,7 @@ impl VectorIndex {
 
         let row_count = self.record_count().saturating_add(self.wal_entries.len());
         if let Some(reason) = query_zero_signal(query, limit)?
-            .or((row_count == 0).then_some(ZeroSignalReason::NewlyCreatedEmpty))
+            .or_else(|| (row_count == 0).then_some(ZeroSignalReason::NewlyCreatedEmpty))
         {
             let stats = MrlSearchStats {
                 zero_signal: Some(reason),
