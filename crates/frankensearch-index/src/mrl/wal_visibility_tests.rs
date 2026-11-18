@@ -94,7 +94,7 @@ fn classified_duplicate_rows_preserve_the_physical_cutoff() {
         let winner = (0..index.record_count())
             .find(|&row| index.vector_at_f32(row).unwrap()[0].to_bits() == 1.0_f32.to_bits())
             .unwrap();
-        for k in [2, 3] {
+        for k in [2, 3, usize::MAX] {
             let expected_ids: &[&str] = if k == 2 {
                 &["repeat"]
             } else {
@@ -102,6 +102,8 @@ fn classified_duplicate_rows_preserve_the_physical_cutoff() {
             };
             for hits in [
                 index.search_top_k_classified(&query, k, None).unwrap().hits,
+                index.search_top_k_int8_two_pass(&query, k, 3).unwrap(),
+                index.search_top_k_4bit_two_pass(&query, k, 5).unwrap(),
                 index.mrl_search(&query, k, &config(k), None).unwrap(),
                 memory
                     .search_top_k_classified(&query, k, None)

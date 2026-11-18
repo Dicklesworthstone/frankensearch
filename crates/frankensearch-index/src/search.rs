@@ -1063,7 +1063,7 @@ impl VectorIndex {
         // selection + tie-break as `search_top_k`, so the final order is identical
         // whenever pass-1 retained the true top-k.
         let stride = dim * 2;
-        let mut heap = BinaryHeap::with_capacity(k.saturating_add(1));
+        let mut heap = BinaryHeap::with_capacity(k.min(candidate_heap.len()));
         for candidate in candidate_heap {
             let index = int8_heap_index(candidate);
             let vector_offset = self.vectors_offset + index * stride;
@@ -1349,7 +1349,7 @@ impl VectorIndex {
 
         // Pass 2: exact f16 rescore (same bounded-heap selection + tie-break).
         let stride = dim * 2;
-        let mut heap = BinaryHeap::with_capacity(k.saturating_add(1));
+        let mut heap = BinaryHeap::with_capacity(k.min(candidate_heap.len()));
         for candidate in candidate_heap {
             let vector_offset = self.vectors_offset + candidate.index * stride;
             let vector_bytes = &self.data[vector_offset..vector_offset + stride];
