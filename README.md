@@ -445,9 +445,9 @@ or `FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract`; disable it with
 still apply, and old receipts without the contract cannot use this path.
 Reuse skips document embedding. Model verification and startup health probes
 still run. With `compatible-contract`, an absent optional quality model allows
-fast-only indexing. If an installed quality model fails verification or loading,
-the upgrade stops and preserves the previous selection. Restore the verified
-model before retrying.
+fast-only indexing. If the run requests an installed quality model and that
+model fails verification or loading, the upgrade stops and preserves the
+previous selection. Restore the verified model before retrying.
 On complete-generation stores, `compact` and `delete` preserve admitted reuse
 evidence for surviving documents without running embedding inference. A later
 index reuses those documents and embeds changed or restored source rows.
@@ -455,6 +455,8 @@ The current indexing contract (v3) preserves exact JSON numbers and native
 source paths, including literal backslashes in Unix filenames. Upgrading from
 a v1 or v2 completion receipt requires one cold index build. Later upgrades
 can reuse that work when the v3 contract and the other admission checks match.
+The switch to exact JSON numbers also invalidated older query caches and
+daemons so forwarded results preserve score bits and explanations.
 A file whose device, inode, length and modification and
 change times still match the stamp recorded when it was read is reused without
 being opened (a stamp is recorded only once its change time is older than the
