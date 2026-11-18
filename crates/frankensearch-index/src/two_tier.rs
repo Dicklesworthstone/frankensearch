@@ -2571,7 +2571,7 @@ impl TwoTierIndexBuilder {
     ///
     /// Returns `SearchError::DimensionMismatch` if this record dimension differs
     /// from previously added fast-tier vectors, or `SearchError::InvalidConfig`
-    /// for duplicate identifiers or vectors unusable before or after F16 encoding.
+    /// for invalid or duplicate identifiers or vectors unusable in F16.
     pub fn add_fast_record(
         &mut self,
         doc_id: impl Into<String>,
@@ -2620,7 +2620,7 @@ impl TwoTierIndexBuilder {
     ///
     /// Returns `SearchError::DimensionMismatch` if this record dimension differs
     /// from previously added quality-tier vectors, or `SearchError::InvalidConfig`
-    /// for duplicate identifiers or vectors unusable before or after F16 encoding.
+    /// for invalid or duplicate identifiers or vectors unusable in F16.
     pub fn add_quality_record(
         &mut self,
         doc_id: impl Into<String>,
@@ -2646,7 +2646,7 @@ impl TwoTierIndexBuilder {
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` if either tier dimension is
-    /// inconsistent, or `SearchError::InvalidConfig` for a duplicate identifier
+    /// inconsistent, or `SearchError::InvalidConfig` for an invalid or duplicate identifier
     /// or a vector unusable before or after F16 encoding in either supplied tier.
     /// Every returned error leaves both tiers unchanged.
     pub fn add_record(
@@ -2858,10 +2858,9 @@ fn validate_record_admission(
             reason: format!("duplicate doc_id in {tier} tier; each document must have a unique id"),
         });
     }
-    // Admit the same numeric domain as the FSVI writer before changing the
-    // buffered corpus. Deferring this until finish would let one rejected
-    // record poison otherwise valid documents and reserve its ID/dimension.
-    crate::validate_stored_embedding(embedding, Quantization::F16)
+    // Validate before a row can reserve its ID or establish a tier's dimension.
+    crate::validate_stored_embedding(embedding, Quantization::F16)?;
+    crate::validate_record_id(doc_id)
 }
 
 /// A completely written tier whose unique temporary name is owned until
@@ -4620,6 +4619,36 @@ mod tests {
             assert_eq!(hits.len(), 1, "{case}");
             assert_eq!(hits[0].doc_id, "retained", "{case}");
         }
+    }
+
+    #[test]
+    fn builder_validates_identifier_byte_length_before_reserving_tier_dimensions() {
+        let dir = temp_index_dir("record-id-byte-length");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+        let prefix = "é".repeat(usize::from(u16::MAX) / 2);
+        let oversized = format!("{prefix}é");
+        let boundary = format!("{prefix}a");
+        let refused = builder.add_record(oversized, &[1.0], Some(&[1.0]));
+        assert!(matches!(
+            refused,
+            Err(SearchError::InvalidConfig { field, value, .. })
+                if field == "doc_id" && value.len() == usize::from(u16::MAX) + 1
+        ));
+
+        builder
+            .add_record(&boundary, &[1.0, 0.0], Some(&[0.0, 1.0, 0.0]))
+            .expect("valid byte boundary and independently established tier dimensions");
+        drop(builder.finish().unwrap());
+        let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+        let hits = reopened.search_fast(&[1.0, 0.0], 2).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, boundary);
+        assert_eq!(
+            reopened
+                .quality_scores_for_hits(&[0.0, 1.0, 0.0], &hits)
+                .unwrap(),
+            vec![Some(1.0)]
+        );
     }
 
     #[test]

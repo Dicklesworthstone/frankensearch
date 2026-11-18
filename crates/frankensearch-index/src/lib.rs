@@ -2860,8 +2860,7 @@ impl VectorIndex {
 
     /// Append a single vector to the index via the WAL.
     ///
-    /// The vector is immediately searchable. It is written to the WAL
-    /// sidecar file for crash safety.
+    /// The vector is immediately searchable in the WAL's stored precision.
     ///
     /// # Errors
     ///
@@ -2912,8 +2911,10 @@ impl VectorIndex {
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` for wrong embedding lengths
-    /// and `SearchError::InvalidConfig` for invalid embeddings or identifiers.
+    /// and `SearchError::InvalidConfig` for an immutable index, invalid
+    /// embeddings, or invalid identifiers.
     pub fn validate_append_entries(&self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
+        self.ensure_mutable_format("append_batch")?;
         let dimension = self.dimension();
         let quantization = self.quantization();
         for (doc_id, vector) in entries {
@@ -2924,11 +2925,7 @@ impl VectorIndex {
                 });
             }
             validate_stored_embedding(vector, quantization)?;
-            let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
-                field: "doc_id".to_owned(),
-                value: doc_id.clone(),
-                reason: "doc_id byte length must fit in u16".to_owned(),
-            })?;
+            validate_record_id(doc_id)?;
         }
         Ok(())
     }
@@ -2972,6 +2969,15 @@ impl VectorIndex {
             next_generation(self.metadata.compaction_gen),
             self.wal_config.fsync_on_write,
         )?;
+
+        // Score newly appended rows at the precision replay will recover.
+        if self.quantization() == Quantization::F16 {
+            for entry in &mut wal_entries {
+                for value in &mut entry.embedding {
+                    *value = f16::from_f32(*value).to_f32();
+                }
+            }
+        }
 
         // Supersede older resident copies in memory, then admit the new
         // entries (immediately searchable). This dedup is load-bearing: it
@@ -3932,7 +3938,7 @@ impl VectorIndex {
             .ok_or_else(|| index_corrupted(&self.path, "vector offset overflow"))
     }
 
-    fn ensure_legacy_mutation_format(&self, operation: &str) -> SearchResult<()> {
+    fn ensure_mutable_format(&self, operation: &str) -> SearchResult<()> {
         if self.metadata.fsvi_version == FSVI_V2_VERSION {
             return Err(SearchError::InvalidConfig {
                 field: "fsvi_v2.mutation".to_owned(),
@@ -3941,6 +3947,11 @@ impl VectorIndex {
                     .to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn ensure_legacy_mutation_format(&self, operation: &str) -> SearchResult<()> {
+        self.ensure_mutable_format(operation)?;
         if self.map_lock.as_ref().is_some_and(FsviMapLock::is_writer) {
             return Ok(());
         }
@@ -4029,11 +4040,7 @@ impl VectorIndexWriter {
             });
         }
         validate_stored_embedding(embedding, self.quantization)?;
-        let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
-            field: "doc_id".to_owned(),
-            value: doc_id.to_owned(),
-            reason: "doc_id byte length must fit in u16".to_owned(),
-        })?;
+        validate_record_id(doc_id)?;
         self.records.push(PendingRecord {
             doc_id: doc_id.into(),
             doc_id_hash: fnv1a_hash(doc_id.as_bytes()),
@@ -4075,11 +4082,7 @@ impl VectorIndexWriter {
             });
         }
         validate_stored_embedding(&embedding, self.quantization)?;
-        let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
-            field: "doc_id".to_owned(),
-            value: doc_id.clone(),
-            reason: "doc_id byte length must fit in u16".to_owned(),
-        })?;
+        validate_record_id(&doc_id)?;
         let doc_id_hash = fnv1a_hash(doc_id.as_bytes());
         self.records.push(PendingRecord {
             doc_id,
@@ -6586,6 +6589,17 @@ fn validate_stored_embedding(embedding: &[f32], quantization: Quantization) -> S
     Ok(())
 }
 
+fn validate_record_id(doc_id: &str) -> SearchResult<()> {
+    if doc_id.len() > usize::from(u16::MAX) {
+        return Err(SearchError::InvalidConfig {
+            field: "doc_id".to_owned(),
+            value: doc_id.to_owned(),
+            reason: "doc_id byte length must fit in u16".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn vector_components_usable(vector: impl Iterator<Item = f32>) -> bool {
     let mut norm_sq = 0.0f32;
     for value in vector {
@@ -7188,6 +7202,15 @@ mod tests {
             .expect("create empty v2")
             .finish()
             .expect("finish empty v2");
+
+        let reader = VectorIndex::open_read_only(&path).expect("open shared vector reader");
+        let proposed = [("new-row".into(), vec![1.0, 0.0, 0.0, 0.0])];
+        assert!(matches!(
+            reader.validate_append_entries(&proposed),
+            Err(SearchError::InvalidConfig { field, value, .. })
+                if field == "fsvi_v2.mutation" && value == "append_batch"
+        ));
+        drop(reader);
 
         let index = admit_owned_v2_fixture(&path, &binding).expect("admit empty owned v2 artifact");
         assert_eq!(index.record_count(), 0);
@@ -11334,6 +11357,55 @@ mod tests {
             classified.zero_signal,
             Some(ZeroSignalReason::AllTombstoned)
         );
+    }
+
+    #[test]
+    fn wal_search_ranks_at_stored_precision_before_reopen_and_compaction() {
+        let query = [1.0, 1.0];
+        let input = [
+            ("near-first".to_owned(), vec![1.000_4, 0.0]),
+            ("near-second".to_owned(), vec![1.0, 1.0 / 4096.0]),
+        ];
+        // Binary16 rounds the first row to 1.0 and preserves both components
+        // of the second, making the order depend on the storage precision.
+        let f16_expected = [("near-second", 1.0_f32 + 1.0 / 4096.0), ("near-first", 1.0)];
+        let f32_expected = [
+            ("near-first", 1.000_4_f32),
+            ("near-second", 1.0 + 1.0 / 4096.0),
+        ];
+        for (precision, expected) in [
+            (Quantization::F16, f16_expected),
+            (Quantization::F32, f32_expected),
+        ] {
+            let path = temp_index_path("wal-stored-precision");
+            VectorIndex::create_with_revision(&path, "signal", "", 2, precision)
+                .unwrap()
+                .finish()
+                .unwrap();
+            let check = |index: &VectorIndex| {
+                let result = index.search_top_k_classified(&query, 2, None).unwrap();
+                assert_eq!(result.zero_signal, None);
+                let hits: Vec<_> = result
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.doc_id.as_str(), hit.score.to_bits()))
+                    .collect();
+                assert_eq!(
+                    hits,
+                    expected.map(|(doc_id, score)| (doc_id, score.to_bits()))
+                );
+            };
+            let mut writer = VectorIndex::open(&path).unwrap();
+            writer.append_batch(&input).unwrap();
+            check(&writer);
+            drop(writer);
+
+            let mut reopened = VectorIndex::open(&path).unwrap();
+            check(&reopened);
+            assert_eq!(reopened.compact().unwrap().wal_records, 2);
+            drop(reopened);
+            check(&VectorIndex::open_read_only(&path).unwrap());
+        }
     }
 
     #[test]
