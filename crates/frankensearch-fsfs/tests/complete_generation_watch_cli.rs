@@ -658,27 +658,38 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
     }
 
     /// Keep a valid tokenizer tree or F32 tensor layout while changing one byte.
-    fn drift_fast_artifact(path: &Path, artifact: &str) -> (u64, u8) {
-        if artifact == "tokenizer" {
+    fn drift_model_artifact(path: &Path, artifact: &str) -> (u64, u8) {
+        if artifact != "weights" {
             let mut bytes = fs::read(path).unwrap();
             let mut expected: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(expected["normalizer"]["normalizers"][1]["content"], " ! ");
-            let needle = b"\"content\":\" ! \"";
+            let (needle, old, new): (&[u8], u8, u8) = match artifact {
+                "tokenizer" => {
+                    let content = &mut expected["normalizer"]["normalizers"][1]["content"];
+                    assert_eq!(*content, " ! ");
+                    *content = Value::String(" ? ".to_owned());
+                    (b"\"content\":\" ! \"", b'!', b'?')
+                }
+                "quality-tokenizer" => {
+                    let stride = &mut expected["truncation"]["stride"];
+                    assert_eq!(*stride, 0);
+                    *stride = Value::from(1);
+                    (b"\"stride\":0", b'0', b'1')
+                }
+                _ => panic!("unknown drift fixture {artifact}"),
+            };
             let matches = bytes
                 .windows(needle.len())
                 .enumerate()
                 .filter_map(|(offset, value)| (value == needle).then_some(offset))
                 .collect::<Vec<_>>();
             assert_eq!(matches.len(), 1);
-            let offset = matches[0] + needle.iter().position(|byte| *byte == b'!').unwrap();
-            bytes[offset] = b'?';
-            expected["normalizer"]["normalizers"][1]["content"] = Value::String(" ? ".to_owned());
+            let offset = matches[0] + needle.iter().position(|byte| *byte == old).unwrap();
+            bytes[offset] = new;
             assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
             let offset = u64::try_from(offset).unwrap();
-            replace_byte(path, offset, b'?');
-            (offset, b'!')
+            replace_byte(path, offset, new);
+            (offset, old)
         } else {
-            assert_eq!(artifact, "weights");
             let mut file = fs::File::open(path).unwrap();
             let mut prefix = [0_u8; 8];
             file.read_exact(&mut prefix).unwrap();
@@ -1244,7 +1255,11 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
     // even when its display ID, configuration, size and mtime still agree.
     for quality in [false, true] {
         for legacy_seed in [false, true] {
-            for artifact in ["tokenizer", "weights"] {
+            for artifact in ["tokenizer", "weights", "quality-tokenizer"] {
+                let quality_drift = artifact == "quality-tokenizer";
+                if quality_drift && !quality {
+                    continue;
+                }
                 let mut fixture = Fixture::new(None, quality);
                 let private = private_models(&fixture, &models);
                 let mut settings: FsfsConfig =
@@ -1293,23 +1308,33 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                 let evidence = fs::read(&evidence_path).unwrap();
                 let pointer = fixture.store.join("FSFS-CURRENT");
                 let selection = pointer.exists().then(|| fs::read(&pointer).unwrap());
-                let fast = private.join("potion-multilingual-128M");
-                let manifest = frankensearch_embed::ModelManifest::potion_128m();
-                assert!(frankensearch_embed::is_verification_cached(
-                    &manifest, &fast
-                ));
-                let receipt = fs::read(fast.join(".verified")).unwrap();
-                let filename = if artifact == "tokenizer" {
-                    "tokenizer.json"
+                let (producer, manifest) = if quality_drift {
+                    (
+                        "all-MiniLM-L6-v2",
+                        frankensearch_embed::ModelManifest::minilm_v2(),
+                    )
                 } else {
-                    "model.safetensors"
+                    (
+                        "potion-multilingual-128M",
+                        frankensearch_embed::ModelManifest::potion_128m(),
+                    )
                 };
-                let path = fast.join(filename);
+                let model = private.join(producer);
+                assert!(frankensearch_embed::is_verification_cached(
+                    &manifest, &model
+                ));
+                let receipt = fs::read(model.join(".verified")).unwrap();
+                let filename = if artifact == "weights" {
+                    "model.safetensors"
+                } else {
+                    "tokenizer.json"
+                };
+                let path = model.join(filename);
                 let metadata = fs::metadata(&path).unwrap();
                 let original_sha = file_sha256(&path);
-                let source_path = models.join("potion-multilingual-128M").join(filename);
+                let source_path = models.join(producer).join(filename);
                 assert_eq!(file_sha256(&source_path), original_sha);
-                let (offset, byte) = drift_fast_artifact(&path, artifact);
+                let (offset, byte) = drift_model_artifact(&path, artifact);
                 fs::OpenOptions::new()
                     .write(true)
                     .open(&path)
@@ -1334,14 +1359,34 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                 let drifted_sha = file_sha256(&path);
                 assert_ne!(drifted_sha, original_sha);
                 assert!(!frankensearch_embed::is_verification_cached(
-                    &manifest, &fast
+                    &manifest, &model
                 ));
-                let error = frankensearch_embed::verify_dir_cached(&manifest, &fast).unwrap_err();
+                let error = frankensearch_embed::verify_dir_cached(&manifest, &model).unwrap_err();
                 assert!(
                     matches!(&error, frankensearch_core::SearchError::HashMismatch { path: refused, .. } if refused == &path),
                     "{error:?}"
                 );
                 fixture.executable.clone_from(&current);
+                let expected_code = if quality_drift {
+                    frankensearch_fsfs::output_schema::OutputErrorCode::MODEL_LOAD_FAILED
+                } else {
+                    frankensearch_fsfs::output_schema::OutputErrorCode::EMBEDDER_UNAVAILABLE
+                };
+                if quality_drift && !legacy_seed {
+                    let output = Process::start(
+                        fixture
+                            .command("index", "json")
+                            .env("FSFS_COMPLETE_GENERATIONS", "true")
+                            .env("FRANKENSEARCH_LOG", "frankensearch_fsfs::indexing=debug")
+                            .args(["--upgrade-reuse", "compatible-contract"]),
+                    )
+                    .finish(Duration::from_secs(180));
+                    assert!(!output.status.success(), "{output:?}");
+                    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(response["error"]["code"], expected_code, "{output:?}");
+                    assert_eq!(document_batches(&output), 0);
+                    assert_eq!(Some(fs::read(&pointer).unwrap()), selection);
+                }
                 let output =
                     watch(&fixture, "compatible-contract").finish(Duration::from_secs(180));
                 assert!(!output.status.success(), "{output:?}");
@@ -1353,8 +1398,7 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                     .collect::<Vec<_>>();
                 assert!(
                     responses.iter().any(|response| response["ok"] == false
-                        && response["error"]["code"]
-                            == frankensearch_fsfs::output_schema::OutputErrorCode::EMBEDDER_UNAVAILABLE),
+                        && response["error"]["code"] == expected_code),
                     "{output:?}"
                 );
                 assert!(
@@ -1367,7 +1411,7 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                     selection
                 );
                 assert_eq!(fs::read(&fixture.config).unwrap(), configuration);
-                assert_eq!(fs::read(fast.join(".verified")).unwrap(), receipt);
+                assert_eq!(fs::read(model.join(".verified")).unwrap(), receipt);
                 for (relative, bytes) in &old_artifacts {
                     assert_eq!(fs::read(old_root.join(relative)).unwrap(), *bytes);
                 }
@@ -1384,7 +1428,7 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                     original_sha,
                     "original cache remains untouched"
                 );
-                frankensearch_embed::verify_dir_and_record(&manifest, &fast).unwrap();
+                frankensearch_embed::verify_dir_and_record(&manifest, &model).unwrap();
                 assert_eq!(ranks(&fixture), old_ranks);
                 let mut retry = watch(&fixture, "compatible-contract");
                 let recovered = wait_for_visible_paths(

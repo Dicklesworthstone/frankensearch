@@ -21870,7 +21870,7 @@ impl FsfsRuntime {
             (None, REASON_VECTOR_QUALITY_TIER_BUILT)
         } else {
             control.admit_work(cx, "index.quality_model_load").await?;
-            self.resolve_indexing_quality_embedder()
+            self.resolve_indexing_quality_embedder()?
         };
         control.checkpoint(cx, "index.quality_model_loaded", true)?;
         if let Some(quality_embedder) = quality_embedder.as_ref() {
@@ -25279,31 +25279,46 @@ impl FsfsRuntime {
     /// embedder. The tier is built whenever the configuration allows a
     /// quality stage (`search.fast_only = false` and a non-empty
     /// `indexing.quality_model`) and a verified semantic quality model is
-    /// available. An unavailable model does not fail the index: the run
-    /// records the reason code, builds the fast tier, and search serves
-    /// INITIAL only until a re-index with the model present.
-    fn resolve_indexing_quality_embedder(&self) -> (Option<Arc<dyn Embedder>>, &'static str) {
+    /// available. A missing optional model permits a fast-only index. Under
+    /// compatible-contract reuse, an installed producer that fails verification
+    /// must not replace a previous selection with a fast-only generation.
+    fn resolve_indexing_quality_embedder(
+        &self,
+    ) -> SearchResult<(Option<Arc<dyn Embedder>>, &'static str)> {
         if self.config.indexing.quality_model.trim().is_empty() {
-            return (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);
+            return Ok((None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY));
         }
         if let Some(deferral) = self.indexing_quality_deferral() {
-            return (None, deferral.reason_code());
+            return Ok((None, deferral.reason_code()));
         }
         if self.config.search.fast_only {
-            return (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);
+            return Ok((None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY));
         }
         match self.resolve_quality_embedder() {
             Ok(Some(embedder)) if embedder.is_semantic() => {
-                (Some(embedder), REASON_VECTOR_QUALITY_TIER_BUILT)
+                Ok((Some(embedder), REASON_VECTOR_QUALITY_TIER_BUILT))
             }
-            Ok(_) => (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE),
+            Ok(_) => Ok((None, REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE)),
             Err(error) => {
+                if self.contract_upgrade_reuse_enabled()
+                    && let Some(manifest) = Self::registered_manifest_for_model(
+                        "quality",
+                        &self.config.indexing.quality_model,
+                    )
+                    && Self::registered_model_cache_path(
+                        &manifest,
+                        Path::new(&self.config.indexing.model_dir),
+                    )
+                    .try_exists()?
+                {
+                    return Err(error);
+                }
                 warn!(
                     error_code = error_code_for(&error),
                     reason = Self::semantic_runtime_failure_summary(&error),
                     "quality-tier model unavailable; building the fast tier only"
                 );
-                (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE)
+                Ok((None, REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE))
             }
         }
     }
@@ -35849,7 +35864,7 @@ mod tests {
                 .quality_model
                 .is_empty()
         );
-        let (quality, reason) = runtime.resolve_indexing_quality_embedder();
+        let (quality, reason) = runtime.resolve_indexing_quality_embedder().unwrap();
         assert!(quality.is_none());
         assert_eq!(reason, super::REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);
         // Explicit admission still validates every stored tier for recovery,
@@ -35943,7 +35958,7 @@ mod tests {
             assert!(!requested.reranking_enabled_by_policy());
             assert!(requested.prepared_reranker(&cx).await.unwrap().is_none());
             assert!(requested.resolve_quality_embedder().unwrap().is_none());
-            let (quality, reason) = requested.resolve_indexing_quality_embedder();
+            let (quality, reason) = requested.resolve_indexing_quality_embedder().unwrap();
             assert!(quality.is_none());
             assert_eq!(reason, super::REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
             assert_eq!(
