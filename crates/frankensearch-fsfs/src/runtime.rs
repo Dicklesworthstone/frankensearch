@@ -43366,11 +43366,12 @@ mod tests {
             .expect("one-shot indexing pipeline end");
         let pipeline = &source[pipeline_start..pipeline_end];
 
-        let fast_probe = pipeline
-            .find("Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;")
-            .expect("fast embedder probe");
+        // Both fast and quality-only indexing can own the primary vector file.
+        let primary_probe = pipeline
+            .rfind("Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;")
+            .expect("primary embedder probe");
         let quality_probe = pipeline
-            .find("Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;")
+            .rfind("Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;")
             .expect("quality embedder probe");
         let vector_dir = pipeline
             .find("fs::create_dir_all(index_root.join(\"vector\"))?;")
@@ -43379,7 +43380,7 @@ mod tests {
             .find("fs::create_dir_all(index_root.join(\"cache\"))?;")
             .expect("cache artifact directory creation");
         assert!(
-            fast_probe.max(quality_probe) < vector_dir.min(cache_dir),
+            primary_probe.max(quality_probe) < vector_dir.min(cache_dir),
             "a failed semantic probe must return before vector/cache artifact creation"
         );
         assert!(
