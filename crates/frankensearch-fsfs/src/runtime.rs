@@ -21510,8 +21510,8 @@ impl FsfsRuntime {
             });
         };
 
-        let path = Self::registered_model_cache_path(&manifest, model_root);
-        if !path.exists() {
+        let path = Self::registered_model_cache_path(&manifest, model_root)?;
+        if !complete_cli::complete_entry_exists(&path)? {
             return Ok(ModelCacheInspection {
                 path,
                 state: ModelCacheVerificationState::Missing,
@@ -21546,17 +21546,47 @@ impl FsfsRuntime {
         })
     }
 
-    fn registered_model_cache_path(manifest: &ModelManifest, model_root: &Path) -> PathBuf {
-        let canonical_path = model_root.join(Self::manifest_install_dir_name(manifest));
-        let root_is_direct_model = manifest
-            .files
-            .iter()
-            .any(|file| model_root.join(&file.name).exists());
-        if canonical_path.exists() || !root_is_direct_model {
-            canonical_path
-        } else {
-            model_root.to_path_buf()
+    fn registered_model_cache_path(
+        manifest: &ModelManifest,
+        model_root: &Path,
+    ) -> SearchResult<PathBuf> {
+        let install_name = Self::manifest_install_dir_name(manifest);
+        let canonical_path = model_root.join(&install_name);
+        if complete_cli::complete_entry_exists(&canonical_path)? {
+            return Ok(canonical_path);
         }
+        if model_root.file_name() == Some(install_name.as_ref()) {
+            return Ok(model_root.to_path_buf());
+        }
+        let mut direct_files = Vec::new();
+        for file in &manifest.files {
+            if complete_cli::complete_entry_exists(&model_root.join(&file.name))? {
+                direct_files.push(file.name.as_str());
+            }
+        }
+        if direct_files.is_empty() {
+            return Ok(canonical_path);
+        }
+        // A direct Potion install shares tokenizer.json with MiniLM. Only
+        // treat quality as absent if a verified fast bundle accounts for
+        // every apparent quality artifact. A partial quality install with
+        // even one independent file must still reach its own verifier.
+        if manifest.tier == Some(ManifestModelTier::Quality)
+            && ModelManifest::builtin_catalog()
+                .models
+                .into_iter()
+                .chain(ModelManifest::opt_in_catalog().models)
+                .filter(|model| model.tier == Some(ManifestModelTier::Fast))
+                .any(|fast| {
+                    direct_files
+                        .iter()
+                        .all(|name| fast.files.iter().any(|file| file.name == *name))
+                        && verify_dir_cached(&fast, model_root).is_ok()
+                })
+        {
+            return Ok(canonical_path);
+        }
+        Ok(model_root.to_path_buf())
     }
 
     fn registered_manifest_for_model(tier: &str, model_name: &str) -> Option<ModelManifest> {
@@ -24633,7 +24663,7 @@ impl FsfsRuntime {
             let model_dir = Self::registered_model_cache_path(
                 registration.download_manifest(),
                 Path::new(&self.config.indexing.model_dir),
-            );
+            )?;
             match registration.verify_identity_for_replay(&model_dir) {
                 Ok((identity, artifacts)) => (model_dir, identity, artifacts),
                 Err(_) => {
@@ -25330,11 +25360,10 @@ impl FsfsRuntime {
                         "quality",
                         &self.config.indexing.quality_model,
                     )
-                    && Self::registered_model_cache_path(
+                    && complete_cli::complete_entry_exists(&Self::registered_model_cache_path(
                         &manifest,
                         Path::new(&self.config.indexing.model_dir),
-                    )
-                    .try_exists()?
+                    )?)?
                 {
                     return Err(error);
                 }

@@ -877,6 +877,47 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
     let current_sha = file_sha256(&current);
     assert_ne!(prior_sha, current_sha);
 
+    // A direct fast-model directory also contains tokenizer.json. Its verified
+    // bytes belong to Potion, so the absent optional MiniLM still permits indexing.
+    {
+        let fixture = Fixture::new(None, false);
+        let models = private_models(&fixture, &models);
+        let direct = models.join("direct-model");
+        fs::rename(models.join("potion-multilingual-128M"), &direct).unwrap();
+        let mut settings: FsfsConfig =
+            toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+        settings.indexing.model_dir = direct.display().to_string();
+        settings.indexing.quality_model = FsfsConfig::default().indexing.quality_model;
+        settings.search.fast_only = false;
+        fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
+        let index = || {
+            Process::start(
+                fixture
+                    .command("index", "json")
+                    .env("FSFS_COMPLETE_GENERATIONS", "true")
+                    .args(["--upgrade-reuse", "compatible-contract"]),
+            )
+            .finish(Duration::from_secs(180))
+        };
+        let output = index();
+        assert!(output.status.success(), "{output:?}");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["data"]["indexed_files"], 1);
+        assert_eq!(
+            response["data"]["vector_generation"]["id"],
+            "potion-multilingual-128M"
+        );
+        assert!(response["data"]["quality_generation"].is_null());
+        let pointer = fixture.store.join("FSFS-CURRENT");
+        let selection = fs::read(&pointer).unwrap();
+        fs::create_dir(direct.join("all-MiniLM-L6-v2")).unwrap();
+        let refused = index();
+        assert!(!refused.status.success(), "{refused:?}");
+        let response: Value = serde_json::from_slice(&refused.stdout).unwrap();
+        assert_eq!(response["error"]["code"], "model_not_found", "{refused:?}");
+        assert_eq!(fs::read(pointer).unwrap(), selection);
+    }
+
     // A terminal operator can decline downloads once. A verified fast producer
     // permits promotion; a missing required producer must preserve the legacy.
     for (missing_fast, interrupt) in [(false, false), (true, false), (true, true)] {
