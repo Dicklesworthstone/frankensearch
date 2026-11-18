@@ -20360,8 +20360,10 @@ impl FsfsRuntime {
             );
         }
         let state = index.zero_signal_state();
+        let index_path_hash =
+            frankensearch_core::sha256_checksum(vector_path.as_os_str().as_encoded_bytes());
         let census = format!(
-            "records={} live={} tombstones={} wal={} usable={}",
+            "index_path_hash={index_path_hash} records={} live={} tombstones={} wal={} usable={}",
             state.record_count,
             state.live_count,
             state.tombstone_count,
@@ -63373,10 +63375,11 @@ mod tests {
 
         assert_eq!(check.verdict, super::DoctorVerdict::Pass);
         assert_eq!(check.name, "semantic.zero_signal");
-        assert!(
-            check.detail.contains("records=1 live=2 tombstones=0 wal=1 usable=2"),
-            "doctor should count both visible rows with the reader active: {}",
-            check.detail
+        let expected_hash =
+            frankensearch_core::sha256_checksum(vector_path.as_os_str().as_encoded_bytes());
+        assert_eq!(
+            check.detail,
+            format!("index_path_hash={expected_hash} records=1 live=2 tombstones=0 wal=1 usable=2")
         );
         drop(live_reader);
     }

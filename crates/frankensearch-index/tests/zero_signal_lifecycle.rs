@@ -205,14 +205,19 @@ impl LaneEventCollector {
     }
 }
 
+#[derive(Default)]
 struct MessageExtractor {
     message: Option<String>,
+    fields: String,
 }
 
 impl tracing::field::Visit for MessageExtractor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = Some(format!("{value:?}"));
+        } else {
+            use std::fmt::Write as _;
+            write!(self.fields, " {}={value:?}", field.name()).expect("format event field");
         }
     }
 }
@@ -231,7 +236,7 @@ impl tracing::Subscriber for LaneEventCollector {
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
 
     fn event(&self, event: &tracing::Event<'_>) {
-        let mut extractor = MessageExtractor { message: None };
+        let mut extractor = MessageExtractor::default();
         event.record(&mut extractor);
         if let Some(message) = extractor.message
             && message.contains("fast-tier semantic lane")
@@ -239,7 +244,7 @@ impl tracing::Subscriber for LaneEventCollector {
             self.messages
                 .lock()
                 .expect("collector lock")
-                .push((*event.metadata().level(), message));
+                .push((*event.metadata().level(), message + &extractor.fields));
         }
     }
 
@@ -346,8 +351,13 @@ fn repeated_unusable_row_searches_warn_once() {
 
     let events = collector.lane_events();
     assert_eq!(events.len(), 1, "unchanged unusable state: {events:?}");
-    assert_eq!(events[0].0, tracing::Level::WARN);
-    assert!(events[0].1.contains("is unusable"));
+    let (level, warning) = &events[0];
+    assert_eq!(*level, tracing::Level::WARN);
+    assert!(warning.contains("is unusable"));
+    let expected_hash = frankensearch_core::sha256_checksum(path.as_os_str().as_encoded_bytes());
+    assert!(warning.contains(&format!("index_path_hash={expected_hash}")));
+    assert!(!warning.contains(dir.path().to_string_lossy().as_ref()));
+    assert!(!warning.contains("legacy-zero"));
 }
 
 #[test]

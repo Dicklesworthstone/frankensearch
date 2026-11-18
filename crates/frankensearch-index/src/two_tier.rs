@@ -1777,6 +1777,14 @@ impl TwoTierIndex {
     /// benign states log at info once per transition, and the first
     /// hit-producing search after any state-scoped emptiness logs recovery.
     fn note_zero_signal(&self, reason: Option<ZeroSignalReason>) {
+        // Hash the actual artifact path (a v2 owner's internal path is synthetic).
+        // Only transition events need the hash. Doctor can report the full census
+        // under this same key without adding a vector scan to the search path.
+        let index_path_hash = || {
+            frankensearch_core::sha256_checksum(
+                self.fast_index_path().as_os_str().as_encoded_bytes(),
+            )
+        };
         match reason {
             Some(request_scoped) if request_scoped.is_request_scoped() => {
                 debug!(
@@ -1792,12 +1800,14 @@ impl TwoTierIndex {
                 }
                 if state_scoped.is_availability_failure() {
                     warn!(
+                        index_path_hash = %index_path_hash(),
                         reason_code = state_scoped.reason_code(),
                         reason = %state_scoped,
                         "fast-tier semantic lane is unusable"
                     );
                 } else {
                     info!(
+                        index_path_hash = %index_path_hash(),
                         reason_code = state_scoped.reason_code(),
                         reason = %state_scoped,
                         "fast-tier semantic lane has no signal"
@@ -1809,7 +1819,10 @@ impl TwoTierIndex {
                     .last_zero_signal
                     .swap(ZERO_SIGNAL_NONE, AtomicOrdering::Relaxed);
                 if previous != ZERO_SIGNAL_NONE {
-                    info!("fast-tier semantic lane recovered: search produced hits");
+                    info!(
+                        index_path_hash = %index_path_hash(),
+                        "fast-tier semantic lane recovered: search produced hits"
+                    );
                 }
             }
         }
