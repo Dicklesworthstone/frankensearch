@@ -674,18 +674,17 @@ impl fmt::Display for ZeroSignalReason {
     }
 }
 
-/// Point-in-time census of a vector index generation, used to classify
-/// zero-signal outcomes without per-query scans.
+/// Point-in-time census used to classify a generation's zero-signal outcomes.
 ///
-/// Computed once at open/reload time (the usable-vector pass is O(n·dim))
-/// and invalidated by mutations (append, soft-delete, vacuum, compaction).
+/// File-backed counts reflect the current main slab and resident WAL.
+/// Computing the census includes an O(n·dim) usable-vector pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZeroSignalState {
     /// Physical records in the main index, including tombstoned ones.
     pub record_count: usize,
-    /// Records not tombstoned.
+    /// Visible rows, including WAL entries and excluding main rows they replace.
     pub live_count: usize,
-    /// Tombstoned records.
+    /// Physically tombstoned records in the main index.
     pub tombstone_count: usize,
     /// WAL-resident entries not yet compacted into the main index.
     pub wal_count: usize,
@@ -714,7 +713,7 @@ impl ZeroSignalState {
     /// True when queries can only be served from WAL-resident entries.
     #[must_use]
     pub const fn is_wal_only(&self) -> bool {
-        self.live_count == 0 && self.wal_count > 0
+        self.wal_count > 0 && (self.live_count == self.wal_count || self.live_count == 0)
     }
 
     /// Classify why a well-formed search (k > 0, finite non-zero query)
@@ -1091,7 +1090,7 @@ mod tests {
     #[test]
     fn zero_signal_state_classification_table() {
         // (record, live, tombstone, wal, usable) -> expected state reason
-        let cases: [(ZeroSignalState, Option<ZeroSignalReason>); 6] = [
+        let cases = [
             (
                 ZeroSignalState::default(),
                 Some(ZeroSignalReason::NewlyCreatedEmpty),
@@ -1147,6 +1146,16 @@ mod tests {
                     usable_vector_count: 5,
                 },
                 None,
+            ),
+            (
+                ZeroSignalState {
+                    record_count: 1,
+                    live_count: 1,
+                    tombstone_count: 0,
+                    wal_count: 1,
+                    usable_vector_count: 0,
+                },
+                Some(ZeroSignalReason::NoUsableVectors),
             ),
         ];
         for (state, expected) in cases {

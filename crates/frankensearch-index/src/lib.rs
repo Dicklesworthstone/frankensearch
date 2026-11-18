@@ -2771,29 +2771,43 @@ impl VectorIndex {
 
     /// Compute the zero-signal census for this index generation.
     ///
-    /// O(n·dim): decodes every live vector once. Callers classify empty
-    /// search results with it lazily — an empty result costs one extra pass
-    /// comparable to the scan that just ran, and the hot (non-empty) path
-    /// pays nothing.
+    /// Counts resident WAL rows and excludes the main rows they supersede.
+    /// Physical record and tombstone counts describe the main slab.
+    ///
+    /// O(n·dim): decodes each visible vector once. Search computes the census
+    /// lazily for empty results.
     #[must_use]
     pub fn zero_signal_state(&self) -> ZeroSignalState {
-        let record_count = self.record_count();
-        let mut tombstone_count = 0usize;
-        let mut usable_vector_count = 0usize;
-        for index in 0..record_count {
-            if self.is_deleted(index) {
-                tombstone_count += 1;
-            } else if self.is_vector_usable(index) {
-                usable_vector_count += 1;
-            }
-        }
-        ZeroSignalState {
-            record_count,
-            live_count: record_count - tombstone_count,
-            tombstone_count,
+        let shadowed: std::collections::HashSet<_> =
+            self.wal_records().map(|(doc_id, _)| doc_id).collect();
+        let mut state = ZeroSignalState {
+            record_count: self.record_count(),
+            live_count: self.wal_record_count(),
+            tombstone_count: 0,
             wal_count: self.wal_record_count(),
-            usable_vector_count,
+            usable_vector_count: self
+                .wal_records()
+                .filter(|(_, embedding)| vector_signal_usable(embedding))
+                .count(),
+        };
+        for index in 0..state.record_count {
+            if self.is_deleted(index) {
+                state.tombstone_count += 1;
+                continue;
+            }
+            let usable = if shadowed.is_empty() {
+                self.is_vector_usable(index)
+            } else {
+                match self.doc_id_at(index) {
+                    Ok(doc_id) if shadowed.contains(doc_id) => continue,
+                    Ok(_) => self.is_vector_usable(index),
+                    Err(_) => false,
+                }
+            };
+            state.live_count += 1;
+            state.usable_vector_count += usize::from(usable);
         }
+        state
     }
 
     /// Fraction of records that are tombstoned (`tombstones / record_count`).
@@ -7203,16 +7217,21 @@ mod tests {
             .finish()
             .expect("finish empty v2");
 
-        let reader = VectorIndex::open_read_only(&path).expect("open shared vector reader");
+        assert!(matches!(
+            VectorIndex::open_read_only(&path),
+            Err(SearchError::IndexVersionMismatch {
+                expected: FSVI_VERSION,
+                found: FSVI_V2_VERSION,
+            })
+        ));
+        let index = admit_owned_v2_fixture(&path, &binding).expect("admit empty owned v2 artifact");
         let proposed = [("new-row".into(), vec![1.0, 0.0, 0.0, 0.0])];
         assert!(matches!(
-            reader.validate_append_entries(&proposed),
+            index.index.validate_append_entries(&proposed),
             Err(SearchError::InvalidConfig { field, value, .. })
                 if field == "fsvi_v2.mutation" && value == "append_batch"
         ));
-        drop(reader);
 
-        let index = admit_owned_v2_fixture(&path, &binding).expect("admit empty owned v2 artifact");
         assert_eq!(index.record_count(), 0);
         let identity = index.identity_v2();
         assert_ne!(identity.ordered_live_docset_digest, [0; SHA256_BYTES]);
@@ -11447,6 +11466,72 @@ mod tests {
         assert_eq!(after_delete.tombstone_count, 1);
         assert_eq!(after_delete.usable_vector_count, 2);
         assert_eq!(index.live_count(), 2);
+    }
+
+    #[test]
+    fn zero_signal_census_uses_visible_wal_rows_after_reopen() {
+        let path = temp_index_path("zero-signal-census-wal");
+        let mut writer = VectorIndex::create(&path, "signal", 2).unwrap();
+        writer.write_record("replaced", &[1.0, 0.0]).unwrap();
+        writer.write_legacy_f16_zero_fixture("legacy-zero");
+        writer.finish().unwrap();
+
+        // A durable legacy replacement can arrive before the main-row
+        // tombstone. Its older usable vector must no longer count.
+        let entries = [
+            ("replaced", vec![0.0, 0.0]),
+            ("wal-healthy", vec![0.0, 1.0]),
+        ]
+        .map(|(doc_id, embedding)| wal::WalEntry {
+            doc_id: doc_id.to_owned(),
+            doc_id_hash: fnv1a_hash(doc_id.as_bytes()),
+            embedding,
+        });
+        wal::append_wal_batch(
+            &wal::wal_path_for(&path),
+            &entries,
+            2,
+            Quantization::F16,
+            next_generation(VectorIndex::peek_compaction_gen(&path).unwrap()),
+            true,
+        )
+        .unwrap();
+
+        let query = [0.0, 1.0];
+        let mut index = VectorIndex::open(&path).unwrap();
+        let state = index.zero_signal_state();
+        assert_eq!(
+            state,
+            ZeroSignalState {
+                record_count: 2,
+                live_count: 3,
+                tombstone_count: 0,
+                wal_count: 2,
+                usable_vector_count: 1,
+            }
+        );
+        assert_eq!(state.state_reason(), None);
+        assert!(!state.is_wal_only());
+        let classified = index.search_top_k_classified(&query, 3, None).unwrap();
+        assert_eq!(classified.hits.len(), 1);
+        assert_eq!(classified.hits[0].doc_id, "wal-healthy");
+        assert_eq!(classified.zero_signal, None);
+
+        assert!(index.soft_delete("wal-healthy").unwrap());
+        assert!(index.soft_delete("legacy-zero").unwrap());
+        drop(index);
+        let reopened = VectorIndex::open_read_only(&path).unwrap();
+        let state = reopened.zero_signal_state();
+        assert_eq!((state.live_count, state.usable_vector_count), (1, 0));
+        assert_eq!(state.tombstone_count, 1);
+        assert!(state.is_wal_only());
+        assert_eq!(
+            state.state_reason(),
+            Some(ZeroSignalReason::NoUsableVectors)
+        );
+        let classified = reopened.search_top_k_classified(&query, 3, None).unwrap();
+        assert!(classified.hits.is_empty());
+        assert_eq!(classified.zero_signal, state.state_reason());
     }
 
     // ─── VectorIndex::open edge cases ───────────────────────────────────
