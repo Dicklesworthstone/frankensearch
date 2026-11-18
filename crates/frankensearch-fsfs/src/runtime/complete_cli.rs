@@ -1653,7 +1653,9 @@ impl FsfsRuntime {
         let mut cache = HashMap::new();
         let ready = Self::search_serve_ready_event(
             self.cli_input.format.to_string(),
-            &session.reader.resources,
+            &session.reader.resources.index_root,
+            session.reader.resources.vector_index.as_deref(),
+            session.reader.resources.fast_embedder.is_some(),
         );
         emit_complete_serve_line(&ready, output)?;
         let mut line = Vec::new();

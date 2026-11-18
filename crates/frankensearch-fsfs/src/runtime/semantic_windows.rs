@@ -458,10 +458,9 @@ pub(super) fn score_sources(
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    // One scan whose budget holds every live row the named sources own (at
-    // most max_windows each; native top-k resolves WAL supersession before
-    // selection). No named row is evicted, so a truncated source is never
-    // mistaken for an absent one.
+    // Budget for every live row the named sources own, at most max_windows
+    // each. Top-k resolves WAL supersession before selection so every usable
+    // source can contribute its best row.
     let limit = sources
         .len()
         .saturating_mul(mapping.map_or(1, |mapping| mapping.max_windows));

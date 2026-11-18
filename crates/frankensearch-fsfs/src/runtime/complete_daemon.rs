@@ -557,20 +557,29 @@ impl FsfsRuntime {
             budget,
             streaming::drive(cx, &connection, async {
                 if is_ready_probe(&bytes) {
-                    // Inspect the admitted resources only while owning them;
-                    // a readiness probe never races an in-flight refresh.
-                    let ready = {
+                    // Snapshot the admitted resources before probing the
+                    // published metadata outside the shared state lock.
+                    let (format, index_root, vector_index, fast_embedder_loaded) = {
                         let state =
                             asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), cx)
                                 .await
                                 .map_err(|error| {
                                     complete_cli_error("daemon_admission", &error.to_string())
                                 })?;
-                        encode_response(&Self::search_serve_ready_event(
+                        let resources = &state.0.reader.resources;
+                        (
                             state.0.reader.runtime.cli_input.format.to_string(),
-                            &state.0.reader.resources,
-                        ))?
+                            resources.index_root.clone(),
+                            resources.vector_index.clone(),
+                            resources.fast_embedder.is_some(),
+                        )
                     };
+                    let ready = encode_response(&Self::search_serve_ready_event(
+                        format,
+                        &index_root,
+                        vector_index.as_deref(),
+                        fast_embedder_loaded,
+                    ))?;
                     write_response(cx, &mut peer, &ready, peer_timeout).await?;
                     return Ok(PeerOutcome::Search);
                 }

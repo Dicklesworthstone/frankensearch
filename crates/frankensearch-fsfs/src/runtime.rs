@@ -10062,7 +10062,12 @@ impl FsfsRuntime {
         let mut hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
 
-        let ready = Self::search_serve_ready_event(self.cli_input.format.to_string(), &resources);
+        let ready = Self::search_serve_ready_event(
+            self.cli_input.format.to_string(),
+            &resources.index_root,
+            resources.vector_index.as_deref(),
+            resources.fast_embedder.is_some(),
+        );
         Self::emit_search_serve_json_line(&ready)?;
 
         loop {
@@ -10171,7 +10176,12 @@ impl FsfsRuntime {
         .with_daemon_coalescers();
         let serving_cx = cx.clone().with_blocking_pool_handle(Some(pool_handle));
         let resources = runtime.prepare_search_serve_resources(&serving_cx).await?;
-        let ready = Self::search_serve_ready_event(self.cli_input.format.to_string(), &resources);
+        let ready = Self::search_serve_ready_event(
+            self.cli_input.format.to_string(),
+            &resources.index_root,
+            resources.vector_index.as_deref(),
+            resources.fast_embedder.is_some(),
+        );
         if let Err(error) = Self::emit_search_serve_json_line(&ready) {
             warn!(
                 error = %error,
@@ -11096,25 +11106,31 @@ impl FsfsRuntime {
 
     fn search_serve_ready_event(
         format: impl Into<String>,
-        resources: &SearchExecutionResources,
+        index_root: &Path,
+        vector_index: Option<&VectorIndex>,
+        fast_embedder_loaded: bool,
     ) -> serde_json::Value {
-        let generation = resources.vector_index.as_ref().map(|index| {
-            let id = index.embedder_id().to_owned();
-            let is_hash = Self::is_legacy_hash_vector_generation(&id);
-            (id, is_hash)
-        });
+        // A lexical-first daemon can report readable published metadata
+        // before it admits a vector tier for a semantic request.
+        let generation = vector_index
+            .map(|index| {
+                let id = index.embedder_id();
+                (id.to_owned(), Self::is_legacy_hash_vector_generation(id))
+            })
+            .or_else(|| {
+                Self::inspect_published_vector_generation(index_root)
+                    .map(|generation| (generation.id, generation.is_hash_control))
+            });
+        let is_hash = generation.as_ref().is_some_and(|(_, is_hash)| *is_hash);
         serde_json::json!({
             "ok": true,
             "event": "ready",
             "schema_version": FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             "pid": std::process::id(),
             "format": format.into(),
-            "vector_generation_id": generation.as_ref().map(|(id, _)| id.clone()),
-            "vector_generation_is_hash": generation.as_ref().is_some_and(|(_, is_hash)| *is_hash),
-            "semantic_admitted": generation
-                .as_ref()
-                .is_some_and(|(_, is_hash)| !*is_hash)
-                && resources.fast_embedder.is_some(),
+            "vector_generation_id": generation.map(|(id, _)| id),
+            "vector_generation_is_hash": is_hash,
+            "semantic_admitted": vector_index.is_some() && !is_hash && fast_embedder_loaded,
         })
     }
 
@@ -11359,10 +11375,20 @@ impl FsfsRuntime {
                     ))),
                 })?;
             let (resources, _) = &*guard;
-            Ok::<_, SearchError>(Self::search_serve_ready_event(format, resources))
+            Ok::<_, SearchError>((
+                resources.index_root.clone(),
+                resources.vector_index.clone(),
+                resources.fast_embedder.is_some(),
+            ))
         });
         match scheduler.block_on(ready_task) {
-            Ok(ready) => {
+            Ok((index_root, vector_index, fast_embedder_loaded)) => {
+                let ready = Self::search_serve_ready_event(
+                    format,
+                    &index_root,
+                    vector_index.as_deref(),
+                    fast_embedder_loaded,
+                );
                 if let Err(error) = Self::write_search_serve_socket_json(stream, &ready) {
                     warn!(
                         error = %error,
@@ -41630,14 +41656,17 @@ mod tests {
                 3 << 20
             );
             if oversized_refinement {
-                assert_eq!(frames[1]["event"], "terminal");
-                assert_eq!(frames[1]["ok"], false);
-                assert!(
-                    frames[1]["error"]
-                        .as_str()
-                        .unwrap()
-                        .contains("frame exceeds byte limit")
-                );
+                let super::SearchServeFrame::Terminal {
+                    ok: false,
+                    error: Some(error),
+                } = serde_json::from_value(frames[1].clone()).expect("structured terminal")
+                else {
+                    panic!("oversized refinement did not end with a refusal: {}", frames[1]);
+                };
+                assert_eq!(error.code, crate::output_schema::OutputErrorCode::INVALID_CONFIG);
+                assert_eq!(error.exit_code, 2);
+                assert_eq!(error.field.as_deref(), Some("cli.daemon"));
+                assert!(error.message.contains("frame exceeds byte limit"));
             } else {
                 assert!(phases.len() > super::FSFS_DAEMON_RESPONSE_MAX_BYTES);
                 assert_eq!(frames[1]["payload"]["phase"], "refined");
@@ -48742,6 +48771,7 @@ mod tests {
             serde_json::from_str(raw.trim()).expect("ready event must be json");
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["ok"], true);
+        assert_eq!(ready["schema_version"], super::FSFS_SEARCH_SERVE_SCHEMA_VERSION);
         let published = FsfsRuntime::inspect_published_vector_generation(&index_root)
             .expect("indexed FSVI must be readable");
         assert_eq!(ready["vector_generation_id"], published.id);
@@ -48749,7 +48779,7 @@ mod tests {
             ready["vector_generation_is_hash"],
             published.is_hash_control
         );
-        assert_eq!(ready["semantic_admitted"], !published.is_hash_control);
+        assert_eq!(ready["semantic_admitted"], false);
         coordinator.request_shutdown(ShutdownReason::UserRequest);
         let result = join_with_timeout(handle, Duration::from_secs(2));
         assert!(result.is_ok(), "serve exits cleanly: {result:?}");
@@ -48851,10 +48881,17 @@ mod tests {
             .unwrap();
         let mut raw = String::new();
         refused.read_to_string(&mut raw).unwrap();
-        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(frame["event"], "terminal");
-        assert_eq!(frame["ok"], false);
-        assert_eq!(frame["error"], "daemon client capacity exhausted");
+        let super::SearchServeFrame::Terminal {
+            ok: false,
+            error: Some(error),
+        } = serde_json::from_str(&raw).expect("structured terminal")
+        else {
+            panic!("socket at capacity did not return a terminal refusal: {raw}");
+        };
+        assert_eq!(error.code, crate::output_schema::OutputErrorCode::QUEUE_FULL);
+        assert_eq!(error.exit_code, 1);
+        let capacity = super::FSFS_DAEMON_MAX_CLIENTS;
+        assert!(error.message.contains(&format!("({capacity}/{capacity} pending)")));
         drop(partial);
 
         coordinator.request_shutdown(ShutdownReason::UserRequest);
@@ -63645,13 +63682,23 @@ mod tests {
         // Readiness precedes lazy model initialization: admission means a
         // verified model was loaded, which the real-model e2e checks again
         // after queries. Neither "not yet loaded" nor a failed load admits.
-        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(false, false));
-        assert_eq!(ready["vector_generation_is_hash"], false);
-        assert_eq!(ready["semantic_admitted"], false);
-        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(false, true));
-        assert_eq!(ready["semantic_admitted"], false);
-        let ready = FsfsRuntime::search_serve_ready_event("jsonl", &resources(true, true));
-        assert_eq!(ready["semantic_admitted"], true);
+        let cold = FsfsRuntime::search_serve_ready_event("jsonl", temp.path(), None, false);
+        assert_eq!(cold["vector_generation_id"], "potion-multilingual-128M");
+        assert_eq!(cold["semantic_admitted"], false);
+        let ready = |loaded, attempted| {
+            let resources = resources(loaded, attempted);
+            FsfsRuntime::search_serve_ready_event(
+                "jsonl",
+                &resources.index_root,
+                resources.vector_index.as_deref(),
+                resources.fast_embedder.is_some(),
+            )
+        };
+        let waiting = ready(false, false);
+        assert_eq!(waiting["vector_generation_is_hash"], false);
+        assert_eq!(waiting["semantic_admitted"], false);
+        assert_eq!(ready(false, true)["semantic_admitted"], false);
+        assert_eq!(ready(true, true)["semantic_admitted"], true);
     }
 
     #[test]
@@ -63701,7 +63748,12 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, OutputWarningCode::HASH_FALLBACK);
 
-        let ready = FsfsRuntime::search_serve_ready_event("json", &resources);
+        let ready = FsfsRuntime::search_serve_ready_event(
+            "json",
+            &resources.index_root,
+            resources.vector_index.as_deref(),
+            resources.fast_embedder.is_some(),
+        );
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["vector_generation_id"], "fnv1a-256");
         assert_eq!(ready["vector_generation_is_hash"], true);
@@ -63749,7 +63801,12 @@ mod tests {
         assert_eq!(lexical.skip_reason.as_deref(), Some("lexical_only"));
         assert!(FsfsRuntime::search_generation_warnings(&lexical).is_empty());
 
-        let ready = FsfsRuntime::search_serve_ready_event("json", &resources);
+        let ready = FsfsRuntime::search_serve_ready_event(
+            "json",
+            &resources.index_root,
+            resources.vector_index.as_deref(),
+            resources.fast_embedder.is_some(),
+        );
         assert_eq!(ready["semantic_admitted"], false);
         assert_eq!(ready["vector_generation_is_hash"], false);
         assert!(ready["vector_generation_id"].is_null());
