@@ -161,14 +161,26 @@ pub(crate) fn classified_candidates(
     usable: impl FnMut(&VectorHit) -> bool,
     mut census: impl FnMut() -> (bool, ZeroSignalReason),
 ) -> SearchResult<ClassifiedHits> {
-    classified_candidates_controlled(
+    let mut classified = classified_candidates_controlled(
         limit,
         candidate_count,
         search,
         usable,
         || Ok(census()),
         UncancelledScan,
-    )
+    )?;
+    classified.hits = deduplicate_ranked_hits(classified.hits);
+    Ok(classified)
+}
+
+// The cutoff is in physical rows. Keep the best surviving row per ID after
+// ranking, validating its vector, and applying the requested limit.
+pub(super) fn deduplicate_ranked_hits(mut hits: Vec<VectorHit>) -> Vec<VectorHit> {
+    if hits.len() > 1 {
+        let mut seen = AHashSet::with_capacity(hits.len());
+        hits.retain(|hit| seen.insert(hit.doc_id.clone()));
+    }
+    hits
 }
 
 fn classified_candidates_controlled(
@@ -357,7 +369,7 @@ impl VectorIndex {
         filter: Option<&dyn SearchFilter>,
         params: SearchParams,
     ) -> SearchResult<Vec<VectorHit>> {
-        let result = self.search_top_k_controlled(query, limit, filter, params, cx);
+        let result = self.search_top_k_controlled::<true>(query, limit, filter, params, cx);
         // Cancellation wins over a decode/filter error occurring at the same
         // boundary, and no success can escape after the final filter callback.
         ScanCancellation::checkpoint(cx)?;
@@ -458,10 +470,23 @@ impl VectorIndex {
         classified_candidates(
             limit,
             self.record_count().saturating_add(self.wal_entries.len()),
-            |candidate_limit| self.search_top_k(query, candidate_limit, filter),
+            |candidate_limit| {
+                self.search_top_k_rows(query, candidate_limit, filter, SearchParams::default())
+            },
             |hit| self.classified_hit_is_usable(hit),
             || self.classified_search_census(filter.is_some()),
         )
+    }
+
+    /// Rank visible physical copies so their caller can validate them before collapsing IDs.
+    pub(super) fn search_top_k_rows(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_controlled::<false>(query, limit, filter, params, UncancelledScan)
     }
 
     pub(crate) fn classified_hit_is_usable(&self, hit: &VectorHit) -> bool {
@@ -543,10 +568,8 @@ impl VectorIndex {
         query: &[f32],
         limit: usize,
     ) -> SearchResult<Vec<VectorHit>> {
-        let mut hits = self.search_main_top_k_raw(query, limit)?;
-        let mut seen = AHashSet::with_capacity(hits.len());
-        hits.retain(|hit| seen.insert(hit.doc_id.clone()));
-        Ok(hits)
+        self.search_main_top_k_raw(query, limit)
+            .map(deduplicate_ranked_hits)
     }
 
     /// Raw physical top-k over the persisted main slab only.
@@ -662,7 +685,7 @@ impl VectorIndex {
                 UncancelledScan,
             )?;
         }
-        self.resolve_hits(heap, UncancelledScan)
+        self.resolve_hits::<true>(heap, UncancelledScan)
     }
 
     /// Bench-only: force the selective-filter gather path, ignoring the production
@@ -696,7 +719,7 @@ impl VectorIndex {
                 UncancelledScan,
             )?;
         }
-        self.resolve_hits(heap, UncancelledScan)
+        self.resolve_hits::<true>(heap, UncancelledScan)
     }
 
     // The input heap contains main-slab candidates only. Ordinary appends
@@ -785,7 +808,7 @@ impl VectorIndex {
         parallel_chunk_size: usize,
         parallel_enabled: bool,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.search_top_k_controlled(
+        self.search_top_k_controlled::<true>(
             query,
             limit,
             filter,
@@ -798,7 +821,7 @@ impl VectorIndex {
         )
     }
 
-    fn search_top_k_controlled(
+    fn search_top_k_controlled<const DEDUPLICATE: bool>(
         &self,
         query: &[f32],
         limit: usize,
@@ -847,7 +870,7 @@ impl VectorIndex {
                 winners.sort_unstable_by(compare_best_first);
             }
             cancel.checkpoint()?;
-            return self.resolve_sorted_entries(winners, cancel);
+            return self.resolve_sorted_entries::<DEDUPLICATE>(winners, cancel);
         }
 
         let mut heap = if has_main {
@@ -868,7 +891,7 @@ impl VectorIndex {
             heap = self.merge_wal_top_k(query, heap, limit, filter, params, cancel)?;
         }
 
-        self.resolve_hits(heap, cancel)
+        self.resolve_hits::<DEDUPLICATE>(heap, cancel)
     }
 
     /// int8 ADC two-pass exact top-k for **standalone** large-N vector search:
@@ -890,6 +913,16 @@ impl VectorIndex {
     /// match index dimensionality, and `SearchError::IndexCorrupted` for
     /// malformed slab data.
     pub fn search_top_k_int8_two_pass(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_int8_rows(query, k, candidate_multiplier)
+            .map(deduplicate_ranked_hits)
+    }
+
+    pub(super) fn search_top_k_int8_rows(
         &self,
         query: &[f32],
         k: usize,
@@ -917,6 +950,7 @@ impl VectorIndex {
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
         self.search_top_k_int8_two_pass_impl::<false, false>(query, k, candidate_multiplier)
+            .map(deduplicate_ranked_hits)
     }
 
     /// Four-row query-decode-reuse candidate retained only so the null-controlled
@@ -930,6 +964,7 @@ impl VectorIndex {
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
         self.search_top_k_int8_two_pass_impl::<true, false>(query, k, candidate_multiplier)
+            .map(deduplicate_ranked_hits)
     }
 
     /// `vpmaddubs` pass-1 kernel candidate (bd-b5wl), retained for the same-binary A/B.
@@ -944,6 +979,7 @@ impl VectorIndex {
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
         self.search_top_k_int8_two_pass_impl::<false, true>(query, k, candidate_multiplier)
+            .map(deduplicate_ranked_hits)
     }
 
     fn search_top_k_int8_two_pass_impl<const ROW_BLOCKED: bool, const MADDUBS: bool>(
@@ -959,7 +995,7 @@ impl VectorIndex {
             || !self.wal_entries.is_empty()
             || self.quantization() != Quantization::F16
         {
-            return self.search_top_k(query, k, None);
+            return self.search_top_k_rows(query, k, None, SearchParams::default());
         }
         if query.len() != self.dimension() {
             return Err(SearchError::DimensionMismatch {
@@ -1035,7 +1071,7 @@ impl VectorIndex {
             let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
             insert_candidate(&mut heap, HeapEntry::new(index, score), k);
         }
-        self.resolve_hits(heap, UncancelledScan)
+        self.resolve_hits::<false>(heap, UncancelledScan)
     }
 
     fn int8_scan_range_orig<const MADDUBS: bool>(
@@ -1320,7 +1356,7 @@ impl VectorIndex {
             let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
             insert_candidate(&mut heap, HeapEntry::new(candidate.index, score), k);
         }
-        self.resolve_hits(heap, UncancelledScan)
+        self.resolve_hits::<true>(heap, UncancelledScan)
     }
 
     /// Bounded-heap 4-bit scan of records `[start, end)` over the packed nibble
@@ -1931,7 +1967,7 @@ impl VectorIndex {
         Ok(())
     }
 
-    fn resolve_hits(
+    fn resolve_hits<const DEDUPLICATE: bool>(
         &self,
         heap: BinaryHeap<HeapEntry>,
         cancel: impl ScanCancellation,
@@ -1944,10 +1980,10 @@ impl VectorIndex {
         let mut winners = heap.into_vec();
         winners.sort_unstable_by(compare_best_first);
         cancel.checkpoint()?;
-        self.resolve_sorted_entries(winners, cancel)
+        self.resolve_sorted_entries::<DEDUPLICATE>(winners, cancel)
     }
 
-    fn resolve_sorted_entries(
+    fn resolve_sorted_entries<const DEDUPLICATE: bool>(
         &self,
         winners: Vec<HeapEntry>,
         cancel: impl ScanCancellation,
@@ -1962,7 +1998,9 @@ impl VectorIndex {
             wal_hashes.insert(entry.doc_id_hash);
         }
 
-        let mut seen: AHashSet<String> = AHashSet::with_capacity(winners.len());
+        // Classified retrieval needs the physical copies until their vectors
+        // have been checked. The ordinary numeric API deduplicates here.
+        let mut seen = DEDUPLICATE.then(|| AHashSet::<String>::with_capacity(winners.len()));
         let mut hits = Vec::with_capacity(winners.len());
         for (offset, winner) in winners.into_iter().enumerate() {
             cancel.checkpoint_at(offset)?;
@@ -1970,7 +2008,7 @@ impl VectorIndex {
                 let wal_idx = from_wal_index(winner.index);
                 let doc_id = &self.wal_entries[wal_idx].doc_id;
                 // Skip WAL-vs-WAL duplicates (keep the first, i.e. highest-scored).
-                if !seen.insert(doc_id.clone()) {
+                if seen.as_mut().is_some_and(|ids| !ids.insert(doc_id.clone())) {
                     continue;
                 }
                 hits.push(self.resolve_wal_hit(&winner)?);
@@ -1998,7 +2036,7 @@ impl VectorIndex {
                     }
                 }
                 // Skip main-vs-main duplicates (String-based for correctness).
-                if !seen.insert(doc_id.clone()) {
+                if seen.as_mut().is_some_and(|ids| !ids.insert(doc_id.clone())) {
                     continue;
                 }
                 let index_u32 =
@@ -2523,7 +2561,7 @@ mod tests {
         let winners: Vec<_> = (0..index.record_count())
             .map(|row| HeapEntry::new(row, 1.0))
             .collect();
-        let result = index.resolve_sorted_entries(
+        let result = index.resolve_sorted_entries::<true>(
             winners,
             CancelDuringRows {
                 cx: &cx,

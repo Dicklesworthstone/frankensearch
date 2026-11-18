@@ -32,7 +32,7 @@ use crate::native_hnsw::{
     HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
     native_hnsw_generation_receipt_path,
 };
-use crate::search::classified_candidates;
+use crate::search::{classified_candidates, deduplicate_ranked_hits, query_zero_signal};
 use crate::{
     ClassifiedHits, FsviAdmissionError, FsviUpgradeRequired, FsviV2IdentityBinding, Quantization,
     SearchParams, ValidatedFsviBytes, VectorIndex, VectorMetadata, dot_product_f32_f32,
@@ -1607,6 +1607,16 @@ impl TwoTierIndex {
         k: usize,
         params: Option<SearchParams>,
     ) -> SearchResult<Vec<VectorHit>> {
+        self.search_fast_candidates(query_vec, k, params)
+            .map(deduplicate_ranked_hits)
+    }
+
+    fn search_fast_candidates(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<Vec<VectorHit>> {
         #[cfg(feature = "ann")]
         if let Some(ann) = &self.fast_ann {
             // Source-aware HNSW filters tombstones and exact-repairs native
@@ -1647,7 +1657,12 @@ impl TwoTierIndex {
                     k,
                     "fast-tier ANN selected a row its resident WAL supersedes; using exact search"
                 );
-                return self.fast_tier().search_top_k(query_vec, k, None);
+                return self.fast_tier().search_top_k_rows(
+                    query_vec,
+                    k,
+                    None,
+                    SearchParams::default(),
+                );
             }
 
             return self.resolve_fast_ann_and_wal(hits, query_vec, k);
@@ -1675,11 +1690,11 @@ impl TwoTierIndex {
         params.map_or_else(
             || {
                 self.fast_tier()
-                    .search_top_k_int8_two_pass(query_vec, k, FAST_TIER_MULT)
+                    .search_top_k_int8_rows(query_vec, k, FAST_TIER_MULT)
             },
             |params| {
                 self.fast_tier()
-                    .search_top_k_with_params(query_vec, k, None, params)
+                    .search_top_k_rows(query_vec, k, None, params)
             },
         )
     }
@@ -1726,20 +1741,8 @@ impl TwoTierIndex {
                 found: query_vec.len(),
             });
         }
-        if k == 0 {
-            let classified = ClassifiedHits::empty(ZeroSignalReason::CallerRequestedZeroK);
-            self.note_zero_signal(classified.zero_signal);
-            return Ok(classified);
-        }
-        if query_vec.iter().any(|value| !value.is_finite()) {
-            return Err(SearchError::InvalidConfig {
-                field: "query".to_owned(),
-                value: "<contains non-finite values>".to_owned(),
-                reason: "query vector must be finite".to_owned(),
-            });
-        }
-        if query_vec.iter().all(|&value| value == 0.0) {
-            let classified = ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery);
+        if let Some(reason) = query_zero_signal(query_vec, k)? {
+            let classified = ClassifiedHits::empty(reason);
             self.note_zero_signal(classified.zero_signal);
             return Ok(classified);
         }
@@ -1747,7 +1750,7 @@ impl TwoTierIndex {
         let classified = classified_candidates(
             k,
             fast.record_count().saturating_add(fast.wal_entries.len()),
-            |candidate_limit| self.search_fast_with_params(query_vec, candidate_limit, params),
+            |candidate_limit| self.search_fast_candidates(query_vec, candidate_limit, params),
             |hit| fast.classified_hit_is_usable(hit),
             || self.classified_fast_census(),
         )?;
@@ -1870,7 +1873,7 @@ impl TwoTierIndex {
         // 2. retain only the physical top-k;
         // 3. suppress a main hit when any resident WAL version of its doc_id
         //    exists (including a non-finite/corrupt version);
-        // 4. deduplicate public doc_ids best-first.
+        // 4. the public caller deduplicates doc_ids best-first after any vector checks.
         //
         // A selected main row its WAL supersedes never reaches this point:
         // the search defers to exact search, which excludes it before
@@ -1920,13 +1923,9 @@ impl TwoTierIndex {
             .iter()
             .map(|entry| entry.doc_id.as_str())
             .collect();
-        let mut seen_doc_ids = HashSet::with_capacity(hits.len());
         hits.retain(|hit| {
             let is_main = usize::try_from(hit.index).is_ok_and(|index| index < base_index);
-            if is_main && wal_doc_ids.contains(hit.doc_id.as_str()) {
-                return false;
-            }
-            seen_doc_ids.insert(hit.doc_id.clone())
+            !(is_main && wal_doc_ids.contains(hit.doc_id.as_str()))
         });
         Ok(hits)
     }

@@ -65,6 +65,138 @@ fn config(candidates: usize) -> MrlConfig {
     }
 }
 
+fn duplicate_fixture(quantization: Quantization) -> TempFixturePath {
+    let path = TempFixturePath::new("classified-duplicate", "index.fsvi");
+    let mut writer =
+        VectorIndex::create_with_revision(&path, "fixture", "r1", 2, quantization).unwrap();
+    for (id, first) in [("repeat", 1.0), ("repeat", 0.5), ("other", -1.0)] {
+        writer.write_record(id, &[first, 1.0]).unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+#[test]
+fn classified_duplicate_rows_preserve_the_physical_cutoff() {
+    let query = [1.0, 0.0];
+    for quantization in [Quantization::F16, Quantization::F32] {
+        let path = duplicate_fixture(quantization);
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let memory = crate::InMemoryVectorIndex::from_fsvi(&path).unwrap();
+        let fast = crate::TwoTierIndex::open_with_paths(
+            &crate::TwoTierIndexPaths::new(path.to_path_buf()),
+            frankensearch_core::TwoTierConfig {
+                mrl_search_dims: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let winner = (0..index.record_count())
+            .find(|&row| index.vector_at_f32(row).unwrap()[0].to_bits() == 1.0_f32.to_bits())
+            .unwrap();
+        for k in [2, 3] {
+            let expected_ids: &[&str] = if k == 2 {
+                &["repeat"]
+            } else {
+                &["repeat", "other"]
+            };
+            for hits in [
+                index.search_top_k_classified(&query, k, None).unwrap().hits,
+                index.mrl_search(&query, k, &config(k), None).unwrap(),
+                memory
+                    .search_top_k_classified(&query, k, None)
+                    .unwrap()
+                    .hits,
+                fast.search_fast_classified(&query, k).unwrap().hits,
+            ] {
+                assert_eq!(
+                    hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+                    expected_ids
+                );
+                assert_eq!(hits[0].index, u32::try_from(winner).unwrap());
+                assert_eq!(hits[0].score.to_bits(), 1.0_f32.to_bits());
+            }
+        }
+    }
+}
+
+#[test]
+fn classified_duplicate_rows_recover_a_usable_copy_hidden_by_corruption() {
+    // The zeroed copy outranks the negative-scoring valid copy. Document-ID
+    // deduplication before checking the vector would discard the only usable copy.
+    let query = [-1.0, 0.0];
+    let only_repeat = PredicateFilter::new("only-repeat", |id| id == "repeat");
+    for quantization in [Quantization::F16, Quantization::F32] {
+        let path = duplicate_fixture(quantization);
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let stride = match quantization {
+            Quantization::F16 => 4,
+            Quantization::F32 => 8,
+        };
+        let base = usize::try_from(index.metadata().vectors_offset).unwrap();
+        let broken = (0..index.record_count())
+            .find(|&row| index.vector_at_f32(row).unwrap()[0].to_bits() == 1.0_f32.to_bits())
+            .unwrap();
+        let survivor = (0..index.record_count())
+            .find(|&row| index.vector_at_f32(row).unwrap()[0].to_bits() == 0.5_f32.to_bits())
+            .unwrap();
+        drop(index);
+        bytes[base + broken * stride..base + (broken + 1) * stride].fill(0);
+        fs::write(&path, bytes).unwrap();
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let memory = crate::InMemoryVectorIndex::from_fsvi(&path).unwrap();
+        let fast = crate::TwoTierIndex::open_with_paths(
+            &crate::TwoTierIndexPaths::new(path.to_path_buf()),
+            frankensearch_core::TwoTierConfig::default(),
+        )
+        .unwrap();
+        for k in [1, usize::MAX] {
+            for hits in [
+                index
+                    .search_top_k_classified(&query, k, Some(&only_repeat))
+                    .unwrap()
+                    .hits,
+                memory
+                    .search_top_k_classified(&query, k, Some(&only_repeat))
+                    .unwrap()
+                    .hits,
+                index
+                    .mrl_search(&query, k, &config(k), Some(&only_repeat))
+                    .unwrap(),
+            ] {
+                assert_eq!(
+                    signature(&hits),
+                    [(
+                        "repeat".to_owned(),
+                        (-0.5_f32).to_bits(),
+                        u32::try_from(survivor).unwrap()
+                    )]
+                );
+            }
+        }
+        // With the query reversed, the healthy copy wins. The invalid copy
+        // still occupies the second slot unless the backend validates each
+        // physical winner before collapsing labels.
+        for (direction, ids, repeat_pos) in [
+            (query, ["other", "repeat"], 1),
+            ([1.0, 0.0], ["repeat", "other"], 0),
+        ] {
+            for params in [None, Some(crate::SearchParams::default())] {
+                let hits = fast
+                    .search_fast_classified_with_params(&direction, 2, params)
+                    .unwrap()
+                    .hits;
+                assert_eq!(
+                    hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+                    ids
+                );
+                assert_eq!(hits[repeat_pos].index, u32::try_from(survivor).unwrap());
+            }
+        }
+    }
+}
+
 #[test]
 fn persisted_replacements_cannot_consume_mrl_candidate_or_result_slots() {
     for quantization in [Quantization::F16, Quantization::F32] {
