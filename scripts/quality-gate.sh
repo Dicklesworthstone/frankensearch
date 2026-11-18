@@ -61,6 +61,7 @@
 #   QUALITY_GATE_CROSS_TARGET  triple for the cross stage (default x86_64-pc-windows-msvc)
 #   QUALITY_GATE_ALLOW_CROSS_SKIP=1  let the cross stage SKIP when that target's std is absent
 #   CARGO_BUILD_JOBS           forwarded to cargo (default 16)
+#   RCH_REQUIRE_REMOTE         on a managed native gate host, set to 0 to allow local Cargo
 #
 # The rch compile-offload hook on the dev fleet is bypassed here on purpose: a gate must run
 # on the host it reports for.
@@ -72,7 +73,6 @@ cd "$REPO_ROOT"
 
 export RCH_DISABLE=1
 export RCH_CARGO_WRAPPER_BYPASS=1
-unset RCH_REQUIRE_REMOTE || true
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
 MODEL_DIR="${QUALITY_GATE_MODEL_DIR:-$HOME/.local/share/frankensearch/models}"
