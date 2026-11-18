@@ -383,17 +383,17 @@ fn lexical_native_watch_streams_creates_updates_and_removals_at_the_publication_
 #[test]
 fn scoped_lexical_watch_tracks_membership_without_restricting_source_indexing() {
     let fixture = Fixture::new(None, false);
-    fs::write(
-        fixture.source.join("parser.rs"),
-        "sharedtoken eligible Rust document",
-    )
-    .unwrap();
+    let src = fixture.source.join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("parser.rs"), "sharedtoken eligible Rust document").unwrap();
+    fs::write(src.join("guide.md"), "sharedtoken in-scope Markdown").unwrap();
+    fs::write(fixture.source.join("outside.rs"), "sharedtoken outside src").unwrap();
     let mut process = Process::start(
         fixture
             .lexical_command(&fixture.source, &fixture.store)
             .args([
                 "--filter",
-                "path:source/ lang:rust",
+                "path:src/ lang:rust",
                 "--limit",
                 "1",
                 "--max-updates",
@@ -407,14 +407,10 @@ fn scoped_lexical_watch_tracks_membership_without_restricting_source_indexing() 
     assert_eq!(first["event"], "snapshot");
     assert_eq!(first["result_count"], 1);
     let selected = first["results"][0]["doc_id"].as_str().unwrap();
-    assert_eq!(Path::new(selected).file_name().unwrap(), "parser.rs");
+    assert_eq!(selected, "src/parser.rs");
 
     // Source membership remains, but changing its extension leaves this scope.
-    fs::rename(
-        fixture.source.join("parser.rs"),
-        fixture.source.join("parser.txt"),
-    )
-    .unwrap();
+    fs::rename(src.join("parser.rs"), src.join("parser.txt")).unwrap();
     let output = process.finish(Duration::from_secs(75));
     assert!(
         output.status.success(),
@@ -459,20 +455,17 @@ fn scoped_lexical_watch_tracks_membership_without_restricting_source_indexing() 
         )
         .unwrap();
         unscoped.poll(&cx, Instant::now()).await.unwrap().unwrap();
-        let names = unscoped
+        let mut ids = unscoped
             .tracker()
             .results()
             .iter()
-            .map(|result| {
-                Path::new(&result.hit.doc_id)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|result| result.hit.doc_id.as_str())
             .collect::<Vec<_>>();
-        assert!(names.contains(&"alpha.md".to_owned()));
-        assert!(names.contains(&"parser.txt".to_owned()));
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["alpha.md", "outside.rs", "src/guide.md", "src/parser.txt"]
+        );
     });
 }
 
