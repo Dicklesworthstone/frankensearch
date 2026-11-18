@@ -2081,42 +2081,8 @@ impl VectorIndex {
             }
         };
         let (metadata, header_len) = parse_header(path, &data)?;
-
-        let records_bytes = metadata
-            .record_count
-            .checked_mul(RECORD_SIZE_BYTES)
-            .ok_or_else(|| index_corrupted(path, "record table size overflow"))?;
-        let records_offset = header_len;
-        let strings_offset = records_offset
-            .checked_add(records_bytes)
-            .ok_or_else(|| index_corrupted(path, "record table offset overflow"))?;
-        let vectors_offset = usize::try_from(metadata.vectors_offset)
-            .map_err(|_| index_corrupted(path, "vectors_offset does not fit in usize"))?;
-        if vectors_offset < strings_offset {
-            return Err(index_corrupted(
-                path,
-                "vectors_offset points inside the record table/string table region",
-            ));
-        }
-
-        let vector_bytes = metadata
-            .record_count
-            .checked_mul(metadata.dimension)
-            .and_then(|v| v.checked_mul(metadata.quantization.bytes_per_element()))
-            .ok_or_else(|| index_corrupted(path, "vector slab size overflow"))?;
-        let required_len = vectors_offset
-            .checked_add(vector_bytes)
-            .ok_or_else(|| index_corrupted(path, "vector slab end overflow"))?;
-        if data.len() < required_len {
-            return Err(index_corrupted(
-                path,
-                format!(
-                    "truncated file: have {} bytes, need at least {} bytes",
-                    data.len(),
-                    required_len
-                ),
-            ));
-        }
+        let (records_offset, strings_offset, vectors_offset) =
+            validate_v1_layout_len(path, &metadata, header_len, data.len())?;
 
         let warm_up_config = WarmUpConfig::from_env();
         if !matches!(warm_up_config.strategy, WarmUpStrategy::None) {
@@ -2410,16 +2376,36 @@ impl VectorIndex {
         Ok(Self::peek_header_metadata(path)?.publication_nonce)
     }
 
+    /// Read a legacy FSVI header and verify its main-file layout under a
+    /// shared lock. Useful for reporting publication metadata before search
+    /// admission. The read is bounded to the header prefix and skips the WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for a missing, locked, truncated, or malformed
+    /// main file, an incompatible version, or an I/O failure.
+    pub fn read_legacy_publication_metadata(path: &Path) -> SearchResult<VectorMetadata> {
+        let file = File::open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SearchError::IndexNotFound {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                SearchError::Io(error)
+            }
+        })?;
+        file.try_lock_shared()
+            .map_err(|error| map_lock_error(path, "shared reader", &error))?;
+        let actual_len = usize::try_from(file.metadata().map_err(SearchError::Io)?.len())
+            .map_err(|_| index_corrupted(path, "file length does not fit in usize"))?;
+        let (metadata, header_len) = read_legacy_header(path, &file)?;
+        validate_v1_layout_len(path, &metadata, header_len, actual_len)?;
+        Ok(metadata)
+    }
+
     fn peek_header_metadata(path: &Path) -> SearchResult<VectorMetadata> {
-        use std::io::Read;
-        // The variable-length header (two u16-length strings + fixed fields +
-        // CRC) cannot exceed 256 KiB, so this prefix always suffices.
         let file = File::open(path).map_err(SearchError::Io)?;
-        let mut data = Vec::new();
-        file.take(256 * 1024)
-            .read_to_end(&mut data)
-            .map_err(SearchError::Io)?;
-        let (metadata, _header_len) = parse_header(path, &data)?;
+        let (metadata, _) = read_legacy_header(path, &file)?;
         Ok(metadata)
     }
 
@@ -4528,6 +4514,14 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
     ))
 }
 
+fn read_legacy_header(path: &Path, file: &File) -> SearchResult<(VectorMetadata, usize)> {
+    let mut header = Vec::new();
+    file.take(FSVI_V1_MAX_HEADER_BYTES as u64)
+        .read_to_end(&mut header)
+        .map_err(SearchError::Io)?;
+    parse_header(path, &header)
+}
+
 fn read_header_for_inspection(path: &Path) -> SearchResult<(u16, Vec<u8>)> {
     if !path.exists() {
         return Err(SearchError::IndexNotFound {
@@ -5725,6 +5719,44 @@ fn validate_expected_v2_binding(
         ));
     }
     Ok(())
+}
+
+fn validate_v1_layout_len(
+    path: &Path,
+    metadata: &VectorMetadata,
+    records_offset: usize,
+    actual_len: usize,
+) -> SearchResult<(usize, usize, usize)> {
+    let records_bytes = metadata
+        .record_count
+        .checked_mul(RECORD_SIZE_BYTES)
+        .ok_or_else(|| index_corrupted(path, "record table size overflow"))?;
+    let strings_offset = records_offset
+        .checked_add(records_bytes)
+        .ok_or_else(|| index_corrupted(path, "record table offset overflow"))?;
+    let vectors_offset = usize::try_from(metadata.vectors_offset)
+        .map_err(|_| index_corrupted(path, "vectors_offset does not fit in usize"))?;
+    if vectors_offset < strings_offset {
+        return Err(index_corrupted(
+            path,
+            "vectors_offset points inside the record table/string table region",
+        ));
+    }
+    let vector_bytes = metadata
+        .record_count
+        .checked_mul(metadata.dimension)
+        .and_then(|v| v.checked_mul(metadata.quantization.bytes_per_element()))
+        .ok_or_else(|| index_corrupted(path, "vector slab size overflow"))?;
+    let required_len = vectors_offset
+        .checked_add(vector_bytes)
+        .ok_or_else(|| index_corrupted(path, "vector slab end overflow"))?;
+    if actual_len < required_len {
+        return Err(index_corrupted(
+            path,
+            format!("truncated file: have {actual_len} bytes, need at least {required_len} bytes"),
+        ));
+    }
+    Ok((records_offset, strings_offset, vectors_offset))
 }
 
 fn validate_v2_layout_len(
@@ -11719,6 +11751,41 @@ mod tests {
         assert_eq!(meta.quantization, Quantization::F32);
         assert_eq!(meta.record_count, 1);
         assert_eq!(meta.vectors_offset % 64, 0);
+    }
+
+    #[test]
+    fn publication_metadata_checks_legacy_layout_and_writer_lock_without_replaying_wal() {
+        let path = temp_index_path("legacy-publication-metadata");
+        let mut writer = VectorIndex::create(&path, "published", 2).unwrap();
+        writer.write_record("doc", &[1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+        let writer = VectorIndex::open_writer(&path).unwrap();
+        assert!(matches!(
+            VectorIndex::read_legacy_publication_metadata(&path),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "fsvi.map_lock"
+        ));
+        let expected = writer.metadata().clone();
+        drop(writer);
+
+        let wal_path = wal::wal_path_for(&path);
+        let bad_wal = [0; 64];
+        fs::write(&wal_path, bad_wal).unwrap();
+        assert!(matches!(
+            VectorIndex::open_read_only(&path),
+            Err(SearchError::IndexCorrupted { .. })
+        ));
+        assert_eq!(
+            VectorIndex::read_legacy_publication_metadata(&path).unwrap(),
+            expected
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), bad_wal);
+
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(matches!(
+            VectorIndex::read_legacy_publication_metadata(&path),
+            Err(SearchError::IndexCorrupted { .. })
+        ));
     }
 
     // ─── is_deleted accessor ────────────────────────────────────────────

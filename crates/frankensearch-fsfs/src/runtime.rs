@@ -11110,25 +11110,27 @@ impl FsfsRuntime {
         vector_index: Option<&VectorIndex>,
         fast_embedder_loaded: bool,
     ) -> serde_json::Value {
-        // A lexical-first daemon can report readable published metadata
-        // before it admits a vector tier for a semantic request.
-        let generation = vector_index
-            .map(|index| {
-                let id = index.embedder_id();
-                (id.to_owned(), Self::is_legacy_hash_vector_generation(id))
-            })
+        // A lexical-first daemon reports the main-file publication identity
+        // without paying for a vector map or accepting its WAL.
+        let embedder_id = vector_index
+            .map(|index| index.embedder_id().to_owned())
             .or_else(|| {
-                Self::inspect_published_vector_generation(index_root)
-                    .map(|generation| (generation.id, generation.is_hash_control))
+                VectorIndex::read_legacy_publication_metadata(
+                    &index_root.join(FSFS_VECTOR_INDEX_FILE),
+                )
+                .ok()
+                .map(|metadata| metadata.embedder_id)
             });
-        let is_hash = generation.as_ref().is_some_and(|(_, is_hash)| *is_hash);
+        let is_hash = embedder_id
+            .as_deref()
+            .is_some_and(Self::is_legacy_hash_vector_generation);
         serde_json::json!({
             "ok": true,
             "event": "ready",
             "schema_version": FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             "pid": std::process::id(),
             "format": format.into(),
-            "vector_generation_id": generation.map(|(id, _)| id),
+            "vector_generation_id": embedder_id,
             "vector_generation_is_hash": is_hash,
             "semantic_admitted": vector_index.is_some() && !is_hash && fast_embedder_loaded,
         })
@@ -48755,20 +48757,22 @@ mod tests {
             socket_path.clone(),
             Arc::clone(&coordinator),
         );
-        let mut stream = connect_socket_with_retry(&socket_path);
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("read timeout");
-        stream.write_all(b":ready\n").expect("write ready control");
-        stream.flush().expect("flush ready control");
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .expect("half-close ready control");
-        let mut raw = String::new();
         use std::io::Read as _;
-        stream.read_to_string(&mut raw).expect("read ready event");
-        let ready: serde_json::Value =
-            serde_json::from_str(raw.trim()).expect("ready event must be json");
+        let probe = || {
+            let mut stream = connect_socket_with_retry(&socket_path);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            stream.write_all(b":ready\n").expect("write ready control");
+            stream.flush().expect("flush ready control");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("half-close ready control");
+            let mut raw = String::new();
+            stream.read_to_string(&mut raw).expect("read ready event");
+            serde_json::from_str::<serde_json::Value>(raw.trim()).expect("ready event must be json")
+        };
+        let ready = probe();
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["ok"], true);
         assert_eq!(ready["schema_version"], super::FSFS_SEARCH_SERVE_SCHEMA_VERSION);
@@ -48780,6 +48784,18 @@ mod tests {
             published.is_hash_control
         );
         assert_eq!(ready["semantic_admitted"], false);
+
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        let wal_path = frankensearch_index::wal_path_for(&vector_path);
+        let bad_wal = [0; 64];
+        fs::write(&wal_path, bad_wal).expect("plant an unreadable WAL header");
+        assert!(matches!(
+            VectorIndex::open_read_only(&vector_path),
+            Err(SearchError::IndexCorrupted { .. })
+        ));
+        assert_eq!(probe(), ready, "cold readiness should describe the main file");
+        assert_eq!(fs::read(&wal_path).unwrap(), bad_wal);
+
         coordinator.request_shutdown(ShutdownReason::UserRequest);
         let result = join_with_timeout(handle, Duration::from_secs(2));
         assert!(result.is_ok(), "serve exits cleanly: {result:?}");
