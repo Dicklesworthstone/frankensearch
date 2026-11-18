@@ -410,7 +410,7 @@ impl FsfsRuntime {
         store: &CompleteGenerationStore,
         candidate_root: &Path,
     ) -> SearchResult<FsfsIndexPayload> {
-        self.run_retained_index_with_progress(cx, store, candidate_root, false, |_| Ok(()))
+        self.run_retained_index_with_progress(cx, store, candidate_root, false, None, |_| Ok(()))
             .await
     }
 
@@ -420,6 +420,7 @@ impl FsfsRuntime {
         store: &CompleteGenerationStore,
         candidate_root: &Path,
         resumed: bool,
+        admitted_quality: Option<super::IndexingQualityTier>,
         on_progress: F,
     ) -> SearchResult<FsfsIndexPayload>
     where
@@ -435,12 +436,13 @@ impl FsfsRuntime {
         } else {
             self
         };
-        let payload = Box::pin(runtime.run_one_shot_index_scaffold_internal(
+        let payload = Box::pin(runtime.run_one_shot_index_with_quality(
             cx,
             CliCommand::Index,
             on_progress,
             false,
             false,
+            admitted_quality,
         ))
         .await?;
         Self::validate_search_generation_at_root(candidate_root, self.indexing_search_mode())?;

@@ -7397,6 +7397,8 @@ impl std::fmt::Debug for RerankerSlot {
 #[derive(Default)]
 struct QualityEmbedderSlot(Option<Arc<dyn Embedder>>);
 
+type IndexingQualityTier = (Option<Arc<dyn Embedder>>, &'static str);
+
 type QualityInitialization =
     asupersync::runtime::TaskHandle<SearchResult<Option<Arc<dyn Embedder>>>>;
 
@@ -21627,14 +21629,36 @@ impl FsfsRuntime {
             .map(|_| ())
     }
 
+    fn run_one_shot_index_scaffold_internal<F>(
+        &self,
+        cx: &Cx,
+        command: CliCommand,
+        on_progress: F,
+        emit_user_output: bool,
+        retain_legacy_reuse: bool,
+    ) -> impl Future<Output = SearchResult<FsfsIndexPayload>>
+    where
+        F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
+    {
+        self.run_one_shot_index_with_quality(
+            cx,
+            command,
+            on_progress,
+            emit_user_output,
+            retain_legacy_reuse,
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
-    async fn run_one_shot_index_scaffold_internal<F>(
+    async fn run_one_shot_index_with_quality<F>(
         &self,
         cx: &Cx,
         command: CliCommand,
         mut on_progress: F,
         emit_user_output: bool,
         retain_legacy_reuse: bool,
+        admitted_quality: Option<IndexingQualityTier>,
     ) -> SearchResult<FsfsIndexPayload>
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
@@ -21870,7 +21894,10 @@ impl FsfsRuntime {
             (None, REASON_VECTOR_QUALITY_TIER_BUILT)
         } else {
             control.admit_work(cx, "index.quality_model_load").await?;
-            self.resolve_indexing_quality_embedder()?
+            match admitted_quality {
+                Some(tier) => tier,
+                None => self.resolve_indexing_quality_embedder()?,
+            }
         };
         control.checkpoint(cx, "index.quality_model_loaded", true)?;
         if let Some(quality_embedder) = quality_embedder.as_ref() {
@@ -25282,9 +25309,7 @@ impl FsfsRuntime {
     /// available. A missing optional model permits a fast-only index. Under
     /// compatible-contract reuse, an installed producer that fails verification
     /// must not replace a previous selection with a fast-only generation.
-    fn resolve_indexing_quality_embedder(
-        &self,
-    ) -> SearchResult<(Option<Arc<dyn Embedder>>, &'static str)> {
+    fn resolve_indexing_quality_embedder(&self) -> SearchResult<IndexingQualityTier> {
         if self.config.indexing.quality_model.trim().is_empty() {
             return Ok((None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY));
         }

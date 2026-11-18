@@ -1372,7 +1372,7 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                 } else {
                     frankensearch_fsfs::output_schema::OutputErrorCode::EMBEDDER_UNAVAILABLE
                 };
-                if quality_drift && !legacy_seed {
+                if quality_drift {
                     let output = Process::start(
                         fixture
                             .command("index", "json")
@@ -1385,7 +1385,13 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
                     assert_eq!(response["error"]["code"], expected_code, "{output:?}");
                     assert_eq!(document_batches(&output), 0);
-                    assert_eq!(Some(fs::read(&pointer).unwrap()), selection);
+                    assert_eq!(
+                        pointer.exists().then(|| fs::read(&pointer).unwrap()),
+                        selection
+                    );
+                    if legacy_seed {
+                        assert!(!fixture.store.join("generations").try_exists().unwrap());
+                    }
                 }
                 let output =
                     watch(&fixture, "compatible-contract").finish(Duration::from_secs(180));
@@ -1410,6 +1416,9 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                     pointer.exists().then(|| fs::read(&pointer).unwrap()),
                     selection
                 );
+                if legacy_seed {
+                    assert!(!fixture.store.join("generations").try_exists().unwrap());
+                }
                 assert_eq!(fs::read(&fixture.config).unwrap(), configuration);
                 assert_eq!(fs::read(model.join(".verified")).unwrap(), receipt);
                 for (relative, bytes) in &old_artifacts {

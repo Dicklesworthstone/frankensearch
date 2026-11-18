@@ -15,6 +15,13 @@ enum RetainedRebuildStart<'a> {
     Resume(&'a RetainedRebuildCheckpoint),
 }
 
+#[derive(Default)]
+struct LegacyUpgradeProducers {
+    // Keep the shared fast loader's weak cache alive through candidate admission.
+    _fast: Option<Arc<dyn Embedder>>,
+    quality: Option<IndexingQualityTier>,
+}
+
 /// A reusable search reader bound to one admitted complete generation.
 ///
 /// Publishing a successor does not retarget this reader. Open a new reader to
@@ -587,11 +594,11 @@ impl FsfsRuntime {
         .await
     }
 
-    async fn admit_legacy_upgrade_fast_producer(
+    async fn admit_legacy_upgrade_producers(
         &self,
         cx: &Cx,
         root: &Path,
-    ) -> SearchResult<Option<Arc<dyn Embedder>>> {
+    ) -> SearchResult<LegacyUpgradeProducers> {
         use crate::generation_store::COMPLETE_GENERATION_POINTER;
 
         if !matches!(
@@ -606,7 +613,7 @@ impl FsfsRuntime {
             || complete_cli::complete_entry_exists(&root.join("generations"))?
             || !Self::read_index_sentinel(root)?.is_some_and(|sentinel| sentinel.generation_complete)
         {
-            return Ok(None);
+            return Ok(LegacyUpgradeProducers::default());
         }
         self.validate_semantic_model_selection(self.indexing_search_mode())?;
         let mut control = IndexRunControl::new(&self.config)?;
@@ -635,8 +642,29 @@ impl FsfsRuntime {
         let embedder = resolved?;
         control.checkpoint(cx, "index.fast_model_loaded", true)?;
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
+        let quality = if self.contract_upgrade_reuse_enabled() {
+            control.admit_work(cx, "index.quality_model_load").await?;
+            // Unit tests inject providers on the caller's thread.
+            #[cfg(test)]
+            let tier = self.resolve_indexing_quality_embedder()?;
+            #[cfg(not(test))]
+            let tier = if cx.blocking_pool_handle().is_some() {
+                let runtime = self.clone();
+                Self::search_blocking(cx, move || runtime.resolve_indexing_quality_embedder())
+                    .await??
+            } else {
+                self.resolve_indexing_quality_embedder()?
+            };
+            control.checkpoint(cx, "index.quality_model_loaded", true)?;
+            Some(tier)
+        } else {
+            None
+        };
         retained_search_checkpoint(cx)?;
-        Ok(Some(embedder))
+        Ok(LegacyUpgradeProducers {
+            _fast: Some(embedder),
+            quality,
+        })
     }
 
     #[allow(clippy::future_not_send)]
@@ -677,16 +705,15 @@ impl FsfsRuntime {
             receipt.admit_scope(cx, self).await?;
         }
         // Creating `generations` makes complete-store routing authoritative.
-        // Admit the required fast producer before first promoting a searchable
-        // legacy index, so a rejected model leaves that index readable. Retain
-        // the producer through the build: the shared model cache holds Weak
-        // references, and the indexer still owns its single readiness probe.
-        let _legacy_fast_producer =
+        // Refuse incompatible installed producers before taking over routing
+        // from a searchable legacy index. The indexer probes the admitted
+        // models and checks their identities against any rows it carries.
+        let producers =
             if kind == RetainedBuildKind::Index && matches!(start, RetainedRebuildStart::Fresh) {
-                self.admit_legacy_upgrade_fast_producer(cx, &canonical_root)
+                self.admit_legacy_upgrade_producers(cx, &canonical_root)
                     .await?
             } else {
-                None
+                LegacyUpgradeProducers::default()
             };
         let resumed = matches!(start, RetainedRebuildStart::Resume(_));
         let store = if resumed {
@@ -738,6 +765,7 @@ impl FsfsRuntime {
             &store,
             build.path(),
             resumed,
+            producers.quality,
             on_progress,
         ))
         .await?;
