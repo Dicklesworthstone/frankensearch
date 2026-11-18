@@ -894,18 +894,11 @@ impl VectorIndex {
         self.resolve_hits::<DEDUPLICATE>(heap, cancel)
     }
 
-    /// int8 ADC two-pass exact top-k for **standalone** large-N vector search:
-    /// a fast parallel int8 pass-1 over all main records keeps the top
-    /// `k·candidate_multiplier` by approximate score, then an exact f16 rescore of
-    /// just those candidates selects the final top-k. Lossless (recall=1.0) whenever
-    /// pass-1 retains the true top-k — validated on the in-memory twin; the int8
-    /// dot is monotonic with the true dot under one corpus max-abs scale.
-    ///
-    /// Covers the contiguous F16 main-vector region only; falls back to the exact
-    /// [`VectorIndex::search_top_k`] when a WAL is present or quantization is not F16
-    /// (so results are always correct, never silently degraded). Not wired into the
-    /// BOLD hybrid (that gap is not vector-bound — see `docs/NEGATIVE_EVIDENCE.md`);
-    /// this targets pure vector-search latency at large N.
+    /// Select up to `k * candidate_multiplier.max(1)` physical rows by their
+    /// int8 dot products, then rank them by their exact f16 scores. Rounding
+    /// can tie or reorder candidates near the cutoff and exclude a true winner.
+    /// Use [`Self::search_top_k`] for exhaustive selection. Indexes with a
+    /// resident WAL or F32 vectors already use that exact scan.
     ///
     /// # Errors
     ///
@@ -1272,15 +1265,10 @@ impl VectorIndex {
         })
     }
 
-    /// 4-bit (16-level) two-pass exact top-k for standalone large-N vector search.
-    /// A fast parallel pass-1 over a packed signed-4-bit slab (`dim/2` bytes/vector —
-    /// half the int8 slab, so the bandwidth-bound pass-1 is faster) keeps the top
-    /// `k·candidate_multiplier` by approximate score (`dot_4bit_prepared`), then
-    /// an exact f16 rescore of just those candidates selects the final top-k. 16
-    /// levels stay lossless at mult≈5 on realistic clustered data (see
-    /// `fsvi_4bit_two_pass` bench); recall rises with `candidate_multiplier`.
-    /// Falls back to the exact `search_top_k` for WAL/non-F16 indexes. Not wired
-    /// into the BOLD hybrid.
+    /// Select candidates using packed signed 4-bit vectors, then rank them by
+    /// their exact f16 scores. As with [`Self::search_top_k_int8_two_pass`],
+    /// the multiplier controls how many physical rows survive approximate
+    /// selection. Indexes with a resident WAL or F32 vectors use the exact scan.
     ///
     /// # Errors
     ///
