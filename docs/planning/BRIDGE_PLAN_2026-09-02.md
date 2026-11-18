@@ -1,5 +1,34 @@
 # Bridge Plan: frankensearch
 
+## Current assessment — November 18, 2026
+
+The stock Linux CLI at `bbd6564d` indexed and searched with both real model
+tiers. With compatible upgrade reuse enabled, it kept the legacy fast index
+searchable when a damaged MiniLM tokenizer stopped one-shot indexing or watch
+startup. After the tokenizer was restored, both tiers returned their original
+ranks and scores before the retry. The retry carried both documents with zero
+document-embedding batches and preserved the fast and quality FSVI files and
+the lexical FSLX file byte for byte. A direct Potion install worked without
+MiniLM. An incomplete MiniLM install produced a typed refusal. All six watch
+tests and all 22 complete-generation CLI tests ran with their real-model
+cases enabled and passed. The one-shot and watch suites used two distinct
+executables.
+
+The ordinary CLI also passed an empty-index, ingest, search, delete, compact
+and reopen sequence. Direct HNSW and Matryoshka searches now distinguish
+request-scoped empty results from unusable stored vectors. Legacy writers
+preserve incompatible WAL sidecars for recovery. The ANN-enabled Index suite
+at `c845ad90` passed 1,136 tests, including the restart lifecycle, with 16
+ignored. The final Index code compiled for Windows MSVC.
+
+Release qualification remains open. The designated Linux DSR host passed
+seven of eight checks, including all packaging checks preceding the shared
+quality script. The script's stock quickstart passed, but the host Cargo
+wrapper refused native compilation. Strict UBS still reported warnings and
+the macOS build host lacked the required free space. The remaining upgrade
+checks include independent format-version and response-bound producer changes.
+The functional runs above did not measure the README latency targets.
+
 ## Implementation follow-through — 2026-10-29
 
 **November 3 deferred-upsert gap, protection still unlanded:** an additional ordinary9f real-model control reproduces a remaining P2 semantic defect: deferred index and explicit completion succeed in an independent control, but a second deferred index accepts an opaque content append and then cannot complete the selected successor's owed quality work (`io_error`, exit one). The immutable predecessor remains intact. Raw five-command evidence is in `deferred-upsert9f-falsifier-nowvszs8` under the evidence root below. The ordinary source/stock gates below did not exercise this combination. A two-file private draft rejects that unsupported upsert before writer allocation, preserves pending input/selection, and includes a regression that completes the preserved work and resumes ordinary updates. Formatting/static scans and strict all-target warnings-denied Clippy job `30091786382737508` on `hz3` pass. Full default FSFS library job `30091786382737509` is compiling; runtime and fixed ordinary-CLI/whole-gate proof remain pending. This is boundary protection in progress, not positive deferred-upsert support, release clearance or a P2 closure. Canonical Rust and the qualified9f cut remain unchanged.
