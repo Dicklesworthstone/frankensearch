@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "contract_version": "1.0.3",
+  "contract_version": "1.0.4",
   "oracle": {
     "engine": "tantivy",
-    "version": "0.27.0",
+    "version": "0.26.2",
     "lockfile": "Cargo.lock",
     "default_conformance": "RankExact",
     "score_epsilon": 0.0001
@@ -2113,33 +2113,40 @@
       }
     },
     {
-      "id": "query-cjk-mixed-script-keeps-cjk-only",
+      "id": "query-cjk-mixed-script-requires-indexed-runs",
       "query_class": "short_keyword",
       "parser": "cass",
       "input": "abc\u641c\u7d22def",
       "expected_ast": {
-        "type": "Term",
-        "text": "\u641c\u7d22",
-        "fields": [
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
           {
-            "name": "title",
-            "boost": 1.0
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "AND",
+              "children": [
+                {"occur": "Must", "query": {"type": "Term", "text": "abc", "fields": [{"name": "title", "boost": 1.0}]}},
+                {"occur": "Must", "query": {"type": "Term", "text": "\u641c\u7d22", "fields": [{"name": "title", "boost": 1.0}]}},
+                {"occur": "Must", "query": {"type": "PhrasePrefix", "terms": ["def"], "slop": 0, "fields": [{"name": "title", "boost": 1.0}]}}
+              ]
+            }
           },
           {
-            "name": "content",
-            "boost": 1.0
-          },
-          {
-            "name": "title_prefix",
-            "boost": 1.0
-          },
-          {
-            "name": "content_prefix",
-            "boost": 1.0
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "AND",
+              "children": [
+                {"occur": "Must", "query": {"type": "Term", "text": "abc", "fields": [{"name": "content", "boost": 1.0}]}},
+                {"occur": "Must", "query": {"type": "Term", "text": "\u641c\u7d22", "fields": [{"name": "content", "boost": 1.0}]}},
+                {"occur": "Must", "query": {"type": "PhrasePrefix", "terms": ["def"], "slop": 0, "fields": [{"name": "content", "boost": 1.0}]}}
+              ]
+            }
           }
         ]
-      },
-      "discarded_query_characters": "abcdef"
+      }
     },
     {
       "id": "query-cjk-single-character-unigram",
@@ -3692,7 +3699,7 @@
         "explicit ASCII prefixes search complete title/content fields beyond edge-ngram bounds",
         "explicit prefix expansion is complete or fails above 1024 terms per field/segment",
         "exact terms of length 2 through 20 may match longer tokens through prefix fields",
-        "mixed-script CJK input drops non-CJK characters before bigramming",
+        "mixed ASCII alphanumeric and CJK operands require the indexed runs in one title or content field",
         "single CJK unigram does not match inside a multi-character bigram-indexed run"
       ]
     },
@@ -3844,7 +3851,7 @@
         "query-cass-source-remote-filter",
         "query-cass-source-id-filter",
         "query-cjk-all-bigrams",
-        "query-cjk-mixed-script-keeps-cjk-only",
+        "query-cjk-mixed-script-requires-indexed-runs",
         "query-cjk-single-character-unigram",
         "query-empty-cass-all",
         "query-cass-phrase-two-term",

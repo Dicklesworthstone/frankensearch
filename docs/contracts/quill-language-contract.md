@@ -1,10 +1,10 @@
 # Quill Language and Scoring Contract
 
-**Contract version:** 1.0.3
+**Contract version:** 1.0.4
 
 **Owning bead:** `bd-quill-e0-contracts-j53p.1`
 
-**Oracle:** Tantivy 0.27.0, pinned by `Cargo.lock`
+**Oracle:** Tantivy 0.26.2, pinned by `Cargo.lock`
 **Contract fixture:** `tests/fixtures/quill_language_contract.json`
 
 **Amendment 1.0.1:** Corrects the default-parser duplicate fixture to match the pinned grammar's pre-analysis stable deduplication of exact raw siblings. Programmatically constructed scoring duplicates remain distinct in the post-parse canonicalizer.
@@ -13,9 +13,11 @@
 
 **Amendment 1.0.3:** Advances the current executable oracle identity to the `Cargo.lock`-pinned Tantivy 0.27.0 dependency after the complete language-contract fixture passed against that linked implementation. Source-specific 0.26.1 behavior and defect-provenance references below remain historical evidence and are not relabeled.
 
+**Amendment 1.0.4 (GOLDEN-CHANGE).** The workspace pin moved to Tantivy 0.26.2 in `5434417f`. The fixture loader now checks the linked library's version. Both CASS adapters changed mixed ASCII/CJK retrieval in `981c65fc`. For `abc搜索def`, the old tree searched only for `搜索`. The amended tree requires exact `abc`, exact `搜索`, and a final `def` prefix together in the title or together in the content. On the 20-document regression corpus, both engines returned the same seven documents for `搜索` and the same three for `abc搜索def`. The four exclusions isolate a missing ASCII term, fragments split across fields, a longer first token, and a suffix-only match.
+
 This document defines what “the same results as Tantivy” means for Quill. It is normative for the used lexical surface in `COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md` §3.1, §5, and §8. Quill code does not merge past gate G0 unless its scalar reference path satisfies this contract. The lexical-crate loader currently executes schema, analyzer, helper, and BM25 operation-order goldens and structurally validates the other records; the G1/G2 differential runner is responsible for executing canonical query trees, lifecycle rows, and cross-engine result comparisons.
 
-The conformance target is the observable behavior of frankensearch, not every Tantivy API. Analyzer behavior is pinned to the shipping scalar implementations. Query and scoring behavior is pinned to the shipping adapters plus the Tantivy 0.27.0 source used as the current oracle. Intentional departures belong in `docs/contracts/quill-divergence-register.md`; an unclassified departure is a failure.
+The conformance target is the observable behavior of frankensearch, not every Tantivy API. Analyzer behavior is pinned to the shipping scalar implementations. Query and scoring behavior is pinned to the shipping adapters plus the Tantivy source identified above. Intentional departures belong in `docs/contracts/quill-divergence-register.md`; an unclassified departure is a failure.
 
 ## 1. Normative sources and precedence
 
@@ -26,7 +28,7 @@ When sources disagree, apply this order:
    - `crates/frankensearch-lexical/src/lib.rs`
    - `crates/frankensearch-lexical/src/cass_compat.rs`
    - `crates/frankensearch-core/src/traits.rs`
-3. Tantivy 0.27.0 for scoring, Boolean `Occur`, parser-default, and token-admission semantics.
+3. The pinned Tantivy version for scoring, Boolean `Occur`, parser-default, and token-admission semantics.
 4. The comprehensive Quill plan.
 
 The fixture distinguishes harvested queries from constructed boundary cases and records source paths or source facts for that query-class corpus. Analyzer and scoring rows are constructed contract vectors whose normative source is this section plus the pinned implementation named above. A later source discovery that contradicts a fixture requires a contract-version amendment, not a silent code change.
@@ -177,7 +179,7 @@ These rules are pinned independently of the parser because query planners also c
 - Ordinary default and CASS phrases require exact adjacent positions (slop zero) in `content` or `title`. An explicit default-parser `~n` suffix uses slop `n`, and a trailing phrase `*` creates a phrase-prefix query. A CJK phrase in the CASS path falls back to the compound bigram query used by shipping.
 - `created_at` filters use inclusive i64 lower and upper bounds; either side may be unbounded. Shipping inserts the FAST-field range as a `Must` query, whose matched `ConstScorer` contributes `1.0`; “filter” describes its selection role, not a scoreless implementation.
 - `CassWildcardPattern` classifies terms as `Exact`, `Prefix`, `Suffix`, `Substring`, or `Complex`. Bare exact terms issue exact `TermQuery` clauses over `title`, `content`, `title_prefix`, and `content_prefix`; the prefix fields contain only prefixes of 2 through 20 Unicode scalar values and the content prefix column covers only the first 4 KiB. An `Exact` term of length 2 through 20 can therefore match a longer indexed word through a prefix field. Explicit ASCII trailing-wildcard queries instead expand against the complete positional `title` and `content` dictionaries: `a*`, prefixes longer than 20 characters, and occurrences beyond 4 KiB are supported without rebuilding the index. They use the existing singleton phrase-prefix constant scorer per matching field and the existing complete-or-error limit of 1,024 distinct expansions per field and immutable segment. Overflow refuses the whole query before returning hits, including under negation, disjunction, or an unmatched required operand. Bare-term behavior and quoted-star normalization are unchanged. Suffix, substring, and complex `*` patterns issue anchor-free `RegexQuery` clauses over `content` and `title`: Tantivy FST regexes already match the complete term and reject explicit `^`/`$` assertions. If either field's regex construction fails, the complete CASS query fails closed to match-none instead of dropping the operand. Regex expansion is unbounded in the shipping path and each matching field uses Tantivy's constant scorer; introducing a bound requires a `GlobExpansionLimit` divergence. The sanitizer does not preserve `?`, so `?` is not a shipping wildcard operator.
-- A term containing any CJK character drops its non-CJK characters for query bigram generation. The remaining CJK characters expand into overlapping bigrams; every bigram is `Must` and may match any searchable field (`title`, `content`, `title_prefix`, `content_prefix`). A single CJK character remains a unigram, but it cannot match inside a multi-character indexed run because that run is represented only by bigrams.
+- Pure CJK terms expand into overlapping bigrams. Every bigram is `Must` and may match any searchable field (`title`, `content`, `title_prefix`, `content_prefix`). A single CJK character remains a unigram and can match an indexed single-character run. Mixed ASCII alphanumeric and CJK operands use the analyzer's separate runs and require all their terms in one title or content field. A final ASCII fragment can qualify for prefix expansion as described in §4.6.
 - Empty/whitespace CASS input produces `All`, after which any supplied filters still apply. Nonempty input without a searchable operand refuses the complete query, including under negation. Star-only and operator-only inputs are not browse requests; see §4.6.
 
 ### 4.6 CASS queries over existing accented-Latin indexes (cass #548)

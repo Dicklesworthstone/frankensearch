@@ -2313,6 +2313,14 @@ mod tests {
                 ("", "backup foo東京qux大阪baz"),
                 ("", "backup 42東京7大阪9"),
                 ("abc東京", "backup"),
+                ("", "abc搜索def"),
+                ("abc 搜索 deferred", ""),
+                ("", "搜索"),
+                ("abc", "搜索 def"),
+                ("", "abcd 搜索 def"),
+                ("", "abc def"),
+                ("", "abc 搜索 xyzdef"),
+                ("", "def 搜索 abc"),
             ];
             let documents = rows
                 .iter()
@@ -2371,6 +2379,8 @@ mod tests {
                 ("\"東京abc大阪\"", &[3]),
                 ("foo東京bar大阪baz", &[8]),
                 ("42東京7大阪9", &[10]),
+                ("搜索", &[12, 13, 14, 15, 16, 18, 19]),
+                ("abc搜索def", &[12, 13, 19]),
                 ("abc東京 AND 大阪", &[3]),
                 ("abc東京 OR foo", &[0, 3, 8, 9, 11]),
                 ("NOT NOT 東京abc大阪", &[3]),

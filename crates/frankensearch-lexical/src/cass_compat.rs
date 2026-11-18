@@ -5663,6 +5663,14 @@ mod cass_query_tests {
             ("", "backup foo東京qux大阪baz"),
             ("", "backup 42東京7大阪9"),
             ("abc東京", "backup"),
+            ("", "abc搜索def"),
+            ("abc 搜索 deferred", ""),
+            ("", "搜索"),
+            ("abc", "搜索 def"),
+            ("", "abcd 搜索 def"),
+            ("", "abc def"),
+            ("", "abc 搜索 xyzdef"),
+            ("", "def 搜索 abc"),
         ];
         let documents = rows
             .iter()
@@ -5697,6 +5705,8 @@ mod cass_query_tests {
             ("\"東京abc大阪\"", vec![3]),
             ("foo東京bar大阪baz", vec![8]),
             ("42東京7大阪9", vec![10]),
+            ("搜索", vec![12, 13, 14, 15, 16, 18, 19]),
+            ("abc搜索def", vec![12, 13, 19]),
             ("abc東京 AND 大阪", vec![3]),
             ("abc東京 OR foo", vec![0, 3, 8, 9, 11]),
             ("NOT NOT 東京abc大阪", vec![3]),
