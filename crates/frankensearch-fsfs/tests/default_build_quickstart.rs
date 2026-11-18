@@ -1366,10 +1366,8 @@ mod loader_only {
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
         let install = model_root.join("potion-multilingual-128M");
-        // The full quickstart deliberately invalidates the external cache's
-        // receipt. This independently runnable test must not race it or write
-        // to that shared installation. Copy only registered artifact bytes and
-        // mint the receipt under this test's private root.
+        // This test moves the producer installation and changes its artifacts.
+        // Use independent files and mint the receipt under its private root.
         copy_verified_potion_install(&source_models.join("potion-multilingual-128M"), &install);
         let corpus = temp.path().join("corpus");
         let index = temp.path().join("index");
@@ -7255,10 +7253,10 @@ meta:
                     .to_owned(),
             );
         }
-        let model_root = configured_model_root();
-        verify_pinned_model_cache(&model_root)?;
-
+        let source_models = configured_model_root();
+        verify_pinned_model_cache(&source_models)?;
         let temp = tempfile::tempdir().expect("create default-build quickstart fixture");
+        let model_root = temp.path().join("models");
         let corpus = temp.path().join("corpus");
         let index = temp.path().join("index");
         write_quickstart_corpus(&corpus);
@@ -7278,7 +7276,19 @@ meta:
                 "all-MiniLM-L6-v2",
             ),
         ] {
-            let receipt_path = model_root.join(install_dir).join(".verified");
+            // The stale-receipt control must never invalidate the user's
+            // configured installation, even if verification fails midway.
+            let private_install = model_root.join(install_dir);
+            for artifact in &manifest.files {
+                let source = source_models.join(install_dir).join(&artifact.name);
+                let destination = private_install.join(&artifact.name);
+                let parent = destination.parent().expect("private model directory");
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("create {}: {error}", parent.display()))?;
+                fs::copy(&source, destination)
+                    .map_err(|error| format!("copy {}: {error}", source.display()))?;
+            }
+            let receipt_path = private_install.join(".verified");
             fs::write(
                 &receipt_path,
                 br#"{"schema_version":0,"invalidated_by":"default-build-e2e"}"#,
