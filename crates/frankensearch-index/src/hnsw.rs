@@ -38,6 +38,7 @@ use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo, Neighbour, PointId};
 use serde::{Deserialize, Serialize};
 
 use crate::recall_certificate::{EfCalibration, calibrate_certified_ef};
+use crate::search::deduplicate_ranked_hits;
 use crate::{SHA256_BYTES, VectorIndex};
 
 /// Default HNSW `M` (max connections per node).
@@ -361,6 +362,9 @@ pub struct HnswIndex {
     /// A different extent means the borrowed exact-repair source is no longer
     /// the immutable main slab this graph indexes.
     source_record_count: usize,
+    /// Compact graph IDs whose original vector has no finite, nonzero squared norm.
+    /// Derived from the source bytes, since normalization loses that information.
+    unusable_origins: HashSet<usize>,
     dimension: usize,
     config: HnswConfig,
     /// Fingerprint of the vectors the graph was built from. See
@@ -492,7 +496,7 @@ impl HnswIndex {
         let mut doc_ids = self.doc_ids.clone();
         for (id, position) in new_rows {
             let vector = current.vector_at_f32(position as usize)?;
-            if vector.len() != self.dimension || vector.iter().any(|value| !value.is_finite()) {
+            if vector.len() != self.dimension || !crate::vector_signal_usable(&vector) {
                 return refuse(self, "invalid_suffix_vector");
             }
             doc_ids.push(id);
@@ -774,11 +778,17 @@ impl HnswIndex {
         // that no longer exist. `try_load_native_graph` is only called for the
         // current format, so a missing fingerprint cannot be treated as a
         // legacy exception: 0 is compared like any other digest value.
-        let live_fp = fingerprint_vector_index_positions(
+        let mut unusable_origins = HashSet::new();
+        let live_fp = fingerprint_vector_index_positions_with(
             source_index,
             &meta.source_positions,
             &meta.doc_ids,
             meta.dimension,
+            |origin, vector| {
+                if !crate::vector_signal_usable(vector) {
+                    unusable_origins.insert(origin);
+                }
+            },
         )
         .ok()?;
         if live_fp != meta.vector_fingerprint {
@@ -859,6 +869,7 @@ impl HnswIndex {
             doc_ids: meta.doc_ids.clone(),
             source_positions: meta.source_positions.clone(),
             source_record_count: meta.source_record_count,
+            unusable_origins,
             dimension: meta.dimension,
             config: meta.config,
             vector_fingerprint: meta.vector_fingerprint,
@@ -1151,6 +1162,10 @@ impl HnswIndex {
                 _ if self.source_record_count == 0 => ZeroSignalReason::NewlyCreatedEmpty,
                 _ => ZeroSignalReason::AllTombstoned,
             })
+        } else if public && self.unusable_origins.len() == self.len() {
+            Some(source.map_or(ZeroSignalReason::NoUsableVectors, |index| {
+                index.classified_ann_census().1
+            }))
         } else {
             None
         };
@@ -1170,15 +1185,23 @@ impl HnswIndex {
             return Ok((Vec::new(), stats));
         }
 
-        let effective_k = k.min(self.doc_ids.len());
-        let effective_ef = ef_search.max(effective_k).max(1);
+        // Raw two-tier retrieval validates its own combined main/WAL winners.
+        // Public ANN retrieval needs enough physical neighbors for k usable rows.
+        let unusable = if public {
+            self.unusable_origins.len()
+        } else {
+            0
+        };
+        let effective_k = k.min(self.len() - unusable);
+        let neighbor_count = effective_k + unusable;
+        let effective_ef = ef_search.max(neighbor_count).max(1);
         let budget = dist_dot_budget(self.dimension)?;
         let normalized_query = normalize_for_dist_dot(query.to_vec(), budget);
 
         let start = Instant::now();
         let neighbors = self
             .hnsw
-            .search(&normalized_query, effective_k, effective_ef);
+            .search(&normalized_query, neighbor_count, effective_ef);
         self.finish_search_with_neighbors_resolution(
             source,
             query,
@@ -1331,6 +1354,11 @@ impl HnswIndex {
                     continue;
                 }
             }
+            if resolution == HnswHitResolution::CanonicalPublic
+                && self.unusable_origins.contains(&neighbor.d_id)
+            {
+                continue;
+            }
             eligible_neighbors.push(neighbor);
         }
         if eligible_neighbors.len() < effective_k {
@@ -1380,6 +1408,7 @@ impl HnswIndex {
                 .map(|neighbor| (neighbor.d_id, neighbor.distance)),
             budget,
             resolution,
+            effective_k,
         )
         .map(|hits| (hits, None))
     }
@@ -1410,6 +1439,13 @@ impl HnswIndex {
             ));
         }
         match resolution {
+            HnswHitResolution::CanonicalPublic if !self.unusable_origins.is_empty() => {
+                let limit = effective_k.saturating_add(self.unusable_origins.len());
+                let mut hits = source.search_main_top_k_raw(canonical_query, limit)?;
+                hits.retain(|hit| source.classified_hit_is_usable(hit));
+                hits.truncate(effective_k);
+                Ok(deduplicate_ranked_hits(hits))
+            }
             HnswHitResolution::CanonicalPublic => {
                 source.search_main_top_k(canonical_query, effective_k)
             }
@@ -1424,6 +1460,7 @@ impl HnswIndex {
         distances: impl IntoIterator<Item = (usize, f32)>,
         budget: DistDotBudget,
         resolution: HnswHitResolution,
+        limit: usize,
     ) -> SearchResult<Vec<VectorHit>> {
         let scores = distances
             .into_iter()
@@ -1431,13 +1468,14 @@ impl HnswIndex {
                 restore_dist_dot_score(distance, budget).map(|score| (neighbor_id, score))
             })
             .collect::<SearchResult<Vec<_>>>()?;
-        self.hits_from_scores(scores, resolution)
+        self.hits_from_scores(scores, resolution, limit)
     }
 
     fn hits_from_scores(
         &self,
         scores: impl IntoIterator<Item = (usize, f32)>,
         resolution: HnswHitResolution,
+        limit: usize,
     ) -> SearchResult<Vec<VectorHit>> {
         let mut hits = Vec::new();
         for (neighbor_id, score) in scores {
@@ -1474,8 +1512,8 @@ impl HnswIndex {
                 .then_with(|| left.index.cmp(&right.index))
         });
         if resolution == HnswHitResolution::CanonicalPublic {
-            let mut seen_doc_ids = HashSet::with_capacity(hits.len());
-            hits.retain(|hit| seen_doc_ids.insert(hit.doc_id.clone()));
+            hits.truncate(limit);
+            return Ok(deduplicate_ranked_hits(hits));
         }
         Ok(hits)
     }
@@ -1672,6 +1710,7 @@ impl HnswIndex {
         let vector_fingerprint = fingerprint_vectors(&doc_ids, &vectors);
 
         let mut normalized_vectors = Vec::with_capacity(vectors.len());
+        let mut unusable_origins = HashSet::new();
         for (idx, vector) in vectors.into_iter().enumerate() {
             if vector.len() != dimension {
                 return Err(SearchError::DimensionMismatch {
@@ -1679,12 +1718,15 @@ impl HnswIndex {
                     found: vector.len(),
                 });
             }
-            if vector.iter().any(|value| !value.is_finite()) {
-                return Err(SearchError::InvalidConfig {
-                    field: "vector".to_owned(),
-                    value: idx.to_string(),
-                    reason: "all vector values must be finite".to_owned(),
-                });
+            if !crate::vector_signal_usable(&vector) {
+                if vector.iter().any(|value| !value.is_finite()) {
+                    return Err(SearchError::InvalidConfig {
+                        field: "vector".to_owned(),
+                        value: idx.to_string(),
+                        reason: "all vector values must be finite".to_owned(),
+                    });
+                }
+                unusable_origins.insert(idx);
             }
             normalized_vectors.push(normalize_for_dist_dot(vector, budget));
         }
@@ -1714,6 +1756,7 @@ impl HnswIndex {
                 })
                 .collect::<SearchResult<Vec<_>>>()?,
             source_record_count: normalized_vectors.len(),
+            unusable_origins,
             dimension,
             config,
             vector_fingerprint,
@@ -3078,6 +3121,22 @@ fn fingerprint_vector_index_positions(
     expected_doc_ids: &[String],
     expected_dim: usize,
 ) -> SearchResult<u64> {
+    fingerprint_vector_index_positions_with(
+        index,
+        positions,
+        expected_doc_ids,
+        expected_dim,
+        |_, _| {},
+    )
+}
+
+fn fingerprint_vector_index_positions_with(
+    index: &VectorIndex,
+    positions: &[u32],
+    expected_doc_ids: &[String],
+    expected_dim: usize,
+    mut observe_vector: impl FnMut(usize, &[f32]),
+) -> SearchResult<u64> {
     if positions.len() != expected_doc_ids.len() {
         return Err(ann_corrupted(
             &index.path,
@@ -3120,6 +3179,7 @@ fn fingerprint_vector_index_positions(
                 found: vector.len(),
             });
         }
+        observe_vector(logical_index, &vector);
         h = fnv1a_update(h, &(logical_index as u64).to_le_bytes());
         h = fnv1a_update(h, expected_doc_id.as_bytes());
         h = fnv1a_update_f32(h, &vector);
@@ -3696,6 +3756,85 @@ mod tests {
             .expect("search");
         assert!(hits.is_empty());
         assert_eq!(stats.zero_signal, Some(ZeroSignalReason::NewlyCreatedEmpty));
+    }
+
+    #[test]
+    fn public_ann_excludes_unusable_legacy_rows_after_build_and_native_reload() {
+        let query = [1.0, 0.0];
+        for all_unusable in [false, true] {
+            let path = temp_path("public-ann-vector-signal", "fsvi");
+            let index = write_index(&path, &[query.to_vec(), vec![-1.0, 0.0]]).unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            let start = usize::try_from(index.metadata().vectors_offset).unwrap();
+            for row in 0..index.record_count() {
+                if all_unusable || index.doc_id_at(row).unwrap() == "doc-0000" {
+                    bytes[start + row * 8..start + (row + 1) * 8].fill(0);
+                }
+            }
+            drop(index);
+            std::fs::write(&path, bytes).unwrap();
+            let index = VectorIndex::open_read_only(&path).unwrap();
+            let built = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).unwrap();
+            let sidecar = path.with_extension("hnsw");
+            built.save(&sidecar).unwrap();
+            let reopened = HnswIndex::try_load_native(&sidecar, &index)
+                .unwrap()
+                .unwrap();
+            for graph in [&built, &reopened] {
+                for k in [1, 2] {
+                    for (hits, stats) in [
+                        graph
+                            .knn_search_with_stats(&query, k, HNSW_DEFAULT_EF_SEARCH)
+                            .unwrap(),
+                        graph
+                            .knn_search_with_stats_against(
+                                &index,
+                                &query,
+                                k,
+                                HNSW_DEFAULT_EF_SEARCH,
+                            )
+                            .unwrap(),
+                    ] {
+                        assert_eq!(stats.k_requested, k);
+                        assert_eq!(stats.k_returned, hits.len());
+                        if all_unusable {
+                            assert!(hits.is_empty());
+                            assert_eq!(stats.zero_signal, Some(ZeroSignalReason::NoUsableVectors));
+                        } else {
+                            assert_eq!(
+                                hits.iter()
+                                    .map(|hit| hit.doc_id.as_str())
+                                    .collect::<Vec<_>>(),
+                                ["doc-0001"]
+                            );
+                            assert!(hits[0].score < 0.0);
+                            assert_eq!(stats.zero_signal, None);
+                        }
+                    }
+                }
+                if !all_unusable {
+                    let (hits, stats) = graph
+                        .finish_search_with_neighbors(
+                            Some(&index),
+                            &query,
+                            1,
+                            1,
+                            HNSW_DEFAULT_EF_SEARCH,
+                            Vec::new(),
+                            dist_dot_budget(2).unwrap(),
+                            Instant::now(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        hits.iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["doc-0001"]
+                    );
+                    assert!(stats.fallback_reason.is_some());
+                }
+            }
+        }
     }
 
     #[test]
