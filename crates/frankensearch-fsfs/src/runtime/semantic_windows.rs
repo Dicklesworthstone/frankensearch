@@ -447,8 +447,8 @@ pub(super) fn search_top_k(
 }
 
 /// Exact fast-tier scores for named source documents, each collapsed to its
-/// best live row as [`search_top_k`] does. A source with no live fast row is
-/// absent from the result.
+/// best usable live row as [`search_top_k`] does. A source without a usable
+/// fast row is absent from the result.
 pub(super) fn score_sources(
     index: &VectorIndex,
     query: &[f32],
@@ -469,13 +469,17 @@ pub(super) fn score_sources(
         sources.contains(source)
     });
     let Some(mapping) = mapping else {
-        return index.search_top_k(query, limit, Some(&named));
+        return Ok(index
+            .search_top_k_classified(query, limit, Some(&named))?
+            .hits);
     };
     let filter = SourceFilter {
         mapping,
         inner: Some(&named),
     };
-    let rows = index.search_top_k(query, limit, Some(&filter))?;
+    let rows = index
+        .search_top_k_classified(query, limit, Some(&filter))?
+        .hits;
     Ok(collapse_rows(mapping, rows)?
         .into_iter()
         .map(|(hit, _)| hit)
@@ -722,13 +726,30 @@ mod tests {
                 .write_record(&row_id("src/unnamed.rs", ordinal), &[1.0, 0.0])
                 .unwrap();
         }
+        writer.write_record("src/legacy.rs", &[1.0, 0.0]).unwrap();
+        writer
+            .write_record("src/orthogonal.rs", &[0.0, 1.0])
+            .unwrap();
         writer.finish().unwrap();
         let index = VectorIndex::open_read_only(&path).unwrap();
+        let legacy = (0..index.record_count())
+            .find(|&row| index.doc_id_at(row).unwrap() == "src/legacy.rs")
+            .unwrap();
+        assert_eq!(index.quantization(), frankensearch_index::Quantization::F16);
+        let stride = index.dimension() * std::mem::size_of::<u16>();
+        let start = usize::try_from(index.metadata().vectors_offset).unwrap() + legacy * stride;
+        drop(index);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[start..start + stride].fill(0);
+        std::fs::write(&path, bytes).unwrap();
+        let index = VectorIndex::open_read_only(&path).unwrap();
+        let single = super::plan("single window", 3).unwrap();
         let mapping = FastWindowMapping::from_plans(
             3,
             ["src/a.rs", "src/b.rs", "src/unnamed.rs"]
                 .into_iter()
-                .map(|source| (source, &plan)),
+                .map(|source| (source, &plan))
+                .chain([("src/legacy.rs", &single), ("src/orthogonal.rs", &single)]),
             &index.live_doc_ids().unwrap(),
         )
         .unwrap();
@@ -745,13 +766,23 @@ mod tests {
         let windowed = score_sources(
             &index,
             &[1.0, 0.0],
-            named(&["src/a.rs", "src/b.rs", "src/absent.rs"]),
+            named(&[
+                "src/a.rs",
+                "src/b.rs",
+                "src/absent.rs",
+                "src/legacy.rs",
+                "src/orthogonal.rs",
+            ]),
             Some(&mapping),
         )
         .unwrap();
         assert_eq!(
             scores(windowed),
-            [("src/b.rs".to_owned(), 500.0), ("src/a.rs".to_owned(), 400.0)]
+            [
+                ("src/b.rs".to_owned(), 500.0),
+                ("src/a.rs".to_owned(), 400.0),
+                ("src/orthogonal.rs".to_owned(), 0.0),
+            ]
         );
         assert!(
             score_sources(&index, &[1.0, 0.0], HashSet::new(), Some(&mapping))

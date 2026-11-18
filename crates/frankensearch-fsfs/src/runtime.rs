@@ -690,7 +690,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v34: reranking admits only complete, finite responses for the exact inputs.
 // v35: negated queries require lexical membership for every vector candidate.
 // v36: corrupt stored vectors cannot contribute semantic ranks or hide recovery.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v36";
+// v37: completing Refined scores requires usable fast-tier vectors too.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v37";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -723,8 +724,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v31 / stream v29: reranking rejects malformed and non-finite score evidence.
 // v32 / stream v30: negated queries reject candidates without lexical evidence.
 // v33 / stream v31: unusable stored vectors cannot attest semantic ranks.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v33";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v31";
+// v34 / stream v32: completing Refined scores skips unusable fast-tier rows.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v34";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v32";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -26776,9 +26778,9 @@ impl FsfsRuntime {
 
     /// The mirror of the fast-candidate completion in [`Self::quality_candidates`]:
     /// a quality-discovered ID that the bounded fast head truncated still has a
-    /// live fast score. Without it the blend's single-source rule ranks that ID
+    /// usable fast score. Without it the blend's single-source rule ranks that ID
     /// on quality alone at every weight, above fast candidates it trails. Only
-    /// an ID with no live fast row keeps that rule.
+    /// an ID with no usable fast row keeps that rule.
     fn complete_fast_candidates(
         cx: &Cx,
         resources: &SearchExecutionResources,
@@ -37178,6 +37180,64 @@ mod tests {
                     .unwrap();
                 assert_eq!(replayed, payloads, "cache replay must retain degradation");
             }
+        });
+    }
+
+    #[test]
+    fn refined_blend_excludes_unusable_fast_scores_for_quality_discoveries() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let index = resources.vector_index.take().unwrap();
+            let row = (0..index.record_count())
+                .find(|&row| index.doc_id_at(row).unwrap() == "b.rs")
+                .unwrap();
+            assert_eq!(index.quantization(), frankensearch_index::Quantization::F16);
+            let stride = index.dimension() * std::mem::size_of::<u16>();
+            let start = usize::try_from(index.metadata().vectors_offset).unwrap() + row * stride;
+            drop(index);
+            // Keep the same document and producer identity but plant a legacy
+            // zero fast vector for the independent quality winner.
+            let path = temp.path().join("fast.fsvi");
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[start..start + stride].fill(0);
+            fs::write(&path, bytes).unwrap();
+            resources.vector_index = Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+
+            let mut config = FsfsConfig::default();
+            config.search.quality_weight = 1.0;
+            config.search.quality_timeout_ms = 5_000;
+            let phases = FsfsRuntime::new(config)
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    "how do semantic policies affect ranking",
+                    3,
+                    SearchExecutionMode::Full,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(phases[0].hits[0].path, "a.rs");
+            assert!(phases[0].hits.iter().all(|hit| hit.path != "b.rs"));
+            let refined = phases.last().unwrap();
+            assert_eq!(refined.phase, SearchOutputPhase::Refined);
+            assert_eq!(refined.hits[0].path, "b.rs");
+            let winner = refined
+                .semantic_blend
+                .as_ref()
+                .unwrap()
+                .hits
+                .iter()
+                .find(|hit| hit.path == "b.rs")
+                .unwrap();
+            assert_eq!(winner.quality.as_ref().unwrap().raw_score, Some(1.0));
+            assert!(winner.fast.is_none(), "unusable fast score: {winner:?}");
         });
     }
 
@@ -48330,6 +48390,18 @@ mod tests {
                 Auto,
                 FSFS_SEARCH_SERVE_SCHEMA_VERSION,
                 "fsfs.search.serve.stream.v9",
+            ),
+            (
+                "all-MiniLM-L6-v2",
+                Auto,
+                "fsfs.search.serve.v33",
+                FSFS_SEARCH_SERVE_STREAM_VERSION,
+            ),
+            (
+                "all-MiniLM-L6-v2",
+                Auto,
+                FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+                "fsfs.search.serve.stream.v31",
             ),
             (
                 "all-MiniLM-L6-v2-native",
@@ -67752,6 +67824,8 @@ mod tests {
                 "fsfs.search.cache.v31",
                 // Could return arbitrary ranks from corrupt stored vectors.
                 "fsfs.search.cache.v35",
+                // Could let a corrupt fast vector back into a Refined result.
+                "fsfs.search.cache.v36",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
