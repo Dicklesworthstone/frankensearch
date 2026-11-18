@@ -863,11 +863,17 @@ pub(crate) fn read_wal(
     };
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
-    if data.len() < WAL_HEADER_SIZE {
-        warn!(path = %path.display(), len = data.len(), "WAL file too small, ignoring");
-        return Ok((Vec::new(), 0, 0));
-    }
     parse_wal_bytes(&data, expected_dimension, quantization, path)
+}
+
+fn other_wal_version(bytes: &[u8]) -> Option<u16> {
+    let prefix = bytes.first_chunk::<6>()?;
+    let version = u16::from_le_bytes([prefix[4], prefix[5]]);
+    (prefix.starts_with(&WAL_MAGIC) && version != WAL_VERSION).then_some(version)
+}
+
+fn legacy_header_crc_matches(header: &[u8; WAL_HEADER_SIZE]) -> bool {
+    header[16..] == crc32_of(&header[..16]).to_le_bytes()
 }
 
 /// Load WAL entries for a WRITE-capable open, quarantining a torn header.
@@ -876,9 +882,10 @@ pub(crate) fn read_wal(
 /// path ([`crate::two_tier::observe_tier`]) shares it, so a sidecar whose
 /// header is torn at or above [`WAL_HEADER_SIZE`] makes it — and therefore
 /// every future open — fail forever, while a sidecar SHORTER than the header
-/// is ignored and a torn batch TAIL is tolerated. This resolves that
-/// asymmetry for the writer path only: the corrupt sidecar is moved aside and
-/// the open continues with no WAL entries.
+/// is ignored and a torn batch TAIL is tolerated. A writer can move a
+/// damaged legacy header aside and continue with no WAL entries.
+/// Recognizable foreign versions and checksum-valid, incompatible headers
+/// remain in place and prevent the writer from opening.
 ///
 /// The corrupt bytes are never destroyed. They are moved, whole, to a
 /// no-clobber `<sidecar>.corrupt.<n>` sibling: stage the successor name with
@@ -914,7 +921,7 @@ pub(crate) fn read_wal_recovering_torn_header(
 
 /// Move a sidecar with an unusable header aside, preserving every byte.
 fn quarantine_torn_wal_header(path: &Path, cause: SearchError) -> SearchResult<()> {
-    let live = match open_fsvi_regular_file(path, OpenOptions::new().write(true)) {
+    let live = match open_fsvi_regular_file(path, OpenOptions::new().read(true).write(true)) {
         Ok(file) => file,
         // The sidecar vanished under us; there is nothing left to quarantine
         // and nothing was lost that a fresh append cannot recreate.
@@ -923,7 +930,7 @@ fn quarantine_torn_wal_header(path: &Path, cause: SearchError) -> SearchResult<(
     };
     // Proving no appender is live is what makes moving the pathname safe.
     // Without it this recovery would race a writer mid-batch.
-    let live = match acquire_wal_writer_lock(path, live) {
+    let mut live = match acquire_wal_writer_lock(path, live) {
         Ok(guard) => guard,
         Err(lock_error) => {
             warn!(
@@ -935,6 +942,18 @@ fn quarantine_torn_wal_header(path: &Path, cause: SearchError) -> SearchResult<(
         }
     };
 
+    // Recheck the descriptor under the mutation lock. A valid header with
+    // a different dimension or quantization is evidence of a mismatch, and
+    // later versions use their own checksums. Neither is a torn v1 header.
+    let mut header = [0; WAL_HEADER_SIZE];
+    match live.file.read_exact(&mut header) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Err(cause),
+        Err(error) => return Err(error.into()),
+    }
+    if other_wal_version(&header).is_some() || legacy_header_crc_matches(&header) {
+        return Err(cause);
+    }
     let quarantine = stage_quarantine_path(path)?;
     fs::rename(path, &quarantine)?;
     drop(live);
@@ -991,16 +1010,18 @@ fn parse_wal_bytes(
     quantization: Quantization,
     path: &Path,
 ) -> SearchResult<(Vec<WalEntry>, u8, u64)> {
-    // Header validation.
-    if data[..4] != WAL_MAGIC {
-        return Err(wal_corrupted(path, "bad magic bytes"));
-    }
-    let version = u16::from_le_bytes([data[4], data[5]]);
-    if version != WAL_VERSION {
+    if let Some(version) = other_wal_version(data) {
         return Err(wal_corrupted(
             path,
             format!("version mismatch: expected {WAL_VERSION}, got {version}"),
         ));
+    }
+    let Some(header) = data.first_chunk::<WAL_HEADER_SIZE>() else {
+        warn!(path = %path.display(), len = data.len(), "WAL file too small, ignoring");
+        return Ok((Vec::new(), 0, 0));
+    };
+    if header[..4] != WAL_MAGIC {
+        return Err(wal_corrupted(path, "bad magic bytes"));
     }
     let dimension = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
     if dimension != expected_dimension {
@@ -1016,9 +1037,7 @@ fn parse_wal_bytes(
     }
     let compaction_gen = data[11];
     // reserved: data[12..16]
-    let header_crc_stored = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-    let header_crc_computed = crc32_of(&data[..16]);
-    if header_crc_stored != header_crc_computed {
+    if !legacy_header_crc_matches(header) {
         return Err(wal_corrupted(path, "header CRC mismatch"));
     }
 
@@ -1532,7 +1551,6 @@ mod tests {
         batch
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn directory_entry_names(path: &Path) -> Vec<std::ffi::OsString> {
         let mut names: Vec<_> = fs::read_dir(path)
             .expect("read private WAL fixture directory")
@@ -2236,6 +2254,63 @@ mod tests {
 
         let result = read_wal(&path, 8, Quantization::F16);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn writer_preserves_an_intact_wal_for_a_different_vector_layout() {
+        for (dimension, quantization) in [(8, Quantization::F16), (4, Quantization::F32)] {
+            let directory = tempfile::tempdir().unwrap();
+            let main = directory.path().join("index.fsvi");
+            crate::VectorIndex::create(&main, "test", 4)
+                .unwrap()
+                .finish()
+                .unwrap();
+            let path = wal_path_for(&main);
+            append_wal_batch(
+                &path,
+                &[make_entry("retained-row", 1.0, dimension)],
+                dimension,
+                quantization,
+                0,
+                false,
+            )
+            .unwrap();
+            let before = fs::read(&path).unwrap();
+            let names = directory_entry_names(directory.path());
+            for result in [
+                crate::VectorIndex::open_read_only(&main),
+                crate::VectorIndex::open_writer(&main),
+            ] {
+                assert!(matches!(result, Err(SearchError::IndexCorrupted { .. })));
+            }
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let (entries, _, _) = read_wal(&path, dimension, quantization).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].doc_id.as_str(), "retained-row");
+            assert_eq!(directory_entry_names(directory.path()), names);
+        }
+    }
+
+    #[test]
+    fn legacy_writer_preserves_recognizable_v2_wal_headers() {
+        let header = identity_binding_v2(4, QuantizationFormat::F16).encode_header();
+        for bytes in [&header[..], &header[..6]] {
+            let directory = tempfile::tempdir().unwrap();
+            let main = directory.path().join("legacy.fsvi");
+            crate::VectorIndex::create(&main, "test", 4)
+                .unwrap()
+                .finish()
+                .unwrap();
+            let path = wal_path_for(&main);
+            fs::write(&path, bytes).unwrap();
+            let names = directory_entry_names(directory.path());
+            assert!(matches!(
+                crate::VectorIndex::open_writer(&main),
+                Err(SearchError::IndexCorrupted { .. })
+            ));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(directory_entry_names(directory.path()), names);
+        }
     }
 
     #[test]
