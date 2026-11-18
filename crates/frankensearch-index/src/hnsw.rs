@@ -3838,6 +3838,80 @@ mod tests {
     }
 
     #[test]
+    fn exact_and_public_ann_agree_for_every_three_row_signal_state() {
+        // Enumerate all assignments of usable, unusable and tombstoned rows.
+        // Index sorting may change physical order, so assign states by ID.
+        let vectors = vec![vec![-1.0, 0.0]; 3];
+        for assignment in 0..27_usize {
+            let path = temp_path("three-row-signal", "fsvi");
+            let mut index = write_index(&path, &vectors).unwrap();
+            let start = usize::try_from(index.metadata().vectors_offset).unwrap();
+            let mut expected = Vec::new();
+            let mut unusable = Vec::new();
+            let mut states = assignment;
+            for id in ["doc-0000", "doc-0001", "doc-0002"] {
+                match states % 3 {
+                    0 => expected.push(id),
+                    1 => unusable.push(index.find_index_by_doc_id(id).unwrap().unwrap()),
+                    _ => assert!(index.soft_delete(id).unwrap()),
+                }
+                states /= 3;
+            }
+            drop(index);
+            let mut bytes = std::fs::read(&path).unwrap();
+            for &row in &unusable {
+                bytes[start + row * 8..start + (row + 1) * 8].fill(0);
+            }
+            std::fs::write(&path, bytes).unwrap();
+            let index = VectorIndex::open_read_only(&path).unwrap();
+            let graph = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).unwrap();
+            for (query, k) in [
+                ([1.0, 0.0], 0),
+                ([0.0, -0.0], 1),
+                ([1.0, 0.0], 1),
+                ([1.0, 0.0], usize::MAX),
+            ] {
+                let reason = if k == 0 {
+                    Some(ZeroSignalReason::CallerRequestedZeroK)
+                } else if query[0] == 0.0 {
+                    Some(ZeroSignalReason::ZeroNormQuery)
+                } else if !expected.is_empty() {
+                    None
+                } else if unusable.is_empty() {
+                    Some(ZeroSignalReason::AllTombstoned)
+                } else {
+                    Some(ZeroSignalReason::NoUsableVectors)
+                };
+                let exact = index.search_top_k_classified(&query, k, None).unwrap();
+                let (ann, stats) = graph
+                    .knn_search_with_stats_against(&index, &query, k, HNSW_DEFAULT_EF_SEARCH)
+                    .unwrap();
+                for (hits, observed) in [(exact.hits, exact.zero_signal), (ann, stats.zero_signal)]
+                {
+                    assert_eq!(observed, reason, "assignment {assignment}, k={k}");
+                    assert_eq!(
+                        hits.len(),
+                        if reason.is_some() {
+                            0
+                        } else {
+                            k.min(expected.len())
+                        }
+                    );
+                    assert!(
+                        hits.iter()
+                            .all(|hit| expected.contains(&hit.doc_id.as_str()))
+                    );
+                    if k == usize::MAX {
+                        let mut ids: Vec<_> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+                        ids.sort_unstable();
+                        assert_eq!(ids, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn direct_ann_empty_graph_distinguishes_tombstones_and_reopened_wal() {
         let path = temp_path("empty-graph-with-history", "fsvi");
         let query = [1.0, 0.0];
