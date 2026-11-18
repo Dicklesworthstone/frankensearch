@@ -770,7 +770,7 @@ mod loader_only {
         let mut records = matching_records();
         assert_eq!(records.len(), 1, "the real query must persist one answer");
         let (cache_path, cache_bytes, record) = records.pop().unwrap();
-        assert_eq!(record["schema_version"], "fsfs.search.cache.v35");
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v37");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
 
         // Multiple fresh processes keep an isolated scheduling delay from
@@ -1293,7 +1293,8 @@ mod loader_only {
         assert_eq!(ready["ok"], true, "{ready}");
         assert_eq!(ready["pid"], owner.child.id(), "{ready}");
         assert_eq!(ready["semantic_admitted"], false);
-        assert!(ready["vector_generation_id"].is_null(), "{ready}");
+        assert_eq!(ready["vector_generation_id"], "potion-multilingual-128M");
+        assert_eq!(ready["vector_generation_is_hash"], false);
         let message = serde_json::json!({
             "query": query, "limit": 3, "mode": "fast_only", "fast_only": true,
         })
@@ -2512,10 +2513,11 @@ mod loader_only {
         ready.read_to_string(&mut raw).unwrap();
         let ready: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(ready["pid"], owner.child.id());
-        // Readiness precedes lazy model initialization; admission is checked
-        // again after distinct real queries have loaded and used the model.
+        // Readiness reports the on-disk producer before loading the model.
+        // The real queries below must subsequently establish semantic admission.
         assert_eq!(ready["semantic_admitted"], false);
-        assert!(ready["vector_generation_id"].is_null(), "{ready}");
+        assert_eq!(ready["vector_generation_id"], expected_generation_id);
+        assert_eq!(ready["vector_generation_is_hash"], false);
         eprintln!(
             "[default-build-e2e] stage=progressive-daemon pid={} ready_ms={} fast_id={}",
             owner.child.id(),
@@ -2997,7 +2999,7 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v32");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v34");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
                     let mut contracts = sha2::Sha256::new();
                     for manifest in [
