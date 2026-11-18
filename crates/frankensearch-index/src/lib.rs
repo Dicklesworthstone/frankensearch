@@ -1210,7 +1210,7 @@ impl ValidatedFsviBytes {
 
     /// Open a published pathname into one immutable owned image.
     ///
-    /// Linux and Android use `O_NOATIME | O_NOFOLLOW | O_CLOEXEC`; other
+    /// Linux and Android use a nonblocking, no-atime, no-follow open; other
     /// targets fail closed because literal timestamp preservation cannot be
     /// established with the available safe standard-library API. The final
     /// file must be a single-link regular inode. File identity, length, mode,
@@ -2014,21 +2014,7 @@ impl VectorIndex {
 
     #[allow(unsafe_code, clippy::too_many_lines)] // memmap constructors require unsafe for memory-mapped I/O.
     fn open_with_lock(path: &Path, writer: bool) -> SearchResult<Self> {
-        if !path.exists() {
-            return Err(SearchError::IndexNotFound {
-                path: path.to_path_buf(),
-            });
-        }
-
-        let file = if writer {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .map_err(SearchError::Io)?
-        } else {
-            File::open(path).map_err(SearchError::Io)?
-        };
+        let file = open_fsvi_main_file(path, writer).map_err(|e| fsvi_open_error(path, e))?;
         let acquired = Instant::now();
         let map_lock = if writer {
             file.try_lock().map_err(|error| {
@@ -2385,15 +2371,7 @@ impl VectorIndex {
     /// Returns a typed error for a missing, locked, truncated, or malformed
     /// main file, an incompatible version, or an I/O failure.
     pub fn read_legacy_publication_metadata(path: &Path) -> SearchResult<VectorMetadata> {
-        let file = File::open(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                SearchError::IndexNotFound {
-                    path: path.to_path_buf(),
-                }
-            } else {
-                SearchError::Io(error)
-            }
-        })?;
+        let file = open_fsvi_main_file(path, false).map_err(|e| fsvi_open_error(path, e))?;
         file.try_lock_shared()
             .map_err(|error| map_lock_error(path, "shared reader", &error))?;
         let actual_len = usize::try_from(file.metadata().map_err(SearchError::Io)?.len())
@@ -2404,7 +2382,7 @@ impl VectorIndex {
     }
 
     fn peek_header_metadata(path: &Path) -> SearchResult<VectorMetadata> {
-        let file = File::open(path).map_err(SearchError::Io)?;
+        let file = open_fsvi_main_file(path, false)?;
         let (metadata, _) = read_legacy_header(path, &file)?;
         Ok(metadata)
     }
@@ -4514,6 +4492,35 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
     ))
 }
 
+fn open_fsvi_main_file(path: &Path, writable: bool) -> std::io::Result<File> {
+    let mut options = File::options();
+    options.read(true).write(writable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // A FIFO can block in open itself, before we can check its type.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "FSVI main file must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn fsvi_open_error(path: &Path, error: std::io::Error) -> SearchError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        SearchError::IndexNotFound {
+            path: path.to_path_buf(),
+        }
+    } else {
+        SearchError::Io(error)
+    }
+}
+
 fn read_legacy_header(path: &Path, file: &File) -> SearchResult<(VectorMetadata, usize)> {
     let mut header = Vec::new();
     file.take(FSVI_V1_MAX_HEADER_BYTES as u64)
@@ -4523,12 +4530,7 @@ fn read_legacy_header(path: &Path, file: &File) -> SearchResult<(VectorMetadata,
 }
 
 fn read_header_for_inspection(path: &Path) -> SearchResult<(u16, Vec<u8>)> {
-    if !path.exists() {
-        return Err(SearchError::IndexNotFound {
-            path: path.to_path_buf(),
-        });
-    }
-    let mut file = File::open(path).map_err(SearchError::Io)?;
+    let mut file = open_fsvi_main_file(path, false).map_err(|e| fsvi_open_error(path, e))?;
     let file_len = file.metadata().map_err(SearchError::Io)?.len();
     let mut prefix = [0_u8; 6];
     read_exact_index_bytes(path, &mut file, &mut prefix, "magic and version")?;
@@ -5512,7 +5514,9 @@ fn open_readonly_noatime_nofollow(path: &Path) -> Result<File, FsviAdmissionErro
 
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOATIME | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(
+            libc::O_NOATIME | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY,
+        )
         .open(path)
         .map_err(|error| {
             let raw_error = error.raw_os_error();
@@ -11786,6 +11790,54 @@ mod tests {
             VectorIndex::read_legacy_publication_metadata(&path),
             Err(SearchError::IndexCorrupted { .. })
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fsvi_main_descriptors_are_nonblocking_before_validation() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+
+        let main = tempfile::NamedTempFile::new().unwrap();
+        for file in [
+            open_fsvi_main_file(main.path(), false).unwrap(),
+            open_fsvi_main_file(main.path(), true).unwrap(),
+            open_readonly_noatime_nofollow(main.path()).unwrap(),
+        ] {
+            assert!(fcntl_getfl(&file).unwrap().contains(OFlags::NONBLOCK));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsvi_main_file_probes_accept_regular_symlinks_and_refuse_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.fsvi");
+        let link = dir.path().join("linked.fsvi");
+        VectorIndex::create(&main, "published", 2)
+            .unwrap()
+            .finish()
+            .unwrap();
+        std::os::unix::fs::symlink(&main, &link).unwrap();
+        let meta = VectorIndex::read_legacy_publication_metadata(&link).unwrap();
+        assert_eq!(meta.embedder_id, "published");
+        assert_eq!(
+            VectorIndex::open_read_only(&link).unwrap().metadata(),
+            &meta
+        );
+
+        let special = Path::new("/dev/null");
+        for error in [
+            VectorIndex::read_legacy_publication_metadata(special).unwrap_err(),
+            VectorIndex::inspect(special).unwrap_err(),
+            VectorIndex::open_read_only(special).unwrap_err(),
+            VectorIndex::peek_publication_nonce(special).unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, SearchError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidInput),
+                "{error}"
+            );
+        }
     }
 
     // ─── is_deleted accessor ────────────────────────────────────────────
