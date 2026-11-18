@@ -43358,7 +43358,7 @@ mod tests {
     fn indexing_probe_precedes_vector_and_cache_artifact_creation() {
         let source = include_str!("runtime.rs");
         let pipeline_start = source
-            .find("async fn run_one_shot_index_scaffold_internal")
+            .find("\n    async fn run_one_shot_index_with_quality<")
             .expect("one-shot indexing pipeline");
         let pipeline_end = source[pipeline_start..]
             .find("\n    fn resolve_target_root")
@@ -43366,9 +43366,12 @@ mod tests {
             .expect("one-shot indexing pipeline end");
         let pipeline = &source[pipeline_start..pipeline_end];
 
-        let probe = pipeline
+        let fast_probe = pipeline
             .find("Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;")
-            .expect("fail-closed real-embedder probe");
+            .expect("fast embedder probe");
+        let quality_probe = pipeline
+            .find("Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;")
+            .expect("quality embedder probe");
         let vector_dir = pipeline
             .find("fs::create_dir_all(index_root.join(\"vector\"))?;")
             .expect("vector artifact directory creation");
@@ -43376,7 +43379,7 @@ mod tests {
             .find("fs::create_dir_all(index_root.join(\"cache\"))?;")
             .expect("cache artifact directory creation");
         assert!(
-            probe < vector_dir && probe < cache_dir,
+            fast_probe.max(quality_probe) < vector_dir.min(cache_dir),
             "a failed semantic probe must return before vector/cache artifact creation"
         );
         assert!(
