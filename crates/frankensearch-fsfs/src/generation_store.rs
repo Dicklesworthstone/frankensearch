@@ -127,6 +127,27 @@ struct GenerationPin {
     _file: File,
 }
 
+/// The collector owns the exclusive lock until it leaves the removal scope.
+struct CollectorPin {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(unix)]
+    creator_pid: u32,
+}
+
+#[cfg(unix)]
+impl Drop for CollectorPin {
+    fn drop(&mut self) {
+        // A forked child can retain an alias after this descriptor closes.
+        // Only the collecting process may unlock the shared open description.
+        if self.creator_pid == std::process::id()
+            && let Err(error) = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock)
+        {
+            tracing::warn!(%error, "failed to unlock generation collector pin");
+        }
+    }
+}
+
 impl PublishedGeneration {
     /// Stable directory containing this generation's complete artifact set.
     #[must_use]
@@ -1216,12 +1237,15 @@ fn pin_generation(root: &Path, id: &str) -> SearchResult<Option<Arc<GenerationPi
 
 /// Try to take the exclusive pin retention needs before removing `id`.
 /// `None` means a live reader holds it.
-fn exclusive_pin(root: &Path, id: &str) -> SearchResult<Option<File>> {
+fn exclusive_pin(root: &Path, id: &str) -> SearchResult<Option<CollectorPin>> {
     #[cfg(unix)]
     {
         let file = lockable_pin_file(root, id).map_err(|(error, _)| SearchError::Io(error))?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(file)),
+            Ok(()) => Ok(Some(CollectorPin {
+                file,
+                creator_pid: std::process::id(),
+            })),
             Err(rustix::io::Errno::AGAIN) => Ok(None),
             Err(errno) => Err(SearchError::Io(std::io::Error::from(errno))),
         }
@@ -2091,6 +2115,13 @@ mod tests {
             let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
             let id = publish(&store, &cx, "selected").id().to_owned();
             let exclusive = exclusive_pin(root.path(), &id).unwrap().unwrap();
+            // A fork before exec can retain the same open file description.
+            let inherited_file = exclusive.file.try_clone().unwrap();
+            // Dropping a child-side guard must not release the parent's lock.
+            drop(CollectorPin {
+                file: inherited_file.try_clone().unwrap(),
+                creator_pid: std::process::id().wrapping_add(1),
+            });
             std::thread::scope(|scope| {
                 let (sender, receiver) = std::sync::mpsc::channel();
                 let pin_root = root.path();
@@ -2108,6 +2139,7 @@ mod tests {
                 assert!(refusal.expect("reader admission waited for the exclusive pin"));
             });
             assert_eq!(store.active(&cx).unwrap().unwrap().id(), id);
+            drop(inherited_file);
         });
     }
 
