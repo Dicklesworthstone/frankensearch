@@ -485,10 +485,11 @@ impl VectorIndex {
             .iter()
             .map(|entry| entry.doc_id.as_str())
             .collect();
-        let has_usable = self
+        let usable_wal = self
             .wal_entries
             .iter()
-            .any(|entry| crate::vector_signal_usable(&entry.embedding))
+            .any(|entry| crate::vector_signal_usable(&entry.embedding));
+        let has_usable = usable_wal
             || (0..self.record_count()).any(|row| {
                 !self.is_deleted(row)
                     && self.doc_id_at(row).is_ok_and(|id| !replaced.contains(id))
@@ -496,6 +497,12 @@ impl VectorIndex {
             });
         let reason = if has_usable && had_filter {
             ZeroSignalReason::FilterEliminatedAll
+        } else if usable_wal
+            && (0..self.record_count()).all(|row| {
+                self.is_deleted(row) || self.doc_id_at(row).is_ok_and(|id| replaced.contains(id))
+            })
+        {
+            ZeroSignalReason::WalOnlyNoLiveRecords
         } else {
             ZeroSignalReason::NoUsableVectors
         };

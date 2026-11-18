@@ -1764,7 +1764,8 @@ impl TwoTierIndex {
     fn classified_fast_census(&self) -> (bool, ZeroSignalReason) {
         let (has_usable, reason) = self.fast_tier().classified_search_census(false);
         #[cfg(feature = "ann")]
-        if has_usable && self.fast_ann.is_some() {
+        // Resident WAL entries are scored exactly, outside the ANN graph.
+        if has_usable && reason == ZeroSignalReason::NoUsableVectors && self.fast_ann.is_some() {
             return (
                 has_usable,
                 ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors,
@@ -6401,6 +6402,56 @@ mod tests {
     }
 
     // ─── bd-3nsq: NaN score in WAL merge ───
+
+    #[test]
+    fn classified_wal_only_miss_after_reopen_is_benign() {
+        let dir = temp_index_dir("classified-wal-only-miss");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&path, &[("replaced", &[0.0, 1.0])]).unwrap();
+        // Reopen at the point where the WAL is durable but the old main row
+        // has not yet been tombstoned.
+        crate::wal::append_wal_batch(
+            &crate::wal::wal_path_for(&path),
+            &[crate::wal::WalEntry {
+                doc_id: "replaced".to_owned(),
+                doc_id_hash: crate::fnv1a_hash(b"replaced"),
+                embedding: vec![2.0, 0.0],
+            }],
+            2,
+            Quantization::F16,
+            crate::next_generation(VectorIndex::peek_compaction_gen(&path).unwrap()),
+            true,
+        )
+        .unwrap();
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            ..TwoTierConfig::default()
+        };
+        let index = TwoTierIndex::open(&dir, config).unwrap();
+        #[cfg(feature = "ann")]
+        assert!(index.has_fast_ann());
+        let fast = index.fast_tier();
+        assert!(!fast.is_deleted(0));
+        // Both components are finite, but scoring the visible WAL vector
+        // overflows. Its superseded main vector would have scored zero.
+        let query = [f32::MAX, 0.0];
+        for result in [
+            fast.search_top_k_classified(&query, 1, None).unwrap(),
+            index.search_fast_classified(&query, 1).unwrap(),
+        ] {
+            assert!(result.hits.is_empty());
+            assert_eq!(
+                result.zero_signal,
+                Some(ZeroSignalReason::WalOnlyNoLiveRecords)
+            );
+        }
+        let ordinary = index.search_fast_classified(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(ordinary.zero_signal, None);
+        assert_eq!(ordinary.hits.len(), 1);
+        assert_eq!(ordinary.hits[0].doc_id, "replaced");
+        assert_eq!(ordinary.hits[0].score.to_bits(), 2.0_f32.to_bits());
+    }
 
     #[test]
     fn classified_quality_scores_keep_durable_wal_shadowing_and_live_zero_scores() {
