@@ -443,15 +443,18 @@ The same opt-in is available as `[indexing] upgrade_reuse = "compatible_contract
 or `FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract`; disable it with
 `--upgrade-reuse same-executable`. Source, producer, topology and artifact checks
 still apply, and old receipts without the contract cannot use this path.
-Reuse skips document embedding; model verification and startup health probes
-still run.
+Reuse skips document embedding. Model verification and startup health probes
+still run. With `compatible-contract`, an absent optional quality model allows
+fast-only indexing. If an installed quality model fails verification or loading,
+the upgrade stops and preserves the previous selection. Restore the verified
+model before retrying.
 On complete-generation stores, `compact` and `delete` preserve admitted reuse
 evidence for surviving documents without running embedding inference. A later
 index reuses those documents and embeds changed or restored source rows.
-Exact JSON number parsing advances the indexing contract to v2. A v1 completion
-receipt starts cold once, including with this opt-in; later v2-compatible binary
-upgrades can reuse its work. Older query caches and daemons are also invalidated
-so forwarding preserves score bits and explanations.
+The current indexing contract (v3) preserves exact JSON numbers and native
+source paths, including literal backslashes in Unix filenames. Upgrading from
+a v1 or v2 completion receipt requires one cold index build. Later upgrades
+can reuse that work when the v3 contract and the other admission checks match.
 A file whose device, inode, length and modification and
 change times still match the stamp recorded when it was read is reused without
 being opened (a stamp is recorded only once its change time is older than the
