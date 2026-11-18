@@ -2795,14 +2795,10 @@ impl VectorIndex {
                 state.tombstone_count += 1;
                 continue;
             }
-            let usable = if shadowed.is_empty() {
-                self.is_vector_usable(index)
-            } else {
-                match self.doc_id_at(index) {
-                    Ok(doc_id) if shadowed.contains(doc_id) => continue,
-                    Ok(_) => self.is_vector_usable(index),
-                    Err(_) => false,
-                }
+            let usable = match self.doc_id_at(index) {
+                Ok(doc_id) if shadowed.contains(doc_id) => continue,
+                Ok(_) => self.is_vector_usable(index),
+                Err(_) => false,
             };
             state.live_count += 1;
             state.usable_vector_count += usize::from(usable);
@@ -10789,8 +10785,16 @@ mod tests {
     /// used to reload through `open` while the just-merged WAL sidecar was
     /// still on disk, so the reload classified it as stale and warned about
     /// discarding entries it had already absorbed.
-    struct WarnRecorder {
+    #[derive(Default)]
+    pub struct WarnRecorder {
         messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl WarnRecorder {
+        #[must_use]
+        pub fn messages(&self) -> Vec<String> {
+            self.messages.lock().expect("recorded warnings").clone()
+        }
     }
 
     impl tracing::Subscriber for WarnRecorder {
@@ -10848,16 +10852,14 @@ mod tests {
             "append must create the sidecar"
         );
 
-        let recorder = std::sync::Arc::new(WarnRecorder {
-            messages: std::sync::Mutex::new(Vec::new()),
-        });
+        let recorder = std::sync::Arc::new(WarnRecorder::default());
         let stats = tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
             index.compact().expect("compact")
         });
         assert_eq!(stats.wal_records, 2);
         assert_eq!(stats.total_records_after, 3);
 
-        let warnings = recorder.messages.lock().unwrap().clone();
+        let warnings = recorder.messages();
         assert!(
             warnings.is_empty(),
             "compacting a live WAL must not warn about discarding it: {warnings:?}"
@@ -11466,6 +11468,34 @@ mod tests {
         assert_eq!(after_delete.tombstone_count, 1);
         assert_eq!(after_delete.usable_vector_count, 2);
         assert_eq!(index.live_count(), 2);
+    }
+
+    #[test]
+    fn zero_signal_census_excludes_vectors_with_unreadable_document_ids() {
+        let path = temp_index_path("zero-signal-census-unreadable-id");
+        let mut writer = VectorIndex::create(&path, "signal", 2).unwrap();
+        writer.write_record("unreadable", &[1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        let (_, header_len) = parse_header(&path, &bytes).unwrap();
+        bytes[header_len + RECORD_SIZE_BYTES] = 0xff;
+        fs::write(&path, bytes).unwrap();
+
+        let reader = VectorIndex::open_read_only(&path).unwrap();
+        assert!(reader.is_vector_usable(0));
+        assert!(matches!(
+            reader.search_top_k_classified(&[1.0, 0.0], 1, None),
+            Err(SearchError::IndexCorrupted { .. })
+        ));
+
+        let state = reader.zero_signal_state();
+        assert_eq!((state.record_count, state.live_count), (1, 1));
+        assert_eq!((state.wal_count, state.usable_vector_count), (0, 0));
+        assert_eq!(
+            state.state_reason(),
+            Some(ZeroSignalReason::NoUsableVectors)
+        );
     }
 
     #[test]

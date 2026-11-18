@@ -1625,7 +1625,9 @@ impl TwoTierIndex {
                     .ann_fallback_count
                     .fetch_add(1, AtomicOrdering::Relaxed)
                     .saturating_add(1);
-                warn!(
+                // HNSW emits the first warning for this graph. Keep per-query
+                // diagnostics at debug level even when exact repair repeats.
+                debug!(
                     ?reason,
                     fallback_count,
                     index_size = stats.index_size,
@@ -6245,6 +6247,42 @@ mod tests {
         let mut hit_ids: Vec<&str> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
         hit_ids.sort_unstable();
         assert_eq!(hit_ids, ["doc-a", "doc-b"]);
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn repeated_ann_underfill_warns_once_and_counts_every_exact_fallback() {
+        let dir = temp_index_dir("ann-underfill-warnings");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&path, &[("doc-a", &[1.0, 0.0]), ("doc-b", &[0.0, 1.0])])
+            .expect("write fast index");
+        let mut writer = VectorIndex::open_writer(&path).expect("open fast vector writer");
+        let ann = HnswIndex::build_from_vector_index(&writer, HnswConfig::default())
+            .expect("build ANN before deleting a graph member");
+        assert!(writer.soft_delete("doc-a").expect("delete graph member"));
+        drop(writer);
+
+        let paths = TwoTierIndexPaths::new(&path);
+        let mut index = TwoTierIndex::open_with_paths(&paths, TwoTierConfig::default())
+            .expect("open the tombstoned fast index");
+        index.fast_ann = Some(ann);
+        let recorder = std::sync::Arc::new(crate::tests::WarnRecorder::default());
+        tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
+            for _ in 0..5 {
+                let result = index
+                    .search_fast_classified(&[1.0, 0.0], 2)
+                    .expect("search with an underfilled graph");
+                assert_eq!(result.hits.len(), 1);
+                assert_eq!(result.hits[0].doc_id, "doc-b");
+                assert_eq!(result.zero_signal, None);
+            }
+        });
+
+        assert_eq!(index.ann_fallback_count(), 5);
+        let warnings = recorder.messages();
+        assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
+        assert!(warnings[0].contains("HNSW search underfilled"));
     }
 
     #[cfg(feature = "ann")]

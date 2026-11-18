@@ -63156,16 +63156,28 @@ mod tests {
             .write_record("docs/healthy.md", &[1.0, 0.0, 0.0, 0.0])
             .expect("write healthy vector");
         writer.finish().expect("finish vector index");
+        {
+            let mut index = VectorIndex::open_writer(&vector_path).expect("open WAL writer");
+            index
+                .append("docs/recent.md", &[0.0, 1.0, 0.0, 0.0])
+                .expect("append a second visible vector to the WAL");
+        }
 
         let live_reader =
             VectorIndex::open_read_only(&vector_path).expect("retain a live shared reader");
+        let search = live_reader
+            .search_top_k_classified(&[0.0, 1.0, 0.0, 0.0], 1, None)
+            .expect("search with the live reader");
+        assert_eq!(search.hits.len(), 1);
+        assert_eq!(search.hits[0].doc_id, "docs/recent.md");
+
         let check = FsfsRuntime::collect_zero_signal_doctor_check(&index_root);
 
         assert_eq!(check.verdict, super::DoctorVerdict::Pass);
         assert_eq!(check.name, "semantic.zero_signal");
         assert!(
-            check.detail.contains("records=1") && check.detail.contains("usable=1"),
-            "doctor should inspect the shared published mapping: {}",
+            check.detail.contains("records=1 live=2 tombstones=0 wal=1 usable=2"),
+            "doctor should count both visible rows with the reader active: {}",
             check.detail
         );
         drop(live_reader);
