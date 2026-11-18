@@ -6,6 +6,7 @@
 //! once per query.
 
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use frankensearch_core::{TwoTierConfig, ZeroSignalReason};
@@ -25,6 +26,8 @@ fn temp_dir(name: &str) -> tempfile::TempDir {
 const DIM: usize = 4;
 const E1: [f32; DIM] = [1.0, 0.0, 0.0, 0.0];
 const E2: [f32; DIM] = [0.0, 1.0, 0.0, 0.0];
+const RESTART_PATH: &str = "FRANKENSEARCH_TEST_ZERO_SIGNAL_RESTART_PATH";
+const RESTART_STATE: &str = "FRANKENSEARCH_TEST_ZERO_SIGNAL_RESTART_STATE";
 
 fn classify(index: &VectorIndex, query: &[f32], k: usize) -> Option<ZeroSignalReason> {
     index
@@ -35,8 +38,60 @@ fn classify(index: &VectorIndex, query: &[f32], k: usize) -> Option<ZeroSignalRe
 
 // ─── VectorIndex lifecycle across restarts ────────────────────────────────────
 
+fn check_from_fresh_process(path: &Path, state: &str) {
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "vector_index_lifecycle_classifies_every_state_across_restarts",
+        ])
+        .env(RESTART_PATH, path)
+        .env(RESTART_STATE, state)
+        .output()
+        .expect("start fresh test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed;"),
+        "fresh-process search of {state} did not pass: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn vector_index_lifecycle_classifies_every_state_across_restarts() {
+    if let Some(path) = std::env::var_os(RESTART_PATH) {
+        let index = VectorIndex::open_read_only(Path::new(&path)).expect("open in fresh process");
+        let classified = index
+            .search_top_k_classified(&E1, 3, None)
+            .expect("fresh-process query");
+        match std::env::var(RESTART_STATE).unwrap().as_str() {
+            "populated" => {
+                let ids: Vec<_> = classified
+                    .hits
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect();
+                assert_eq!(ids, ["doc-a", "doc-b"]);
+                assert_eq!(classified.zero_signal, None);
+            }
+            "tombstoned" => {
+                assert!(classified.hits.is_empty());
+                assert_eq!(
+                    classified.zero_signal,
+                    Some(ZeroSignalReason::AllTombstoned)
+                );
+            }
+            "vacuumed" => {
+                assert!(classified.hits.is_empty());
+                assert_eq!(
+                    classified.zero_signal,
+                    Some(ZeroSignalReason::NewlyCreatedEmpty)
+                );
+            }
+            state => panic!("unknown restart proof state: {state}"),
+        }
+        return;
+    }
+
     let dir = temp_dir("lifecycle");
     let path = dir.path().join("index.fsvi");
 
@@ -73,6 +128,7 @@ fn vector_index_lifecycle_classifies_every_state_across_restarts() {
     drop(index);
 
     // Stage 3: restart — WAL-resident records must survive and still clear.
+    check_from_fresh_process(&path, "populated");
     let mut index = VectorIndex::open(&path).expect("reopen after restart");
     let classified = index
         .search_top_k_classified(&E1, 3, None)
@@ -104,6 +160,7 @@ fn vector_index_lifecycle_classifies_every_state_across_restarts() {
     drop(index);
 
     // Stage 5: the tombstoned state survives restart.
+    check_from_fresh_process(&path, "tombstoned");
     let mut index = VectorIndex::open(&path).expect("reopen tombstoned");
     let reason = classify(&index, &E1, 3).expect("still empty after restart");
     assert_eq!(
@@ -119,8 +176,11 @@ fn vector_index_lifecycle_classifies_every_state_across_restarts() {
         classify(&index, &E1, 3),
         Some(ZeroSignalReason::NewlyCreatedEmpty)
     );
+    drop(index);
+    check_from_fresh_process(&path, "vacuumed");
 
     // Stage 7: re-ingest after vacuum; the lane recovers.
+    let mut index = VectorIndex::open(&path).expect("reopen vacuumed index");
     index.append("doc-c", &E1).expect("append after vacuum");
     let classified = index
         .search_top_k_classified(&E1, 3, None)
@@ -136,11 +196,11 @@ fn vector_index_lifecycle_classifies_every_state_across_restarts() {
 /// `TwoTierIndex::search_fast_classified`.
 #[derive(Clone, Default)]
 struct LaneEventCollector {
-    messages: Arc<Mutex<Vec<String>>>,
+    messages: Arc<Mutex<Vec<(tracing::Level, String)>>>,
 }
 
 impl LaneEventCollector {
-    fn lane_events(&self) -> Vec<String> {
+    fn lane_events(&self) -> Vec<(tracing::Level, String)> {
         self.messages.lock().expect("collector lock").clone()
     }
 }
@@ -176,7 +236,10 @@ impl tracing::Subscriber for LaneEventCollector {
         if let Some(message) = extractor.message
             && message.contains("fast-tier semantic lane")
         {
-            self.messages.lock().expect("collector lock").push(message);
+            self.messages
+                .lock()
+                .expect("collector lock")
+                .push((*event.metadata().level(), message));
         }
     }
 
@@ -247,9 +310,44 @@ fn repeated_empty_searches_log_one_transition_not_a_storm() {
          transition, got {events:?}"
     );
     assert!(
-        events[0].contains("no signal"),
+        events[0].0 == tracing::Level::INFO && events[0].1.contains("no signal"),
         "AllTombstoned is a benign state, not an availability failure: {events:?}"
     );
+}
+
+#[test]
+fn repeated_unusable_row_searches_warn_once() {
+    let dir = temp_dir("unusable");
+    let path = dir.path().join("vector.fast.idx");
+    let mut writer = VectorIndex::create(&path, "test-embedder", DIM).expect("create writer");
+    writer.write_record("legacy-zero", &E1).expect("write row");
+    writer.finish().expect("finish index");
+
+    // Older F16 writers could leave a live doc ID with an entirely zero slab.
+    let reader = VectorIndex::open_read_only(&path).expect("locate the stored vector");
+    let offset = usize::try_from(reader.metadata().vectors_offset).expect("vector offset");
+    drop(reader);
+    let mut image = std::fs::read(&path).expect("read legacy fixture image");
+    image[offset..offset + DIM * 2].fill(0);
+    std::fs::write(&path, image).expect("install legacy zero slab");
+
+    let index = open_two_tier(dir.path());
+    let collector = LaneEventCollector::default();
+    tracing::subscriber::with_default(collector.clone(), || {
+        for _ in 0..5 {
+            let classified = index.search_fast_classified(&E1, 3).expect("search");
+            assert!(classified.hits.is_empty());
+            assert_eq!(
+                classified.zero_signal,
+                Some(ZeroSignalReason::NoUsableVectors)
+            );
+        }
+    });
+
+    let events = collector.lane_events();
+    assert_eq!(events.len(), 1, "unchanged unusable state: {events:?}");
+    assert_eq!(events[0].0, tracing::Level::WARN);
+    assert!(events[0].1.contains("is unusable"));
 }
 
 #[test]
