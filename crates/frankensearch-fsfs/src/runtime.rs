@@ -691,7 +691,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v35: negated queries require lexical membership for every vector candidate.
 // v36: corrupt stored vectors cannot contribute semantic ranks or hide recovery.
 // v37: completing Refined scores requires usable fast-tier vectors too.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v37";
+// v38: successful empty semantic searches retain each tier's stable reason.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v38";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -725,8 +726,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v32 / stream v30: negated queries reject candidates without lexical evidence.
 // v33 / stream v31: unusable stored vectors cannot attest semantic ranks.
 // v34 / stream v32: completing Refined scores skips unusable fast-tier rows.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v34";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v32";
+// v35 / stream v33: carry classified empty outcomes from the serving reader.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v35";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v33";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -9947,6 +9949,7 @@ impl FsfsRuntime {
                                 total_units: Some(1),
                                 reason_code: "daemon_cache_hit".to_owned(),
                                 message: "Replaying complete cached search phases".to_owned(),
+                                zero_signal: BTreeMap::new(),
                                 recovery_plans: BTreeMap::new(),
                             }),
                         );
@@ -12196,6 +12199,7 @@ impl FsfsRuntime {
                 total_units: Some(u64::try_from(payload.total_candidates).unwrap_or(u64::MAX)),
                 reason_code: reason_code.to_owned(),
                 message: timeout_message.unwrap_or_else(|| message.to_owned()),
+                zero_signal: payload.zero_signal.clone(),
                 recovery_plans: payload.recovery_plans.clone(),
             }),
         );
@@ -12246,6 +12250,7 @@ impl FsfsRuntime {
                     total_units: Some(u64::try_from(rerank.candidate_budget).unwrap_or(u64::MAX)),
                     reason_code: rerank.reason_code.clone(),
                     message,
+                    zero_signal: BTreeMap::new(),
                     recovery_plans: BTreeMap::new(),
                 }),
             );
@@ -14043,6 +14048,13 @@ impl FsfsRuntime {
             SearchOutputPhase::Initial
         };
         for source in sources {
+            for (tier, reasons) in &source.zero_signal {
+                payload
+                    .zero_signal
+                    .entry(tier.clone())
+                    .or_default()
+                    .extend(reasons.iter().cloned());
+            }
             for (reason, plan) in &source.recovery_plans {
                 payload
                     .recovery_plans
@@ -14938,17 +14950,25 @@ impl FsfsRuntime {
         .and_then(|plan| serde_json::to_value(plan).ok())
     }
 
-    fn attach_zero_signal_recovery(
+    fn attach_semantic_zero_signal(
         &self,
         payload: &mut SearchPayload,
         mode: SearchExecutionMode,
         tier: ModelTier,
         reason: Option<ZeroSignalReason>,
     ) {
-        let Some(reason) = reason.filter(|reason| reason.is_availability_failure()) else {
+        let Some(reason) = reason else {
             return;
         };
         if mode == SearchExecutionMode::LexicalOnly || payload.vector_generation_is_hash {
+            return;
+        }
+        payload
+            .zero_signal
+            .entry(tier.to_string())
+            .or_default()
+            .insert(reason.reason_code().to_owned());
+        if !reason.is_availability_failure() {
             return;
         }
         // This plan describes the keyed lane. A broken quality lane must not
@@ -16585,7 +16605,7 @@ impl FsfsRuntime {
             resources,
             mode,
         );
-        self.attach_zero_signal_recovery(&mut payload, mode, ModelTier::Fast, fast_zero_signal);
+        self.attach_semantic_zero_signal(&mut payload, mode, ModelTier::Fast, fast_zero_signal);
         hit_lines.annotate(&mut payload);
         // A planner downgrade outranks the requested fast_only (it removed the
         // semantic lane that mode promised), but not a missing or hash-control
@@ -16773,7 +16793,8 @@ impl FsfsRuntime {
                     refined_payload
                         .recovery_plans
                         .clone_from(&payload.recovery_plans);
-                    self.attach_zero_signal_recovery(
+                    refined_payload.zero_signal.clone_from(&payload.zero_signal);
+                    self.attach_semantic_zero_signal(
                         &mut refined_payload,
                         mode,
                         ModelTier::Quality,
@@ -16871,6 +16892,7 @@ impl FsfsRuntime {
                     failed_payload
                         .recovery_plans
                         .clone_from(&payload.recovery_plans);
+                    failed_payload.zero_signal.clone_from(&payload.zero_signal);
                     self.attach_quality_failure_recovery(&mut failed_payload, &error);
                     hit_lines.annotate(&mut failed_payload);
                     if let SearchError::SearchTimeout {
@@ -16925,6 +16947,7 @@ impl FsfsRuntime {
                     failed_payload
                         .recovery_plans
                         .clone_from(&payload.recovery_plans);
+                    failed_payload.zero_signal.clone_from(&payload.zero_signal);
                     if !failed_payload.vector_generation_is_hash
                         && let Some(plan) = self.unproven_quality_recovery_plan()
                     {
@@ -20251,19 +20274,18 @@ impl FsfsRuntime {
             *problem = Some(SemanticReadiness::IndexEmpty(reason));
             return DoctorCheck {
                 name: NAME.to_owned(),
-                verdict: if reason == frankensearch_core::config::ZeroSignalReason::NoUsableVectors
-                {
+                verdict: if reason.is_availability_failure() {
                     DoctorVerdict::Fail
                 } else {
-                    DoctorVerdict::Warn
+                    DoctorVerdict::Pass
                 },
                 detail: format!(
                     "quality tier has no usable semantic signal: {}",
                     reason.reason_code()
                 ),
-                suggestion: Some(
-                    "run `fsfs index --full` with the verified quality model".to_owned(),
-                ),
+                suggestion: reason.is_availability_failure().then(|| {
+                    "run `fsfs index --full` with the verified quality model".to_owned()
+                }),
             };
         }
         if signal.usable_vector_count < signal.live_count {
@@ -20386,14 +20408,9 @@ impl FsfsRuntime {
             Some(reason) => (
                 DoctorCheck {
                     name: "semantic.zero_signal".to_owned(),
-                    verdict: DoctorVerdict::Warn,
+                    verdict: DoctorVerdict::Pass,
                     detail: format!("{}: {census}", reason.reason_code()),
-                    suggestion: Some(match reason {
-                        ZeroSignalReason::AllTombstoned => {
-                            "every record is tombstoned; compact or re-run `fsfs index`".to_owned()
-                        }
-                        _ => "index is empty; run `fsfs index <dir>` to populate it".to_owned(),
-                    }),
+                    suggestion: None,
                 },
                 Some(reason),
             ),
@@ -26604,7 +26621,7 @@ impl FsfsRuntime {
             resources,
             SearchExecutionMode::QualityOnly,
         );
-        self.attach_zero_signal_recovery(
+        self.attach_semantic_zero_signal(
             &mut payload,
             SearchExecutionMode::QualityOnly,
             ModelTier::Quality,
@@ -37255,6 +37272,10 @@ mod tests {
                 let last = payloads.last().unwrap();
                 assert_eq!(last.recovery_plans.len(), 1, "{mode:?}");
                 assert_eq!(
+                    last.zero_signal["quality"],
+                    super::BTreeSet::from([reason.reason_code().to_owned()])
+                );
+                assert_eq!(
                     last.recovery_plans
                         .get(&format!("retrieve.quality.{}", reason.reason_code())),
                     Some(&expected)
@@ -37357,26 +37378,33 @@ mod tests {
             ZeroSignalReason::AllTombstoned,
             ZeroSignalReason::WalOnlyNoLiveRecords,
         ] {
-            runtime.attach_zero_signal_recovery(
+            payload.zero_signal.clear();
+            runtime.attach_semantic_zero_signal(
                 &mut payload,
                 SearchExecutionMode::Full,
                 ModelTier::Fast,
                 Some(reason),
             );
             assert!(payload.recovery_plans.is_empty(), "{reason:?}");
+            assert_eq!(
+                payload.zero_signal["fast"],
+                super::BTreeSet::from([reason.reason_code().to_owned()])
+            );
         }
+        payload.zero_signal.clear();
         for (mode, hash_control) in [
             (SearchExecutionMode::LexicalOnly, false),
             (SearchExecutionMode::FastOnly, true),
         ] {
             payload.vector_generation_is_hash = hash_control;
-            runtime.attach_zero_signal_recovery(
+            runtime.attach_semantic_zero_signal(
                 &mut payload,
                 mode,
                 ModelTier::Fast,
                 Some(ZeroSignalReason::NoUsableVectors),
             );
             assert!(payload.recovery_plans.is_empty());
+            assert!(payload.zero_signal.is_empty());
         }
         payload.vector_generation_is_hash = false;
         for error in [
@@ -47625,6 +47653,10 @@ mod tests {
             reason_code: "query.quality.timeout".to_owned(),
         });
         short.explanation_warnings.push(warning.clone());
+        short.zero_signal.insert(
+            "fast".into(),
+            super::BTreeSet::from(["zerosignal.request.filter_eliminated_all".into()]),
+        );
         recovery_runtime.attach_quality_failure_recovery(
             &mut short,
             &SearchError::SearchTimeout {
@@ -47640,6 +47672,10 @@ mod tests {
             reason_code: "query.quality.timeout".to_owned(),
         });
         long.explanation_warnings.push(warning.clone());
+        long.zero_signal.insert(
+            "fast".into(),
+            super::BTreeSet::from(["zerosignal.state.newly_created_empty".into()]),
+        );
         recovery_runtime.attach_quality_failure_recovery(
             &mut long,
             &SearchError::EmbedderUnavailable {
@@ -47657,6 +47693,13 @@ mod tests {
         assert_eq!(fused.phase, SearchOutputPhase::RefinementFailed);
         assert_eq!(fused.skip_reason.as_deref(), Some("quality_timeout"));
         assert_eq!(fused.quality_timeout, long.quality_timeout);
+        assert_eq!(
+            fused.zero_signal["fast"],
+            short.zero_signal["fast"]
+                .union(&long.zero_signal["fast"])
+                .cloned()
+                .collect::<super::BTreeSet<_>>()
+        );
         assert_eq!(fused.degradation_advice.len(), 2);
         assert_eq!(fused.recovery_plans.len(), 2);
         for source in [&short, &long] {
@@ -47706,6 +47749,7 @@ mod tests {
         assert_eq!(progress.stage, "retrieve.expansion");
         assert_eq!(progress.reason_code, "query.stream.expanded_degraded");
         assert_eq!(progress.recovery_plans, fused.recovery_plans);
+        assert_eq!(progress.zero_signal, fused.zero_signal);
         assert!(progress.message.contains("100ms (observed 125ms)"));
         assert!(
             progress
@@ -67975,6 +68019,8 @@ mod tests {
                 "fsfs.search.cache.v35",
                 // Could let a corrupt fast vector back into a Refined result.
                 "fsfs.search.cache.v36",
+                // Omitted the classified reason for a successful empty result.
+                "fsfs.search.cache.v37",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

@@ -500,9 +500,65 @@ mod loader_only {
             .unwrap();
             assert_index_completion(&envelope, &sentinel, 0, format);
         }
+        verify_empty_semantic_results(fsfs, root, &empty_index);
         eprintln!(
             "[default-build-e2e] stage=index-formats json=jsonl=toon=csv=table:verified nonempty=10 empty=0 counts=published-sentinel"
         );
+    }
+
+    #[cfg(feature = "semantic-loaders")]
+    fn verify_empty_semantic_results(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
+        let index = index.to_str().unwrap();
+        for (flag, tier) in [("--fast-only", "fast"), ("--quality-only", "quality")] {
+            let label = format!("empty-{tier}-search");
+            let outcome = fsfs.run(
+                root,
+                &label,
+                [
+                    "search",
+                    "network retry",
+                    flag,
+                    "--no-daemon",
+                    "--index-dir",
+                    index,
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let envelope = parse_success_envelope(&label, &outcome);
+            let data = &envelope["data"];
+            assert_eq!(data["hits"], serde_json::json!([]), "{envelope}");
+            assert_eq!(
+                data["zero_signal"],
+                serde_json::json!({(tier): ["zerosignal.state.newly_created_empty"]}),
+                "{envelope}"
+            );
+            assert!(data.get("recovery_plans").is_none(), "{envelope}");
+        }
+
+        let doctor = fsfs.run(
+            root,
+            "doctor-empty-index",
+            ["doctor", "--index-dir", index, "--format", "json"],
+            QUICKSTART_TIMEOUT,
+        );
+        let envelope = parse_success_envelope("doctor on a complete empty index", &doctor);
+        let check = envelope["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "semantic.zero_signal")
+            .expect("semantic zero-signal census");
+        assert_eq!(check["verdict"], "pass", "{check}");
+        let detail = check["detail"].as_str().unwrap();
+        for count in ["records=0", "live=0", "tombstones=0", "wal=0", "usable=0"] {
+            assert!(
+                detail.split_whitespace().any(|word| word == count),
+                "{check}"
+            );
+        }
+        assert!(check["suggestion"].is_null(), "{check}");
     }
 
     #[cfg(feature = "semantic-loaders")]
@@ -578,6 +634,7 @@ mod loader_only {
                 "{label} must skip quality on an existing two-tier index"
             );
             assert_eq!(envelopes[0]["data"]["phase"], "initial");
+            assert!(envelopes[0]["data"].get("zero_signal").is_none());
             assert!(
                 envelopes[0]["data"]["hits"]
                     .as_array()
@@ -770,7 +827,7 @@ mod loader_only {
         let mut records = matching_records();
         assert_eq!(records.len(), 1, "the real query must persist one answer");
         let (cache_path, cache_bytes, record) = records.pop().unwrap();
-        assert_eq!(record["schema_version"], "fsfs.search.cache.v37");
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v38");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
 
         // Multiple fresh processes keep an isolated scheduling delay from
@@ -2997,7 +3054,7 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v34");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v35");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
                     let mut contracts = sha2::Sha256::new();
                     for manifest in [

@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::{ValidationResult, ValidationViolation};
 use crate::explanation_payload::FsfsExplanationPayload;
 use crate::output_schema::{
-    OutputError, OutputErrorCode, OutputWarning, exit_code_for, output_error_from,
+    OutputError, OutputErrorCode, OutputWarning, SemanticZeroSignals, exit_code_for,
+    output_error_from,
 };
 
 const SUBSYSTEM: &str = "fsfs_stream_protocol";
@@ -109,6 +110,9 @@ pub struct StreamProgressEvent {
     /// authority or replacing aggregate coverage. Ordinary progress omits it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub recovery_plans: BTreeMap<String, serde_json::Value>,
+    /// Stable reason codes for semantic tiers that returned no signal in this phase.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub zero_signal: SemanticZeroSignals,
 }
 
 /// Result event payload.
@@ -933,6 +937,7 @@ mod tests {
                 reason_code: "query.phase.initial".into(),
                 message: "phase 1 complete".into(),
                 recovery_plans: BTreeMap::new(),
+                zero_signal: BTreeMap::new(),
             })
             .kind(),
             StreamEventKind::Progress
@@ -1190,6 +1195,7 @@ mod tests {
                 reason_code: "query.phase.initial".into(),
                 message: "fast retrieval complete".into(),
                 recovery_plans: BTreeMap::new(),
+                zero_signal: BTreeMap::new(),
             }),
             StreamEvent::Result(StreamResultEvent {
                 rank: 1,
@@ -1678,10 +1684,12 @@ mod tests {
             reason_code: "query.phase.initial".into(),
             message: "in progress".into(),
             recovery_plans: BTreeMap::new(),
+            zero_signal: BTreeMap::new(),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("total_units"));
         assert!(!json.contains("recovery_plans"));
+        assert!(!json.contains("zero_signal"));
         assert_eq!(
             serde_json::from_str::<StreamProgressEvent>(&json).unwrap(),
             event

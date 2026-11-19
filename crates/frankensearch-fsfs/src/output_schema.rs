@@ -425,6 +425,10 @@ pub struct IndexFreshnessPayload {
     pub unknown_missing_doc_segments: usize,
 }
 
+/// Stable zero-signal reason codes observed by each semantic tier. Expanded
+/// queries may observe multiple reasons in one tier.
+pub type SemanticZeroSignals = BTreeMap<String, BTreeSet<String>>;
+
 /// Search payload embedded in `OutputEnvelope::data` for `fsfs search <query>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchPayload {
@@ -433,6 +437,9 @@ pub struct SearchPayload {
     pub total_candidates: usize,
     pub returned_hits: usize,
     pub hits: Vec<SearchHitPayload>,
+    /// Present when an executed semantic tier classified an empty result.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub zero_signal: SemanticZeroSignals,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub degradation_advice: BTreeMap<String, DegradationAdvice>,
     /// Canonical recovery plans for observed stage failures, keyed by stage
@@ -601,6 +608,7 @@ impl SearchPayload {
             total_candidates,
             returned_hits,
             hits,
+            zero_signal: BTreeMap::new(),
             degradation_advice: BTreeMap::new(),
             recovery_plans: BTreeMap::new(),
             index_freshness: None,

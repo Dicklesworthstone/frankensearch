@@ -18,7 +18,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::output_schema::{OutputEnvelope, OutputWarning, SearchPayload};
+use crate::output_schema::{OutputEnvelope, OutputWarning, SearchPayload, SemanticZeroSignals};
 
 // ─── Compact Mode ───────────────────────────────────────────────────────────
 
@@ -96,6 +96,9 @@ pub struct CompactSearchResponse {
     /// These serialized plans are diagnostic data, never recovery authority.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub recovery_plans: BTreeMap<String, serde_json::Value>,
+    /// Stable reason codes for semantic tiers that returned no signal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub zero_signal: SemanticZeroSignals,
 }
 
 /// A compact error response.
@@ -460,6 +463,10 @@ pub fn compactify(
                 .data
                 .as_ref()
                 .map_or_else(BTreeMap::new, |payload| payload.recovery_plans.clone()),
+            zero_signal: envelope
+                .data
+                .as_ref()
+                .map_or_else(BTreeMap::new, |payload| payload.zero_signal.clone()),
         }),
         err: None,
         w: compact_warnings(&envelope.warnings),
@@ -732,6 +739,21 @@ mod tests {
         let payload = env.data.as_mut().unwrap();
         payload.phase = SearchOutputPhase::RefinementFailed;
         payload.recovery_plans.clone_from(&plans);
+        let zero_signal = SemanticZeroSignals::from([
+            (
+                "fast".to_owned(),
+                [
+                    "zerosignal.request.filter_eliminated_all".to_owned(),
+                    "zerosignal.request.zero_norm_query".to_owned(),
+                ]
+                .into(),
+            ),
+            (
+                "quality".to_owned(),
+                ["zerosignal.availability.no_usable_vectors".to_owned()].into(),
+            ),
+        ]);
+        payload.zero_signal.clone_from(&zero_signal);
 
         for format in [
             crate::OutputFormat::Json,
@@ -755,11 +777,13 @@ mod tests {
             let data = decoded.data.unwrap();
             assert_eq!(data.phase.as_deref(), Some("refinement_failed"));
             assert_eq!(data.recovery_plans, plans);
+            assert_eq!(data.zero_signal, zero_signal);
             assert_eq!(data.hits[0].doc, "retained.rs");
             assert_eq!(data.hits[0].line, Some(7));
         }
         let minimal = compactify(&env, CompactLevel::Minimal).data.unwrap();
         assert_eq!(minimal.recovery_plans, plans);
+        assert_eq!(minimal.zero_signal, zero_signal);
         assert!(minimal.ms.is_none());
         assert!(minimal.hits[0].snip.is_none());
     }
@@ -872,6 +896,7 @@ mod tests {
                 ms: Some(15),
                 phase: Some("initial".into()),
                 recovery_plans: BTreeMap::new(),
+                zero_signal: BTreeMap::new(),
             }),
             err: None,
             w: Vec::new(),
@@ -882,9 +907,12 @@ mod tests {
         assert!(!json.contains("\"err\""));
         assert!(!json.contains("\"w\""));
         assert!(!json.contains("recovery_plans"));
+        assert!(!json.contains("zero_signal"));
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"id\":\"R0\""));
         let legacy: CompactEnvelope = serde_json::from_str(&json).unwrap();
-        assert!(legacy.data.unwrap().recovery_plans.is_empty());
+        let legacy_data = legacy.data.unwrap();
+        assert!(legacy_data.recovery_plans.is_empty());
+        assert!(legacy_data.zero_signal.is_empty());
     }
 }

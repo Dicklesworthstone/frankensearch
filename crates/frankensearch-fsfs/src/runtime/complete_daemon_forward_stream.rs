@@ -258,6 +258,7 @@ async fn serve_cached_search(
                             reason_code: "daemon_cache_hit".to_owned(),
                             message: "Replaying complete cached search phases".to_owned(),
                             recovery_plans: std::collections::BTreeMap::new(),
+                            zero_signal: std::collections::BTreeMap::new(),
                         }),
                     );
                     emit_stream_frame(&frame, OutputFormat::Jsonl, writer)?;
@@ -795,6 +796,7 @@ mod tests {
                 reason_code: "query.stream.initial_ready".to_owned(),
                 message: "original results ready".to_owned(),
                 recovery_plans: std::collections::BTreeMap::new(),
+                zero_signal: std::collections::BTreeMap::new(),
             }),
         )
     }
@@ -1178,6 +1180,9 @@ mod tests {
                 format!("retrieve.fast.{}", reason.reason_code()),
                 serde_json::to_value(plan).unwrap(),
             );
+            progress
+                .zero_signal
+                .insert("fast".to_owned(), [reason.reason_code().to_owned()].into());
             let expected = progress.recovery_plans.clone();
             let bytes = frames_bytes(&[
                 started(&request),
@@ -1208,6 +1213,12 @@ mod tests {
                 panic!("expected forwarded progress");
             };
             assert_eq!(progress.recovery_plans, expected);
+            assert_eq!(
+                progress.zero_signal["fast"],
+                std::collections::BTreeSet::from([
+                    "zerosignal.availability.no_usable_vectors".to_owned()
+                ])
+            );
             assert!(matches!(
                 &frames[2].event,
                 StreamEvent::Terminal(terminal) if terminal.status == StreamTerminalStatus::Completed
