@@ -2110,6 +2110,26 @@ mod tests {
 
     #[test]
     fn a_collectors_exclusive_pin_does_not_block_reader_admission() {
+        const ISOLATED: &str = "FSFS_TEST_ISOLATED_COLLECTOR_PIN";
+        if std::env::var_os(ISOLATED).is_none() {
+            // Parallel tests fork. They can legitimately inherit the shared
+            // reader pin returned by publish before this fixture drops it.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "generation_store::tests::a_collectors_exclusive_pin_does_not_block_reader_admission",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         run_test_with_cx(|cx| async move {
             let root = tempfile::tempdir().unwrap();
             let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
@@ -2135,11 +2155,15 @@ mod tests {
                 // Release even on timeout so reverting to blocking flock makes
                 // the assertion fail instead of hanging the entire test suite.
                 drop(exclusive);
+                // Check reopening while the independent alias still lives. If
+                // the reader timed out, release the alias before joining it.
+                if matches!(refusal, Ok(true)) {
+                    assert_eq!(store.active(&cx).unwrap().unwrap().id(), id);
+                }
+                drop(inherited_file);
                 reader.join().unwrap();
                 assert!(refusal.expect("reader admission waited for the exclusive pin"));
             });
-            assert_eq!(store.active(&cx).unwrap().unwrap().id(), id);
-            drop(inherited_file);
         });
     }
 
