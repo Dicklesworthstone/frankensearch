@@ -110,8 +110,15 @@ window positions and fast vector rows matched independent fresh builds. A
 compatible upgrade between different v5 executables carried all three test
 files with zero document-embedding batches. An upgrade from v4 rebuilt once.
 
+At the same revision, the Core, Index (with ANN) and Fusion packages passed
+3,711 tests and doctests with 26 declared ignores on a separate Linux worker
+(RCH `30097323753217212`). The stock doctor reported three usable fast rows
+in the healthy store, identified the damaged tier in the quality-only case,
+and reported zero usable fast rows when both tiers were damaged. All 12
+checked input hashes remained unchanged.
+
 Release qualification remains open. Strict
-UBS reported findings and the macOS host had 1.47 GiB free against its
+UBS reported findings and the macOS host had 0.74 GiB free against its
 40 GiB admission requirement. Hosted producer changes still lack an
 authenticated response through the stock indexing command. The functional
 runs above did not measure the README latency targets.
