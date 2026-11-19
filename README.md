@@ -1330,6 +1330,9 @@ of a freshly created empty index returns `hits: []` and
 `"zero_signal":{"quality":["zerosignal.state.newly_created_empty"]}`.
 Expanded queries can report several distinct codes per tier. An unusable
 vector generation also reports a recovery plan for the affected tier.
+With `--limit 0`, each executed semantic tier reports
+`zerosignal.request.zero_k`, including with `--expand`. A requested reranker
+scores zero documents and returns no document paths in its score list.
 
 Practical implication: phase-1 UX can still stay responsive even when higher-cost
 quality paths fail.

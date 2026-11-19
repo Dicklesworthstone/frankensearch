@@ -178,6 +178,23 @@ The cache rejects answers written before the limit fix. A real 50 ms
 timeout suggested reading the effective budget, and that command returned
 50 with the environment named as its source.
 
+On a populated index, expansion lost the zero-limit reason and reranking
+could name and score a document even though the response contained no
+hits. The complete-store daemon also rejected zero when the CLI forwarded
+the search, although it accepted zero in raw socket requests.
+
+At `f40628be`, the stock CLI passed 100 commands and 44 named-socket
+requests on each of Linux and Apple Silicon. The checks covered both
+index layouts, empty and populated corpora, expansion, streams and repeat
+requests. At limits one and all, the real cross-encoder ranked the planted
+astronomy document first. At zero it scored no documents. Another 24 Linux
+raw-socket requests checked fresh and cached results.
+A positive request with no candidates now reports
+`query.stage.rerank.disabled.no_candidates`. An explicit zero reports
+`query.stage.rerank.disabled.zero_depth` when reranking was available.
+Both client/server version mismatches refused the request before emitting
+a hit. An older streaming peer can report this refusal as `UnexpectedEof`.
+
 Release qualification remains open. Strict UBS reported findings. On
 November 19 the designated Mac passed DSR's 40 GiB disk minimum. Its
 separate build-space check initially refused the 20 GiB request, then
@@ -191,6 +208,24 @@ retention controls passed on macOS. Stock fsfs selects registered local
 models and refuses explicit hosted-provider configuration. Authenticated
 hosted producer changes remain unverified through stock indexing. The functional
 runs above did not measure the README latency targets.
+
+The Linux quality gate passed all eight checks at `f40628be` with the
+same source and configuration before and after. Its 24 real-model CLI
+cases passed in 114.71 seconds. All six separate native watcher cases
+passed in 627.54 seconds with the genuine predecessor binary and original
+deadlines, including search during publication and warm restart across
+executables. Strict UBS on the four reviewed Rust files
+reported zero critical findings and 10,764 warnings and exited one.
+On macOS, the corresponding CLI suite passed 23 of 24 at `f40628be`.
+Live deletion and the stock hybrid quickstart passed. Two earlier runs,
+`7d3732e3` and `4e7b3e41`, timed out waiting for a deleted document to
+disappear from search. The separate six-case watcher suite passed four
+cases on macOS at `8e20ad39`. One case timed out waiting for a rename, and
+the other rebuilt documents during an upgrade.
+The remaining stock CLI failure requires a second executable to reuse the
+first one's index across a restart. macOS currently rebuilds because
+the executable identity is process-scoped. The CLI warns when a user
+requests cross-executable reuse on this platform.
 
 ## Implementation follow-through — 2026-10-29
 
