@@ -969,6 +969,11 @@ fn complete_watch_binary_reuses_prior_executable_and_restarts_warm() {
             .arg(
                 r"import errno, fcntl, json, os, pathlib, pty, select, signal, subprocess, sys, time
 master, slave = pty.openpty()
+# Darwin records the first write in F_GETFL (FWASWRITTEN). All three child
+# streams share this slave, so establish its write history before taking the
+# baseline. Both comparisons below still cover every bit, including O_NONBLOCK.
+assert os.write(slave, b'.') == 1
+assert os.read(master, 1) == b'.'
 original_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
 terminal_identity = os.fstat(slave)
 child = subprocess.Popen(json.loads(sys.argv[1]), stdin=slave, stdout=slave, stderr=slave)
