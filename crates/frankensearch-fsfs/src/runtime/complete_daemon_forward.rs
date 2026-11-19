@@ -35,8 +35,9 @@ use crate::output_schema::{
 };
 use crate::{CliCommand, FsfsConfig, OutputFormat};
 
-// Ranking changes invalidate retained peers even when configuration and
-// generation identity match. The progressive request shares this version.
+// Buffered and progressive CLI requests share this protocol version.
+// The configuration contract also binds the answer-cache schema, so a peer
+// that would produce an obsolete answer cannot serve a new client.
 // 3: the WAL top-k repair (0dc3df2f).
 // 4: request-scoped, retained-reader inline explanations.
 // 5: fast scores for quality-discovered Refined documents.
@@ -57,7 +58,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 20: degraded search phases carry canonical per-lane recovery diagnostics.
 // 21: quoted literals and case-insensitive phrase exclusions agree across lanes.
 // 22: reranking scores its candidate window before the displayed page is cut.
-const VERSION: u32 = 22;
+// 23: zero is a valid result limit; empty rerank decisions and scores follow it.
+const VERSION: u32 = 23;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -241,6 +243,7 @@ fn codec_error(error: serde_json::Error) -> SearchError {
 
 fn configuration_contract(config: &FsfsConfig) -> SearchResult<serde_json::Value> {
     let mut value = serde_json::to_value(config).map_err(codec_error)?;
+    value["answer_cache_schema"] = crate::runtime::FSFS_SEARCH_CACHE_SCHEMA_VERSION.into();
     // Limit and explanations are explicit request arguments, not properties
     // of warmed models. An ordinary daemon can explain a particular request.
     // The search policy travels with each request and is applied to it.
@@ -277,12 +280,6 @@ fn decode_request(bytes: &[u8]) -> SearchResult<ForwardedSearch> {
         return Err(complete_cli_error(
             "daemon_protocol",
             "invalid CLI protocol version or request id",
-        ));
-    }
-    if request.search.limit == 0 {
-        return Err(complete_cli_error(
-            "daemon_limit",
-            "forward the resolved positive search limit, not the CLI's zero/unlimited spelling",
         ));
     }
     if request.search.quality_only && request.search.policy.fast_only {
@@ -1224,8 +1221,16 @@ mod tests {
             assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
         }
         value["fsfs_complete_cli"] = serde_json::json!(VERSION);
-        value["search"]["limit"] = serde_json::json!(0);
-        assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
+        // The CLI encodes "all" as usize::MAX; an explicit zero stays zero.
+        for limit in [0, 1, usize::MAX] {
+            value["search"]["limit"] = serde_json::json!(limit);
+            let decoded = decode_request(&serde_json::to_vec(&value).unwrap()).unwrap();
+            assert_eq!(decoded.search.limit, limit);
+        }
+        for invalid in [serde_json::json!(-1), serde_json::json!("all")] {
+            value["search"]["limit"] = invalid;
+            assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
     }
 
     #[test]
@@ -1235,7 +1240,13 @@ mod tests {
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         validate_request(&runtime, &canonical_root, &request).unwrap();
         let original = request.search.configuration.clone();
-        for section in ["indexing", "search", "privacy", "pressure", "storage"] {
+        assert_eq!(
+            original["answer_cache_schema"],
+            crate::runtime::FSFS_SEARCH_CACHE_SCHEMA_VERSION
+        );
+        for section in [
+            "indexing", "search", "privacy", "pressure", "storage", "answer_cache_schema",
+        ] {
             request.search.configuration = original.clone();
             request.search.configuration[section] = serde_json::Value::Null;
             assert!(
