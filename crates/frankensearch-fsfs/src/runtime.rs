@@ -694,7 +694,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v38: successful empty semantic searches retain each tier's stable reason.
 // v39: a zero result limit takes precedence over planning and rerank budgets.
 // v40: zero-limit responses also omit cross-encoder scores and document paths.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v40";
+// v41: distinguish an empty rerank candidate set from an enabled stage.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v41";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -731,8 +732,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v35 / stream v33: carry classified empty outcomes from the serving reader.
 // v36 / stream v34: keep an explicit zero limit in both semantic tiers.
 // v37 / stream v35: skip cross-encoder scoring for a zero result limit.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v37";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v35";
+// v38 / stream v36: explain why a positive rerank request scored no candidates.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v38";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v36";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -7358,6 +7360,8 @@ fn registered_local_model_policy(offline: bool, explicit_remote_intent: bool) ->
 /// `query.stage.rerank.*` codes cover the plan-level skips.
 const REASON_RERANK_NOT_REQUESTED: &str = "query.stage.rerank.disabled.not_requested";
 const REASON_RERANK_UNAVAILABLE: &str = "query.stage.rerank.disabled.unavailable";
+const REASON_RERANK_ZERO_DEPTH: &str = "query.stage.rerank.disabled.zero_depth";
+const REASON_RERANK_NO_CANDIDATES: &str = "query.stage.rerank.disabled.no_candidates";
 const REASON_RERANK_NO_TEXT: &str = "query.stage.rerank.disabled.no_document_text";
 const REASON_RERANK_APPLIED: &str = "query.stage.rerank.applied";
 const REASON_RERANK_FAILED: &str = "query.stage.rerank.failed";
@@ -25054,7 +25058,7 @@ impl FsfsRuntime {
                 enabled: false,
                 candidate_budget: 0,
                 timeout_ms: 0,
-                reason_code: "query.stage.rerank.disabled.zero_depth",
+                reason_code: REASON_RERANK_ZERO_DEPTH,
             };
         }
     }
@@ -25102,7 +25106,12 @@ impl FsfsRuntime {
         };
         let depth = budget.min(fused.len());
         if depth == 0 {
-            return Ok(skipped(fused, stage.reason_code));
+            let reason = if budget == 0 {
+                REASON_RERANK_ZERO_DEPTH
+            } else {
+                REASON_RERANK_NO_CANDIDATES
+            };
+            return Ok(skipped(fused, reason));
         }
 
         let started = Instant::now();
@@ -46297,6 +46306,43 @@ mod tests {
                 payload.rerank = Some(outcome.payload);
                 assert!(!FsfsRuntime::search_payloads_cacheable(&[payload]), "{reply:?}");
             }
+        });
+    }
+
+    #[test]
+    fn rerank_stage_distinguishes_empty_candidates_from_zero_depth_without_scoring() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, mut stage, fused) = rerank_admission_fixture(temp.path());
+            let provider = RerankAdmissionProbe {
+                reply: RerankAdmissionReply::Valid,
+                calls: Arc::default(),
+                cancel_on_model_name: None,
+            };
+            for (budget, candidates, reason) in [
+                (3, Vec::new(), "query.stage.rerank.disabled.no_candidates"),
+                (0, fused, "query.stage.rerank.disabled.zero_depth"),
+            ] {
+                stage.candidate_budget = budget;
+                let outcome = runtime
+                    .apply_rerank_stage(
+                        &cx,
+                        Some(&provider),
+                        &stage,
+                        temp.path(),
+                        "retry",
+                        candidates.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.fused, candidates);
+                assert_eq!(outcome.payload.status, RerankStageStatus::Skipped);
+                assert_eq!(outcome.payload.reason_code, reason);
+                assert_eq!(outcome.payload.candidate_budget, budget);
+                assert_eq!(outcome.payload.reranked_hits, 0);
+                assert!(outcome.payload.scores.is_empty());
+            }
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         });
     }
 
@@ -68132,6 +68178,8 @@ mod tests {
                 "fsfs.search.cache.v38",
                 // Could retain cross-encoder document paths at an explicit zero limit.
                 "fsfs.search.cache.v39",
+                // Described a skipped positive-limit rerank as enabled.
+                "fsfs.search.cache.v40",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
