@@ -66,6 +66,14 @@ impl TestContext {
     }
 
     fn run_with_env(&self, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let mut command = self.command(cwd, args);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        command.output().expect("spawn fsfs process")
+    }
+
+    fn command(&self, cwd: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(&self.fsfs_bin);
         command
             .args(args)
@@ -82,11 +90,7 @@ impl TestContext {
             .env_remove("FSFS_INDEX_DIR")
             .env_remove("FRANKENSEARCH_STORAGE_INDEX_DIR")
             .env_remove("FSFS_STORAGE_INDEX_DIR");
-        for (key, value) in extra_env {
-            command.env(key, value);
-        }
-
-        command.output().expect("spawn fsfs process")
+        command
     }
 }
 
@@ -1665,6 +1669,72 @@ fn explain_discovers_parent_index_from_nested_cwd() {
         Some(true),
         "explain should resolve the saved search session through ancestor discovery"
     );
+}
+
+#[test]
+fn config_reports_the_winning_layer_even_when_values_are_equal() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let ctx = TestContext::new(temp.path());
+    let project = temp.path().join("project");
+    let project_config = project.join(".frankensearch/config.toml");
+    let user_config = ctx.xdg_config_home.join("frankensearch/config.toml");
+    fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    fs::create_dir(project.join(".git")).unwrap();
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    let user_toml = "[search]\nquality_timeout_ms = 500\ndefault_limit = 37\n";
+    let project_toml = "[search]\ndefault_limit = 37\n";
+    fs::write(&user_config, user_toml).unwrap();
+    fs::write(&project_config, project_toml).unwrap();
+
+    let run = |args: &[&str], env_limit: bool| {
+        let mut command = ctx.command(&project, args);
+        for (name, _) in std::env::vars_os() {
+            let bytes = name.as_encoded_bytes();
+            if bytes.starts_with(b"FRANKENSEARCH_") || bytes.starts_with(b"FSFS_") {
+                command.env_remove(name);
+            }
+        }
+        command.env("FRANKENSEARCH_CHECK_UPDATES", "0");
+        if env_limit {
+            command.env("FSFS_SEARCH_DEFAULT_LIMIT", "37");
+        }
+        let output = command.output().expect("run config command");
+        assert_success(&args.join(" "), &output);
+        output
+    };
+    let explicit = [
+        "--config",
+        user_config.to_str().expect("UTF-8 fixture path"),
+    ];
+    let limit = ["--limit", "37"];
+    let timeout = "search.quality_timeout_ms";
+    for (key, extra, env_limit, value, source) in [
+        (timeout, explicit.as_slice(), false, 500, "config"),
+        (timeout, &[], false, 500, "user"),
+        ("search.default_limit", &[], false, 37, "project"),
+        ("search.default_limit", &[], true, 37, "env"),
+        ("search.default_limit", limit.as_slice(), true, 37, "cli"),
+        ("search.shadow_max_in_flight", &[], false, 2, "defaults"),
+    ] {
+        let mut args = vec!["config", "get", key, "--format", "json"];
+        args.extend_from_slice(extra);
+        let payload = parse_json("config get", &run(&args, env_limit));
+        assert_eq!(payload["data"]["value"], value, "{key} from {source}");
+        assert_eq!(payload["data"]["source"], source, "{key} from {source}");
+    }
+
+    let table = stdout_str(&run(
+        &["config", "show", "--format", "table", "--limit", "37"],
+        true,
+    ));
+    for expected in [
+        "search.default_limit = 37 (cli)",
+        "search.quality_timeout_ms = 500 (user)",
+    ] {
+        assert!(table.lines().any(|line| line == expected), "{table}");
+    }
+    assert_eq!(fs::read(&user_config).unwrap(), user_toml.as_bytes());
+    assert_eq!(fs::read(&project_config).unwrap(), project_toml.as_bytes());
 }
 
 #[test]
