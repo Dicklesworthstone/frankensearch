@@ -14,20 +14,53 @@ tests and all 22 complete-generation CLI tests ran with their real-model
 cases enabled and passed. The one-shot and watch suites used two distinct
 executables.
 
-The ordinary CLI also passed an empty-index, ingest, search, delete, compact
-and reopen sequence. Direct HNSW and Matryoshka searches now distinguish
-request-scoped empty results from unusable stored vectors. Legacy writers
-preserve incompatible WAL sidecars for recovery. The ANN-enabled Index suite
-at `c845ad90` passed 1,136 tests, including the restart lifecycle, with 16
-ignored. The final Index code compiled for Windows MSVC.
+The ordinary CLI passed an empty-index, ingest, search, delete, compact and
+reopen sequence. At `09e6316a`, six direct searches and six Unix-daemon
+searches agreed on document IDs, ranks and recovery plans. When both vector
+tiers contained only unusable rows, quality-only search reported the failure
+and hybrid search still returned the correct lexical document. Exact,
+Matryoshka and HNSW searches now preserve a usable copy of a document when
+another copy has a damaged vector. The Windows MSVC Index compile passed.
 
-Release qualification remains open. The designated Linux DSR host passed
-seven of eight checks, including all packaging checks preceding the shared
-quality script. The script's stock quickstart passed, but the host Cargo
-wrapper refused native compilation. Strict UBS still reported warnings and
-the macOS build host lacked the required free space. The remaining upgrade
-checks include independent format-version and response-bound producer changes.
-The functional runs above did not measure the README latency targets.
+The native Linux workspace test also exposed an obsolete CASS expectation for
+`abc搜索def`. On a 20-document corpus, both the linked Tantivy 0.26.2 adapter
+and a reopened Quill index returned seven matches for `搜索` and three for
+the full operand. Language contract 1.0.4 records the field and prefix
+requirements and checks the oracle version against the linked library.
+
+At `639f9cdd`, the upgrade-reuse fingerprint includes both FSVI format
+versions and the fsfs catalog schema. Two different executables built in
+isolated Cargo targets carried three of three documents across a compatible
+v4 upgrade, with zero document-embedding batches and identical fast and
+quality vector files. A v3 predecessor required two embedding batches to
+rebuild the three documents. The following run carried all three, and both
+predecessor manifests remained byte-identical.
+
+Four separately built controls changed one catalog schema version, FSVI
+writer version, FSLX version or lexical normalization limit. Each executable
+could build a fresh index. On upgrade, each carried zero documents and ran
+two embedding batches. Its next run carried all three documents. Header
+inspection confirmed the vector and lexical format changes. The shortened
+lexical normalization limit removed the last word of the retry document
+from search while preserving a match for an earlier word.
+
+The Linux ANN package passed 1,139 tests at `639f9cdd`, with 16 ignored.
+Two reader-concurrency tests first exceeded their 30-second deadlines and
+then passed individually and in the package run with three simultaneous
+tests. Both runs used the same test executable. The native workspace and
+hybrid Clippy checks and the Windows MSVC Index compile also passed.
+
+Release qualification remains open. The Linux stock CLI suite exposed stale
+cache and daemon expectations and a test that overwrote the configured
+model verification receipts. The corrected test uses independent model
+files. It passed against a read-only installation, preserving both source
+receipts byte for byte. A concurrent four-model run passed 20 of 23 cases.
+Three missed their semantic refinement deadlines. All 23 passed together
+at `6c3e2907` with one test at a time and the same deadlines. Strict
+UBS reported warnings and the macOS host had 6.05 GiB free against its
+40 GiB admission requirement. Hosted producer changes still lack an
+authenticated response through the stock indexing command. The functional
+runs above did not measure the README latency targets.
 
 ## Implementation follow-through — 2026-10-29
 
