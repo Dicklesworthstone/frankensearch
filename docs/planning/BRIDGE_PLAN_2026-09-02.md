@@ -129,6 +129,13 @@ but Cargo kept the build-directory lock. At `c78ca63c`, sending SIGTERM to
 the real driver during a Cargo build released that lock. The registered
 Quill probe suite passed 59 tests and rejected all five negative controls.
 
+Repeating the full `3372449b` run in a private home passed the workspace
+tests and Quill, then reached the same three-hour limit compiling the
+following fsfs stage. The subsequent registered run at `c78ca63c` passed
+all eight checks. Its real-model stage passed all 24 cases in 118.65
+seconds. The recorded source and gate configuration matched before and
+after the run.
+
 In a separate stock Linux run at `3372449b`, the cross-executable upgrade
 case passed. The real-model CLI suite passed 18 of 24. Two daemon calls
 returned I/O timeouts, three searches missed their refinement deadlines,
@@ -143,6 +150,8 @@ run against an explicit file. At `f9cb508c` the stock CLI retained all
 three initial hits on a 52 ms refinement against a 50 ms budget. It
 recommended reading the effective setting. That command returned 50, 500,
 5,000 and 10,000 ms from four files and preserved all four byte for byte.
+The full registered Linux run on this source passed all eight checks,
+including all 24 real-model CLI tests in 117.24 seconds.
 
 At `89949b85` the stock CLI reports which configuration layer supplied a
 setting, including explicit values equal to defaults or another layer.
@@ -151,12 +160,33 @@ The JSON and table output agreed on the winning sources, and both a 49 ms
 budget and a nonnumeric value were rejected. The config error and README
 now identify the project and user files that the loader actually reads.
 
+On a newly built, empty two-tier index, the previous stock CLI returned
+zero hits without explaining the empty result. At `387a1dc8`, fast and
+quality searches report `zerosignal.state.newly_created_empty`. Direct,
+compact and daemon output retained each tier's code. The progressive stream
+reported the fast tier at Initial and both tiers at Refined. With both
+vector tiers damaged, hybrid search still returned the planted lexical
+document and named both unusable tiers. Doctor passed the empty census and
+failed the damaged stores. One cold quality search exhausted its stock
+500 ms deadline. The completed diagnostic probes used 30,000 ms.
+
+At `fbba5e9d` an explicit `--limit 0` returns `zerosignal.request.zero_k`
+for each executed semantic tier. This also holds on a populated fast index
+paired with damaged quality vectors. A positive request against the same
+damaged quality index names the failure and supplies its recovery plan.
+The cache rejects answers written before the limit fix. A real 50 ms
+timeout suggested reading the effective budget, and that command returned
+50 with the environment named as its source.
+
 Release qualification remains open. Strict UBS reported findings. On
 November 19 the designated Mac passed DSR's 40 GiB disk minimum. Its
 separate build-space check initially refused the 20 GiB request, then
 admitted the native watch build. That build used its 1,800-second budget
-compiling dependencies and ran zero tests. A fresh 20 GiB space check
-then refused. The Quill driver interruption and output
+compiling dependencies and ran zero tests. A new private APFS build volume
+on the Mac's shared storage passed the same admission check. At `387a1dc8`
+all eight default watch lifecycle combinations passed in 243.43 seconds,
+including direct and daemon visibility of file edits, additions, renames
+and deletions. The Quill driver interruption and output
 retention controls passed on macOS. Stock fsfs selects registered local
 models and refuses explicit hosted-provider configuration. Authenticated
 hosted producer changes remain unverified through stock indexing. The functional

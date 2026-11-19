@@ -1326,6 +1326,13 @@ The engine is intentionally designed to degrade gracefully:
 | Fast embedder fails and no lexical fallback | hard failure | search returns error |
 | Lexical backend failure | semantic continues | search continues without lexical contribution |
 
+When an executed semantic tier classifies an empty result, `fsfs search
+--format json` reports the reason in `data.zero_signal`. A quality-only search
+of a freshly created empty index returns `hits: []` and
+`"zero_signal":{"quality":["zerosignal.state.newly_created_empty"]}`.
+Expanded queries can report several distinct codes per tier. An unusable
+vector generation also reports a recovery plan for the affected tier.
+
 Practical implication: phase-1 UX can still stay responsive even when higher-cost
 quality paths fail.
 
