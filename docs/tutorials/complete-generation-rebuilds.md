@@ -452,6 +452,11 @@ or a missing protected file even when the original source tree is unavailable.
 The narrower `--repair-vectors` option continues to require intact lexical data;
 the two options are mutually exclusive.
 
+The stock `fsfs index` command leaves keyword files unprotected. To recover
+those files, keep the source tree and use `--rebuild-source DIR`. Source-free
+keyword repair requires a publisher that created the keyword sidecars before
+sealing the original generation.
+
 Use the generation ID and manifest SHA-256 from the original trusted publication
 receipt. Each repaired file must have an intact `.fec` sidecar authenticated by
 that receipt, and its reconstructed bytes must match the original SHA-256 and

@@ -129,7 +129,18 @@ fn command_help_and_usage_errors_do_not_create_a_store() {
 
 #[test]
 fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
+    exercise_keyword_repair(true);
+}
+
+#[test]
+fn artifact_repair_refuses_unprotected_stock_keyword_data_without_changing_selection() {
+    exercise_keyword_repair(false);
+}
+
+fn exercise_keyword_repair(protect: bool) {
+    use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
     use frankensearch_fsfs::config::DegradationOverrideMode;
+    use frankensearch_fsfs::generation_store::COMPLETE_GENERATION_MANIFEST;
     use frankensearch_fsfs::{FsCategory, FsfsConfig, MountTable, read_system_mounts};
 
     run_test_with_cx(|cx| async move {
@@ -174,7 +185,7 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
         config.search.rerank = false;
         "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
         fs::write(&config_path, config.to_toml().unwrap()).unwrap();
-        let configure = |command: &mut Command| {
+        let configure = |command: &mut Command, index_dir: &Path| {
             for (key, _) in std::env::vars_os() {
                 let name = key.to_string_lossy();
                 if name.starts_with("FSFS_") || name.starts_with("FRANKENSEARCH_") {
@@ -184,7 +195,7 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
             command
                 .current_dir(directory.path())
                 .arg("--index-dir")
-                .arg(&root)
+                .arg(index_dir)
                 .arg("--config")
                 .arg(&config_path)
                 .env("HOME", directory.path())
@@ -198,7 +209,14 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
         };
         let mut index = Command::new(env!("CARGO_BIN_EXE_fsfs"));
         index.arg("index").arg(&source);
-        configure(&mut index);
+        // Keep the healthy template outside the protected recovery store, so
+        // repair has no intact predecessor to select or copy.
+        let stock_root = if protect {
+            directory.path().join("stock-template")
+        } else {
+            root.clone()
+        };
+        configure(&mut index, &stock_root);
         index
             .args(["--no-watch-mode", "--format", "json", "--quiet"])
             .env("FSFS_COMPLETE_GENERATIONS", "1");
@@ -209,10 +227,13 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
             String::from_utf8_lossy(&indexed.stderr)
         );
         assert_eq!(body(&indexed)["data"]["indexed_files"], 2);
-        let store = CompleteGenerationStore::open(&cx, &root).unwrap();
-        let original = store.active(&cx).unwrap().unwrap();
-        let healthy = files(original.path());
-        let segment = healthy
+        let stock = CompleteGenerationStore::open(&cx, &stock_root)
+            .unwrap()
+            .active(&cx)
+            .unwrap()
+            .unwrap();
+        let stock_files = files(stock.path());
+        let segment = stock_files
             .keys()
             .find(|path| {
                 path.extension()
@@ -220,23 +241,65 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
             })
             .unwrap()
             .clone();
-        let manifest = healthy
+        let manifest = stock_files
             .keys()
             .find(|path| path.file_name().is_some_and(|name| name == "MANIFEST"))
             .unwrap()
             .clone();
-        assert!(
-            original
-                .path()
-                .join(format!("{}.fec", segment.display()))
-                .is_file()
-        );
-        assert!(
-            original
-                .path()
-                .join(manifest.with_file_name("MANIFEST.fec"))
-                .is_file()
-        );
+        for relative in [&segment, &manifest] {
+            assert!(!stock_files.contains_key(&FileProtector::sidecar_path(relative)));
+        }
+        let search_command = |index_dir: &Path| {
+            let mut search = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+            search.args(["search", "repairquerytoken"]);
+            configure(&mut search, index_dir);
+            search.args(["--no-daemon", "--format", "json", "--quiet"]);
+            search
+        };
+        let original = if protect {
+            // Opt in as a publisher. The store must seal the real sidecars in
+            // its original inventory before any data is damaged.
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            let build = store.begin(&cx).unwrap();
+            for (relative, bytes) in &stock_files {
+                if relative != Path::new(COMPLETE_GENERATION_MANIFEST) {
+                    let destination = build.path().join(relative);
+                    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                    fs::write(destination, bytes).unwrap();
+                }
+            }
+            let protector = FileProtector::new(
+                std::sync::Arc::new(DefaultSymbolCodec),
+                DurabilityConfig::default(),
+            )
+            .unwrap();
+            for relative in [&segment, &manifest] {
+                protector
+                    .protect_file(&build.path().join(relative))
+                    .unwrap();
+            }
+            let publication = build
+                .publish(&cx, |_, candidate| {
+                    let output = run(
+                        &mut search_command(candidate),
+                        directory.path(),
+                        Duration::from_secs(30),
+                    );
+                    let result = body(&output);
+                    assert!(output.status.success(), "{result}");
+                    assert_keyword_hits(&result["data"]);
+                    Ok(())
+                })
+                .unwrap();
+            let GenerationPublication::Durable(generation) = publication else {
+                panic!("protected keyword fixture must publish durably");
+            };
+            generation
+        } else {
+            stock
+        };
+        let healthy = files(original.path());
+        assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 1);
         let mut damaged_manifest = healthy[&manifest].clone();
         damaged_manifest[10] ^= 0x5a;
         fs::write(original.path().join(&manifest), damaged_manifest).unwrap();
@@ -248,15 +311,12 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
         fs::rename(&source, directory.path().join("source-unavailable")).unwrap();
         let damaged = files(original.path());
         let selection = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
-        let mut search = Command::new(env!("CARGO_BIN_EXE_fsfs"));
-        search.args(["search", "repairquerytoken"]);
-        configure(&mut search);
-        search.args(["--no-daemon", "--format", "json", "--quiet"]);
+        let mut search = search_command(&root);
         let failed = run(&mut search, directory.path(), Duration::from_secs(30));
         assert!(!failed.status.success());
         assert_eq!(body(&failed)["ok"], false);
         let mut prepare = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
-        configure(&mut prepare);
+        configure(&mut prepare, &root);
         prepare
             .args([
                 "--generation",
@@ -273,6 +333,28 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
             .arg("--save-preparation")
             .arg(&preparation);
         let output = run(&mut prepare, directory.path(), Duration::from_secs(120));
+        if !protect {
+            let refused = body(&output);
+            assert!(!output.status.success());
+            assert_eq!(refused["ok"], false);
+            assert!(
+                refused["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("damaged artifact has no receipted repair sidecar"),
+                "{refused}"
+            );
+            assert!(!preparation.exists());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                selection
+            );
+            assert_eq!(files(original.path()), damaged);
+            assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 1);
+            assert!(!source.exists());
+            assert!(!directory.path().join("missing-models").exists());
+            return;
+        }
         assert!(
             output.status.success(),
             "stdout={} stderr={}",
@@ -288,7 +370,7 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
             prepared["repaired_from"]["manifest_sha256"],
             original.manifest_sha256()
         );
-        assert_eq!(prepared["preview"][0]["hits"].as_array().unwrap().len(), 2);
+        assert_keyword_hits(&prepared["preview"][0]);
         assert_eq!(
             fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
             selection
@@ -298,14 +380,13 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
             .join("generations")
             .join(prepared["generation_id"].as_str().unwrap());
         for (path, bytes) in &healthy {
-            if path != Path::new(frankensearch_fsfs::generation_store::COMPLETE_GENERATION_MANIFEST)
-            {
+            if path != Path::new(COMPLETE_GENERATION_MANIFEST) {
                 assert_eq!(fs::read(target.join(path)).unwrap(), *bytes, "{path:?}");
             }
         }
         let sealed = files(&target);
         let mut apply = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
-        configure(&mut apply);
+        configure(&mut apply, &root);
         apply.arg("--resume-file").arg(&preparation).args([
             "--apply",
             "--query",
@@ -324,28 +405,28 @@ fn artifact_repair_prepares_and_applies_real_keyword_data_without_sources() {
         assert_eq!(applied["state"], "restored_durable");
         assert_eq!(applied["generation_id"], prepared["generation_id"]);
         assert_eq!(applied["repaired_from"], prepared["repaired_from"]);
-        assert_eq!(applied["preview"][0]["hits"].as_array().unwrap().len(), 2);
+        assert_keyword_hits(&applied["preview"][0]);
         let output = run(&mut search, directory.path(), Duration::from_secs(120));
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
         let result = body(&output);
-        let mut hits = result["data"]["hits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|hit| hit["path"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        hits.sort_unstable();
-        assert_eq!(hits, ["alpha.md", "beta.md"]);
+        assert!(output.status.success(), "{result}");
+        assert_keyword_hits(&result["data"]);
         assert_eq!(files(original.path()), damaged);
         assert_eq!(files(&target), sealed);
         assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 2);
         assert!(!source.exists());
         assert!(!directory.path().join("missing-models").exists());
     });
+}
+
+fn assert_keyword_hits(payload: &serde_json::Value) {
+    let mut hits = payload["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    hits.sort_unstable();
+    assert_eq!(hits, ["alpha.md", "beta.md"]);
 }
 
 #[test]
