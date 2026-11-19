@@ -9,26 +9,29 @@ use frankensearch_core::{DefaultCanonicalizer, SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{FsfsConfig, SearchConfig, UpgradeReusePolicy};
+use crate::file_classification::FileClassificationContractDefinition;
 
 use super::content_sha256_hex;
 
-pub(super) const INDEXING_CONTRACT_VERSION_V4: &str = "fsfs.indexing_contract.v4";
+pub(super) const INDEXING_CONTRACT_VERSION_V5: &str = "fsfs.indexing_contract.v5";
 
 /// Explicit, versioned indexing-pipeline contract (`bd-ky0j2`).
-/// V4 records the catalog and both vector formats. V3 recorded only the
-/// identity-bound vector format, even when the stock writer emitted FSVI v1.
+/// V5 binds window overlap and the default file classification policy. V4
+/// already bound the catalog and both vector formats.
 /// A receipt from an earlier contract requires a fresh build.
 ///
-/// Binds every compile-time and configuration-derived contract that shapes
-/// persisted lexical segments, vector rows, window plans, and catalog records:
+/// Inputs shaping persisted lexical segments, vector rows, window plans, and
+/// catalog records are listed below. Changes to algorithms that are not
+/// represented by these inputs require an explicit contract version bump.
 /// - checkpoint schema version (`INDEXING_CHECKPOINT_SCHEMA_VERSION`)
 /// - fsfs catalog schema and both FSVI binary format versions
 /// - Quill lexical engine/segment/manifest format versions and canonicalizer limits
 /// - embedding canonicalizer limits (`DefaultCanonicalizer::default()`)
-/// - fast semantic windowing contract (`WINDOW_CHARS`, `MAX_WINDOWS_PER_FILE`)
+/// - file classifier thresholds, encoding and partial-input policies
+/// - fast semantic window length, overlap, and maximum windows per file
 /// - indexing configuration digest (`digest(config)`)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct IndexingContractDigestV4 {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct IndexingContractDigestV5 {
     pub contract_version: String,
     pub checkpoint_schema_version: u16,
     pub catalog_schema_version: i64,
@@ -43,17 +46,19 @@ pub(super) struct IndexingContractDigestV4 {
     pub embedding_canonicalizer_max_length: usize,
     pub embedding_canonicalizer_code_head_lines: usize,
     pub embedding_canonicalizer_code_tail_lines: usize,
+    pub file_classification: FileClassificationContractDefinition,
     pub fast_window_chars: usize,
+    pub fast_window_overlap_chars: usize,
     pub fast_window_max_per_file_cap: usize,
     pub configuration_sha256: String,
 }
 
-impl IndexingContractDigestV4 {
+impl IndexingContractDigestV5 {
     pub(super) fn from_config(config: &FsfsConfig) -> SearchResult<Self> {
         let embedding_canonicalizer = DefaultCanonicalizer::default();
         let lexical_canonicalizer = crate::runtime::LEXICAL_CANONICALIZER;
         Ok(Self {
-            contract_version: INDEXING_CONTRACT_VERSION_V4.to_owned(),
+            contract_version: INDEXING_CONTRACT_VERSION_V5.to_owned(),
             checkpoint_schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
             catalog_schema_version: crate::catalog::CATALOG_SCHEMA_VERSION,
             fsvi_format_version: frankensearch_index::FSVI_VERSION,
@@ -67,7 +72,9 @@ impl IndexingContractDigestV4 {
             embedding_canonicalizer_max_length: embedding_canonicalizer.max_length,
             embedding_canonicalizer_code_head_lines: embedding_canonicalizer.code_head_lines,
             embedding_canonicalizer_code_tail_lines: embedding_canonicalizer.code_tail_lines,
+            file_classification: FileClassificationContractDefinition::default(),
             fast_window_chars: crate::runtime::semantic_windows::WINDOW_CHARS,
+            fast_window_overlap_chars: crate::runtime::semantic_windows::WINDOW_OVERLAP_CHARS,
             fast_window_max_per_file_cap: crate::runtime::semantic_windows::MAX_WINDOWS_PER_FILE,
             configuration_sha256: digest(config)?,
         })
@@ -83,7 +90,7 @@ impl IndexingContractDigestV4 {
 }
 
 pub(super) fn contract_digest(config: &FsfsConfig) -> SearchResult<String> {
-    IndexingContractDigestV4::from_config(config)?.sha256_hex()
+    IndexingContractDigestV5::from_config(config)?.sha256_hex()
 }
 
 pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
@@ -213,12 +220,12 @@ mod tests {
     #[test]
     fn indexing_contract_digest_changes_when_schema_or_window_or_canonicalizer_contract_drifts() {
         let config = FsfsConfig::default();
-        let baseline = IndexingContractDigestV4::from_config(&config).unwrap();
+        let baseline = IndexingContractDigestV5::from_config(&config).unwrap();
         let expected = baseline.sha256_hex().unwrap();
         assert_eq!(expected.len(), 64);
 
         let mut changed_version = baseline.clone();
-        changed_version.contract_version = "fsfs.indexing_contract.v3".to_owned();
+        changed_version.contract_version = "fsfs.indexing_contract.v4".to_owned();
         assert_ne!(changed_version.sha256_hex().unwrap(), expected);
 
         let mut changed_catalog = baseline.clone();
@@ -240,6 +247,14 @@ mod tests {
         let mut changed_canonicalizer = baseline.clone();
         changed_canonicalizer.embedding_canonicalizer_max_length += 1;
         assert_ne!(changed_canonicalizer.sha256_hex().unwrap(), expected);
+
+        let mut changed_classifier = baseline.clone();
+        changed_classifier.file_classification.sniff_heuristics.max_probe_bytes += 1;
+        assert_ne!(changed_classifier.sha256_hex().unwrap(), expected);
+
+        let mut changed_overlap = baseline.clone();
+        changed_overlap.fast_window_overlap_chars += 1;
+        assert_ne!(changed_overlap.sha256_hex().unwrap(), expected);
 
         let mut changed_window = baseline;
         changed_window.fast_window_chars += 100;

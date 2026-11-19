@@ -447,9 +447,10 @@ The same opt-in is available as `[indexing] upgrade_reuse = "compatible_contract
 or `FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract`; disable it with
 `--upgrade-reuse same-executable`. Source, producer, topology and artifact checks
 still apply, and old receipts without the contract cannot use this path.
-The first index run after upgrading from indexing contract v3 rebuilds the
-index. Contract v4 records the fsfs catalog schema and both FSVI format
-versions, including the format used by the stock writer.
+The first index run after upgrading from indexing contract v4 or earlier
+rebuilds the index. Contract v5 also checks the fast semantic window overlap
+and the file classifier's default policies. A change to either can alter
+which text is indexed even when the files and models are identical.
 Reuse skips document embedding. Model verification and startup health probes
 still run. With `compatible-contract`, an absent optional quality model allows
 fast-only indexing. If the run requests an installed quality model and that

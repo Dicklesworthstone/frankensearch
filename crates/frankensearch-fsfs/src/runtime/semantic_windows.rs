@@ -13,7 +13,7 @@ use frankensearch_index::{ClassifiedHits, VectorIndex};
 use serde::{Deserialize, Serialize};
 
 pub(super) const WINDOW_CHARS: usize = 2_000;
-const WINDOW_OVERLAP_CHARS: usize = 200;
+pub(super) const WINDOW_OVERLAP_CHARS: usize = 200;
 const WINDOW_STRIDE_CHARS: usize = WINDOW_CHARS - WINDOW_OVERLAP_CHARS;
 pub(super) const MAX_WINDOWS_PER_FILE: usize = 128;
 const ROW_SEPARATOR: &str = "\0fsfs-window-v1:";
