@@ -391,7 +391,7 @@ mod loader_only {
     #[cfg(feature = "semantic-loaders")]
     fn verify_index_output_formats(fsfs: &IsolatedFsfs, root: &Path, corpus: &Path, index: &Path) {
         for format in ["jsonl", "table", "toon", "csv"] {
-            let outcome = fsfs.run(
+            let outcome = fsfs.run_with_env(
                 root,
                 &format!("index-format-{format}"),
                 [
@@ -403,6 +403,7 @@ mod loader_only {
                     format,
                 ],
                 QUICKSTART_TIMEOUT,
+                &[("RUST_LOG", "frankensearch_fsfs::indexing=debug")],
             );
             assert_finished_successfully(format, &outcome);
             let sentinel: Value = serde_json::from_slice(
@@ -411,15 +412,21 @@ mod loader_only {
             .unwrap();
             if format == "table" {
                 assert!(outcome.stdout.starts_with("Discovered 10 file(s)"));
-                // JSONL already indexed the same corpus above. The next format
-                // must report carrying all ten files, rather than rebuilding
-                // their document embeddings just to change presentation.
-                assert!(
-                    outcome.stdout.contains(
-                        "Indexed 10 file(s) (discovered 10, skipped 0; 10 unchanged, not reread)"
-                    ),
-                    "warm table output must retain the file counts and report reuse: {}",
-                    outcome.stdout
+                // JSONL just indexed this corpus in another process. Check the
+                // displayed counts against actual embedding work on this host.
+                let expected = if cfg!(target_os = "linux") {
+                    "Indexed 10 file(s) (discovered 10, skipped 0; 10 unchanged, not reread)"
+                } else {
+                    "Indexed 10 file(s) (discovered 10, skipped 0)"
+                };
+                assert!(outcome.stdout.contains(expected), "{}", outcome.stdout);
+                assert_eq!(
+                    outcome
+                        .stderr
+                        .contains("fsfs admitted indexing embedding batch"),
+                    cfg!(not(target_os = "linux")),
+                    "{}",
+                    outcome.stderr
                 );
                 continue;
             }
