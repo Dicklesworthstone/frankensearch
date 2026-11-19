@@ -88,6 +88,11 @@ rejected that same cache and executable. With each model verified offline,
 the source-built and installed binary passed all 12 commands and 22 negative
 controls and left no owned child processes.
 
+At `aefe3dd3` synchronous and asynchronous progressive searches report
+`CallerRequestedZeroK` when the caller requests zero results. They emit
+no phases and perform no embedding or vector scans. The default Fusion
+library passed 1,212 tests with four declared ignores.
+
 Release qualification remains open. Strict
 UBS reported findings and the macOS host had 0.49 GiB free against its
 40 GiB admission requirement. Hosted producer changes still lack an
