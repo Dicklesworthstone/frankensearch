@@ -692,7 +692,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v36: corrupt stored vectors cannot contribute semantic ranks or hide recovery.
 // v37: completing Refined scores requires usable fast-tier vectors too.
 // v38: successful empty semantic searches retain each tier's stable reason.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v38";
+// v39: a zero result limit takes precedence over planning and rerank budgets.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v39";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -727,8 +728,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v33 / stream v31: unusable stored vectors cannot attest semantic ranks.
 // v34 / stream v32: completing Refined scores skips unusable fast-tier rows.
 // v35 / stream v33: carry classified empty outcomes from the serving reader.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v35";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v33";
+// v36 / stream v34: keep an explicit zero limit in both semantic tiers.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v36";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v34";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -16019,6 +16021,15 @@ impl FsfsRuntime {
             0
         };
         let refinement_limit = output_limit.max(rerank_candidate_limit);
+        // Planning and reranking can widen a positive request, but probing
+        // even one row for k=0 changes the index's classified outcome.
+        let semantic_retrieval_budget = |budget: usize| {
+            if output_limit == 0 {
+                0
+            } else {
+                budget.max(rerank_candidate_limit)
+            }
+        };
 
         info!(
             phase = "query_parse",
@@ -16432,7 +16443,7 @@ impl FsfsRuntime {
                         let windowed = semantic_windows::search_top_k(
                             index,
                             &query_embedding,
-                            semantic_budget.max(rerank_candidate_limit),
+                            semantic_retrieval_budget(semantic_budget),
                             vector_filter,
                             resources.fast_window_mapping.as_deref(),
                         );
@@ -16659,7 +16670,7 @@ impl FsfsRuntime {
                     },
                 )
             };
-            let quality_budget = quality_budget.max(rerank_candidate_limit);
+            let quality_budget = semantic_retrieval_budget(quality_budget);
             // The window starts after Initial has been published and includes
             // cold initialization, waiting for model capacity, inference and
             // independent quality retrieval. Optional reranking has its own
@@ -37308,6 +37319,38 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(replayed, payloads, "cache replay must retain degradation");
+                // k=0 wins over the healthy fast rows and the broken quality
+                // rows, including when the progressive planner widens its head.
+                let zero = runtime
+                    .execute_search_phase_artifacts_with_mode_using_resources(
+                        &cx,
+                        "semantic recovery",
+                        0,
+                        mode,
+                        &mut resources,
+                        SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let code = super::ZeroSignalReason::CallerRequestedZeroK.reason_code();
+                let mut expected = BTreeMap::new();
+                let phases: &[_] = if mode == SearchExecutionMode::Full {
+                    &[("fast", SearchOutputPhase::Initial), ("quality", SearchOutputPhase::Refined)]
+                } else {
+                    &[("quality", SearchOutputPhase::Initial)]
+                };
+                assert_eq!(zero.len(), phases.len());
+                for (artifact, &(tier, phase)) in zero.iter().zip(phases) {
+                    expected.insert(tier.to_owned(), super::BTreeSet::from([code.to_owned()]));
+                    assert_eq!(artifact.phase, phase);
+                    assert_eq!(artifact.payload.zero_signal, expected);
+                    assert!(artifact.payload.hits.is_empty());
+                    assert!(artifact.payload.recovery_plans.is_empty());
+                }
             }
         });
     }
@@ -68030,6 +68073,8 @@ mod tests {
                 "fsfs.search.cache.v36",
                 // Omitted the classified reason for a successful empty result.
                 "fsfs.search.cache.v37",
+                // May describe an index state even when the caller requested zero hits.
+                "fsfs.search.cache.v38",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

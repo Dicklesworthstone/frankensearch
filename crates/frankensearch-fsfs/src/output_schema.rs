@@ -1190,7 +1190,7 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
         SearchError::SearchTimeout { budget_ms, .. } => Some(format!(
             "The operation stopped at its {budget_ms} ms budget.\n\
              Retry when the host is less busy; `fsfs status` shows whether indexing is running.\n\
-             Search refinement's budget is `search.quality_timeout_ms` in fsfs.toml."
+             Read the effective search refinement budget with `fsfs config get search.quality_timeout_ms`."
         )),
         SearchError::HashMismatch { path, .. } => Some(format!(
             "The file at {} may be corrupted or tampered with.\n\
@@ -2469,6 +2469,10 @@ mod tests {
         .suggestion
         .unwrap();
         assert!(timeout.contains("500 ms"), "{timeout}");
+        assert!(
+            timeout.contains("fsfs config get search.quality_timeout_ms"),
+            "{timeout}"
+        );
         assert!(!timeout.contains("--timeout"), "no such flag: {timeout}");
     }
 
