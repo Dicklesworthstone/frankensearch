@@ -8,6 +8,7 @@ ignored tests retain their separate nightly/isolated/review-only obligations.
 """
 
 import argparse
+from contextlib import contextmanager, suppress
 import hashlib
 import json
 import os
@@ -52,6 +53,39 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+@contextmanager
+def command_group(argv):
+    process = None
+    interrupted = None
+
+    def stop(signum, _frame):
+        nonlocal interrupted
+        if interrupted is None:
+            interrupted = signum
+            if process is not None:
+                raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, stop)
+    try:
+        # Defer termination during Popen until we own the new group ID.
+        process = subprocess.Popen(argv, cwd=PACKAGE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        if interrupted is not None:
+            raise SystemExit(128 + interrupted)
+        yield process
+    except BaseException:
+        if process is not None:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        if process is not None:
+            process.stdout.close()
+            process.stderr.close()
+
+
 def invoke(argv, seconds, label, logs):
     """Keep both output streams and reap this invocation's entire process group."""
     started = time.monotonic()
@@ -62,11 +96,7 @@ def invoke(argv, seconds, label, logs):
     # Retain child output even if the remote controller interrupts this driver.
     # Report only observed output growth, not a synthetic liveness heartbeat.
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file, \
-            selectors.DefaultSelector() as streams:
-        process = subprocess.Popen(
-            argv, cwd=PACKAGE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+            selectors.DefaultSelector() as streams, command_group(argv) as process:
         streams.register(process.stdout, selectors.EVENT_READ, stdout_file)
         streams.register(process.stderr, selectors.EVENT_READ, stderr_file)
         previous_sizes = (0, 0)
@@ -98,21 +128,15 @@ def invoke(argv, seconds, label, logs):
             collect(started + max(seconds, 0.0001))
         except subprocess.TimeoutExpired:
             timed_out = True
-            os.killpg(process.pid, signal.SIGTERM)
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
             try:
                 collect(time.monotonic() + 5)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
                 collect(float("inf"))
                 process.wait()
-        except BaseException:
-            # A log write failure must not leave the command running unobserved.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-            raise
         finally:
             for key in list(streams.get_map().values()):
                 key.fileobj.close()
@@ -259,6 +283,69 @@ sys.exit(9)
                                            0.5, "probe-inherited-output-timeout", logs))
 
 
+def probe_controller_termination(logs):
+    import fcntl
+
+    # Both child generations retain the same open-file-description lock.
+    # Killing only the direct child would still block a subsequent build.
+    label = "probe-controller-termination"
+    lock_path = logs / f"{label}.lock"
+    child = """import fcntl, subprocess, sys, time
+with open(sys.argv[1], "r+b") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                     pass_fds=(lock.fileno(),))
+    print("locked", flush=True)
+    print("diagnostic", file=sys.stderr, flush=True)
+    time.sleep(30)
+"""
+    driver = """import json, runpy, sys
+from pathlib import Path
+runpy.run_path(sys.argv[1])["invoke"](json.loads(sys.argv[2]), 60, sys.argv[3], Path(sys.argv[4]))
+"""
+    streams = [(logs / f"{label}.stdout", b"locked\n"),
+               (logs / f"{label}.stderr", b"diagnostic\n")]
+    with lock_path.open("a+b") as lock, subprocess.Popen([
+        sys.executable, "-c", driver, str(Path(__file__).resolve()),
+        json.dumps([sys.executable, "-c", child, str(lock_path)]), label, str(logs),
+    ]) as controller:
+        try:
+            deadline = time.monotonic() + 10
+            while not all(path.exists() and path.read_bytes() == data for path, data in streams):
+                if controller.poll() is not None or time.monotonic() >= deadline:
+                    raise Refusal("INTERRUPT_PROBE_NOT_READY", label)
+                time.sleep(0.02)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise Refusal("INTERRUPT_PROBE_LOCK_NOT_HELD", label)
+            controller.terminate()
+            status = controller.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Refusal("INTERRUPTED_CHILD_STILL_HOLDS_LOCK", label) from None
+                    time.sleep(0.02)
+            if status not in (-signal.SIGTERM, 128 + signal.SIGTERM):
+                raise Refusal("INTERRUPT_STATUS", str(status))
+            if any(path.read_bytes() != data for path, data in streams):
+                raise Refusal("INTERRUPT_LOST_OUTPUT", label)
+        finally:
+            if controller.poll() is None:
+                controller.terminate()
+                try:
+                    controller.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    controller.kill()
+    emit("positive_control", observed="SIGTERM released child and descendant lock and preserved both logs")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -281,6 +368,7 @@ def main():
          lock_sha256=digest(ROOT / "Cargo.lock"), host=os.uname().nodename, logs=str(logs))
     if args.probes:
         probe_output_retention(logs)
+        probe_controller_termination(logs)
     failures = []
     for configuration in configurations:
         binaries = build(configuration, logs)
