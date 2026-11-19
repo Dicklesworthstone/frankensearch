@@ -93,8 +93,17 @@ At `aefe3dd3` synchronous and asynchronous progressive searches report
 no phases and perform no embedding or vector scans. The default Fusion
 library passed 1,212 tests with four declared ignores.
 
+The registered Linux gate at `aefe3dd3` passed seven of eight checks.
+All 25 default fsfs test binaries passed (3,754 tests, 37 declared ignores).
+The real-model CLI suite passed 22 of 23. Its live-watch observer tried to
+decode the first 1,024 bytes of a JSONL record before its terminating newline
+arrived. All 23 passed on a separate retry of the same source. At `31ea8c53`
+the observer waits for complete records before decoding UTF-8. The new
+byte-boundary regression and all 23 existing real-model CLI cases passed
+together at stock parallelism.
+
 Release qualification remains open. Strict
-UBS reported findings and the macOS host had 0.49 GiB free against its
+UBS reported findings and the macOS host had 1.47 GiB free against its
 40 GiB admission requirement. Hosted producer changes still lack an
 authenticated response through the stock indexing command. The functional
 runs above did not measure the README latency targets.
