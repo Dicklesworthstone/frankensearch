@@ -693,7 +693,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v37: completing Refined scores requires usable fast-tier vectors too.
 // v38: successful empty semantic searches retain each tier's stable reason.
 // v39: a zero result limit takes precedence over planning and rerank budgets.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v39";
+// v40: zero-limit responses also omit cross-encoder scores and document paths.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v40";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -729,8 +730,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v34 / stream v32: completing Refined scores skips unusable fast-tier rows.
 // v35 / stream v33: carry classified empty outcomes from the serving reader.
 // v36 / stream v34: keep an explicit zero limit in both semantic tiers.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v36";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v34";
+// v37 / stream v35: skip cross-encoder scoring for a zero result limit.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v37";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v35";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -16018,8 +16020,9 @@ impl FsfsRuntime {
             CapabilityState::Disabled
         };
         let planner = QueryPlanner::from_fsfs(&self.config);
-        let plan =
+        let mut plan =
             planner.execution_plan_for_query(&normalized_query, Some(planning_limit), capabilities);
+        Self::restrict_rerank_to_output_limit(&mut plan.rerank_stage, output_limit);
 
         // A cross-encoder needs its planned candidate window before the
         // displayed page is selected. Keep Initial's existing ranking head,
@@ -25045,6 +25048,17 @@ impl FsfsRuntime {
         Ok(Some(Arc::new(reranker)))
     }
 
+    fn restrict_rerank_to_output_limit(stage: &mut StageDirective, output_limit: usize) {
+        if output_limit == 0 && stage.enabled {
+            *stage = StageDirective {
+                enabled: false,
+                candidate_budget: 0,
+                timeout_ms: 0,
+                reason_code: "query.stage.rerank.disabled.zero_depth",
+            };
+        }
+    }
+
     /// Re-score the head of a fused ranking with the cross-encoder.
     ///
     /// The plan's `candidate_budget` bounds the head. Scored hits are ordered
@@ -26600,12 +26614,13 @@ impl FsfsRuntime {
         // rank; the existing one-arm RRF preserves the public score contract.
         let fused = orchestrator.fuse_rankings(&[], &candidates, candidate_budget, 0);
         let reranker = self.prepared_reranker(cx).await?;
-        let rerank_stage = StageDirective {
+        let mut rerank_stage = StageDirective {
             enabled: self.config.search.rerank,
             candidate_budget,
             timeout_ms: self.config.search.rerank_timeout_ms,
             reason_code: "query.stage.rerank.enabled",
         };
+        Self::restrict_rerank_to_output_limit(&mut rerank_stage, output_limit);
         let RerankStageOutcome {
             fused,
             payload: rerank_payload,
@@ -46604,6 +46619,7 @@ mod tests {
             config: FsfsConfig,
             index_root: &Path,
             query: &str,
+            limit: usize,
         ) -> Vec<super::SearchPhaseArtifact> {
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 command: CliCommand::Search,
@@ -46619,7 +46635,7 @@ mod tests {
                 .execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
-                    3,
+                    limit,
                     super::SearchExecutionMode::Full,
                     &mut resources,
                     super::SearchExecutionFlags {
@@ -46692,7 +46708,7 @@ mod tests {
 
             // Baseline: the fused REFINED order without the stage, and no
             // rerank block because nobody asked.
-            let baseline = search_artifacts(&cx, config.clone(), &index_root, query).await;
+            let baseline = search_artifacts(&cx, config.clone(), &index_root, query, 3).await;
             let baseline_refined = refined(&baseline);
             assert!(baseline_refined.payload.rerank.is_none());
             let baseline_order = order(baseline_refined);
@@ -46705,7 +46721,7 @@ mod tests {
             super::set_test_reranker(Some(Arc::new(frankensearch_core::SyncRerankerAdapter(
                 ReverseReranker,
             ))));
-            let reranked = search_artifacts(&cx, rerank_config.clone(), &index_root, query).await;
+            let reranked = search_artifacts(&cx, rerank_config.clone(), &index_root, query, 3).await;
             assert!(
                 reranked[0].payload.rerank.is_none(),
                 "INITIAL is never reranked"
@@ -46760,11 +46776,19 @@ mod tests {
                 "the fused artifact the explain session persists follows the reranked order"
             );
 
+            let zero = search_artifacts(&cx, rerank_config.clone(), &index_root, query, 0).await;
+            assert!(zero.iter().all(|artifact| artifact.payload.hits.is_empty()));
+            let stage = refined(&zero).payload.rerank.as_ref().expect("rerank skip");
+            assert_eq!(stage.status, crate::output_schema::RerankStageStatus::Skipped);
+            assert_eq!(stage.reason_code, "query.stage.rerank.disabled.zero_depth");
+            assert_eq!((stage.candidate_budget, stage.reranked_hits), (0, 0));
+            assert!(stage.scores.is_empty());
+
             // Planted negative: requested, no cross-encoder anywhere => the
             // fused order is kept and the reason is typed.
             super::set_test_reranker(None);
             let unavailable =
-                search_artifacts(&cx, rerank_config.clone(), &index_root, query).await;
+                search_artifacts(&cx, rerank_config.clone(), &index_root, query, 3).await;
             let refined_artifact = refined(&unavailable);
             let stage = refined_artifact
                 .payload
@@ -46786,7 +46810,7 @@ mod tests {
             super::set_test_reranker(Some(Arc::new(frankensearch_core::SyncRerankerAdapter(
                 ReverseReranker,
             ))));
-            let fast_only = search_artifacts(&cx, fast_only_config, &index_root, query).await;
+            let fast_only = search_artifacts(&cx, fast_only_config, &index_root, query, 3).await;
             assert_eq!(fast_only.len(), 1, "fast-only serves INITIAL only");
             let stage = fast_only[0]
                 .payload
@@ -68106,6 +68130,8 @@ mod tests {
                 "fsfs.search.cache.v37",
                 // May describe an index state even when the caller requested zero hits.
                 "fsfs.search.cache.v38",
+                // Could retain cross-encoder document paths at an explicit zero limit.
+                "fsfs.search.cache.v39",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
