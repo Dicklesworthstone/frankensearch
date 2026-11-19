@@ -102,6 +102,14 @@ the observer waits for complete records before decoding UTF-8. The new
 byte-boundary regression and all 23 existing real-model CLI cases passed
 together at stock parallelism.
 
+The v4 cross-executable reuse policy could keep returning a file that the
+upgraded classifier excluded from a fresh index. Contract v5 at `3372449b`
+binds the classifier defaults and semantic window overlap. Changing either
+input rebuilt the index with two document-embedding batches. Search results,
+window positions and fast vector rows matched independent fresh builds. A
+compatible upgrade between different v5 executables carried all three test
+files with zero document-embedding batches. An upgrade from v4 rebuilt once.
+
 Release qualification remains open. Strict
 UBS reported findings and the macOS host had 1.47 GiB free against its
 40 GiB admission requirement. Hosted producer changes still lack an
