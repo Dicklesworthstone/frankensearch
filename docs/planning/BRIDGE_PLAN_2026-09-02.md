@@ -65,14 +65,31 @@ closed-pool refusal control and warnings-denied hybrid Clippy. Raising one
 replay score by the smallest representable `f32` step still failed the
 comparison.
 
-Release qualification remains open. The Linux stock CLI suite exposed stale
+The Linux stock CLI suite exposed stale
 cache and daemon expectations and a test that overwrote the configured
 model verification receipts. The corrected test uses independent model
 files. It passed against a read-only installation, preserving both source
 receipts byte for byte. A concurrent four-model run passed 20 of 23 cases.
 Three missed their semantic refinement deadlines. All 23 passed together
-at `6c3e2907` with one test at a time and the same deadlines. Strict
-UBS reported warnings and the macOS host had 1.75 GiB free against its
+at `6c3e2907` both serially and at stock parallelism with the same deadlines.
+The complete registered Linux run at that revision passed seven of eight
+checks. Its nested gate failed on the collector, native reranking and model
+verification receipts copied from another cache.
+
+At `adbe1319` all eight recovery CLI tests passed on Linux with real Potion
+and MiniLM, including the two opt-in tests. After a protected Quill segment
+went missing and its manifest was damaged, recovery restored the published
+bytes and both expected documents without source files. The ordinary stock
+index refused the same repair and preserved its selection.
+
+The quickstart checker previously accepted Potion's receipt in MiniLM's slot.
+The loader had admitted only Potion's receipt. At `adbe1319` the checker
+rejected that same cache and executable. With each model verified offline,
+the source-built and installed binary passed all 12 commands and 22 negative
+controls and left no owned child processes.
+
+Release qualification remains open. Strict
+UBS reported findings and the macOS host had 0.49 GiB free against its
 40 GiB admission requirement. Hosted producer changes still lack an
 authenticated response through the stock indexing command. The functional
 runs above did not measure the README latency targets.
