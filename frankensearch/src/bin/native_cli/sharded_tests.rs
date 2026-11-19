@@ -549,7 +549,8 @@ fn shared_stream_delivers_before_each_model_and_preserves_reranked_shard_rows() 
 fn primary_sharded_reranking_reopens_all_partitions_and_keeps_selected_tier_provenance() {
     use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
     use std::time::Duration;
-    run_test_with_cx(|cx| async move {
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::current().expect("runtime authority for pooled queries");
         let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 2);
         for exact in [false, true] {
             let root = tempfile::tempdir().unwrap();

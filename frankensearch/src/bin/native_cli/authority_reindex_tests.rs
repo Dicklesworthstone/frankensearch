@@ -802,7 +802,12 @@ fn bound_reindex_preserves_semantic_reranking_and_gives_each_query_its_original_
                             .iter()
                             .find(|(ordinary_phase, _)| *ordinary_phase == phase)
                             .unwrap();
-                        assert_eq!(&response["results"], results);
+                        // Compare both complete pages as a JSONL consumer sees
+                        // them. Parsing a decimal score can change the last
+                        // bit of its in-memory f64 representation.
+                        let bytes = serde_json::to_vec(results).unwrap();
+                        let expected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(response["results"], expected);
                     }
                     // A default query is a negative control: losing the configured
                     // fusion policy must change the actual Initial scores.

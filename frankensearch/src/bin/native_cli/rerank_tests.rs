@@ -142,7 +142,8 @@ fn primary_reranking_retains_persisted_tier_rows_scope_and_strict_noop_admission
     use frankensearch_core::generation::EmbedderTierTag;
     use frankensearch_index::ValidatedFsviBytes;
     use std::time::Duration;
-    run_test_with_cx(|cx| async move {
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::current().expect("runtime authority for pooled queries");
         let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 2);
         for exact in [false, true] {
             let root = tempfile::tempdir().unwrap();
