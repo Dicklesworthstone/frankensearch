@@ -13539,7 +13539,7 @@ impl FsfsRuntime {
             .await?;
         let fingerprint = resources.generation_fingerprint.clone();
         let index_root = resources.index_root.clone();
-        let expansion_limit = limit.saturating_mul(2).max(20);
+        let expansion_limit = Self::expansion_candidate_limit(limit);
         let retrieval_flags = SearchExecutionFlags {
             persist_explain_session: false,
             ..flags
@@ -13650,6 +13650,16 @@ impl FsfsRuntime {
         Ok(vec![fused])
     }
 
+    /// Widen a positive request for cross-query fusion. An explicit zero
+    /// must reach each retriever so it can report why the result is empty.
+    fn expansion_candidate_limit(limit: usize) -> usize {
+        if limit == 0 {
+            0
+        } else {
+            limit.saturating_mul(2).max(20)
+        }
+    }
+
     /// Expansion searches a wider candidate pool, including for its original
     /// query. Only output is clipped; the complete ranking stays available for
     /// cross-query fusion without rerunning the original model inference.
@@ -13707,7 +13717,7 @@ impl FsfsRuntime {
 
         // Gather payloads from each expanded query. Use a larger internal limit
         // to get enough candidates for meaningful fusion.
-        let expansion_limit = (limit.saturating_mul(2)).max(20);
+        let expansion_limit = Self::expansion_candidate_limit(limit);
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
             self.requested_search_mode(),
@@ -47997,7 +48007,7 @@ mod tests {
     #[test]
     fn expanded_stream_runs_original_inference_once_with_or_without_generated_queries() {
         run_on_runtime_task(|cx| async move {
-            for generate in [false, true] {
+            for (generate, limit) in [(false, 1), (true, 1), (false, 0), (true, 0)] {
                 let temp = tempfile::tempdir().unwrap();
                 let mut resources = disagreeing_blend_resources(temp.path());
                 let fast = Arc::new(ScriptedBoundEmbedder::new(BoundScript::Values(vec![
@@ -48032,13 +48042,15 @@ mod tests {
                 let mut transport = writer.clone();
                 let query = "how do indexed alpha documents rank";
                 let expansion = async {
-                    assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+                    if limit > 0 {
+                        assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+                    }
                     assert_eq!(
                         decode_visible_stream(&writer)
                             .iter()
                             .filter(|frame| frame.event.kind() == StreamEventKind::Result)
                             .count(),
-                        1
+                        limit
                     );
                     Ok(stream_expansion_fixture(
                         query,
@@ -48049,7 +48061,7 @@ mod tests {
                     .run_search_stream_with_query_expansion(
                         &cx,
                         query,
-                        1,
+                        limit,
                         "expanded-once",
                         &mut transport,
                         Some(super::SearchStreamResources {
@@ -48064,11 +48076,29 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                assert_eq!(
-                    fast.calls.load(Ordering::SeqCst),
-                    if generate { 2 } else { 1 }
-                );
                 let frames = decode_visible_stream(&writer);
+                let phases = if generate { 2 } else { 1 };
+                if limit > 0 {
+                    assert_eq!(fast.calls.load(Ordering::SeqCst), phases);
+                } else {
+                    let expected = BTreeMap::from([(
+                        "fast".to_owned(),
+                        super::BTreeSet::from(["zerosignal.request.zero_k".to_owned()]),
+                    )]);
+                    let mut reported = 0;
+                    for frame in &frames {
+                        if let StreamEvent::Progress(progress) = &frame.event
+                            && matches!(
+                                progress.stage.as_str(),
+                                "retrieve.fast" | "retrieve.expansion"
+                            )
+                        {
+                            assert_eq!(progress.zero_signal, expected);
+                            reported += 1;
+                        }
+                    }
+                    assert_eq!(reported, phases);
+                }
                 assert_eq!(frames.iter().filter(|frame| matches!(
                     &frame.event, StreamEvent::Progress(progress) if progress.stage == "retrieve.expansion"
                 )).count(), usize::from(generate));
@@ -48077,7 +48107,7 @@ mod tests {
                         .iter()
                         .filter(|frame| frame.event.kind() == StreamEventKind::Result)
                         .count(),
-                    if generate { 2 } else { 1 }
+                    limit * phases
                 );
             }
         });

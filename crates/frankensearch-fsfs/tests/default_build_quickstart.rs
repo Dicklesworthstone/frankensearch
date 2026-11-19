@@ -2848,7 +2848,8 @@ mod loader_only {
             serde_json::from_str::<Value>(&line).unwrap()["payload"]["phase"],
             "initial"
         );
-        reader.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+        // Drop the sole descriptor after Initial. The peer may have already
+        // finished its response and closed its side of the socket.
         drop(reader);
         let mut ready = UnixStream::connect(&owner.socket).unwrap();
         ready.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();

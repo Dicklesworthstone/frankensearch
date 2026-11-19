@@ -1542,7 +1542,7 @@ impl FsfsRuntime {
                 cx,
                 query,
                 queries,
-                limit.saturating_mul(2).max(20),
+                Self::expansion_candidate_limit(limit),
                 resources,
                 &fingerprint,
                 SearchExecutionFlags {
