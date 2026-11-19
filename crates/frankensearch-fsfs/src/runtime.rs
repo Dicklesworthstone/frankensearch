@@ -16648,6 +16648,7 @@ impl FsfsRuntime {
                         index
                             .record_count()
                             .saturating_add(index.wal_record_count())
+                            .max(1)
                     })
             } else {
                 plan.quality_stage.candidate_budget.max(planning_limit).min(
@@ -26524,7 +26525,9 @@ impl FsfsRuntime {
         } else {
             output_limit
         }
-        .min(quality_rows);
+        // An empty generation still needs a positive probe for a positive
+        // request. A zero budget tells the classifier the caller requested k=0.
+        .min(quality_rows.max(1));
         let semantic_query = if parsed.has_negations() && !parsed.is_positive_empty() {
             parsed.positive.clone()
         } else {
@@ -26536,8 +26539,14 @@ impl FsfsRuntime {
         } = self
             .with_quality_deadline(cx, async {
                 self.admit_required_quality(cx, resources).await?;
-                if normalized_query.is_empty() || output_limit == 0 {
+                if normalized_query.is_empty() {
                     return Ok(QualityCandidateBatch::default());
+                }
+                if output_limit == 0 {
+                    return Ok(QualityCandidateBatch {
+                        candidates: Vec::new(),
+                        zero_signal: Some(ZeroSignalReason::CallerRequestedZeroK),
+                    });
                 }
                 let excluded = Self::query_exclusions(
                     cx,
