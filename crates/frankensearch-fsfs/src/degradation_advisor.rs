@@ -645,8 +645,8 @@ fn next_actions_for(
             action(
                 2,
                 "degrade.action.raise_quality_timeout",
-                "Increase the quality timeout only after confirming the host has spare capacity.",
-                Some("fsfs config set search.quality_timeout_ms 1000".to_owned()),
+                "Inspect the quality timeout using the same configuration and environment as the search. If the host has spare capacity, choose a value above the reported budget.",
+                Some("fsfs config get search.quality_timeout_ms".to_owned()),
             ),
         ],
         DegradationFailureKind::CorruptIndex => vec![
@@ -993,6 +993,26 @@ mod tests {
                 .join("\n");
             assert!(commands.contains("fsfs doctor"));
             assert!(!commands.to_ascii_lowercase().contains("delete"));
+        }
+    }
+
+    #[test]
+    fn timeout_advice_inspects_the_setting_without_overwriting_the_budget() {
+        for budget_ms in [500, 5_000, 10_000] {
+            let error = SearchError::SearchTimeout {
+                elapsed_ms: budget_ms + 1,
+                budget_ms,
+            };
+            let advice = advice_for_search_error("network retries", None, &error);
+            let action = advice
+                .next_actions
+                .iter()
+                .find(|action| action.reason_code == "degrade.action.raise_quality_timeout")
+                .expect("timeout recovery action");
+            assert_eq!(
+                action.command.as_deref(),
+                Some("fsfs config get search.quality_timeout_ms")
+            );
         }
     }
 

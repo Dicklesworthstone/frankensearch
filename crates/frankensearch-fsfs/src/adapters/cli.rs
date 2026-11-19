@@ -2756,7 +2756,7 @@ mod tests {
         "fsfs search --rerank --format json -- <X>",
         "fsfs search --index-dir <X> --format json -- <X>",
         "fsfs config validate --format json",
-        "fsfs config set search.quality_timeout_ms 1000",
+        "fsfs config get search.quality_timeout_ms",
         "fsfs download-models",
         "fsfs download-models --verify",
         "fsfs download-models --list",
