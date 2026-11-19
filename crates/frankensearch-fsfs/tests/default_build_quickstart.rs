@@ -5834,6 +5834,38 @@ meta:
         }
     }
 
+    // The live writer may stop mid-record, even in the middle of a UTF-8
+    // character. Only a newline makes that record available to the reader.
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    fn read_complete_watch_output(path: &Path) -> String {
+        let mut bytes = fs::read(path).expect("read watch output");
+        let end = bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |index| index + 1);
+        bytes.truncate(end);
+        String::from_utf8(bytes).expect("complete watch records must be UTF-8")
+    }
+
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[test]
+    fn watch_output_waits_for_the_whole_publication_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("watch.jsonl");
+        let first = "{\"generation_complete\":false}\n";
+        let next = "{\"generation_complete\":true,\"path\":\"café.md\"}\n";
+        for split in 0..next.len() {
+            let partial = &next.as_bytes()[..split];
+            fs::write(&path, partial).unwrap();
+            assert_eq!(read_complete_watch_output(&path), "", "split {split}");
+            fs::write(&path, [first.as_bytes(), partial].concat()).unwrap();
+            assert_eq!(read_complete_watch_output(&path), first, "split {split}");
+        }
+        let complete = format!("{first}{next}");
+        fs::write(&path, &complete).unwrap();
+        assert_eq!(read_complete_watch_output(&path), complete);
+    }
+
     #[cfg(all(unix, feature = "semantic-loaders"))]
     fn wait_for_watch_output(
         child: &mut WatchChild,
@@ -5844,7 +5876,7 @@ meta:
     ) -> String {
         let started = Instant::now();
         loop {
-            let output = fs::read_to_string(path).expect("read watch output");
+            let output = read_complete_watch_output(path);
             if output.matches(needle).count() >= count {
                 return output;
             }
