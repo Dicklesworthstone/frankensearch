@@ -1299,7 +1299,11 @@ impl TwoTierSearcher {
     ) -> SearchResult<TwoTierMetrics> {
         let mut metrics = TwoTierMetrics::default();
 
-        if query.is_empty() || k == 0 {
+        if k == 0 {
+            metrics.zero_signal = Some(ZeroSignalReason::CallerRequestedZeroK);
+            return Ok(metrics);
+        }
+        if query.is_empty() {
             return Ok(metrics);
         }
 
@@ -10711,6 +10715,7 @@ mod tests {
 
             assert!(phases.is_empty());
             assert!(metrics.phase1_total_ms.abs() < f64::EPSILON);
+            assert_eq!(metrics.zero_signal, None);
         });
     }
 
@@ -10718,16 +10723,25 @@ mod tests {
     fn search_zero_k_returns_no_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_index_dir, index) = build_test_index(4);
-            let embedder = Arc::new(StubEmbedder::new("fast", 4));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let embedder = Arc::new(CountingEmbedder::new("fast", 4, calls.clone()));
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
-            let mut phases = Vec::new();
-            searcher
-                .search(&cx, "test", 0, |_| None, |p| phases.push(format!("{p:?}")))
-                .await
-                .unwrap();
-
-            assert!(phases.is_empty());
+            let mut phases = 0;
+            for query in ["test", ""] {
+                let metrics = searcher
+                    .search(&cx, query, 0, |_| None, |_| phases += 1)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    metrics.zero_signal,
+                    Some(ZeroSignalReason::CallerRequestedZeroK)
+                );
+                assert_eq!(metrics.phase1_vectors_searched, 0);
+                assert_eq!(metrics.phase2_vectors_searched, 0);
+            }
+            assert_eq!(phases, 0);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
         });
     }
 

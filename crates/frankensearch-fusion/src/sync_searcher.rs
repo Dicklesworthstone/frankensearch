@@ -825,6 +825,7 @@ impl SyncTwoTierSearcher {
         // successful no-op, not a request to scan the corpus and discard the
         // candidate pool afterwards (bd-k3089).
         if k == 0 {
+            metrics.zero_signal = Some(ZeroSignalReason::CallerRequestedZeroK);
             return Ok(SyncPreparedSearch {
                 initial: SyncSearchOutcome {
                     phase: None,
@@ -5208,7 +5209,10 @@ mod tests {
         let query = tiered(vec![0.0, 0.0]);
         let (results, metrics) = searcher.search_collect(&query, 0).unwrap();
         assert!(results.is_empty());
-        assert_eq!(metrics.zero_signal, None);
+        assert_eq!(
+            metrics.zero_signal,
+            Some(ZeroSignalReason::CallerRequestedZeroK)
+        );
         assert_eq!(metrics.phase1_vectors_searched, 0);
         assert_eq!(metrics.phase2_vectors_searched, 0);
         assert_eq!(searcher.search_iter(&query, 0).count(), 0);
