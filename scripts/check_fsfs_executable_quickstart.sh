@@ -42,8 +42,12 @@ The gate builds the binary exactly as the README documents. Since the
 loader-capable stock default landed (bd-fsfs-default-build-usable-6mtid),
 the documented source path is the PLAIN default build — no feature flags —
 with model artifacts provisioned at runtime; --profile embedded exercises
-the zero-download release profile instead. Model inputs must already be
-provisioned and SHA-verified via: scripts/rch-ensure-deps.sh --models-only
+the zero-download release profile instead. To prepare a new or copied cache,
+export FRANKENSEARCH_MODEL_DIR with its path and run:
+  scripts/rch-ensure-deps.sh --models-only
+  fsfs download-models potion-multilingual-128m --verify --offline
+  fsfs download-models all-minilm-l6-v2 --verify --offline
+The two offline checks record verification receipts for the files at that location.
 USAGE
 }
 
@@ -511,12 +515,14 @@ try:
     receipts = {}
     for directory in ('potion-multilingual-128M', 'all-MiniLM-L6-v2'):
         receipt_path = model_root / directory / '.verified'
-        require(receipt_path.is_file(), 'MODEL-IDENTITY', f'no verification receipt for {directory}')
+        verify_hint = (f'Run fsfs download-models {directory.lower()} --verify --offline '
+                       'with FRANKENSEARCH_MODEL_DIR pointing to this cache.')
+        require(receipt_path.is_file(), 'MODEL-IDENTITY', f'no verification receipt for {directory}. {verify_hint}')
         receipts[directory] = json.loads(receipt_path.read_text())
         fingerprint = receipts[directory]['manifest_fingerprint']
         require(any('model verification receipt accepted' in line
                     and f'receipt_manifest_fingerprint={fingerprint}' in line for line in log.splitlines()),
-                'MODEL-IDENTITY', f'loader did not admit the recorded {directory} receipt')
+                'MODEL-IDENTITY', f'loader did not admit the recorded {directory} receipt. {verify_hint}')
     receipt['model_receipts'] = receipts
     for tier in ('fast', 'quality'):
         actual_identity = receipt['generation2'][tier]['revision']

@@ -111,6 +111,10 @@ fsfs doctor --format json
 For an uninstalled development binary, use
 `cargo build --locked -p frankensearch-fsfs --bin fsfs` with the repository's
 pinned toolchain, then run `target/debug/fsfs` with the same model setup.
+If you copy a model cache, set `FRANKENSEARCH_MODEL_DIR` to the copy and
+repeat both `--verify` commands there with `--offline`. These commands
+hash the copied files and record their current identities. A copied
+`.verified` receipt still describes the original files.
 The Linux DSR quality lane builds in a clean checkout, installs with
 `cargo install --locked --debug --path crates/frankensearch-fsfs --root <private-root>`,
 and verifies that the installed executable matches the Cargo build byte for byte.
