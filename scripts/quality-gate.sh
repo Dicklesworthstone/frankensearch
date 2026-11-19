@@ -210,7 +210,7 @@ if want e2e; then
   elif [ "${QUALITY_GATE_ALLOW_MODEL_SKIP:-0}" = "1" ]; then
     skip e2e "registered models absent under $MODEL_DIR (allowed by QUALITY_GATE_ALLOW_MODEL_SKIP=1)"
   else
-    fail e2e "registered models absent under $MODEL_DIR; run scripts/rch-ensure-deps.sh --models-only or set QUALITY_GATE_ALLOW_MODEL_SKIP=1"
+    fail e2e "base model directories missing under $MODEL_DIR; see the README Quality Gate setup to install and verify Potion, ONNX MiniLM, native MiniLM and multilingual MiniLM"
   fi
 fi
 

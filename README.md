@@ -138,7 +138,7 @@ registered cache returns a typed nonzero error rather than a successful payload.
 compiled Model2Vec/FastEmbed loader. A hard doctor verdict exits nonzero with
 one stable `subsystem_error` report with the failing checks in its context. If the cache is absent or offline mode
 forbids acquisition, indexing fails with an actionable typed error; it never
-substitutes hash control embeddings for semantic results. Use
+substitutes hash control embeddings for semantic results. Building with
 `--no-default-features` alone produces the model-free lite binary. Add
 `--features semantic-native` for the native semantic profile described below.
 
@@ -1388,17 +1388,24 @@ because the installer and updater use that endpoint.
 GitHub Actions is not used as a gate for this repository: every CI workflow under
 `.github/workflows/` is disabled (owner decision 2026-09-01). The one active workflow,
 `quill-gh51-landing.yml`, runs only on manual dispatch and gates nothing. The gate that must pass
-before any release lives in the repository and runs on a real host:
+before any release lives in the repository and runs on a real host. On that
+host, use an `fsfs` built from the checkout to provision its registered models.
 
 ```bash
+set -e
+export QUALITY_GATE_MODEL_DIR=/absolute/path/to/model-cache
+export FRANKENSEARCH_MODEL_DIR="$QUALITY_GATE_MODEL_DIR"
+for model in potion-multilingual-128m all-minilm-l6-v2 \
+             all-minilm-l6-v2-native paraphrase-multilingual-minilm-l12-v2; do
+    fsfs download-models "$model"
+    fsfs download-models "$model" --verify --offline
+done
 export FSFS_UPGRADE_REUSE_PREVIOUS_BINARY=/absolute/path/to/previous/fsfs
-scripts/quality-gate.sh                     # fmt, check, clippy -D warnings, lib tests,
-                                            # downloader/API proxies, installer contracts,
-                                            # Quill/Tantivy witness, fsfs tests, real-model e2e,
-                                            # executable quick-start gate
-dsr quality --tool frankensearch            # the same gate plus configured packaging
-                                            # checks, driven by dsr
+dsr quality --tool frankensearch
 ```
+
+To run the repository checks directly, use `scripts/quality-gate.sh` with
+the same environment. DSR also runs the configured packaging checks.
 
 The full `e2e` stage runs the two-executable upgrade-reuse regression. Supply a
 previous `fsfs` built from a different source revision with the same registered
@@ -1407,12 +1414,15 @@ producer protocols and indexing contract in `FSFS_UPGRADE_REUSE_PREVIOUS_BINARY`
 receipt. The test requires a different executable hash and exercises compatible
 reuse, default cold rebuilding, and independent source, producer, and artifact drift.
 
-Stages can be selected with `QUALITY_GATE_STAGES=fmt,check,clippy,tests` and
-the registered model cache with `QUALITY_GATE_MODEL_DIR`. The end-to-end stage
-fails closed when the two registered models are absent unless
-`QUALITY_GATE_ALLOW_MODEL_SKIP=1` is set. Release validation requires the real
-models and does not use that skip. Releases use `dsr` or the documented real-host
-build and publication commands with the same gates;
+Select stages with `QUALITY_GATE_STAGES=fmt,check,clippy,tests`. The full Linux
+CLI suite uses all four models above. `scripts/rch-ensure-deps.sh --models-only`
+provisions the bundled Potion and ONNX MiniLM files. The native quality and
+multilingual search cases also need their respective model files. With weights
+already installed, run just the offline verification for each model in the
+selected cache. For development, `QUALITY_GATE_ALLOW_MODEL_SKIP=1` lets the
+`e2e` stage skip when either base model directory is absent. With both present,
+the stage runs its full suite. Releases require all four models on Linux and
+use `dsr` or the documented real-host build and publication commands.
 `docs/fsfs-packaging-release-install-contract.md` and
 `docs/crates-publishing-contract.md` are the authoritative recipes.
 
