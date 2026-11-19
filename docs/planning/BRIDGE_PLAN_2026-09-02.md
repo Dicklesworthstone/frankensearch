@@ -50,6 +50,21 @@ then passed individually and in the package run with three simultaneous
 tests. Both runs used the same test executable. The native workspace and
 hybrid Clippy checks and the Windows MSVC Index compile also passed.
 
+The Linux default fsfs library exposed a reader getting `WouldBlock` after
+the collector released its generation. A duplicate descriptor reproduced
+the failure. The collector now unlocks when its owning scope ends, even
+while the duplicate stays open. A live collector still refuses competing
+readers. At `38d3c08f` all 56 generation-store tests and all 3,234 fsfs
+library tests passed, with 16 declared ignores in the library.
+
+The hybrid native CLI had three reproducible reranking test failures.
+Two pooled tests now use the host runtime's spawn authority. The retained
+reindex test compares complete replay and ordinary query pages after JSON
+decoding on both sides. At `4f8efdc6` all three passed, as did the separate
+closed-pool refusal control and warnings-denied hybrid Clippy. Raising one
+replay score by the smallest representable `f32` step still failed the
+comparison.
+
 Release qualification remains open. The Linux stock CLI suite exposed stale
 cache and daemon expectations and a test that overwrote the configured
 model verification receipts. The corrected test uses independent model
@@ -57,7 +72,7 @@ files. It passed against a read-only installation, preserving both source
 receipts byte for byte. A concurrent four-model run passed 20 of 23 cases.
 Three missed their semantic refinement deadlines. All 23 passed together
 at `6c3e2907` with one test at a time and the same deadlines. Strict
-UBS reported warnings and the macOS host had 6.05 GiB free against its
+UBS reported warnings and the macOS host had 1.75 GiB free against its
 40 GiB admission requirement. Hosted producer changes still lack an
 authenticated response through the stock indexing command. The functional
 runs above did not measure the README latency targets.
