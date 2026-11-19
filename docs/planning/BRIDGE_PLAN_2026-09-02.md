@@ -1,6 +1,6 @@
 # Bridge Plan: frankensearch
 
-## Current assessment — November 18, 2026
+## Current assessment — November 19, 2026
 
 The stock Linux CLI at `bbd6564d` indexed and searched with both real model
 tiers. With compatible upgrade reuse enabled, it kept the legacy fast index
@@ -100,7 +100,10 @@ decode the first 1,024 bytes of a JSONL record before its terminating newline
 arrived. All 23 passed on a separate retry of the same source. At `31ea8c53`
 the observer waits for complete records before decoding UTF-8. The new
 byte-boundary regression and all 23 existing real-model CLI cases passed
-together at stock parallelism.
+together at stock parallelism. The registered run on `31ea8c53` passed
+seven of eight checks. Its nested gate passed the workspace tests and
+default fsfs suite, then reached the three-hour limit in the native facade
+tests before the real-model CLI stage.
 
 The v4 cross-executable reuse policy could keep returning a file that the
 upgraded classifier excluded from a fresh index. Contract v5 at `3372449b`
@@ -117,10 +120,46 @@ in the healthy store, identified the damaged tier in the quality-only case,
 and reported zero usable fast rows when both tiers were damaged. All 12
 checked input hashes remained unchanged.
 
-Release qualification remains open. Strict
-UBS reported findings and the macOS host had 0.74 GiB free against its
-40 GiB admission requirement. Hosted producer changes still lack an
-authenticated response through the stock indexing command. The functional
+The first registered Linux run at `3372449b` passed seven of eight checks.
+Four snapshot concurrency tests timed out in the shared home directory. All
+four passed together in 10.60 seconds using the same test executable and
+deadlines in a private home on the same host. The full run subsequently
+reached its three-hour limit while compiling Quill. The Quill driver exited
+but Cargo kept the build-directory lock. At `c78ca63c`, sending SIGTERM to
+the real driver during a Cargo build released that lock. The registered
+Quill probe suite passed 59 tests and rejected all five negative controls.
+
+In a separate stock Linux run at `3372449b`, the cross-executable upgrade
+case passed. The real-model CLI suite passed 18 of 24. Two daemon calls
+returned I/O timeouts, three searches missed their refinement deadlines,
+and the multilingual model missed its load deadline.
+Four of the six passed with the same test-profile binary on replay. The
+installed default binary subsequently passed all 24 at stock parallelism in
+a private btrfs directory. It also passed all 12 quickstart commands and
+22 negative controls, with zero owned children remaining.
+
+The original timeout advice lowered a 5,000 ms budget to 1,000 ms when
+run against an explicit file. At `f9cb508c` the stock CLI retained all
+three initial hits on a 52 ms refinement against a 50 ms budget. It
+recommended reading the effective setting. That command returned 50, 500,
+5,000 and 10,000 ms from four files and preserved all four byte for byte.
+
+At `89949b85` the stock CLI reports which configuration layer supplied a
+setting, including explicit values equal to defaults or another layer.
+The selected timeout environment variable takes precedence over the file.
+The JSON and table output agreed on the winning sources, and both a 49 ms
+budget and a nonnumeric value were rejected. The config error and README
+now identify the project and user files that the loader actually reads.
+
+Release qualification remains open. Strict UBS reported findings. On
+November 19 the designated Mac passed DSR's 40 GiB disk minimum. Its
+separate build-space check initially refused the 20 GiB request, then
+admitted the native watch build. That build used its 1,800-second budget
+compiling dependencies and ran zero tests. A fresh 20 GiB space check
+then refused. The Quill driver interruption and output
+retention controls passed on macOS. Stock fsfs selects registered local
+models and refuses explicit hosted-provider configuration. Authenticated
+hosted producer changes remain unverified through stock indexing. The functional
 runs above did not measure the README latency targets.
 
 ## Implementation follow-through — 2026-10-29
