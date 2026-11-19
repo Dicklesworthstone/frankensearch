@@ -972,8 +972,8 @@ master, slave = pty.openpty()
 # Darwin records the first write in F_GETFL (FWASWRITTEN). All three child
 # streams share this slave, so establish its write history before taking the
 # baseline. Both comparisons below still cover every bit, including O_NONBLOCK.
-assert os.write(slave, b'.') == 1
-assert os.read(master, 1) == b'.'
+if os.write(slave, b'.') != 1 or os.read(master, 1) != b'.':
+    raise RuntimeError('could not prime shared terminal')
 original_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
 terminal_identity = os.fstat(slave)
 child = subprocess.Popen(json.loads(sys.argv[1]), stdin=slave, stdout=slave, stderr=slave)
