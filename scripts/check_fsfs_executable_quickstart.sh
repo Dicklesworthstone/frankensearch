@@ -477,6 +477,26 @@ def phases(raw):
     return frames
 
 
+def admitted_model_receipt(directory, receipt_path, log):
+    model_id = directory.lower()
+    hint = (f'Run fsfs download-models {model_id} --verify --offline '
+            'with FRANKENSEARCH_MODEL_DIR pointing to this cache.')
+    try:
+        record = json.loads(receipt_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as error:
+        raise Refusal('MODEL-IDENTITY', f'cannot read the verification receipt for {directory}: {error}. {hint}') from error
+    require(isinstance(record, dict) and record.get('manifest_id') == model_id,
+            'MODEL-IDENTITY', f'wrong manifest ID in the {directory} receipt. {hint}')
+    fingerprint = record.get('manifest_fingerprint')
+    require(isinstance(fingerprint, str) and re.fullmatch('[0-9a-f]{64}', fingerprint),
+            'MODEL-IDENTITY', f'invalid manifest fingerprint for {directory}. {hint}')
+    expected = {f'manifest_id={model_id}', f'receipt_manifest_fingerprint={fingerprint}'}
+    require(any('model verification receipt accepted' in line and expected.issubset(line.split())
+                for line in log.splitlines()),
+            'MODEL-IDENTITY', f'loader did not admit the recorded {directory} receipt. {hint}')
+    return record
+
+
 def provenance(value):
     require(value['binary_source'] != 'unknown' and value['origin'] == 'invocation-build',
             'BINARY-PROVENANCE', 'checker revision cannot attest an override binary')
@@ -515,14 +535,7 @@ try:
     receipts = {}
     for directory in ('potion-multilingual-128M', 'all-MiniLM-L6-v2'):
         receipt_path = model_root / directory / '.verified'
-        verify_hint = (f'Run fsfs download-models {directory.lower()} --verify --offline '
-                       'with FRANKENSEARCH_MODEL_DIR pointing to this cache.')
-        require(receipt_path.is_file(), 'MODEL-IDENTITY', f'no verification receipt for {directory}. {verify_hint}')
-        receipts[directory] = json.loads(receipt_path.read_text())
-        fingerprint = receipts[directory]['manifest_fingerprint']
-        require(any('model verification receipt accepted' in line
-                    and f'receipt_manifest_fingerprint={fingerprint}' in line for line in log.splitlines()),
-                'MODEL-IDENTITY', f'loader did not admit the recorded {directory} receipt. {verify_hint}')
+        receipts[directory] = admitted_model_receipt(directory, receipt_path, log)
     receipt['model_receipts'] = receipts
     for tier in ('fast', 'quality'):
         actual_identity = receipt['generation2'][tier]['revision']
@@ -552,6 +565,9 @@ try:
     hits(semantic_result, hybrid=False)
     require(semantic_result.get('phase') == 'initial', 'MISSING-PHASE', 'quality-less search must stay Initial')
     if probes == '1':
+        reject('crossed-model-receipt', 'MODEL-IDENTITY',
+               lambda: admitted_model_receipt('all-MiniLM-L6-v2', model_root/'potion-multilingual-128M'/'.verified', log),
+               'other-tier-verification-receipt')
         # Remove authority only from new copies. The live positive generation
         # and shared model cache remain untouched; absent inputs are not mocks.
         omitted = [('missing-current', 'lexical/CURRENT', 'MISSING-CURRENT'),
@@ -641,7 +657,7 @@ try:
         endpoint = Path('/tmp') / f'fsfs-a5-{os.getpid()}.sock'
         run('leaked-listener', ['serve', '--daemon', '--daemon-socket', endpoint,
                                '--index-dir', index], cap=60, listener=endpoint)
-        require(len(controls) == 21, 'NEGATIVE-INVENTORY', len(controls))
+        require(len(controls) == 22, 'NEGATIVE-INVENTORY', len(controls))
     require(sha(binary) == binary_sha, 'BINARY-PROVENANCE', 'executable changed during run')
     receipt['result'] = 'PASS'
 except (Refusal, OSError, ValueError, KeyError, struct.error) as error:
