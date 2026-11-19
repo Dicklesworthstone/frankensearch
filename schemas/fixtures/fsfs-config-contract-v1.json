@@ -3,8 +3,8 @@
   "v": 1,
   "source_precedence": ["cli", "env", "file", "defaults"],
   "config_file_policy": {
-    "primary": "${XDG_CONFIG_HOME}/fsfs/config.toml",
-    "fallback": "~/.config/fsfs/config.toml",
+    "primary": "${XDG_CONFIG_HOME}/frankensearch/config.toml",
+    "fallback": "~/.config/frankensearch/config.toml",
     "expand_tilde": true
   },
   "defaults": {

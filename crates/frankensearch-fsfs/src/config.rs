@@ -4281,10 +4281,18 @@ mod tests {
             let user = format!("[search]\nfast_only = {user_value}\n");
             let project = format!("[search]\nfast_only = {project_value}\n");
             let result = super::load_from_str_layers(
-                Some(&user),
-                None,
-                Some(&project),
-                None,
+                &[
+                    super::ConfigFileLayer {
+                        name: "user",
+                        toml: Some(&user),
+                        path: None,
+                    },
+                    super::ConfigFileLayer {
+                        name: "project",
+                        toml: Some(&project),
+                        path: None,
+                    },
+                ],
                 &HashMap::new(),
                 &CliOverrides::default(),
                 home(),

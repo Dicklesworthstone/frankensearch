@@ -32,13 +32,16 @@ No component may override this order.
 
 ## Config File Location Policy
 
-Primary path:
+The project file is `.frankensearch/config.toml` under the nearest Git root.
+Outside a Git repository, fsfs looks under the current directory. The project
+file takes precedence over the user file. An explicit `--config PATH` selects
+a single file and still allows environment and CLI overrides.
 
-- `${XDG_CONFIG_HOME}/fsfs/config.toml`
+When `XDG_CONFIG_HOME` is set, the user file is
+`${XDG_CONFIG_HOME}/frankensearch/config.toml`. Otherwise fsfs uses
+`~/.config/frankensearch/config.toml`.
 
-Fallback path:
-
-- `~/.config/fsfs/config.toml`
+`fsfs config validate --format json` lists the selected file paths.
 
 Path expansion rule:
 

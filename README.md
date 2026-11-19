@@ -533,8 +533,9 @@ uses extracted PDF text. Vector-only indexes use a bounded source-text read.
 ### Fast semantic windows (on by default)
 
 The fast tier embeds up to 128 overlapping windows of each file, not just its
-opening. The cap is `indexing.fast_window_max_per_file` in your project
-`fsfs.toml` or user configuration; `1` restores prefix-only embedding:
+opening. Set `indexing.fast_window_max_per_file` in the project's
+`.frankensearch/config.toml` or in the user configuration. A cap of `1`
+restores prefix-only embedding.
 
 ```toml
 [indexing]
@@ -761,12 +762,18 @@ The benchmark lane validates deterministic artifact identity fields (`dataset_sh
 
 ## Configuration
 
-Configuration precedence (highest first; `fsfs config` prints the resolved
-`source_precedence_applied` for the current process):
+Configuration precedence, highest first
+
 1. CLI flags
 2. environment variables
-3. config files (project `fsfs.toml` over user `~/.config/fsfs/config.toml`)
+3. the project file `.frankensearch/config.toml` over the user file
+   `$XDG_CONFIG_HOME/frankensearch/config.toml` (default `~/.config/frankensearch/config.toml`)
 4. built-in defaults
+
+`--config PATH` selects a single file. Run `fsfs config get search.quality_timeout_ms`
+to see the effective budget and its source, or `fsfs config validate --format json`
+to see the file paths. `FRANKENSEARCH_SEARCH_QUALITY_TIMEOUT_MS` overrides the
+file setting and takes precedence over `FSFS_SEARCH_QUALITY_TIMEOUT_MS`.
 
 `--fast-only`, `FRANKENSEARCH_FAST_ONLY=true`, and `[search] fast_only = true`
 disable quality work under the default `performance` pressure profile. The

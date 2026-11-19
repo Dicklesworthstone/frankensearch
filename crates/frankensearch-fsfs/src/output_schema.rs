@@ -1164,7 +1164,9 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
             Some(format!(
                 "Check the '{field}' setting in your configuration.\n\
                  {reason}\n\
-                 Config files: fsfs.toml (project) or ~/.config/fsfs/config.toml (user)"
+                 Check the file passed to --config, or .frankensearch/config.toml in the project. \
+                 The user file is $XDG_CONFIG_HOME/frankensearch/config.toml \
+                 or ~/.config/frankensearch/config.toml when XDG_CONFIG_HOME is unset."
             ))
         }
         // Inputs and runtime state (an append-batch line, update metadata, an
@@ -2434,7 +2436,14 @@ mod tests {
         let config = output_error_from(&invalid("search.quality_timeout_ms"))
             .suggestion
             .unwrap();
-        assert!(config.contains("config.toml"), "{config}");
+        for path in [
+            "--config",
+            ".frankensearch/config.toml",
+            "$XDG_CONFIG_HOME/frankensearch/config.toml",
+            "~/.config/frankensearch/config.toml",
+        ] {
+            assert!(config.contains(path), "{config}");
+        }
         // An input (an append-batch line) is no setting: no config-file advice.
         let input = output_error_from(&invalid("append_batch.input"))
             .suggestion
