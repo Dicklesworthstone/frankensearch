@@ -381,7 +381,12 @@ fn exercise_keyword_repair(protect: bool) {
             .join(prepared["generation_id"].as_str().unwrap());
         for (path, bytes) in &healthy {
             if path != Path::new(COMPLETE_GENERATION_MANIFEST) {
-                assert_eq!(fs::read(target.join(path)).unwrap(), *bytes, "{path:?}");
+                assert_eq!(
+                    fs::read(target.join(path)).unwrap(),
+                    *bytes,
+                    "{}",
+                    path.display()
+                );
             }
         }
         let sealed = files(&target);
