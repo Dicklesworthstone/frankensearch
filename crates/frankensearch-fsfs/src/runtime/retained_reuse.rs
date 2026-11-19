@@ -8,7 +8,7 @@
 //! Receipts bind every completed input, including the final batch, to the
 //! running executable bytes and configuration that produced it on Linux. A
 //! fresh Linux process can reuse that work only after the immutable selected
-//! bundle is verified; other platforms retain process-scoped reuse. This
+//! bundle is verified. Other platforms retain process-scoped reuse.
 //! Mutable legacy roots use the same receipt compatibility rule, with a digest
 //! binding the evidence to their actual serving artifacts under the publication
 //! lease. They still pass through ordinary indexing and publication admission.

@@ -26,6 +26,9 @@ const CONFIG_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FAST_ONLY_WARNING_CODE: &str = "config.search.fast_only_with_quality_model";
 /// A setting set to a value that changes nothing (`no_effect_setting_warnings`).
 pub const CONFIG_NO_EFFECT_WARNING_CODE: &str = "config.setting.no_effect";
+/// The requested upgrade policy can retain work only within the current process.
+pub const UPGRADE_REUSE_PROCESS_SCOPE_WARNING: &str =
+    "config.indexing.upgrade_reuse.process_scoped";
 /// Default rerank-stage deadline, the value the planner hard-coded before the
 /// setting existed. Abstract-length documents need seconds (bd-e25eo).
 pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 300;
@@ -965,7 +968,7 @@ pub struct IndexingConfig {
     pub fast_window_max_per_file: usize,
     pub reindex_on_change: bool,
     pub watch_mode: bool,
-    /// Opt in to completed-work reuse across compatible executable upgrades.
+    /// Opt in to completed-work reuse across compatible executable upgrades on Linux.
     /// This controls admission, not the bytes or coverage produced by indexing.
     #[serde(
         default,
@@ -3502,6 +3505,17 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
 
     if config.search.fast_only && !config.indexing.quality_model.trim().is_empty() {
         warnings.push(fast_only_quality_model_warning());
+    }
+    if cfg!(not(target_os = "linux"))
+        && config.indexing.upgrade_reuse == UpgradeReusePolicy::CompatibleContract
+    {
+        warnings.push(ConfigWarning {
+            severity: ConfigDiagnosticSeverity::Warn,
+            reason_code: UPGRADE_REUSE_PROCESS_SCOPE_WARNING.into(),
+            field: "indexing.upgrade_reuse".into(),
+            source: ConfigSource::Runtime,
+            message: "Cross-process index reuse requires Linux. On this platform a new fsfs process rebuilds retained work.".into(),
+        });
     }
     no_effect_setting_warnings(config, warnings);
 

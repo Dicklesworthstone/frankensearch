@@ -7736,7 +7736,7 @@ impl FsfsRuntime {
         self.config.search.ranking_priors
     }
 
-    /// Enable or disable `IndexingContractDigestV1`-gated warm reuse across `fsfs`
+    /// Enable or disable indexing-contract-gated warm reuse across `fsfs`
     /// binary upgrades when `indexing_contract_sha256`, `configuration_sha256`, and
     /// producer model fingerprints match (`bd-ky0j2`).
     #[must_use]
@@ -7749,7 +7749,7 @@ impl FsfsRuntime {
         self
     }
 
-    /// Whether `IndexingContractDigestV1`-gated warm reuse across binary upgrades is enabled.
+    /// Whether the configuration requests compatible index reuse across binary upgrades.
     #[must_use]
     pub const fn contract_upgrade_reuse_enabled(&self) -> bool {
         matches!(
@@ -29761,7 +29761,8 @@ Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --q
               Recovery requires installed models; it never downloads, retries automatically, or replaces a newer concurrent publication.
 Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>
               --upgrade-reuse <same-executable|compatible-contract>
-              Default: same-executable. Compatible-contract admits verified reuse across binary upgrades.
+              Default: same-executable. On Linux, compatible-contract admits verified reuse across binary upgrades.
+              Other platforms retain indexed work within the same process.
               --full/--force always bypass retained reuse and rebuild from source.
               --complete-quality --index-dir STORE finishes deferred quality from retained inputs.
               Quality completion is one-shot and requires no source path or discovery flags.

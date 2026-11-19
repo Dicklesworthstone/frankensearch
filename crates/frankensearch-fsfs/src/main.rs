@@ -231,6 +231,12 @@ fn run(args: Vec<String>, error_context: &mut ProcessErrorContext) -> SearchResu
         for warning in loaded.warnings.iter().filter(|warning| {
             warning.reason_code == "override.rejected.locked_field"
                 || warning.reason_code == frankensearch_fsfs::config::CONFIG_NO_EFFECT_WARNING_CODE
+                || (warning.reason_code
+                    == frankensearch_fsfs::config::UPGRADE_REUSE_PROCESS_SCOPE_WARNING
+                    && matches!(
+                        cli_input.command,
+                        CliCommand::Index | CliCommand::Watch | CliCommand::Config
+                    ))
         }) {
             eprintln!(
                 "warning: [{}] {} ({})",

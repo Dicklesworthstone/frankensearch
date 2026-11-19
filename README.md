@@ -441,8 +441,10 @@ published artifacts still need indexing resumed before semantic search.
 
 Completed ordinary index runs retain evidence for reusing their work on later
 runs. Reuse normally requires matching executable, configuration, producer identities
-and artifact bytes. `fsfs index <dir> --upgrade-reuse compatible-contract` explicitly
+and artifact bytes. On Linux, `fsfs index <dir> --upgrade-reuse compatible-contract`
 permits a different executable when its versioned indexing contract also matches.
+On macOS and other platforms, a watcher can reuse work within its own process.
+Restarting it rebuilds the index, even with this option enabled.
 The same opt-in is available as `[indexing] upgrade_reuse = "compatible_contract"`
 or `FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract`; disable it with
 `--upgrade-reuse same-executable`. Source, producer, topology and artifact checks
@@ -459,10 +461,8 @@ previous selection. Restore the verified model before retrying.
 On complete-generation stores, `compact` and `delete` preserve admitted reuse
 evidence for surviving documents without running embedding inference. A later
 index reuses those documents and embeds changed or restored source rows.
-The current indexing contract (v3) preserves exact JSON numbers and native
-source paths, including literal backslashes in Unix filenames. Upgrading from
-a v1 or v2 completion receipt requires one cold index build. Later upgrades
-can reuse that work when the v3 contract and the other admission checks match.
+The indexing contract also preserves exact JSON numbers and native source
+paths, including literal backslashes in Unix filenames.
 The switch to exact JSON numbers also invalidated older query caches and
 daemons so forwarded results preserve score bits and explanations.
 A file whose device, inode, length and modification and
@@ -476,8 +476,6 @@ files are read and indexed again; removed files leave the index. `fsfs index
 --force` (also `--full`) rebuilds all discovered files and clears stale
 lexical rows.
 Existing indexes acquire this evidence on their next successful build.
-Cross-process reuse is supported on Linux; other platforms keep the existing
-process-scoped executable evidence policy.
 
 Each search hit carries its `path`, a plain-text `snippet` of the best-matching
 fragment, and `line`: the 1-based line of the file where the snippet's first
