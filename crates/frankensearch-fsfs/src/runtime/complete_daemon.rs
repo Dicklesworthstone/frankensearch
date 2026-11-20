@@ -2891,22 +2891,33 @@ mod generation_tests {
             }
         }
 
-        for change_mode in [false, true] {
+        for (fast_only, change_mode) in [(false, false), (false, true), (true, false)] {
             run_test_with_cx(|cx| async move {
                 let directory = tempfile::tempdir().unwrap();
                 let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
                 let runtime = runtime.with_daemon_coalescers();
-                let session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
-                let bytes =
-                    b"{\"query\":\"sharedtoken\",\"mode\":\"full\",\"limit\":10,\"rerank\":true}";
-                let (request, _) = parse_request(bytes).unwrap();
+                let mut session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+                session.reader.runtime.config.indexing.quality_model =
+                    FsfsConfig::default().indexing.quality_model;
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "query": "sharedtoken", "mode": "full", "limit": 10,
+                    "rerank": true, "fast_only": fast_only
+                }))
+                .unwrap();
+                let (request, _) = parse_request(&bytes).unwrap();
+                let mode = if cfg!(feature = "semantic-support") {
+                    SearchExecutionMode::Full
+                } else {
+                    SearchExecutionMode::LexicalOnly
+                };
+                let admits_model = mode == SearchExecutionMode::Full && !fast_only;
                 let mut prepared = session
                     .reader
                     .runtime
                     .with_search_serve_request_policy(&request)
                     .unwrap();
                 let unavailable = prepared
-                    .search_cache_key("sharedtoken", 10, SearchExecutionMode::Full)
+                    .search_cache_key("sharedtoken", 10, mode)
                     .unwrap();
                 let probe = Arc::new(frankensearch_core::SyncRerankerAdapter(KeyProbe(
                     std::sync::Mutex::new(None),
@@ -2916,13 +2927,20 @@ mod generation_tests {
                     crate::runtime::RerankerSlot(Some(provider.clone())),
                 ));
                 let key = prepared
-                    .search_cache_key("sharedtoken", 10, SearchExecutionMode::Full)
+                    .search_cache_key("sharedtoken", 10, mode)
                     .unwrap();
-                assert_ne!(unavailable, key);
+                if admits_model {
+                    assert_ne!(unavailable, key);
+                    assert_eq!(key.rerank_model.as_deref(), Some("snapshot-reranker"));
+                } else {
+                    assert_eq!(unavailable, key);
+                    assert!(key.rerank_model.is_none() && key.rerank_contract.is_none());
+                }
                 let cache = HashMap::from([(unavailable, Vec::new()), (key.clone(), Vec::new())]);
                 let shared = Arc::new(asupersync::sync::Mutex::new((session, cache)));
                 let weak = Arc::downgrade(&shared);
                 *probe.0.0.lock().unwrap() = Some(Box::new(move || {
+                    assert!(admits_model, "a skipped request consulted the model");
                     let shared = weak.upgrade().unwrap();
                     let mut state = shared
                         .try_lock_owned()
@@ -2940,14 +2958,14 @@ mod generation_tests {
                 crate::runtime::set_test_reranker(Some(provider));
                 let _reset = ResetReranker;
                 let (snapshot, cache) = runtime
-                    .snapshot_complete_daemon_request(&cx, &shared, bytes, false, true)
+                    .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, true)
                     .await
                     .unwrap();
                 assert!(!Arc::ptr_eq(
                     &snapshot.reader.runtime.reranker,
                     &runtime.reranker
                 ));
-                if change_mode {
+                if admits_model && change_mode {
                     assert!(
                         cache.is_empty(),
                         "a changed resource mode fences the snapshot"
@@ -2955,7 +2973,10 @@ mod generation_tests {
                 } else {
                     assert_eq!(cache, HashMap::from([(key, Vec::new())]));
                 }
-                assert_eq!(shared.try_lock_owned().unwrap().1.len(), 2);
+                assert_eq!(
+                    shared.try_lock_owned().unwrap().1.len(),
+                    1 + usize::from(admits_model)
+                );
             });
         }
     }

@@ -44706,8 +44706,16 @@ mod tests {
         scheduler.block_on(async {
             for (mode, limit) in [(Full, 0), (QualityOnly, 0), (FastOnly, 1), (LexicalOnly, 1)] {
                 let mut request = runtime.clone();
-                request.prepare_search_reranker(&cx, limit, mode).await.unwrap();
-                let key = request.search_cache_key("retry", limit, mode).unwrap();
+                request
+                    .prepare_search_reranker(&cx, limit, mode)
+                    .await
+                    .unwrap();
+                let key = request.search_cache_key("retry", limit, mode);
+                if mode == QualityOnly && !super::SEMANTIC_LOADERS_COMPILED {
+                    assert!(matches!(key, Err(SearchError::EmbedderUnavailable { .. })));
+                    continue;
+                }
+                let key = key.unwrap();
                 assert!(key.rerank);
                 assert!(key.rerank_model.is_none());
                 assert!(key.rerank_contract.is_none());
