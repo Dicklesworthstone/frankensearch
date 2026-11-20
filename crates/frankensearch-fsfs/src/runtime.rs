@@ -44828,7 +44828,8 @@ mod tests {
                     lexical_expansion_stream_fixture(&cx, directory.path()).await;
                 // A directory at the file destination makes explanation writes
                 // fail deterministically, independent of filesystem permissions.
-                fs::create_dir_all(FsfsRuntime::explain_session_path(directory.path())).unwrap();
+                let session_path = FsfsRuntime::explain_session_path(directory.path());
+                fs::create_dir_all(&session_path).unwrap();
                 runtime.cli_input.query = Some(QUERY.to_owned());
                 runtime.cli_input.stream = false;
                 runtime.cli_input.expand = false;
@@ -44887,6 +44888,9 @@ mod tests {
                 assert_eq!(replay.query, QUERY);
                 assert_eq!(replay.payloads, response.payloads);
 
+                // Expansion must replace the previous explanation before it
+                // can report success. The cache replay above needs the blocked path.
+                fs::rename(&session_path, directory.path().join("blocked-session")).unwrap();
                 runtime.cli_input.stream = true;
                 runtime.cli_input.expand = true;
                 runtime.cli_input.format = OutputFormat::Jsonl;
@@ -44907,6 +44911,13 @@ mod tests {
                 assert!(output.contains(QUERY), "the user's stream keeps its query");
                 assert!(output.contains("original.md"));
                 assert!(output.contains("expanded.md"));
+                let session = FsfsRuntime::load_explain_session_at_root(directory.path())
+                    .unwrap()
+                    .expect("expanded search must record why its hits cannot be explained");
+                assert_eq!(
+                    session.unavailable,
+                    Some(super::ExplainUnavailableReason::ExpandedQueryFusion)
+                );
             });
         });
         let captured = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
