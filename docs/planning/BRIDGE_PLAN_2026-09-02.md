@@ -45,6 +45,16 @@ The corrected test checks that equivalence and also checks that a
 control-only query completes model selection while the initialization lock
 is held.
 
+The registered Linux DSR run `20261120T164621-66jw79Mg` passed all eight
+checks on unchanged source `47630c55`. The workspace stage passed 7,538
+tests with 36 ignored. The fsfs stage passed 3,766 with 37 ignored.
+All 24 real-model end-to-end tests and the installed CLI quick start
+passed. The preceding run failed the quick start because the model
+verification receipts belonged to another installation. The successful
+run used the stock CLI to verify all four fixtures offline in place.
+The separate strict UBS scan of the six reviewed files exited 1 and
+flagged the pre-existing panic in the CLI test helper for invalid JSON.
+
 The native Apple Silicon CLI at `47630c55` passed the same 36 requests
 with the 30-second functional deadlines. Four fresh daemons also rejected
 the contradictory request before loading a model. On the next valid query,
@@ -52,6 +62,14 @@ each loaded the cross-encoder once and returned `stars.md` first. At the
 stock 300 ms rerank deadline, one daemon returned a score of 0.97645354.
 Three reported `query.stage.rerank.timeout` and kept the fused order.
 All four ran the same unoptimized executable on the shared Mac.
+
+The native Mac watcher served an edit, creation and rename through both
+the direct reader and the live daemon. After deletion, the source held
+only `renamed.md` but the two-document generation stayed selected for the
+full 180-second deadline. A repeat with pressure logging stopped earlier,
+at the first edit. The watcher reported 100% CPU against its 80% ceiling
+and paused indexing. The first run did not log its pressure state. Native
+watch freshness across all eight configurations remains open in `bd-z2nfa`.
 
 Cross-executable index reuse on macOS remains open. A running ad-hoc-signed
 Apple Silicon executable accepted an in-place append and exited normally.
