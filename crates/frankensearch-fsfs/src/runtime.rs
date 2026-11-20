@@ -696,7 +696,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v40: zero-limit responses also omit cross-encoder scores and document paths.
 // v41: distinguish an empty rerank candidate set from an enabled stage.
 // v42: zero-depth reranking is independent of cross-encoder availability.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v42";
+// v43: an empty quality query reports no candidates even without a cross-encoder.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v43";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -735,8 +736,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v37 / stream v35: skip cross-encoder scoring for a zero result limit.
 // v38 / stream v36: explain why a positive rerank request scored no candidates.
 // v39 / stream v37: skip model selection for requests that cannot rerank.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v39";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v37";
+// v40 / stream v38: reranker eligibility uses the normalized query and retained tiers.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v40";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v38";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -38972,6 +38974,7 @@ mod tests {
             "fsfs.search.serve.v26",
             "fsfs.search.serve.v27",
             "fsfs.search.serve.v28",
+            "fsfs.search.serve.v39",
         ] {
             response.schema_version = old_schema.to_owned();
             assert!(
@@ -41259,6 +41262,7 @@ mod tests {
         // weight; v3 blends quality discoveries without fast scores; v2
         // predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v37",
             "fsfs.search.serve.stream.v17",
             "fsfs.search.serve.stream.v16",
             "fsfs.search.serve.stream.v15",
@@ -68801,6 +68805,8 @@ mod tests {
                 "fsfs.search.cache.v39",
                 // Described a skipped positive-limit rerank as enabled.
                 "fsfs.search.cache.v40",
+                // Could report an unavailable reranker for a query with no candidates.
+                "fsfs.search.cache.v42",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
