@@ -46,14 +46,36 @@ control-only query completes model selection while the initialization lock
 is held.
 
 The registered Linux DSR run `20261120T164621-66jw79Mg` passed all eight
-checks on unchanged source `47630c55`. The workspace stage passed 7,538
-tests with 36 ignored. The fsfs stage passed 3,766 with 37 ignored.
+checks on unchanged source `47630c55`. The workspace stage passed 7,530
+tests across 53 Cargo targets, with 36 ignored. Eight subprocess probes
+also printed their own summaries. The fsfs stage passed 3,766 with 37 ignored.
 All 24 real-model end-to-end tests and the installed CLI quick start
 passed. The preceding run failed the quick start because the model
 verification receipts belonged to another installation. The successful
 run used the stock CLI to verify all four fixtures offline in place.
 The separate strict UBS scan of the six reviewed files exited 1 and
 flagged the pre-existing panic in the CLI test helper for invalid JSON.
+
+After the pressure-policy and tracing changes landed, the integrated
+stock CLI failed to compile at `44928e3d`. Its snippet fallback passed a
+Quill error to the public search error classifier. Revision `30a989fc`
+uses Quill's existing conversion and logs only the stable error code.
+The rebuilt CLI passed the 36-request exercise with the cross-encoder
+installed. A private query returned a snippet for `stars.md`, and its
+marker appeared in none of the 27 trace lines. Revision `9310d511`
+also passed all 52 selected reranker tests with the real model available.
+Its tracing regression verifies the cached explanation-write warning and
+the expanded search's persisted explanation state.
+
+The registered Linux gate passed all eight checks on `9310d511`, run
+`20261120T172647-RrlTJHPJ`. The workspace stage passed 7,537 tests
+(36 ignored), fsfs passed 3,772 (37 ignored), and the real-model
+end-to-end stage passed all 24. The installed quick start ran 12 commands
+and 22 controls. That executable also passed the 36-request rerank
+exercise and the four-document score, explain and missing-weight checks.
+The preceding run on `30a989fc` retained both its Clippy failure and
+the failing tracing test. Separate strict UBS still reports warnings
+for the reviewed runtime file.
 
 The native Apple Silicon CLI at `47630c55` passed the same 36 requests
 with the 30-second functional deadlines. Four fresh daemons also rejected
@@ -68,8 +90,10 @@ the direct reader and the live daemon. After deletion, the source held
 only `renamed.md` but the two-document generation stayed selected for the
 full 180-second deadline. A repeat with pressure logging stopped earlier,
 at the first edit. The watcher reported 100% CPU against its 80% ceiling
-and paused indexing. The first run did not log its pressure state. Native
-watch freshness across all eight configurations remains open in `bd-z2nfa`.
+and paused indexing. A third run published the edit and creation, then
+missed the rename deadline after reporting 96.77% CPU. The first run did
+not log its pressure state. Native watch freshness across all eight
+configurations remains open in `bd-z2nfa`.
 
 Cross-executable index reuse on macOS remains open. A running ad-hoc-signed
 Apple Silicon executable accepted an in-place append and exited normally.
