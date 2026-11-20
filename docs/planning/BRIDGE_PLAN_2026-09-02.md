@@ -28,6 +28,23 @@ and reported `query.stage.rerank.disabled.unavailable`. The separate
 reranking. The README's latency measurements apply to their original
 workloads and revisions.
 
+An older daemon also returned `unavailable` for a quality query that
+normalized to empty when the current client returned `no_candidates`
+directly. Revision `bca598ad` binds that distinction to the answer cache
+and both serving protocols. The stock executable passed the same
+36 requests and the real-weight CLI regression. All four mixed-version
+combinations of client, daemon and transport refused before emitting hits.
+All four matching combinations served their expected result.
+
+At `47630c55` all 51 reranker library tests ran and passed, including
+cancellation, retry and cache identity with verified ms-marco weights.
+The earlier run passed 50 of 51. Its failing test had assumed a control
+byte between words disabled semantic search. The stock CLI normalized it
+to a space and returned identical hits and scores for both spellings.
+The corrected test checks that equivalence and also checks that a
+control-only query completes model selection while the initialization lock
+is held.
+
 Cross-executable index reuse on macOS remains open. A running ad-hoc-signed
 Apple Silicon executable accepted an in-place append and exited normally.
 An open descriptor and matching vnode therefore cannot prove which
