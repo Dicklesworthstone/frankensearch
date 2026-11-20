@@ -95,9 +95,7 @@ impl TestContext {
 }
 
 fn fsfs_binary_path() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_fsfs")
-        .map(PathBuf::from)
-        .expect("cargo must provide CARGO_BIN_EXE_fsfs for integration tests")
+    PathBuf::from(env!("CARGO_BIN_EXE_fsfs"))
 }
 
 fn assert_success(label: &str, output: &Output) {
@@ -1197,7 +1195,7 @@ fn registered_model_cache_with_reranker() -> Option<PathBuf> {
         reranker.join("tokenizer.json"),
         reranker.join(".verified"),
         root.join("all-MiniLM-L6-v2"),
-        root.join("potion-base-128M"),
+        root.join("potion-multilingual-128M"),
     ];
     required.iter().all(|path| path.exists()).then_some(root)
 }
@@ -1245,7 +1243,10 @@ fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
     let ctx = TestContext::new(temp.path());
     let corpus_arg = corpus.display().to_string();
     let index_arg = index_dir.display().to_string();
-    let real_models = [("FRANKENSEARCH_MODEL_DIR", model_root_arg.as_str())];
+    let real_models = [
+        ("FRANKENSEARCH_MODEL_DIR", model_root_arg.as_str()),
+        ("RUST_LOG", "frankensearch_fsfs=info"),
+    ];
 
     let index = ctx.run_with_env(
         temp.path(),
@@ -1301,8 +1302,30 @@ fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
 
     let mut rerank_args = base_args.to_vec();
     rerank_args.push("--rerank");
+    for flags in [&["--limit", "0"][..], &["--limit", "1", "--fast-only"]] {
+        let mut args = rerank_args.clone();
+        args.extend_from_slice(flags);
+        let skipped = ctx.run_with_env(temp.path(), &args, &real_models);
+        assert_success("search without rerank work", &skipped);
+        let result = parse_json("search without rerank work", &skipped);
+        let hits = hit_paths(&result);
+        let reason = if flags[1] == "0" {
+            assert!(hits.is_empty(), "{result}");
+            "query.stage.rerank.disabled.zero_depth"
+        } else {
+            assert_eq!(hits.len(), 1, "{result}");
+            "query.stage.rerank.disabled.no_quality"
+        };
+        assert_eq!(
+            result.pointer("/data/rerank/reason_code").and_then(Value::as_str),
+            Some(reason),
+            "{result}"
+        );
+        assert!(!String::from_utf8_lossy(&skipped.stderr).contains("cross-encoder loaded"));
+    }
     let reranked = ctx.run_with_env(temp.path(), &rerank_args, &real_models);
     assert_success("search --rerank", &reranked);
+    assert!(String::from_utf8_lossy(&reranked.stderr).contains("cross-encoder loaded"));
     let json = parse_json("search --rerank", &reranked);
     assert_eq!(
         json.pointer("/data/phase").and_then(Value::as_str),
@@ -1370,8 +1393,9 @@ fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
     );
     assert_success("explain after --rerank", &explain);
     let explain_text = stdout_str(&explain);
+    let expected_score = format!("Reranker: {:.6}", values[0]);
     assert!(
-        explain_text.contains("Reranker: 0.") || explain_text.contains("Reranker: 1.0"),
+        explain_text.lines().any(|line| line == expected_score),
         "explain must print the reranker score for the top hit:\n{explain_text}"
     );
 
@@ -1380,7 +1404,7 @@ fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
     // reports the typed reason instead of pretending.
     let partial_root = temp.path().join("models-without-reranker");
     fs::create_dir_all(&partial_root).expect("create partial model root");
-    for dir in ["potion-base-128M", "all-MiniLM-L6-v2"] {
+    for dir in ["potion-multilingual-128M", "all-MiniLM-L6-v2"] {
         std::os::unix::fs::symlink(model_root.join(dir), partial_root.join(dir))
             .expect("link semantic tier into the partial model root");
     }

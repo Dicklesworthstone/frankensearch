@@ -695,7 +695,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v39: a zero result limit takes precedence over planning and rerank budgets.
 // v40: zero-limit responses also omit cross-encoder scores and document paths.
 // v41: distinguish an empty rerank candidate set from an enabled stage.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v41";
+// v42: zero-depth reranking is independent of cross-encoder availability.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v42";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -733,8 +734,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v36 / stream v34: keep an explicit zero limit in both semantic tiers.
 // v37 / stream v35: skip cross-encoder scoring for a zero result limit.
 // v38 / stream v36: explain why a positive rerank request scored no candidates.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v38";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v36";
+// v39 / stream v37: skip model selection for requests that cannot rerank.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v39";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v37";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -10965,7 +10967,7 @@ impl FsfsRuntime {
                 .limit
                 .unwrap_or(self.config.search.default_limit)
         });
-        runtime.prepare_search_reranker(cx).await?;
+        runtime.prepare_search_reranker(cx, requested_limit, mode).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
         // Every failed replay must invalidate the request-local entry, including
@@ -13388,7 +13390,7 @@ impl FsfsRuntime {
         } else {
             None
         };
-        prepared.prepare_search_reranker(cx).await?;
+        prepared.prepare_search_reranker(cx, limit, mode).await?;
         let key = prepared.search_cache_key(query, limit, mode)?;
         match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
@@ -14446,7 +14448,7 @@ impl FsfsRuntime {
             quality_timeout_ms: self.config.search.quality_timeout_ms,
             rerank_timeout_ms: self.config.search.rerank_timeout_ms,
             rerank: self.reranking_enabled_by_policy(),
-            rerank_model: if self.reranking_enabled_by_policy() {
+            rerank_model: if self.search_can_rerank(requested_limit, mode) {
                 self.reranker
                     .get()
                     .and_then(|slot| slot.0.as_ref())
@@ -14454,13 +14456,17 @@ impl FsfsRuntime {
             } else {
                 None
             },
-            rerank_contract: self.registered_reranker_cache_contract()?,
+            rerank_contract: self.registered_reranker_cache_contract(requested_limit, mode)?,
         })
     }
 
     #[cfg_attr(not(feature = "rerank"), allow(clippy::unnecessary_wraps))]
-    fn registered_reranker_cache_contract(&self) -> SearchResult<Option<String>> {
-        if !self.reranking_enabled_by_policy() {
+    fn registered_reranker_cache_contract(
+        &self,
+        limit: usize,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<Option<String>> {
+        if !self.search_can_rerank(limit, mode) {
             return Ok(None);
         }
         #[cfg(feature = "rerank")]
@@ -16017,7 +16023,7 @@ impl FsfsRuntime {
         // The cross-encoder is a process resource, not an index resource: the
         // runtime owns it, so its capability is decided here. Nothing is
         // loaded unless the caller asked for the stage.
-        let reranker = self.prepared_reranker(cx).await?;
+        let reranker = self.reranker_for_search(cx, output_limit, mode).await?;
         capabilities.rerank = if reranker.is_some() {
             CapabilityState::Enabled
         } else {
@@ -16026,7 +16032,9 @@ impl FsfsRuntime {
         let planner = QueryPlanner::from_fsfs(&self.config);
         let mut plan =
             planner.execution_plan_for_query(&normalized_query, Some(planning_limit), capabilities);
-        Self::restrict_rerank_to_output_limit(&mut plan.rerank_stage, output_limit);
+        if plan.quality_stage.enabled {
+            Self::restrict_rerank_to_output_limit(&mut plan.rerank_stage, output_limit);
+        }
 
         // A cross-encoder needs its planned candidate window before the
         // displayed page is selected. Keep Initial's existing ranking head,
@@ -24881,11 +24889,40 @@ impl FsfsRuntime {
         }
     }
 
+    const fn search_can_rerank(&self, limit: usize, mode: SearchExecutionMode) -> bool {
+        limit > 0
+            && self.reranking_enabled_by_policy()
+            && match mode {
+                SearchExecutionMode::Full => !self.quality_disabled_by_policy(),
+                SearchExecutionMode::QualityOnly => true,
+                SearchExecutionMode::FastOnly | SearchExecutionMode::LexicalOnly => false,
+            }
+    }
+
+    async fn reranker_for_search(
+        &self,
+        cx: &Cx,
+        limit: usize,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<Option<Arc<dyn Reranker>>> {
+        if self.search_can_rerank(limit, mode) {
+            self.prepared_reranker(cx).await
+        } else {
+            Self::semantic_retry_checkpoint(cx, "reranker_initialization")?;
+            Ok(None)
+        }
+    }
+
     /// Freeze a query's selection before its cache key is built. Only the
     /// successful process-wide model is shared with subsequent queries; an
     /// unavailable result stays local so the next query can retry provisioning.
-    async fn prepare_search_reranker(&mut self, cx: &Cx) -> SearchResult<()> {
-        let selected = self.prepared_reranker(cx).await?;
+    async fn prepare_search_reranker(
+        &mut self,
+        cx: &Cx,
+        limit: usize,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<()> {
+        let selected = self.reranker_for_search(cx, limit, mode).await?;
         self.reranker = Arc::new(std::sync::OnceLock::from(RerankerSlot(selected)));
         Ok(())
     }
@@ -25053,7 +25090,7 @@ impl FsfsRuntime {
     }
 
     fn restrict_rerank_to_output_limit(stage: &mut StageDirective, output_limit: usize) {
-        if output_limit == 0 && stage.enabled {
+        if output_limit == 0 {
             *stage = StageDirective {
                 enabled: false,
                 candidate_budget: 0,
@@ -26622,7 +26659,9 @@ impl FsfsRuntime {
         // With no lexical or fast votes, only quality similarity determines
         // rank; the existing one-arm RRF preserves the public score contract.
         let fused = orchestrator.fuse_rankings(&[], &candidates, candidate_budget, 0);
-        let reranker = self.prepared_reranker(cx).await?;
+        let reranker = self
+            .reranker_for_search(cx, output_limit, SearchExecutionMode::QualityOnly)
+            .await?;
         let mut rerank_stage = StageDirective {
             enabled: self.config.search.rerank,
             candidate_budget,
@@ -44998,7 +45037,7 @@ mod tests {
         runtime.config.indexing.model_dir = private_cache.display().to_string();
         scheduler.block_on(async {
             let mut absent = runtime.clone();
-            absent.prepare_search_reranker(&cx).await.unwrap();
+            absent.prepare_search_reranker(&cx, 10, SearchExecutionMode::Full).await.unwrap();
             assert!(absent.reranker.get().unwrap().0.is_none());
             assert!(
                 runtime.reranker.get().is_none(),
@@ -45022,7 +45061,7 @@ mod tests {
             frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &installed)
                 .unwrap();
             let mut available = runtime.clone();
-            available.prepare_search_reranker(&cx).await.unwrap();
+            available.prepare_search_reranker(&cx, 10, SearchExecutionMode::Full).await.unwrap();
             let retained = runtime.reranker.get().unwrap().0.as_ref().unwrap();
             assert!(Arc::ptr_eq(
                 retained,
@@ -45170,7 +45209,7 @@ mod tests {
                 );
                 let mut fresh = FsfsRuntime::new(runtime.config.clone())
                     .with_native_blocking_pool(scheduler.blocking_handle().unwrap());
-                fresh.prepare_search_reranker(&cx).await.unwrap();
+                fresh.prepare_search_reranker(&cx, 10, SearchExecutionMode::Full).await.unwrap();
                 let unavailable_key = fresh
                     .search_cache_key("recover network", 10, SearchExecutionMode::Full)
                     .unwrap();
@@ -45200,7 +45239,7 @@ mod tests {
                 .unwrap();
             let mut restored = FsfsRuntime::new(runtime.config.clone())
                 .with_native_blocking_pool(scheduler.blocking_handle().unwrap());
-            restored.prepare_search_reranker(&cx).await.unwrap();
+            restored.prepare_search_reranker(&cx, 10, SearchExecutionMode::Full).await.unwrap();
             let restored_key = restored
                 .search_cache_key("recover network", 10, SearchExecutionMode::Full)
                 .unwrap();

@@ -1333,6 +1333,8 @@ vector generation also reports a recovery plan for the affected tier.
 With `--limit 0`, each executed semantic tier reports
 `zerosignal.request.zero_k`, including with `--expand`. A requested reranker
 scores zero documents and returns no document paths in its score list.
+Zero-limit, fast-only and lexical-only searches skip loading the cross-encoder,
+even when reranking is enabled.
 
 Practical implication: phase-1 UX can still stay responsive even when higher-cost
 quality paths fail.

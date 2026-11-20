@@ -819,7 +819,7 @@ impl FsfsRuntime {
             let mut runtime = runtime.with_search_serve_request_policy(&request)?;
             // Reranker initialization may await work. Never hold the shared
             // reader lock while preparing this request's exact model key.
-            runtime.prepare_search_reranker(cx).await?;
+            runtime.prepare_search_reranker(cx, limit, mode).await?;
             let key = runtime.search_cache_key(&request.query, limit, mode)?;
             Ok::<_, SearchError>(Some((runtime, key)))
         }
@@ -866,7 +866,8 @@ impl FsfsRuntime {
         runtime
             .rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
-        runtime.prepare_search_reranker(cx).await?;
+        let limit = request.limit.unwrap_or(runtime.config.search.default_limit);
+        runtime.prepare_search_reranker(cx, limit, mode).await?;
         if matches!(mode, SearchExecutionMode::QualityOnly) {
             runtime.quality_budget_started_at = Some(cx.now());
             runtime
@@ -879,7 +880,6 @@ impl FsfsRuntime {
         runtime.cli_input.daemon = false;
         runtime.cli_input.daemon_socket = None;
         runtime.cli_input.query = Some(request.query.clone());
-        let limit = request.limit.unwrap_or(runtime.config.search.default_limit);
         let stream_id = format!(
             "complete-{}-{}-{}",
             pressure_timestamp_ms(),
