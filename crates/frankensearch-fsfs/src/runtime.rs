@@ -9498,7 +9498,7 @@ impl FsfsRuntime {
                 Err(error) if matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket") =>
                 {
                     warn!(
-                        error = %error,
+                        error_code = error_code_for(&error),
                         "fsfs daemon-backed search unavailable; falling back to in-process retrieval"
                     );
                     search_runtime
@@ -9525,7 +9525,7 @@ impl FsfsRuntime {
             "fsfs search display phase prepared"
         );
         info!(
-            query = payload.query,
+            query_bytes = payload.query.len(),
             phase = payload.phase.to_string(),
             output_format = self.cli_input.format.to_string(),
             returned_hits = payload.returned_hits,
@@ -9976,7 +9976,7 @@ impl FsfsRuntime {
                 {
                     Err(error) if matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket") =>
                     {
-                        warn!(error = %error, "daemon startup unavailable; using in-process retrieval");
+                        warn!(error_code = error_code_for(&error), "daemon startup unavailable; using in-process retrieval");
                         let mut direct_sink = |payload: &SearchPayload| {
                             self.emit_search_stream_payload(payload, stream_id, &mut seq, writer)
                         };
@@ -10027,7 +10027,7 @@ impl FsfsRuntime {
             self.emit_search_stream_explanations(&payload, stream_id, seq, writer)?;
             self.emit_search_stream_terminal_completed(stream_id, seq, writer)?;
             info!(
-                query = query,
+                query_bytes = query.len(),
                 phase = payload.phase.to_string(),
                 returned_hits = payload.returned_hits,
                 total_candidates = payload.total_candidates,
@@ -11119,7 +11119,10 @@ impl FsfsRuntime {
                 && let Err(error) =
                     runtime.persist_explain_session_for_cached_payloads(&request.query, &payloads)
             {
-                warn!(%error, "failed to persist cached daemon search explanation context");
+                warn!(
+                    error_code = error_code_for(&error),
+                    "failed to persist cached daemon search explanation context"
+                );
             }
             if options.hot_cache_enabled
                 && !cached
@@ -11649,7 +11652,7 @@ impl FsfsRuntime {
             Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
             if let Err(error) = self.persist_explain_session_for_cached_payloads(query, &payloads) {
                 warn!(
-                    error = %error,
+                    error_code = error_code_for(&error),
                     "fsfs daemon-backed search could not persist explain-session context"
                 );
             }
@@ -12944,13 +12947,8 @@ impl FsfsRuntime {
             &artifact.fused,
             Some(&artifact.payload),
         ) {
-            let destination = self
-                .complete_explain_target
-                .as_ref()
-                .map_or(index_root, |target| target.store_root.as_path());
             warn!(
-                error = %error,
-                path = %Self::explain_session_path(destination).display(),
+                error_code = error_code_for(&error),
                 "failed to persist explain-session context for follow-up `fsfs explain <rank>`"
             );
         }
@@ -13514,7 +13512,7 @@ impl FsfsRuntime {
                         self.persist_explain_session_for_cached_payloads(query, &payloads)
                     {
                         warn!(
-                            error = %error,
+                            error_code = error_code_for(&error),
                             "fsfs cached search could not persist explain-session context"
                         );
                     }
@@ -13524,7 +13522,7 @@ impl FsfsRuntime {
             Ok(None) => {}
             Err(error) => {
                 warn!(
-                    error = %error,
+                    error_code = error_code_for(&error),
                     "fsfs search cache read failed; continuing with uncached execution"
                 );
             }
@@ -13559,7 +13557,7 @@ impl FsfsRuntime {
         if let Err(error) = self.write_search_payload_cache(&key, &payloads, &execution_fingerprint)
         {
             warn!(
-                error = %error,
+                error_code = error_code_for(&error),
                 "fsfs search cache write failed; continuing without cache persistence"
             );
         }
@@ -13900,7 +13898,7 @@ impl FsfsRuntime {
             };
             info!(
                 strategy = expanded.strategy.label(),
-                query_text = variant_query,
+                query_bytes = variant_query.len(),
                 "fsfs expanded query: executing search variant"
             );
             let mut variant_payloads = self
@@ -15456,7 +15454,10 @@ impl FsfsRuntime {
                 Ok(snippets) => found.extend(ids.into_iter().zip(snippets)),
                 Err(error) => {
                     Self::semantic_retry_checkpoint(cx, "fsfs.search.snippets")?;
-                    debug!(error = %error, "fsfs search: hit snippets unavailable");
+                    debug!(
+                        error_code = error_code_for(&error),
+                        "fsfs search: hit snippets unavailable"
+                    );
                 }
             }
         }
@@ -15494,7 +15495,10 @@ impl FsfsRuntime {
                 Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                 Err(error) => {
                     Self::semantic_retry_checkpoint(cx, "fsfs.search.window_snippet")?;
-                    debug!(error = %error, "fsfs search: indexed window context unavailable");
+                    debug!(
+                        error_code = error_code_for(&error),
+                        "fsfs search: indexed window context unavailable"
+                    );
                     continue;
                 }
             };
@@ -16107,7 +16111,7 @@ impl FsfsRuntime {
 
         info!(
             phase = "query_parse",
-            query = normalized_query,
+            query_bytes = normalized_query.len(),
             intent = ?plan.intent.intent,
             fallback = ?plan.intent.fallback,
             confidence_per_mille = plan.intent.confidence_per_mille,
@@ -17074,7 +17078,7 @@ impl FsfsRuntime {
         if hash_control_lane {
             info!(
                 phase = Self::retrieval_completion_phase(true),
-                query = normalized_query,
+                query_bytes = normalized_query.len(),
                 lexical_candidates = lexical_candidates.len(),
                 hash_control_candidates = semantic_candidates.len(),
                 fused_candidates = final_payload.total_candidates,
@@ -17088,7 +17092,7 @@ impl FsfsRuntime {
         } else {
             info!(
                 phase = Self::retrieval_completion_phase(false),
-                query = normalized_query,
+                query_bytes = normalized_query.len(),
                 lexical_candidates = lexical_candidates.len(),
                 semantic_candidates = semantic_candidates.len(),
                 fused_candidates = final_payload.total_candidates,
@@ -25180,7 +25184,6 @@ impl FsfsRuntime {
             Err(error) => {
                 warn!(
                     error_code = error_code_for(&error),
-                    error = %error,
                     model = FSFS_RERANKER_MODEL_ID,
                     "fsfs rerank stage disabled: the cross-encoder failed to load"
                 );
@@ -25200,8 +25203,7 @@ impl FsfsRuntime {
         if !inspection.state.is_verified() {
             warn!(
                 state = ?inspection.state,
-                path = %inspection.path.display(),
-                diagnostic = inspection.diagnostic.as_deref().unwrap_or(""),
+                model = FSFS_RERANKER_MODEL_ID,
                 "fsfs rerank stage disabled: no verified cross-encoder in the model cache; run `fsfs download-models ms-marco-minilm-l-6-v2`"
             );
             return Ok(None);
@@ -25393,7 +25395,6 @@ impl FsfsRuntime {
             head = depth,
             elapsed_ms,
             budget_timeout_ms = stage.timeout_ms,
-            model = %model,
             "fsfs search rerank stage applied"
         );
         Ok(RerankStageOutcome {
@@ -25437,7 +25438,10 @@ impl FsfsRuntime {
         if matches!(error, SearchError::Cancelled { .. }) {
             return Err(error);
         }
-        warn!(error_code = error_code_for(&error), error = %error, "fsfs rerank stage failed; keeping the fused order");
+        warn!(
+            error_code = error_code_for(&error),
+            "fsfs rerank stage failed; keeping the fused order"
+        );
         let reason = if matches!(error, SearchError::SearchTimeout { .. }) {
             REASON_RERANK_TIMEOUT
         } else {
@@ -25519,7 +25523,7 @@ impl FsfsRuntime {
             let sentinel = match Self::read_index_sentinel(&index_root) {
                 Ok(sentinel) => sentinel,
                 Err(error) => {
-                    warn!(error = %error, "fsfs rerank stage: index sentinel unreadable; resolving candidate paths against the index root");
+                    warn!(error_code = error_code_for(&error), "fsfs rerank stage: index sentinel unreadable; resolving candidate paths against the index root");
                     None
                 }
             };
@@ -26226,8 +26230,7 @@ impl FsfsRuntime {
                 Err(error) if quality_required => return Err(error),
                 Err(error) => {
                     warn!(
-                        path = %quality_vector_path.display(),
-                        error = %error,
+                        error_code = error_code_for(&error),
                         "quality-tier vector generation is unreadable; serving the fast tier only"
                     );
                     None
@@ -26539,7 +26542,7 @@ impl FsfsRuntime {
                     if Self::hash_control_can_degrade_to_lexical(resources) {
                         resources.fast_embedder_attempted = true;
                         warn!(
-                            error = %error,
+                            error_code = error_code_for(&error),
                             "hash control generation is not an admissible semantic lane; continuing lexical-only"
                         );
                         resources
@@ -26573,7 +26576,7 @@ impl FsfsRuntime {
                 if Self::hash_control_can_degrade_to_lexical(resources) {
                     resources.fast_embedder_attempted = true;
                     warn!(
-                        error = %error,
+                        error_code = error_code_for(&error),
                         "hash control generation has no admitted embedder; continuing lexical-only"
                     );
                     resources
@@ -30353,7 +30356,10 @@ impl HitLineLocator {
                             .collect(),
                     ),
                     Err(error) => {
-                        debug!(error = %error, "fsfs hit lines: source policy unreadable; omitting source decoration");
+                        debug!(
+                            error_code = error_code_for(&error),
+                            "fsfs hit lines: source policy unreadable; omitting source decoration"
+                        );
                         None
                     }
                 }
@@ -30371,7 +30377,10 @@ impl HitLineLocator {
             }
             let sentinel = self.sentinel.get_or_init(|| {
                 FsfsRuntime::read_index_sentinel(&self.index_root).unwrap_or_else(|error| {
-                    debug!(error = %error, "fsfs hit lines: index sentinel unreadable");
+                    debug!(
+                        error_code = error_code_for(&error),
+                        "fsfs hit lines: index sentinel unreadable"
+                    );
                     None
                 })
             });
@@ -30460,8 +30469,7 @@ fn read_rerank_document_text(path: &Path, query: &str) -> Option<String> {
         Ok(bytes) => bytes,
         Err(error) => {
             debug!(
-                path = %path.display(),
-                error = %error,
+                error_kind = ?error.kind(),
                 "fsfs rerank stage: candidate source unavailable or changed; it keeps its fused rank"
             );
             return None;
@@ -44508,6 +44516,194 @@ mod tests {
         assert!(!encoded.contains("private-query-canary"));
         assert!(!encoded.contains("private-token-canary"));
         assert!(encoded.contains("line 1"));
+    }
+
+    #[derive(Clone, Default)]
+    struct DiagnosticLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn search_diagnostics_keep_query_text_out_of_direct_serve_and_expanded_logs() {
+        const QUERY: &str = "alpha privatequerycanary";
+        const VARIANT: &str = "beta privatevariantcanary";
+        let log = DiagnosticLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            run_on_runtime_task(|cx| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut runtime, _lexical) =
+                    lexical_expansion_stream_fixture(&cx, directory.path()).await;
+                // A directory at the file destination makes explanation writes
+                // fail deterministically, independent of filesystem permissions.
+                fs::create_dir_all(FsfsRuntime::explain_session_path(directory.path())).unwrap();
+                runtime.cli_input.query = Some(QUERY.to_owned());
+                runtime.cli_input.stream = false;
+                runtime.cli_input.expand = false;
+                runtime.cli_input.daemon = false;
+                runtime.cli_input.format = OutputFormat::Json;
+                runtime.run_search_command(&cx).await.unwrap();
+
+                let mut resources = runtime.prepare_search_serve_resources(&cx).await.unwrap();
+                let request = FsfsRuntime::parse_search_serve_request(
+                    &serde_json::json!({"query": QUERY, "limit": 2, "mode": "lexical"}).to_string(),
+                )
+                .unwrap();
+                let mut hot_cache = HashMap::new();
+                let response = runtime
+                    .execute_search_serve_request_with_sink(
+                        &cx,
+                        request.clone(),
+                        &mut resources,
+                        &mut hot_cache,
+                        super::SearchServeOptions {
+                            hot_cache_enabled: true,
+                            persist_explain_session: false,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(response.ok);
+                assert!(!response.cached);
+                assert_eq!(response.query, QUERY);
+                assert!(
+                    response.payloads[0]
+                        .hits
+                        .iter()
+                        .any(|hit| hit.path == "original.md")
+                );
+                let replay = runtime
+                    .execute_search_serve_request_with_sink(
+                        &cx,
+                        request,
+                        &mut resources,
+                        &mut hot_cache,
+                        super::SearchServeOptions {
+                            hot_cache_enabled: true,
+                            persist_explain_session: true,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(replay.ok);
+                assert!(
+                    replay.cached,
+                    "the explanation failure must follow a cache hit"
+                );
+                assert_eq!(replay.query, QUERY);
+                assert_eq!(replay.payloads, response.payloads);
+
+                runtime.cli_input.stream = true;
+                runtime.cli_input.expand = true;
+                runtime.cli_input.format = OutputFormat::Jsonl;
+                let mut output = Vec::new();
+                runtime
+                    .run_search_stream_with_query_expansion(
+                        &cx,
+                        QUERY,
+                        3,
+                        "diagnostic-canary",
+                        &mut output,
+                        None,
+                        async { Ok(stream_expansion_fixture(QUERY, Some(VARIANT))) },
+                    )
+                    .await
+                    .unwrap();
+                let output = String::from_utf8(output).unwrap();
+                assert!(output.contains(QUERY), "the user's stream keeps its query");
+                assert!(output.contains("original.md"));
+                assert!(output.contains("expanded.md"));
+            });
+        });
+        let captured = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        for secret in ["privatequerycanary", "privatevariantcanary"] {
+            assert!(
+                !captured.contains(secret),
+                "private query reached diagnostics"
+            );
+        }
+        for event in [
+            "fsfs search command completed",
+            "fsfs search query planned",
+            "fsfs search retrieval pipeline completed",
+            "fsfs expanded query: executing search variant",
+            "fsfs search stream completed",
+        ] {
+            assert!(captured.contains(event), "missing exercised event {event}");
+        }
+        assert!(captured.contains("query_bytes="));
+        assert!(captured.contains("returned_hits="));
+        let cached_warning = captured
+            .lines()
+            .find(|line| {
+                line.contains("failed to persist cached daemon search explanation context")
+            })
+            .expect("cached replay must exercise the explanation persistence warning");
+        assert!(cached_warning.contains("error_code=\"io_error\""));
+    }
+
+    #[test]
+    fn rerank_failure_diagnostics_never_format_opaque_provider_errors() {
+        #[derive(Debug)]
+        struct PrivateProviderFailure;
+
+        impl std::fmt::Display for PrivateProviderFailure {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("diagnostics must not format a private provider response");
+            }
+        }
+
+        impl std::error::Error for PrivateProviderFailure {}
+
+        let log = DiagnosticLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for error in [
+                SearchError::RerankFailed {
+                    model: "private-model-canary".to_owned(),
+                    source: Box::new(PrivateProviderFailure),
+                },
+                SearchError::Io(std::io::Error::other(PrivateProviderFailure)),
+                SearchError::SubsystemError {
+                    subsystem: "private-subsystem-canary",
+                    source: Box::new(PrivateProviderFailure),
+                },
+            ] {
+                let result =
+                    FsfsRuntime::rerank_stage_failure(Vec::new(), 4, Instant::now(), error)
+                        .unwrap();
+                assert_eq!(result.payload.status, RerankStageStatus::Failed);
+                assert_eq!(result.payload.reason_code, super::REASON_RERANK_FAILED);
+            }
+        });
+        let captured = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(!captured.contains("private-model-canary"));
+        assert!(!captured.contains("private-subsystem-canary"));
+        assert!(captured.contains("error_code="));
+        assert!(captured.contains("fsfs rerank stage failed; keeping the fused order"));
     }
 
     #[test]

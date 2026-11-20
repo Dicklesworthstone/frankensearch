@@ -3319,10 +3319,9 @@ impl TantivyIndex {
     fn parse_query_lenient(&self, query: &str) -> Box<dyn tantivy::query::Query> {
         let parser = self.query_parser();
         let (parsed, errors) = parser.parse_query_lenient(query);
-        if let Some(first_error) = errors.first() {
+        if !errors.is_empty() {
             debug!(
                 error_count = errors.len(),
-                first_error = %first_error,
                 "lenient query parse produced warnings"
             );
         }
@@ -3446,7 +3445,7 @@ impl TantivyIndex {
     /// # Errors
     ///
     /// Returns `SearchError` if the query cannot be parsed or search fails.
-    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    #[instrument(skip_all, fields(query_bytes = query.len(), limit = limit))]
     pub fn search_with_snippets(
         &self,
         _cx: &Cx,
@@ -3532,7 +3531,7 @@ impl TantivyIndex {
     ///
     /// Returns `SearchError` if query execution or stored-field loading fails.
     #[cfg(feature = "tantivy-oracle")]
-    #[instrument(skip_all, fields(query = %query, limit = limit, tie_expansion_limit = tie_expansion_limit))]
+    #[instrument(skip_all, fields(query_bytes = query.len(), limit = limit, tie_expansion_limit = tie_expansion_limit))]
     pub fn oracle_observe_query(
         &self,
         _cx: &Cx,
@@ -3652,7 +3651,7 @@ impl TantivyIndex {
     /// Returns a typed search failure when query execution, rank arithmetic,
     /// or stored-document materialization fails.
     #[cfg(feature = "tantivy-oracle")]
-    #[instrument(skip_all, fields(query = %query, limit = limit, offset = offset))]
+    #[instrument(skip_all, fields(query_bytes = query.len(), limit = limit, offset = offset))]
     pub fn oracle_observe_page(
         &self,
         _cx: &Cx,
@@ -3712,7 +3711,7 @@ impl TantivyIndex {
     /// # Errors
     ///
     /// Returns `SearchError` if the query cannot be parsed or search fails.
-    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    #[instrument(skip_all, fields(query_bytes = query.len(), limit = limit))]
     pub fn search_doc_ids(
         &self,
         _cx: &Cx,
@@ -3856,7 +3855,7 @@ impl TantivyIndex {
     /// benchmark so the optimized and counted paths can be compared in one
     /// binary.
     #[doc(hidden)]
-    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    #[instrument(skip_all, fields(query_bytes = query.len(), limit = limit))]
     pub fn search_doc_ids_counted(
         &self,
         _cx: &Cx,
@@ -3879,7 +3878,7 @@ impl TantivyIndex {
     /// Used only by the `search_doc_ids_materialize` benchmark to A/B the fast
     /// materialization wiring in one binary; not for production use.
     #[doc(hidden)]
-    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    #[instrument(skip_all, fields(query_bytes = query.len(), limit = limit))]
     pub fn search_doc_ids_via_docstore(
         &self,
         _cx: &Cx,
@@ -4101,7 +4100,7 @@ impl TantivyIndex {
 // ─── LexicalSearch implementation ───────────────────────────────────────────
 
 impl frankensearch_core::traits::LexicalRead for TantivyIndex {
-    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    #[instrument(skip_all, fields(query_bytes = query.len(), limit = limit))]
     fn search<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -4399,6 +4398,146 @@ mod tests {
         Fut: Future<Output = ()>,
     {
         asupersync::test_utils::run_test_with_cx(f);
+    }
+
+    #[derive(Clone, Default)]
+    struct DiagnosticCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::field::Visit for DiagnosticCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for DiagnosticCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let id = {
+                let mut captured = self.0.lock().unwrap();
+                captured.push(format!("span={}", attributes.metadata().name()));
+                u64::try_from(captured.len()).unwrap()
+            };
+            attributes.record(&mut self.clone());
+            tracing::span::Id::from_u64(id)
+        }
+
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            values.record(&mut self.clone());
+        }
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut self.clone());
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn lexical_diagnostics_omit_queries_from_spans_and_parse_warnings() {
+        const QUERY: &str = "alpha privatequerycanary";
+        const MALFORMED: &str = "privatefieldcanary:alpha";
+        let diagnostics = DiagnosticCapture::default();
+        let capture = diagnostics.clone();
+        run_with_cx(|cx| async move {
+            let index = TantivyIndex::in_memory().unwrap();
+            index
+                .index_document(&cx, &IndexableDocument::new("doc", QUERY))
+                .await
+                .unwrap();
+            index.commit(&cx).await.unwrap();
+            // Capture attributes at span creation, including spans with no events.
+            let _subscriber = tracing::subscriber::set_default(capture);
+            let snippets = index
+                .search_with_snippets(&cx, QUERY, 1, &SnippetConfig::default())
+                .unwrap();
+            assert_eq!(snippets.len(), 1);
+            assert!(
+                snippets[0]
+                    .snippet
+                    .as_deref()
+                    .unwrap()
+                    .contains("privatequerycanary")
+            );
+            for search in [
+                TantivyIndex::search_doc_ids,
+                TantivyIndex::search_doc_ids_counted,
+                TantivyIndex::search_doc_ids_via_docstore,
+            ] {
+                assert_eq!(search(&index, &cx, QUERY, 1).unwrap()[0].doc_id, "doc");
+            }
+            assert_eq!(index.search(&cx, QUERY, 1).await.unwrap()[0].doc_id, "doc");
+            assert_eq!(
+                index
+                    .search_candidates(&cx, QUERY, 1)
+                    .await
+                    .unwrap()
+                    .into_parts()
+                    .0
+                    .len(),
+                1
+            );
+            index.search_candidates(&cx, MALFORMED, 1).await.unwrap();
+            #[cfg(feature = "tantivy-oracle")]
+            {
+                assert_eq!(
+                    index
+                        .oracle_observe_query(&cx, QUERY, 1, 2, &SnippetConfig::default())
+                        .unwrap()
+                        .hits
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    index
+                        .oracle_observe_page(&cx, QUERY, 1, 0)
+                        .unwrap()
+                        .hits
+                        .len(),
+                    1
+                );
+            }
+        });
+        let captured = diagnostics.0.lock().unwrap().join("\n");
+        for secret in ["privatequerycanary", "privatefieldcanary"] {
+            assert!(
+                !captured.contains(secret),
+                "private query reached diagnostics"
+            );
+        }
+        for span in [
+            "search_with_snippets",
+            "search_doc_ids",
+            "search_doc_ids_counted",
+            "search_doc_ids_via_docstore",
+            "search",
+        ] {
+            assert!(
+                captured
+                    .lines()
+                    .any(|line| line.strip_prefix("span=") == Some(span))
+            );
+        }
+        #[cfg(feature = "tantivy-oracle")]
+        for span in ["oracle_observe_query", "oracle_observe_page"] {
+            assert!(
+                captured
+                    .lines()
+                    .any(|line| line.strip_prefix("span=") == Some(span))
+            );
+        }
+        assert!(captured.contains(&format!("query_bytes={}", QUERY.len())));
+        assert!(captured.contains("lenient query parse produced warnings"));
+        assert!(captured.contains("error_count="));
     }
 
     /// bd-f20ye: BOOSTING A GROUP CHANGES ITS BOOLEAN MEANING in tantivy

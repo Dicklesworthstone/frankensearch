@@ -726,7 +726,7 @@ impl ShadowState {
         self.shed.fetch_add(1, Ordering::Relaxed);
         info!(
             event = "shadow_query_shed",
-            query,
+            query_bytes = query.len(),
             manifest_generation = generation,
             shed_reason = reason.label(),
             "shadow lexical query was shed without affecting serving"
@@ -746,7 +746,6 @@ impl ShadowState {
             event = "shadow_degraded",
             manifest_generation = generation,
             degradation_kind = ?kind,
-            detail,
             "shadow lexical failure was isolated from serving"
         );
         if persist {
@@ -1216,7 +1215,7 @@ impl ShadowLexical {
             state.sampled_out.fetch_add(1, Ordering::Relaxed);
             info!(
                 event = "shadow_query_shed",
-                query,
+                query_bytes = query.len(),
                 manifest_generation = generation,
                 shed_reason = "sample_rate",
                 sample_ordinal = ordinal,
@@ -1257,7 +1256,7 @@ impl ShadowLexical {
         let corpus_revision = task_state.corpus_revision.load(Ordering::Acquire);
         let span = info_span!(
             "shadow_lexical_query",
-            query = %query,
+            query_bytes = query.len(),
             limit,
             manifest_generation = generation,
             serve_latency_micros,
@@ -1808,6 +1807,120 @@ mod tests {
             artifact_directory: root.join(SHADOW_ARTIFACT_DIRECTORY),
             ..ShadowLexicalConfig::default()
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct DiagnosticCapture(Arc<Mutex<String>>, Arc<AtomicU64>);
+
+    impl tracing::field::Visit for DiagnosticCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            writeln!(self.0.lock().unwrap(), "{}={value:?}", field.name()).unwrap();
+        }
+    }
+
+    impl tracing::Subscriber for DiagnosticCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            writeln!(
+                self.0.lock().unwrap(),
+                "span={}",
+                attributes.metadata().name()
+            )
+            .unwrap();
+            attributes.record(&mut self.clone());
+            tracing::span::Id::from_u64(self.1.fetch_add(1, Ordering::Relaxed) + 1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            values.record(&mut self.clone());
+        }
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut self.clone());
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn shadow_diagnostics_omit_queries_and_degradation_details() {
+        const QUERY: &str = "private-shadow-query-canary \u{001b}[31m 診断";
+        const DETAIL: &str = "private-shadow-provider-response-canary";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shadow = Arc::new(StaticLexical::new(Vec::new()));
+        let serving = vec![result("private-shadow-document-canary", 1.0)];
+        let capture = DiagnosticCapture::default();
+        let cx = Cx::for_testing();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let sampled_out = ShadowLexicalObserver::new(
+                shadow.clone(),
+                ShadowLexicalConfig {
+                    sample_rate_basis_points: 0,
+                    ..enabled_config(temp.path())
+                },
+            )
+            .expect("sampled-out observer");
+            sampled_out.observe_serving_results(&cx, QUERY, 1, &serving, false, 1);
+            assert_eq!(sampled_out.status().sampled_out, 1);
+
+            let admitted = ShadowLexicalObserver::new(
+                shadow.clone(),
+                ShadowLexicalConfig {
+                    allow_inline_shadow: true,
+                    ..enabled_config(temp.path())
+                },
+            )
+            .expect("admitted observer");
+            // This creates the real query span before the synthetic Cx refuses
+            // spawning. Capture span attributes even though no task is polled.
+            admitted.observe_serving_results(&cx, QUERY, 1, &serving, false, 1);
+            assert_eq!(admitted.status().shed, 1);
+            assert_eq!(admitted.status().in_flight, 0);
+            admitted.record_degradation(ShadowDegradationKind::OracleUnavailable, DETAIL);
+        });
+        assert_eq!(shadow.search_count.load(Ordering::Acquire), 0);
+        let captured = capture.0.lock().unwrap().clone();
+        for secret in [
+            "private-shadow-query-canary",
+            "診断",
+            "private-shadow-document-canary",
+            DETAIL,
+        ] {
+            assert!(
+                !captured.contains(secret),
+                "private content reached diagnostics"
+            );
+        }
+        assert!(captured.contains("span=shadow_lexical_query"));
+        assert!(captured.contains("shed_reason=\"sample_rate\""));
+        assert!(captured.contains("shed_reason=\"runtime_unavailable\""));
+        assert!(captured.contains("degradation_kind=OracleUnavailable"));
+        assert_eq!(
+            captured
+                .matches(&format!("query_bytes={}\n", QUERY.len()))
+                .count(),
+            3,
+            "sample-out, admission span, and runtime shedding must all retain query length"
+        );
+        let persisted = fs::read_to_string(
+            temp.path()
+                .join(SHADOW_ARTIFACT_DIRECTORY)
+                .join(SHADOW_DEGRADATIONS_FILE),
+        )
+        .expect("persisted degradation");
+        let record: ShadowDegradationRecord =
+            serde_json::from_str(persisted.trim()).expect("degradation record");
+        assert_eq!(
+            record.detail, DETAIL,
+            "the diagnostic boundary must preserve evidence"
+        );
     }
 
     #[test]

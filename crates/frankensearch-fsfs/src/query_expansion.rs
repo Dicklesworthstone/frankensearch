@@ -36,6 +36,25 @@ pub enum LlmBackend {
     OpenAi,
 }
 
+/// Only fixed classifications cross the diagnostic boundary. Transport errors
+/// and malformed JSON can contain credentials, prompts or provider responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpansionFailure {
+    Request,
+    Response,
+    MissingText,
+}
+
+impl ExpansionFailure {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Request => "query.expansion.request_failed",
+            Self::Response => "query.expansion.invalid_response",
+            Self::MissingText => "query.expansion.missing_text",
+        }
+    }
+}
+
 /// A single expanded query variant with metadata about its origin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,6 +122,20 @@ fn detect_backend(env_map: &HashMap<String, String>) -> Option<(LlmBackend, Stri
 /// a warning.
 #[must_use]
 pub fn expand_query(query: &str, env_map: &HashMap<String, String>) -> ExpansionResult {
+    expand_query_with(query, env_map, |backend, api_key, prompt| match backend {
+        LlmBackend::Anthropic => call_anthropic(api_key, prompt),
+        LlmBackend::OpenAi => call_openai(api_key, prompt),
+    })
+}
+
+fn expand_query_with<F>(
+    query: &str,
+    env_map: &HashMap<String, String>,
+    request: F,
+) -> ExpansionResult
+where
+    F: FnOnce(LlmBackend, &str, &str) -> Result<String, ExpansionFailure>,
+{
     let start = Instant::now();
     let original = ExpandedQuery {
         text: query.to_owned(),
@@ -123,16 +156,13 @@ pub fn expand_query(query: &str, env_map: &HashMap<String, String>) -> Expansion
 
     info!(
         backend = ?backend,
-        query = query,
+        query_bytes = query.len(),
         "fsfs query expansion: calling LLM for query variants"
     );
 
     let prompt = build_expansion_prompt(query);
 
-    let result = match backend {
-        LlmBackend::Anthropic => call_anthropic(&api_key, &prompt),
-        LlmBackend::OpenAi => call_openai(&api_key, &prompt),
-    };
+    let result = request(backend, &api_key, &prompt);
 
     match result {
         Ok(raw_response) => {
@@ -155,7 +185,7 @@ pub fn expand_query(query: &str, env_map: &HashMap<String, String>) -> Expansion
         Err(error) => {
             warn!(
                 backend = ?backend,
-                error = %error,
+                error_code = error.code(),
                 "fsfs --expand: LLM call failed; continuing with original query only"
             );
             ExpansionResult {
@@ -194,7 +224,7 @@ fn make_agent() -> ureq::Agent {
 }
 
 /// Call the Anthropic Messages API with Claude Haiku.
-fn call_anthropic(api_key: &str, prompt: &str) -> Result<String, String> {
+fn call_anthropic(api_key: &str, prompt: &str) -> Result<String, ExpansionFailure> {
     let body = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": MAX_EXPANSION_TOKENS,
@@ -213,22 +243,26 @@ fn call_anthropic(api_key: &str, prompt: &str) -> Result<String, String> {
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .send_json(&body)
-        .map_err(|e| format!("Anthropic API request failed: {e}"))?
+        .map_err(|_| ExpansionFailure::Request)?
         .into_body();
 
-    let parsed: AnthropicResponse = serde_json::from_reader(response.as_reader())
-        .map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
+    read_anthropic_response(response.as_reader())
+}
+
+fn read_anthropic_response(reader: impl std::io::Read) -> Result<String, ExpansionFailure> {
+    let parsed: AnthropicResponse =
+        serde_json::from_reader(reader).map_err(|_| ExpansionFailure::Response)?;
 
     parsed
         .content
         .into_iter()
         .find(|block| block.block_type == "text")
         .map(|block| block.text)
-        .ok_or_else(|| "Anthropic response contained no text content".to_owned())
+        .ok_or(ExpansionFailure::MissingText)
 }
 
 /// Call the `OpenAI` Chat Completions API with gpt-4o-mini.
-fn call_openai(api_key: &str, prompt: &str) -> Result<String, String> {
+fn call_openai(api_key: &str, prompt: &str) -> Result<String, ExpansionFailure> {
     let body = serde_json::json!({
         "model": "gpt-4o-mini",
         "max_tokens": MAX_EXPANSION_TOKENS,
@@ -246,18 +280,22 @@ fn call_openai(api_key: &str, prompt: &str) -> Result<String, String> {
         .header("Authorization", &format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .send_json(&body)
-        .map_err(|e| format!("OpenAI API request failed: {e}"))?
+        .map_err(|_| ExpansionFailure::Request)?
         .into_body();
 
-    let parsed: OpenAiResponse = serde_json::from_reader(response.as_reader())
-        .map_err(|e| format!("Failed to parse OpenAI response: {e}"))?;
+    read_openai_response(response.as_reader())
+}
+
+fn read_openai_response(reader: impl std::io::Read) -> Result<String, ExpansionFailure> {
+    let parsed: OpenAiResponse =
+        serde_json::from_reader(reader).map_err(|_| ExpansionFailure::Response)?;
 
     parsed
         .choices
         .into_iter()
         .next()
         .map(|choice| choice.message.content)
-        .ok_or_else(|| "OpenAI response contained no choices".to_owned())
+        .ok_or(ExpansionFailure::MissingText)
 }
 
 /// Parse the raw LLM response into structured expanded queries.
@@ -332,6 +370,100 @@ struct OpenAiMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct DiagnosticLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn expansion_diagnostics_exclude_query_credentials_and_provider_content() {
+        const QUERY: &str = "private-query-canary \u{001b}[31m 診断";
+        const KEY: &str = "private-api-credential-canary";
+        const VARIANT: &str = "private-provider-response-canary";
+        let log = DiagnosticLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for (key_name, backend) in [
+                ("ANTHROPIC_API_KEY", LlmBackend::Anthropic),
+                ("OPENAI_API_KEY", LlmBackend::OpenAi),
+            ] {
+                let env = HashMap::from([(key_name.to_owned(), KEY.to_owned())]);
+                for fail in [false, true] {
+                    let result = expand_query_with(QUERY, &env, |chosen, key, prompt| {
+                        assert_eq!(chosen, backend);
+                        assert_eq!(key, KEY);
+                        assert!(prompt.contains(QUERY));
+                        // Exercise the actual response decoders. Serde's error
+                        // for the string-instead-of-array case includes the
+                        // private value; only its fixed classification may log.
+                        match backend {
+                            LlmBackend::Anthropic => {
+                                let body = if fail {
+                                    serde_json::json!({"content": VARIANT})
+                                } else {
+                                    serde_json::json!({"content": [{
+                                        "type": "text", "text": format!("KEYWORD: {VARIANT}"),
+                                    }]})
+                                };
+                                read_anthropic_response(body.to_string().as_bytes())
+                            }
+                            LlmBackend::OpenAi => {
+                                let body = if fail {
+                                    serde_json::json!({"choices": VARIANT})
+                                } else {
+                                    serde_json::json!({"choices": [{"message": {
+                                        "content": format!("KEYWORD: {VARIANT}"),
+                                    }}]})
+                                };
+                                read_openai_response(body.to_string().as_bytes())
+                            }
+                        }
+                    });
+                    assert_eq!(result.queries[0].text, QUERY);
+                    assert_eq!(result.backend_used, Some(backend));
+                    if fail {
+                        assert_eq!(result.queries.len(), 1);
+                    } else {
+                        assert_eq!(result.queries[1].text, VARIANT);
+                    }
+                }
+                for failure in [ExpansionFailure::Request, ExpansionFailure::MissingText] {
+                    let fallback = expand_query_with(QUERY, &env, |_, _, _| Err(failure));
+                    assert_eq!(fallback.queries.len(), 1);
+                    assert_eq!(fallback.queries[0].text, QUERY);
+                }
+            }
+        });
+        let captured = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        for secret in ["private-query-canary", "診断", KEY, VARIANT] {
+            assert!(!captured.contains(secret), "private content reached logs");
+        }
+        assert!(captured.contains("query_bytes="));
+        assert!(captured.contains("expansion_count=1"));
+        for failure in [
+            ExpansionFailure::Request,
+            ExpansionFailure::Response,
+            ExpansionFailure::MissingText,
+        ] {
+            assert!(captured.contains(failure.code()));
+        }
+    }
 
     #[test]
     fn parse_expansion_response_extracts_all_strategies() {

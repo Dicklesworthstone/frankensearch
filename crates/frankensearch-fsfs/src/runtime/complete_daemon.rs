@@ -325,8 +325,7 @@ impl FsfsRuntime {
         let timeout = Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS);
         if let Err(error) = control::stop(cx, socket, timeout).await {
             tracing::warn!(
-                %error,
-                socket = %socket.display(),
+                error_code = crate::output_schema::error_code_for(&error),
                 "could not stop the store's query daemon; searching in process"
             );
             return Ok(false);
