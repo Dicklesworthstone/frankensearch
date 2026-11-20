@@ -477,6 +477,13 @@ files are read and indexed again; removed files leave the index. `fsfs index
 lexical rows.
 Existing indexes acquire this evidence on their next successful build.
 
+An index is bound to its recorded source directory: document IDs are relative
+to that root. Indexing a different directory (including a subdirectory) into the
+same `--index-dir` is refused before changing the corpus. Reindex the original
+root to update it, use another index directory for a separate corpus, or pass
+`--full`/`--force` to explicitly replace the corpus and re-root its document IDs.
+This applies to legacy indexes, complete generations, and legacy upgrades.
+
 Each search hit carries its `path`, a plain-text `snippet` of the best-matching
 fragment, and `line`: the 1-based line of the file where the snippet's first
 query word sits (the table prints `path:line`). `line` is absent for hits
@@ -649,6 +656,15 @@ For a relative configured index directory, commands also find the nearest
 existing store in a parent directory when run from a project subdirectory.
 Corrupt selections and interrupted first publications produce errors at that
 store instead of redirecting the command to a different legacy index.
+
+`delete` accepts relative document IDs and absolute paths beneath the source
+root recorded by the index. Absolute paths are resolved without reading source
+files, so deletion still works after a source is moved or removed. An absolute
+path outside that root, or containing `..`, is rejected before any document is
+deleted. With `--prefix`, keep the trailing slash to select a directory:
+`fsfs delete ~/projects/src/ --prefix --index-dir ./search-store` selects `src/`
+but preserves `src-old/`. Relative IDs keep their exact spelling, and a valid
+request matching no documents still succeeds with `deleted: 0`.
 
 Current source builds can finish a pressure-deferred quality tier. Clear forced
 deferral and fast-only policy, enable a pressure profile that permits quality,

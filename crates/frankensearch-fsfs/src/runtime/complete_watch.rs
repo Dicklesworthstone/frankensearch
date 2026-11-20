@@ -2014,6 +2014,96 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn complete_watch_startup_refuses_a_different_source_root_without_allocating() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            let first = require_durable_publication(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let before = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let allocated = candidate_count(&root);
+
+            let other = directory.path().join("other-source");
+            fs::create_dir(&other).unwrap();
+            // The same relative ID must never silently change its source.
+            fs::write(
+                other.join("alpha.md"),
+                "otherrootmarker replacement document",
+            )
+            .unwrap();
+            let mut input = runtime.cli_input.clone();
+            input.target_path = Some(other);
+            let other_runtime = runtime.clone().with_cli_input(input);
+            let mut session = CompleteWatchSession::open(&other_runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let error = session.attempt(&cx, true, None).await.unwrap_err();
+            assert!(
+                matches!(&error, SearchError::InvalidConfig { field, reason, .. }
+                if field == "cli.index.target"
+                    && reason.contains(source.to_str().unwrap())
+                    && reason.contains("--full")),
+                "{error}"
+            );
+            assert!(session.baseline.is_none());
+            assert!(session.publication.is_none());
+            assert_eq!(candidate_count(&root), allocated);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                before
+            );
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(first.clone())
+            );
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(
+                fresh
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert!(
+                fresh
+                    .search(&cx, "otherrootmarker", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
+            assert_eq!(pinned.generation(), &first);
+            assert_eq!(
+                pinned
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
     fn complete_watch_file_policy_directories_publish_edits_and_preserve_old_readers() {
         use crate::config::{DegradationOverrideMode, TextSelectionMode};
 
