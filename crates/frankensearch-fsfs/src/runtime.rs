@@ -15495,7 +15495,7 @@ impl FsfsRuntime {
                 Err(error) => {
                     Self::semantic_retry_checkpoint(cx, "fsfs.search.snippets")?;
                     debug!(
-                        error_code = error_code_for(&error),
+                        error_code = error_code_for(&SearchError::from(error)),
                         "fsfs search: hit snippets unavailable"
                     );
                 }
