@@ -45,6 +45,14 @@ The corrected test checks that equivalence and also checks that a
 control-only query completes model selection while the initialization lock
 is held.
 
+The native Apple Silicon CLI at `47630c55` passed the same 36 requests
+with the 30-second functional deadlines. Four fresh daemons also rejected
+the contradictory request before loading a model. On the next valid query,
+each loaded the cross-encoder once and returned `stars.md` first. At the
+stock 300 ms rerank deadline, one daemon returned a score of 0.97645354.
+Three reported `query.stage.rerank.timeout` and kept the fused order.
+All four ran the same unoptimized executable on the shared Mac.
+
 Cross-executable index reuse on macOS remains open. A running ad-hoc-signed
 Apple Silicon executable accepted an in-place append and exited normally.
 An open descriptor and matching vnode therefore cannot prove which
