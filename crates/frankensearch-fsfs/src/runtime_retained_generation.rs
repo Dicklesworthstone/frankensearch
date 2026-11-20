@@ -611,10 +611,12 @@ impl FsfsRuntime {
                 | DegradationOverrideMode::ForcePaused
         ) || complete_cli::complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
             || complete_cli::complete_entry_exists(&root.join("generations"))?
-            || !Self::read_index_sentinel(root)?.is_some_and(|sentinel| sentinel.generation_complete)
+            || !Self::read_index_sentinel(root)?
+                .is_some_and(|sentinel| sentinel.generation_complete)
         {
             return Ok(LegacyUpgradeProducers::default());
         }
+        self.validate_index_source_root(root, &self.resolve_target_root()?)?;
         self.validate_semantic_model_selection(self.indexing_search_mode())?;
         let mut control = IndexRunControl::new(&self.config)?;
         control.admit_work(cx, "index.model_provisioning").await?;
@@ -724,7 +726,14 @@ impl FsfsRuntime {
         let build = match &start {
             RetainedRebuildStart::Resume(receipt) => receipt.resume(cx, &store)?,
             _ => match kind {
-                RetainedBuildKind::Index => store.begin(cx)?,
+                RetainedBuildKind::Index => {
+                    store.begin_with_predecessor_check(cx, |predecessor| {
+                        self.validate_index_source_root(
+                            predecessor.map_or(store.root(), |generation| generation.path()),
+                            &target_root,
+                        )
+                    })?
+                }
                 RetainedBuildKind::Recovery => store.begin_recovery_rebuild(cx)?,
             },
         };
@@ -934,6 +943,12 @@ impl FsfsRuntime {
                 "no complete generation has been published",
             )
         })?;
+        let sentinel = Self::read_index_sentinel(predecessor.path())?;
+        let ids = normalize_delete_ids_for_index(
+            &self.cli_input.delete_ids,
+            sentinel.as_ref().map(|value| Path::new(&value.target_root)),
+            self.cli_input.delete_prefix,
+        )?;
         let candidate_mode = Self::retained_generation_search_mode(predecessor.path())?;
         let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
             .ok_or_else(|| {
@@ -963,7 +978,7 @@ impl FsfsRuntime {
         let targets = live_ids
             .into_iter()
             .filter(|id| {
-                self.cli_input.delete_ids.iter().any(|requested| {
+                ids.iter().any(|requested| {
                     if self.cli_input.delete_prefix {
                         id.starts_with(requested.as_str())
                     } else {
@@ -2692,7 +2707,26 @@ mod retained_delete_tests {
             let (runtime, source, root, predecessor) = fixture(&cx, parent.path(), false).await;
             let before = file_bytes(predecessor.path());
             let mut old = runtime.open_retained_search(&cx, &root).await.unwrap();
-            let command = deletion(&runtime, &["beta.md", "beta.md", "absent.md"], false);
+            let outside = parent.path().join("outside/alpha.md").display().to_string();
+            let invalid = deletion(&runtime, &["alpha.md", &outside], false);
+            assert!(matches!(
+                invalid.delete_retained_generation(&cx, &root).await,
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "complete_generation.delete_ids"
+            ));
+            assert_eq!(file_bytes(predecessor.path()), before);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(predecessor.clone())
+            );
+            let absolute = source.join("beta.md").display().to_string();
+            let moved_source = parent.path().join("moved-beta.md");
+            fs::rename(source.join("beta.md"), &moved_source).unwrap();
+            let mut command = deletion(&runtime, &[&absolute, "beta.md", "absent.md"], false);
+            command.cli_input.target_path = None;
             let (publication, deleted) = command
                 .delete_retained_generation(&cx, &root)
                 .await
@@ -2820,10 +2854,12 @@ mod retained_delete_tests {
             assert!(storage.get_document("beta.md").unwrap().is_none());
             assert!(storage.get_document("alpha.md").unwrap().is_some());
             drop(storage);
+            assert!(!source.join("beta.md").exists());
             assert!(
-                source.join("beta.md").exists(),
+                moved_source.exists(),
                 "index deletion must retain source files"
             );
+            assert!(source.join("alpha.md").exists());
             assert_eq!(file_bytes(predecessor.path()), before);
             assert_eq!(
                 CompleteGenerationStore::open(&cx, &root)
@@ -2861,8 +2897,10 @@ mod retained_delete_tests {
     fn retained_delete_prefix_and_no_match_are_truthful() {
         run_test_with_cx(|cx| async move {
             let parent = tempfile::tempdir().unwrap();
-            let (runtime, _, root, _) = fixture(&cx, parent.path(), false).await;
-            let command = deletion(&runtime, &["beta"], true);
+            let (runtime, source, root, _) = fixture(&cx, parent.path(), false).await;
+            let absolute = source.join("beta").display().to_string();
+            assert!(!source.join("beta").exists());
+            let command = deletion(&runtime, &[&absolute], true);
             let (publication, deleted) = command
                 .delete_retained_generation(&cx, &root)
                 .await

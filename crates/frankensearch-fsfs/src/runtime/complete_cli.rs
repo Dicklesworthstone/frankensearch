@@ -2515,7 +2515,10 @@ mod tests {
         DashboardSearchStage, SearchDashboardState, SearchExecutionMode, set_test_fast_embedder,
         set_test_quality_embedder, test_fast_embedder_override, test_quality_embedder_override,
     };
-    use super::super::{FSFS_EXPLAIN_SESSION_FILE, IndexSentinel};
+    use super::super::{
+        FSFS_EXPLAIN_SESSION_FILE, INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexSentinel,
+        IndexingCheckpoint, write_indexing_checkpoint,
+    };
     use super::*;
     use crate::output_schema::SearchHitPayload;
     #[cfg(feature = "semantic-support")]
@@ -4884,6 +4887,212 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("overlap"), "{error}");
             assert!(!visible.exists());
+        });
+    }
+
+    #[test]
+    fn reindex_requires_explicit_source_root_replacement() {
+        run_test_with_cx(|cx| async move {
+            for layout in ["legacy", "complete", "legacy-upgrade"] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut runtime, source, root) = fixture(directory.path());
+                let source = fs::canonicalize(source).unwrap();
+                runtime.config.pressure.degradation_override =
+                    crate::config::DegradationOverrideMode::ForceLexicalOnly;
+                fs::write(source.join("alpha.md"), "originalrootmarker zebra").unwrap();
+                let nested = source.join("nested");
+                fs::create_dir(&nested).unwrap();
+                fs::write(nested.join("alpha.md"), "nestedrootmarker giraffe").unwrap();
+                let other = directory.path().join("other");
+                fs::create_dir(&other).unwrap();
+                fs::write(other.join("alpha.md"), "replacementrootmarker yak").unwrap();
+                let other = fs::canonicalize(other).unwrap();
+
+                let complete = layout != "legacy";
+                if layout == "complete" {
+                    publish(&runtime, &cx, &root).await;
+                } else {
+                    runtime
+                        .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                        .await
+                        .unwrap();
+                }
+                let predecessor = if layout == "complete" {
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap()
+                } else {
+                    None
+                };
+                let previous_root = predecessor.as_ref().map_or(root.as_path(), |p| p.path());
+                let old_reader = FsfsRuntime::open_explain_lexical_index(&cx, previous_root)
+                    .await
+                    .unwrap();
+                let before = sealed_inventory(&root);
+                let predecessor_before = predecessor
+                    .as_ref()
+                    .map(|generation| sealed_inventory(generation.path()));
+
+                for target in [&nested, &other] {
+                    let mut changed = runtime.clone();
+                    changed.cli_input.target_path = Some(target.clone());
+                    let error = if complete {
+                        changed
+                            .run_complete_generation_index_with_writer(&cx, &root, &mut Vec::new())
+                            .await
+                            .unwrap_err()
+                    } else {
+                        changed
+                            .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                            .await
+                            .unwrap_err()
+                    };
+                    assert!(
+                        matches!(&error, SearchError::InvalidConfig { field, reason, .. }
+                            if field == "cli.index.target"
+                                && reason.contains(&source.display().to_string())
+                                && reason.contains("--full")
+                                && reason.contains("--force")),
+                        "{layout}: {error}",
+                    );
+                    assert_eq!(sealed_inventory(&root), before, "{layout}");
+                    if layout == "legacy-upgrade" {
+                        assert!(!root.join("generations").exists());
+                        assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
+                    }
+                    let hits = old_reader
+                        .search_doc_ids(&cx, "originalrootmarker", 10)
+                        .unwrap();
+                    assert_eq!(hits.len(), 1, "{layout}");
+                    assert_eq!(hits[0].document_id, "alpha.md");
+                    assert!(
+                        old_reader
+                            .search_doc_ids(&cx, "replacementrootmarker", 10)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+
+                // An alias of the recorded root is still the same source.
+                let alias = directory.path().join("source-alias");
+                std::os::unix::fs::symlink(&source, &alias).unwrap();
+                let mut same = runtime.clone();
+                same.cli_input.target_path = Some(alias);
+                same.validate_index_source_root(
+                    previous_root,
+                    &same.resolve_target_root().unwrap(),
+                )
+                .unwrap();
+
+                // --full/--force is the deliberate replacement path. The new
+                // source may reuse alpha.md only after that explicit request.
+                let mut replacement = runtime.clone();
+                replacement.cli_input.target_path = Some(other.clone());
+                replacement.cli_input.full_reindex = true;
+                let successor = if complete {
+                    publish(&replacement, &cx, &root).await;
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap()
+                } else {
+                    replacement
+                        .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                        .await
+                        .unwrap();
+                    None
+                };
+                let selected = successor.as_ref().map_or(root.as_path(), |p| p.path());
+                let sentinel = FsfsRuntime::read_index_sentinel(selected).unwrap().unwrap();
+                assert_eq!(Path::new(&sentinel.target_root), other);
+                let reader = FsfsRuntime::open_explain_lexical_index(&cx, selected)
+                    .await
+                    .unwrap();
+                let hits = reader
+                    .search_doc_ids(&cx, "replacementrootmarker", 10)
+                    .unwrap();
+                assert_eq!(hits.len(), 1, "{layout}");
+                assert_eq!(hits[0].document_id, "alpha.md");
+                assert!(
+                    reader
+                        .search_doc_ids(&cx, "originalrootmarker", 10)
+                        .unwrap()
+                        .is_empty()
+                );
+                replacement.cli_input.full_reindex = false;
+                replacement
+                    .validate_index_source_root(selected, &other)
+                    .unwrap();
+                assert!(
+                    runtime
+                        .validate_index_source_root(selected, &source)
+                        .is_err()
+                );
+                if let Some(predecessor) = predecessor {
+                    assert_eq!(
+                        sealed_inventory(predecessor.path()),
+                        predecessor_before.unwrap(),
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn interrupted_first_build_keeps_its_recorded_source_root() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            let source = fs::canonicalize(source).unwrap();
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            fs::create_dir(&root).unwrap();
+            let checkpoint = IndexingCheckpoint {
+                schema_version: INDEXING_CHECKPOINT_SCHEMA_VERSION,
+                target_root: source.display().to_string(),
+                index_root: root.display().to_string(),
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                embedder_id: "lexical-only".to_owned(),
+                embedder_dimension: 0,
+                embedder_is_hash_fallback: false,
+                artifacts_durable: false,
+                source_hash_hex: String::new(),
+                reason_codes: Vec::new(),
+                files: BTreeMap::new(),
+                discovered_files: 0,
+                skipped_files: 0,
+                fast_window_max_per_file: 1,
+                content_skipped: BTreeMap::new(),
+            };
+            write_indexing_checkpoint(&root, &checkpoint).unwrap();
+            drop(crate::lifecycle::PublicationLease::acquire(&root).unwrap());
+            runtime.validate_index_source_root(&root, &source).unwrap();
+            let before = sealed_inventory(&root);
+            let other = directory.path().join("other");
+            fs::create_dir(&other).unwrap();
+            runtime.cli_input.target_path = Some(other);
+            for complete in [false, true] {
+                let error = if complete {
+                    runtime
+                        .run_complete_generation_index_with_writer(&cx, &root, &mut Vec::new())
+                        .await
+                        .unwrap_err()
+                } else {
+                    runtime
+                        .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                        .await
+                        .unwrap_err()
+                };
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { ref field, .. }
+                        if field == "cli.index.target"),
+                    "{error}",
+                );
+                assert_eq!(sealed_inventory(&root), before);
+                assert!(!root.join("generations").exists());
+            }
         });
     }
 

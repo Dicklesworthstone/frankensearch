@@ -18302,10 +18302,16 @@ impl FsfsRuntime {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        let sentinel = Self::read_index_sentinel(&index_root)?;
+        let ids = normalize_delete_ids_for_index(
+            ids,
+            sentinel.as_ref().map(|value| Path::new(&value.target_root)),
+            self.cli_input.delete_prefix,
+        )?;
         // Removing a source must not cost the next `fsfs index` every other
         // file: keep the completed evidence this delete starts from (bd-lsuub).
         // The receipt names the tree it indexed, which `fsfs delete` does not.
-        let indexed = match Self::read_index_sentinel(&index_root)? {
+        let indexed = match sentinel {
             Some(sentinel) => {
                 retained_reuse::prepare_legacy_reuse(cx).await?;
                 Some(self.clone().with_cli_input(CliInput {
@@ -18378,7 +18384,7 @@ impl FsfsRuntime {
             // both main-index tombstones and WAL tombstones idempotently.
             let mut to_delete = Vec::new();
             for doc_id in &live_rows {
-                for prefix in ids {
+                for prefix in &ids {
                     if doc_id.starts_with(prefix.as_str()) {
                         to_delete.push(doc_id.clone());
                         break;
@@ -18388,7 +18394,7 @@ impl FsfsRuntime {
             to_delete
         } else {
             // Exact match.
-            ids.clone()
+            ids
         };
 
         if !targets.is_empty() {
@@ -21363,6 +21369,40 @@ impl FsfsRuntime {
         Ok(Some(sentinel))
     }
 
+    /// Relative document IDs belong to the source root that produced them.
+    /// Reusing the index directory for another root must be an explicit corpus
+    /// replacement, not an ordinary incremental run that silently retargets IDs.
+    fn validate_index_source_root(
+        &self,
+        index_root: &Path,
+        target_root: &Path,
+    ) -> SearchResult<()> {
+        if self.cli_input.full_reindex {
+            return Ok(());
+        }
+        let recorded = if let Some(sentinel) = Self::read_index_sentinel(index_root)? {
+            Some(sentinel.target_root)
+        } else {
+            // An interrupted first build may have bound its IDs before it
+            // could publish a sentinel. Its checkpoint still owns that scope.
+            read_indexing_checkpoint(index_root)?.map(|checkpoint| checkpoint.target_root)
+        };
+        if let Some(recorded) = recorded
+            && Path::new(&recorded) != target_root
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index.target".to_owned(),
+                value: target_root.display().to_string(),
+                reason: format!(
+                    "this index is bound to source root {recorded:?}; index that root to update it, \
+                     choose a separate --index-dir, or use --full (alias --force) to explicitly \
+                     replace the corpus and its relative document IDs with the new root"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn read_index_manifest(index_root: &Path) -> SearchResult<Option<Vec<IndexManifestEntry>>> {
         Self::read_index_manifest_file(index_root, FSFS_VECTOR_MANIFEST_FILE)
     }
@@ -21770,6 +21810,7 @@ impl FsfsRuntime {
         // boundary below so a substituted lock file aborts the publication.
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         publication_lease.fence("one-shot index entry")?;
+        self.validate_index_source_root(&index_root, &target_root)?;
         let source_policy = if self.source_policy == IndexSourcePolicy::RequireReadable {
             self.source_policy
         } else {
@@ -25681,7 +25722,6 @@ impl FsfsRuntime {
         cx: &Cx,
         index_root: &Path,
     ) -> SearchResult<()> {
-        let ids = &self.cli_input.delete_ids;
         let publication_lease = crate::lifecycle::PublicationLease::acquire(index_root)?;
         let membership = match (
             Self::read_matching_manifest_generation(index_root)?,
@@ -25695,6 +25735,11 @@ impl FsfsRuntime {
                 ));
             }
         };
+        let ids = normalize_delete_ids_for_index(
+            &self.cli_input.delete_ids,
+            Some(Path::new(&membership.1.target_root)),
+            self.cli_input.delete_prefix,
+        )?;
         let targets = membership
             .0
             .keys()
@@ -34156,6 +34201,71 @@ fn normalize_file_key_for_index(path: &Path, target_root: &Path) -> String {
     {
         relative.into_owned()
     }
+}
+
+/// Accept source paths in the same namespace as the recorded index root without
+/// consulting the live filesystem. A deleted source must still be removable
+/// from the index, and an opaque relative document ID must remain unchanged.
+fn normalize_delete_ids_for_index(
+    ids: &[String],
+    target_root: Option<&Path>,
+    prefix: bool,
+) -> SearchResult<Vec<String>> {
+    ids.iter()
+        .map(|id| {
+            if id.contains('\0') {
+                return Err(complete_cli::complete_cli_error(
+                    "delete_ids",
+                    "document IDs and prefixes cannot contain the reserved semantic-window NUL byte",
+                ));
+            }
+            let path = Path::new(id);
+            if !path.is_absolute() {
+                return Ok(id.clone());
+            }
+            let root = target_root.filter(|root| root.is_absolute()).ok_or_else(|| {
+                complete_cli::complete_cli_error(
+                    "delete_ids",
+                    "absolute deletion paths require a recorded absolute indexed source root; use a relative document ID",
+                )
+            })?;
+            if path.components().chain(root.components()).any(|component| {
+                matches!(component, std::path::Component::ParentDir)
+            }) {
+                return Err(complete_cli::complete_cli_error(
+                    "delete_ids",
+                    "absolute deletion paths and the indexed source root cannot contain parent traversal",
+                ));
+            }
+            let relative = path.strip_prefix(root).map_err(|_| {
+                complete_cli::complete_cli_error(
+                    "delete_ids",
+                    "absolute deletion path is outside the indexed source root; use a relative document ID",
+                )
+            })?;
+            if relative.as_os_str().is_empty() && !prefix {
+                return Err(complete_cli::complete_cli_error(
+                    "delete_ids",
+                    "the indexed source root is not a document ID; use --prefix to select its documents",
+                ));
+            }
+            let normalized_path = path.components().collect::<PathBuf>();
+            let mut normalized = normalize_file_key_for_index(&normalized_path, root);
+            // Path components can discard the final separator. Retain it for
+            // directory prefixes so `/root/a/` never also selects `ab/file`.
+            let directory_prefix = id.ends_with(std::path::is_separator)
+                || id.ends_with("/.")
+                || (cfg!(windows) && id.ends_with("\\."));
+            if prefix
+                && !normalized.is_empty()
+                && directory_prefix
+                && !normalized.ends_with('/')
+            {
+                normalized.push('/');
+            }
+            Ok(normalized)
+        })
+        .collect()
 }
 
 const fn ingestion_class_label(class: IngestionClass) -> &'static str {
@@ -44482,6 +44592,95 @@ mod tests {
     }
 
     #[test]
+    fn absolute_delete_ids_use_recorded_root_and_preserve_prefix_boundaries() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("missing-source");
+        let absolute = root.join("a/missing.md").display().to_string();
+        let directory = format!(
+            "{}{sep}",
+            root.join("b").display(),
+            sep = std::path::MAIN_SEPARATOR
+        );
+        let relative = vec![
+            "opaque-id".to_owned(),
+            "./literal.md".to_owned(),
+            "../literal.md".to_owned(),
+            "a\\b.md".to_owned(),
+        ];
+        assert_eq!(
+            super::normalize_delete_ids_for_index(&relative, None, false).unwrap(),
+            relative
+        );
+        assert_eq!(
+            super::normalize_delete_ids_for_index(&[absolute], Some(&root), false).unwrap(),
+            ["a/missing.md"]
+        );
+        assert_eq!(
+            super::normalize_delete_ids_for_index(
+                &[format!("{}/a//./missing.md", root.display())],
+                Some(&root),
+                false,
+            )
+            .unwrap(),
+            ["a/missing.md"]
+        );
+        let prefixes =
+            super::normalize_delete_ids_for_index(&[directory], Some(&root), true).unwrap();
+        assert_eq!(prefixes, ["b/"]);
+        assert!("b/member.md".starts_with(&prefixes[0]));
+        assert!(!"b-sibling/keep.md".starts_with(&prefixes[0]));
+        assert_eq!(
+            super::normalize_delete_ids_for_index(
+                &[format!("{}/b/.", root.display())],
+                Some(&root),
+                true,
+            )
+            .unwrap(),
+            ["b/"]
+        );
+        assert_eq!(
+            super::normalize_delete_ids_for_index(
+                &[root.display().to_string()],
+                Some(&root),
+                true,
+            )
+            .unwrap(),
+            [""]
+        );
+        for (id, target) in [
+            (root.display().to_string(), Some(root.as_path())),
+            (
+                root.join("a/../b.md").display().to_string(),
+                Some(root.as_path()),
+            ),
+            (
+                parent.path().join("other/b.md").display().to_string(),
+                Some(root.as_path()),
+            ),
+            (
+                format!("{}-sibling/b.md", root.display()),
+                Some(root.as_path()),
+            ),
+            (root.join("a.md").display().to_string(), None),
+            (
+                root.join("a.md").display().to_string(),
+                Some(Path::new("relative-root")),
+            ),
+            ("a\0window".to_owned(), Some(root.as_path())),
+        ] {
+            assert!(matches!(
+                super::normalize_delete_ids_for_index(&["valid.md".to_owned(), id], target, false),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "complete_generation.delete_ids"
+            ));
+        }
+        assert!(
+            !root.exists(),
+            "normalization must not inspect or create sources"
+        );
+    }
+
+    #[test]
     fn delete_prefix_tombstones_documents_that_exist_only_in_the_wal() {
         // Regression for the dead WAL loop in `delete --prefix` (fixed in
         // 367f894a without a test): a document appended through the WAL and
@@ -44497,6 +44696,9 @@ mod tests {
         writer
             .write_record("main/keep.md", &vector)
             .expect("write main-generation vector");
+        writer
+            .write_record("wal-sibling/keep.md", &vector)
+            .expect("write sibling-prefix vector");
         writer.finish().expect("finish main vector generation");
         let mut mutator = super::FsfsRuntime::open_vector_index_for_mutation(&vector_path)
             .expect("open WAL append writer");
@@ -44506,20 +44708,50 @@ mod tests {
         drop(mutator);
 
         run_test_with_cx(|cx| async move {
+            let source = temp.path().join("missing-source");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                delete_prefix: true,
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
+            let mut sentinel = publication_lease_test_sentinel(temp.path(), "delete-path-fixture");
+            sentinel.target_root = source.display().to_string();
+            runtime
+                .write_index_sentinel(temp.path(), &sentinel)
+                .unwrap();
+            let before = fs::read(&vector_path).unwrap();
+            let wal_path = frankensearch_index::wal::wal_path_for(&vector_path);
+            let wal_before = fs::read(&wal_path).unwrap();
+            let mut invalid = runtime.clone();
+            invalid.cli_input.delete_ids = vec![
+                "main/".to_owned(),
+                temp.path().join("outside/").display().to_string(),
+            ];
+            assert!(matches!(
+                invalid.run_delete_command(&cx).await,
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "complete_generation.delete_ids"
+            ));
+            assert_eq!(fs::read(&vector_path).unwrap(), before);
+            assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
             let mut live_after = Vec::new();
             // Planted negative first (a prefix that matches nothing tombstones
-            // nothing), then the positive prefix.
-            for ids in [vec!["nope/"], vec!["wal/"]] {
-                let mut config = FsfsConfig::default();
-                config.storage.index_dir = temp.path().display().to_string();
-                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-                    index_dir: Some(temp.path().to_path_buf()),
-                    delete_ids: ids.into_iter().map(str::to_owned).collect(),
-                    delete_prefix: true,
-                    format: OutputFormat::Json,
-                    ..CliInput::default()
-                });
-                runtime
+            // nothing), then an absolute directory prefix whose source no
+            // longer exists. Its trailing separator must exclude wal-sibling.
+            for ids in [
+                vec!["nope/".to_owned()],
+                vec![format!(
+                    "{}{sep}",
+                    source.join("wal").display(),
+                    sep = std::path::MAIN_SEPARATOR
+                )],
+            ] {
+                let mut command = runtime.clone();
+                command.cli_input.delete_ids = ids;
+                command
                     .run_delete_command(&cx)
                     .await
                     .expect("delete --prefix succeeds");
@@ -44542,6 +44774,8 @@ mod tests {
                 after.contains("main/keep.md"),
                 "documents outside the prefix must survive: {after:?}"
             );
+            assert!(after.contains("wal-sibling/keep.md"));
+            assert!(!source.exists());
         });
     }
 
@@ -54466,7 +54700,7 @@ mod tests {
                 .with_cli_input(CliInput {
                     command: CliCommand::Delete,
                     index_dir: Some(index_root.clone()),
-                    delete_ids: vec!["README.md".to_owned()],
+                    delete_ids: vec![project.join("README.md").display().to_string()],
                     format: OutputFormat::Json,
                     ..CliInput::default()
                 })

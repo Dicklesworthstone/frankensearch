@@ -451,14 +451,37 @@ impl CompleteGenerationStore {
     /// # Errors
     /// Returns contention, cancellation, corrupt-current, or filesystem errors.
     pub fn begin(&self, cx: &Cx) -> SearchResult<GenerationBuild> {
+        self.begin_with_predecessor_check(cx, |_| Ok(()))
+    }
+
+    /// Validate a consumer's source scope under the same publication lease
+    /// that selects the predecessor, before allocating an inactive generation.
+    /// The check is read-only and cannot authorize a corrupt predecessor.
+    pub(crate) fn begin_with_predecessor_check<F>(
+        &self,
+        cx: &Cx,
+        check: F,
+    ) -> SearchResult<GenerationBuild>
+    where
+        F: FnOnce(Option<&PublishedGeneration>) -> SearchResult<()>,
+    {
         checkpoint(cx)?;
         self.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation build entry")?;
+        let predecessor = read_pointer(&self.root)?;
         // A corrupt predecessor must be repaired explicitly, not silently
         // overwritten just because a new rebuild could be started.
-        let _active = self.active(cx)?;
-        let predecessor = read_pointer(&self.root)?;
+        let active = self.active(cx)?;
+        check(active.as_ref())?;
+        checkpoint(cx)?;
+        lease.fence("complete-generation predecessor admission")?;
+        if read_pointer(&self.root)? != predecessor {
+            return Err(invalid(
+                &self.root,
+                "selection changed during predecessor admission",
+            ));
+        }
         self.allocate_build(cx, lease, predecessor, true)
     }
 
