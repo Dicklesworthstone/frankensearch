@@ -729,7 +729,8 @@ impl FsfsRuntime {
                 RetainedBuildKind::Index => {
                     store.begin_with_predecessor_check(cx, |predecessor| {
                         self.validate_index_source_root(
-                            predecessor.map_or_else(|| store.root(), |generation| generation.path()),
+                            predecessor
+                                .map_or_else(|| store.root(), |generation| generation.path()),
                             &target_root,
                         )
                     })?
@@ -1361,16 +1362,18 @@ mod retained_delete_tests {
         })
         .unwrap();
         for name in ["alpha.md", "beta.md", "beta-notes.md"] {
+            let text = format!("sharedtoken document {name}");
             storage
                 .upsert_document(&frankensearch_storage::DocumentRecord::new(
                     name,
-                    "sharedtoken catalog row",
-                    [7; 32],
-                    23,
+                    &text,
+                    frankensearch_storage::ContentHasher::hash(&text),
+                    text.chars().count(),
                     1,
                     1,
                 ))
                 .unwrap();
+            storage.set_document_content(name, &text).unwrap();
         }
         drop(storage);
         assert!(protect_vector_generations(build.path(), "delete test fixture").is_empty());
@@ -1736,9 +1739,13 @@ mod retained_delete_tests {
             let canonicalizer = DefaultCanonicalizer::default();
             let raw = format!("\r\nappendnovel replacement α {}\r\n", "β".repeat(450));
             let expected = canonicalizer.canonicalize(&raw);
+            let raw_new = format!("\r\nappendnovel new body {}\r\n", "新".repeat(450));
+            let expected_new = canonicalizer.canonicalize(&raw_new);
+            assert!(expected.chars().count() > 400);
+            assert!(expected_new.chars().count() > 400);
             let input = [
                 serde_json::json!({"id": "alpha.md", "text": "discarded duplicate body"}),
-                serde_json::json!({"id": "virtual/new.md", "text": "appendnovel new body"}),
+                serde_json::json!({"id": "virtual/new.md", "text": raw_new}),
                 serde_json::json!({"id": "alpha.md", "text": raw}),
             ]
             .iter()
@@ -1795,7 +1802,7 @@ mod retained_delete_tests {
                     "virtual/new.md",
                 )
                 .unwrap(),
-                "appendnovel new body"
+                expected_new
             );
             for (relative, embedder) in [
                 (
@@ -1862,7 +1869,25 @@ mod retained_delete_tests {
             );
             assert_eq!(document.created_at, 1);
             assert!(document.source_path.is_none());
-            assert!(catalog.get_document("virtual/new.md").unwrap().is_some());
+            for (id, canonical) in [("alpha.md", &expected), ("virtual/new.md", &expected_new)] {
+                let document = catalog.get_document(id).unwrap().unwrap();
+                assert!(document.source_path.is_none());
+                assert_eq!(document.content_length, canonical.chars().count());
+                assert_eq!(
+                    document.content_hash,
+                    frankensearch_storage::ContentHasher::hash(canonical),
+                );
+                assert_eq!(
+                    catalog.get_document_content(id).unwrap().as_ref(),
+                    Some(canonical),
+                    "a preview or an older content row cannot recover a source-less upsert",
+                );
+            }
+            assert_eq!(
+                catalog.get_document_content("beta.md").unwrap().as_deref(),
+                Some("sharedtoken document beta.md"),
+                "untouched durable input survives the batch",
+            );
             for embedder in [runtime.resolve_fast_embedder().unwrap(), quality] {
                 let pending = catalog.list_pending_embeddings(embedder.id(), 20).unwrap();
                 assert!(
@@ -2051,6 +2076,140 @@ mod retained_delete_tests {
     }
 
     #[test]
+    fn retained_lexical_append_preserves_complete_catalog_input_after_source_loss() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let source = parent.path().join("source");
+            let root = parent.path().join("store");
+            fs::create_dir(&source).unwrap();
+            let original = "oldsourceword original document";
+            fs::write(source.join("alpha.md"), original).unwrap();
+            let mut config = FsfsConfig::default();
+            config.indexing.offline = true;
+            config.indexing.quality_model.clear();
+            config.search.fast_only = true;
+            config.search.rerank = false;
+            config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(source.clone()),
+                index_dir: Some(root.clone()),
+                quiet: true,
+                ..CliInput::default()
+            });
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let mut input = runtime.cli_input.clone();
+            input.index_dir = Some(build.path().to_path_buf());
+            let candidate = runtime.clone().with_cli_input(input);
+            candidate
+                .run_retained_index_with_reuse(&cx, &store, build.path())
+                .await
+                .unwrap();
+            let catalog = Storage::open(PipelineStorageConfig {
+                db_path: candidate.resolve_storage_db_path().unwrap(),
+                ..PipelineStorageConfig::default()
+            })
+            .unwrap();
+            catalog
+                .upsert_document(&frankensearch_storage::DocumentRecord::new(
+                    "alpha.md",
+                    original,
+                    frankensearch_storage::ContentHasher::hash(original),
+                    original.chars().count(),
+                    1,
+                    1,
+                ))
+                .unwrap();
+            catalog.set_document_content("alpha.md", original).unwrap();
+            drop(catalog);
+            let GenerationPublication::Durable(predecessor) = build
+                .publish(&cx, |_, path| {
+                    FsfsRuntime::validate_search_generation_at_root(
+                        path,
+                        SearchExecutionMode::LexicalOnly,
+                    )
+                })
+                .unwrap()
+            else {
+                panic!("lexical fixture must publish durably"); // ubs:ignore — cfg(test) assertion.
+            };
+            let before = file_bytes(predecessor.path());
+            let old = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let moved = parent.path().join("moved-source");
+            fs::rename(&source, &moved).unwrap();
+            let bodies = [
+                ("alpha.md", format!("replacementword {}", "é".repeat(600))),
+                (
+                    "opaque/new.md",
+                    format!("newopaqueword {}", "界".repeat(600)),
+                ),
+            ];
+            let jsonl = bodies
+                .iter()
+                .map(|(id, text)| serde_json::json!({"id": id, "text": text}).to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let command = append_input(&runtime, parent.path(), &jsonl);
+            let (publication, count) = command
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+            let Some(GenerationPublication::Durable(next)) = publication else {
+                panic!("lexical append must publish durably"); // ubs:ignore — cfg(test) assertion.
+            };
+            assert!(!next.path().join(FSFS_VECTOR_INDEX_FILE).exists());
+            assert!(!next.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists());
+            let fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let catalog = inspect_catalog_copy(parent.path(), next.path());
+            for (id, text) in &bodies {
+                let canonical = DefaultCanonicalizer::default().canonicalize(text);
+                assert!(canonical.chars().count() > 400);
+                let document = catalog.get_document(id).unwrap().unwrap();
+                assert!(document.source_path.is_none());
+                assert_eq!(document.content_preview.chars().count(), 400);
+                assert_eq!(document.content_length, canonical.chars().count());
+                assert_eq!(
+                    document.content_hash,
+                    frankensearch_storage::ContentHasher::hash(&canonical),
+                );
+                assert_eq!(
+                    catalog.get_document_content(id).unwrap().as_deref(),
+                    Some(canonical.as_str()),
+                );
+                assert_eq!(
+                    read_indexed_document_text(
+                        &cx,
+                        fresh.resources.lexical_index.as_ref().unwrap(),
+                        id,
+                    )
+                    .unwrap(),
+                    LEXICAL_CANONICALIZER.canonicalize(text),
+                );
+            }
+            assert_eq!(
+                read_indexed_document_text(
+                    &cx,
+                    old.resources.lexical_index.as_ref().unwrap(),
+                    "alpha.md",
+                )
+                .unwrap(),
+                original,
+            );
+            assert!(!source.exists());
+            assert_eq!(
+                fs::read_to_string(moved.join("alpha.md")).unwrap(),
+                original
+            );
+            assert_eq!(file_bytes(predecessor.path()), before);
+            assert_eq!(store.active(&cx).unwrap(), Some(next));
+        });
+    }
+
+    #[test]
     fn retained_append_preserves_full_lexical_text_and_bounded_embedding_inputs() {
         run_test_with_cx(|cx| async move {
             let parent = tempfile::tempdir().unwrap();
@@ -2162,6 +2321,11 @@ mod retained_delete_tests {
                 assert_eq!(
                     document.content_hash,
                     frankensearch_storage::ContentHasher::hash(&bounded),
+                );
+                assert_eq!(
+                    catalog.get_document_content(id).unwrap().as_deref(),
+                    Some(bounded.as_str()),
+                    "catalog input must match bounded inference, not whole lexical text",
                 );
                 assert_eq!(
                     manifests[*id].canonical_bytes,
@@ -2852,7 +3016,12 @@ mod retained_delete_tests {
             })
             .unwrap();
             assert!(storage.get_document("beta.md").unwrap().is_none());
+            assert!(storage.get_document_content("beta.md").unwrap().is_none());
             assert!(storage.get_document("alpha.md").unwrap().is_some());
+            assert_eq!(
+                storage.get_document_content("alpha.md").unwrap().as_deref(),
+                Some("sharedtoken document alpha.md"),
+            );
             drop(storage);
             assert!(!source.join("beta.md").exists());
             assert!(

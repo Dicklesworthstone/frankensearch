@@ -964,6 +964,13 @@ impl FsfsRuntime {
                             &body.embedding,
                             revision,
                         )?;
+                    } else {
+                        // The source-less catalog row must retain the exact
+                        // input behind its new hash, including ordinary and
+                        // metadata-only updates. A preview cannot replace a
+                        // long input, and an older content row has a stale hash.
+                        // Deferred semantic capture above already writes it.
+                        storage.set_document_content(id, &body.embedding)?;
                     }
                     if body.semantic() {
                         for producer in [fast.as_ref(), quality.as_ref()].into_iter().flatten() {
