@@ -1,6 +1,40 @@
 # Bridge Plan: frankensearch
 
-## Current assessment — November 19, 2026
+## Current assessment — November 20, 2026
+
+The library and the stock CLI can deliver an initial hybrid result and a
+quality-refined result from local models. Retained generations also let
+independent readers search while the watcher publishes updates. The open
+release decisions include native macOS upgrade reuse
+(`bd-fsfs-cli-upgrade-reuse-rsqq7`) and the cross-platform semantic
+installer (`bd-fsfs-cross-platform-semantic-installer-46z3u`). Current
+Quill performance comparisons with Tantivy remain a separate task
+(`bd-h6eh`).
+
+On the stock Linux CLI at `9ccaba26`, a zero limit, fast-only mode or
+lexical-only mode skipped the cross-encoder. Full and quality-only searches
+still reranked the expected document. Across 32 CLI requests and four raw
+socket requests, the long-lived daemon loaded the model once. A separate
+cold daemon rejected contradictory quality-only and fast-only options
+before loading the cross-encoder. Its next valid request returned `stars.md`
+with reranking applied. The predecessor at `276ad598` returned the same
+typed error but initialized the model before rejecting the request.
+
+On a four-document corpus with stock deadlines, the cross-encoder scored
+`retry.md` first at 0.7099016. The score displayed by `explain` was
+0.709902. Removing just the cross-encoder preserved all four fused ranks
+and reported `query.stage.rerank.disabled.unavailable`. The separate
+36-request exercise used 30-second functional deadlines for quality and
+reranking. The README's latency measurements apply to their original
+workloads and revisions.
+
+Cross-executable index reuse on macOS remains open. A running ad-hoc-signed
+Apple Silicon executable accepted an in-place append and exited normally.
+An open descriptor and matching vnode therefore cannot prove which
+executable bytes launched the process. The conservative process-scoped
+fallback remains necessary until a stronger identity is established.
+
+## November 19, 2026
 
 The stock Linux CLI at `bbd6564d` indexed and searched with both real model
 tiers. With compatible upgrade reuse enabled, it kept the legacy fast index
