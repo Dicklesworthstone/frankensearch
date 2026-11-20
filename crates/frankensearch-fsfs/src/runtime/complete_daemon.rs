@@ -817,6 +817,7 @@ impl FsfsRuntime {
                     .unwrap_or(runtime.config.search.default_limit)
             });
             let mut runtime = runtime.with_search_serve_request_policy(&request)?;
+            runtime.validate_semantic_model_selection(mode)?;
             // Reranker initialization may await work. Never hold the shared
             // reader lock while preparing this request's exact model key.
             runtime.prepare_search_reranker(cx, limit, mode).await?;
@@ -2957,6 +2958,13 @@ mod generation_tests {
                 assert!(runtime.reranker.get().is_none());
                 crate::runtime::set_test_reranker(Some(provider));
                 let _reset = ResetReranker;
+                let conflicting = br#"{"query":"sharedtoken","mode":"quality_only","fast_only":true,"rerank":true,"limit":10}"#;
+                let (_, rejected_cache) = runtime
+                    .snapshot_complete_daemon_request(&cx, &shared, conflicting, false, true)
+                    .await
+                    .unwrap();
+                assert!(rejected_cache.is_empty());
+                assert!(runtime.reranker.get().is_none());
                 let (snapshot, cache) = runtime
                     .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, true)
                     .await
