@@ -1871,8 +1871,8 @@ struct SearchCacheKey {
     /// Profiles change retrieval fanout and prior weights even when quality
     /// is disabled in both requests. Missing fields cannot admit old answers.
     pressure_profile: PressureProfile,
-    /// Deferred embedding also disables code-navigation priors; fast_only
-    /// alone does not represent the effective ranking and diagnostic policy.
+    /// Deferred embedding also disables code-navigation priors. Replaying
+    /// matching rankings and diagnostics requires this policy alongside `fast_only`.
     degradation_override: DegradationOverrideMode,
     rrf_k_bits: u64,
     /// Exact bits of the f32 policy consumed by the shared blend kernel.
