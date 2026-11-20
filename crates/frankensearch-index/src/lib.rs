@@ -2726,11 +2726,6 @@ impl VectorIndex {
         })
     }
 
-    fn signal_vector_at(&self, record_index: usize) -> SearchResult<Option<Vec<f32>>> {
-        let vector = self.vector_at_f32(record_index)?;
-        Ok(vector_signal_usable(&vector).then_some(vector))
-    }
-
     /// Compute the zero-signal census for this index generation.
     ///
     /// Counts resident WAL rows and excludes the main rows they supersede.
@@ -3042,6 +3037,9 @@ impl VectorIndex {
     /// Rewrites the main index file with all main + WAL records merged,
     /// then removes the WAL sidecar. The index is atomically swapped
     /// (write to tmp, rename over original).
+    /// Duplicate main records retain the latest usable vector when one is
+    /// available. A WAL replacement always supersedes main records, even if
+    /// its vector is unusable, so stale content cannot be resurrected.
     ///
     /// # Errors
     ///
@@ -3109,16 +3107,27 @@ impl VectorIndex {
                     .then(a.key.doc_id.cmp(b.key.doc_id))
             });
 
-            // Deduplicate sources by doc_id, keeping the latest (WAL over Main).
-            // Since `keyed_sources` is sorted, duplicates are adjacent and the stable sort
-            // ensures that newer sources (WAL) appear after older sources (Main).
+            // Deduplicate sources by doc_id. The stable sort places newer
+            // sources (WAL) after main records. Within main records, preserve
+            // a usable sibling instead of letting a damaged later copy erase
+            // the only searchable vector during an unrelated WAL compaction.
+            // WAL replacements still win unconditionally: they are newer
+            // source content, not redundant physical copies of a main row.
             let mut deduped: Vec<KeyedSource<'_>> = Vec::with_capacity(keyed_sources.len());
             for item in keyed_sources {
                 if let Some(last) = deduped.last_mut() {
                     if item.key.doc_id_hash == last.key.doc_id_hash
                         && item.key.doc_id == last.key.doc_id
                     {
-                        // Overwrite the older entry with the newer one
+                        if let (MergeSource::Main(previous), MergeSource::Main(candidate)) =
+                            (last.source, item.source)
+                        {
+                            if !self.vector_has_signal(candidate)?
+                                && self.vector_has_signal(previous)?
+                            {
+                                continue;
+                            }
+                        }
                         *last = item;
                         continue;
                     }
@@ -10540,6 +10549,111 @@ mod tests {
             .search_top_k(&[1.0, 1.0, 1.0, 1.0], 10, None)
             .expect("search");
         assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn compaction_preserves_usable_main_duplicates_across_restart() {
+        for precision in [Quantization::F16, Quantization::F32] {
+            for damaged in [0.0_f32, f32::NAN, f32::INFINITY, f32::MAX] {
+                let path = temp_index_path("compact-usable-duplicate");
+                let mut writer =
+                    VectorIndex::create_with_revision(&path, "signal", "", 2, precision).unwrap();
+                writer.write_record("recoverable", &[1.0, 0.0]).unwrap();
+                writer.write_record("recoverable", &[0.0, 1.0]).unwrap();
+                writer.finish().unwrap();
+
+                // Damage the later physical copy only after the writer has
+                // admitted valid inputs. The earlier copy remains searchable.
+                let reader = VectorIndex::open_read_only(&path).unwrap();
+                assert_eq!(reader.record_count(), 2);
+                let offset = reader.vector_start(1).unwrap();
+                let mut bytes = fs::read(&path).unwrap();
+                let encoded = match precision {
+                    Quantization::F16 => f16::from_f32(damaged).to_le_bytes().to_vec(),
+                    Quantization::F32 => damaged.to_le_bytes().to_vec(),
+                };
+                let width = encoded.len();
+                bytes[offset..offset + width].copy_from_slice(&encoded);
+                bytes[offset + width..offset + 2 * width].fill(0);
+                drop(reader);
+                fs::write(&path, bytes).unwrap();
+
+                let verify = |index: &VectorIndex| {
+                    let found = index
+                        .search_top_k_classified(&[1.0, 0.0], 10, None)
+                        .unwrap();
+                    assert_eq!(found.zero_signal, None);
+                    assert_eq!(found.hits.len(), 2);
+                    assert_eq!(found.hits[0].doc_id, "recoverable");
+                    assert_eq!(found.hits[0].score, 1.0);
+                    assert_eq!(found.hits[1].doc_id, "unrelated-update");
+                };
+                let mut index = VectorIndex::open(&path).unwrap();
+                // An unrelated WAL update causes compaction to deduplicate
+                // the main rows too; it must not erase their only usable copy.
+                index.append("unrelated-update", &[-1.0, 0.0]).unwrap();
+                verify(&index);
+                assert_eq!(index.compact().unwrap().total_records_after, 2);
+                verify(&index);
+                drop(index);
+                verify(&VectorIndex::open_read_only(&path).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_duplicate_recovery_preserves_latest_healthy_rows_and_wal_authority() {
+        for precision in [Quantization::F16, Quantization::F32] {
+            let path = temp_index_path("compact-duplicate-authority");
+            let mut writer =
+                VectorIndex::create_with_revision(&path, "signal", "", 2, precision).unwrap();
+            for id in ["healthy", "wal-replaced", "wal-unusable"] {
+                writer.write_record(id, &[1.0, 0.0]).unwrap();
+                writer.write_record(id, &[0.0, 1.0]).unwrap();
+            }
+            writer.finish().unwrap();
+            // Legacy WAL data can contain an unusable replacement. It is
+            // still newer source content, so never resurrect a main vector.
+            let entries = [
+                ("wal-replaced", vec![-1.0, 0.0]),
+                ("wal-unusable", vec![0.0, 0.0]),
+            ]
+            .map(|(id, embedding)| wal::WalEntry {
+                doc_id: id.to_owned(),
+                doc_id_hash: fnv1a_hash(id.as_bytes()),
+                embedding,
+            });
+            wal::append_wal_batch(
+                &wal::wal_path_for(&path),
+                &entries,
+                2,
+                precision,
+                next_generation(VectorIndex::peek_compaction_gen(&path).unwrap()),
+                true,
+            )
+            .unwrap();
+            let verify = |index: &VectorIndex| {
+                let found = index
+                    .search_top_k_classified(&[0.0, 1.0], 10, None)
+                    .unwrap();
+                assert_eq!(found.zero_signal, None);
+                assert_eq!(found.hits.len(), 2);
+                assert_eq!(found.hits[0].doc_id, "healthy");
+                assert_eq!(found.hits[0].score, 1.0);
+                assert_eq!(found.hits[1].doc_id, "wal-replaced");
+                assert_eq!(found.hits[1].score, 0.0);
+            };
+            let mut index = VectorIndex::open(&path).unwrap();
+            verify(&index);
+            assert_eq!(index.compact().unwrap().total_records_after, 3);
+            verify(&index);
+            let healthy = index.find_index_by_doc_id("healthy").unwrap().unwrap();
+            assert_eq!(index.vector_at_f32(healthy).unwrap(), [0.0, 1.0]);
+            let replaced = index.find_index_by_doc_id("wal-replaced").unwrap().unwrap();
+            assert_eq!(index.vector_at_f32(replaced).unwrap(), [-1.0, 0.0]);
+            drop(index);
+            verify(&VectorIndex::open_read_only(&path).unwrap());
+        }
     }
 
     #[test]

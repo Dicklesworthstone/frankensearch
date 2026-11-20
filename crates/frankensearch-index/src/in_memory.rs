@@ -3550,19 +3550,26 @@ impl InMemoryVectorIndex {
     }
 
     /// O(1) `doc_id → position` lookup via a lazily-built map, replacing the O(N)
-    /// `doc_ids.iter().position(...)` linear scan. First-insert-wins, matching
-    /// `position`'s first-match semantics for any (non-canonical) duplicate ids.
+    /// `doc_ids.iter().position(...)` linear scan. The first usable duplicate
+    /// wins; an unusable first row must not hide a healthy copy of the document.
+    /// Unique ids incur no vector census while the map is built.
     /// Built once on first lookup (the per-hit quality-rerank path); search-only
     /// callers never pay the `O(N)` build or its footprint. The map hashes with
     /// `ahash` (not SipHash): every quality query pays one hash of each hit's
     /// `doc_id` here, and `ahash` cuts the rescore loop ~1.27–1.48× at 128–300
-    /// candidates (see `quality_rescore_hasher_ab`). Semantics are unchanged.
+    /// candidates (see `quality_rescore_hasher_ab`).
     fn index_of_doc_id(&self, doc_id: &str) -> Option<usize> {
         self.doc_id_index
             .get_or_init(|| {
                 let mut map = AHashMap::with_capacity(self.doc_ids.len());
                 for (i, id) in self.doc_ids.iter().enumerate() {
-                    map.entry(id.clone()).or_insert(i);
+                    map.entry(id.clone())
+                        .and_modify(|index| {
+                            if !self.vector_is_usable(*index) && self.vector_is_usable(i) {
+                                *index = i;
+                            }
+                        })
+                        .or_insert(i);
                 }
                 map
             })
@@ -6151,6 +6158,76 @@ mod tests {
                 s.is_some_and(|v| v.is_finite()),
                 "quality score should be Some and finite"
             );
+        }
+    }
+
+    #[test]
+    fn duplicate_lookup_preserves_usable_quality_and_mmr_vectors() {
+        for damaged in [f16::ZERO, f16::NAN, f16::INFINITY] {
+            let mut quality = InMemoryVectorIndex::from_vectors(
+                vec![
+                    "recovered".to_owned(),
+                    "recovered".to_owned(),
+                    "unusable".to_owned(),
+                    "unusable".to_owned(),
+                    "stable".to_owned(),
+                    "stable".to_owned(),
+                ],
+                vec![
+                    vec![0.5, 0.5],
+                    vec![0.5, 0.5],
+                    vec![0.5, 0.5],
+                    vec![0.5, 0.5],
+                    vec![0.0, 1.0],
+                    vec![1.0, 0.0],
+                ],
+                2,
+            )
+            .unwrap();
+            // Preserve the real row order and damage only the stored slab,
+            // as can happen to a persisted source after writer admission.
+            for row in [0, 2, 3] {
+                quality.vectors[row * 2..row * 2 + 2].fill(damaged);
+            }
+            let classified = quality
+                .search_top_k_classified(&[1.0, 0.0], quality.record_count(), None)
+                .unwrap();
+            let recovered = classified
+                .hits
+                .iter()
+                .find(|hit| hit.doc_id == "recovered")
+                .expect("ranked retrieval retains the healthy duplicate");
+            assert_eq!(recovered.score, 0.5);
+            assert!(classified.hits.iter().all(|hit| hit.doc_id != "unusable"));
+            assert_eq!(
+                quality.vector_for_doc_id("recovered").unwrap(),
+                Some(vec![0.5, 0.5]),
+                "MMR must retain the same usable document as classified retrieval"
+            );
+            assert_eq!(quality.vector_for_doc_id("unusable").unwrap(), None);
+            assert_eq!(quality.vector_for_doc_id("absent").unwrap(), None);
+            assert_eq!(
+                quality.vector_for_doc_id("stable").unwrap(),
+                Some(vec![0.0, 1.0]),
+                "an already-usable first duplicate keeps its deterministic precedence"
+            );
+            assert_eq!(
+                quality
+                    .scores_for_hits(&[1.0, 0.0], std::slice::from_ref(recovered))
+                    .unwrap(),
+                [recovered.score]
+            );
+
+            let ids = vec![
+                "recovered".to_owned(),
+                "unusable".to_owned(),
+                "stable".to_owned(),
+            ];
+            let fast = InMemoryVectorIndex::from_vectors(ids, vec![vec![1.0, 0.0]; 3], 2).unwrap();
+            let index = InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap();
+            let hits = index.search_fast(&[1.0, 0.0], 3).unwrap();
+            let scores = index.quality_scores_for_hits(&[1.0, 0.0], &hits).unwrap();
+            assert_eq!(scores, [Some(0.5), None, Some(0.0)]);
         }
     }
 

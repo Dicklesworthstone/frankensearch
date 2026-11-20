@@ -2038,16 +2038,13 @@ impl TwoTierIndex {
             } else {
                 None
             };
-            let quality_row = match mapped {
-                Some(row) => Some(row),
-                None => quality_index.find_index_by_doc_id(&hit.doc_id)?,
-            };
+            let quality_row = usable_main_row_for_doc_id(quality_index, &hit.doc_id, mapped)?;
             let score = match quality_row {
-                Some(row) if quality_index.vector_has_signal(row)? => {
+                Some(row) => {
                     let score = quality_index.dot_query_at(row, query_vec)?;
                     score.is_finite().then_some(score)
                 }
-                _ => None,
+                None => None,
             };
             scores.push(score);
         }
@@ -2334,11 +2331,9 @@ impl TwoTierIndex {
             }
         }
 
-        if let Some(index) = self.fast_tier().find_index_by_doc_id(doc_id)? {
-            return self.fast_tier().signal_vector_at(index);
-        }
-
-        Ok(None)
+        usable_main_row_for_doc_id(self.fast_tier(), doc_id, None)?
+            .map(|index| self.fast_tier().vector_at_f32(index))
+            .transpose()
     }
 
     /// Usable quality-tier vector for the given document id.
@@ -2359,18 +2354,14 @@ impl TwoTierIndex {
             }
         }
 
-        if let Some(fast_index) = self.fast_tier().find_index_by_doc_id(doc_id)?
-            && let Some(quality_index_pos) = self.quality_index_for_fast_index(fast_index)
-            && !quality_index.is_deleted(quality_index_pos)
-        {
-            return quality_index.signal_vector_at(quality_index_pos);
-        }
-
-        if let Some(qual_idx) = quality_index.find_index_by_doc_id(doc_id)? {
-            return quality_index.signal_vector_at(qual_idx);
-        }
-
-        Ok(None)
+        let mapped = self
+            .fast_tier()
+            .find_index_by_doc_id(doc_id)?
+            .and_then(|fast_index| self.quality_index_for_fast_index(fast_index))
+            .filter(|&row| !quality_index.is_deleted(row));
+        usable_main_row_for_doc_id(quality_index, doc_id, mapped)?
+            .map(|index| quality_index.vector_at_f32(index))
+            .transpose()
     }
 
     /// Semantic vector for the given document id, preferring quality tier.
@@ -2449,6 +2440,50 @@ impl TwoTierIndex {
             QualityAlignment::Mapping(map) => map.get(fast_idx).copied().flatten(),
         }
     }
+}
+
+/// Find a usable main-slab row without changing an already-usable alignment or
+/// first-match lookup. Callers must resolve WAL authority before using this:
+/// an unusable WAL replacement still shadows every main copy of its document.
+/// `preferred` is an already-aligned, live row for `doc_id` when available.
+fn usable_main_row_for_doc_id(
+    index: &VectorIndex,
+    doc_id: &str,
+    preferred: Option<usize>,
+) -> SearchResult<Option<usize>> {
+    let row = match preferred {
+        Some(row) => Some(row),
+        None => index.find_index_by_doc_id(doc_id)?,
+    };
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if index.vector_has_signal(row)? {
+        return Ok(Some(row));
+    }
+
+    // A damaged physical row does not invalidate its healthy siblings. Only
+    // inspect this hash run, including rows before an unusable aligned row;
+    // ordinary unique-document lookups never scan the rest of the index.
+    let hash = crate::fnv1a_hash(doc_id.as_bytes());
+    let mut first = row;
+    while first > 0 && index.record_at(first - 1)?.doc_id_hash == hash {
+        first -= 1;
+    }
+    for candidate in first..index.record_count() {
+        let entry = index.record_at(candidate)?;
+        if entry.doc_id_hash != hash {
+            break;
+        }
+        if candidate != row
+            && !crate::is_tombstoned_flags(entry.flags)
+            && index.doc_id_at(candidate)? == doc_id
+            && index.vector_has_signal(candidate)?
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// Tier that served a semantic vector
@@ -6403,6 +6438,203 @@ mod tests {
     }
 
     // ─── bd-3nsq: NaN score in WAL merge ───
+
+    #[test]
+    fn duplicate_lookup_preserves_usable_persisted_vectors_and_wal_precedence() {
+        use crate::wal::{WalEntry, append_wal_batch, wal_path_for};
+
+        for quantization in [Quantization::F16, Quantization::F32] {
+            for damaged in [0.0, f32::NAN, f32::INFINITY, f32::MAX] {
+                let dir = temp_index_dir("duplicate-lookup");
+                fs::create_dir_all(&dir).unwrap();
+                let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+                let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+                for (path, quality) in [(&fast_path, false), (&quality_path, true)] {
+                    let mut writer = VectorIndex::create_with_revision(
+                        path,
+                        "test",
+                        "duplicate-lookup",
+                        2,
+                        quantization,
+                    )
+                    .unwrap();
+                    let ids = if quality {
+                        [
+                            "recovered",
+                            "recovered",
+                            "unusable",
+                            "unusable",
+                            "wal-shadowed",
+                            "wal-shadowed",
+                        ]
+                    } else {
+                        [
+                            "recovered",
+                            "fast-duplicate",
+                            "fast-duplicate",
+                            "unusable",
+                            "wal-shadowed",
+                            "wal-shadowed",
+                        ]
+                    };
+                    for id in ids {
+                        writer.write_record(id, &[0.5, 0.5]).unwrap();
+                    }
+                    writer.finish().unwrap();
+                    let index = VectorIndex::open_read_only(path).unwrap();
+                    let offset = usize::try_from(index.metadata().vectors_offset).unwrap();
+                    let stride = match quantization {
+                        Quantization::F16 => 4,
+                        Quantization::F32 => 8,
+                    };
+                    let mut bytes = fs::read(path).unwrap();
+                    let mut seen = std::collections::HashSet::new();
+                    for row in 0..index.record_count() {
+                        let id = index.doc_id_at(row).unwrap();
+                        let first = seen.insert(id.to_owned());
+                        if (quality && (id == "unusable" || (id == "recovered" && first)))
+                            || (!quality && id == "fast-duplicate" && first)
+                        {
+                            let encoded: Vec<u8> = match quantization {
+                                Quantization::F16 => [damaged, 0.0]
+                                    .into_iter()
+                                    .flat_map(|value| half::f16::from_f32(value).to_le_bytes())
+                                    .collect(),
+                                Quantization::F32 => [damaged, 0.0]
+                                    .into_iter()
+                                    .flat_map(f32::to_le_bytes)
+                                    .collect(),
+                            };
+                            bytes[offset + row * stride..offset + (row + 1) * stride]
+                                .copy_from_slice(&encoded);
+                        }
+                    }
+                    let generation = crate::next_generation(index.metadata().compaction_gen);
+                    drop(index);
+                    fs::write(path, bytes).unwrap();
+                    // An authoritative unusable WAL replacement still hides
+                    // BOTH healthy main duplicates; it cannot resurrect them.
+                    append_wal_batch(
+                        &wal_path_for(path),
+                        &[WalEntry {
+                            doc_id: "wal-shadowed".to_owned(),
+                            doc_id_hash: crate::fnv1a_hash(b"wal-shadowed"),
+                            embedding: vec![0.0, 0.0],
+                        }],
+                        2,
+                        quantization,
+                        generation,
+                        true,
+                    )
+                    .unwrap();
+                }
+                let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+                let quality = index.quality_tier().unwrap();
+                let ranked = quality
+                    .search_top_k_classified(&[1.0, 0.0], 10, None)
+                    .unwrap();
+                assert_eq!(ranked.hits.len(), 1);
+                assert_eq!(ranked.hits[0].doc_id, "recovered");
+                assert_eq!(ranked.hits[0].score, 0.5);
+                assert_eq!(
+                    index.fast_vector_for_doc_id("fast-duplicate").unwrap(),
+                    Some(vec![0.5, 0.5])
+                );
+                assert_eq!(
+                    index.quality_vector_for_doc_id("recovered").unwrap(),
+                    Some(vec![0.5, 0.5]),
+                    "quality lookup must retain the vector available to classified search"
+                );
+                assert_eq!(index.quality_vector_for_doc_id("unusable").unwrap(), None);
+                assert_eq!(index.fast_vector_for_doc_id("wal-shadowed").unwrap(), None);
+                assert_eq!(
+                    index.quality_vector_for_doc_id("wal-shadowed").unwrap(),
+                    None
+                );
+                assert_eq!(
+                    index
+                        .semantic_vector_with_tier_for_doc_id("recovered")
+                        .unwrap(),
+                    Some((SemanticVectorTier::Quality, vec![0.5, 0.5]))
+                );
+                let hits: Vec<_> = ["recovered", "unusable", "wal-shadowed"]
+                    .into_iter()
+                    .map(|id| VectorHit {
+                        index: u32::try_from(index.fast_index_for_doc_id(id).unwrap().unwrap())
+                            .unwrap(),
+                        score: 0.5,
+                        doc_id: id.into(),
+                    })
+                    .collect();
+                assert_eq!(
+                    index.quality_scores_for_hits(&[1.0, 0.0], &hits).unwrap(),
+                    [Some(ranked.hits[0].score), None, None]
+                );
+                // Force the ID lookup fallback as well as the precomputed
+                // cross-tier alignment used by ordinary fast hits.
+                let unaligned = VectorHit {
+                    index: u32::MAX,
+                    ..hits[0].clone()
+                };
+                assert_eq!(
+                    index
+                        .quality_scores_for_hits(&[1.0, 0.0], &[unaligned])
+                        .unwrap(),
+                    [Some(0.5)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_lookup_recovers_before_alignment_without_reviving_tombstones() {
+        let dir = temp_index_dir("duplicate-alignment");
+        fs::create_dir_all(&dir).unwrap();
+        for (filename, quality) in [
+            (VECTOR_INDEX_FAST_FILENAME, false),
+            (VECTOR_INDEX_QUALITY_FILENAME, true),
+        ] {
+            let path = dir.join(filename);
+            write_index_file(
+                &path,
+                &[
+                    ("recovered", &[1.0, 0.0]),
+                    ("recovered", &[0.5, 0.5]),
+                    ("recovered", &[0.5, 0.5]),
+                    ("recovered", &[0.0, 1.0]),
+                ],
+            )
+            .unwrap();
+            let index = VectorIndex::open_read_only(&path).unwrap();
+            let mut bytes = fs::read(&path).unwrap();
+            let flags = index.record_flags_offset(0).unwrap();
+            bytes[flags..flags + 2].copy_from_slice(&crate::RECORD_FLAG_TOMBSTONE.to_le_bytes());
+            if quality {
+                let vector = index.vector_start(2).unwrap();
+                bytes[vector..vector + 4].fill(0);
+            }
+            drop(index);
+            fs::write(path, bytes).unwrap();
+        }
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+        let hits: Vec<_> = [2, 3]
+            .into_iter()
+            .map(|index| VectorHit {
+                index,
+                score: 0.5,
+                doc_id: "recovered".into(),
+            })
+            .collect();
+        assert_eq!(
+            index.quality_scores_for_hits(&[1.0, 0.0], &hits).unwrap(),
+            [Some(0.5), Some(0.0)],
+            "an unusable aligned row can recover an earlier live sibling, while a healthy aligned row keeps its own score"
+        );
+        assert_eq!(
+            index.quality_vector_for_doc_id("recovered").unwrap(),
+            Some(vec![0.5, 0.5])
+        );
+    }
 
     #[test]
     fn classified_wal_only_miss_after_reopen_is_benign() {
