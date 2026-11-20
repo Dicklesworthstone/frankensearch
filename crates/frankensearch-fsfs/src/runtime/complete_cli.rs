@@ -1337,7 +1337,9 @@ impl FsfsRuntime {
             std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none() && !self.config.search.explain;
         let fingerprint = resources.generation_fingerprint.clone();
         let mut prepared = self.clone();
-        prepared.prepare_search_reranker(cx, limit, mode).await?;
+        prepared
+            .prepare_search_reranker(cx, query, limit, mode, resources)
+            .await?;
         let key = cache_enabled
             .then(|| prepared.search_cache_key(query, limit, mode))
             .transpose()?;

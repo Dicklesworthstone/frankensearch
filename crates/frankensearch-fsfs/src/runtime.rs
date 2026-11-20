@@ -10710,7 +10710,7 @@ impl FsfsRuntime {
         options: SearchServeOptions,
         frame_sink: Option<SearchServeFrameSink<'_>>,
     ) -> SearchResult<SearchServeResponse> {
-        let runtime = self
+        let mut runtime = self
             .with_search_serve_request_policy(&request)?
             .with_daemon_coalescers();
         let _query = runtime
@@ -10729,7 +10729,7 @@ impl FsfsRuntime {
                 .limit
                 .unwrap_or(runtime.config.search.default_limit)
         });
-        let key = runtime.search_cache_key(&request.query, limit, mode)?;
+        let mut key = runtime.search_cache_key(&request.query, limit, mode)?;
         let (mut resources, mut cache) = {
             let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), cx)
                 .await
@@ -10783,19 +10783,48 @@ impl FsfsRuntime {
             };
             (resources.clone(), cached.unwrap_or_default())
         };
-        let expected_cached = cache.get(&key).cloned();
+        let mut expected_cached = cache.get(&key).cloned();
         let expected_generation = resources.generation_fingerprint.clone();
         let expected_mode = resources.resource_mode;
-        let response = runtime
-            .execute_search_serve_request_with_sink(
-                cx,
-                request,
-                &mut resources,
-                &mut cache,
-                options,
-                frame_sink,
-            )
-            .await;
+        let response = async {
+            // Provider initialization may wait on caller-owned capacity. Freeze
+            // its selection after retaining resources and outside the shared
+            // reader lock, then look up the exact key that execution will use.
+            runtime
+                .prepare_search_reranker(cx, &request.query, limit, mode, &resources)
+                .await?;
+            let prepared_key = runtime.search_cache_key(&request.query, limit, mode)?;
+            if prepared_key != key {
+                key = prepared_key;
+                cache.clear();
+                expected_cached = None;
+                if options.hot_cache_enabled {
+                    let guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), cx)
+                        .await
+                        .map_err(|error| {
+                            Self::search_daemon_error(format!("search cache admission: {error}"))
+                        })?;
+                    if guard.0.generation_fingerprint == expected_generation
+                        && guard.0.resource_mode == expected_mode
+                        && let Some(payloads) = guard.1.get(&key)
+                    {
+                        expected_cached = Some(payloads.clone());
+                        cache.insert(key.clone(), payloads.clone());
+                    }
+                }
+            }
+            runtime
+                .execute_search_serve_request_with_sink(
+                    cx,
+                    request,
+                    &mut resources,
+                    &mut cache,
+                    options,
+                    frame_sink,
+                )
+                .await
+        }
+        .await;
         let mut guard = if let Ok(guard) = shared.try_lock_owned() {
             guard
         } else {
@@ -10967,7 +10996,9 @@ impl FsfsRuntime {
                 .limit
                 .unwrap_or(self.config.search.default_limit)
         });
-        runtime.prepare_search_reranker(cx, requested_limit, mode).await?;
+        runtime
+            .prepare_search_reranker(cx, &request.query, requested_limit, mode, resources)
+            .await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
         // Every failed replay must invalidate the request-local entry, including
@@ -13379,9 +13410,12 @@ impl FsfsRuntime {
         let mut prepared = self.clone();
         let parsed_query = ParsedQuery::parse(&Self::normalize_search_query(query));
         // A cached answer cannot stand in for the lexical evidence needed to
-        // enforce exclusions. Open that evidence before loading any model,
-        // including the reranker, and reuse it for either replay or retrieval.
-        let mut admitted_resources = if parsed_query.has_negations() {
+        // enforce exclusions or the retained tiers needed to plan reranking.
+        // Admit that evidence before loading any model, then reuse it for
+        // either replay or retrieval. Other cache hits retain their lazy open.
+        let mut admitted_resources = if parsed_query.has_negations()
+            || prepared.search_can_rerank(query, limit, mode)
+        {
             let resources = prepared
                 .prepare_search_execution_resources_at_root_with_modes(cx, &index_root, mode, mode)
                 .await?;
@@ -13390,7 +13424,13 @@ impl FsfsRuntime {
         } else {
             None
         };
-        prepared.prepare_search_reranker(cx, limit, mode).await?;
+        if let Some(resources) = &admitted_resources {
+            prepared
+                .prepare_search_reranker(cx, query, limit, mode, resources)
+                .await?;
+        } else {
+            Self::semantic_retry_checkpoint(cx, "reranker_initialization")?;
+        }
         let key = prepared.search_cache_key(query, limit, mode)?;
         match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
@@ -14448,7 +14488,7 @@ impl FsfsRuntime {
             quality_timeout_ms: self.config.search.quality_timeout_ms,
             rerank_timeout_ms: self.config.search.rerank_timeout_ms,
             rerank: self.reranking_enabled_by_policy(),
-            rerank_model: if self.search_can_rerank(requested_limit, mode) {
+            rerank_model: if self.search_can_rerank(query, requested_limit, mode) {
                 self.reranker
                     .get()
                     .and_then(|slot| slot.0.as_ref())
@@ -14456,17 +14496,22 @@ impl FsfsRuntime {
             } else {
                 None
             },
-            rerank_contract: self.registered_reranker_cache_contract(requested_limit, mode)?,
+            rerank_contract: self.registered_reranker_cache_contract(
+                query,
+                requested_limit,
+                mode,
+            )?,
         })
     }
 
     #[cfg_attr(not(feature = "rerank"), allow(clippy::unnecessary_wraps))]
     fn registered_reranker_cache_contract(
         &self,
+        query: &str,
         limit: usize,
         mode: SearchExecutionMode,
     ) -> SearchResult<Option<String>> {
-        if !self.search_can_rerank(limit, mode) {
+        if !self.search_can_rerank(query, limit, mode) {
             return Ok(None);
         }
         #[cfg(feature = "rerank")]
@@ -16023,7 +16068,9 @@ impl FsfsRuntime {
         // The cross-encoder is a process resource, not an index resource: the
         // runtime owns it, so its capability is decided here. Nothing is
         // loaded unless the caller asked for the stage.
-        let reranker = self.reranker_for_search(cx, output_limit, mode).await?;
+        let reranker = self
+            .reranker_for_search(cx, &normalized_query, output_limit, mode, resources)
+            .await?;
         capabilities.rerank = if reranker.is_some() {
             CapabilityState::Enabled
         } else {
@@ -24930,23 +24977,57 @@ impl FsfsRuntime {
         }
     }
 
-    const fn search_can_rerank(&self, limit: usize, mode: SearchExecutionMode) -> bool {
-        limit > 0
-            && self.reranking_enabled_by_policy()
-            && match mode {
-                SearchExecutionMode::Full => !self.quality_disabled_by_policy(),
-                SearchExecutionMode::QualityOnly => true,
-                SearchExecutionMode::FastOnly | SearchExecutionMode::LexicalOnly => false,
+    fn search_can_rerank(&self, query: &str, limit: usize, mode: SearchExecutionMode) -> bool {
+        if limit == 0 || !self.reranking_enabled_by_policy() {
+            return false;
+        }
+        let query = Self::normalize_search_query(query);
+        if query.is_empty() {
+            return false;
+        }
+        match mode {
+            SearchExecutionMode::Full => {
+                !self.quality_disabled_by_policy()
+                    && QueryPlanner::from_fsfs(&self.config)
+                        .budget_for_query(&query, Some(Self::resolve_planning_limit(limit)))
+                        .rerank_depth
+                        > 0
             }
+            // Explicit quality-only retrieval has its own candidate budget,
+            // independent of the hybrid planner's lexical fallback policy.
+            SearchExecutionMode::QualityOnly => true,
+            SearchExecutionMode::FastOnly | SearchExecutionMode::LexicalOnly => false,
+        }
     }
 
     async fn reranker_for_search(
         &self,
         cx: &Cx,
+        query: &str,
         limit: usize,
         mode: SearchExecutionMode,
+        resources: &SearchExecutionResources,
     ) -> SearchResult<Option<Arc<dyn Reranker>>> {
-        if self.search_can_rerank(limit, mode) {
+        let can_rerank = self.search_can_rerank(query, limit, mode)
+            && if matches!(mode, SearchExecutionMode::QualityOnly) {
+                resources.quality_stage_viable(false)
+            } else {
+                let mut capabilities =
+                    resources.capabilities_for_mode(mode, self.quality_disabled_by_policy());
+                // Decide whether the stage can run before paying to acquire
+                // its provider. The real availability is resolved only after
+                // the retained tiers and query plan permit reranking.
+                capabilities.rerank = CapabilityState::Enabled;
+                QueryPlanner::from_fsfs(&self.config)
+                    .execution_plan_for_query(
+                        &Self::normalize_search_query(query),
+                        Some(Self::resolve_planning_limit(limit)),
+                        capabilities,
+                    )
+                    .rerank_stage
+                    .enabled
+            };
+        if can_rerank {
             self.prepared_reranker(cx).await
         } else {
             Self::semantic_retry_checkpoint(cx, "reranker_initialization")?;
@@ -24960,10 +25041,14 @@ impl FsfsRuntime {
     async fn prepare_search_reranker(
         &mut self,
         cx: &Cx,
+        query: &str,
         limit: usize,
         mode: SearchExecutionMode,
+        resources: &SearchExecutionResources,
     ) -> SearchResult<()> {
-        let selected = self.reranker_for_search(cx, limit, mode).await?;
+        let selected = self
+            .reranker_for_search(cx, query, limit, mode, resources)
+            .await?;
         self.reranker = Arc::new(std::sync::OnceLock::from(RerankerSlot(selected)));
         Ok(())
     }
@@ -26705,13 +26790,23 @@ impl FsfsRuntime {
         // rank; the existing one-arm RRF preserves the public score contract.
         let fused = orchestrator.fuse_rankings(&[], &candidates, candidate_budget, 0);
         let reranker = self
-            .reranker_for_search(cx, output_limit, SearchExecutionMode::QualityOnly)
+            .reranker_for_search(
+                cx,
+                &normalized_query,
+                output_limit,
+                SearchExecutionMode::QualityOnly,
+                resources,
+            )
             .await?;
         let mut rerank_stage = StageDirective {
-            enabled: self.config.search.rerank,
+            enabled: self.config.search.rerank && !normalized_query.is_empty(),
             candidate_budget,
             timeout_ms: self.config.search.rerank_timeout_ms,
-            reason_code: "query.stage.rerank.enabled",
+            reason_code: if normalized_query.is_empty() {
+                REASON_RERANK_NO_CANDIDATES
+            } else {
+                "query.stage.rerank.enabled"
+            },
         };
         Self::restrict_rerank_to_output_limit(&mut rerank_stage, output_limit);
         let RerankStageOutcome {
@@ -44797,33 +44892,18 @@ mod tests {
         config.indexing.model_dir = model_dir.parent().unwrap().display().to_string();
         config.storage.index_dir = root.display().to_string();
         let runtime = FsfsRuntime::new(config).with_native_blocking_pool(pool);
-        // An empty generation isolates the daemon's cache/preparation boundary.
-        // Ranking below calls the actual retained model, not a test provider.
-        let resources = SearchExecutionResources {
-            index_root: root.to_path_buf(),
-            generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(root).unwrap(),
-            resource_mode: SearchExecutionMode::Full,
-            lexical_index: None,
-            shadow_observer: None,
-            shadow_pressure_sampler: None,
-            vector_index: None,
-            fast_window_mapping: None,
-            quality_vector_index: None,
-            fast_embedder: None,
-            #[cfg(feature = "semantic-support")]
-            cached_fast_producer: None,
-            quality_embedder: None,
-            fast_embedder_attempted: false,
-            quality_embedder_attempted: false,
-            degradation_advice: Vec::new(),
-        };
+        // The request must have a real refinement lane before it can load a
+        // cross-encoder. These FSVI fixtures use deterministic query vectors;
+        // reranker initialization and the ranking probes below use the actual
+        // registered model, not a reranker test provider.
+        let resources = disagreeing_blend_resources(root);
         (runtime, resources)
     }
 
     #[cfg(feature = "rerank")]
     fn cold_reranker_request() -> SearchServeRequest {
         SearchServeRequest {
-            query: String::new(),
+            query: "recover network failures".to_owned(),
             limit: Some(10),
             mode: Some("full".to_owned()),
             filter: None,
@@ -44936,11 +45016,16 @@ mod tests {
         let mut config = FsfsConfig::default();
         config.search.rerank = true;
         let runtime = FsfsRuntime::new(config).with_native_blocking_pool(pool.handle());
+        let temp = tempfile::tempdir().unwrap();
+        let resources = disagreeing_blend_resources(temp.path());
         assert!(pool.shutdown_and_wait(Duration::from_secs(2)));
         scheduler.block_on(async {
             for (mode, limit) in [(Full, 0), (QualityOnly, 0), (FastOnly, 1), (LexicalOnly, 1)] {
                 let mut request = runtime.clone();
-                request.prepare_search_reranker(&cx, limit, mode).await.unwrap();
+                request
+                    .prepare_search_reranker(&cx, "retry", limit, mode, &resources)
+                    .await
+                    .unwrap();
                 let key = request.search_cache_key("retry", limit, mode).unwrap();
                 assert!(key.rerank);
                 assert!(key.rerank_model.is_none());
@@ -44948,16 +45033,203 @@ mod tests {
             }
             assert!(runtime.reranker.get().is_none());
             for mode in [Full, QualityOnly] {
-                let result = runtime.reranker_for_search(&cx, 1, mode).await;
+                let result = runtime
+                    .reranker_for_search(&cx, "retry", 1, mode, &resources)
+                    .await;
                 assert!(matches!(result, Err(SearchError::RerankFailed { .. })));
             }
             cx.cancel_fast(asupersync::CancelKind::User);
             assert!(matches!(
-                runtime.reranker_for_search(&cx, 0, Full).await,
+                runtime
+                    .reranker_for_search(&cx, "retry", 0, Full, &resources)
+                    .await,
                 Err(SearchError::Cancelled { .. })
             ));
         });
         assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn reranker_selection_skips_disabled_query_plans_without_poisoning_later_requests() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let resources = disagreeing_blend_resources(temp.path());
+            let mut config = FsfsConfig::default();
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config);
+            let permit = asupersync::sync::OwnedMutexGuard::lock(
+                Arc::clone(&runtime.reranker_load_gate),
+                &cx,
+            )
+            .await
+            .unwrap();
+            for (query, strict, mode) in [
+                ("  \n\t ", false, SearchExecutionMode::Full),
+                ("???", false, SearchExecutionMode::Full),
+                ("find\u{0007}secret", false, SearchExecutionMode::Full),
+                ("recover network failures", true, SearchExecutionMode::Full),
+                ("   ", false, SearchExecutionMode::QualityOnly),
+            ] {
+                let mut request = runtime.clone();
+                if strict {
+                    request.config.pressure.profile = crate::config::PressureProfile::Strict;
+                }
+                let mut operation =
+                    Box::pin(request.prepare_search_reranker(&cx, query, 10, mode, &resources));
+                std::future::poll_fn(|task_cx| {
+                    assert!(
+                        matches!(operation.as_mut().poll(task_cx), Poll::Ready(Ok(()))),
+                        "a disabled plan must not wait for provider admission: {query:?} {mode:?}",
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(operation);
+                assert!(request.reranker.get().unwrap().0.is_none());
+                let key = request.search_cache_key(query, 10, mode).unwrap();
+                assert!(key.rerank_model.is_none());
+                assert!(key.rerank_contract.is_none());
+                assert!(runtime.reranker.get().is_none());
+                if mode == SearchExecutionMode::QualityOnly {
+                    let phases = request
+                        .execute_quality_only_search(
+                            &cx,
+                            query,
+                            10,
+                            &mut resources.clone(),
+                            SearchExecutionFlags {
+                                include_snippets: false,
+                                persist_explain_session: false,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(phases.len(), 1);
+                    assert!(phases[0].payload.hits.is_empty());
+                    assert_eq!(
+                        phases[0].payload.rerank.as_ref().unwrap().reason_code,
+                        super::REASON_RERANK_NO_CANDIDATES,
+                    );
+                    assert!(runtime.reranker.get().is_none());
+                }
+            }
+            drop(permit);
+
+            let provider: Arc<dyn frankensearch_core::Reranker> =
+                Arc::new(frankensearch_core::SyncRerankerAdapter(ReverseReranker));
+            super::set_test_reranker(Some(Arc::clone(&provider)));
+            for mode in [SearchExecutionMode::Full, SearchExecutionMode::QualityOnly] {
+                let mut request = runtime.clone();
+                request
+                    .prepare_search_reranker(&cx, "recover network failures", 10, mode, &resources)
+                    .await
+                    .unwrap();
+                let selected = request.reranker.get().unwrap().0.as_ref().unwrap();
+                assert!(Arc::ptr_eq(selected, &provider));
+                assert_eq!(
+                    request
+                        .search_cache_key("recover network failures", 10, mode)
+                        .unwrap()
+                        .rerank_model
+                        .as_deref(),
+                    Some("reverse-reranker-test"),
+                );
+            }
+            // Explicit QualityOnly does not inherit hybrid's lexical fallback.
+            let mut quality = runtime.clone();
+            quality.config.pressure.profile = crate::config::PressureProfile::Strict;
+            quality
+                .prepare_search_reranker(
+                    &cx,
+                    "???",
+                    10,
+                    SearchExecutionMode::QualityOnly,
+                    &resources,
+                )
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                quality.reranker.get().unwrap().0.as_ref().unwrap(),
+                &provider,
+            ));
+            let mut skipped = runtime.clone();
+            skipped
+                .prepare_search_reranker(&cx, "???", 10, SearchExecutionMode::Full, &resources)
+                .await
+                .unwrap();
+            assert!(skipped.reranker.get().unwrap().0.is_none());
+            assert!(runtime.reranker.get().unwrap().0.is_some());
+            super::set_test_reranker(None);
+        });
+    }
+
+    #[test]
+    fn reranker_selection_requires_usable_retained_tiers_before_provider_admission() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let resources = disagreeing_blend_resources(temp.path());
+            let hash_path = temp.path().join("hash.fsvi");
+            let mut writer = VectorIndex::create(&hash_path, "hash-2", 2).unwrap();
+            writer.write_record("a.rs", &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let hash = Arc::new(VectorIndex::open_read_only(&hash_path).unwrap());
+            let mut config = FsfsConfig::default();
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config);
+            let permit = asupersync::sync::OwnedMutexGuard::lock(
+                Arc::clone(&runtime.reranker_load_gate),
+                &cx,
+            )
+            .await
+            .unwrap();
+            for scenario in [
+                "missing_fast",
+                "missing_quality",
+                "hash_fast",
+                "hash_quality",
+                "unavailable_fast",
+                "unavailable_quality",
+            ] {
+                let mut candidate = resources.clone();
+                match scenario {
+                    "missing_fast" => candidate.vector_index = None,
+                    "missing_quality" => candidate.quality_vector_index = None,
+                    "hash_fast" => candidate.vector_index = Some(Arc::clone(&hash)),
+                    "hash_quality" => candidate.quality_vector_index = Some(Arc::clone(&hash)),
+                    "unavailable_fast" => candidate.fast_embedder = None,
+                    "unavailable_quality" => candidate.quality_embedder = None,
+                    _ => unreachable!(),
+                }
+                let mut request = runtime.clone();
+                let mut operation = Box::pin(request.prepare_search_reranker(
+                    &cx,
+                    "recover network failures",
+                    10,
+                    SearchExecutionMode::Full,
+                    &candidate,
+                ));
+                std::future::poll_fn(|task_cx| {
+                    assert!(
+                        matches!(operation.as_mut().poll(task_cx), Poll::Ready(Ok(()))),
+                        "unusable retained tiers must not admit a reranker: {scenario}",
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(operation);
+                assert!(request.reranker.get().unwrap().0.is_none());
+                assert!(runtime.reranker.get().is_none());
+            }
+            cx.cancel_fast(asupersync::CancelKind::User);
+            assert!(matches!(
+                runtime
+                    .reranker_for_search(&cx, "???", 10, SearchExecutionMode::Full, &resources)
+                    .await,
+                Err(SearchError::Cancelled { .. }),
+            ));
+            drop(permit);
+        });
     }
 
     #[test]
@@ -45300,13 +45572,22 @@ mod tests {
             .unwrap();
         let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
         let temp = tempfile::tempdir().unwrap();
-        let (mut runtime, _) =
+        let (mut runtime, resources) =
             cold_reranker_fixture(scheduler.blocking_handle().unwrap(), temp.path());
         let private_cache = temp.path().join("models");
         runtime.config.indexing.model_dir = private_cache.display().to_string();
         scheduler.block_on(async {
             let mut absent = runtime.clone();
-            absent.prepare_search_reranker(&cx, 10, SearchExecutionMode::Full).await.unwrap();
+            absent
+                .prepare_search_reranker(
+                    &cx,
+                    "recover network",
+                    10,
+                    SearchExecutionMode::Full,
+                    &resources,
+                )
+                .await
+                .unwrap();
             assert!(absent.reranker.get().unwrap().0.is_none());
             assert!(
                 runtime.reranker.get().is_none(),
@@ -45330,7 +45611,16 @@ mod tests {
             frankensearch_embed::model_manifest::verify_dir_and_record(&manifest, &installed)
                 .unwrap();
             let mut available = runtime.clone();
-            available.prepare_search_reranker(&cx, 10, SearchExecutionMode::Full).await.unwrap();
+            available
+                .prepare_search_reranker(
+                    &cx,
+                    "recover network",
+                    10,
+                    SearchExecutionMode::Full,
+                    &resources,
+                )
+                .await
+                .unwrap();
             let retained = runtime.reranker.get().unwrap().0.as_ref().unwrap();
             assert!(Arc::ptr_eq(
                 retained,
@@ -45478,7 +45768,16 @@ mod tests {
                 );
                 let mut fresh = FsfsRuntime::new(runtime.config.clone())
                     .with_native_blocking_pool(scheduler.blocking_handle().unwrap());
-                fresh.prepare_search_reranker(&cx, 10, SearchExecutionMode::Full).await.unwrap();
+                fresh
+                    .prepare_search_reranker(
+                        &cx,
+                        "recover network",
+                        10,
+                        SearchExecutionMode::Full,
+                        &resources,
+                    )
+                    .await
+                    .unwrap();
                 let unavailable_key = fresh
                     .search_cache_key("recover network", 10, SearchExecutionMode::Full)
                     .unwrap();
@@ -45508,7 +45807,16 @@ mod tests {
                 .unwrap();
             let mut restored = FsfsRuntime::new(runtime.config.clone())
                 .with_native_blocking_pool(scheduler.blocking_handle().unwrap());
-            restored.prepare_search_reranker(&cx, 10, SearchExecutionMode::Full).await.unwrap();
+            restored
+                .prepare_search_reranker(
+                    &cx,
+                    "recover network",
+                    10,
+                    SearchExecutionMode::Full,
+                    &resources,
+                )
+                .await
+                .unwrap();
             let restored_key = restored
                 .search_cache_key("recover network", 10, SearchExecutionMode::Full)
                 .unwrap();
@@ -69900,6 +70208,79 @@ mod tests {
                 assert!(!resources.quality_embedder_attempted);
             });
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_search_caches_the_selected_reranker_key_after_a_topology_skip() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = published_blend_resources(temp.path());
+            resources.quality_vector_index = None;
+            resources.quality_embedder = None;
+            let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                })
+                .with_daemon_coalescers();
+            // A model loaded for an earlier generation is still shared, but
+            // the selected generation can no longer run a refinement stage.
+            runtime
+                .reranker
+                .set(super::RerankerSlot(Some(Arc::new(
+                    frankensearch_core::SyncRerankerAdapter(ReverseReranker),
+                ))))
+                .unwrap();
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": "why does semantic ranking find these files",
+                "mode": "full", "limit": 10, "rerank": true,
+            }))
+            .unwrap();
+            let options = super::SearchServeOptions {
+                hot_cache_enabled: true,
+                persist_explain_session: false,
+            };
+            let cold = runtime
+                .execute_shared_search_serve_request_with_sink(
+                    &cx,
+                    request.clone(),
+                    Arc::clone(&shared),
+                    options,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!cold.cached);
+            assert_eq!(cold.payloads.len(), 1);
+            assert!(!cold.payloads[0].hits.is_empty());
+            assert_eq!(
+                cold.payloads[0].rerank.as_ref().unwrap().reason_code,
+                "query.stage.rerank.disabled.no_quality",
+            );
+            {
+                let state = shared.try_lock_owned().unwrap();
+                assert_eq!(state.1.len(), 1, "cache the key used by actual execution");
+                assert!(state.1.keys().next().unwrap().rerank_model.is_none());
+            }
+            let warm = runtime
+                .execute_shared_search_serve_request_with_sink(
+                    &cx,
+                    request,
+                    Arc::clone(&shared),
+                    options,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(warm.cached);
+            assert_eq!(warm.payloads, cold.payloads);
+            assert!(runtime.reranker.get().unwrap().0.is_some());
+        });
     }
 
     #[cfg(all(feature = "semantic-support", unix))]

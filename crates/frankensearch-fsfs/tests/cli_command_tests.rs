@@ -1318,7 +1318,9 @@ fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
             "query.stage.rerank.disabled.no_quality"
         };
         assert_eq!(
-            result.pointer("/data/rerank/reason_code").and_then(Value::as_str),
+            result
+                .pointer("/data/rerank/reason_code")
+                .and_then(Value::as_str),
             Some(reason),
             "{result}"
         );

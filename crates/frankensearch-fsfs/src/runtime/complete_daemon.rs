@@ -817,9 +817,21 @@ impl FsfsRuntime {
                     .unwrap_or(runtime.config.search.default_limit)
             });
             let mut runtime = runtime.with_search_serve_request_policy(&request)?;
+            // A retained daemon may have opened this generation for a narrower
+            // mode. Admit the requested tiers on its private snapshot before
+            // deciding whether this request can use a cross-encoder.
+            runtime
+                .rebind_search_resources_if_generation_changed(
+                    cx,
+                    mode,
+                    &mut session.reader.resources,
+                )
+                .await?;
             // Reranker initialization may await work. Never hold the shared
             // reader lock while preparing this request's exact model key.
-            runtime.prepare_search_reranker(cx, limit, mode).await?;
+            runtime
+                .prepare_search_reranker(cx, &request.query, limit, mode, &session.reader.resources)
+                .await?;
             let key = runtime.search_cache_key(&request.query, limit, mode)?;
             Ok::<_, SearchError>(Some((runtime, key)))
         }
@@ -867,7 +879,9 @@ impl FsfsRuntime {
             .rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
         let limit = request.limit.unwrap_or(runtime.config.search.default_limit);
-        runtime.prepare_search_reranker(cx, limit, mode).await?;
+        runtime
+            .prepare_search_reranker(cx, &request.query, limit, mode, resources)
+            .await?;
         if matches!(mode, SearchExecutionMode::QualityOnly) {
             runtime.quality_budget_started_at = Some(cx.now());
             runtime
@@ -1865,8 +1879,9 @@ mod tests {
             ] {
                 for streamed in [false, true] {
                     for mode in ["full", "fast_only", "quality_only", "lexical_only"] {
-                        let raw =
-                            format!("{{\"query\":\"q\",\"stream\":{streamed},\"mode\":\"{mode}\"}}\n");
+                        let raw = format!(
+                            "{{\"query\":\"q\",\"stream\":{streamed},\"mode\":\"{mode}\"}}\n"
+                        );
                         let (client, mut server) = pair(raw.as_bytes());
                         serve_peer::<serde_json::Value, _, _>(
                             &cx,
@@ -2891,12 +2906,35 @@ mod generation_tests {
             }
         }
 
-        for change_mode in [false, true] {
+        for (change_mode, initially_narrow) in [(false, false), (true, false), (false, true)] {
             run_test_with_cx(|cx| async move {
                 let directory = tempfile::tempdir().unwrap();
-                let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
-                let runtime = runtime.with_daemon_coalescers();
-                let session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+                let (base, root) = published_daemon_fixture(&cx, directory.path()).await;
+                let mut session = base.open_live_retained_search(&cx, &root).await.unwrap();
+                let vectors = directory.path().join("unit-vectors");
+                fs::create_dir(&vectors).unwrap();
+                // Key preparation needs a viable progressive plan. The common
+                // daemon fixture intentionally has no quality tier; use real
+                // FSVI readers with deterministic query providers for this
+                // lock/cache test, as in complete_cache_fixture.
+                let mut resources = crate::runtime::tests::published_blend_resources(&vectors);
+                if initially_narrow {
+                    resources.resource_mode = SearchExecutionMode::LexicalOnly;
+                    resources.vector_index = None;
+                    resources.quality_vector_index = None;
+                    resources.fast_embedder = None;
+                    resources.quality_embedder = None;
+                    resources.fast_embedder_attempted = false;
+                    resources.quality_embedder_attempted = false;
+                }
+                let runtime = FsfsRuntime::new(FsfsConfig::default())
+                    .with_cli_input(CliInput {
+                        index_dir: Some(vectors),
+                        ..CliInput::default()
+                    })
+                    .with_daemon_coalescers();
+                session.reader.runtime = runtime.clone();
+                session.reader.resources = resources;
                 let bytes =
                     b"{\"query\":\"sharedtoken\",\"mode\":\"full\",\"limit\":10,\"rerank\":true}";
                 let (request, _) = parse_request(bytes).unwrap();
@@ -2947,7 +2985,10 @@ mod generation_tests {
                     &snapshot.reader.runtime.reranker,
                     &runtime.reranker
                 ));
-                if change_mode {
+                assert!(snapshot.reader.runtime.reranker.get().unwrap().0.is_some());
+                assert!(snapshot.reader.resources.vector_index.is_some());
+                assert!(snapshot.reader.resources.quality_vector_index.is_some());
+                if change_mode || initially_narrow {
                     assert!(
                         cache.is_empty(),
                         "a changed resource mode fences the snapshot"
