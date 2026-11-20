@@ -44693,6 +44693,41 @@ mod tests {
 
     #[test]
     #[cfg(feature = "rerank")]
+    fn skipped_searches_do_not_require_an_open_reranker_pool() {
+        use SearchExecutionMode::{FastOnly, Full, LexicalOnly, QualityOnly};
+
+        let scheduler = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = scheduler.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let pool = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+        let mut config = FsfsConfig::default();
+        config.search.rerank = true;
+        let runtime = FsfsRuntime::new(config).with_native_blocking_pool(pool.handle());
+        assert!(pool.shutdown_and_wait(Duration::from_secs(2)));
+        scheduler.block_on(async {
+            for (mode, limit) in [(Full, 0), (QualityOnly, 0), (FastOnly, 1), (LexicalOnly, 1)] {
+                let mut request = runtime.clone();
+                request.prepare_search_reranker(&cx, limit, mode).await.unwrap();
+                let key = request.search_cache_key("retry", limit, mode).unwrap();
+                assert!(key.rerank);
+                assert!(key.rerank_model.is_none());
+                assert!(key.rerank_contract.is_none());
+            }
+            assert!(runtime.reranker.get().is_none());
+            for mode in [Full, QualityOnly] {
+                let result = runtime.reranker_for_search(&cx, 1, mode).await;
+                assert!(matches!(result, Err(SearchError::RerankFailed { .. })));
+            }
+            cx.cancel_fast(asupersync::CancelKind::User);
+            assert!(matches!(
+                runtime.reranker_for_search(&cx, 0, Full).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+        });
+        assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[cfg(feature = "rerank")]
     #[ignore = "requires verified FRANKENSEARCH_RERANK_MODEL_DIR; run optimized"]
     fn cold_reranker_fixture_stopped_pool_never_initializes_inline() {
         let scheduler = RuntimeBuilder::current_thread().build().unwrap();

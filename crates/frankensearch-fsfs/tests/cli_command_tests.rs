@@ -95,7 +95,8 @@ impl TestContext {
 }
 
 fn fsfs_binary_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_fsfs"))
+    std::env::var_os("CARGO_BIN_EXE_fsfs")
+        .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_fsfs")), PathBuf::from)
 }
 
 fn assert_success(label: &str, output: &Output) {
