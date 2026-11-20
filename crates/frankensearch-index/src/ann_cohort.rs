@@ -149,7 +149,7 @@ impl NativeAnnCohortV1 {
     /// Receipt presence must match the encoded graph presence exactly. A corrupt
     /// or omitted declared graph is an error, never a switch to exact search.
     /// All framing, lengths, digests and common coverage are checked before
-    /// allocating child images. Each graph then receives ordinary owner-bound
+    /// decoding the borrowed child images. Each graph receives ordinary owner-bound
     /// native admission, including source-map and seeded topology validation.
     ///
     /// # Errors
@@ -209,14 +209,16 @@ impl NativeAnnCohortV1 {
                 return Err(refused("payload-digest"));
             }
         }
-        let fast_image = fast_receipt
-            .map(|receipt| copy_image(cx, fast.payload).map(|bytes| (receipt, bytes)))
-            .transpose()?;
-        let quality_image = quality_receipt
-            .map(|receipt| copy_image(cx, quality.payload).map(|bytes| (receipt, bytes)))
-            .transpose()?;
-        let fast_graph = admit_graph(cx, cohort.fast(), fast_image.as_ref())?;
-        let quality_graph = admit_graph(cx, cohort.quality(), quality_image.as_ref())?;
+        let fast_graph = admit_graph_image(
+            cx,
+            cohort.fast(),
+            fast_receipt.map(|receipt| (receipt, fast.payload)),
+        )?;
+        let quality_graph = admit_graph_image(
+            cx,
+            cohort.quality(),
+            quality_receipt.map(|receipt| (receipt, quality.payload)),
+        )?;
         Self::from_admitted(cx, bytes, cohort, fast_graph, quality_graph)
     }
 
@@ -288,11 +290,21 @@ fn admit_graph(
     owner: &Arc<ValidatedFsviBytes>,
     image: Option<&(&NativeHnswGenerationReceiptV2, Arc<[u8]>)>,
 ) -> SearchResult<Option<ValidatedNativeHnsw>> {
+    admit_graph_image(
+        cx,
+        owner,
+        image.map(|(receipt, bytes)| (*receipt, bytes.as_ref())),
+    )
+}
+
+fn admit_graph_image(
+    cx: &Cx,
+    owner: &Arc<ValidatedFsviBytes>,
+    image: Option<(&NativeHnswGenerationReceiptV2, &[u8])>,
+) -> SearchResult<Option<ValidatedNativeHnsw>> {
     checkpoint(cx)?;
     let graph = image
-        .map(|(receipt, bytes)| {
-            ValidatedNativeHnsw::from_bytes(Arc::clone(owner), Arc::clone(bytes), receipt)
-        })
+        .map(|(receipt, bytes)| ValidatedNativeHnsw::from_image(Arc::clone(owner), bytes, receipt))
         .transpose()?;
     checkpoint(cx)?;
     Ok(graph)
@@ -395,14 +407,6 @@ fn checked_total(fast: usize, quality: usize, limit: usize) -> SearchResult<usiz
         .and_then(|size| size.checked_add(quality))
         .filter(|size| *size <= limit)
         .ok_or_else(|| refused("image-budget"))
-}
-
-fn copy_image(cx: &Cx, bytes: &[u8]) -> SearchResult<Arc<[u8]>> {
-    let mut copy = Vec::new();
-    copy.try_reserve_exact(bytes.len())
-        .map_err(|_| refused("allocation"))?;
-    append_image(cx, &mut copy, bytes)?;
-    Ok(copy.into())
 }
 
 fn append_image(cx: &Cx, output: &mut Vec<u8>, bytes: &[u8]) -> SearchResult<()> {
@@ -699,6 +703,62 @@ mod tests {
             assert!(hits.iter().any(|hit| hit.doc_id() == "zeta"));
             assert!(hits.iter().any(|hit| hit.doc_id() == "alpha"));
         }
+    }
+
+    #[test]
+    fn admitted_graphs_release_encoded_images_and_keep_shared_vector_owners() {
+        let fixture = Fixture::new();
+        let vector_image = fixture.cohort.bytes();
+        let vector_allocation = Arc::downgrade(&vector_image);
+        let vectors = ExactVectorCohortV1::admit(
+            &Cx::for_testing(),
+            Arc::clone(&vector_image),
+            &fixture.fast_binding,
+            &fixture.quality_binding,
+            source(),
+            BUDGET,
+        )
+        .unwrap();
+        let graph_image = fixture.build(true, true).unwrap().bytes();
+        let graph_allocation = Arc::downgrade(&graph_image);
+        let admitted = NativeAnnCohortV1::admit(
+            &Cx::for_testing(),
+            Arc::clone(&graph_image),
+            &vectors,
+            Some(&fixture.fast_receipt),
+            Some(&fixture.quality_receipt),
+            BUDGET,
+        )
+        .unwrap();
+        let fast_witness = vectors.fast().witness().clone();
+        let quality_witness = vectors.quality().witness().clone();
+        let (fast, quality) = admitted.into_graphs();
+        let fast = fast.unwrap();
+        let quality = quality.unwrap();
+        drop(fixture);
+        drop(vectors);
+        drop(vector_image);
+        drop(graph_image);
+        assert!(graph_allocation.upgrade().is_none());
+        assert!(vector_allocation.upgrade().is_some());
+        assert_eq!(fast.owner_witness(), &fast_witness);
+        assert_eq!(quality.owner_witness(), &quality_witness);
+        assert_eq!(
+            fast.search(&Cx::for_testing(), &[1.0, 0.0], 2, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            quality
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0], 2, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(fast);
+        drop(quality);
+        assert!(vector_allocation.upgrade().is_none());
     }
 
     #[test]

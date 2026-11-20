@@ -1316,11 +1316,23 @@ impl ValidatedNativeHnsw {
         graph_bytes: Arc<[u8]>,
         receipt: &NativeHnswGenerationReceiptV2,
     ) -> SearchResult<Self> {
+        let graph = Self::from_image(owner, &graph_bytes, receipt);
+        drop(graph_bytes);
+        graph
+    }
+
+    /// Parse a bounded graph payload borrowed from a retained aggregate.
+    /// The graph owns its decoded adjacency and retains only the vector owner.
+    pub(crate) fn from_image(
+        owner: Arc<ValidatedFsviBytes>,
+        graph_bytes: &[u8],
+        receipt: &NativeHnswGenerationReceiptV2,
+    ) -> SearchResult<Self> {
         let image_label = Path::new("<retained-native-hnsw>");
         receipt.validate()?;
         let binding = Self::binding_for_owner(owner.as_ref())?;
         binding.validate_owner_identity(receipt, image_label)?;
-        NativeHnswGenerationBindingV2::validate_graph_bytes(receipt, image_label, &graph_bytes)?;
+        NativeHnswGenerationBindingV2::validate_graph_bytes(receipt, image_label, graph_bytes)?;
         let (graph, metadata) = NativeHnsw::read_with_metadata(
             image_label,
             &mut Cursor::new(graph_bytes),
@@ -7364,6 +7376,47 @@ mod tests {
         assert!(
             matches!(error, SearchError::IndexCorrupted { .. }),
             "replacement race was not rejected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn borrowed_graph_payload_checks_exact_bytes_and_outlives_its_container() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = generation_owner(23, 0x23, "borrowed-graph", 6, 24);
+        let graph =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 31)
+                .unwrap();
+        let path = directory.path().join("borrowed.fshnsw");
+        let receipt = graph.save(&path).unwrap();
+        let image: Arc<[u8]> = std::fs::read(path).unwrap().into();
+        let mut container = vec![0xa5; 7];
+        container.extend_from_slice(&image);
+        container.push(0x91);
+        let end = 7 + image.len();
+        let borrowed =
+            ValidatedNativeHnsw::from_image(Arc::clone(&owner), &container[7..end], &receipt)
+                .unwrap();
+        let standalone =
+            ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), image, &receipt).unwrap();
+        assert!(
+            ValidatedNativeHnsw::from_image(Arc::clone(&owner), &container[7..], &receipt,)
+                .is_err()
+        );
+        container[end - 1] ^= 0x80;
+        assert!(
+            ValidatedNativeHnsw::from_image(Arc::clone(&owner), &container[7..end], &receipt,)
+                .is_err()
+        );
+        drop(container);
+        drop(owner);
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(
+            borrowed
+                .search(&Cx::for_testing(), &query, 8, Some(24))
+                .unwrap(),
+            standalone
+                .search(&Cx::for_testing(), &query, 8, Some(24))
+                .unwrap()
         );
     }
 

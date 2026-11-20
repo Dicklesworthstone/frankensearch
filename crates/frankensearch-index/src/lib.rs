@@ -73,7 +73,7 @@ pub mod warmup;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -754,7 +754,10 @@ pub(crate) struct RecordEntry {
 pub(crate) enum VectorIndexData {
     Mutable(MmapMut),
     ReadOnly(Mmap),
-    Immutable(Arc<[u8]>),
+    Immutable {
+        bytes: Arc<[u8]>,
+        range: Range<usize>,
+    },
 }
 
 impl VectorIndexData {
@@ -780,7 +783,7 @@ impl VectorIndexData {
                 value: "read-only mapping".to_owned(),
                 reason: "mutating a published FSVI requires VectorIndex::open_writer and its retained exclusive writer lock".to_owned(),
             }),
-            Self::Immutable(_) => Err(SearchError::InvalidConfig {
+            Self::Immutable { .. } => Err(SearchError::InvalidConfig {
                 field: "fsvi_v2.mutation".to_owned(),
                 value: "immutable-owned-image".to_owned(),
                 reason: "FSVI v2 artifacts are immutable; create a new generation instead"
@@ -797,7 +800,7 @@ impl Deref for VectorIndexData {
         match self {
             Self::Mutable(mapping) => mapping,
             Self::ReadOnly(mapping) => mapping,
-            Self::Immutable(bytes) => bytes,
+            Self::Immutable { bytes, range } => &bytes[range.clone()],
         }
     }
 }
@@ -936,7 +939,9 @@ enum FsviPublicationState {
 ///
 /// Construction copies pathname input into an owned [`Arc`] and then parses,
 /// hashes, validates, searches, and serves rows exclusively from that exact
-/// allocation. No file mapping or writable slice is retained. Replacing,
+/// allocation. An image embedded in an admitted vector cohort instead retains
+/// its validated range of the cohort's allocation, without copying the payload.
+/// No file mapping or writable slice is retained. Replacing,
 /// renaming, linking, or mutating the source pathname after construction cannot
 /// alter this owner's search results.
 ///
@@ -1003,6 +1008,8 @@ enum FsviPublicationState {
 /// ```
 pub struct ValidatedFsviBytes {
     bytes: Arc<[u8]>,
+    byte_range: Range<usize>,
+    exported_image: OnceLock<Arc<[u8]>>,
     index: VectorIndex,
     witness: FsviV2Witness,
     identity_binding: FsviV2IdentityBinding,
@@ -1206,6 +1213,21 @@ impl ValidatedFsviBytes {
         expected: &FsviV2IdentityBinding,
     ) -> Result<Self, FsviAdmissionError> {
         Self::from_arc_with_state(bytes, expected, FsviPublicationState::OwnedBytesOnly)
+    }
+
+    /// Admit one complete FSVI image within an immutable aggregate allocation.
+    /// Every offset and witness remains relative to the selected child image.
+    pub(crate) fn from_arc_range(
+        bytes: Arc<[u8]>,
+        range: Range<usize>,
+        expected: &FsviV2IdentityBinding,
+    ) -> Result<Self, FsviAdmissionError> {
+        Self::from_arc_range_with_state(
+            bytes,
+            range,
+            expected,
+            FsviPublicationState::OwnedBytesOnly,
+        )
     }
 
     /// Open a published pathname into one immutable owned image.
@@ -1422,7 +1444,7 @@ impl ValidatedFsviBytes {
             .into());
         }
         let witness = completed_owner.witness.clone();
-        let completed_bytes = Arc::clone(&completed_owner.bytes);
+        let completed_bytes = completed_owner.owned_bytes();
 
         let mut temporary =
             tempfile::NamedTempFile::new_in(destination_parent).map_err(SearchError::Io)?;
@@ -1476,19 +1498,34 @@ impl ValidatedFsviBytes {
         &self.witness
     }
 
-    /// Exact byte length retained by this owner.
+    /// Exact byte length of the admitted FSVI image.
     #[must_use]
     pub fn owned_byte_len(&self) -> usize {
-        self.bytes.len()
+        self.byte_range.len()
     }
 
-    /// Share the exact immutable image admitted by this owner.
+    /// Obtain a shared copy of the exact immutable image admitted by this owner.
     ///
-    /// Cloning this allocation does not grant mutable access or a pathname
-    /// publication proof. Consumers must retain or recheck its typed binding.
+    /// A standalone image shares its original allocation. For a child image
+    /// retained inside a cohort, the first call materializes only that child's
+    /// bytes; later calls share the cached allocation. Ordinary search and row
+    /// access keep using the cohort without materializing this export.
+    /// The returned allocation grants neither mutable access to the owner nor a
+    /// pathname publication proof. Consumers must retain or recheck its binding.
     #[must_use]
     pub fn owned_bytes(&self) -> Arc<[u8]> {
-        Arc::clone(&self.bytes)
+        if self.byte_range == (0..self.bytes.len()) {
+            Arc::clone(&self.bytes)
+        } else {
+            Arc::clone(
+                self.exported_image
+                    .get_or_init(|| Arc::from(self.image_bytes())),
+            )
+        }
+    }
+
+    fn image_bytes(&self) -> &[u8] {
+        &self.bytes[self.byte_range.clone()]
     }
 
     /// Bind retained vector bytes to a strictly newer artifact generation.
@@ -1532,7 +1569,8 @@ impl ValidatedFsviBytes {
                 "replacement generation sequence must strictly increase",
             ));
         }
-        if self.bytes.len() > max_image_bytes {
+        let retained = self.image_bytes();
+        if retained.len() > max_image_bytes {
             return Err(fsvi_v2_config_error(
                 "rebind_generation.max_image_bytes",
                 "retained vector image exceeds the encoded output budget",
@@ -1556,14 +1594,14 @@ impl ValidatedFsviBytes {
             ));
         }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(self.bytes.len()).map_err(|_| {
+        bytes.try_reserve_exact(retained.len()).map_err(|_| {
             fsvi_v2_config_error(
                 "rebind_generation.allocation",
                 "could not reserve the bounded replacement image",
             )
         })?;
         bytes.extend_from_slice(&header);
-        for chunk in self.bytes[identity.header_size..].chunks(64 * 1024) {
+        for chunk in retained[identity.header_size..].chunks(64 * 1024) {
             checkpoint()?;
             bytes.extend_from_slice(chunk);
         }
@@ -1781,7 +1819,8 @@ impl ValidatedFsviBytes {
     fn owner_and_search_share_allocation(&self) -> bool {
         matches!(
             &self.index.data,
-            VectorIndexData::Immutable(search_bytes) if Arc::ptr_eq(&self.bytes, search_bytes)
+            VectorIndexData::Immutable { bytes, range }
+                if Arc::ptr_eq(&self.bytes, bytes) && *range == self.byte_range
         )
     }
 
@@ -1790,22 +1829,35 @@ impl ValidatedFsviBytes {
         expected: &FsviV2IdentityBinding,
         publication_state: FsviPublicationState,
     ) -> Result<Self, FsviAdmissionError> {
+        let range = 0..bytes.len();
+        Self::from_arc_range_with_state(bytes, range, expected, publication_state)
+    }
+
+    fn from_arc_range_with_state(
+        bytes: Arc<[u8]>,
+        range: Range<usize>,
+        expected: &FsviV2IdentityBinding,
+        publication_state: FsviPublicationState,
+    ) -> Result<Self, FsviAdmissionError> {
         const OWNED_PATH: &str = "<owned-fsvi-v2>";
         let path = Path::new(OWNED_PATH);
-        if bytes.len() < 6 {
+        let image = bytes
+            .get(range.clone())
+            .ok_or_else(|| index_corrupted(path, "retained image range is out of bounds"))?;
+        if image.len() < 6 {
             return Err(index_corrupted(path, "magic and version are truncated").into());
         }
-        if bytes[..4] != FSVI_MAGIC {
+        if image[..4] != FSVI_MAGIC {
             return Err(index_corrupted(path, "invalid FSVI magic bytes").into());
         }
         let version = u16::from_le_bytes(
-            bytes[4..6]
+            image[4..6]
                 .try_into()
                 .expect("owned FSVI version field has fixed width"),
         );
         match version {
             FSVI_VERSION => {
-                let _ = parse_header(path, &bytes)?;
+                let _ = parse_header(path, image)?;
                 return Err(FsviAdmissionError::ReindexRequired(
                     FsviReindexRequired {
                         reason: FsviReindexReason::LegacyUnidentified,
@@ -1831,13 +1883,13 @@ impl ValidatedFsviBytes {
             }
         }
 
-        let (metadata, header_len) = parse_v2_header(path, &bytes)?;
+        let (metadata, header_len) = parse_v2_header(path, image)?;
         validate_expected_v2_binding(path, &metadata, expected)?;
         let (records_offset, strings_offset, vectors_offset) =
-            validate_v2_layout_len(path, &metadata, header_len, bytes.len())?;
+            validate_v2_layout_len(path, &metadata, header_len, image.len())?;
         let content = validate_v2_records_and_content(
             path,
-            &bytes,
+            image,
             &metadata,
             records_offset,
             strings_offset,
@@ -1847,7 +1899,7 @@ impl ValidatedFsviBytes {
             .identity_v2
             .as_ref()
             .ok_or_else(|| index_corrupted(path, "v2 metadata omitted identity bindings"))?;
-        let byte_len = u64::try_from(bytes.len())
+        let byte_len = u64::try_from(image.len())
             .map_err(|_| index_corrupted(path, "owned image length does not fit in u64"))?;
         let dimension = u32::try_from(metadata.dimension)
             .map_err(|_| index_corrupted(path, "dimension does not fit in u32"))?;
@@ -1857,7 +1909,7 @@ impl ValidatedFsviBytes {
             schema_version: FSVI_WITNESS_SCHEMA_V1,
             fsvi_version: FSVI_V2_VERSION,
             byte_len,
-            whole_image_sha256: Sha256::digest(&bytes).into(),
+            whole_image_sha256: Sha256::digest(image).into(),
             generation: identity.generation,
             identity_bundle_fingerprint: identity.identity_bundle_fingerprint,
             space_fingerprint: identity.space_fingerprint,
@@ -1876,12 +1928,15 @@ impl ValidatedFsviBytes {
 
         let warm_up_config = WarmUpConfig::from_env();
         if !matches!(warm_up_config.strategy, WarmUpStrategy::None) {
-            let _ = warmup::warm_up_bytes(&bytes, header_len, &warm_up_config, None);
+            let _ = warmup::warm_up_bytes(image, header_len, &warm_up_config, None);
         }
 
         let index = VectorIndex {
             path: PathBuf::from(OWNED_PATH),
-            data: VectorIndexData::Immutable(Arc::clone(&bytes)),
+            data: VectorIndexData::Immutable {
+                bytes: Arc::clone(&bytes),
+                range: range.clone(),
+            },
             map_lock: None,
             metadata,
             records_offset,
@@ -1894,6 +1949,8 @@ impl ValidatedFsviBytes {
         };
         Ok(Self {
             bytes,
+            byte_range: range,
+            exported_image: OnceLock::new(),
             index,
             witness,
             identity_binding: expected.clone(),
@@ -6934,6 +6991,79 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<ValidatedFsviBytes>();
+    }
+
+    #[test]
+    fn retained_fsvi_ranges_keep_child_witnesses_offsets_and_rebind_bytes() {
+        for precision in [Quantization::F16, Quantization::F32] {
+            let (path, binding) = write_v2_fixture(
+                "retained-range",
+                fsvi_v2_binding("retained-range", 4, precision, 51, 0x51),
+            );
+            let child: Arc<[u8]> = fs::read(&path).unwrap().into();
+            let standalone = ValidatedFsviBytes::from_arc(Arc::clone(&child), &binding).unwrap();
+            let mut container = vec![0x92; 3];
+            container.extend_from_slice(&child);
+            container.extend_from_slice(&[0x37; 11]);
+            let container: Arc<[u8]> = container.into();
+            let range = 3..3 + child.len();
+            let owner =
+                ValidatedFsviBytes::from_arc_range(Arc::clone(&container), range.clone(), &binding)
+                    .unwrap();
+            assert_eq!(owner.witness(), standalone.witness());
+            assert_eq!(owner.owned_byte_len(), child.len());
+            assert_eq!(
+                owner.image_bytes().as_ptr(),
+                container[range.clone()].as_ptr()
+            );
+            assert!(owner.owner_and_search_share_allocation());
+            assert!(owner.exported_image.get().is_none());
+            for physical in 0..owner.record_count() {
+                assert_eq!(
+                    owner.doc_id_at(physical).unwrap(),
+                    standalone.doc_id_at(physical).unwrap()
+                );
+                assert_eq!(
+                    owner.vector_at_f32(physical).unwrap(),
+                    standalone.vector_at_f32(physical).unwrap()
+                );
+            }
+            assert_eq!(
+                owner.search_top_k(&[1.0, 0.0, 0.0, 0.0], 1, None).unwrap(),
+                standalone
+                    .search_top_k(&[1.0, 0.0, 0.0, 0.0], 1, None)
+                    .unwrap()
+            );
+
+            // Rebasing a child must copy its image, never the aggregate framing
+            // or another tier. It also must not materialize the export cache.
+            let next = ArtifactGenerationIdentityV1::new(52, [0x52; 16]).unwrap();
+            let rebound = owner
+                .rebind_generation(&frankensearch_core::Cx::for_testing(), next, child.len())
+                .unwrap();
+            assert_eq!(rebound.owned_byte_len(), child.len());
+            assert_eq!(
+                &rebound.owned_bytes()[owner.identity_v2().header_size..],
+                &child[owner.identity_v2().header_size..]
+            );
+            assert!(owner.exported_image.get().is_none());
+
+            for invalid in [
+                range.end..range.start,
+                range.start..usize::MAX,
+                range.start..range.end - 1,
+                range.start..range.end + 1,
+                0..range.end,
+            ] {
+                assert!(
+                    ValidatedFsviBytes::from_arc_range(Arc::clone(&container), invalid, &binding,)
+                        .is_err()
+                );
+            }
+            let mut corrupted = container.to_vec();
+            corrupted[range.end - 1] ^= 0x80;
+            assert!(ValidatedFsviBytes::from_arc_range(corrupted.into(), range, &binding).is_err());
+        }
     }
 
     #[test]

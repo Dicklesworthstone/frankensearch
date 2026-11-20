@@ -34,6 +34,7 @@
 //! embedded FSVI images' own lengths, hashes, dimensions and physical counts.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 use frankensearch_core::generation::{
@@ -58,9 +59,11 @@ const CHUNK_BYTES: usize = 1024 * 1024;
 /// Immutable complete vector cohort with two independently admitted owners.
 ///
 /// Admission is synchronous and checks cancellation between bounded chunks and
-/// validation stages. It opens no paths and creates no runtime or tasks. The
-/// encoded-image limit does not bound process RSS: parsed owners retain separate
-/// immutable payload allocations alongside the aggregate image.
+/// validation stages. It opens no paths and creates no runtime or tasks.
+/// Reopening shares the aggregate allocation with both independently validated
+/// tier owners; retaining either tier keeps that aggregate alive. Building retains
+/// the supplied input images alongside the packed aggregate. The encoded-image
+/// limit does not bound parsed metadata or process RSS.
 pub struct ExactVectorCohortV1 {
     bytes: Arc<[u8]>,
     tiers: AdmittedTiers,
@@ -105,7 +108,12 @@ impl ExactVectorCohortV1 {
         let total = checked_total(fast.1.len(), quality.1.len(), max_image_bytes)?;
         let fast_bytes = Arc::clone(&fast.1);
         let quality_bytes = Arc::clone(&quality.1);
-        let tiers = admit_tiers(cx, fast, quality, source)?;
+        let tiers = admit_tiers(
+            cx,
+            (fast.0, fast.1, 0..fast_bytes.len()),
+            (quality.0, quality.1, 0..quality_bytes.len()),
+            source,
+        )?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(total)
@@ -181,8 +189,12 @@ impl ExactVectorCohortV1 {
         }
         let tiers = admit_tiers(
             cx,
-            (expected_fast, copy_image(cx, fast.payload)?),
-            (expected_quality, copy_image(cx, quality.payload)?),
+            (
+                expected_fast,
+                Arc::clone(&bytes),
+                VECTOR_COHORT_HEADER_BYTES_V1..fast.end,
+            ),
+            (expected_quality, Arc::clone(&bytes), fast.end..quality.end),
             source,
         )?;
         if bytes[40..72] != tiers.fast_receipt.docset_digest
@@ -254,8 +266,8 @@ impl ExactVectorCohortV1 {
 
 fn admit_tiers(
     cx: &Cx,
-    fast: (&FsviV2IdentityBinding, Arc<[u8]>),
-    quality: (&FsviV2IdentityBinding, Arc<[u8]>),
+    fast: (&FsviV2IdentityBinding, Arc<[u8]>, Range<usize>),
+    quality: (&FsviV2IdentityBinding, Arc<[u8]>, Range<usize>),
     source: SourceCheckpointV1,
 ) -> SearchResult<AdmittedTiers> {
     checkpoint(cx)?;
@@ -270,11 +282,14 @@ fn admit_tiers(
     if fast_identity.space.kind != quality_identity.space.kind {
         return Err(refused("space-kind"));
     }
-    let fast =
-        Arc::new(ValidatedFsviBytes::from_arc(fast.1, fast.0).map_err(|_| refused("fast-image"))?);
+    let fast = Arc::new(
+        ValidatedFsviBytes::from_arc_range(fast.1, fast.2, fast.0)
+            .map_err(|_| refused("fast-image"))?,
+    );
     checkpoint(cx)?;
     let quality = Arc::new(
-        ValidatedFsviBytes::from_arc(quality.1, quality.0).map_err(|_| refused("quality-image"))?,
+        ValidatedFsviBytes::from_arc_range(quality.1, quality.2, quality.0)
+            .map_err(|_| refused("quality-image"))?,
     );
     checkpoint(cx)?;
     let fast_receipt = owner_receipt(cx, &fast, source)?;
@@ -394,14 +409,6 @@ fn checked_total(fast: usize, quality: usize, limit: usize) -> SearchResult<usiz
         .and_then(|size| size.checked_add(quality))
         .filter(|size| *size <= limit)
         .ok_or_else(|| refused("image-budget"))
-}
-
-fn copy_image(cx: &Cx, bytes: &[u8]) -> SearchResult<Arc<[u8]>> {
-    let mut copy = Vec::new();
-    copy.try_reserve_exact(bytes.len())
-        .map_err(|_| refused("allocation"))?;
-    append_image(cx, &mut copy, bytes)?;
-    Ok(copy.into())
 }
 
 fn append_image(cx: &Cx, output: &mut Vec<u8>, bytes: &[u8]) -> SearchResult<()> {
@@ -597,6 +604,111 @@ mod tests {
         assert_eq!(retained.fast().witness(), built.fast().witness());
         assert_eq!(retained.fast().vector_at_f32(0).unwrap().len(), 2);
         assert_eq!(retained.quality().vector_at_f32(0).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn reopened_tiers_share_the_aggregate_and_export_only_the_requested_child() {
+        let fixture = Fixture::new(3);
+        let image = fixture.build().bytes();
+        let reopened = fixture.admit(Arc::clone(&image)).unwrap();
+        let fast = Arc::clone(reopened.fast());
+        let quality = Arc::clone(reopened.quality());
+        for (owner, expected, offset) in [
+            (&fast, &fixture.fast_bytes, VECTOR_COHORT_HEADER_BYTES_V1),
+            (
+                &quality,
+                &fixture.quality_bytes,
+                VECTOR_COHORT_HEADER_BYTES_V1 + fixture.fast_bytes.len(),
+            ),
+        ] {
+            assert!(Arc::ptr_eq(&owner.bytes, &image));
+            assert_eq!(owner.byte_range, offset..offset + expected.len());
+            assert!(owner.owner_and_search_share_allocation());
+            assert!(owner.exported_image.get().is_none());
+            assert_eq!(owner.owned_byte_len(), expected.len());
+        }
+
+        let retained_image = Arc::downgrade(&image);
+        drop(reopened);
+        drop(image);
+        assert!(retained_image.upgrade().is_some());
+        assert_eq!(
+            fast.search_top_k(&[1.0, 0.0], 1, None).unwrap()[0].doc_id,
+            "zeta"
+        );
+        assert_eq!(
+            quality.search_top_k(&[1.0, 0.0, 0.0], 1, None).unwrap()[0].doc_id,
+            "zeta"
+        );
+        assert!(fast.exported_image.get().is_none());
+        assert!(quality.exported_image.get().is_none());
+
+        let mut exported = fast.owned_bytes();
+        assert_eq!(exported, fixture.fast_bytes);
+        assert!(Arc::ptr_eq(&exported, &fast.owned_bytes()));
+        assert!(!Arc::ptr_eq(&exported, &fast.bytes));
+        assert!(quality.exported_image.get().is_none());
+        Arc::make_mut(&mut exported)[0] ^= 0x80;
+        assert_eq!(fast.owned_bytes(), fixture.fast_bytes);
+        assert_eq!(
+            fast.search_top_k(&[1.0, 0.0], 1, None).unwrap()[0].doc_id,
+            "zeta"
+        );
+        drop(fast);
+        drop(quality);
+        assert!(retained_image.upgrade().is_none());
+    }
+
+    #[test]
+    fn retained_quality_rows_can_start_at_an_unaligned_aggregate_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        let template = binding("unaligned-fast", 1);
+        let mut identity = template.frozen_identity().identity.clone();
+        identity.storage.quantization = QuantizationFormat::F16;
+        let fast =
+            FsviV2IdentityBinding::new(template.generation(), identity.freeze().unwrap()).unwrap();
+        let quality = binding("unaligned-quality", 3);
+        let fast_image = write_image(
+            directory.path(),
+            "fast.fsvi",
+            &fast,
+            &[("zeta", true), ("alpha", true), ("deleted", false)],
+        );
+        let quality_image = write_image(directory.path(), "quality.fsvi", &quality, &LIVE);
+        let quality_start = VECTOR_COHORT_HEADER_BYTES_V1 + fast_image.len();
+        assert_eq!(quality_start % 4, 2);
+        let original = ValidatedFsviBytes::from_arc(Arc::clone(&quality_image), &quality).unwrap();
+        let image = ExactVectorCohortV1::build(
+            &Cx::for_testing(),
+            (&fast, fast_image),
+            (&quality, quality_image),
+            source(),
+            BUDGET,
+        )
+        .unwrap()
+        .bytes();
+        let cohort = ExactVectorCohortV1::admit(
+            &Cx::for_testing(),
+            Arc::clone(&image),
+            &fast,
+            &quality,
+            source(),
+            BUDGET,
+        )
+        .unwrap();
+        assert_eq!(cohort.quality().witness(), original.witness());
+        assert_eq!(
+            cohort.quality().image_bytes().as_ptr(),
+            image[quality_start..].as_ptr()
+        );
+        assert_eq!(cohort.fast().tombstone_count(), 1);
+        for query in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            assert_eq!(
+                cohort.quality().search_top_k(&query, 2, None).unwrap(),
+                original.search_top_k(&query, 2, None).unwrap()
+            );
+        }
+        assert!(cohort.quality().exported_image.get().is_none());
     }
 
     #[test]

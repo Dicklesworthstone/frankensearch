@@ -8263,8 +8263,8 @@ mod tests {
     /// Rust drops fields in declaration order, so the byte image is released
     /// first while the index that serves from it is still alive.
     ///
-    /// That is sound only because `index.data` is
-    /// `VectorIndexData::Immutable(Arc::clone(&bytes))` -- the SAME allocation
+    /// That is sound only because `index.data`'s
+    /// `VectorIndexData::Immutable` retains the SAME allocation and image range
     /// behind a second refcount, not a borrow and not a second copy. A naive
     /// owner that stored a borrow, a raw pointer, or an independent copy would
     /// be either unsound or silently double-resident under exactly this

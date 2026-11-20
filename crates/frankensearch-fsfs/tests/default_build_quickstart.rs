@@ -183,6 +183,10 @@ mod loader_only {
                 .env_remove("FRANKENSEARCH_STORAGE_INDEX_DIR")
                 .env_remove("FRANKENSEARCH_RANKING_PRIORS")
                 .env_remove("FSFS_RANKING_PRIORS")
+                .env_remove("FRANKENSEARCH_PRESSURE_PROFILE")
+                .env_remove("FSFS_PRESSURE_PROFILE")
+                .env_remove("FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE")
+                .env_remove("FSFS_PRESSURE_DEGRADATION_OVERRIDE")
                 .env_remove("FRANKENSEARCH_INDEXING_UPGRADE_REUSE")
                 .env_remove("FSFS_INDEXING_UPGRADE_REUSE")
                 .env_remove("FRANKENSEARCH_COMPLETE_GENERATIONS")
@@ -834,8 +838,10 @@ mod loader_only {
         let mut records = matching_records();
         assert_eq!(records.len(), 1, "the real query must persist one answer");
         let (cache_path, cache_bytes, record) = records.pop().unwrap();
-        assert_eq!(record["schema_version"], "fsfs.search.cache.v43");
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v44");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
+        assert_eq!(record["key"]["pressure_profile"], "performance");
+        assert_eq!(record["key"]["degradation_override"], "auto");
 
         // Multiple fresh processes keep an isolated scheduling delay from
         // deciding the latency gate. The load-log assertion is the
@@ -3062,7 +3068,9 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v40");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v41");
+                    assert_eq!(response["policy"]["pressure_profile"], "performance");
+                    assert_eq!(response["policy"]["degradation_override"], "auto");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
                     let mut contracts = sha2::Sha256::new();
                     for manifest in [
