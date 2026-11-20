@@ -729,7 +729,7 @@ impl FsfsRuntime {
                 RetainedBuildKind::Index => {
                     store.begin_with_predecessor_check(cx, |predecessor| {
                         self.validate_index_source_root(
-                            predecessor.map_or(store.root(), |generation| generation.path()),
+                            predecessor.map_or_else(|| store.root(), |generation| generation.path()),
                             &target_root,
                         )
                     })?
