@@ -1182,7 +1182,7 @@ fn append_batch_reaches_the_lexical_arm_and_delete_removes_it_everywhere() {
 /// The registered model cache, when it carries both semantic tiers and the
 /// ms-marco cross-encoder weights (`fsfs download-models ms-marco-minilm-l-6-v2`).
 /// `None` means the real-model rerank lane must skip, never fake a pass.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "rerank"))]
 fn registered_model_cache_with_reranker() -> Option<PathBuf> {
     let root = std::env::var_os("FRANKENSEARCH_MODEL_DIR")
         .map(PathBuf::from)
@@ -1207,7 +1207,7 @@ fn registered_model_cache_with_reranker() -> Option<PathBuf> {
 /// order and says `query.stage.rerank.disabled.unavailable`. Runs only where
 /// the registered model cache carries the semantic tiers and the ms-marco
 /// weights; skips elsewhere.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "rerank"))]
 #[test]
 fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
     let Some(model_root) = registered_model_cache_with_reranker() else {
@@ -1303,22 +1303,28 @@ fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
 
     let mut rerank_args = base_args.to_vec();
     rerank_args.push("--rerank");
-    for flags in [&["--limit", "0"][..], &["--limit", "1", "--fast-only"]] {
+    for (flags, expected_hits, reason) in [
+        (
+            &["--limit", "0"][..],
+            0,
+            "query.stage.rerank.disabled.zero_depth",
+        ),
+        (
+            &["--limit", "1", "--fast-only"][..],
+            1,
+            "query.stage.rerank.disabled.no_quality",
+        ),
+    ] {
         let mut args = rerank_args.clone();
         args.extend_from_slice(flags);
         let skipped = ctx.run_with_env(temp.path(), &args, &real_models);
         assert_success("search without rerank work", &skipped);
         let result = parse_json("search without rerank work", &skipped);
-        let hits = hit_paths(&result);
-        let reason = if flags[1] == "0" {
-            assert!(hits.is_empty(), "{result}");
-            "query.stage.rerank.disabled.zero_depth"
-        } else {
-            assert_eq!(hits.len(), 1, "{result}");
-            "query.stage.rerank.disabled.no_quality"
-        };
+        assert_eq!(hit_paths(&result).len(), expected_hits, "{result}");
         assert_eq!(
-            result.pointer("/data/rerank/reason_code").and_then(Value::as_str),
+            result
+                .pointer("/data/rerank/reason_code")
+                .and_then(Value::as_str),
             Some(reason),
             "{result}"
         );
@@ -1350,11 +1356,8 @@ fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
         stage.get("model").and_then(Value::as_str),
         Some("ms-marco-minilm-l-6-v2")
     );
-    let scores = stage
-        .get("scores")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let scores: Vec<frankensearch_fsfs::output_schema::RerankHitScore> =
+        serde_json::from_value(stage["scores"].clone()).expect("decode reranked hits");
     assert!(!scores.is_empty(), "{stage}");
     let reranked_order = hit_paths(&json);
     assert_eq!(
@@ -1363,14 +1366,11 @@ fn search_rerank_re_scores_the_refined_head_with_the_real_cross_encoder() {
         "the cross-encoder must put the relevant document first: {json}"
     );
     assert_eq!(
-        scores[0].get("path").and_then(Value::as_str),
+        Some(scores[0].path.as_str()),
         reranked_order.first().map(String::as_str),
         "scores are reported in final rank order: {stage}"
     );
-    let values = scores
-        .iter()
-        .filter_map(|score| score.get("score").and_then(Value::as_f64))
-        .collect::<Vec<_>>();
+    let values: Vec<_> = scores.iter().map(|hit| hit.score).collect();
     assert!(
         values.windows(2).all(|pair| pair[0] >= pair[1]),
         "descending scores: {values:?}"
