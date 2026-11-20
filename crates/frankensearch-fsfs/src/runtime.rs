@@ -45075,7 +45075,7 @@ mod tests {
             for (query, strict, mode) in [
                 ("  \n\t ", false, SearchExecutionMode::Full),
                 ("???", false, SearchExecutionMode::Full),
-                ("find\u{0007}secret", false, SearchExecutionMode::Full),
+                ("\u{0007}", false, SearchExecutionMode::Full),
                 ("recover network failures", true, SearchExecutionMode::Full),
                 ("   ", false, SearchExecutionMode::QualityOnly),
             ] {
@@ -45095,7 +45095,12 @@ mod tests {
                 .await;
                 drop(operation);
                 assert!(request.reranker.get().unwrap().0.is_none());
-                let key = request.search_cache_key(query, 10, mode).unwrap();
+                let key = request.search_cache_key(query, 10, mode);
+                if mode == SearchExecutionMode::QualityOnly && !super::SEMANTIC_LOADERS_COMPILED {
+                    assert!(matches!(key, Err(SearchError::EmbedderUnavailable { .. })));
+                    continue;
+                }
+                let key = key.unwrap();
                 assert!(key.rerank_model.is_none());
                 assert!(key.rerank_contract.is_none());
                 assert!(runtime.reranker.get().is_none());
@@ -45128,22 +45133,28 @@ mod tests {
             let provider: Arc<dyn frankensearch_core::Reranker> =
                 Arc::new(frankensearch_core::SyncRerankerAdapter(ReverseReranker));
             super::set_test_reranker(Some(Arc::clone(&provider)));
-            for mode in [SearchExecutionMode::Full, SearchExecutionMode::QualityOnly] {
+            for (query, mode) in [
+                ("recover network failures", SearchExecutionMode::Full),
+                ("recover network failures", SearchExecutionMode::QualityOnly),
+                ("find\u{0007}secret", SearchExecutionMode::Full),
+            ] {
                 let mut request = runtime.clone();
                 request
-                    .prepare_search_reranker(&cx, "recover network failures", 10, mode, &resources)
+                    .prepare_search_reranker(&cx, query, 10, mode, &resources)
                     .await
                     .unwrap();
                 let selected = request.reranker.get().unwrap().0.as_ref().unwrap();
                 assert!(Arc::ptr_eq(selected, &provider));
-                assert_eq!(
-                    request
-                        .search_cache_key("recover network failures", 10, mode)
-                        .unwrap()
-                        .rerank_model
-                        .as_deref(),
-                    Some("reverse-reranker-test"),
-                );
+                let key = request.search_cache_key(query, 10, mode);
+                if mode == SearchExecutionMode::QualityOnly && !super::SEMANTIC_LOADERS_COMPILED {
+                    assert!(matches!(key, Err(SearchError::EmbedderUnavailable { .. })));
+                } else {
+                    let key = key.unwrap();
+                    assert_eq!(key.rerank_model.as_deref(), Some("reverse-reranker-test"));
+                    if query == "find\u{0007}secret" {
+                        assert_eq!(key, request.search_cache_key("find secret", 10, mode).unwrap());
+                    }
+                }
             }
             // Explicit QualityOnly does not inherit hybrid's lexical fallback.
             let mut quality = runtime.clone();
