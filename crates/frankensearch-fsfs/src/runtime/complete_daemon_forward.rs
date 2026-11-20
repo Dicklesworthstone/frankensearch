@@ -59,7 +59,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 21: quoted literals and case-insensitive phrase exclusions agree across lanes.
 // 22: reranking scores its candidate window before the displayed page is cut.
 // 23: zero is a valid result limit; empty rerank decisions and scores follow it.
-const VERSION: u32 = 23;
+// 24: pressure profiles and degradation overrides bind the answer policy.
+const VERSION: u32 = 24;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -1245,7 +1246,12 @@ mod tests {
             crate::runtime::FSFS_SEARCH_CACHE_SCHEMA_VERSION
         );
         for section in [
-            "indexing", "search", "privacy", "pressure", "storage", "answer_cache_schema",
+            "indexing",
+            "search",
+            "privacy",
+            "pressure",
+            "storage",
+            "answer_cache_schema",
         ] {
             request.search.configuration = original.clone();
             request.search.configuration[section] = serde_json::Value::Null;

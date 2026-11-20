@@ -697,7 +697,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v41: distinguish an empty rerank candidate set from an enabled stage.
 // v42: zero-depth reranking is independent of cross-encoder availability.
 // v43: an empty quality query reports no candidates even without a cross-encoder.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v43";
+// v44: planner fanout and ranking priors bind the pressure profile and override.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v44";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -737,8 +738,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v38 / stream v36: explain why a positive rerank request scored no candidates.
 // v39 / stream v37: skip model selection for requests that cannot rerank.
 // v40 / stream v38: reranker eligibility uses the normalized query and retained tiers.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v40";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v38";
+// v41 / stream v39: attest the serving pressure profile and degradation override.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v41";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v39";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -1866,6 +1868,12 @@ struct SearchCacheKey {
     filter: Option<String>,
     fast_only: bool,
     ranking_priors: bool,
+    /// Profiles change retrieval fanout and prior weights even when quality
+    /// is disabled in both requests. Missing fields cannot admit old answers.
+    pressure_profile: PressureProfile,
+    /// Deferred embedding also disables code-navigation priors; fast_only
+    /// alone does not represent the effective ranking and diagnostic policy.
+    degradation_override: DegradationOverrideMode,
     rrf_k_bits: u64,
     /// Exact bits of the f32 policy consumed by the shared blend kernel.
     quality_weight_bits: u32,
@@ -1975,6 +1983,8 @@ struct SearchServePolicy {
     rrf_k_bits: u64,
     fast_only: bool,
     ranking_priors: bool,
+    pressure_profile: PressureProfile,
+    degradation_override: DegradationOverrideMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11876,15 +11886,13 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    /// Start this executable with `args` plus the caller's config, verbosity
-    /// and color flags, detached from the calling command and with no stdio.
+    /// Build the child command with the resolved pressure profile. A profile
+    /// selected on the search CLI is not inherited through the config file.
     #[cfg(unix)]
-    fn spawn_detached_fsfs(
+    fn detached_fsfs_command(
         &self,
         args: impl IntoIterator<Item = std::ffi::OsString>,
-    ) -> SearchResult<std::process::Child> {
-        use std::os::unix::process::CommandExt;
-
+    ) -> SearchResult<Command> {
         let binary_path = std::env::current_exe().map_err(SearchError::Io)?;
         // ubs:ignore[rust.security.command-executable] -- The OS supplies this running executable; query/config values are separate argv, never an executable selector.
         let mut command = Command::new(binary_path);
@@ -11896,6 +11904,13 @@ impl FsfsRuntime {
         if let Some(config_path) = self.cli_input.overrides.config_path.as_deref() {
             command.arg("--config").arg(config_path);
         }
+        command
+            .arg("--profile")
+            .arg(match self.config.pressure.profile {
+                PressureProfile::Strict => "strict",
+                PressureProfile::Performance => "performance",
+                PressureProfile::Degraded => "degraded",
+            });
         if self.cli_input.verbose {
             command.arg("--verbose");
         }
@@ -11905,6 +11920,19 @@ impl FsfsRuntime {
         if self.cli_input.no_color {
             command.arg("--no-color");
         }
+        Ok(command)
+    }
+
+    /// Start this executable with the caller's configuration and profile,
+    /// detached from the calling command and with no stdio.
+    #[cfg(unix)]
+    fn spawn_detached_fsfs(
+        &self,
+        args: impl IntoIterator<Item = std::ffi::OsString>,
+    ) -> SearchResult<std::process::Child> {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = self.detached_fsfs_command(args)?;
 
         // Detach the daemon from the search that spawned it. Two properties
         // must hold at once, and they come from two different places:
@@ -12015,6 +12043,7 @@ impl FsfsRuntime {
         let variant = Self::daemon_socket_variant(
             &fast_model,
             &quality_model,
+            self.config.pressure.profile,
             self.config.pressure.degradation_override,
             FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             FSFS_SEARCH_SERVE_STREAM_VERSION,
@@ -12026,12 +12055,13 @@ impl FsfsRuntime {
         ))
     }
 
-    /// Socket name suffix that separates daemons by checked model ids and
-    /// serve protocol.
+    /// Socket name suffix that separates daemons by checked model ids,
+    /// pressure policy and serve protocol.
     #[cfg(unix)]
     fn daemon_socket_variant(
         fast_model: &str,
         quality_model: &str,
+        pressure_profile: PressureProfile,
         degradation_override: crate::config::DegradationOverrideMode,
         serve_version: &str,
         stream_version: &str,
@@ -12041,8 +12071,10 @@ impl FsfsRuntime {
         hasher.update([0]);
         hasher.update(quality_model.as_bytes());
         hasher.update([0]);
-        // A daemon applies its own degradation override to every request, so
-        // clients with a different override must not share it.
+        // A daemon owns its worker limits, planner profile and degradation
+        // override. Different policies need separate daemon lifetimes.
+        hasher.update(format!("{pressure_profile:?}").as_bytes());
+        hasher.update([0]);
         hasher.update(format!("{degradation_override:?}").as_bytes());
         hasher.update([0]);
         hasher.update(serve_version.as_bytes());
@@ -14483,6 +14515,8 @@ impl FsfsRuntime {
             filter: self.cli_input.filter.clone(),
             fast_only: self.quality_disabled_by_policy(),
             ranking_priors: self.config.search.ranking_priors,
+            pressure_profile: self.config.pressure.profile,
+            degradation_override: self.config.pressure.degradation_override,
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
@@ -14539,6 +14573,10 @@ impl FsfsRuntime {
         hasher.update(key.filter.as_deref().unwrap_or("").as_bytes());
         hasher.update([u8::from(key.fast_only)]);
         hasher.update([u8::from(key.ranking_priors)]);
+        hasher.update(format!("{:?}", key.pressure_profile).as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{:?}", key.degradation_override).as_bytes());
+        hasher.update([0]);
         hasher.update(key.rrf_k_bits.to_le_bytes());
         hasher.update(key.quality_weight_bits.to_le_bytes());
         hasher.update(key.quality_timeout_ms.to_le_bytes());
@@ -14616,6 +14654,8 @@ impl FsfsRuntime {
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
             fast_only: self.quality_disabled_by_policy(),
             ranking_priors: self.config.search.ranking_priors,
+            pressure_profile: self.config.pressure.profile,
+            degradation_override: self.config.pressure.degradation_override,
         })
     }
 
@@ -35871,6 +35911,197 @@ mod tests {
             !plain.ranking_priors_enabled(),
             "request selection must not mutate server defaults"
         );
+        let mut profiled = enabled.clone();
+        profiled.config.search.fast_only = true;
+        let profiled_key = profiled.search_cache_key("identifier", 5, mode).unwrap();
+        for (profile, degradation) in [
+            (PressureProfile::Strict, DegradationOverrideMode::Auto),
+            (PressureProfile::Degraded, DegradationOverrideMode::Auto),
+            (
+                PressureProfile::Performance,
+                DegradationOverrideMode::ForceEmbedDeferred,
+            ),
+        ] {
+            let mut changed = profiled.clone();
+            changed.config.pressure.profile = profile;
+            changed.config.pressure.degradation_override = degradation;
+            let key = changed.search_cache_key("identifier", 5, mode).unwrap();
+            assert_ne!(key, profiled_key);
+            assert_ne!(
+                FsfsRuntime::search_cache_key_hash(&key),
+                FsfsRuntime::search_cache_key_hash(&profiled_key),
+            );
+            assert_ne!(
+                changed.search_serve_policy_for_mode(mode).unwrap(),
+                profiled.search_serve_policy_for_mode(mode).unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn pressure_policy_separates_live_rankings_and_persistent_and_hot_caches() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let path = temp.path().join("profile.fsvi");
+            let mut writer = VectorIndex::create_with_revision(
+                &path,
+                "blend-fast-2",
+                &test_identity("blend-fast-2", 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer
+                .write_record("docs/overview.md", &[1.0, 0.0])
+                .unwrap();
+            writer
+                .write_record("src/query_execution.rs", &[0.0, 1.0])
+                .unwrap();
+            writer.finish().unwrap();
+            resources.vector_index = Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
+            resources.resource_mode = SearchExecutionMode::FastOnly;
+            let fingerprint = resources.generation_fingerprint.clone();
+            let runtime = |profile, degradation_override| {
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = temp.path().display().to_string();
+                config.search.fast_only = true;
+                config.search.ranking_priors = true;
+                config.pressure.profile = profile;
+                config.pressure.degradation_override = degradation_override;
+                FsfsRuntime::new(config).with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                })
+            };
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": "query_execution", "mode": "fast_only", "limit": 2,
+                "fast_only": true, "ranking_priors": true,
+            }))
+            .unwrap();
+            let mode = SearchExecutionMode::FastOnly;
+            let performance = runtime(PressureProfile::Performance, DegradationOverrideMode::Auto);
+            let key = performance
+                .search_cache_key(&request.query, 2, mode)
+                .unwrap();
+            let mut hot = HashMap::new();
+            let cold = performance
+                .execute_search_serve_request(&cx, request.clone(), &mut resources, &mut hot, true)
+                .await
+                .unwrap();
+            assert!(!cold.cached);
+            assert_eq!(cold.payloads.len(), 1);
+            let code_score = |payloads: &[SearchPayload]| {
+                payloads[0]
+                    .hits
+                    .iter()
+                    .find(|hit| hit.path == "src/query_execution.rs")
+                    .expect("the same code document must be retrieved under every policy")
+                    .score
+            };
+            let performance_score = code_score(&cold.payloads);
+            performance
+                .write_search_payload_cache(&key, &cold.payloads, &fingerprint)
+                .unwrap();
+            assert_eq!(
+                performance
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap(),
+                Some(cold.payloads.clone()),
+            );
+
+            for (profile, degradation) in [
+                (PressureProfile::Strict, DegradationOverrideMode::Auto),
+                (PressureProfile::Degraded, DegradationOverrideMode::Auto),
+                (
+                    PressureProfile::Performance,
+                    DegradationOverrideMode::ForceEmbedDeferred,
+                ),
+            ] {
+                let changed = runtime(profile, degradation);
+                let changed_key = changed.search_cache_key(&request.query, 2, mode).unwrap();
+                assert_ne!(changed_key, key, "{profile:?} {degradation:?}");
+                assert_ne!(
+                    changed.search_cache_path(&changed_key).unwrap(),
+                    performance.search_cache_path(&key).unwrap(),
+                    "different policies must not overwrite one persistent cache file",
+                );
+                assert!(
+                    changed
+                        .try_load_search_payload_cache(&changed_key, &fingerprint)
+                        .unwrap()
+                        .is_none(),
+                    "a previous policy's persisted scores cannot satisfy this request",
+                );
+                let response = changed
+                    .execute_search_serve_request(
+                        &cx,
+                        request.clone(),
+                        &mut resources,
+                        &mut hot,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!response.cached, "{profile:?} {degradation:?}");
+                assert!(
+                    code_score(&response.payloads) < performance_score,
+                    "the real search must use the profile's smaller or disabled code prior",
+                );
+                changed
+                    .write_search_payload_cache(&changed_key, &response.payloads, &fingerprint)
+                    .unwrap();
+                assert_eq!(
+                    changed
+                        .try_load_search_payload_cache(&changed_key, &fingerprint)
+                        .unwrap(),
+                    Some(response.payloads.clone()),
+                );
+                let warm = changed
+                    .execute_search_serve_request(
+                        &cx,
+                        request.clone(),
+                        &mut resources,
+                        &mut hot,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(warm.cached);
+                assert_eq!(warm.payloads, response.payloads);
+            }
+            assert_eq!(hot.len(), 4);
+            let original = performance
+                .execute_search_serve_request(&cx, request, &mut resources, &mut hot, true)
+                .await
+                .unwrap();
+            assert!(original.cached);
+            assert_eq!(original.payloads, cold.payloads);
+            assert_eq!(
+                performance
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap(),
+                Some(cold.payloads),
+                "other policies must preserve the original persistent entry",
+            );
+
+            // Even a record copied under the new filename cannot omit the
+            // policy and acquire its default by deserialization.
+            let cache_path = performance.search_cache_path(&key).unwrap();
+            let bytes = fs::read(&cache_path).unwrap();
+            for field in ["pressure_profile", "degradation_override"] {
+                let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                legacy["key"].as_object_mut().unwrap().remove(field);
+                fs::write(&cache_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+                assert!(
+                    performance
+                        .try_load_search_payload_cache(&key, &fingerprint)
+                        .is_err(),
+                    "missing {field} cannot attest persisted ranking policy",
+                );
+            }
+        });
     }
 
     #[test]
@@ -38970,6 +39201,27 @@ mod tests {
             "the daemon must acknowledge the requested ranking-prior policy"
         );
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.policy.as_mut().unwrap().pressure_profile = PressureProfile::Strict;
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "the daemon must acknowledge the planner and prior profile"
+        );
+        response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.policy.as_mut().unwrap().degradation_override =
+            DegradationOverrideMode::ForceEmbedDeferred;
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "the daemon must acknowledge the effective degradation policy"
+        );
+        response.policy = Some(runtime.search_serve_policy().unwrap());
+        for field in ["pressure_profile", "degradation_override"] {
+            let mut unbound = serde_json::to_value(&response).unwrap();
+            unbound["policy"].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<super::SearchServeResponse>(unbound).is_err(),
+                "an omitted {field} cannot acknowledge a current request",
+            );
+        }
         for old_schema in [
             "fsfs.search.serve.v18",
             "fsfs.search.serve.v19",
@@ -38983,6 +39235,7 @@ mod tests {
             "fsfs.search.serve.v27",
             "fsfs.search.serve.v28",
             "fsfs.search.serve.v39",
+            "fsfs.search.serve.v40",
         ] {
             response.schema_version = old_schema.to_owned();
             assert!(
@@ -41271,6 +41524,7 @@ mod tests {
         // predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
             "fsfs.search.serve.stream.v37",
+            "fsfs.search.serve.stream.v38",
             "fsfs.search.serve.stream.v17",
             "fsfs.search.serve.stream.v16",
             "fsfs.search.serve.stream.v15",
@@ -41333,6 +41587,29 @@ mod tests {
             !state.attested,
             "a different ranking policy must admit no phase"
         );
+        for (profile, degradation) in [
+            (PressureProfile::Strict, DegradationOverrideMode::Auto),
+            (
+                PressureProfile::Performance,
+                DegradationOverrideMode::ForceEmbedDeferred,
+            ),
+        ] {
+            let mut bad = header();
+            if let SearchServeFrame::Attested { policy, .. } = &mut bad {
+                policy.pressure_profile = profile;
+                policy.degradation_override = degradation;
+            }
+            assert!(
+                accept(bad, &mut state)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("search policy")
+            );
+            assert!(
+                !state.attested,
+                "mismatched pressure policy must admit no phase"
+            );
+        }
         let mut bad = header();
         if let SearchServeFrame::Attested { policy, .. } = &mut bad {
             policy.quality_weight_bits = 0;
@@ -49499,6 +49776,43 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn detached_daemon_command_preserves_the_resolved_pressure_profile() {
+        for profile in [
+            PressureProfile::Performance,
+            PressureProfile::Strict,
+            PressureProfile::Degraded,
+        ] {
+            for cli_selected in [false, true] {
+                let mut config = FsfsConfig::default();
+                config.pressure.profile = profile;
+                let mut input = CliInput::default();
+                input.overrides.profile = cli_selected.then_some(profile);
+                input.overrides.config_path = Some(PathBuf::from("daemon-policy.toml"));
+                input.verbose = true;
+                input.no_color = true;
+                let runtime = FsfsRuntime::new(config).with_cli_input(input);
+                let command = runtime.detached_fsfs_command(["serve".into()]).unwrap();
+                let child = crate::adapters::cli::parse_cli_args(
+                    command.get_args().map(|arg| arg.to_str().unwrap()),
+                )
+                .unwrap();
+                assert_eq!(child.command, CliCommand::Serve);
+                assert_eq!(child.overrides.profile, Some(profile));
+                assert_eq!(
+                    child.overrides.config_path,
+                    runtime.cli_input.overrides.config_path,
+                );
+                assert!(child.verbose && child.no_color);
+                assert_eq!(
+                    runtime.cli_input.overrides.profile,
+                    cli_selected.then_some(profile)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn daemon_socket_variant_changes_with_the_serve_protocol() {
         use super::{
             FSFS_DAEMON_SOCKET_VARIANT_LEN, FSFS_SEARCH_SERVE_SCHEMA_VERSION,
@@ -49508,6 +49822,7 @@ mod tests {
         let current = FsfsRuntime::daemon_socket_variant(
             "potion-multilingual-128m",
             "all-MiniLM-L6-v2",
+            PressureProfile::Performance,
             Auto,
             FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             FSFS_SEARCH_SERVE_STREAM_VERSION,
@@ -49555,12 +49870,27 @@ mod tests {
                 FsfsRuntime::daemon_socket_variant(
                     "potion-multilingual-128m",
                     model,
+                    PressureProfile::Performance,
                     degradation,
                     serve,
                     stream
                 ),
                 current,
                 "{model} {degradation:?} {serve} {stream}"
+            );
+        }
+        for profile in [PressureProfile::Strict, PressureProfile::Degraded] {
+            assert_ne!(
+                FsfsRuntime::daemon_socket_variant(
+                    "potion-multilingual-128m",
+                    "all-MiniLM-L6-v2",
+                    profile,
+                    Auto,
+                    FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+                    FSFS_SEARCH_SERVE_STREAM_VERSION,
+                ),
+                current,
+                "a {profile:?} client must not inherit performance worker and ranking policy",
             );
         }
     }
@@ -69014,6 +69344,8 @@ mod tests {
                 "fsfs.search.cache.v40",
                 // Could report an unavailable reranker for a query with no candidates.
                 "fsfs.search.cache.v42",
+                // Could replay another pressure profile or override's scores.
+                "fsfs.search.cache.v43",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

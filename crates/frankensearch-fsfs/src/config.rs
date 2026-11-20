@@ -69,7 +69,7 @@ pub enum TextSelectionMode {
     Allowlist,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PressureProfile {
     Strict,
@@ -168,7 +168,7 @@ pub struct PressureProfileResolution {
     pub diagnostics: PressureProfileResolutionDiagnostics,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DegradationOverrideMode {
     #[default]
