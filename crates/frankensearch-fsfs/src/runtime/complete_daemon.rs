@@ -541,7 +541,10 @@ impl FsfsRuntime {
                 .and_then(|(request, _)| {
                     Ok((
                         self.complete_request_delivery_budget(&request),
-                        parse_search_execution_mode(request.mode.as_deref())?,
+                        self.search_mode_for_query(
+                            &request.query,
+                            parse_search_execution_mode(request.mode.as_deref())?,
+                        )?,
                     ))
                 })
                 .unwrap_or((peer_timeout, SearchExecutionMode::LexicalOnly))
@@ -582,7 +585,7 @@ impl FsfsRuntime {
                     write_response(cx, &mut peer, &ready, peer_timeout).await?;
                     return Ok(PeerOutcome::Search);
                 }
-                let (mut session, mut cache) = match self
+                let ((mut session, mut cache), opening_mode) = match self
                     .snapshot_complete_daemon_request(
                         cx,
                         &shared,
@@ -703,6 +706,32 @@ impl FsfsRuntime {
                 // Rejected local entries still need eviction when this peer
                 // was cancelled. Do not admit new results after cancellation.
                 let checkpoint = retained_search_checkpoint(cx);
+                if result.is_ok()
+                    && checkpoint.is_ok()
+                    && matches!(
+                        (opening_mode, session.reader.resources.resource_mode),
+                        (
+                            SearchExecutionMode::LexicalOnly,
+                            SearchExecutionMode::Full
+                                | SearchExecutionMode::FastOnly
+                                | SearchExecutionMode::QualityOnly
+                        ) | (
+                            SearchExecutionMode::FastOnly | SearchExecutionMode::QualityOnly,
+                            SearchExecutionMode::Full
+                        )
+                    )
+                    && original_cache.generation == *session.generation()
+                    && state.0.generation() == session.generation()
+                    && state.0.reader.resources.resource_mode == opening_mode
+                {
+                    // The service opens lexically before receiving a query.
+                    // Retain a successful request's wider tiers so subsequent
+                    // semantic queries can reuse its resources and answer cache.
+                    // Never replace a concurrent publication or mode change,
+                    // and never let a lexical request downgrade a warm reader.
+                    state.0.reader.resources = session.reader.resources.clone();
+                    state.1.clear();
+                }
                 if cache_enabled {
                     original_cache.reconcile(
                         &mut state,
@@ -786,13 +815,14 @@ impl FsfsRuntime {
         bytes: &[u8],
         prepare_fast: bool,
         cache_enabled: bool,
-    ) -> SearchResult<SessionState> {
+    ) -> SearchResult<(SessionState, SearchExecutionMode)> {
         let mut session = self
             .snapshot_complete_daemon(cx, shared, prepare_fast)
             .await?;
+        let opening_mode = session.reader.resources.resource_mode;
         let mut cache = HashMap::new();
         if !cache_enabled {
-            return Ok((session, cache));
+            return Ok(((session, cache), opening_mode));
         }
         let prepared = async {
             let request = if forwarding::is_forwarded(bytes) {
@@ -804,8 +834,8 @@ impl FsfsRuntime {
             let Some((runtime, request)) = request else {
                 return Ok(None);
             };
-            let mode = degraded_search_mode(
-                runtime.config.pressure.degradation_override,
+            let mode = runtime.search_mode_for_query(
+                &request.query,
                 parse_search_execution_mode(request.mode.as_deref())?,
             )?;
             let limit = request.limit.unwrap_or_else(|| {
@@ -841,7 +871,7 @@ impl FsfsRuntime {
         // failed key projection cannot authorize an answer; let the ordinary
         // handler report that failure through its existing transport path.
         let Ok(Some((prepared, key))) = prepared else {
-            return Ok((session, cache));
+            return Ok(((session, cache), opening_mode));
         };
         // Freeze even an unavailable reranker for this request, matching the
         // key selected above. A concurrent successful load remains available
@@ -856,7 +886,7 @@ impl FsfsRuntime {
         {
             cache.insert(key, payloads.clone());
         }
-        Ok((session, cache))
+        Ok(((session, cache), opening_mode))
     }
 
     /// Raw streams use the same typed request mode as buffered searches. Admit
@@ -872,8 +902,7 @@ impl FsfsRuntime {
         let requested_mode = parse_search_execution_mode(request.mode.as_deref())?;
         let mut runtime = self.with_search_serve_request_policy(&request)?;
         runtime.quality_budget_started_at = None;
-        let mode =
-            degraded_search_mode(runtime.config.pressure.degradation_override, requested_mode)?;
+        let mode = runtime.search_mode_for_query(&request.query, requested_mode)?;
         runtime.validate_semantic_model_selection(mode)?;
         runtime
             .rebind_search_resources_if_generation_changed(cx, mode, resources)
@@ -2777,11 +2806,22 @@ mod generation_tests {
         shared: &SharedSession,
         bound: &BoundCompleteSocket,
     ) -> serde_json::Value {
+        complete_cache_exchange_request(cx, runtime, shared, bound, CACHE_TEST_REQUEST).await
+    }
+
+    #[cfg(feature = "semantic-support")]
+    async fn complete_cache_exchange_request(
+        cx: &Cx,
+        runtime: &FsfsRuntime,
+        shared: &SharedSession,
+        bound: &BoundCompleteSocket,
+        request: &[u8],
+    ) -> serde_json::Value {
         let mut client = UnixStream::connect(&bound.path).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        client.write_all(CACHE_TEST_REQUEST).unwrap();
+        client.write_all(request).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
         let timeout = Duration::from_secs(10);
         let mut intake = admission::Intake::new(timeout);
@@ -2800,6 +2840,89 @@ mod generation_tests {
             .read_line(&mut line)
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_daemon_lexical_startup_retains_positive_resources_and_cached_answers() {
+        struct RestoreProviders {
+            fast: Option<Arc<dyn frankensearch_core::Embedder>>,
+            quality: Option<Arc<dyn frankensearch_core::Embedder>>,
+        }
+        impl Drop for RestoreProviders {
+            fn drop(&mut self) {
+                crate::runtime::set_test_fast_embedder(self.fast.take());
+                crate::runtime::set_test_quality_embedder(self.quality.take());
+            }
+        }
+        for modes in [
+            [SearchExecutionMode::Full, SearchExecutionMode::QualityOnly],
+            [SearchExecutionMode::QualityOnly, SearchExecutionMode::Full],
+        ] {
+            let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 2)
+                .build()
+                .unwrap();
+            scheduler.block_on(async {
+                let cx = Cx::current().unwrap();
+                let directory = tempfile::tempdir_in("/tmp").unwrap();
+                let (runtime, shared, producer, bound) =
+                    complete_cache_fixture(&cx, directory.path()).await;
+                let _restore = RestoreProviders {
+                    fast: crate::runtime::test_fast_embedder_override(),
+                    quality: crate::runtime::test_quality_embedder_override(),
+                };
+                {
+                    let mut state = shared.try_lock_owned().unwrap();
+                    let resources = &mut state.0.reader.resources;
+                    crate::runtime::set_test_fast_embedder(Some(
+                        resources.fast_embedder.take().unwrap().embedder,
+                    ));
+                    crate::runtime::set_test_quality_embedder(Some(
+                        resources.quality_embedder.take().unwrap().embedder,
+                    ));
+                    resources.vector_index = None;
+                    resources.quality_vector_index = None;
+                    resources.resource_mode = SearchExecutionMode::LexicalOnly;
+                    resources.fast_embedder_attempted = false;
+                    resources.quality_embedder_attempted = false;
+                }
+                let mut expected_mode = SearchExecutionMode::LexicalOnly;
+                for mode in modes {
+                    let request = serde_json::to_vec(&serde_json::json!({
+                        "query": "how to recover network requests", "mode": mode.label(),
+                        "limit": 10, "rerank": false,
+                    }))
+                    .unwrap();
+                    let mut framed = request;
+                    framed.push(b'\n');
+                    let cold =
+                        complete_cache_exchange_request(&cx, &runtime, &shared, &bound, &framed)
+                            .await;
+                    assert_eq!(cold["ok"], true, "{mode:?}: {cold}");
+                    assert_eq!(cold["cached"], false);
+                    if expected_mode == SearchExecutionMode::LexicalOnly
+                        || mode == SearchExecutionMode::Full
+                    {
+                        expected_mode = mode;
+                    }
+                    {
+                        let state = shared.try_lock_owned().unwrap();
+                        assert_eq!(state.0.reader.resources.resource_mode, expected_mode);
+                        assert!(state.0.reader.resources.quality_embedder.is_some());
+                        assert!(state.1.keys().any(|key| key.mode == mode));
+                    }
+                    let calls = producer.calls.load(Ordering::SeqCst);
+                    let warm =
+                        complete_cache_exchange_request(&cx, &runtime, &shared, &bound, &framed)
+                            .await;
+                    assert_eq!(warm["ok"], true, "{mode:?}: {warm}");
+                    assert_eq!(warm["cached"], true, "{mode:?}: {warm}");
+                    assert_eq!(warm["payloads"], cold["payloads"]);
+                    assert_eq!(producer.calls.load(Ordering::SeqCst), calls);
+                }
+            });
+        }
     }
 
     #[cfg(feature = "semantic-support")]
@@ -2836,7 +2959,7 @@ mod generation_tests {
                 }
                 (key, payloads)
             };
-            let (_, snapshot) = runtime
+            let ((_, snapshot), _) = runtime
                 .snapshot_complete_daemon_request(&cx, &shared, CACHE_TEST_REQUEST, false, true)
                 .await
                 .unwrap();
@@ -2853,7 +2976,7 @@ mod generation_tests {
                 (serde_json::to_vec(&streamed).unwrap(), true),
                 (CACHE_TEST_REQUEST.to_vec(), false),
             ] {
-                let (_, snapshot) = runtime
+                let ((_, snapshot), _) = runtime
                     .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, enabled)
                     .await
                     .unwrap();
@@ -2957,9 +3080,7 @@ mod generation_tests {
                     .runtime
                     .with_search_serve_request_policy(&request)
                     .unwrap();
-                let unavailable = prepared
-                    .search_cache_key("sharedtoken", 10, mode)
-                    .unwrap();
+                let unavailable = prepared.search_cache_key("sharedtoken", 10, mode).unwrap();
                 let probe = Arc::new(frankensearch_core::SyncRerankerAdapter(KeyProbe(
                     std::sync::Mutex::new(None),
                 )));
@@ -2967,9 +3088,7 @@ mod generation_tests {
                 prepared.reranker = Arc::new(std::sync::OnceLock::from(
                     crate::runtime::RerankerSlot(Some(provider.clone())),
                 ));
-                let key = prepared
-                    .search_cache_key("sharedtoken", 10, mode)
-                    .unwrap();
+                let key = prepared.search_cache_key("sharedtoken", 10, mode).unwrap();
                 if admits_model {
                     assert_ne!(unavailable, key);
                     assert_eq!(key.rerank_model.as_deref(), Some("snapshot-reranker"));
@@ -2999,13 +3118,13 @@ mod generation_tests {
                 crate::runtime::set_test_reranker(Some(provider));
                 let _reset = ResetReranker;
                 let conflicting = br#"{"query":"sharedtoken","mode":"quality_only","fast_only":true,"rerank":true,"limit":10}"#;
-                let (_, rejected_cache) = runtime
+                let ((_, rejected_cache), _) = runtime
                     .snapshot_complete_daemon_request(&cx, &shared, conflicting, false, true)
                     .await
                     .unwrap();
                 assert!(rejected_cache.is_empty());
                 assert!(runtime.reranker.get().is_none());
-                let (snapshot, cache) = runtime
+                let ((snapshot, cache), _) = runtime
                     .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, true)
                     .await
                     .unwrap();
@@ -3194,7 +3313,7 @@ mod generation_tests {
                     complete_cache_fixture(&cx, directory.path()).await;
                 let cold = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
                 assert_eq!(cold["ok"], true, "{cold}");
-                let (mut replacement, expected_cache) = runtime
+                let ((mut replacement, expected_cache), _) = runtime
                     .snapshot_complete_daemon_request(&cx, &shared, CACHE_TEST_REQUEST, false, true)
                     .await
                     .unwrap();

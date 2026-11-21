@@ -698,7 +698,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v42: zero-depth reranking is independent of cross-encoder availability.
 // v43: an empty quality query reports no candidates even without a cross-encoder.
 // v44: planner fanout and ranking priors bind the pressure profile and override.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v44";
+// v45: exclusion-only queries browse the lexical complement without embedding.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v45";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -739,8 +740,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v39 / stream v37: skip model selection for requests that cannot rerank.
 // v40 / stream v38: reranker eligibility uses the normalized query and retained tiers.
 // v41 / stream v39: attest the serving pressure profile and degradation override.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v41";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v39";
+// v42 / stream v40: exclusion-only requests admit only the lexical complement.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v42";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v40";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -9460,6 +9462,7 @@ impl FsfsRuntime {
                 value: String::new(),
                 reason: "missing search query argument".to_owned(),
             })?;
+        self.search_mode_for_query(query, self.requested_search_mode())?;
         let limit = self
             .cli_input
             .overrides
@@ -9572,10 +9575,8 @@ impl FsfsRuntime {
 
         if self.cli_input.format == OutputFormat::Table {
             let mut stdout = std::io::stdout().lock();
-            let mode = degraded_search_mode(
-                search_runtime.config.pressure.degradation_override,
-                search_runtime.requested_search_mode(),
-            )?;
+            let mode = search_runtime
+                .search_mode_for_query(query, search_runtime.requested_search_mode())?;
             if let Some(mode_hint) =
                 search_runtime.search_readiness_warning_for_payload(query, mode, &payload)?
             {
@@ -9880,7 +9881,7 @@ impl FsfsRuntime {
             || self.requested_search_mode(),
             |execution| execution.requested_mode,
         );
-        let mode = degraded_search_mode(self.config.pressure.degradation_override, requested_mode);
+        let mode = self.search_mode_for_query(query, requested_mode);
         let semantic_admitted = resources_override.as_ref().is_some_and(|execution| {
             let embedder = if matches!(mode, Ok(SearchExecutionMode::QualityOnly)) {
                 execution.resources.quality_embedder.as_ref()
@@ -10744,8 +10745,8 @@ impl FsfsRuntime {
             .daemon_coalescers
             .as_ref()
             .map(|services| services.enter());
-        let mode = degraded_search_mode(
-            runtime.config.pressure.degradation_override,
+        let mode = runtime.search_mode_for_query(
+            &request.query,
             parse_search_execution_mode(request.mode.as_deref())?,
         )?;
         runtime.validate_semantic_model_selection(mode)?;
@@ -10783,13 +10784,13 @@ impl FsfsRuntime {
                 ) && resources.vector_index.is_some()
                 {
                     runtime.maybe_prepare_fast_embedder(cx, resources).await?;
-                }
-                let services = runtime
-                    .daemon_coalescers
-                    .as_ref()
-                    .expect("daemon services installed");
-                if let Some(admitted) = &mut resources.fast_embedder {
-                    admitted.enable_daemon_dispatch(cx, services).await?;
+                    let services = runtime
+                        .daemon_coalescers
+                        .as_ref()
+                        .expect("daemon services installed");
+                    if let Some(admitted) = &mut resources.fast_embedder {
+                        admitted.enable_daemon_dispatch(cx, services).await?;
+                    }
                 }
                 Ok(())
             }
@@ -10996,8 +10997,8 @@ impl FsfsRuntime {
         mut frame_sink: Option<SearchServeFrameSink<'_>>,
     ) -> SearchResult<SearchServeResponse> {
         // The server applies its own degradation override to every client.
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
+        let mode = self.search_mode_for_query(
+            &request.query,
             parse_search_execution_mode(request.mode.as_deref())?,
         )?;
         let mut runtime = self.with_search_serve_request_policy(&request)?;
@@ -11061,7 +11062,9 @@ impl FsfsRuntime {
                     schema_version: FSFS_SEARCH_SERVE_STREAM_VERSION.to_owned(),
                     policy: Box::new(policy.clone()),
                     generation_fingerprint: resources.generation_fingerprint.clone(),
-                    vector_generation_id: if matches!(mode, SearchExecutionMode::QualityOnly) {
+                    vector_generation_id: if Self::is_lexical_complement_query(&request.query) {
+                        None
+                    } else if matches!(mode, SearchExecutionMode::QualityOnly) {
                         resources
                             .quality_vector_index
                             .as_ref()
@@ -11526,12 +11529,9 @@ impl FsfsRuntime {
     ) -> SearchResult<Vec<SearchPayload>> {
         #[cfg(unix)]
         {
-            let mode = degraded_search_mode(
-                self.config.pressure.degradation_override,
-                self.requested_search_mode(),
-            )?;
+            let mode = self.search_mode_for_query(query, self.requested_search_mode())?;
             self.validate_semantic_model_selection(mode)?;
-            let socket_path = self.resolve_daemon_socket_path()?;
+            let socket_path = self.resolve_daemon_socket_path_for_mode(mode)?;
             ensure_daemon_socket_path_fits(&socket_path)?;
             let mut stream = if let Ok(stream) = UnixStream::connect(&socket_path) {
                 stream
@@ -11790,7 +11790,9 @@ impl FsfsRuntime {
                 }
                 if generation_fingerprint != fingerprint
                     || vector_generation_id
-                        != if matches!(
+                        != if Self::is_lexical_complement_query(&request.query) {
+                            None
+                        } else if matches!(
                             parse_search_execution_mode(request.mode.as_deref())?,
                             SearchExecutionMode::QualityOnly
                         ) {
@@ -12026,17 +12028,43 @@ impl FsfsRuntime {
 
     #[cfg(unix)]
     fn resolve_daemon_socket_path(&self) -> SearchResult<PathBuf> {
-        // Explicit sockets must reject invalid selections just as default
-        // socket routing does, before contacting a retained warm daemon.
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
+        // A newly spawned server has an explicit endpoint but no query yet.
+        // Its per-request admission decides which producers are required.
+        if matches!(
+            self.cli_input.command,
+            CliCommand::Serve | CliCommand::Daemon
+        ) && let Some(path) = self.cli_input.daemon_socket.as_deref()
+        {
+            return absolutize_path(path);
+        }
+        let mode = self.search_mode_for_query(
+            self.cli_input.query.as_deref().unwrap_or_default(),
             self.requested_search_mode(),
         )?;
+        self.resolve_daemon_socket_path_for_mode(mode)
+    }
+
+    #[cfg(unix)]
+    fn resolve_daemon_socket_path_for_mode(
+        &self,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<PathBuf> {
+        // Explicit sockets must reject invalid selections just as default
+        // socket routing does, before contacting a retained warm daemon.
         self.selected_model_ids_for_mode(mode)?;
         if let Some(path) = self.cli_input.daemon_socket.as_deref() {
             return absolutize_path(path);
         }
-        self.default_daemon_socket_path()
+        self.default_daemon_socket_path_for_mode(mode)
+    }
+
+    #[cfg(all(unix, test))]
+    fn default_daemon_socket_path(&self) -> SearchResult<PathBuf> {
+        let mode = self.search_mode_for_query(
+            self.cli_input.query.as_deref().unwrap_or_default(),
+            self.requested_search_mode(),
+        )?;
+        self.default_daemon_socket_path_for_mode(mode)
     }
 
     /// `fsfs-query-<index>-<variant>.sock`: one daemon per index, fast/quality
@@ -12044,11 +12072,10 @@ impl FsfsRuntime {
     /// an upgraded client whose results changed spawns its own daemon instead
     /// of being refused by a warm older one until that one idles out.
     #[cfg(unix)]
-    fn default_daemon_socket_path(&self) -> SearchResult<PathBuf> {
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
-            self.requested_search_mode(),
-        )?;
+    fn default_daemon_socket_path_for_mode(
+        &self,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<PathBuf> {
         let (fast_model, quality_model) = self.selected_model_ids_for_mode(mode)?;
         let (socket_dir, index_stem) = self.default_daemon_socket_stem()?;
         let variant = Self::daemon_socket_variant(
@@ -12148,7 +12175,14 @@ impl FsfsRuntime {
         let mut event =
             StreamStartedEvent::new(stream_id, query, self.cli_input.format.to_string());
         if matches!(mode, SearchExecutionMode::LexicalOnly) {
-            event.skip_reason = Some("lexical_only".to_owned());
+            event.skip_reason = Some(
+                if Self::is_lexical_complement_query(query) {
+                    "lexical_complement"
+                } else {
+                    "lexical_only"
+                }
+                .to_owned(),
+            );
             return event;
         }
         let Ok(index_root) = self.resolve_status_index_root() else {
@@ -12184,14 +12218,10 @@ impl FsfsRuntime {
         seq: &mut u64,
         writer: &mut W,
     ) -> SearchResult<()> {
-        self.emit_search_stream_started_in_mode(
-            query,
-            stream_id,
-            self.requested_search_mode(),
-            false,
-            seq,
-            writer,
-        )
+        let mode = self
+            .search_mode_for_query(query, self.requested_search_mode())
+            .unwrap_or_else(|_| self.requested_search_mode());
+        self.emit_search_stream_started_in_mode(query, stream_id, mode, false, seq, writer)
     }
 
     fn emit_search_stream_started_in_mode<W: Write>(
@@ -13433,10 +13463,7 @@ impl FsfsRuntime {
         limit: usize,
         mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPayload>> {
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
-            self.requested_search_mode(),
-        )?;
+        let mode = self.search_mode_for_query(query, self.requested_search_mode())?;
         self.validate_semantic_model_selection(mode)?;
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         if !cache_enabled {
@@ -13625,6 +13652,7 @@ impl FsfsRuntime {
         S: FnMut(&SearchPayload, bool) -> SearchResult<()> + Send,
     {
         Self::semantic_retry_checkpoint(cx, "fsfs.query_expansion")?;
+        let mode = self.search_mode_for_query(query, mode)?;
         self.rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
         let fingerprint = resources.generation_fingerprint.clone();
@@ -13796,6 +13824,7 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
+        let mode = self.search_mode_for_query(query, self.requested_search_mode())?;
         let expansion = Self::expand_search_query(cx, query).await?;
 
         // If we only have the original query (no expansions), fast-path to normal search.
@@ -13808,10 +13837,6 @@ impl FsfsRuntime {
         // Gather payloads from each expanded query. Use a larger internal limit
         // to get enough candidates for meaningful fusion.
         let expansion_limit = Self::expansion_candidate_limit(limit);
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
-            self.requested_search_mode(),
-        )?;
         let mut resources = self.prepare_search_execution_resources(cx, mode).await?;
         let expansion_fingerprint = resources.generation_fingerprint.clone();
         let all_payloads = self
@@ -13855,6 +13880,16 @@ impl FsfsRuntime {
             })
         };
         checkpoint()?;
+        if Self::is_lexical_complement_query(query) {
+            return Ok(query_expansion::ExpansionResult {
+                queries: vec![query_expansion::ExpandedQuery {
+                    text: query.to_owned(),
+                    strategy: query_expansion::ExpansionStrategy::Original,
+                }],
+                backend_used: None,
+                elapsed_ms: 0,
+            });
+        }
         let env_map = current_unicode_environment();
         let query_for_expansion = query.to_owned();
         let expansion =
@@ -13881,10 +13916,7 @@ impl FsfsRuntime {
         expansion_fingerprint: &str,
         flags: SearchExecutionFlags,
     ) -> SearchResult<Vec<SearchPayload>> {
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
-            self.requested_search_mode(),
-        )?;
+        let mode = self.search_mode_for_query(original_query, self.requested_search_mode())?;
         self.execute_expanded_query_variants_in_mode(
             cx,
             original_query,
@@ -14414,6 +14446,35 @@ impl FsfsRuntime {
         }
     }
 
+    /// Exclusions have no positive semantic anchor. Resolve their lexical
+    /// complement before resource, model, cache or daemon admission so neither
+    /// an excluded term nor an empty query is embedded as a relevance signal.
+    fn search_mode_for_query(
+        &self,
+        query: &str,
+        requested: SearchExecutionMode,
+    ) -> SearchResult<SearchExecutionMode> {
+        let requested = if Self::is_lexical_complement_query(query) {
+            if matches!(requested, SearchExecutionMode::QualityOnly) {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.search_query".to_owned(),
+                    value: "exclusion_only".to_owned(),
+                    reason: "quality-only search requires positive query text; use ordinary search for a lexical complement"
+                        .to_owned(),
+                });
+            }
+            SearchExecutionMode::LexicalOnly
+        } else {
+            requested
+        };
+        degraded_search_mode(self.config.pressure.degradation_override, requested)
+    }
+
+    fn is_lexical_complement_query(query: &str) -> bool {
+        let parsed = ParsedQuery::parse(&Self::normalize_search_query(query));
+        parsed.has_negations() && parsed.is_positive_empty()
+    }
+
     const fn indexing_search_mode(&self) -> SearchExecutionMode {
         if matches!(self.indexing_primary_tier, IndexingPrimaryTier::Quality) {
             SearchExecutionMode::QualityOnly
@@ -14513,6 +14574,7 @@ impl FsfsRuntime {
         requested_limit: usize,
         mode: SearchExecutionMode,
     ) -> SearchResult<SearchCacheKey> {
+        let mode = self.search_mode_for_query(query, mode)?;
         self.validate_semantic_model_selection(mode)?;
         let (fast_model, quality_model) = self.selected_model_ids_for_mode(mode)?;
         Ok(SearchCacheKey {
@@ -16036,6 +16098,7 @@ impl FsfsRuntime {
         mode: SearchExecutionMode,
         phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        let mode = self.search_mode_for_query(query, mode)?;
         let mut resources = self.prepare_search_execution_resources(cx, mode).await?;
         self.execute_search_phase_artifacts_with_mode_using_resources(
             cx,
@@ -16084,7 +16147,7 @@ impl FsfsRuntime {
         flags: SearchExecutionFlags,
         mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
-        let mode = degraded_search_mode(self.config.pressure.degradation_override, mode)?;
+        let mode = self.search_mode_for_query(query, mode)?;
         self.validate_semantic_model_selection(mode)?;
         self.rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
@@ -16683,7 +16746,9 @@ impl FsfsRuntime {
             Self::validate_exclusion_candidate_membership(
                 cx,
                 resources.lexical_index.as_ref(),
-                semantic_candidates.iter().map(|candidate| candidate.doc_id.as_str()),
+                semantic_candidates
+                    .iter()
+                    .map(|candidate| candidate.doc_id.as_str()),
             )?;
         }
         let semantic_elapsed_ms = semantic_start.elapsed().as_millis();
@@ -16781,6 +16846,13 @@ impl FsfsRuntime {
             resources,
             mode,
         );
+        if parsed_query.has_negations() && parsed_query.is_positive_empty() {
+            payload.skip_reason = Some("lexical_complement".to_owned());
+            // A retained daemon may also hold vector tiers from an earlier
+            // positive request; they did not produce this complement answer.
+            payload.vector_generation_id = None;
+            payload.vector_generation_is_hash = false;
+        }
         self.attach_semantic_zero_signal(&mut payload, mode, ModelTier::Fast, fast_zero_signal);
         hit_lines.annotate(&mut payload);
         // A planner downgrade outranks the requested fast_only (it removed the
@@ -18603,7 +18675,12 @@ impl FsfsRuntime {
             let lexical_mutations = targets
                 .iter()
                 .map(|doc_id| {
-                    LexicalMutation::delete(doc_id.clone(), 0, IngestionClass::Skip, "delete_command")
+                    LexicalMutation::delete(
+                        doc_id.clone(),
+                        0,
+                        IngestionClass::Skip,
+                        "delete_command",
+                    )
                 })
                 .collect::<Vec<_>>();
             Self::publish_one_shot_lexical_mutations(cx, &lexical_index, &lexical_mutations, false)
@@ -19770,7 +19847,14 @@ impl FsfsRuntime {
     pub fn search_recovery_context(
         &self,
     ) -> Option<crate::degradation_advisor::SearchRecoveryContext> {
-        self.search_recovery_context_for_mode(self.requested_search_mode())
+        let requested = self.requested_search_mode();
+        let mode = self
+            .search_mode_for_query(
+                self.cli_input.query.as_deref().unwrap_or_default(),
+                requested,
+            )
+            .unwrap_or(requested);
+        self.search_recovery_context_for_mode(mode)
     }
 
     fn search_recovery_context_for_mode(
@@ -20634,9 +20718,9 @@ impl FsfsRuntime {
                     "quality tier has no usable semantic signal: {}",
                     reason.reason_code()
                 ),
-                suggestion: reason.is_availability_failure().then(|| {
-                    "run `fsfs index --full` with the verified quality model".to_owned()
-                }),
+                suggestion: reason
+                    .is_availability_failure()
+                    .then(|| "run `fsfs index --full` with the verified quality model".to_owned()),
             };
         }
         if signal.usable_vector_count < signal.live_count {
@@ -22307,12 +22391,9 @@ impl FsfsRuntime {
                 Some(embedder) => Some(Arc::clone(embedder)),
                 None => self.resolve_quality_embedder()?,
             }
-            .ok_or_else(|| {
-                SearchError::EmbedderUnavailable {
-                    model: self.config.indexing.quality_model.clone(),
-                    reason: "quality-only indexing requires its verified quality producer"
-                        .to_owned(),
-                }
+            .ok_or_else(|| SearchError::EmbedderUnavailable {
+                model: self.config.indexing.quality_model.clone(),
+                reason: "quality-only indexing requires its verified quality producer".to_owned(),
             })?;
             control.checkpoint(cx, "index.quality_model_loaded", true)?;
             Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
@@ -25262,7 +25343,7 @@ impl FsfsRuntime {
             return false;
         }
         let query = Self::normalize_search_query(query);
-        if query.is_empty() {
+        if query.is_empty() || Self::is_lexical_complement_query(&query) {
             return false;
         }
         match mode {
@@ -26118,14 +26199,16 @@ impl FsfsRuntime {
             self.cli_input.delete_prefix,
             &live_ids,
         )?;
-        let mut manifests =
-            Self::read_matching_manifest_generation_with(index_root, Self::resolve_delete_lexical_engine)?
-            .ok_or_else(|| {
-                complete_cli::complete_cli_error(
-                    "delete_membership",
-                    "the lexical-only generation's manifests disagree; rerun `fsfs index`",
-                )
-            })?;
+        let mut manifests = Self::read_matching_manifest_generation_with(
+            index_root,
+            Self::resolve_delete_lexical_engine,
+        )?
+        .ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "delete_membership",
+                "the lexical-only generation's manifests disagree; rerun `fsfs index`",
+            )
+        })?;
         if !targets.is_empty() {
             publication_lease.fence("lexical-only delete publication")?;
             if let Some(index) = Self::prepare_delete_lexical_writer(cx, index_root).await? {
@@ -27002,6 +27085,9 @@ impl FsfsRuntime {
         flags: SearchExecutionFlags,
         phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        if Self::is_lexical_complement_query(query) {
+            self.search_mode_for_query(query, SearchExecutionMode::QualityOnly)?;
+        }
         let normalized_query = Self::normalize_search_query(query);
         let filter = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
         let parsed = ParsedQuery::parse(&normalized_query);
@@ -27329,11 +27415,13 @@ impl FsfsRuntime {
         document_ids: impl IntoIterator<Item = &'a str>,
     ) -> SearchResult<()> {
         Self::exclusion_membership_checkpoint(cx)?;
-        let missing_evidence = || SearchError::InvalidConfig {
+        let missing_evidence = || {
+            SearchError::InvalidConfig {
             field: "cli.search_query".to_owned(),
             value: "exclusion_candidate_evidence_missing".to_owned(),
             reason: "query exclusions cannot be verified for every retrieved document in the lexical index; rebuild the index before retrying this query"
                 .to_owned(),
+        }
         };
         let Some(lexical) = lexical else {
             return Err(missing_evidence());
@@ -38299,7 +38387,10 @@ mod tests {
                 let code = super::ZeroSignalReason::CallerRequestedZeroK.reason_code();
                 let mut expected = BTreeMap::new();
                 let phases: &[_] = if mode == SearchExecutionMode::Full {
-                    &[("fast", SearchOutputPhase::Initial), ("quality", SearchOutputPhase::Refined)]
+                    &[
+                        ("fast", SearchOutputPhase::Initial),
+                        ("quality", SearchOutputPhase::Refined),
+                    ]
                 } else {
                     &[("quality", SearchOutputPhase::Initial)]
                 };
@@ -42822,9 +42913,15 @@ mod tests {
                     error: Some(error),
                 } = serde_json::from_value(frames[1].clone()).expect("structured terminal")
                 else {
-                    panic!("oversized refinement did not end with a refusal: {}", frames[1]);
+                    panic!(
+                        "oversized refinement did not end with a refusal: {}",
+                        frames[1]
+                    );
                 };
-                assert_eq!(error.code, crate::output_schema::OutputErrorCode::INVALID_CONFIG);
+                assert_eq!(
+                    error.code,
+                    crate::output_schema::OutputErrorCode::INVALID_CONFIG
+                );
                 assert_eq!(error.exit_code, 2);
                 assert_eq!(error.field.as_deref(), Some("cli.daemon"));
                 assert!(error.message.contains("frame exceeds byte limit"));
@@ -45917,7 +46014,10 @@ mod tests {
                             ),
                             "{refused:?}"
                         );
-                        assert!(!pointer_path.exists(), "damaged windows must not adopt CURRENT");
+                        assert!(
+                            !pointer_path.exists(),
+                            "damaged windows must not adopt CURRENT"
+                        );
                     }
                     assert_eq!(
                         fs::read(lexical_path.join("MANIFEST")).unwrap(),
@@ -45949,8 +46049,9 @@ mod tests {
                     } else {
                         vec![inside.clone(), outside.clone(), inside.clone()]
                     };
-                    let writer =
-                        QuillIndex::open(&cx, &lexical_path, QuillConfig::default()).await.unwrap();
+                    let writer = QuillIndex::open(&cx, &lexical_path, QuillConfig::default())
+                        .await
+                        .unwrap();
                     let refused = command.run_delete_command(&cx).await;
                     assert!(
                         matches!(&refused, Err(SearchError::SubsystemError { source, .. })
@@ -45958,9 +46059,18 @@ mod tests {
                                 Some(frankensearch_quill::KeeperError::WriterBusy { .. }))),
                         "lexical_only={lexical_only} prefix={prefix}: {refused:?}"
                     );
-                    assert!(!pointer_path.exists(), "a busy writer must not adopt CURRENT");
-                    assert_eq!(fs::read(lexical_path.join("MANIFEST")).unwrap(), lexical_before);
-                    assert_eq!(fs::read(root.join(super::FSFS_SENTINEL_FILE)).unwrap(), sentinel_before);
+                    assert!(
+                        !pointer_path.exists(),
+                        "a busy writer must not adopt CURRENT"
+                    );
+                    assert_eq!(
+                        fs::read(lexical_path.join("MANIFEST")).unwrap(),
+                        lexical_before
+                    );
+                    assert_eq!(
+                        fs::read(root.join(super::FSFS_SENTINEL_FILE)).unwrap(),
+                        sentinel_before
+                    );
                     assert_eq!(fs::read(&fast_path).ok(), fast_before);
                     assert_eq!(fs::read(&wal_path).ok(), wal_before);
                     drop(writer);
@@ -46130,7 +46240,10 @@ mod tests {
             runtime.run_delete_command(&cx).await.expect("retry delete");
             for path in [&fast_path, &quality_path] {
                 let tier = VectorIndex::open_read_only(path).expect("read published tier");
-                assert_eq!(tier.live_doc_ids().unwrap(), HashSet::from(["keep.md".to_owned()]));
+                assert_eq!(
+                    tier.live_doc_ids().unwrap(),
+                    HashSet::from(["keep.md".to_owned()])
+                );
             }
         });
     }
@@ -46409,7 +46522,10 @@ mod tests {
                     let key = key.unwrap();
                     assert_eq!(key.rerank_model.as_deref(), Some("reverse-reranker-test"));
                     if query == "find\u{0007}secret" {
-                        assert_eq!(key, request.search_cache_key("find secret", 10, mode).unwrap());
+                        assert_eq!(
+                            key,
+                            request.search_cache_key("find secret", 10, mode).unwrap()
+                        );
                     }
                 }
             }
@@ -48027,8 +48143,7 @@ mod tests {
             documents: &'a [frankensearch_core::RerankDocument],
         ) -> SearchFuture<'a, Vec<frankensearch_core::RerankScore>> {
             Box::pin(async move {
-                self.calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(
                     documents
                         .iter()
@@ -48107,7 +48222,11 @@ mod tests {
         root: &Path,
     ) -> (FsfsRuntime, super::StageDirective, Vec<FusedCandidate>) {
         for name in ["a.md", "b.md", "tail.md"] {
-            fs::write(root.join(name), "Recover failed requests with bounded retries.").unwrap();
+            fs::write(
+                root.join(name),
+                "Recover failed requests with bounded retries.",
+            )
+            .unwrap();
         }
         let fused = ["a.md", "missing.md", "b.md", "tail.md"]
             .into_iter()
@@ -48178,7 +48297,11 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(outcome.fused, fused, "{reply:?}");
-                assert_eq!(outcome.payload.status, RerankStageStatus::Failed, "{reply:?}");
+                assert_eq!(
+                    outcome.payload.status,
+                    RerankStageStatus::Failed,
+                    "{reply:?}"
+                );
                 assert_eq!(
                     outcome.payload.reason_code,
                     super::REASON_RERANK_FAILED,
@@ -48194,7 +48317,10 @@ mod tests {
                     Vec::new(),
                 );
                 payload.rerank = Some(outcome.payload);
-                assert!(!FsfsRuntime::search_payloads_cacheable(&[payload]), "{reply:?}");
+                assert!(
+                    !FsfsRuntime::search_payloads_cacheable(&[payload]),
+                    "{reply:?}"
+                );
             }
         });
     }
@@ -48272,7 +48398,11 @@ mod tests {
                     ],
                     "{reply:?}",
                 );
-                assert_eq!(outcome.payload.status, RerankStageStatus::Applied, "{reply:?}");
+                assert_eq!(
+                    outcome.payload.status,
+                    RerankStageStatus::Applied,
+                    "{reply:?}"
+                );
                 assert_eq!(outcome.payload.reranked_hits, 2, "{reply:?}");
                 assert_eq!(
                     outcome
@@ -48317,7 +48447,10 @@ mod tests {
                         fused,
                     )
                     .await;
-                assert!(matches!(result, Err(SearchError::Cancelled { .. })), "{reply:?}");
+                assert!(
+                    matches!(result, Err(SearchError::Cancelled { .. })),
+                    "{reply:?}"
+                );
                 assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
             });
         }
@@ -48651,7 +48784,8 @@ mod tests {
             super::set_test_reranker(Some(Arc::new(frankensearch_core::SyncRerankerAdapter(
                 ReverseReranker,
             ))));
-            let reranked = search_artifacts(&cx, rerank_config.clone(), &index_root, query, 3).await;
+            let reranked =
+                search_artifacts(&cx, rerank_config.clone(), &index_root, query, 3).await;
             assert!(
                 reranked[0].payload.rerank.is_none(),
                 "INITIAL is never reranked"
@@ -48709,7 +48843,10 @@ mod tests {
             let zero = search_artifacts(&cx, rerank_config.clone(), &index_root, query, 0).await;
             assert!(zero.iter().all(|artifact| artifact.payload.hits.is_empty()));
             let stage = refined(&zero).payload.rerank.as_ref().expect("rerank skip");
-            assert_eq!(stage.status, crate::output_schema::RerankStageStatus::Skipped);
+            assert_eq!(
+                stage.status,
+                crate::output_schema::RerankStageStatus::Skipped
+            );
             assert_eq!(stage.reason_code, "query.stage.rerank.disabled.zero_depth");
             assert_eq!((stage.candidate_budget, stage.reranked_hits), (0, 0));
             assert!(stage.scores.is_empty());
@@ -49181,6 +49318,295 @@ mod tests {
                 super::vector_live_doc_ids(after_tombstone).expect("read tombstone generation ids");
             assert!(live_ids.contains("new.md"));
             assert!(!live_ids.contains("old.md"));
+        });
+    }
+
+    #[test]
+    fn exclusion_only_queries_resolve_modes_before_model_admission() {
+        let mut config = FsfsConfig::default();
+        config.indexing.fast_model = "unavailable-fast-model".to_owned();
+        config.indexing.quality_model = "unavailable-quality-model".to_owned();
+        config.search.rerank = true;
+        let runtime = FsfsRuntime::new(config);
+        for query in [
+            "-foo",
+            "\t-foo\n-bar\u{0}",
+            "-AND -OR -NOT",
+            r#"NOT "internal secret""#,
+            "not 'internal secret' -foo",
+            r#"-"internal secret" -title:"draft copy""#,
+        ] {
+            assert!(FsfsRuntime::is_lexical_complement_query(query), "{query}");
+            for requested in [
+                SearchExecutionMode::Full,
+                SearchExecutionMode::FastOnly,
+                SearchExecutionMode::LexicalOnly,
+            ] {
+                let mode = runtime.search_mode_for_query(query, requested).unwrap();
+                assert_eq!(mode, SearchExecutionMode::LexicalOnly, "{query}");
+                runtime.validate_semantic_model_selection(mode).unwrap();
+                let key = runtime.search_cache_key(query, 10, requested).unwrap();
+                assert_eq!(key.mode, SearchExecutionMode::LexicalOnly);
+                assert!(key.fast_model.is_empty() && key.quality_model.is_empty());
+                assert!(key.rerank_model.is_none() && key.rerank_contract.is_none());
+            }
+            assert!(matches!(
+                runtime.search_mode_for_query(query, SearchExecutionMode::QualityOnly),
+                Err(SearchError::InvalidConfig { field, value, .. })
+                    if field == "cli.search_query" && value == "exclusion_only"
+            ));
+        }
+        for query in [
+            "foo -bar",
+            r#""-foo""#,
+            r"\-foo",
+            "--foo",
+            "NOT foo",
+            "",
+            r#"NOT """#,
+        ] {
+            assert!(!FsfsRuntime::is_lexical_complement_query(query), "{query}");
+            assert_eq!(
+                runtime
+                    .search_mode_for_query(query, SearchExecutionMode::Full)
+                    .unwrap(),
+                super::build_search_mode(SearchExecutionMode::Full),
+                "{query}"
+            );
+        }
+        for override_mode in [
+            DegradationOverrideMode::ForceFull,
+            DegradationOverrideMode::ForceEmbedDeferred,
+            DegradationOverrideMode::ForceLexicalOnly,
+            DegradationOverrideMode::ForceMetadataOnly,
+            DegradationOverrideMode::ForcePaused,
+        ] {
+            let mut active = runtime.clone();
+            active.config.pressure.degradation_override = override_mode;
+            let mode = active.search_mode_for_query("-foo", SearchExecutionMode::Full);
+            if matches!(
+                override_mode,
+                DegradationOverrideMode::ForceMetadataOnly | DegradationOverrideMode::ForcePaused
+            ) {
+                assert!(mode.is_err());
+            } else {
+                assert_eq!(mode.unwrap(), SearchExecutionMode::LexicalOnly);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn exclusion_only_queries_browse_filtered_corpus_without_semantic_inference() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let writer = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            for index in 0..64 {
+                for (path, text) in [
+                    (format!("docs/outside-{index}.md"), "ordinary document"),
+                    (format!("src/banned-{index}.rs"), "banned internal secret"),
+                ] {
+                    writer
+                        .index_document(&cx, &IndexableDocument::new(path, text))
+                        .await
+                        .unwrap();
+                }
+            }
+            let allowed = ["src/first.rs", "src/second.rs", "src/third.RS"];
+            for path in allowed {
+                writer
+                    .index_document(&cx, &IndexableDocument::new(path, "ordinary document"))
+                    .await
+                    .unwrap();
+            }
+            writer.commit(&cx).await.unwrap();
+            resources.lexical_index = Some(
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            // Neither a retained producer nor invalid replacement selections
+            // may be consulted by an exclusion-only request.
+            let producer = Arc::new(ScriptedBoundEmbedder::new(BoundScript::Fail));
+            resources.fast_embedder = Some(admitted_shared(&producer));
+            resources.quality_embedder = Some(admitted_shared(&producer));
+            let mut config = FsfsConfig::default();
+            config.indexing.fast_model = "unavailable-fast-model".to_owned();
+            config.indexing.quality_model = "unavailable-quality-model".to_owned();
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                filter: Some("path:src/ ext:rs".to_owned()),
+                ..CliInput::default()
+            });
+            for query in [
+                "-banned",
+                r#"NOT "internal secret""#,
+                "not 'internal secret' -banned",
+            ] {
+                for include_snippets in [false, true] {
+                    for limit in [0, 1, 3, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL] {
+                        let payloads = runtime
+                            .execute_search_payloads_with_mode_using_resources(
+                                &cx,
+                                query,
+                                limit,
+                                SearchExecutionMode::Full,
+                                &mut resources,
+                                SearchExecutionFlags {
+                                    include_snippets,
+                                    persist_explain_session: false,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(payloads.len(), 1, "{query}");
+                        let payload = &payloads[0];
+                        assert_eq!(payload.skip_reason.as_deref(), Some("lexical_complement"));
+                        assert_eq!(payload.phase, SearchOutputPhase::Initial);
+                        assert!(payload.vector_generation_id.is_none());
+                        assert!(!payload.vector_generation_is_hash);
+                        assert_eq!(payload.hits.len(), limit.min(allowed.len()), "{query}");
+                        assert!(payload.hits.iter().all(|hit| {
+                            allowed.contains(&hit.path.as_str())
+                                && hit.lexical_rank.is_some()
+                                && hit.semantic_rank.is_none()
+                                && hit.hash_rank.is_none()
+                        }));
+                        if limit >= allowed.len() {
+                            let mut paths = payload
+                                .hits
+                                .iter()
+                                .map(|hit| hit.path.as_str())
+                                .collect::<Vec<_>>();
+                            paths.sort_unstable();
+                            assert_eq!(paths, allowed);
+                        }
+                    }
+                }
+                let expansion = FsfsRuntime::expand_search_query(&cx, query).await.unwrap();
+                assert!(expansion.backend_used.is_none());
+                assert_eq!(expansion.queries.len(), 1);
+                assert_eq!(expansion.queries[0].text, query);
+            }
+            let mut emitted = 0;
+            let error = runtime
+                .execute_quality_only_search(
+                    &cx,
+                    "-banned",
+                    3,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut |_| {
+                        emitted += 1;
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { value, .. } if value == "exclusion_only")
+            );
+            assert_eq!(emitted, 0);
+            assert_eq!(producer.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exclusion_only_daemon_cache_replays_lexical_attestation_without_models() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let writer = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            for (path, text) in [("blocked.rs", "banned"), ("keep.rs", "ordinary document")] {
+                writer
+                    .index_document(&cx, &IndexableDocument::new(path, text))
+                    .await
+                    .unwrap();
+            }
+            writer.commit(&cx).await.unwrap();
+            resources.lexical_index = Some(
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let fingerprint = resources.generation_fingerprint.clone();
+            let producer = Arc::new(ScriptedBoundEmbedder::new(BoundScript::Fail));
+            resources.fast_embedder = Some(admitted_shared(&producer));
+            resources.quality_embedder = Some(admitted_shared(&producer));
+            let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
+            let mut config = FsfsConfig::default();
+            config.indexing.fast_model = "unavailable-fast-model".to_owned();
+            config.indexing.quality_model = "unavailable-quality-model".to_owned();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request = || SearchServeRequest {
+                query: "-banned".to_owned(),
+                limit: Some(10),
+                mode: Some("full".to_owned()),
+                filter: Some("ext:rs".to_owned()),
+                rerank: Some(true),
+                rerank_timeout_ms: None,
+                quality_weight: None,
+                quality_timeout_ms: None,
+                rrf_k: None,
+                fast_only: None,
+                ranking_priors: None,
+            };
+            // CLI forwarding transmits the resolved lexical mode. A raw client
+            // may still request full, which the server must resolve identically.
+            let mut wire_request = request();
+            wire_request.mode = Some("lexical_only".to_owned());
+            for cached in [false, true] {
+                let mut state = super::SearchServeStreamState::default();
+                let mut delivered = Vec::new();
+                let mut sink = |frame| {
+                    if let Some(payload) = runtime.accept_search_serve_frame(
+                        frame,
+                        &mut state,
+                        &wire_request,
+                        temp.path(),
+                        &fingerprint,
+                    )? {
+                        delivered.push(payload);
+                    }
+                    Ok(())
+                };
+                let response = runtime
+                    .execute_shared_search_serve_request_with_sink(
+                        &cx,
+                        request(),
+                        Arc::clone(&shared),
+                        super::SearchServeOptions {
+                            hot_cache_enabled: true,
+                            persist_explain_session: false,
+                        },
+                        Some(&mut sink),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.cached, cached);
+                assert_eq!(response.mode, "lexical_only");
+                assert_eq!(delivered.len(), 1);
+                assert_eq!(delivered[0].hits[0].path, "keep.rs");
+                assert_eq!(
+                    delivered[0].skip_reason.as_deref(),
+                    Some("lexical_complement")
+                );
+                assert!(state.vector_generation_id.is_none());
+            }
+            assert_eq!(producer.calls.load(Ordering::SeqCst), 0);
         });
     }
 
@@ -50984,7 +51410,10 @@ mod tests {
         let ready = probe();
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["ok"], true);
-        assert_eq!(ready["schema_version"], super::FSFS_SEARCH_SERVE_SCHEMA_VERSION);
+        assert_eq!(
+            ready["schema_version"],
+            super::FSFS_SEARCH_SERVE_SCHEMA_VERSION
+        );
         let published = FsfsRuntime::inspect_published_vector_generation(&index_root)
             .expect("indexed FSVI must be readable");
         assert_eq!(ready["vector_generation_id"], published.id);
@@ -51002,7 +51431,11 @@ mod tests {
             VectorIndex::open_read_only(&vector_path),
             Err(SearchError::IndexCorrupted { .. })
         ));
-        assert_eq!(probe(), ready, "cold readiness should describe the main file");
+        assert_eq!(
+            probe(),
+            ready,
+            "cold readiness should describe the main file"
+        );
         assert_eq!(fs::read(&wal_path).unwrap(), bad_wal);
 
         coordinator.request_shutdown(ShutdownReason::UserRequest);
@@ -51113,10 +51546,17 @@ mod tests {
         else {
             panic!("socket at capacity did not return a terminal refusal: {raw}");
         };
-        assert_eq!(error.code, crate::output_schema::OutputErrorCode::QUEUE_FULL);
+        assert_eq!(
+            error.code,
+            crate::output_schema::OutputErrorCode::QUEUE_FULL
+        );
         assert_eq!(error.exit_code, 1);
         let capacity = super::FSFS_DAEMON_MAX_CLIENTS;
-        assert!(error.message.contains(&format!("({capacity}/{capacity} pending)")));
+        assert!(
+            error
+                .message
+                .contains(&format!("({capacity}/{capacity} pending)"))
+        );
         drop(partial);
 
         coordinator.request_shutdown(ShutdownReason::UserRequest);
@@ -58292,9 +58732,11 @@ mod tests {
         let Err(error) = result else {
             panic!("missing lexical membership must refuse an excluded query");
         };
-        assert!(matches!(&error, SearchError::InvalidConfig { field, value, .. }
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { field, value, .. }
             if field == "cli.search_query"
-                && value == "exclusion_candidate_evidence_missing"));
+                && value == "exclusion_candidate_evidence_missing")
+        );
         let diagnostic = error.to_string();
         for private in [
             "a.rs",
@@ -58370,12 +58812,9 @@ mod tests {
     fn missing_quality_exclusion_membership_preserves_initial_only_when_optional() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
-            let (runtime, mut resources) = exclusion_membership_fixture(
-                &cx,
-                temp.path(),
-                &["a.rs", "b.rs", "fast-only.rs"],
-            )
-            .await;
+            let (runtime, mut resources) =
+                exclusion_membership_fixture(&cx, temp.path(), &["a.rs", "b.rs", "fast-only.rs"])
+                    .await;
             let flags = SearchExecutionFlags {
                 include_snippets: false,
                 persist_explain_session: false,
@@ -58418,11 +58857,17 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 emitted,
-                [SearchOutputPhase::Initial, SearchOutputPhase::RefinementFailed],
+                [
+                    SearchOutputPhase::Initial,
+                    SearchOutputPhase::RefinementFailed
+                ],
             );
             assert_eq!(phases[0].payload.hits, phases[1].payload.hits);
             assert!(!FsfsRuntime::search_payloads_cacheable(
-                &phases.iter().map(|phase| phase.payload.clone()).collect::<Vec<_>>(),
+                &phases
+                    .iter()
+                    .map(|phase| phase.payload.clone())
+                    .collect::<Vec<_>>(),
             ));
             let mut required_emitted = 0;
             let required = runtime
@@ -61336,8 +61781,10 @@ mod tests {
                                 if field == "identity_bound_embedding.values"));
                         }
                         AppendProviderFault::F16Underflow | AppendProviderFault::F16Overflow => {
-                            assert!(matches!(error, SearchError::InvalidConfig { field, reason, .. }
-                                if field == "embedding" && reason.contains("F16 encoding")));
+                            assert!(
+                                matches!(error, SearchError::InvalidConfig { field, reason, .. }
+                                if field == "embedding" && reason.contains("F16 encoding"))
+                            );
                         }
                         AppendProviderFault::Cancelled => {
                             assert!(matches!(error, SearchError::Cancelled { .. }));

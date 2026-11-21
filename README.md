@@ -614,6 +614,12 @@ the BM25 tier matches for it. The BM25 tier also understands:
 | `quantize AND f16`, `rrf OR fusion` | both words required, or either |
 | `rrf^3 fusion` | count `rrf` three times as much |
 
+Exclusions can stand alone: `fsfs search -- '-fusion'` searches the indexed
+documents that survive the exclusions, with the usual filters and result
+limits. This uses lexical retrieval and skips embedding, reranking, and query
+expansion, so it also works without downloaded models. `--quality-only`
+requires positive query text and rejects exclusion-only queries.
+
 `*` is not a wildcard: `quantiz*` searches for the word `quantiz`. To see how
 each word scored for a hit, run `fsfs explain <rank>` after the search.
 

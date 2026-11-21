@@ -96,7 +96,9 @@ impl RetainedSearchReader {
         sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPayload>> {
         retained_search_checkpoint(cx)?;
-        let mode = self.search_mode()?;
+        let mode = self
+            .runtime
+            .search_mode_for_query(query, self.runtime.requested_search_mode())?;
         let artifacts = Box::pin(
             self.runtime
                 .execute_search_phase_artifacts_with_mode_using_resources(
@@ -478,11 +480,21 @@ impl FsfsRuntime {
         // without semantic loaders, or `force_lexical_only`) neither maps nor
         // admits the vector tiers, as on the legacy layout. An override that
         // refuses search opens the least; each search then reports the refusal.
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
-            self.requested_search_mode(),
-        )
-        .unwrap_or(SearchExecutionMode::LexicalOnly);
+        let mode = if matches!(
+            self.cli_input.command,
+            CliCommand::Serve | CliCommand::Daemon
+        ) {
+            // A daemon has not received a query yet. Like legacy serve,
+            // admit lexical evidence first; each semantic request rebinds
+            // its required tiers before caching, attestation or retrieval.
+            SearchExecutionMode::LexicalOnly
+        } else {
+            self.search_mode_for_query(
+                self.cli_input.query.as_deref().unwrap_or_default(),
+                self.requested_search_mode(),
+            )
+            .unwrap_or(SearchExecutionMode::LexicalOnly)
+        };
         let resources = Box::pin(
             runtime.prepare_search_execution_resources_at_root_with_modes(
                 cx,

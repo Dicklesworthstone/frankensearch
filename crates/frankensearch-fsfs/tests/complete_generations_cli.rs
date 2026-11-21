@@ -998,6 +998,291 @@ fn complete_cli_binary_default_search_without_a_daemon_runs_in_process() {
     assert_eq!(fs::read_dir(&fixture.store).unwrap().count(), 1);
 }
 
+fn exclusion_only_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fs::write(fixture.source.join("alpha.md"), "sharedtoken rank fusion").unwrap();
+    fs::write(
+        fixture.source.join("beta.md"),
+        "sharedtoken ordinary document",
+    )
+    .unwrap();
+    fs::write(
+        fixture.source.join("gamma.md"),
+        "sharedtoken rank separated from fusion",
+    )
+    .unwrap();
+    json_output(
+        &execute(
+            fixture
+                .lexical_discovery_command("index")
+                .arg("--no-watch-mode"),
+        ),
+        true,
+    );
+
+    // The ordinary search path must recognize a lexical complement before
+    // resolving either producer. No model fixture or forced degradation may
+    // hide an attempted semantic admission, even in loader-capable builds.
+    let mut config = FsfsConfig::default();
+    config.indexing.offline = true;
+    config.indexing.model_dir = fixture
+        .directory
+        .path()
+        .join("missing-models")
+        .display()
+        .to_string();
+    "unused-exclusion-fast-producer".clone_into(&mut config.indexing.fast_model);
+    "unused-exclusion-quality-producer".clone_into(&mut config.indexing.quality_model);
+    config.search.fast_only = false;
+    config.search.rerank = false;
+    "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+    fs::write(&fixture.config, config.to_toml().unwrap()).unwrap();
+    fixture
+}
+
+#[test]
+fn complete_cli_binary_exclusion_only_queries_browse_without_model_admission() {
+    let fixture = exclusion_only_fixture();
+    let selection = fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap();
+    for (query, expected) in [
+        ("-fusion", vec!["beta.md"]),
+        ("NOT \"rank fusion\"", vec!["beta.md", "gamma.md"]),
+        ("-absenttoken", vec!["alpha.md", "beta.md", "gamma.md"]),
+    ] {
+        for fast_only in [false, true] {
+            // Repeat the exact command to cover persisted answer reuse as
+            // well as the initial request through the actual executable.
+            for _ in 0..2 {
+                let result = json_output(
+                    &execute(fixture.command("s", "json").args([
+                        "--no-daemon",
+                        "--limit",
+                        "all",
+                        if fast_only {
+                            "--fast-only"
+                        } else {
+                            "--no-fast-only"
+                        },
+                        "--",
+                        query,
+                    ])),
+                    true,
+                );
+                let payload = &result["data"];
+                assert_eq!(payload["query"], query, "{result}");
+                assert_eq!(payload["skip_reason"], "lexical_complement", "{result}");
+                assert!(payload["vector_generation_id"].is_null(), "{result}");
+                assert!(payload["semantic_blend"].is_null(), "{result}");
+                let hits = payload["hits"].as_array().expect("complement hits");
+                let actual = hits
+                    .iter()
+                    .map(|hit| {
+                        assert!(hit["semantic_rank"].is_null(), "{hit}");
+                        assert!(hit["hash_rank"].is_null(), "{hit}");
+                        assert!(hit["lexical_rank"].is_number(), "{hit}");
+                        hit["path"].as_str().expect("hit path")
+                    })
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(actual, expected.iter().copied().collect(), "{result}");
+                assert_eq!(hits.len(), expected.len(), "{result}");
+            }
+        }
+    }
+    assert_eq!(
+        fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+        selection,
+    );
+    assert!(!fixture.directory.path().join("missing-models").exists());
+}
+
+#[test]
+fn complete_cli_binary_exclusion_only_stream_never_admits_semantic_results() {
+    use frankensearch_fsfs::stream_protocol::{
+        StreamEvent, StreamFrame, StreamTerminalStatus, decode_stream_frame_ndjson,
+    };
+
+    let fixture = exclusion_only_fixture();
+    let output = execute(fixture.command("s", "jsonl").args([
+        "--no-daemon",
+        "--stream",
+        "--limit",
+        "all",
+        "--",
+        "NOT \"rank fusion\"",
+    ]));
+    assert!(output.status.success(), "{output:?}");
+    let frames: Vec<StreamFrame<Value>> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| decode_stream_frame_ndjson(line).expect("stream frame"))
+        .collect();
+    let Some(StreamEvent::Started(started)) = frames.first().map(|frame| &frame.event) else {
+        panic!("missing started frame: {output:?}");
+    };
+    assert!(!started.semantic_admitted);
+    assert!(started.vector_generation_id.is_none());
+    assert_eq!(started.skip_reason.as_deref(), Some("lexical_complement"));
+    let hits = frames
+        .iter()
+        .filter_map(|frame| match &frame.event {
+            StreamEvent::Result(result) => {
+                assert!(result.item["semantic_rank"].is_null());
+                Some(result.item["path"].as_str().expect("hit path"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(hits.len(), 2, "{output:?}");
+    assert_eq!(
+        hits.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from(["beta.md", "gamma.md"])
+    );
+    let Some(StreamEvent::Terminal(terminal)) = frames.last().map(|frame| &frame.event) else {
+        panic!("missing terminal frame: {output:?}");
+    };
+    assert_eq!(terminal.status, StreamTerminalStatus::Completed);
+    assert_eq!(terminal.exit_code, 0);
+}
+
+#[test]
+fn complete_cli_binary_exclusion_only_named_daemon_needs_no_models() {
+    use frankensearch_fsfs::stream_protocol::{
+        StreamEvent, StreamFrame, StreamTerminalStatus, decode_stream_frame_ndjson,
+    };
+    use std::process::{Child, Stdio};
+
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let fixture = exclusion_only_fixture();
+    let selection = fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap();
+    let socket_root = tempfile::tempdir_in("/tmp").expect("short Unix socket directory");
+    let socket = socket_root.path().join("query.sock");
+    let daemon_stdout = fixture.directory.path().join("daemon.stdout");
+    let daemon_stderr = fixture.directory.path().join("daemon.stderr");
+    let mut daemon = Daemon(
+        fixture
+            .command("daemon", "json")
+            .arg("--daemon-socket")
+            .arg(&socket)
+            .args(["--idle-timeout-ms", "30000"])
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&daemon_stdout).unwrap())
+            .stderr(fs::File::create(&daemon_stderr).unwrap())
+            .spawn()
+            .expect("start model-free complement daemon"),
+    );
+    let started = Instant::now();
+    while !socket.exists() {
+        let status = daemon.0.try_wait().unwrap();
+        assert!(
+            status.is_none() && started.elapsed() < Duration::from_secs(20),
+            "daemon did not become ready: {status:?}\nstdout: {}\nstderr: {}",
+            fs::read_to_string(&daemon_stdout).unwrap(),
+            fs::read_to_string(&daemon_stderr).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    for streamed in [false, false, true, true] {
+        let mut command = fixture.command("s", if streamed { "jsonl" } else { "json" });
+        command.args(["--daemon", "--daemon-socket"]).arg(&socket);
+        if streamed {
+            command.arg("--stream");
+        }
+        command.args(["--limit", "all", "--", "NOT \"rank fusion\""]);
+        let output = execute(&mut command);
+        assert!(output.status.success(), "{output:?}");
+        if streamed {
+            let frames: Vec<StreamFrame<Value>> = std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| decode_stream_frame_ndjson(line).expect("stream frame"))
+                .collect();
+            let Some(StreamEvent::Started(started)) = frames.first().map(|frame| &frame.event)
+            else {
+                panic!("missing started frame: {output:?}");
+            };
+            assert!(!started.semantic_admitted);
+            assert!(started.vector_generation_id.is_none());
+            assert_eq!(started.skip_reason.as_deref(), Some("lexical_complement"));
+            let hits = frames
+                .iter()
+                .filter_map(|frame| match &frame.event {
+                    StreamEvent::Result(result) => {
+                        assert!(result.item["semantic_rank"].is_null());
+                        Some(result.item["path"].as_str().expect("hit path"))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(hits.len(), 2, "{output:?}");
+            assert_eq!(
+                hits.into_iter().collect::<BTreeSet<_>>(),
+                BTreeSet::from(["beta.md", "gamma.md"])
+            );
+            let Some(StreamEvent::Terminal(terminal)) = frames.last().map(|frame| &frame.event)
+            else {
+                panic!("missing terminal frame: {output:?}");
+            };
+            assert_eq!(terminal.status, StreamTerminalStatus::Completed);
+            assert_eq!(terminal.exit_code, 0);
+        } else {
+            let result = json_output(&output, true);
+            let payload = &result["data"];
+            assert_eq!(payload["skip_reason"], "lexical_complement", "{result}");
+            assert!(payload["vector_generation_id"].is_null(), "{result}");
+            let hits = payload["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 2, "{result}");
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit["path"].as_str().unwrap())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["beta.md", "gamma.md"])
+            );
+        }
+    }
+    assert_eq!(
+        fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+        selection
+    );
+    assert!(!fixture.directory.path().join("missing-models").exists());
+}
+
+#[test]
+fn complete_cli_binary_quality_only_requires_positive_text_before_model_admission() {
+    let fixture = exclusion_only_fixture();
+    let selection = fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap();
+    let output = execute(fixture.command("s", "json").args([
+        "--no-daemon",
+        "--quality-only",
+        "--no-fast-only",
+        "--",
+        "-fusion",
+    ]));
+    let result = json_output(&output, false);
+    assert_eq!(output.status.code(), Some(2), "{result}");
+    assert_eq!(result["error"]["code"], "invalid_config", "{result}");
+    assert_eq!(result["error"]["field"], "cli.search_query", "{result}");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("positive query text"),
+        "{result}"
+    );
+    assert_eq!(
+        fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+        selection
+    );
+    assert!(!fixture.directory.path().join("missing-models").exists());
+}
+
 #[test]
 fn stream_encoding_refusal_is_reported_before_output_ownership() {
     use frankensearch_fsfs::stream_protocol::{

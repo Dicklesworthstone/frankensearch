@@ -234,10 +234,8 @@ async fn serve_cached_search(
     // terminal handler, including a pressure override that refuses the mode
     // before the executor is entered.
     let result = async {
-        let mode = super::degraded_search_mode(
-            runtime.config.pressure.degradation_override,
-            runtime.requested_search_mode(),
-        )?;
+        let mode = runtime
+            .search_mode_for_query(&request.search.query, runtime.requested_search_mode())?;
         let mut cached = false;
         let mut sink = |frame| match frame {
             SearchServeFrame::Attested { cached: hit, .. } => {

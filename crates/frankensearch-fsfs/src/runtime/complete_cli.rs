@@ -14,9 +14,8 @@ use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
     RetainedSearchReader, SearchDashboardSession, SearchDashboardState, SearchExecutionFlags,
-    SearchStreamResources, canonical_store_root, degraded_search_mode, iso_timestamp_now,
-    pressure_timestamp_ms, retained_search_checkpoint, store_overlaps_source,
-    validate_retained_catalog_path,
+    SearchStreamResources, canonical_store_root, iso_timestamp_now, pressure_timestamp_ms,
+    retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
@@ -1108,16 +1107,13 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         self.cli_input.validate_search_recovery()?;
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
-            self.requested_search_mode(),
-        )?;
-        self.validate_semantic_model_selection(mode)?;
         let query = self
             .cli_input
             .query
             .as_deref()
             .ok_or_else(|| complete_cli_error("query", "missing search query argument"))?;
+        let mode = self.search_mode_for_query(query, self.requested_search_mode())?;
+        self.validate_semantic_model_selection(mode)?;
         let limit = self
             .cli_input
             .overrides
@@ -1278,7 +1274,9 @@ impl FsfsRuntime {
                     })
                 });
         }
-        let mode = reader.search_mode()?;
+        let mode = reader
+            .runtime
+            .search_mode_for_query(query, reader.runtime.requested_search_mode())?;
         let payloads = Box::pin(reader.runtime.execute_retained_cli_search(
             cx,
             query,
@@ -1312,6 +1310,7 @@ impl FsfsRuntime {
         flags: SearchExecutionFlags,
         mut phase_sink: Option<super::SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<crate::output_schema::SearchPayload>> {
+        let mode = self.search_mode_for_query(query, mode)?;
         let target = self.complete_explain_target.as_ref().ok_or_else(|| {
             complete_cli_error(
                 "cache_generation",
@@ -1520,10 +1519,7 @@ impl FsfsRuntime {
         queries: &[crate::query_expansion::ExpandedQuery],
     ) -> SearchResult<crate::output_schema::SearchPayload> {
         retained_search_checkpoint(cx)?;
-        let mode = super::degraded_search_mode(
-            self.config.pressure.degradation_override,
-            self.requested_search_mode(),
-        )?;
+        let mode = self.search_mode_for_query(query, self.requested_search_mode())?;
         if queries.len() <= 1 {
             let mut artifacts = self
                 .execute_search_phase_artifacts_with_mode_using_resources(

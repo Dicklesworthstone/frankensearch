@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::super::{
     FSFS_DAEMON_RESPONSE_MAX_BYTES, LiveRetainedSearchReader, SearchCacheKey, SearchExecutionMode,
-    SearchServeOptions, SearchServeRequest, degraded_search_mode,
+    SearchServeOptions, SearchServeRequest,
 };
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FsfsRuntime, PeerOutcome, SearchExecutionFlags,
@@ -95,6 +95,8 @@ impl SearchRequest {
     fn admission_policy(&self) -> (Duration, SearchExecutionMode) {
         let mode = if self.quality_only {
             SearchExecutionMode::QualityOnly
+        } else if FsfsRuntime::is_lexical_complement_query(&self.query) {
+            SearchExecutionMode::LexicalOnly
         } else if self.policy.fast_only {
             SearchExecutionMode::FastOnly
         } else {
@@ -318,10 +320,7 @@ fn make_request(
     query: &str,
     limit: usize,
 ) -> SearchResult<ForwardedSearch> {
-    let mode = degraded_search_mode(
-        runtime.config.pressure.degradation_override,
-        runtime.requested_search_mode(),
-    )?;
+    let mode = runtime.search_mode_for_query(query, runtime.requested_search_mode())?;
     runtime.validate_semantic_model_selection(mode)?;
     if runtime
         .cli_input
@@ -639,10 +638,8 @@ async fn execute(
     let query_runtime = query_runtime(session, &request.search, false)?;
     // The daemon applies its own degradation override to every client, as
     // the legacy query daemon does.
-    let mode = degraded_search_mode(
-        query_runtime.config.pressure.degradation_override,
-        query_runtime.requested_search_mode(),
-    )?;
+    let mode = query_runtime
+        .search_mode_for_query(&request.search.query, query_runtime.requested_search_mode())?;
     if !request.search.explain {
         // Use the ordinary daemon executor so both transports share complete
         // phase payloads, producer checks, cache keys, bounded admission and
@@ -801,10 +798,8 @@ pub(super) fn cache_request(
         return Ok(None);
     }
     let query_runtime = query_runtime(session, &request.search, streamed)?;
-    let mode = degraded_search_mode(
-        query_runtime.config.pressure.degradation_override,
-        query_runtime.requested_search_mode(),
-    )?;
+    let mode = query_runtime
+        .search_mode_for_query(&request.search.query, query_runtime.requested_search_mode())?;
     Ok(Some((query_runtime, request.search.as_serve_request(mode))))
 }
 
@@ -2000,8 +1995,7 @@ mod generation_tests {
             assert_ne!(first.hits[0].snippet.as_deref(), Some(CACHED_SNIPPET));
             assert_eq!(cache.len(), 1, "a completed search is kept");
             // Only replay can return this snippet. Keep the original count and rank.
-            cache.values_mut().next().unwrap()[0].hits[0].snippet =
-                Some(CACHED_SNIPPET.to_owned());
+            cache.values_mut().next().unwrap()[0].hits[0].snippet = Some(CACHED_SNIPPET.to_owned());
             let cached = Box::pin(execute(
                 &cx,
                 &runtime,
