@@ -1283,6 +1283,31 @@ Notes:
 - Keep `TwoTierConfig` explicit in code for reproducible behavior across environments.
 - This path is proven with the real models, not doubles: the gate's `facade` stage runs `integration.rs::real_models_two_tier_search_yields_refined_through_the_public_api` (potion fast tier + MiniLM quality tier from the registered cache; INITIAL then REFINED with the quality tier searched). Reproduce locally with `FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 cargo test -p frankensearch --features hybrid --test integration -- real_models`.
 
+### Direct quality-only async search
+
+With a matching quality embedder attached and `TwoTierConfig::fast_only` disabled,
+an async caller can request the quality tier directly:
+
+```rust,no_run
+let (results, metrics) = searcher
+    .search_quality_only_collect(&cx, "ownership rules", 10)
+    .await
+    .expect("quality-only search should succeed");
+```
+
+This request independently admits and searches the quality space, including
+documents outside the fast candidate pool. It performs no fast-provider work
+or fast-index lookup. An attached lexical arm still participates in fusion;
+use `search_quality_only_collect_with_text` for exclusions and optional
+cross-encoder text access.
+
+The callback API, `search_quality_only`, emits a quality-labeled `Initial` and
+an optional `Reranked` result. Quality inference and retrieval use
+`quality_timeout_ms`; unavailable, incompatible, or failed required quality
+returns an error. Diversity ranking uses quality vectors exclusively and skips
+MMR when the complete candidate pool lacks quality coverage. Ordinary
+`search` and `search_collect` retain their progressive fast/quality behavior.
+
 ### Native ANN on admitted v2 indexes (opt-in)
 
 An index opened through `TwoTierIndex::open_admitted_v2_with_paths` can use

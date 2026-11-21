@@ -463,6 +463,17 @@ impl VectorIndex {
         limit: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<ClassifiedHits> {
+        self.search_top_k_classified_with_params(query, limit, filter, SearchParams::default())
+    }
+
+    /// Internal classified scan with an admitted caller's parallelism settings.
+    pub(crate) fn search_top_k_classified_with_params(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
+    ) -> SearchResult<ClassifiedHits> {
         self.ensure_query_dimension(query)?;
         if let Some(reason) = query_zero_signal(query, limit)? {
             return Ok(ClassifiedHits::empty(reason));
@@ -470,9 +481,7 @@ impl VectorIndex {
         classified_candidates(
             limit,
             self.record_count().saturating_add(self.wal_entries.len()),
-            |candidate_limit| {
-                self.search_top_k_rows(query, candidate_limit, filter, SearchParams::default())
-            },
+            |candidate_limit| self.search_top_k_rows(query, candidate_limit, filter, params),
             |hit| self.classified_hit_is_usable(hit),
             || self.classified_search_census(filter.is_some()),
         )

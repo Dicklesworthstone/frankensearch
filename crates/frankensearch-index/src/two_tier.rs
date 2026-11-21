@@ -1954,6 +1954,24 @@ impl TwoTierIndex {
         query: &BoundQueryEmbedding,
         k: usize,
     ) -> SearchResult<Vec<VectorHit>> {
+        Ok(self
+            .search_quality_classified_with_producer(query, k, None)?
+            .hits)
+    }
+
+    /// Retrieve classified quality candidates bound to the persisted producer.
+    /// Explicit parameters configure the same exact scan; no raw-vector
+    /// search or dimension-only admission is exposed by this entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_quality_with_producer`].
+    pub fn search_quality_classified_with_producer(
+        &self,
+        query: &BoundQueryEmbedding,
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<ClassifiedHits> {
         let index = self
             .quality_tier()
             .ok_or_else(|| SearchError::InvalidConfig {
@@ -1969,7 +1987,10 @@ impl TwoTierIndex {
                     .to_owned(),
             });
         }
-        Ok(index.search_top_k_classified(query.vector(), k, None)?.hits)
+        params.map_or_else(
+            || index.search_top_k_classified(query.vector(), k, None),
+            |params| index.search_top_k_classified_with_params(query.vector(), k, None, params),
+        )
     }
 
     /// Complete fast-tier evidence for an already selected document union.
@@ -2383,6 +2404,25 @@ impl TwoTierIndex {
     ///
     /// Returns `SearchError` if index access fails.
     pub fn quality_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
+        self.quality_vector_for_doc_id_with_alignment(doc_id, true)
+    }
+
+    /// Look up a usable quality vector without reading fast-tier metadata or
+    /// consulting cross-tier row alignment. Direct quality-only ranking uses
+    /// this lookup because its request has not admitted the fast tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if quality-index access fails.
+    pub fn quality_vector_for_doc_id_direct(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
+        self.quality_vector_for_doc_id_with_alignment(doc_id, false)
+    }
+
+    fn quality_vector_for_doc_id_with_alignment(
+        &self,
+        doc_id: &str,
+        use_fast_alignment: bool,
+    ) -> SearchResult<Option<Vec<f32>>> {
         let Some(quality_index) = self.quality_tier() else {
             return Ok(None);
         };
@@ -2395,11 +2435,14 @@ impl TwoTierIndex {
             }
         }
 
-        let mapped = self
-            .fast_tier()
-            .find_index_by_doc_id(doc_id)?
-            .and_then(|fast_index| self.quality_index_for_fast_index(fast_index))
-            .filter(|&row| !quality_index.is_deleted(row));
+        let mapped = if use_fast_alignment {
+            self.fast_tier()
+                .find_index_by_doc_id(doc_id)?
+                .and_then(|fast_index| self.quality_index_for_fast_index(fast_index))
+                .filter(|&row| !quality_index.is_deleted(row))
+        } else {
+            None
+        };
         usable_main_row_for_doc_id(quality_index, doc_id, mapped)?
             .map(|index| quality_index.vector_at_f32(index))
             .transpose()
@@ -3253,14 +3296,33 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     ///
     /// Returns the same errors as [`Self::search_quality`].
     pub fn search_quality_classified(&self, k: usize) -> SearchResult<ClassifiedHits> {
-        self.quality
+        self.search_quality_classified_with_params(k, None)
+    }
+
+    /// Retrieve classified quality candidates with optional exact-scan settings.
+    /// Explicit settings bypass native candidate generation while retaining the
+    /// quality query's complete admission and cooperative cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_quality`].
+    pub fn search_quality_classified_with_params(
+        &self,
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<ClassifiedHits> {
+        let tier = self
+            .quality
             .as_ref()
             .ok_or_else(|| SearchError::InvalidConfig {
                 field: "search_activation.quality".to_owned(),
                 value: format!("{:?}", self.topology),
                 reason: "quality retrieval requires an activated quality tier".to_owned(),
-            })?
-            .search_candidates(k)
+            })?;
+        params.map_or_else(
+            || tier.search_candidates(k),
+            |params| tier.search_exact_classified(k, Some(params)),
+        )
     }
 
     /// Retrieve directly from the FAST owner with the fast-bound query.
@@ -3331,9 +3393,25 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     /// Propagates typed decode failures from re-reading each activated tier's
     /// own top-`k` doc ids, which is how contribution is attributed.
     pub fn coverage(&self, returned: &[VectorHit], k: usize) -> SearchResult<SearchCoverageV1> {
+        self.coverage_with_params(returned, k, None)
+    }
+
+    /// Reconstruct coverage using the exact same retrieval policy that served
+    /// the candidates. An explicit scan override must not replay a native
+    /// graph and misattribute candidates that only the exact scan returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::coverage`].
+    pub fn coverage_with_params(
+        &self,
+        returned: &[VectorHit],
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<SearchCoverageV1> {
         self.checkpoint()?;
-        let fast = Self::tier_coverage(self.fast.as_ref(), returned, k)?;
-        let quality = Self::tier_coverage(self.quality.as_ref(), returned, k)?;
+        let fast = Self::tier_coverage(self.fast.as_ref(), returned, k, params)?;
+        let quality = Self::tier_coverage(self.quality.as_ref(), returned, k, params)?;
         self.checkpoint()?;
         Ok(SearchCoverageV1::new(self.topology, fast, quality))
     }
@@ -3344,12 +3422,16 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
         tier: Option<&ActivatedTier<'index, 'query>>,
         returned: &[VectorHit],
         k: usize,
+        params: Option<SearchParams>,
     ) -> SearchResult<TierQueryCoverageV1> {
         let Some(tier) = tier else {
             return Ok(TierQueryCoverageV1::NotRequested);
         };
-        let served: BTreeSet<String> = tier
-            .search_candidates(k)?
+        let served: BTreeSet<String> = params
+            .map_or_else(
+                || tier.search_candidates(k),
+                |params| tier.search_exact_classified(k, Some(params)),
+            )?
             .hits
             .into_iter()
             .map(|hit| hit.doc_id.to_string())
