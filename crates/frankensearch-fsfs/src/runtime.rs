@@ -18507,6 +18507,8 @@ impl FsfsRuntime {
             None
         };
 
+        let lexical_index = Self::prepare_delete_lexical_writer(cx, &index_root).await?;
+        retained_search_checkpoint(cx)?;
         publication_lease.fence("delete vector tombstones")?;
         let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
         if let Some((_, sentinel)) = window_membership.as_mut() {
@@ -18542,14 +18544,16 @@ impl FsfsRuntime {
         // And the lexical arm: a deleted document must stop matching by
         // BM25 in the same command that removes its vectors.
         publication_lease.fence("delete lexical publication")?;
-        let lexical_mutations = targets
-            .iter()
-            .map(|doc_id| {
-                LexicalMutation::delete(doc_id.clone(), 0, IngestionClass::Skip, "delete_command")
-            })
-            .collect::<Vec<_>>();
-        self.apply_one_shot_lexical_mutations(cx, &index_root, &lexical_mutations)
-            .await?;
+        if let Some(lexical_index) = lexical_index {
+            let lexical_mutations = targets
+                .iter()
+                .map(|doc_id| {
+                    LexicalMutation::delete(doc_id.clone(), 0, IngestionClass::Skip, "delete_command")
+                })
+                .collect::<Vec<_>>();
+            Self::publish_one_shot_lexical_mutations(cx, &lexical_index, &lexical_mutations, false)
+                .await?;
+        }
         if let Some((mut manifests, sentinel)) = window_membership {
             for id in &targets {
                 manifests.remove(id);
@@ -18725,6 +18729,29 @@ impl FsfsRuntime {
             }),
             _ => Self::resolve_sealed_lexical_engine(index_root),
         }
+    }
+
+    /// Pin the actual lexical writer before deleting from either vector tier.
+    /// A busy writer must also leave an unpointed legacy layout unadopted.
+    async fn prepare_delete_lexical_writer(
+        cx: &Cx,
+        index_root: &Path,
+    ) -> SearchResult<Option<QuillIndex>> {
+        let layout = Self::resolve_delete_lexical_engine(index_root)?;
+        let (Some(BlueGreenEngine::Quill), Some(path)) = (layout.engine(), layout.engine_dir())
+        else {
+            return Ok(None);
+        };
+        let index = QuillIndex::open(cx, path, Self::one_shot_lexical_config()).await?;
+        retained_search_checkpoint(cx)?;
+        // Allow ordinary legacy adoption only after the writer has opened.
+        if Self::resolve_lexical_engine(index_root)? != layout {
+            return Err(complete_cli::complete_cli_error(
+                "delete_membership",
+                "the active lexical generation changed while opening its writer; retry the delete",
+            ));
+        }
+        Ok(Some(index))
     }
 
     /// Merge the WAL into the main FSVI file, eliminating tombstones.
@@ -25850,6 +25877,13 @@ impl FsfsRuntime {
             );
             return Ok(false);
         };
+        let index = QuillIndex::create(cx, &lexical_path, Self::one_shot_lexical_config()).await?;
+        Self::publish_one_shot_lexical_mutations(cx, &index, mutations, reclaim_unpublished)
+            .await?;
+        Ok(true)
+    }
+
+    fn one_shot_lexical_config() -> QuillConfig {
         // Keyword segments carry no repair sidecars (bd-2pkpj): they rebuild
         // from sources, so a segment that fails verification is quarantined
         // and its documents reindexed rather than repaired.
@@ -25859,20 +25893,23 @@ impl FsfsRuntime {
         // leaves the merge's inputs named by MANIFEST.prev and so on disk:
         // a complete-generation candidate then sealed them too, a second copy
         // of every merged row (bd-dnqgr).
-        let index = QuillIndex::create(
-            cx,
-            &lexical_path,
-            QuillConfig {
-                bulk_load_mode: true,
-                max_ingest_shards: 1,
-                deterministic_ingest: true,
-                quarantine_on_unrepairable: true,
-                ..QuillConfig::default()
-            },
-        )
-        .await?;
+        QuillConfig {
+            bulk_load_mode: true,
+            max_ingest_shards: 1,
+            deterministic_ingest: true,
+            quarantine_on_unrepairable: true,
+            ..QuillConfig::default()
+        }
+    }
+
+    async fn publish_one_shot_lexical_mutations(
+        cx: &Cx,
+        index: &QuillIndex,
+        mutations: &[LexicalMutation],
+        reclaim_unpublished: bool,
+    ) -> SearchResult<()> {
         let stats = {
-            let backend = QuillLexicalBackend::new(&index);
+            let backend = QuillLexicalBackend::new(index);
             let mut pipeline = LexicalPipeline::new(backend);
             let stats = pipeline.apply_incremental(mutations)?;
             let flush_result = pipeline.backend_mut().flush(cx).await;
@@ -25927,7 +25964,7 @@ impl FsfsRuntime {
                 "reclaimed unreferenced lexical files of an unpublished candidate"
             );
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Retire a quality-tier generation that no longer belongs to the fast
@@ -26024,19 +26061,20 @@ impl FsfsRuntime {
             })?;
         if !targets.is_empty() {
             publication_lease.fence("lexical-only delete publication")?;
-            let mutations = targets
-                .iter()
-                .map(|doc_id| {
-                    LexicalMutation::delete(
-                        doc_id.clone(),
-                        0,
-                        IngestionClass::Skip,
-                        "delete_command",
-                    )
-                })
-                .collect::<Vec<_>>();
-            self.apply_one_shot_lexical_mutations(cx, index_root, &mutations)
-                .await?;
+            if let Some(index) = Self::prepare_delete_lexical_writer(cx, index_root).await? {
+                let mutations = targets
+                    .iter()
+                    .map(|doc_id| {
+                        LexicalMutation::delete(
+                            doc_id.clone(),
+                            0,
+                            IngestionClass::Skip,
+                            "delete_command",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                Self::publish_one_shot_lexical_mutations(cx, &index, &mutations, false).await?;
+            }
             for id in &targets {
                 manifests.remove(id);
             }
@@ -45695,6 +45733,21 @@ mod tests {
                     } else {
                         vec![inside.clone(), outside.clone(), inside.clone()]
                     };
+                    let writer =
+                        QuillIndex::open(&cx, &lexical_path, QuillConfig::default()).await.unwrap();
+                    let refused = command.run_delete_command(&cx).await;
+                    assert!(
+                        matches!(&refused, Err(SearchError::SubsystemError { source, .. })
+                            if matches!(source.downcast_ref::<frankensearch_quill::KeeperError>(),
+                                Some(frankensearch_quill::KeeperError::WriterBusy { .. }))),
+                        "lexical_only={lexical_only} prefix={prefix}: {refused:?}"
+                    );
+                    assert!(!pointer_path.exists(), "a busy writer must not adopt CURRENT");
+                    assert_eq!(fs::read(lexical_path.join("MANIFEST")).unwrap(), lexical_before);
+                    assert_eq!(fs::read(root.join(super::FSFS_SENTINEL_FILE)).unwrap(), sentinel_before);
+                    assert_eq!(fs::read(&fast_path).ok(), fast_before);
+                    assert_eq!(fs::read(&wal_path).ok(), wal_before);
+                    drop(writer);
                     command.run_delete_command(&cx).await.unwrap();
                     assert!(
                         pointer_path.exists(),
