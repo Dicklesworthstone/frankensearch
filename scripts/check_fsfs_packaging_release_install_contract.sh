@@ -1263,9 +1263,9 @@ GLIBC_STUB
     FAILURES=$((FAILURES + 1))
   fi
 
-  # Fault injection affects only the filesystem operation being tested. The
-  # real installer must refuse a failed backup, and restore the real backup
-  # after a publication command has already damaged the destination.
+  # Observe the live executable while the copy is incomplete, before any
+  # rollback can hide damage. Publication must keep the incumbent runnable
+  # even when copying the candidate or the rollback copy fails.
   local shim_dir="$work/io-faults" real_cp real_install fault
   real_cp=$(command -v cp)
   real_install=$(command -v install)
@@ -1280,38 +1280,84 @@ exec "$FSFS_REAL_CP" "$@"
 CP_FAULT
   cat >"$shim_dir/install" <<'INSTALL_FAULT'
 #!/usr/bin/env bash
+observe_incumbent() {
+  if cmp -s "$FSFS_LIVE_DEST" "$FSFS_INCUMBENT_SNAPSHOT" \
+    && "$FSFS_LIVE_DEST" version | grep -q '1\.0\.0'; then
+    printf 'intact\n' >>"$FSFS_PUBLICATION_OBSERVATIONS"
+  else
+    printf 'damaged\n' >>"$FSFS_PUBLICATION_OBSERVATIONS"
+  fi
+}
 if [[ "${FSFS_IO_FAULT:-}" == restoration ]]; then
   if [[ "$3" == *.incumbent ]]; then
     printf '%s\n' "$3" >"$FSFS_RECOVERY_PATH_RECORD"
   fi
   printf 'partial publication\n' >"$4"
+  observe_incumbent
   exit 73
 fi
 if [[ "${FSFS_IO_FAULT:-}" == publication && "$3" != *.incumbent ]]; then
   printf 'partial publication\n' >"$4"
+  observe_incumbent
   exit 73
+fi
+if [[ "${FSFS_IO_FAULT:-}" == interrupted && "$3" != *.incumbent ]]; then
+  printf 'partial publication\n' >"$4"
+  observe_incumbent
+  kill -TERM "$PPID"
+  exit 143
+fi
+if [[ "${FSFS_IO_FAULT:-}" == observe-success ]]; then
+  "$FSFS_REAL_INSTALL" "$@" || exit $?
+  observe_incumbent
+  exit 0
 fi
 exec "$FSFS_REAL_INSTALL" "$@"
 INSTALL_FAULT
   chmod 0755 "$shim_dir/cp" "$shim_dir/install"
-  for fault in backup publication; do
+  local incumbent_snapshot="$work/incumbent.snapshot" observations
+  cp "$dest/fsfs" "$incumbent_snapshot"
+  for fault in backup publication interrupted; do
+    observations="$work/observations-$fault"
     status=0
     output=$(env NO_COLOR=1 "PATH=$shim_dir:$PATH" \
       "FSFS_REAL_CP=$real_cp" "FSFS_REAL_INSTALL=$real_install" "FSFS_IO_FAULT=$fault" \
+      "FSFS_LIVE_DEST=$dest/fsfs" "FSFS_INCUMBENT_SNAPSHOT=$incumbent_snapshot" \
+      "FSFS_PUBLICATION_OBSERVATIONS=$observations" \
       "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
       "$installer_shell" "$installer" --offline --lite --version v9.9.9 \
       --artifact-url "$archive" --checksum "$digest" --dest "$dest" 2>&1) || status=$?
     local expected_error="upgrade.apply.backup_failed"
-    [[ "$fault" != publication ]] || expected_error="upgrade.apply.rollback_triggered"
+    [[ "$fault" == backup ]] || expected_error="upgrade.apply.rollback_triggered"
     if [[ "$status" -ne 0 && "$output" == *"$expected_error"* ]] \
       && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]] \
-      && "$dest/fsfs" version | grep -q '1\.0\.0'; then
+      && "$dest/fsfs" version | grep -q '1\.0\.0' \
+      && { [[ "$fault" == backup ]] || [[ "$(cat "$observations")" == intact ]]; } \
+      && [[ -z "$(find "$dest" -maxdepth 1 -name '.fsfs.install.*' -print)" ]]; then
       echo "[installer][OK]   $fault failure preserves the working incumbent"
     else
       echo "[installer][FAIL] $fault failure status=$status output=$output"
       FAILURES=$((FAILURES + 1))
     fi
   done
+
+  observations="$work/observations-success"
+  status=0
+  output=$(env NO_COLOR=1 "PATH=$shim_dir:$PATH" \
+    "FSFS_REAL_CP=$real_cp" "FSFS_REAL_INSTALL=$real_install" FSFS_IO_FAULT=observe-success \
+    "FSFS_LIVE_DEST=$dest/fsfs" "FSFS_INCUMBENT_SNAPSHOT=$incumbent_snapshot" \
+    "FSFS_PUBLICATION_OBSERVATIONS=$observations" "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --lite --version v9.9.9 \
+    --artifact-url "$archive" --checksum "$digest" --dest "$dest" 2>&1) || status=$?
+  if [[ "$status" -eq 0 && "$(cat "$observations")" == intact ]] \
+    && "$dest/fsfs" version | grep -q '9\.9\.9' \
+    && [[ -z "$(find "$dest" -maxdepth 1 -name '.fsfs.install.*' -print)" ]]; then
+    echo "[installer][OK]   complete candidate replaces the intact incumbent with no leftover stage"
+  else
+    echo "[installer][FAIL] atomic publication status=$status output=$output"
+    FAILURES=$((FAILURES + 1))
+  fi
+  installer_write_stub "$dest/fsfs" "1.0.0"
 
   # 1. Post-install validation fails only once the binary runs from the
   #    destination; the incumbent must come back.
@@ -1362,13 +1408,15 @@ INSTALL_FAULT
     FAILURES=$((FAILURES + 1))
   fi
 
-  # A persistent destination error can defeat rollback too. The original
-  # executable must remain at the reported recovery path after EXIT cleanup.
+  # A persistent copy error can defeat both publication and rollback. Atomic
+  # staging must preserve the live executable as well as the recovery copy.
   installer_write_stub "$dest/fsfs" "1.0.0"
   local recovery_record="$work/recovery-path" recovery_path=""
   status=0
   output=$(env NO_COLOR=1 "PATH=$shim_dir:$PATH" \
     "FSFS_REAL_CP=$real_cp" "FSFS_REAL_INSTALL=$real_install" \
+    "FSFS_LIVE_DEST=$dest/fsfs" "FSFS_INCUMBENT_SNAPSHOT=$incumbent_snapshot" \
+    "FSFS_PUBLICATION_OBSERVATIONS=$work/observations-restoration" \
     FSFS_IO_FAULT=restoration "FSFS_RECOVERY_PATH_RECORD=$recovery_record" \
     "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
     "$installer_shell" "$installer" --offline --lite --version v9.9.9 \
@@ -1380,8 +1428,9 @@ INSTALL_FAULT
     && [[ "$output" == *"restoring the previous fsfs also failed"* ]] \
     && [[ "$output" == *"$recovery_path"* ]] \
     && [[ "$(installer_file_digest "$recovery_path")" == "$incumbent_digest" ]] \
-    && [[ "$(installer_file_digest "$dest/fsfs")" != "$incumbent_digest" ]]; then
-    echo "[installer][OK]   failed restoration retains and reports the original recovery copy"
+    && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]] \
+    && [[ "$(cat "$work/observations-restoration")" == $'intact\nintact' ]]; then
+    echo "[installer][OK]   failed restoration preserves the live incumbent and reports its recovery copy"
   else
     echo "[installer][FAIL] restoration failure status=$status recovery=$recovery_path output=$output"
     FAILURES=$((FAILURES + 1))

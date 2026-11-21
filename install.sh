@@ -519,14 +519,50 @@ check_release_endpoint_reachable() {
   return 0
 }
 
-install_binary() {
+install_binary() (
   local source_binary="$1" destination_binary="$2"
-  if [ "$SYSTEM" -eq 1 ]; then
-    sudo install -m 0755 "$source_binary" "$destination_binary"
-  else
-    install -m 0755 "$source_binary" "$destination_binary"
+  local destination_dir staging_dir staged_binary
+
+  # Keep the incumbent executable intact until the complete replacement is
+  # ready. A temporary directory on the destination filesystem makes the final
+  # rename atomic, including when TMPDIR lives on another volume. Its private
+  # permissions also keep a partially copied executable out of other readers.
+  install_fs_command() {
+    if [ "$SYSTEM" -eq 1 ]; then
+      sudo "$@"
+    else
+      command "$@"
+    fi
+  }
+  if [ -d "$destination_binary" ]; then
+    err "Cannot replace a directory with ${BINARY_NAME}: $destination_binary"
+    exit 1
   fi
-}
+  destination_dir=$(dirname -- "$destination_binary") || exit 1
+  staging_dir=$(install_fs_command mktemp -d "$destination_dir/.${BINARY_NAME}.install.XXXXXXXX") || {
+    err "Could not stage ${BINARY_NAME} beside $destination_binary; nothing was replaced"
+    exit 1
+  }
+  staged_binary="$staging_dir/${BINARY_NAME}"
+  # The subshell scopes these traps to publication; the installer's existing
+  # rollback and lock cleanup remain installed in its parent shell.
+  trap 'install_fs_command rm -f -- "$staged_binary" || :; install_fs_command rmdir -- "$staging_dir" || :' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if ! install_fs_command install -m 0755 "$source_binary" "$staged_binary"; then
+    err "Could not copy ${BINARY_NAME} into its publication stage; nothing was replaced"
+    exit 1
+  fi
+  # mv treats a directory (including a symlink to one) as a container rather
+  # than a replacement target. Refuse that interpretation before publication.
+  if [ -d "$destination_binary" ]; then
+    err "The installation destination became a directory; nothing was replaced"
+    exit 1
+  fi
+  install_fs_command mv -f -- "$staged_binary" "$destination_binary"
+)
 
 provision_default_semantic_models() {
   local staged_binary="$1" model_id
