@@ -19,6 +19,8 @@ struct Fixture {
     executable: PathBuf,
     #[cfg(feature = "semantic-support")]
     quality: bool,
+    #[cfg(feature = "semantic-support")]
+    quality_only: bool,
 }
 
 #[cfg(feature = "semantic-support")]
@@ -102,7 +104,25 @@ impl Fixture {
             executable: PathBuf::from(env!("CARGO_BIN_EXE_fsfs")),
             #[cfg(feature = "semantic-support")]
             quality,
+            #[cfg(feature = "semantic-support")]
+            quality_only: false,
         }
+    }
+
+    #[cfg(all(feature = "semantic-support", feature = "rerank"))]
+    fn configure_quality_only(&mut self, models: &Path) {
+        let mut settings = FsfsConfig::default();
+        "{index_dir}/catalog.sqlite".clone_into(&mut settings.storage.db_path);
+        settings.indexing.offline = true;
+        settings.indexing.watch_mode = false;
+        "unused-invalid-fast-producer".clone_into(&mut settings.indexing.fast_model);
+        "all-minilm-l6-v2-native".clone_into(&mut settings.indexing.quality_model);
+        settings.indexing.model_dir = models.display().to_string();
+        settings.search.fast_only = false;
+        settings.search.rerank = false;
+        settings.search.quality_timeout_ms = 30_000;
+        fs::write(&self.config, settings.to_toml().unwrap()).unwrap();
+        self.quality_only = true;
     }
 
     fn command(&self, command: &str, format: &str) -> Command {
@@ -355,7 +375,11 @@ fn wait_for_visible_paths(
                 // common words must exercise the actual semantic reader.
                 let output = Process::start(fixture.command("search", "json").args([
                     "find a relevant document",
-                    "--fast-only",
+                    if fixture.quality_only {
+                        "--quality-only"
+                    } else {
+                        "--fast-only"
+                    },
                     "--no-daemon",
                     "--no-rerank",
                     "--limit",
@@ -382,7 +406,11 @@ fn wait_for_visible_paths(
                     && store.is_selected(&cx, &selected).unwrap()
                 {
                     assert_search_hits(&result["data"], expected, "semantic_rank");
-                    if fixture.quality {
+                    if fixture.quality_only {
+                        assert_eq!(result["data"]["skip_reason"], "quality_only");
+                        assert!(selected.path().join("vector/quality.fsvi").is_file());
+                        assert!(!selected.path().join("vector/index.fsvi").exists());
+                    } else if fixture.quality {
                         let quality = Process::start(fixture.command("search", "json").args([
                             "find a relevant document",
                             "--quality-only",
@@ -1657,6 +1685,78 @@ fn complete_watch_binary_keeps_search_available() {
                 assert_default_complete_watch_lifecycle(&models, legacy_seed, index_watch, quality);
             }
         }
+    }
+}
+
+#[cfg(all(feature = "semantic-support", feature = "rerank"))]
+#[test]
+#[allow(clippy::too_many_lines)]
+#[ignore = "requires FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR with verified native MiniLM artifacts"]
+fn complete_quality_only_watch_binary_updates_and_restarts_without_a_fast_model() {
+    let models = fs::canonicalize(
+        std::env::var_os("FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR")
+            .expect("provide a verified native MiniLM model-cache root"),
+    )
+    .unwrap();
+    for index_watch in [false, true] {
+        let mut fixture = Fixture::new(Some(&models), true);
+        fixture.configure_quality_only(&models);
+        let mut command = fixture.command(if index_watch { "index" } else { "watch" }, "jsonl");
+        command.arg("--quality-only");
+        if index_watch {
+            command.arg("--watch");
+        }
+        let mut watching = Process::start(&mut command);
+        let first = wait_for_visible_paths(&fixture, &mut watching, &["alpha.md"], None);
+        let first_vectors = fs::read(first.path().join("vector/quality.fsvi")).unwrap();
+        let first_manifest = fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap();
+        fs::write(fixture.source.join("alpha.md"), "sharedtoken revised alpha document").unwrap();
+        fs::write(fixture.source.join("beta.md"), "sharedtoken new beta document").unwrap();
+        let edited = wait_for_visible_paths(
+            &fixture,
+            &mut watching,
+            &["alpha.md", "beta.md"],
+            Some(first.id()),
+        );
+        fs::rename(fixture.source.join("alpha.md"), fixture.source.join("renamed.md")).unwrap();
+        fs::rename(
+            fixture.source.join("beta.md"),
+            fixture.directory.path().join("removed-beta.md"),
+        )
+        .unwrap();
+        let renamed = wait_for_visible_paths(
+            &fixture,
+            &mut watching,
+            &["renamed.md"],
+            Some(edited.id()),
+        );
+        assert_eq!(fs::read(first.path().join("vector/quality.fsvi")).unwrap(), first_vectors);
+        assert_eq!(fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap(), first_manifest);
+        watching.stop_gracefully();
+
+        // Fresh executable, same standalone quality topology and native producer.
+        let mut restarted = Process::start(
+            fixture.command("watch", "jsonl").arg("--quality-only"),
+        );
+        let warm = wait_for_visible_paths(
+            &fixture,
+            &mut restarted,
+            &["renamed.md"],
+            Some(renamed.id()),
+        );
+        restarted.stop_gracefully();
+        let selection = fs::read(fixture.store.join("FSFS-CURRENT")).unwrap();
+        let vectors = fs::read(warm.path().join("vector/quality.fsvi")).unwrap();
+        let missing = fixture.directory.path().join("missing-models");
+        fixture.configure_quality_only(&missing);
+        let refused = Process::start(fixture.command("watch", "jsonl").arg("--quality-only"))
+            .finish(Duration::from_secs(60));
+        assert!(
+            !refused.status.success(),
+            "required quality cannot degrade into fast or lexical output"
+        );
+        assert_eq!(fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(), selection);
+        assert_eq!(fs::read(warm.path().join("vector/quality.fsvi")).unwrap(), vectors);
     }
 }
 

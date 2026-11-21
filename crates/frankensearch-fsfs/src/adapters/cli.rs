@@ -288,19 +288,15 @@ impl CliInput {
         if !self.quality_only {
             return Ok(());
         }
-        let reason = if !matches!(self.command, CliCommand::Search | CliCommand::Index) {
-            Some("--quality-only is only valid for search and one-shot index commands")
+        let reason = if !matches!(
+            self.command,
+            CliCommand::Search | CliCommand::Index | CliCommand::Watch
+        ) {
+            Some("--quality-only is only valid for search, index and watch commands")
         } else if self.overrides.fast_only == Some(true) {
             Some("quality-only and fast-only are mutually exclusive")
         } else if self.command == CliCommand::Index && self.complete_quality {
             Some("--quality-only builds a standalone quality generation; omit --complete-quality")
-        } else if self.command == CliCommand::Index
-            && self
-                .overrides
-                .allow_background_indexing
-                .unwrap_or(self.watch)
-        {
-            Some("quality-only indexing is one-shot; omit --watch and --watch-mode")
         } else {
             None
         };
@@ -1680,8 +1676,6 @@ mod tests {
             vec!["search", "query", "--quality-only", "--fast-only"],
             vec!["search", "query", "--fast-only", "--quality-only"],
             vec!["index", "--quality-only", "--fast-only"],
-            vec!["index", "--quality-only", "--watch"],
-            vec!["index", "--quality-only", "--watch-mode"],
             vec![
                 "index",
                 "--quality-only",
@@ -1689,7 +1683,7 @@ mod tests {
                 "--index-dir",
                 "store",
             ],
-            vec!["watch", "--quality-only"],
+            vec!["watch", "--quality-only", "--fast-only"],
             vec!["serve", "--quality-only"],
             vec!["doctor", "--quality-only"],
         ] {
@@ -1730,6 +1724,51 @@ mod tests {
             assert!(input.quality_only);
             assert_eq!(input.target_path.as_deref(), Some(Path::new("source")));
             assert_eq!(input.index_dir.as_deref(), Some(Path::new("store")));
+        }
+    }
+
+    #[test]
+    fn quality_only_watch_accepts_both_command_forms_and_keeps_watch_intent() {
+        for args in [
+            vec!["watch", "source", "--quality-only", "--index-dir", "store"],
+            vec![
+                "index",
+                "source",
+                "--quality-only",
+                "--watch",
+                "--index-dir",
+                "store",
+            ],
+            vec![
+                "index",
+                "source",
+                "--quality-only",
+                "--watch-mode",
+                "--index-dir",
+                "store",
+            ],
+        ] {
+            let input = parse_cli_args(args).expect("quality-only watch");
+            assert!(input.quality_only);
+            assert_eq!(input.overrides.allow_background_indexing, Some(true));
+            assert_eq!(input.target_path.as_deref(), Some(Path::new("source")));
+            assert_eq!(input.index_dir.as_deref(), Some(Path::new("store")));
+        }
+        for args in [
+            vec!["watch", "source", "--quality-only", "--acquire-models"],
+            vec![
+                "index",
+                "source",
+                "--quality-only",
+                "--watch",
+                "--acquire-models",
+            ],
+        ] {
+            assert!(matches!(
+                parse_cli_args(args),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "cli.search.acquire_models"
+            ));
         }
     }
 

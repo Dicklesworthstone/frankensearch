@@ -7890,7 +7890,9 @@ impl FsfsRuntime {
     #[must_use]
     pub fn with_cli_input(mut self, cli_input: CliInput) -> Self {
         self.indexing_primary_tier =
-            if cli_input.command == CliCommand::Index && cli_input.quality_only {
+            if matches!(cli_input.command, CliCommand::Index | CliCommand::Watch)
+                && cli_input.quality_only
+            {
                 IndexingPrimaryTier::Quality
             } else {
                 IndexingPrimaryTier::Fast
@@ -9365,7 +9367,7 @@ impl FsfsRuntime {
                 "quality completion requires an existing complete-generation store; use run_mode_with_complete_generations or complete_retained_quality",
             ));
         }
-        if command == CliCommand::Index && self.cli_input.quality_only {
+        if matches!(command, CliCommand::Index | CliCommand::Watch) && self.cli_input.quality_only {
             return Err(complete_cli::complete_cli_error(
                 "quality_only",
                 "quality-only indexing requires complete generations; use FSFS_COMPLETE_GENERATIONS=1 with a store outside the source or beneath a hidden source directory",
@@ -28207,12 +28209,14 @@ impl FsfsRuntime {
             ));
         }
         self.cli_input.validate_quality_completion()?;
-        if self.cli_input.command == CliCommand::Index && self.cli_input.quality_only {
-            if command != CliCommand::Index || self.watch_requested(command) {
+        if matches!(self.cli_input.command, CliCommand::Index | CliCommand::Watch)
+            && self.cli_input.quality_only
+        {
+            if !matches!(command, CliCommand::Index | CliCommand::Watch) {
                 return Err(SearchError::InvalidConfig {
                     field: "cli.quality_only".to_owned(),
                     value: "--quality-only".to_owned(),
-                    reason: "quality-only indexing requires a one-shot index command; use --no-watch-mode to override configured watching".to_owned(),
+                    reason: "quality-only indexing requires an index or watch command".to_owned(),
                 });
             }
             self.validate_semantic_model_selection(SearchExecutionMode::QualityOnly)?;
@@ -30239,7 +30243,7 @@ Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --q
               After provisioning, recovery captures the current selection; changes during rebuilding or preview prevent publication. It never retries automatically.
 Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>
               --quality-only builds a standalone quality tier using installed models, without a fast producer.
-              Quality-only indexing is one-shot and requires complete generations; search it with --quality-only.
+              Quality-only indexing and watching require complete generations; search them with --quality-only.
               --upgrade-reuse <same-executable|compatible-contract>
               Default: same-executable. On Linux, compatible-contract admits verified reuse across binary upgrades.
               Other platforms retain indexed work within the same process.
@@ -57068,6 +57072,14 @@ mod tests {
             ordinary.indexing_primary_tier,
             super::IndexingPrimaryTier::Fast
         );
+        let watching = runtime.clone().with_cli_input(CliInput {
+            command: CliCommand::Watch,
+            ..input.clone()
+        });
+        assert_eq!(
+            watching.indexing_search_mode(),
+            SearchExecutionMode::QualityOnly
+        );
         let search = runtime.with_cli_input(CliInput {
             command: CliCommand::Search,
             query: Some("quality query".to_owned()),
@@ -57085,7 +57097,7 @@ mod tests {
 
     #[cfg(feature = "semantic-support")]
     #[test]
-    fn quality_only_index_refuses_effective_watch_and_deferred_or_disabled_quality() {
+    fn quality_only_index_and_watch_refuse_deferred_or_disabled_quality() {
         let mut config = FsfsConfig::default();
         config.search.fast_only = false;
         "unused-invalid-fast-producer".clone_into(&mut config.indexing.fast_model);
@@ -57108,9 +57120,11 @@ mod tests {
         }
         let mut watching = runtime.clone();
         watching.config.indexing.watch_mode = true;
-        assert!(watching.validate_command_inputs(CliCommand::Index).is_err());
+        watching.validate_command_inputs(CliCommand::Index).unwrap();
+        assert!(watching.watch_requested(CliCommand::Index));
         watching.cli_input.overrides.allow_background_indexing = Some(false);
         watching.validate_command_inputs(CliCommand::Index).unwrap();
+        assert!(!watching.watch_requested(CliCommand::Index));
         let mut disabled = runtime.clone();
         disabled.config.search.fast_only = true;
         assert!(disabled.validate_command_inputs(CliCommand::Index).is_err());

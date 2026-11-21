@@ -1315,7 +1315,7 @@ fn complete_cli_binary_rejects_malformed_opt_in_before_writing() {
 
 #[test]
 fn complete_cli_binary_quality_only_conflicts_do_not_create_a_store() {
-    for flag in ["--fast-only", "--watch", "--complete-quality"] {
+    for flag in ["--fast-only", "--complete-quality"] {
         let fixture = Fixture::new();
         fixture.write_quality_only_config(&fixture.directory.path().join("missing-models"));
         let output = execute(

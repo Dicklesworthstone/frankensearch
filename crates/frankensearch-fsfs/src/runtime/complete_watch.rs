@@ -581,6 +581,18 @@ impl CompleteWatchSession {
     fn open(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> SearchResult<Self> {
         retained_search_checkpoint(cx)?;
         runtime.validate_background_indexing()?;
+        if matches!(
+            runtime.indexing_search_mode(),
+            super::SearchExecutionMode::QualityOnly
+        ) {
+            runtime.validate_semantic_model_selection(super::SearchExecutionMode::QualityOnly)?;
+            if runtime.indexing_quality_deferral().is_some() {
+                return Err(complete_cli_error(
+                    "quality_only",
+                    "the required quality producer cannot be deferred while watching",
+                ));
+            }
+        }
         let pressure = IndexPressureMonitor::new(&runtime.config.pressure)?;
         validate_retained_catalog_path(&runtime.config.storage.db_path)?;
         let mut source = SourceRoot::open(fs::canonicalize(runtime.resolve_target_root()?)?)?;
@@ -759,7 +771,13 @@ impl CompleteWatchSession {
     /// Resume only a selected backlog from this watched source. Producer
     /// retries are throttled independently from source reconciliation.
     fn pending_quality_generation(&self, cx: &Cx) -> SearchResult<Option<PublishedGeneration>> {
-        if self.quality_retry_at.is_some()
+        // A required quality primary starts by rebuilding its own topology.
+        // Completing an incumbent optional-quality backlog would instead
+        // publish Full and could carry the old fast producer into this watch.
+        if matches!(
+            self.runtime.indexing_search_mode(),
+            super::SearchExecutionMode::QualityOnly
+        ) || self.quality_retry_at.is_some()
             || self.runtime.cli_input.full_reindex
             || self.runtime.quality_disabled_by_policy()
             || self.runtime.lexical_only_indexing
@@ -1061,7 +1079,7 @@ impl FsfsRuntime {
     /// Native notifications are registered before the initial rebuild. Edits
     /// coalesce for 500 ms (at most 5 s); a 30 s metadata/membership reconciliation
     /// recovers missed observable changes. Bounded path hints also preserve edits
-    /// with unchanged coarse timestamps. Every build reuses full-search admission and
+    /// with unchanged coarse timestamps. Every build admits its requested tiers and
     /// validates source membership/metadata before selection. A store inside the
     /// source requires a hidden path component and is excluded from discovery.
     /// The store must not contain the source. Incomplete scans never authorize
@@ -1079,6 +1097,11 @@ impl FsfsRuntime {
     /// Explicit quality deferral, fast-only policy and `--full-reindex` retain
     /// their normal behavior. Completion leaves the initial source reconciliation
     /// owed; it never claims that older retained text represents the current tree.
+    /// A quality-only watch builds and maintains the required quality primary
+    /// without resolving fast, including after restart and through mixed deltas.
+    /// It never resumes an incumbent optional-quality backlog or publishes a
+    /// deferred primary. Required-producer failures stop the session
+    /// with the selected generation and existing readers intact.
     ///
     /// Existing retained readers remain usable throughout this future. Bounded
     /// UTF-8 text changes use an atomic mixed batch; unchanged documents are not
@@ -3225,6 +3248,232 @@ mod lifecycle_tests {
             controlled_notifications(&mut session);
             pressure(&mut session, 0.0);
             session
+        }
+
+        fn quality_only_runtime(runtime: &FsfsRuntime) -> FsfsRuntime {
+            let mut config = runtime.config.clone();
+            config.pressure.degradation_override = DegradationOverrideMode::Auto;
+            config.pressure.sample_interval_ms = 60_000;
+            config.search.fast_only = false;
+            "unused-invalid-fast-producer".clone_into(&mut config.indexing.fast_model);
+            "all-minilm-l6-v2".clone_into(&mut config.indexing.quality_model);
+            let mut input = runtime.cli_input.clone();
+            input.quality_only = true;
+            FsfsRuntime::new(config).with_cli_input(input)
+        }
+
+        fn assert_quality_primary(generation: &PublishedGeneration) {
+            assert_eq!(
+                FsfsRuntime::retained_generation_search_mode(generation.path()).unwrap(),
+                SearchExecutionMode::QualityOnly
+            );
+            assert!(!generation.path().join(FSFS_VECTOR_INDEX_FILE).exists());
+            assert!(generation.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).is_file());
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn quality_only_watch_reconciles_deltas_and_restart_with_independent_readers() {
+            run(|cx, fast, quality| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (ordinary, source, root) = fixture(directory.path());
+                let runtime = quality_only_runtime(&ordinary);
+                let mut watching = session(&runtime, &cx, &root);
+                let first = publish_tick(&mut watching, &cx).await;
+                assert_quality_primary(&first);
+                assert_eq!(
+                    *quality.inputs.lock().unwrap(),
+                    vec!["sharedtoken alpha document"]
+                );
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                let original = fs::read(first.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap();
+                let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+                let mut live = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+                quality.inputs.lock().unwrap().clear();
+
+                fs::write(source.join("alpha.md"), "edited alpha document").unwrap();
+                fs::write(source.join("beta.md"), "created beta document").unwrap();
+                let second = publish_tick(&mut watching, &cx).await;
+                assert_quality_primary(&second);
+                assert_eq!(
+                    quality.inputs.lock().unwrap().iter().cloned().collect::<BTreeSet<_>>(),
+                    BTreeSet::from([
+                        "edited alpha document".to_owned(),
+                        "created beta document".to_owned(),
+                    ])
+                );
+                assert_eq!(
+                    pinned.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                    1
+                );
+                assert_eq!(
+                    live.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                    2
+                );
+                quality.inputs.lock().unwrap().clear();
+
+                fs::rename(source.join("alpha.md"), source.join("renamed.md")).unwrap();
+                fs::rename(source.join("beta.md"), directory.path().join("removed-beta.md")).unwrap();
+                let renamed = publish_tick(&mut watching, &cx).await;
+                assert_quality_primary(&renamed);
+                assert_eq!(*quality.inputs.lock().unwrap(), vec!["edited alpha document"]);
+                let answer = live.search(&cx, "document", 10).await.unwrap();
+                assert_eq!(answer.last().unwrap().hits[0].path, "renamed.md");
+                assert_eq!(answer.last().unwrap().hits.len(), 1);
+                quality.inputs.lock().unwrap().clear();
+
+                // With native hints disabled, the periodic source census must
+                // still discover the new file through the same quality delta.
+                fs::write(source.join("gamma.md"), "missed notification document").unwrap();
+                let deadline = watching.last_reconcile + RECONCILE_INTERVAL;
+                let reconciled = require_durable_publication(
+                    watching.advance(&cx, deadline).await.unwrap().unwrap(),
+                ).unwrap();
+                assert_quality_primary(&reconciled);
+                assert_eq!(
+                    *quality.inputs.lock().unwrap(),
+                    vec!["missed notification document"]
+                );
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                quality.inputs.lock().unwrap().clear();
+                drop(watching);
+
+                let restarted = quality_only_runtime(&runtime);
+                let mut watching = session(&restarted, &cx, &root);
+                let warm = publish_tick(&mut watching, &cx).await;
+                assert_quality_primary(&warm);
+                assert!(
+                    quality.inputs.lock().unwrap().is_empty(),
+                    "unchanged sources must survive watch restart"
+                );
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                assert_eq!(
+                    fs::read(first.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap(),
+                    original
+                );
+                assert_eq!(
+                    pinned.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                    1
+                );
+                assert_eq!(
+                    live.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                    2
+                );
+            });
+        }
+
+        #[test]
+        fn quality_only_watch_rebuilds_sources_instead_of_completing_an_optional_backlog() {
+            run(|cx, fast, quality| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (ordinary, source, root, old) = pending_generation(&cx, directory.path()).await;
+                let old_vectors = fs::read(old.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap();
+                let runtime = quality_only_runtime(&ordinary);
+                fs::write(source.join("alpha.md"), "current quality source document").unwrap();
+                fast.inputs.lock().unwrap().clear();
+                quality.inputs.lock().unwrap().clear();
+                let _ = set_quality_completion_load_failure(Some(unavailable_quality_producer));
+                let mut watching = session(&runtime, &cx, &root);
+                assert!(watching.pending_quality_generation(&cx).unwrap().is_none());
+                let selected = publish_tick(&mut watching, &cx).await;
+                assert_quality_primary(&selected);
+                assert_eq!(
+                    *quality.inputs.lock().unwrap(),
+                    vec!["current quality source document"]
+                );
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                assert_eq!(QUALITY_LOAD_ATTEMPTS.with(std::cell::Cell::get), 0);
+                assert!(watching.quality_retry_at.is_none());
+                assert_eq!(
+                    fs::read(old.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                    old_vectors
+                );
+            });
+        }
+
+        #[test]
+        fn quality_only_watch_required_producer_failures_preserve_selection_and_readers() {
+            run(|cx, fast, quality| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (ordinary, source, root) = fixture(directory.path());
+                let runtime = quality_only_runtime(&ordinary);
+                let mut watching = session(&runtime, &cx, &root);
+                let old = publish_tick(&mut watching, &cx).await;
+                let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+                let vectors = fs::read(old.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap();
+                let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+                pinned.search(&cx, "document", 10).await.unwrap();
+                quality.inputs.lock().unwrap().clear();
+                fs::write(source.join("alpha.md"), "changed required quality document").unwrap();
+
+                for missing in [true, false] {
+                    let mut changed = Producer::new("watch-resume-quality");
+                    changed.identity.producer.implementation_revision.push_str("-changed");
+                    let changed = Arc::new(changed);
+                    set_test_quality_embedder(
+                        (!missing).then(|| changed.clone() as Arc<dyn Embedder>),
+                    );
+                    let now = Instant::now();
+                    lock_changes(&watching.changes).unwrap().record(now, false);
+                    assert!(watching.advance(&cx, now + MAX_DEBOUNCE).await.is_err());
+                    assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), selected);
+                    assert_eq!(
+                        fs::read(old.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap(),
+                        vectors
+                    );
+                    assert!(watching.quality_retry_at.is_none());
+                    assert!(changed.inputs.lock().unwrap().is_empty());
+                    assert!(fast.inputs.lock().unwrap().is_empty());
+                    assert_eq!(
+                        pinned.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                        1
+                    );
+                }
+                set_test_quality_embedder(Some(quality));
+            });
+        }
+
+        #[test]
+        fn quality_only_watch_preserves_source_scope_and_expected_old_publication() {
+            run(|cx, fast, quality| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (ordinary, source, root) = fixture(directory.path());
+                let runtime = quality_only_runtime(&ordinary);
+                let mut watching = session(&runtime, &cx, &root);
+                let old = publish_tick(&mut watching, &cx).await;
+                let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+                let allocated = candidate_count(&root);
+                quality.inputs.lock().unwrap().clear();
+
+                let other_source = directory.path().join("other-source");
+                fs::create_dir(&other_source).unwrap();
+                fs::write(other_source.join("alpha.md"), "different source identity").unwrap();
+                let mut input = runtime.cli_input.clone();
+                input.target_path = Some(other_source);
+                let other_runtime = runtime.clone().with_cli_input(input);
+                let other = session(&other_runtime, &cx, &root);
+                assert!(matches!(
+                    other.attempt(&cx, true, None).await,
+                    Err(SearchError::InvalidConfig { field, .. }) if field == "cli.index.target"
+                ));
+                assert_eq!(candidate_count(&root), allocated);
+                assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), selected);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                drop(other);
+
+                let outside = require_durable_publication(
+                    runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
+                ).unwrap();
+                assert_ne!(outside, old);
+                let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+                let allocated = candidate_count(&root);
+                fs::write(source.join("alpha.md"), "edited after another publisher won").unwrap();
+                assert!(watching.advance(&cx, Instant::now() + RECONCILE_INTERVAL).await.is_err());
+                assert_eq!(candidate_count(&root), allocated);
+                assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), selected);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                assert!(fast.inputs.lock().unwrap().is_empty());
+            });
         }
 
         #[test]
