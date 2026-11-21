@@ -59304,7 +59304,10 @@ mod tests {
         });
     }
 
-    fn assert_exclusions_refused_before_work<T>(operation: impl Future<Output = SearchResult<T>>) {
+    fn assert_exclusions_refused_before_work<T>(
+        operation: impl Future<Output = SearchResult<T>>,
+        expected_value: &str,
+    ) {
         let mut operation = Box::pin(operation);
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(
@@ -59312,7 +59315,7 @@ mod tests {
                 operation.as_mut().poll(&mut context),
                 Poll::Ready(Err(SearchError::InvalidConfig { field, value, .. }))
                     if field == "cli.search_query"
-                        && value == "exclusions_without_lexical_index"
+                        && value == expected_value
             ),
             "missing exclusion evidence must fail before model or reranker work",
         );
@@ -59376,6 +59379,16 @@ mod tests {
                     "how do alpha documents rank NOT \"internal secret\"",
                     "-banned",
                 ] {
+                    // Pure exclusion queries have no positive text, so explicit
+                    // quality-only requests fail at mode admission before lexical
+                    // validation (73d3a1f1); all other cases fail on missing lexical
+                    // exclusion evidence. Both refuse synchronously before model work.
+                    let expected_value =
+                        if matches!(mode, SearchExecutionMode::QualityOnly) && query == "-banned" {
+                            "exclusion_only"
+                        } else {
+                            "exclusions_without_lexical_index"
+                        };
                     assert_exclusions_refused_before_work(
                         runtime.execute_search_phase_artifacts_with_mode_using_resources(
                             &cx,
@@ -59389,6 +59402,7 @@ mod tests {
                                 Ok(())
                             }),
                         ),
+                        expected_value,
                     );
                 }
             }

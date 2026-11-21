@@ -1819,6 +1819,13 @@ mod tests {
     }
 
     impl tracing::Subscriber for DiagnosticCapture {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
         }
@@ -1859,6 +1866,7 @@ mod tests {
         let capture = DiagnosticCapture::default();
         let cx = Cx::for_testing();
         tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
             let sampled_out = ShadowLexicalObserver::new(
                 shadow.clone(),
                 ShadowLexicalConfig {

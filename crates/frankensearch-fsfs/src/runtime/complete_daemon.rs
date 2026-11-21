@@ -2863,7 +2863,7 @@ mod generation_tests {
                 before_embed: std::sync::Mutex::new(None),
             });
             let root = directory.path().join("store");
-            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
             let build = store.begin(&cx).unwrap();
             let quality_file = crate::runtime::FSFS_VECTOR_QUALITY_INDEX_FILE;
             fs::create_dir(build.path().join("vector")).unwrap();

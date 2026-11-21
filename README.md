@@ -1311,10 +1311,22 @@ With a matching quality embedder attached and `TwoTierConfig::fast_only` disable
 an async caller can request the quality tier directly:
 
 ```rust,no_run
+# use std::path::Path;
+# use std::sync::Arc;
+# use frankensearch::{EmbedderStack, TwoTierConfig, TwoTierIndex, TwoTierSearcher};
+# asupersync::test_utils::run_test_with_cx(|cx| async move {
+#     let stack = EmbedderStack::auto_detect_semantic_with(Some(Path::new("./models"))).unwrap();
+#     let index = Arc::new(TwoTierIndex::open(Path::new("./my_index"), TwoTierConfig::default()).unwrap());
+#     let mut searcher = TwoTierSearcher::new(index, stack.fast_arc(), TwoTierConfig::default());
+#     if let Some(quality) = stack.quality_arc() {
+#         searcher = searcher.with_quality_embedder(quality);
+#     }
 let (results, metrics) = searcher
     .search_quality_only_collect(&cx, "ownership rules", 10)
     .await
     .expect("quality-only search should succeed");
+#     let _ = (results, metrics);
+# });
 ```
 
 This request independently admits and searches the quality space, including
