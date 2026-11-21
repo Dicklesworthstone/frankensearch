@@ -4,6 +4,7 @@
 //! [`crate::searcher::TwoTierSearcher`] but operates on precomputed query
 //! embeddings and fully in-memory indices.
 
+use std::collections::hash_map::Entry;
 use std::path::Path;
 
 // The per-query `&str`-keyed score maps + `seen` dedup set are `.get()`/`.insert()`
@@ -145,8 +146,8 @@ pub trait SyncLexicalSearch: Send + Sync {
     /// Implementations may ignore `query_vec` when they already have external
     /// query context. Return at most `limit` candidates in relevance order;
     /// fewer candidates means the matching corpus is exhausted. Filtered
-    /// searches may repeat this call with a larger limit to fill the eligible
-    /// candidate budget.
+    /// searches count each document ID once and may repeat this call with a
+    /// larger limit to fill the eligible candidate budget.
     ///
     /// # Errors
     ///
@@ -2095,12 +2096,20 @@ fn search_filtered_lexical(
         // Unpinned custom sources may change between refills, so only the last
         // complete batch supplies observations, just as it supplies scores.
         metadata.clear();
-        for hit in &hits {
-            let observation = metadata.entry(hit.doc_id.to_string()).or_default();
-            if observation.is_none() {
-                observation.clone_from(&hit.metadata);
+        // Keep the best ranked row for each public ID. A later row can still
+        // supply its metadata when earlier rows had none.
+        hits.retain(|hit| match metadata.entry(hit.doc_id.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(hit.metadata.clone());
+                true
             }
-        }
+            Entry::Occupied(mut entry) => {
+                if entry.get().is_none() {
+                    entry.get_mut().clone_from(&hit.metadata);
+                }
+                false
+            }
+        });
         let unknown: Vec<_> = hits
             .iter()
             .filter(|hit| {
@@ -5193,6 +5202,45 @@ mod tests {
             failed.search_collect_with_filter(&query, 2, Some(&allowed)),
             Err(SearchError::Cancelled { ref phase, .. }) if phase == "lexical-refill"
         ));
+    }
+
+    #[test]
+    fn filtered_lexical_refill_counts_distinct_documents() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        let mut duplicate = lexical_result("repeat", 9.0);
+        duplicate.metadata = Some(Arc::new(serde_json::json!({"doc_type": "keep"})));
+        let mut blocked = lexical_result("blocked", 8.0);
+        blocked.metadata = Some(Arc::new(serde_json::json!({"doc_type": "blocked"})));
+        let mut tail = lexical_result("tail", 7.0);
+        tail.metadata = Some(Arc::new(serde_json::json!({"doc_type": "keep"})));
+        let searcher = SyncTwoTierSearcher::new(
+            make_index(),
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                fast_only: true,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_lexical(Arc::new(StaticLexical {
+            hits: vec![lexical_result("repeat", 10.0), duplicate, blocked, tail],
+        }));
+        let filter = DocTypeFilter::new(["keep"]);
+        let query = fast_only_query(vec![0.0, 0.0]);
+        let (results, metrics) = searcher
+            .search_collect_with_filter(&query, 2, Some(&filter))
+            .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["repeat", "tail"]
+        );
+        assert_eq!(metrics.lexical_candidates, 2);
+        assert_eq!(results[0].lexical_score, Some(10.0));
+        assert_eq!(results[0].metadata.as_deref().unwrap()["doc_type"], "keep");
     }
 
     #[test]

@@ -15402,6 +15402,9 @@ mod tests {
         use frankensearch_core::traits::LexicalWrite;
         use frankensearch_quill::{QuillConfig, QuillIndex};
 
+        const POSITIVE_QUERY: &str = "needle guide reference overview";
+        const QUERY: &str = r#"needle guide reference overview -RuSt nOt "danger zone""#;
+
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
             let quill = QuillIndex::create(
@@ -15416,21 +15419,21 @@ mod tests {
             .unwrap();
             let mut docs: Vec<_> = (0..64)
                 .map(|rank| {
+                    let excluded_text = if rank < 32 { "RUST" } else { "DaNgEr ZoNe" };
                     IndexableDocument::new(
                         format!("excluded-{rank:02}"),
-                        if rank < 32 {
-                            "needle RUST"
-                        } else {
-                            "needle DaNgEr ZoNe"
-                        },
+                        format!("{POSITIVE_QUERY} {excluded_text}"),
                     )
                     .with_title("needle")
                 })
                 .collect();
             for id in ["tail-a", "tail-b"] {
                 docs.push(
-                    IndexableDocument::new(id, "needle with some extra surrounding context")
-                        .with_metadata("path", format!("src/{id}.rs")),
+                    IndexableDocument::new(
+                        id,
+                        format!("{POSITIVE_QUERY} with some extra surrounding context"),
+                    )
+                    .with_metadata("path", format!("src/{id}.rs")),
                 );
             }
             LexicalWrite::index_documents(&quill, &cx, &docs)
@@ -15438,7 +15441,7 @@ mod tests {
                 .unwrap();
             LexicalWrite::commit(&quill, &cx).await.unwrap();
             let lexical: Arc<dyn LexicalRead> = Arc::new(quill);
-            let prefix = lexical.search(&cx, "needle", 64).await.unwrap();
+            let prefix = lexical.search(&cx, POSITIVE_QUERY, 64).await.unwrap();
             assert_eq!(prefix.len(), 64);
             assert!(prefix.iter().all(|hit| hit.doc_id.starts_with("excluded-")));
             let (_index_dir, index) = build_test_index_with_quality(4);
@@ -15466,9 +15469,8 @@ mod tests {
                 )
                 .with_quality_embedder(Arc::new(StubEmbedder::new("quality", 4)))
                 .with_lexical(Arc::clone(&lexical));
-                let query = r#"needle -RuSt nOt "danger zone""#;
                 let (collected, metrics) = searcher
-                    .search_collect_with_text(&cx, query, 2, text)
+                    .search_collect_with_text(&cx, QUERY, 2, text)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -15476,6 +15478,7 @@ mod tests {
                     2,
                     "fast_only={fast_only}, hash_only={hash_only}"
                 );
+                assert_eq!(metrics.query_class, Some(QueryClass::NaturalLanguage));
                 assert_eq!(metrics.lexical_candidates, 2);
                 assert_eq!(metrics.semantic_candidates, 0);
                 assert!(collected.iter().all(|hit| hit.doc_id.starts_with("tail-")
@@ -15490,7 +15493,7 @@ mod tests {
                 }));
                 let mut phases = Vec::new();
                 searcher
-                    .search(&cx, query, 2, text, |phase| phases.push(phase))
+                    .search(&cx, QUERY, 2, text, |phase| phases.push(phase))
                     .await
                     .unwrap();
                 assert_eq!(phases.len(), if fast_only || hash_only { 1 } else { 2 });
