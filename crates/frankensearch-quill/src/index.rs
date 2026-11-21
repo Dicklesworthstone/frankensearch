@@ -15670,6 +15670,39 @@ impl LexicalRead for QuillIndex {
         crate::query::escape_unknown_field_colons(query, self.reader.schema)
     }
 
+    fn pin_search<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, Option<Arc<dyn LexicalRead>>> {
+        Box::pin(async move {
+            check_cancel(cx, "pin lexical search").map_err(SearchError::from)?;
+            let snapshot = self
+                .checked_published_snapshot()
+                .map_err(SearchError::from)?;
+            check_cancel(cx, "pin lexical search").map_err(SearchError::from)?;
+            Ok(Some(Arc::new(QuillSearchSession {
+                reader: self.reader.clone(),
+                snapshot,
+            }) as Arc<dyn LexicalRead>))
+        })
+    }
+
+    fn metadata_for_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        document_ids: &'a [&str],
+    ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+        Box::pin(async move {
+            check_cancel(cx, "selected document metadata").map_err(SearchError::from)?;
+            let snapshot = self
+                .checked_published_snapshot()
+                .map_err(SearchError::from)?;
+            QuillSearchSession {
+                reader: self.reader.clone(),
+                snapshot,
+            }
+            .metadata_for_documents(cx, document_ids)
+            .map_err(SearchError::from)
+        })
+    }
+
     fn search<'a>(
         &'a self,
         cx: &'a Cx,
@@ -15774,6 +15807,25 @@ impl LexicalRead for QuillSearchIndex {
         crate::query::escape_unknown_field_colons(query, self.reader.schema)
     }
 
+    fn pin_search<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, Option<Arc<dyn LexicalRead>>> {
+        Box::pin(async move {
+            Ok(Some(
+                Arc::new(Self::pin_search(self, cx).map_err(SearchError::from)?)
+                    as Arc<dyn LexicalRead>,
+            ))
+        })
+    }
+
+    fn metadata_for_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        document_ids: &'a [&str],
+    ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+        Box::pin(async move {
+            Self::metadata_for_documents(self, cx, document_ids).map_err(SearchError::from)
+        })
+    }
+
     fn search<'a>(
         &'a self,
         cx: &'a Cx,
@@ -15817,6 +15869,41 @@ impl LexicalRead for QuillSearchIndex {
 impl LexicalRead for QuillSnapshotIndex {
     fn query_text<'q>(&self, query: &'q str) -> Cow<'q, str> {
         crate::query::escape_unknown_field_colons(query, self.reader.schema)
+    }
+
+    fn pin_search<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, Option<Arc<dyn LexicalRead>>> {
+        Box::pin(async move {
+            check_cancel(cx, "pin lexical search").map_err(SearchError::from)?;
+            let snapshot = self
+                .reader
+                .checked_published_snapshot()
+                .map_err(SearchError::from)?;
+            check_cancel(cx, "pin lexical search").map_err(SearchError::from)?;
+            Ok(Some(Arc::new(QuillSearchSession {
+                reader: self.reader.clone(),
+                snapshot,
+            }) as Arc<dyn LexicalRead>))
+        })
+    }
+
+    fn metadata_for_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        document_ids: &'a [&str],
+    ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+        Box::pin(async move {
+            check_cancel(cx, "selected document metadata").map_err(SearchError::from)?;
+            let snapshot = self
+                .reader
+                .checked_published_snapshot()
+                .map_err(SearchError::from)?;
+            QuillSearchSession {
+                reader: self.reader.clone(),
+                snapshot,
+            }
+            .metadata_for_documents(cx, document_ids)
+            .map_err(SearchError::from)
+        })
     }
 
     fn search<'a>(
@@ -15867,6 +15954,22 @@ impl LexicalRead for RootBoundQuillSearchIndex {
         LexicalRead::query_text(self.state.load_full().reader.as_ref(), query)
     }
 
+    fn pin_search<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, Option<Arc<dyn LexicalRead>>> {
+        let reader = Arc::clone(&self.state.load_full().reader);
+        Box::pin(async move { LexicalRead::pin_search(reader.as_ref(), cx).await })
+    }
+
+    fn metadata_for_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        document_ids: &'a [&str],
+    ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+        let reader = Arc::clone(&self.state.load_full().reader);
+        Box::pin(async move {
+            LexicalRead::metadata_for_documents(reader.as_ref(), cx, document_ids).await
+        })
+    }
+
     fn search<'a>(
         &'a self,
         cx: &'a Cx,
@@ -15904,6 +16007,51 @@ impl LexicalRead for RootBoundQuillSearchIndex {
     fn doc_count(&self) -> SearchResult<usize> {
         let state = self.state.load_full();
         LexicalRead::doc_count(state.reader.as_ref())
+    }
+}
+
+/// A retained search session is also the engine-neutral read capability.
+/// Eager candidates carry metadata from this exact snapshot, so no later
+/// hydration can accidentally consult the originating reader after refresh.
+impl LexicalRead for QuillSearchSession {
+    fn query_text<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        crate::query::escape_unknown_field_colons(query, self.reader.schema)
+    }
+
+    fn pin_search<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, Option<Arc<dyn LexicalRead>>> {
+        Box::pin(async move {
+            check_cancel(cx, "pin lexical search").map_err(SearchError::from)?;
+            Ok(Some(Arc::new(self.clone()) as Arc<dyn LexicalRead>))
+        })
+    }
+
+    fn metadata_for_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        document_ids: &'a [&str],
+    ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+        Box::pin(async move {
+            Self::metadata_for_documents(self, cx, document_ids).map_err(SearchError::from)
+        })
+    }
+
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move {
+            self.search_results(cx, query, limit)
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn doc_count(&self) -> SearchResult<usize> {
+        usize::try_from(self.snapshot.live_doc_count()).map_err(|_| SearchError::SubsystemError {
+            subsystem: "quill",
+            source: "retained Quill document count does not fit usize".into(),
+        })
     }
 }
 
@@ -36618,9 +36766,25 @@ mod tests {
             assert_eq!(metadata[0], metadata[3]);
             assert!(reader.metadata_for_documents(&cx, &[]).unwrap().is_empty());
             let session = reader.pin_search(&cx).expect("pin related reads");
+            let async_session = LexicalRead::pin_search(&reader, &cx)
+                .await
+                .expect("pin engine-neutral reader")
+                .expect("Quill supplies a retained reader");
+            assert_eq!(
+                async_session
+                    .metadata_for_documents(&cx, &ids)
+                    .await
+                    .unwrap(),
+                metadata,
+            );
             let before = session.search_results(&cx, "alpha", 10).unwrap();
             let prefix = session.search_results(&cx, "alpha", 1).unwrap();
             assert_eq!(prefix[0].doc_id, before[0].doc_id);
+            let async_prefix = async_session
+                .search_candidates(&cx, "alpha", 1)
+                .await
+                .unwrap();
+            assert_eq!(async_prefix.results()[0].doc_id, before[0].doc_id);
 
             writer
                 .upsert_documents(
@@ -36670,6 +36834,39 @@ mod tests {
                 "refills cannot observe refreshed membership, scores or metadata",
             );
             assert_eq!(reader.search_results(&cx, "alpha", 10).unwrap().len(), 3);
+            assert_eq!(async_session.doc_count().unwrap(), 2);
+            assert_eq!(
+                async_session
+                    .metadata_for_documents(&cx, &ids)
+                    .await
+                    .unwrap(),
+                metadata,
+                "engine-neutral selected metadata cannot observe the refresh",
+            );
+            let async_refilled = async_session
+                .search_candidates(&cx, "alpha", 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                async_refilled
+                    .results()
+                    .iter()
+                    .map(|hit| (
+                        hit.doc_id.as_str(),
+                        hit.score.to_bits(),
+                        hit.metadata.as_deref()
+                    ))
+                    .collect::<Vec<_>>(),
+                before
+                    .iter()
+                    .map(|hit| (
+                        hit.doc_id.as_str(),
+                        hit.score.to_bits(),
+                        hit.metadata.as_deref()
+                    ))
+                    .collect::<Vec<_>>(),
+                "engine-neutral candidate refills retain membership, scores and metadata",
+            );
 
             cx.set_cancel_requested(true);
             for ids in [&ids[..], &[][..]] {
@@ -36682,6 +36879,10 @@ mod tests {
                 assert!(matches!(
                     session.metadata_for_documents(&cx, ids),
                     Err(QuillIndexError::Cancelled { .. }),
+                ));
+                assert!(matches!(
+                    async_session.metadata_for_documents(&cx, ids).await,
+                    Err(SearchError::Cancelled { .. }),
                 ));
             }
             assert!(matches!(

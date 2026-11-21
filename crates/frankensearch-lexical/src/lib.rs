@@ -24,6 +24,7 @@ pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod cass_compat;
 pub mod quill_contract;
+mod retained;
 
 pub use cass_compat::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument, CassDocumentRef, CassFields,
@@ -51,7 +52,6 @@ pub use tantivy::{
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "bench-internals")]
 use std::sync::Arc;
 use std::sync::RwLock;
 #[cfg(feature = "bench-internals")]
@@ -4100,6 +4100,28 @@ impl TantivyIndex {
 // ─── LexicalSearch implementation ───────────────────────────────────────────
 
 impl frankensearch_core::traits::LexicalRead for TantivyIndex {
+    fn pin_search<'a>(
+        &'a self,
+        cx: &'a Cx,
+    ) -> SearchFuture<'a, Option<Arc<dyn frankensearch_core::traits::LexicalRead>>> {
+        Box::pin(async move {
+            let reader = retained::PinnedTantivyReader::new(cx, self)?;
+            Ok(Some(
+                Arc::new(reader) as Arc<dyn frankensearch_core::traits::LexicalRead>
+            ))
+        })
+    }
+
+    fn metadata_for_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        document_ids: &'a [&str],
+    ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+        Box::pin(async move {
+            retained::PinnedTantivyReader::new(cx, self)?.selected_metadata(cx, document_ids)
+        })
+    }
+
     #[instrument(skip_all, fields(query_bytes = query.len(), limit = limit))]
     fn search<'a>(
         &'a self,
@@ -6297,6 +6319,166 @@ mod tests {
             for (candidate, expected) in candidates.iter().zip(&full) {
                 assert_eq!(candidate.metadata, expected.metadata);
             }
+        });
+    }
+
+    #[test]
+    fn retained_lexical_reader_keeps_refills_and_selected_metadata_on_one_publication() {
+        let index = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("alpha", "alpha signal")
+                            .with_metadata("revision", "first"),
+                        IndexableDocument::new("semantic-only", "unrelated vocabulary")
+                            .with_metadata("revision", "first"),
+                        IndexableDocument::new("bare", "alpha"),
+                    ],
+                )
+                .await
+                .expect("index");
+            index.commit(&cx).await.expect("commit");
+            let pinned = index
+                .pin_search(&cx)
+                .await
+                .expect("pin")
+                .expect("retained reader");
+            let ids = ["semantic-only", "missing", "bare", "semantic-only", "alpha"];
+            let metadata = pinned
+                .metadata_for_documents(&cx, &ids)
+                .await
+                .expect("metadata");
+            assert_eq!(metadata.len(), ids.len());
+            assert_eq!(
+                metadata[0].as_deref(),
+                Some(&serde_json::json!({"revision":"first"}))
+            );
+            assert_eq!(metadata[0], metadata[3]);
+            assert!(metadata[1].is_none());
+            assert!(metadata[2].is_none());
+            let before = pinned
+                .search_candidates(&cx, "alpha", 10)
+                .await
+                .expect("before");
+            let prefix = pinned
+                .search_candidates(&cx, "alpha", 1)
+                .await
+                .expect("prefix");
+            assert_eq!(prefix.results()[0].doc_id, before.results()[0].doc_id);
+            assert!(
+                !before
+                    .results()
+                    .iter()
+                    .any(|hit| hit.doc_id == "semantic-only")
+            );
+
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("alpha", "alpha changed")
+                            .with_metadata("revision", "second"),
+                        IndexableDocument::new("new", "alpha").with_metadata("revision", "second"),
+                    ],
+                )
+                .await
+                .expect("update");
+            index
+                .delete_document(&cx, "semantic-only")
+                .await
+                .expect("delete and commit");
+            assert_eq!(pinned.doc_count().unwrap(), 3);
+            assert_eq!(
+                pinned.metadata_for_documents(&cx, &ids).await.unwrap(),
+                metadata
+            );
+            let fresh = index.metadata_for_documents(&cx, &ids).await.unwrap();
+            assert!(fresh[0].is_none());
+            assert_eq!(
+                fresh[4].as_deref(),
+                Some(&serde_json::json!({"revision":"second"}))
+            );
+            let refilled = pinned
+                .search_candidates(&cx, "alpha", 10)
+                .await
+                .expect("refill");
+            assert_eq!(
+                serde_json::to_value(refilled.results()).unwrap(),
+                serde_json::to_value(before.results()).unwrap(),
+                "commit cannot change a retained query's membership, scores or metadata",
+            );
+            assert_eq!(index.search(&cx, "alpha", 10).await.unwrap().len(), 3);
+            assert!(
+                pinned
+                    .metadata_for_documents(&cx, &[])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                pinned.pin_search(&cx).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                pinned.metadata_for_documents(&cx, &ids).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                pinned.search(&cx, "alpha", 10).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn selected_metadata_refuses_corrupt_json_instead_of_reporting_unknown() {
+        let index = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            let mut document = index.to_tantivy_doc(&IndexableDocument::new("damaged", "alpha"));
+            document.add_text(index.fields.metadata_json, "{broken");
+            {
+                let mut writer = index.writer.lock(&cx).await.expect("writer lock");
+                writer
+                    .as_mut()
+                    .expect("writable index")
+                    .add_document(document)
+                    .expect("write fixture");
+            }
+            index.commit(&cx).await.expect("publish malformed fixture");
+            let pinned = index
+                .pin_search(&cx)
+                .await
+                .expect("pin")
+                .expect("retained reader");
+            for reader in [
+                &index as &dyn frankensearch_core::traits::LexicalRead,
+                pinned.as_ref(),
+            ] {
+                assert!(matches!(
+                    reader.metadata_for_documents(&cx, &["damaged"]).await,
+                    Err(SearchError::SubsystemError {
+                        subsystem: "tantivy.metadata",
+                        ..
+                    }),
+                ));
+                assert_eq!(
+                    reader
+                        .metadata_for_documents(&cx, &["missing"])
+                        .await
+                        .unwrap(),
+                    vec![None]
+                );
+            }
+            assert!(matches!(
+                pinned.search_candidates(&cx, "alpha", 10).await,
+                Err(SearchError::SubsystemError {
+                    subsystem: "tantivy.metadata",
+                    ..
+                }),
+            ));
         });
     }
 

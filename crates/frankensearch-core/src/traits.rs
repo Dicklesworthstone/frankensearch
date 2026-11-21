@@ -1775,6 +1775,44 @@ pub trait LexicalRead: Send + Sync {
         Cow::Borrowed(query)
     }
 
+    /// Retain one lexical publication for a complete filtered search.
+    ///
+    /// Candidate refills, winner hydration and selected-document metadata
+    /// lookups through the returned reader must observe the same publication,
+    /// including between progressive phases. The reader has no mutation or
+    /// refresh capability. `None` preserves a backend's existing per-call
+    /// contract when it cannot supply a retained reader.
+    ///
+    /// # Errors
+    /// Returns snapshot-admission or cancellation failures before retrieval.
+    fn pin_search<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, Option<Arc<dyn LexicalRead>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Read metadata for selected document IDs, including semantic-only hits.
+    ///
+    /// Results follow the input order, including repeated IDs. Missing
+    /// documents and genuinely absent metadata produce `None`; an unreadable
+    /// document or malformed stored metadata must return an error instead.
+    /// A backend supplying metadata must bind it to the publication used by
+    /// its candidate searches, normally through [`Self::pin_search`].
+    ///
+    /// The default reports unknown metadata. Unlike winner hydration, this
+    /// operation does not require a lexical match or fabricate a lexical score.
+    /// Filters receive each unknown value unchanged so their own missing-value
+    /// policy remains authoritative.
+    ///
+    /// # Errors
+    /// Returns selected-document hydration or cancellation failures. A caller
+    /// must not treat these failures as permissive missing metadata.
+    fn metadata_for_documents<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        document_ids: &'a [&str],
+    ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+        Box::pin(async move { Ok(vec![None; document_ids.len()]) })
+    }
+
     /// Search for documents matching the query, returning up to `limit`
     /// results sorted by BM25 relevance, with full metadata attached.
     ///
