@@ -638,8 +638,7 @@ impl FsfsRuntime {
             } else {
                 self.resolve_quality_embedder()
             };
-            let embedder = resolved?.ok_or_else(|| {
-                SearchError::EmbedderUnavailable {
+            let embedder = resolved?.ok_or_else(|| SearchError::EmbedderUnavailable {
                 model: self.config.indexing.quality_model.clone(),
                 reason: "quality-only indexing requires its verified quality producer".to_owned(),
             })?;
