@@ -60,6 +60,7 @@ use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
     blend_two_tier, blend_two_tier_aligned_vector_index, build_borrowed_rank_map,
     complete_quality_evidence, compute_rank_changes_with_maps, kendall_tau_with_refined_rank,
+    missing_candidate_ids,
 };
 use crate::calibration::CalibratorConfig;
 use crate::circuit_breaker::{CircuitBreaker, QualityOutcome};
@@ -535,12 +536,20 @@ struct RefinementPools {
     /// Semantic pool after calibration, exclusion filtering, and pool
     /// corrections — exactly what Phase-1 fusion consumed.
     fast_hits: Vec<VectorHit>,
+    /// Actual admitted query and raw scores, retained so quality discoveries
+    /// can receive fast evidence without embedding again or calibrating twice.
+    fast_evidence: Option<FastRefinementEvidence>,
     /// Lexical pool after exclusion filtering. `None` when no lexical
     /// subsystem is configured; `Some` (possibly empty) when one answered.
     lexical: Option<Vec<ScoredResult>>,
     /// Own the scoring snapshot until refinement finishes, including metadata
     /// hydration for candidates promoted from outside the Initial fused pool.
     lexical_context: Option<LexicalHydrationContext>,
+}
+
+struct FastRefinementEvidence {
+    query: BoundQueryEmbedding,
+    hits: Vec<VectorHit>,
 }
 
 /// What the quality tier contributed to a refinement (bd-ctzo C2).
@@ -2398,7 +2407,7 @@ impl TwoTierSearcher {
         }
 
         match fast_embed_result {
-            Ok((query_vec, _)) => {
+            Ok((query_vec, fast_identity)) => {
                 self.export_embedding_metrics(
                     self.fast_embedder.as_ref(),
                     1,
@@ -2491,6 +2500,18 @@ impl TwoTierSearcher {
                     vector_exclusion_source(self.fast_embedder.as_ref()),
                     |limit| retrieve_fast(limit).map(|(hits, _)| hits),
                 )?;
+                let fast_evidence = fast_identity
+                    .filter(|_| {
+                        self.index.fast_admitted_owner().is_some()
+                            || !self.index.fast_embedder_revision().is_empty()
+                    })
+                    .map(|identity| -> SearchResult<FastRefinementEvidence> {
+                        Ok(FastRefinementEvidence {
+                            query: BoundQueryEmbedding::new(query_vec.clone(), identity)?,
+                            hits: fast_hits.clone(),
+                        })
+                    })
+                    .transpose()?;
                 self.apply_score_calibration_to_hits(&mut fast_hits);
                 // Dense-score corrections (hubness demotion, k-NN diffusion) over the semantic
                 // pool. Both off by default, in which case the pool is returned by move and this
@@ -2675,6 +2696,7 @@ impl TwoTierSearcher {
                     pools: Some(RefinementPools {
                         semantic_budget,
                         fast_hits,
+                        fast_evidence,
                         lexical: lexical_results,
                         lexical_context,
                     }),
@@ -3037,6 +3059,28 @@ impl TwoTierSearcher {
                 self.index.quality_scores_for_hits(&quality_vec, missing)
             })?;
         }
+        let mut refined_fast_hits = fast_hits.clone();
+        if let QualityPool::Retrieved(hits) = &quality_pool
+            && let Some(evidence) = pools.and_then(|pools| pools.fast_evidence.as_ref())
+        {
+            let missing = missing_candidate_ids(&fast_hits, hits);
+            if !missing.is_empty() {
+                cancellation_checkpoint(cx, "quality_to_fast_candidate_evidence")?;
+                let supplemental =
+                    self.index
+                        .fast_candidates_with_producer(cx, &evidence.query, &missing)?;
+                if !supplemental.is_empty() {
+                    // Rebuild from raw observations: calibration and hubness
+                    // apply once, and graph diffusion sees the full refined
+                    // fast evidence pool. Initial ranks and retrieval coverage
+                    // still describe only the original Phase-1 candidates.
+                    refined_fast_hits = evidence.hits.clone();
+                    refined_fast_hits.extend(supplemental);
+                    self.apply_score_calibration_to_hits(&mut refined_fast_hits);
+                    refined_fast_hits = self.correct_phase1_pool(refined_fast_hits);
+                }
+            }
+        }
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         cancellation_checkpoint(cx, "quality_search_to_calibration")?;
@@ -3127,13 +3171,12 @@ impl TwoTierSearcher {
                 blend_two_tier_aligned_vector_index(&fast_hits, scores, blend_factor)
             }
             // The union blend: a document in both tiers blends, a fast-only
-            // document keeps its fast score, and a QUALITY-ONLY document keeps
-            // its quality score instead of being dropped. That last case is
-            // the whole behaviour change — it is the document the rescoring
-            // path could never return.
+            // document keeps its fast score, and a document with genuinely
+            // absent fast evidence keeps its quality score. A top-k cutoff
+            // alone cannot select this unpenalized single-source policy.
             QualityPool::Retrieved(hits) => {
-                let mut blended = blend_two_tier(&fast_hits, hits, blend_factor);
-                let fast_indices: AHashMap<&str, u32> = fast_hits
+                let mut blended = blend_two_tier(&refined_fast_hits, hits, blend_factor);
+                let fast_indices: AHashMap<&str, u32> = refined_fast_hits
                     .iter()
                     .map(|hit| (hit.doc_id.as_str(), hit.index))
                     .collect();
@@ -3182,7 +3225,7 @@ impl TwoTierSearcher {
             .iter()
             .map(|result| (result.doc_id.as_str(), result))
             .collect();
-        let fast_scores_by_doc: AHashMap<&str, f32> = fast_hits
+        let fast_scores_by_doc: AHashMap<&str, f32> = refined_fast_hits
             .iter()
             .map(|hit| (hit.doc_id.as_str(), hit.score))
             .collect();
@@ -6781,7 +6824,6 @@ mod tests {
     /// Reopen each production layout with independent 4D fast and 6D quality
     /// spaces. The quality-only document cannot be discovered by fast rescoring.
     fn query_admission_index(layout: &str) -> (OwnerBackedDir, Arc<TwoTierIndex>) {
-        let dir = owner_backed_dir(layout);
         let fast_rows: &[(&str, &[f32])] = &[
             ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
             ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
@@ -6791,6 +6833,15 @@ mod tests {
             ("doc-b", &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
             ("doc-quality-only", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
         ];
+        query_admission_index_with_rows(layout, fast_rows, quality_rows)
+    }
+
+    fn query_admission_index_with_rows(
+        layout: &str,
+        fast_rows: &[(&str, &[f32])],
+        quality_rows: &[(&str, &[f32])],
+    ) -> (OwnerBackedDir, Arc<TwoTierIndex>) {
+        let dir = owner_backed_dir(layout);
         if layout == "stamped-v1" {
             let mut writer = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
             writer
@@ -9702,6 +9753,110 @@ mod tests {
                 Some(None),
                 "a quality-only document has no fast-tier row and must say so"
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn quality_discoveries_receive_fast_evidence_before_union_blending() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_dir, index) = query_admission_index_with_rows(
+                    layout,
+                    &[
+                        ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                        ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                        ("doc-c", &[0.8, 0.6, 0.0, 0.0]),
+                    ],
+                    &[
+                        ("doc-a", &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                        ("doc-b", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                        ("doc-c", &[0.6, 0.8, 0.0, 0.0, 0.0, 0.0]),
+                    ],
+                );
+                for calibrated in [false, true] {
+                    let fast = Arc::new(query_admission_embedder("fast"));
+                    let quality = Arc::new(query_admission_embedder("quality"));
+                    let mut searcher = TwoTierSearcher::new(
+                        Arc::clone(&index),
+                        fast.clone(),
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            quality_weight: 0.7,
+                            explain: true,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_quality_embedder(quality.clone());
+                    if calibrated {
+                        searcher =
+                            searcher.with_score_calibrator(CalibratorConfig::TemperatureScaling(
+                                crate::calibration::TemperatureScaling::new(2.0),
+                            ));
+                    }
+                    let mut phases = Vec::new();
+                    let metrics = searcher
+                        .search(&cx, "query", 2, |_| None, |phase| phases.push(phase))
+                        .await
+                        .unwrap();
+                    let [
+                        SearchPhase::Initial {
+                            results: initial, ..
+                        },
+                        SearchPhase::Refined { results, .. },
+                    ] = phases.as_slice()
+                    else {
+                        panic!("both tiers must run for {layout}: {phases:?}");
+                    };
+                    assert_eq!(
+                        initial
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["doc-a", "doc-c"]
+                    );
+                    // B exists in fast but falls below its retrieval cutoff.
+                    // Treating that as absent evidence gives B a full 1.0
+                    // quality-only score, incorrectly displacing C (~0.8).
+                    assert_eq!(
+                        results
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["doc-c", "doc-b"],
+                        "layout={layout}, calibrated={calibrated}"
+                    );
+                    let discovered = &results[1];
+                    assert_eq!(discovered.fast_score, Some(searcher.calibrate_score(0.0)));
+                    assert_eq!(
+                        discovered.quality_score,
+                        Some(searcher.calibrate_score(1.0))
+                    );
+                    assert_eq!(
+                        discovered.index,
+                        index
+                            .fast_index_for_doc_id("doc-b")
+                            .unwrap()
+                            .map(|row| u32::try_from(row).unwrap())
+                    );
+                    assert!((discovered.score - 0.7).abs() < 1e-6);
+                    assert_eq!(results[0].fast_score, initial[1].fast_score);
+                    assert_eq!(metrics.semantic_candidates, 2);
+                    assert_eq!(metrics.phase2_vectors_searched, 3);
+                    assert_eq!(metrics.incomplete_embeddings, 0);
+                    assert_eq!(fast.embed_count(), 1, "completion reuses the fast response");
+                    assert_eq!(quality.embed_count(), 1);
+                    if let Some(coverage) = metrics.coverage.as_ref() {
+                        assert!(matches!(
+                            coverage.quality,
+                            frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                contributed_candidates: 2,
+                                ..
+                            }
+                        ));
+                    }
+                }
+            }
         });
     }
 

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use frankensearch_core::explanation::{
     ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
 };
-use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::filter::{IncludeDocIdsFilter, SearchFilter};
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_core::{
@@ -30,7 +30,7 @@ use frankensearch_index::{
 
 use crate::blend::{
     blend_two_tier, blend_two_tier_aligned_vector_index, complete_quality_evidence,
-    compute_rank_changes,
+    compute_rank_changes, missing_candidate_ids,
 };
 use crate::mmr::{MmrConfig, mmr_rerank};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
@@ -985,6 +985,7 @@ impl SyncTwoTierSearcher {
         Ok(SyncPreparedSearch {
             initial,
             refinement: Some(SyncRefinement {
+                fast_query,
                 quality_query,
                 fast_hits,
                 lexical_hits,
@@ -1168,6 +1169,7 @@ impl SyncTwoTierSearcher {
             ..
         } = initial;
         let SyncRefinement {
+            fast_query,
             quality_query,
             fast_hits,
             lexical_hits,
@@ -1191,6 +1193,7 @@ impl SyncTwoTierSearcher {
         // coverage. Caller-declared spaces and unstamped control fixtures keep
         // their existing rescoring contract.
         let independent_quality = independently_retrievable_quality(quality_index);
+        let mut refined_fast_hits = fast_hits.clone();
         let quality_pool = if independent_quality {
             quality_index
                 .search_top_k_classified(quality_query.vector(), fetch, filter)
@@ -1199,6 +1202,23 @@ impl SyncTwoTierSearcher {
                         self.index
                             .quality_scores_for_hits(quality_query.vector(), missing)
                     })?;
+                    let missing = missing_candidate_ids(&fast_hits, &hits);
+                    if !missing.is_empty() {
+                        let candidates = IncludeDocIdsFilter::new(missing);
+                        let fast_index = self.index.fast_index();
+                        // A physical-row limit of one per ID can lose other
+                        // requested IDs behind duplicate rows. The exact-ID
+                        // gather scores only the selected candidate union.
+                        refined_fast_hits.extend(
+                            fast_index
+                                .search_top_k_classified(
+                                    fast_query.vector(),
+                                    fast_index.record_count(),
+                                    Some(&candidates),
+                                )?
+                                .hits,
+                        );
+                    }
                     Ok(SyncQualityPool::Retrieved(hits))
                 })
         } else {
@@ -1237,7 +1257,7 @@ impl SyncTwoTierSearcher {
         // is only expressible while the quality tier is a subset of the fast
         // pool; a doc_id key costs one hash per row and is the only key an
         // independently retrieved pool can share.
-        let fast_scores_by_doc: AHashMap<&str, f32> = fast_hits
+        let fast_scores_by_doc: AHashMap<&str, f32> = refined_fast_hits
             .iter()
             .map(|hit| (hit.doc_id.as_str(), hit.score))
             .collect();
@@ -1269,13 +1289,13 @@ impl SyncTwoTierSearcher {
                 blend_two_tier_aligned_vector_index(&fast_hits, scores, quality_weight)
             }
             SyncQualityPool::Retrieved(hits) => {
-                let mut blended = blend_two_tier(&fast_hits, hits, quality_weight);
+                let mut blended = blend_two_tier(&refined_fast_hits, hits, quality_weight);
                 // `VectorHit::index` is a FAST-tier row ordinal for every
-                // consumer downstream. A document only the quality tier
-                // returned has no fast row, so it carries the "no index"
-                // sentinel rather than a quality ordinal that would silently
-                // read as a fast one.
-                let fast_indices: AHashMap<&str, u32> = fast_hits
+                // consumer downstream. Only documents still lacking usable
+                // fast evidence after completion carry the "no index"
+                // sentinel. A quality discovery with a live fast row keeps
+                // that row, even when it missed the fast retrieval window.
+                let fast_indices: AHashMap<&str, u32> = refined_fast_hits
                     .iter()
                     .map(|hit| (hit.doc_id.as_str(), hit.index))
                     .collect();
@@ -1607,6 +1627,7 @@ struct SyncFinalRanking {
 
 #[derive(Debug)]
 struct SyncRefinement<'query> {
+    fast_query: &'query BoundQueryEmbedding,
     quality_query: &'query BoundQueryEmbedding,
     fast_hits: Vec<VectorHit>,
     lexical_hits: Option<Vec<ScoredResult>>,
@@ -2344,6 +2365,74 @@ mod tests {
                 assert!(results.iter().all(|result| result.index.is_none()));
             }
         }
+    }
+
+    #[test]
+    fn quality_discoveries_receive_fast_evidence_before_union_blending() {
+        let dir = temp_dir("persisted-symmetric-candidate-evidence");
+        let fast = semantic_identity("persisted-fast", 2);
+        let quality = semantic_identity("persisted-quality", 3);
+        let mut writer =
+            frankensearch_index::TwoTierIndex::create(dir.path(), TwoTierConfig::default())
+                .unwrap();
+        writer.set_fast_identity(&fast).unwrap();
+        writer.set_quality_identity(&quality).unwrap();
+        for (id, fast_vector, quality_vector) in [
+            ("a", [1.0, 0.0], [0.0, 1.0, 0.0]),
+            ("b", [0.0, 1.0], [1.0, 0.0, 0.0]),
+            ("c", [0.8, 0.6], [0.8, 0.6, 0.0]),
+        ] {
+            writer
+                .add_record(id, &fast_vector, Some(&quality_vector))
+                .unwrap();
+        }
+        drop(writer.finish().unwrap());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap());
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::clone(&index),
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                quality_weight: 0.7,
+                explain: true,
+                ..TwoTierConfig::default()
+            },
+        );
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+        let [
+            SearchPhase::Initial {
+                results: initial, ..
+            },
+            SearchPhase::Refined { results, .. },
+        ] = phases.as_slice()
+        else {
+            panic!("expected progressive refinement: {phases:?}");
+        };
+        assert_eq!(
+            initial
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "b"]
+        );
+        assert_eq!(results[1].fast_score, Some(0.0));
+        assert_eq!(results[1].quality_score, Some(1.0));
+        assert!(results[1].index.is_some(), "B has a real fast row");
+        assert!((results[1].score - 0.7).abs() < 1e-6);
+        let (_, metrics) = searcher.search_collect(&query, 2).unwrap();
+        assert_eq!(metrics.semantic_candidates, 2);
+        assert_eq!(metrics.phase2_vectors_searched, 3);
+        assert_eq!(metrics.incomplete_embeddings, 0);
     }
 
     #[test]

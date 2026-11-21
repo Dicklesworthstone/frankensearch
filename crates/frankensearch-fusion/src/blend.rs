@@ -138,6 +138,22 @@ pub(crate) fn complete_quality_evidence(
     Ok(())
 }
 
+/// IDs already selected by one tier whose evidence the other tier still lacks.
+/// Completing these observations must not expand the retrieved candidate union.
+pub(crate) fn missing_candidate_ids<'a>(
+    observed: &[VectorHit],
+    candidates: &'a [VectorHit],
+) -> Vec<&'a str> {
+    let mut seen: AHashSet<&str> = observed.iter().map(|hit| hit.doc_id.as_str()).collect();
+    candidates
+        .iter()
+        .filter_map(|hit| {
+            let id = hit.doc_id.as_str();
+            seen.insert(id).then_some(id)
+        })
+        .collect()
+}
+
 /// Blend fast-tier and quality-tier vector hits into a single ranking.
 ///
 /// Both input score lists are min-max normalized independently before blending.
