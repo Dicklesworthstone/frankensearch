@@ -73,7 +73,8 @@ use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
 use crate::rrf::{
-    RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
+    InitialFusionExplanation, RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy,
+    fuse_by_strategy_for_vector_lane,
 };
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -2623,9 +2624,16 @@ impl TwoTierSearcher {
                 fused_hits_to_scored_results(
                     &fused,
                     lexical,
-                    self.config.explain,
+                    self.config.explain.then(|| {
+                        InitialFusionExplanation::new(
+                            self.config.fusion_strategy,
+                            lexical,
+                            &hits,
+                            &[],
+                            &rrf_config,
+                        )
+                    }),
                     embedder.id(),
-                    rrf_config.k,
                 )
             },
         );
@@ -3139,9 +3147,16 @@ impl TwoTierSearcher {
                                 fused_hits_to_scored_results(
                                     &fused,
                                     &[],
-                                    self.config.explain,
+                                    self.config.explain.then(|| {
+                                        InitialFusionExplanation::new(
+                                            self.config.fusion_strategy,
+                                            &[],
+                                            &fast_hits,
+                                            graph,
+                                            &rrf_config,
+                                        )
+                                    }),
                                     self.fast_embedder.id(),
-                                    rrf_config.k,
                                 )
                             },
                         )
@@ -3154,44 +3169,31 @@ impl TwoTierSearcher {
                             semantic_weight: self.effective_semantic_weight(lexical),
                             ..rrf_config.clone()
                         };
-                        let fused = graph_candidates.as_ref().map_or_else(
-                            || {
-                                fuse_by_strategy_for_vector_lane(
-                                    self.config.fusion_strategy,
-                                    lexical,
-                                    &fast_hits,
-                                    &[],
-                                    0.0,
-                                    base_candidates,
-                                    0,
-                                    &rrf_config,
-                                    frankensearch_core::is_hash_generation_id(
-                                        self.fast_embedder.id(),
-                                    ),
-                                )
-                            },
-                            |graph| {
-                                fuse_by_strategy_for_vector_lane(
-                                    self.config.fusion_strategy,
-                                    lexical,
-                                    &fast_hits,
-                                    graph,
-                                    self.config.graph_ranking_weight,
-                                    base_candidates,
-                                    0,
-                                    &rrf_config,
-                                    frankensearch_core::is_hash_generation_id(
-                                        self.fast_embedder.id(),
-                                    ),
-                                )
-                            },
+                        let graph = graph_candidates.as_deref().unwrap_or_default();
+                        let fused = fuse_by_strategy_for_vector_lane(
+                            self.config.fusion_strategy,
+                            lexical,
+                            &fast_hits,
+                            graph,
+                            self.config.graph_ranking_weight,
+                            base_candidates,
+                            0,
+                            &rrf_config,
+                            frankensearch_core::is_hash_generation_id(self.fast_embedder.id()),
                         );
                         fused_hits_to_scored_results(
                             &fused,
                             lexical,
-                            self.config.explain,
+                            self.config.explain.then(|| {
+                                InitialFusionExplanation::new(
+                                    self.config.fusion_strategy,
+                                    lexical,
+                                    &fast_hits,
+                                    graph,
+                                    &rrf_config,
+                                )
+                            }),
                             self.fast_embedder.id(),
-                            rrf_config.k,
                         )
                     },
                 );
@@ -3893,13 +3895,8 @@ impl TwoTierSearcher {
                 &rrf_config,
             );
             cancellation_checkpoint(cx, "quality_refusion_to_result_construction")?;
-            let mut results = fused_hits_to_scored_results(
-                &fused,
-                lexical_pool,
-                false,
-                self.fast_embedder.id(),
-                rrf_config.k,
-            );
+            let mut results =
+                fused_hits_to_scored_results(&fused, lexical_pool, None, self.fast_embedder.id());
             let mut lexical_components = self
                 .config
                 .explain
@@ -4993,9 +4990,8 @@ const fn embedder_tier_for_stage(stage: EmbeddingStage, category: ModelCategory)
 fn fused_hits_to_scored_results(
     fused: &[frankensearch_core::types::FusedHit],
     lexical_results: &[ScoredResult],
-    explain: bool,
+    explanation: Option<InitialFusionExplanation>,
     fast_embedder_id: &str,
-    rrf_k: f64,
 ) -> Vec<ScoredResult> {
     // Borrow each candidate's metadata `&Value` into the map instead of cloning
     // it: only the `fused` (top-k) hits below ever read it, so cloning every
@@ -5017,50 +5013,15 @@ fn fused_hits_to_scored_results(
         .iter()
         .map(|fh| {
             let mut fh = fh.clone();
-            if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
+            let hash_control = frankensearch_core::is_hash_generation_id(fast_embedder_id);
+            if hash_control {
                 fh.remap_hash_control_ranks();
             }
             #[allow(clippy::cast_possible_truncation)]
             let score = fh.rrf_score as f32;
             let source = crate::rrf::classify_fused_hit_source(&fh, fast_embedder_id);
-            let explanation = explain.then(|| {
-                let mut components = Vec::new();
-
-                if let (Some(rank), Some(raw_score)) = (fh.lexical_rank, fh.lexical_score) {
-                    components.push(ScoreComponent {
-                        source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
-                        raw_score: f64::from(raw_score),
-                        normalized_score: f64::from(raw_score),
-                        rrf_contribution: rank_contribution(rrf_k, rank),
-                        weight: 1.0,
-                    });
-                }
-
-                let (vector_rank, vector_score) =
-                    if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
-                        (fh.hash_rank, fh.hash_score)
-                    } else {
-                        (fh.semantic_rank, fh.semantic_score)
-                    };
-                if let (Some(rank), Some(raw_score)) = (vector_rank, vector_score) {
-                    components.push(ScoreComponent {
-                        source: ExplainedSource::vector_fast(
-                            fast_embedder_id,
-                            f64::from(raw_score),
-                        ),
-                        raw_score: f64::from(raw_score),
-                        normalized_score: f64::from(raw_score),
-                        rrf_contribution: rank_contribution(rrf_k, rank),
-                        weight: 1.0,
-                    });
-                }
-
-                Box::new(HitExplanation {
-                    final_score: f64::from(score),
-                    components,
-                    phase: ExplanationPhase::Initial,
-                    rank_movement: None,
-                })
+            let explanation = explanation.as_ref().map(|explanation| {
+                Box::new(explanation.for_hit(&fh, score, fast_embedder_id, hash_control))
             });
             ScoredResult {
                 doc_id: fh.doc_id.clone(),
@@ -5081,20 +5042,6 @@ fn fused_hits_to_scored_results(
             }
         })
         .collect()
-}
-
-fn rank_contribution(rrf_k: f64, rank: usize) -> f64 {
-    let rank_u32 = u32::try_from(rank).unwrap_or(u32::MAX);
-    1.0 / (sanitize_rrf_k(rrf_k) + f64::from(rank_u32) + 1.0)
-}
-
-fn sanitize_rrf_k(k: f64) -> f64 {
-    const DEFAULT_RRF_K: f64 = 60.0;
-    if k.is_finite() && k >= 0.0 {
-        k
-    } else {
-        DEFAULT_RRF_K
-    }
 }
 
 fn should_lexical_short_circuit(
@@ -16053,8 +16000,7 @@ mod tests {
             }))),
         }];
 
-        let scored =
-            fused_hits_to_scored_results(&fused, &lexical_results, false, "fast-test", 60.0);
+        let scored = fused_hits_to_scored_results(&fused, &lexical_results, None, "fast-test");
         let lexical = scored
             .iter()
             .find(|result| result.doc_id == "lex-doc-1")
@@ -17807,7 +17753,7 @@ mod tests {
             hash_score: None,
             in_both_sources: true,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
+        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test");
         assert_eq!(results[0].source, ScoreSource::Hybrid);
         assert_eq!(results[0].fast_score, Some(0.8));
         assert_eq!(results[0].lexical_score, Some(3.0));
@@ -17827,7 +17773,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
+        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test");
         assert_eq!(results[0].source, ScoreSource::SemanticFast);
     }
 
@@ -17880,7 +17826,8 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], true, "fnv1a-256", 60.0);
+        let results =
+            fused_hits_to_scored_results(&fused, &[], Some(default_rrf_explanation()), "fnv1a-256");
         assert_eq!(results[0].source, ScoreSource::HashControl);
         assert!(
             matches!(
@@ -17892,7 +17839,7 @@ mod tests {
             "hash explanation must not use SemanticFast: {:?}",
             results[0].explanation
         );
-        let semantic = fused_hits_to_scored_results(&fused, &[], false, "minilm-l6-v2", 60.0);
+        let semantic = fused_hits_to_scored_results(&fused, &[], None, "minilm-l6-v2");
         assert_eq!(semantic[0].source, ScoreSource::SemanticFast);
 
         let remapped = vec![frankensearch_core::types::FusedHit {
@@ -17907,8 +17854,12 @@ mod tests {
             hash_score: Some(0.9),
             in_both_sources: false,
         }];
-        let remapped_results =
-            fused_hits_to_scored_results(&remapped, &[], true, "fnv1a-256", 60.0);
+        let remapped_results = fused_hits_to_scored_results(
+            &remapped,
+            &[],
+            Some(default_rrf_explanation()),
+            "fnv1a-256",
+        );
         assert_eq!(remapped_results[0].source, ScoreSource::HashControl);
         assert_eq!(remapped_results[0].fast_score, Some(0.9));
     }
@@ -17927,7 +17878,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
+        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test");
         assert_eq!(results[0].source, ScoreSource::Lexical);
     }
 
@@ -17945,7 +17896,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
+        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test");
         assert_eq!(results[0].source, ScoreSource::Hybrid);
     }
 
@@ -17964,7 +17915,8 @@ mod tests {
             in_both_sources: true,
         }];
 
-        let results = fused_hits_to_scored_results(&fused, &[], true, "fast-test", 60.0);
+        let results =
+            fused_hits_to_scored_results(&fused, &[], Some(default_rrf_explanation()), "fast-test");
         let explanation = results[0]
             .explanation
             .as_ref()
@@ -17973,6 +17925,16 @@ mod tests {
         assert_eq!(explanation.components.len(), 2);
         assert!(explanation.components[0].rrf_contribution > 0.0);
         assert!(explanation.components[1].rrf_contribution > 0.0);
+    }
+
+    fn default_rrf_explanation() -> InitialFusionExplanation {
+        InitialFusionExplanation::new(
+            frankensearch_core::FusionStrategy::Rrf,
+            &[],
+            &[],
+            &[],
+            &RrfConfig::default(),
+        )
     }
 
     #[test]

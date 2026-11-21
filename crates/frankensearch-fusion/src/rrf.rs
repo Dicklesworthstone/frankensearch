@@ -15,7 +15,9 @@
 use std::collections::hash_map::Entry;
 
 use ahash::AHashMap;
-use frankensearch_core::explanation::{ExplainedSource, ScoreComponent};
+use frankensearch_core::explanation::{
+    ExplainedSource, ExplanationPhase, HitExplanation, ScoreComponent,
+};
 use frankensearch_core::{
     FusedHit, FusionStrategy, ScoreSource, ScoredResult, VectorHit, is_hash_generation_id,
 };
@@ -585,6 +587,128 @@ fn minmax_norm(score: f32, min: f32, max: f32) -> f64 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FusionArmExplanation {
+    bounds: Option<(f32, f32)>,
+    k: f64,
+    weight: f64,
+}
+
+impl FusionArmExplanation {
+    fn new(
+        strategy: FusionStrategy,
+        k: f64,
+        weight: f64,
+        scores: impl Iterator<Item = f32>,
+    ) -> Self {
+        Self {
+            bounds: (strategy == FusionStrategy::PoolMinMax).then(|| pool_min_max(scores)),
+            k: sanitize_rrf_k(k),
+            weight: sanitize_tier_weight(weight),
+        }
+    }
+
+    fn component(&self, source: ExplainedSource, rank: usize, score: f32) -> ScoreComponent {
+        let (normalized_score, rrf_contribution) = match self.bounds {
+            Some((min, max)) => (minmax_norm(score, min, max), 0.0),
+            None => (
+                f64::from(score),
+                self.weight * rank_contribution(self.k, rank),
+            ),
+        };
+        ScoreComponent {
+            source,
+            raw_score: f64::from(score),
+            normalized_score,
+            rrf_contribution,
+            weight: self.weight,
+        }
+    }
+
+    fn lexical_component(&self, hit: &FusedHit) -> Option<ScoreComponent> {
+        hit.lexical_rank
+            .zip(hit.lexical_score)
+            .map(|(rank, score)| {
+                self.component(
+                    ExplainedSource::LexicalBm25 { terms: Vec::new() },
+                    rank,
+                    score,
+                )
+            })
+    }
+}
+
+/// Retain the scoring settings and pool bounds used by initial fusion.
+#[derive(Clone, Copy)]
+pub(crate) struct InitialFusionExplanation {
+    lexical: FusionArmExplanation,
+    vector: FusionArmExplanation,
+}
+
+impl InitialFusionExplanation {
+    pub(crate) fn new(
+        strategy: FusionStrategy,
+        lexical: &[ScoredResult],
+        vector: &[VectorHit],
+        graph: &[ScoredResult],
+        config: &RrfConfig,
+    ) -> Self {
+        let strategy = effective_fusion_strategy(strategy, graph);
+        Self {
+            lexical: FusionArmExplanation::new(
+                strategy,
+                config.k,
+                config.lexical_weight,
+                lexical.iter().map(|result| result.score),
+            ),
+            vector: FusionArmExplanation::new(
+                strategy,
+                config.k,
+                config.semantic_weight,
+                vector.iter().map(|hit| hit.score),
+            ),
+        }
+    }
+
+    pub(crate) fn for_hit(
+        &self,
+        hit: &FusedHit,
+        score: f32,
+        embedder: &str,
+        hash_control: bool,
+    ) -> HitExplanation {
+        let mut components = Vec::with_capacity(2);
+        components.extend(self.lexical.lexical_component(hit));
+        let (vector_rank, vector_score) = if hash_control {
+            (hit.hash_rank, hit.hash_score)
+        } else {
+            (hit.semantic_rank, hit.semantic_score)
+        };
+        if let Some((rank, raw_score)) = vector_rank.zip(vector_score) {
+            let embedder = embedder.to_owned();
+            let cosine_sim = f64::from(raw_score);
+            let source = if hash_control {
+                ExplainedSource::HashControl {
+                    embedder,
+                    cosine_sim,
+                }
+            } else {
+                ExplainedSource::SemanticFast {
+                    embedder,
+                    cosine_sim,
+                }
+            };
+            components.push(self.vector.component(source, rank, raw_score));
+        }
+        HitExplanation {
+            final_score: f64::from(score),
+            components,
+            phase: ExplanationPhase::Initial,
+            rank_movement: None,
+        }
+    }
+}
+
 /// Explain the lexical arm of a refinement, which fuses without a graph arm.
 /// Fused ranks identify the exact rows used, including after a filtered refill.
 pub(crate) fn refined_lexical_components<'a>(
@@ -593,24 +717,13 @@ pub(crate) fn refined_lexical_components<'a>(
     fused: &'a [FusedHit],
     config: &RrfConfig,
 ) -> impl Iterator<Item = Option<ScoreComponent>> + use<'a> {
-    let bounds = (strategy == FusionStrategy::PoolMinMax)
-        .then(|| pool_min_max(lexical.iter().map(|result| result.score)));
-    let k = sanitize_rrf_k(config.k);
-    let weight = sanitize_tier_weight(config.lexical_weight);
-    fused.iter().map(move |hit| {
-        let (rank, score) = hit.lexical_rank.zip(hit.lexical_score)?;
-        let (normalized_score, rrf_contribution) = match bounds {
-            Some((min, max)) => (minmax_norm(score, min, max), 0.0),
-            None => (f64::from(score), weight * rank_contribution(k, rank)),
-        };
-        Some(ScoreComponent {
-            source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
-            raw_score: f64::from(score),
-            normalized_score,
-            rrf_contribution,
-            weight,
-        })
-    })
+    let scoring = FusionArmExplanation::new(
+        strategy,
+        config.k,
+        config.lexical_weight,
+        lexical.iter().map(|result| result.score),
+    );
+    fused.iter().map(move |hit| scoring.lexical_component(hit))
 }
 
 /// Fuse lexical and semantic results by **pool-local min-max score fusion** — a
@@ -1007,8 +1120,8 @@ pub fn fuse_by_strategy_for_vector_lane(
     config: &RrfConfig,
     vector_is_hash: bool,
 ) -> Vec<FusedHit> {
-    let mut fused = match strategy {
-        FusionStrategy::PoolMinMax if graph.is_empty() => pool_minmax_fuse_merge_for_vector_lane(
+    let mut fused = match effective_fusion_strategy(strategy, graph) {
+        FusionStrategy::PoolMinMax => pool_minmax_fuse_merge_for_vector_lane(
             lexical,
             semantic,
             limit,
@@ -1016,7 +1129,7 @@ pub fn fuse_by_strategy_for_vector_lane(
             config,
             vector_is_hash,
         ),
-        FusionStrategy::Rrf | FusionStrategy::PoolMinMax => rrf_fuse_merge_inner(
+        FusionStrategy::Rrf => rrf_fuse_merge_inner(
             lexical,
             semantic,
             graph,
@@ -1030,6 +1143,17 @@ pub fn fuse_by_strategy_for_vector_lane(
     };
     remap_fused_hits_for_hash_lane(&mut fused, vector_is_hash);
     fused
+}
+
+const fn effective_fusion_strategy(
+    strategy: FusionStrategy,
+    graph: &[ScoredResult],
+) -> FusionStrategy {
+    if graph.is_empty() {
+        strategy
+    } else {
+        FusionStrategy::Rrf
+    }
 }
 
 /// Like [`rrf_fuse_with_graph_merge`] but **assumes the `semantic` slice has no
@@ -1521,6 +1645,17 @@ mod tests {
             fused_ids(&via).contains(&"z".to_string()),
             "graph-only doc must survive; dropping it would be a silent correctness loss"
         );
+        let evidence = InitialFusionExplanation::new(
+            FusionStrategy::PoolMinMax,
+            &lexical,
+            &semantic,
+            &graph,
+            &cfg,
+        );
+        let hybrid = via.iter().find(|hit| hit.doc_id == "a").unwrap();
+        let explanation = evidence.for_hit(hybrid, 2.0 / 61.0, "fixture", false);
+        assert_eq!(explanation.components.len(), 2);
+        assert!((explanation.total_rrf_contribution() - 2.0 / 61.0).abs() < 1e-12);
     }
 
     /// QUALITY GATE. The claimed nDCG advantage is not just a rank permutation — measure it.

@@ -513,10 +513,10 @@ fn lexical_phase_snapshots(
     config: TwoTierConfig,
     hits: Vec<ScoredResult>,
     k: usize,
-    lexical_weight: f64,
+    weights: (f64, f64),
 ) -> ParitySnapshots {
     let sync = SyncTwoTierSearcher::new(sync_index(true), config.clone())
-        .with_rrf_weights(lexical_weight, 1.0)
+        .with_rrf_weights(weights.0, weights.1)
         .with_lexical(Arc::new(StaticLexical { hits: hits.clone() }))
         .search_iter(&tiered_query(query_vec), k)
         .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
@@ -536,7 +536,7 @@ fn lexical_phase_snapshots(
         let slot = &mut async_phases;
         async move {
             TwoTierSearcher::new(index, fast, config)
-                .with_rrf_weights(lexical_weight, 1.0)
+                .with_rrf_weights(weights.0, weights.1)
                 .with_quality_embedder(quality)
                 .with_lexical(lexical)
                 .search(
@@ -1093,7 +1093,7 @@ fn lexical_explain_mode_preserves_field_parity_in_each_progressive_phase() {
     };
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
     let (sync_phases, async_phases) =
-        lexical_phase_snapshots(&query, config, lexical_hits(), 3, 1.0);
+        lexical_phase_snapshots(&query, config, lexical_hits(), 3, (1.0, 1.0));
     let sync_labels = sync_phases
         .iter()
         .map(|(label, _)| *label)
@@ -1124,7 +1124,7 @@ fn lexical_explain_mode_preserves_field_parity_in_each_progressive_phase() {
 }
 
 #[test]
-fn refined_explanation_preserves_lexical_scoring_in_both_fusion_strategies() {
+fn explanations_preserve_scoring_in_both_fusion_strategies() {
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
     let mut hits = lexical_hits();
     hits.insert(
@@ -1144,8 +1144,13 @@ fn refined_explanation_preserves_lexical_scoring_in_both_fusion_strategies() {
             explain: true,
             ..TwoTierConfig::default()
         };
-        let (sync, asynchronous) = lexical_phase_snapshots(&query, config, hits.clone(), 5, 2.0);
+        let (sync, asynchronous) =
+            lexical_phase_snapshots(&query, config, hits.clone(), 5, (2.0, 0.5));
         for (api, phases) in [("sync", sync), ("async", asynchronous)] {
+            let (phase, initial) = phases.first().expect("initial results");
+            assert_eq!(*phase, "initial");
+            assert_eq!(initial.len(), 5);
+            assert_initial_fusion_explanations(api, fusion_strategy, initial);
             let (phase, results) = phases.last().expect("refined results");
             assert_eq!(*phase, "refined");
             assert_eq!(results.len(), 5);
@@ -1175,6 +1180,45 @@ fn refined_explanation_preserves_lexical_scoring_in_both_fusion_strategies() {
                 }
             }
         }
+    }
+}
+
+fn assert_initial_fusion_explanations(api: &str, strategy: FusionStrategy, hits: &[ScoredResult]) {
+    for hit in hits {
+        let explanation = hit.explanation.as_ref().expect("initial explanation");
+        assert_eq!(
+            explanation.components.len(),
+            usize::from(hit.lexical_score.is_some()) + usize::from(hit.fast_score.is_some())
+        );
+        let contribution = explanation
+            .components
+            .iter()
+            .map(|component| {
+                let expected_weight = match component.source {
+                    ExplainedSource::LexicalBm25 { .. } => 2.0,
+                    ExplainedSource::SemanticFast { .. } => 0.5,
+                    ref source => panic!("unexpected Initial source {source:?}"),
+                };
+                assert!(
+                    (component.weight - expected_weight).abs() < 1e-7,
+                    "{api} {strategy:?} {} reports the wrong weight",
+                    hit.doc_id
+                );
+                match strategy {
+                    FusionStrategy::Rrf => component.rrf_contribution,
+                    FusionStrategy::PoolMinMax => {
+                        assert_eq!(component.rrf_contribution.to_bits(), 0.0_f64.to_bits());
+                        assert!((0.0..=1.0).contains(&component.normalized_score));
+                        component.normalized_score * component.weight
+                    }
+                }
+            })
+            .sum::<f64>();
+        assert!(
+            (contribution - f64::from(hit.score)).abs() < 2e-7,
+            "{api} {strategy:?} {} cannot reconstruct the score",
+            hit.doc_id
+        );
     }
 }
 

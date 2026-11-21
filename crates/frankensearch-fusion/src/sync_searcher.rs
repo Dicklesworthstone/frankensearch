@@ -37,8 +37,8 @@ use crate::blend::{
 use crate::mmr::{MmrConfig, mmr_rerank};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{
-    RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
-    refined_lexical_components,
+    InitialFusionExplanation, RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy,
+    fuse_by_strategy_for_vector_lane, refined_lexical_components,
 };
 use crate::searcher::promoted_quality_source;
 
@@ -992,6 +992,12 @@ impl SyncTwoTierSearcher {
                 )
             },
             |lexical| {
+                let rrf_config = RrfConfig {
+                    k: self.config.rrf_k,
+                    lexical_weight: self.rrf_lexical_weight,
+                    semantic_weight: query_semantic_weight,
+                    tiebreak: self.rrf_tiebreak,
+                };
                 fused_hits_to_scored_results(
                     fuse_by_strategy_for_vector_lane(
                         self.config.fusion_strategy,
@@ -1001,17 +1007,20 @@ impl SyncTwoTierSearcher {
                         0.0,
                         target,
                         0,
-                        &RrfConfig {
-                            k: self.config.rrf_k,
-                            lexical_weight: self.rrf_lexical_weight,
-                            semantic_weight: query_semantic_weight,
-                            tiebreak: self.rrf_tiebreak,
-                        },
+                        &rrf_config,
                         hash_control,
                     ),
                     lexical,
                     target,
-                    self.config.explain.then_some(self.config.rrf_k),
+                    self.config.explain.then(|| {
+                        InitialFusionExplanation::new(
+                            self.config.fusion_strategy,
+                            lexical,
+                            &fast_hits,
+                            &[],
+                            &rrf_config,
+                        )
+                    }),
                     sync_fast_embedder_id(&self.index),
                     hash_control,
                 )
@@ -1220,6 +1229,12 @@ impl SyncTwoTierSearcher {
                 )
             },
             |lexical| {
+                let rrf_config = RrfConfig {
+                    k: self.config.rrf_k,
+                    lexical_weight: self.rrf_lexical_weight,
+                    semantic_weight: self.effective_semantic_weight(lexical),
+                    tiebreak: self.rrf_tiebreak,
+                };
                 fused_hits_to_scored_results(
                     fuse_by_strategy(
                         self.config.fusion_strategy,
@@ -1229,16 +1244,19 @@ impl SyncTwoTierSearcher {
                         0.0,
                         k,
                         0,
-                        &RrfConfig {
-                            k: self.config.rrf_k,
-                            lexical_weight: self.rrf_lexical_weight,
-                            semantic_weight: self.effective_semantic_weight(lexical),
-                            tiebreak: self.rrf_tiebreak,
-                        },
+                        &rrf_config,
                     ),
                     lexical,
                     k,
-                    self.config.explain.then_some(self.config.rrf_k),
+                    self.config.explain.then(|| {
+                        InitialFusionExplanation::new(
+                            self.config.fusion_strategy,
+                            lexical,
+                            hits,
+                            &[],
+                            &rrf_config,
+                        )
+                    }),
                     embedder_id,
                     false,
                 )
@@ -2335,7 +2353,7 @@ fn fused_hits_to_scored_results(
     hits: Vec<FusedHit>,
     lexical: &[ScoredResult],
     k: usize,
-    explanation_rrf_k: Option<f64>,
+    explanation: Option<InitialFusionExplanation>,
     fast_embedder_id: &str,
     hash_control: bool,
 ) -> Vec<ScoredResult> {
@@ -2373,41 +2391,8 @@ fn fused_hits_to_scored_results(
             } else {
                 ScoreSource::Hybrid
             };
-            let explanation = explanation_rrf_k.map(|rrf_k| {
-                let mut components = Vec::with_capacity(2);
-                if let (Some(rank), Some(raw_score)) = (hit.lexical_rank, hit.lexical_score) {
-                    components.push(ScoreComponent {
-                        source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
-                        raw_score: f64::from(raw_score),
-                        normalized_score: f64::from(raw_score),
-                        rrf_contribution: rrf_rank_contribution(rrf_k, rank),
-                        weight: 1.0,
-                    });
-                }
-                let (vector_rank, vector_score) = if hash_control {
-                    (hit.hash_rank, hit.hash_score)
-                } else {
-                    (hit.semantic_rank, hit.semantic_score)
-                };
-                if let (Some(rank), Some(raw_score)) = (vector_rank, vector_score) {
-                    components.push(ScoreComponent {
-                        source: sync_fast_explanation_source(
-                            fast_embedder_id,
-                            f64::from(raw_score),
-                            hash_control,
-                        ),
-                        raw_score: f64::from(raw_score),
-                        normalized_score: f64::from(raw_score),
-                        rrf_contribution: rrf_rank_contribution(rrf_k, rank),
-                        weight: 1.0,
-                    });
-                }
-                Box::new(HitExplanation {
-                    final_score: f64::from(score),
-                    components,
-                    phase: ExplanationPhase::Initial,
-                    rank_movement: None,
-                })
+            let explanation = explanation.as_ref().map(|explanation| {
+                Box::new(explanation.for_hit(&hit, score, fast_embedder_id, hash_control))
             });
             let metadata = metadata_by_doc.get(hit.doc_id.as_str()).copied().cloned();
             ScoredResult {
@@ -2424,16 +2409,6 @@ fn fused_hits_to_scored_results(
             }
         })
         .collect()
-}
-
-fn rrf_rank_contribution(rrf_k: f64, rank: usize) -> f64 {
-    let rank = u32::try_from(rank).unwrap_or(u32::MAX);
-    let rrf_k = if rrf_k.is_finite() && rrf_k >= 0.0 {
-        rrf_k
-    } else {
-        60.0
-    };
-    1.0 / (rrf_k + f64::from(rank) + 1.0)
 }
 
 fn sync_fast_embedder_id(index: &InMemoryTwoTierIndex) -> &str {
