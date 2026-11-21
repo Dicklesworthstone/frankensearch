@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.13.0] — 2026-11-21
+
+Qualified multi-platform release of `fsfs 1.13.0` and the `frankensearch 0.8.0`
+workspace crate family (`frankensearch-core` / `durability` / `embed` / `index`
+/ `lexical` / `quill` / `fusion` / `storage` / `tui` / `ops` `0.5.0`,
+`frankensearch-rerank` `0.6.0`, `frankensearch` `0.8.0`, `frankensearch-fsfs`
+`1.13.0`).
+
+### Highlights
+
+- **Source-root preservation & absolute delete paths (#75, #76):** Ordinary
+  `fsfs index` refuses replacing an existing index from a different source root
+  unless `--full`/`--force` is given. `fsfs delete` resolves absolute paths and
+  `--prefix` selectors against the recorded source root and live document
+  identities across fast, quality, and Quill arms.
+- **Warm `--fast-only` answer-cache replay without reloading weights (#73):**
+  Artifact-verified producer admission replays valid cached answers without
+  loading Model2Vec weights while preserving fail-closed rejection on missing,
+  changed, or corrupted producers.
+- **Accented Latin CASS queries (inspired by #74):** Both `frankensearch-quill`
+  and `frankensearch-lexical` reuse the complete indexing analyzer for accented
+  Latin words, phrases, and prefixes on existing CASS indexes without reindexing.
+- **Discovery root exclusions & watcher recovery (#72):** Component exclusion
+  rules apply at and below the configured discovery root rather than rejecting
+  roots beneath excluded parent directories; filesystem notification overflows
+  trigger authoritative reconciliation.
+- **Outbound HTTP/HTTPS/SOCKS5 proxy policy (#70):** Model downloads and hosted
+  API calls honor `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` (with lowercase
+  precedence, redirect re-evaluation, and credential-safe errors).
+- **Signed installer verification:** `install.sh --verify` authenticates
+  `.minisig` release signatures with the pinned repository public key before
+  extraction or execution.
+- **Quill 0.5.0 sealing & producer metadata (#68):** Reduces peak sealing memory
+  and derives durable producer versions directly from Cargo metadata.
+- **Standalone quality indexes & metadata filtering:** Direct quality-only async
+  search (`search_quality_only_collect`) and standalone quality CLI indexing/watch,
+  plus synchronous metadata-filter enforcement and duplicate-refill fixes.
+- **Dependencies:** Upgraded FrankenSQLite family to `0.5.0` (eliminating the
+  duplicate Asupersync 0.5 runtime), refreshed 130+ semver-compatible lockfile
+  crates, updated `arc-swap` `1.9.5`, `zeroize` `1.9.2`, and dev-dep
+  `jsonschema` `0.62.0`, while preserving `asupersync 0.6.2` (`default-features
+  = false`), zero forbidden async runtimes, and `cargo audit` 0 vulnerabilities.
+
 ### fsfs 1.13.0 — Search accented Latin words in existing CASS indexes (#548)
 
 - Reuse the complete indexing analyzer before Unicode case conversion or
