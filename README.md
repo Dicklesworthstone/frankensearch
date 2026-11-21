@@ -690,6 +690,27 @@ queue their inputs for the original quality producer and explicit completion.
 Stores first indexed from an empty corpus under forced deferral preserve that
 producer choice too, so their later appends can complete quality normally.
 
+To build a standalone quality-tier index, select a verified quality model in
+the configuration and run:
+
+```bash
+fsfs index ~/projects --quality-only --no-fast-only --index-dir ./quality-store
+fsfs search "structured concurrency" --quality-only --no-fast-only --index-dir ./quality-store
+```
+
+This one-shot build indexes the source into Quill and `vector/quality.fsvi`
+without loading the fast model. It publishes a complete generation; later
+quality-only builds can reuse compatible unchanged quality rows. `append-batch`,
+`delete`, and `compact` preserve the stored topology. Use `--quality-only` when
+searching this store, since ordinary hybrid search requires a fast tier.
+
+Quality-only indexing requires a pressure profile that permits quality and a
+complete-generation store on Linux or macOS. It refuses watch mode, forced
+embedding deferral, metadata-only or lexical-only policy, and combination with
+`--complete-quality`. If configuration enables watch mode, add
+`--no-watch-mode`. A missing or incompatible required quality producer is an
+error; an unsuccessful successor build leaves the selected generation intact.
+
 `append-batch` accepts JSONL objects with string `id` and `text` fields, from
 `--file` or standard input. It inserts or replaces the supplied documents in
 lexical data, every present vector tier, and an existing catalog, then publishes

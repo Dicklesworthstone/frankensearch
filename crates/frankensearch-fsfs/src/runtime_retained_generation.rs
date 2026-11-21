@@ -16,7 +16,7 @@ enum RetainedRebuildStart<'a> {
 }
 
 #[derive(Default)]
-struct LegacyUpgradeProducers {
+struct RetainedBuildProducers {
     // Keep the shared fast loader's weak cache alive through candidate admission.
     _fast: Option<Arc<dyn Embedder>>,
     quality: Option<IndexingQualityTier>,
@@ -594,13 +594,50 @@ impl FsfsRuntime {
         .await
     }
 
-    async fn admit_legacy_upgrade_producers(
+    async fn admit_retained_build_producers(
         &self,
         cx: &Cx,
         root: &Path,
-    ) -> SearchResult<LegacyUpgradeProducers> {
+    ) -> SearchResult<RetainedBuildProducers> {
         use crate::generation_store::COMPLETE_GENERATION_POINTER;
 
+        if matches!(
+            self.indexing_search_mode(),
+            SearchExecutionMode::QualityOnly
+        ) {
+            self.validate_semantic_model_selection(SearchExecutionMode::QualityOnly)?;
+            if !complete_cli::complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
+                && !complete_cli::complete_entry_exists(&root.join("generations"))?
+            {
+                self.validate_index_source_root(root, &self.resolve_target_root()?)?;
+            }
+            let mut control = IndexRunControl::new(&self.config)?;
+            control.admit_work(cx, "index.quality_model_load").await?;
+            // Quality is required for this topology. Prove it before creating
+            // `generations`, which would otherwise redirect a legacy reader
+            // even if an unavailable or invalid model then aborts the build.
+            #[cfg(test)]
+            let resolved = self.resolve_quality_embedder();
+            #[cfg(not(test))]
+            let resolved = if cx.blocking_pool_handle().is_some() {
+                let runtime = self.clone();
+                Self::search_blocking(cx, move || runtime.resolve_quality_embedder()).await?
+            } else {
+                self.resolve_quality_embedder()
+            };
+            let embedder = resolved?.ok_or_else(|| SearchError::EmbedderUnavailable {
+                model: self.config.indexing.quality_model.clone(),
+                reason: "quality-only indexing requires its verified quality producer".to_owned(),
+            })?;
+            control.checkpoint(cx, "index.quality_model_loaded", true)?;
+            Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
+            Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+            retained_search_checkpoint(cx)?;
+            return Ok(RetainedBuildProducers {
+                _fast: None,
+                quality: Some((Some(embedder), REASON_VECTOR_QUALITY_TIER_BUILT)),
+            });
+        }
         if !matches!(
             build_search_mode(self.indexing_search_mode()),
             SearchExecutionMode::Full | SearchExecutionMode::FastOnly
@@ -614,7 +651,7 @@ impl FsfsRuntime {
             || !Self::read_index_sentinel(root)?
                 .is_some_and(|sentinel| sentinel.generation_complete)
         {
-            return Ok(LegacyUpgradeProducers::default());
+            return Ok(RetainedBuildProducers::default());
         }
         self.validate_index_source_root(root, &self.resolve_target_root()?)?;
         self.validate_semantic_model_selection(self.indexing_search_mode())?;
@@ -663,7 +700,7 @@ impl FsfsRuntime {
             None
         };
         retained_search_checkpoint(cx)?;
-        Ok(LegacyUpgradeProducers {
+        Ok(RetainedBuildProducers {
             _fast: Some(embedder),
             quality,
         })
@@ -712,10 +749,10 @@ impl FsfsRuntime {
         // models and checks their identities against any rows it carries.
         let producers =
             if kind == RetainedBuildKind::Index && matches!(start, RetainedRebuildStart::Fresh) {
-                self.admit_legacy_upgrade_producers(cx, &canonical_root)
+                self.admit_retained_build_producers(cx, &canonical_root)
                     .await?
             } else {
-                LegacyUpgradeProducers::default()
+                RetainedBuildProducers::default()
             };
         let resumed = matches!(start, RetainedRebuildStart::Resume(_));
         let store = if resumed {
