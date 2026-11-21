@@ -70,7 +70,7 @@ frankensearch-quill = { version = "0.5.0", path = "crates/frankensearch-quill" }
 # the earlier 0.4.11 driver drained queued shadow work before block_on returned
 # (bd-dsbym). A dependency bump alone is not evidence that contract holds.
 asupersync = { version = "0.6.2", default-features = false, features = ["proc-macros"] }
-arc-swap = "=1.9.2"
+arc-swap = "=1.9.5"
 
 # Descriptor-relative generation-root admission. Keep the syscall surface
 # explicit so unsupported targets compile without pulling platform code in.
@@ -149,7 +149,7 @@ ndarray = "0.17"
 hnsw_rs = { package = "frankenhnsw", version = "=0.3.5", default-features = false }
 
 # CRC32 checksums for FSVI index integrity
-crc32fast = "1.5.2"
+crc32fast = "1.5.5"
 
 # Fast non-cryptographic hashing for hot-path HashMaps (inspired by fff.nvim)
 ahash = "0.8"
@@ -163,16 +163,16 @@ unicode-normalization = "0.1"
 # Platform-standard directories for model storage
 
 # TOML parsing for configuration surfaces
-toml = "1.1.6"
+toml = "1.2.2"
 
 # SHA-256 verification for model manifests
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 
 # Authenticated encryption and keyed digests for private evidence artifacts (bd-fttb)
 chacha20poly1305 = "=0.11.0"
 getrandom = "=0.4.3"
 hmac = "=0.13.0"
-zeroize = "=1.9.0"
+zeroize = "=1.9.2"
 # Ed25519 receipt signatures mandated by the frozen ArtifactStore v4 F0
 # contract (docs/artifactstore-v4-threat-model.md); consumed by
 # frankensearch-quill-gauntlet's `supervisor` module (F2/F3).

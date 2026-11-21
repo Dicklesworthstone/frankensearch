@@ -20,7 +20,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 memmap2 = { workspace = true }
 rustix = { version = "1.1.5", features = ["fs"] }
 libc = "0.2"
-raptorq = "2.0.1"
+raptorq = "2.0.2"
 
 [features]
 # Engine-neutral by construction (bd-tkjm): durability primitives compose with
