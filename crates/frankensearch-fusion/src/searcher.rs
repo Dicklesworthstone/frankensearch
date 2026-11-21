@@ -3776,12 +3776,14 @@ impl TwoTierSearcher {
                                          doc_id: &str,
                                          fast_score: Option<f32>,
                                          quality_score: Option<f32>,
-                                         rank_map: &std::collections::HashMap<&str, usize>|
+                                         rank_map: &std::collections::HashMap<&str, usize>,
+                                         lexical_component: Option<ScoreComponent>|
          -> Option<Box<HitExplanation>> {
             if !self.config.explain {
                 return None;
             }
             let mut components = Vec::new();
+            components.extend(lexical_component);
 
             let fast_norm = |s: f32| -> f64 {
                 if !s.is_finite() {
@@ -3894,10 +3896,23 @@ impl TwoTierSearcher {
             let mut results = fused_hits_to_scored_results(
                 &fused,
                 lexical_pool,
-                self.config.explain,
+                false,
                 self.fast_embedder.id(),
                 rrf_config.k,
             );
+            let mut lexical_components = self
+                .config
+                .explain
+                .then(|| {
+                    crate::rrf::refined_lexical_components(
+                        self.config.fusion_strategy,
+                        lexical_pool,
+                        &fused,
+                        &rrf_config,
+                    )
+                })
+                .into_iter()
+                .flatten();
             let initial_fused_rank: std::collections::HashMap<&str, usize> = initial_results
                 .iter()
                 .enumerate()
@@ -3925,6 +3940,7 @@ impl TwoTierSearcher {
                     fast_score,
                     quality_score,
                     &initial_fused_rank,
+                    lexical_components.next().flatten(),
                 );
             }
             if let (Some(lexical), Some(context)) = (
@@ -3988,6 +4004,7 @@ impl TwoTierSearcher {
                     fast_score,
                     quality_score,
                     &initial_rank,
+                    None,
                 );
 
                 ScoredResult {

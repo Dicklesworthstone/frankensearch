@@ -15,6 +15,7 @@
 use std::collections::hash_map::Entry;
 
 use ahash::AHashMap;
+use frankensearch_core::explanation::{ExplainedSource, ScoreComponent};
 use frankensearch_core::{
     FusedHit, FusionStrategy, ScoreSource, ScoredResult, VectorHit, is_hash_generation_id,
 };
@@ -582,6 +583,34 @@ fn minmax_norm(score: f32, min: f32, max: f32) -> f64 {
     } else {
         0.0
     }
+}
+
+/// Explain the lexical arm of a refinement, which fuses without a graph arm.
+/// Fused ranks identify the exact rows used, including after a filtered refill.
+pub(crate) fn refined_lexical_components<'a>(
+    strategy: FusionStrategy,
+    lexical: &[ScoredResult],
+    fused: &'a [FusedHit],
+    config: &RrfConfig,
+) -> impl Iterator<Item = Option<ScoreComponent>> + use<'a> {
+    let bounds = (strategy == FusionStrategy::PoolMinMax)
+        .then(|| pool_min_max(lexical.iter().map(|result| result.score)));
+    let k = sanitize_rrf_k(config.k);
+    let weight = sanitize_tier_weight(config.lexical_weight);
+    fused.iter().map(move |hit| {
+        let (rank, score) = hit.lexical_rank.zip(hit.lexical_score)?;
+        let (normalized_score, rrf_contribution) = match bounds {
+            Some((min, max)) => (minmax_norm(score, min, max), 0.0),
+            None => (f64::from(score), weight * rank_contribution(k, rank)),
+        };
+        Some(ScoreComponent {
+            source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
+            raw_score: f64::from(score),
+            normalized_score,
+            rrf_contribution,
+            weight,
+        })
+    })
 }
 
 /// Fuse lexical and semantic results by **pool-local min-max score fusion** — a

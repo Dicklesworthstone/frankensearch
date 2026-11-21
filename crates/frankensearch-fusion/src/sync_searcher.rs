@@ -38,6 +38,7 @@ use crate::mmr::{MmrConfig, mmr_rerank};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{
     RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
+    refined_lexical_components,
 };
 use crate::searcher::promoted_quality_source;
 
@@ -1010,7 +1011,7 @@ impl SyncTwoTierSearcher {
                     ),
                     lexical,
                     target,
-                    &self.config,
+                    self.config.explain.then_some(self.config.rrf_k),
                     sync_fast_embedder_id(&self.index),
                     hash_control,
                 )
@@ -1237,7 +1238,7 @@ impl SyncTwoTierSearcher {
                     ),
                     lexical,
                     k,
-                    &self.config,
+                    self.config.explain.then_some(self.config.rrf_k),
                     embedder_id,
                     false,
                 )
@@ -1457,26 +1458,38 @@ impl SyncTwoTierSearcher {
         let rank_changes = compute_rank_changes(&fast_hits, &blended);
 
         let target = self.final_candidate_target(k);
+        let mut lexical_components = Vec::new();
         let mut refined_results = if let Some(lexical) = lexical_hits.as_ref() {
-            fused_hits_to_scored_results(
-                fuse_by_strategy(
+            let rrf_config = RrfConfig {
+                k: self.config.rrf_k,
+                lexical_weight: self.rrf_lexical_weight,
+                semantic_weight: query_semantic_weight,
+                tiebreak: self.rrf_tiebreak,
+            };
+            let fused = fuse_by_strategy(
+                self.config.fusion_strategy,
+                lexical,
+                &blended,
+                &[],
+                0.0,
+                target,
+                0,
+                &rrf_config,
+            );
+            if self.config.explain {
+                // The conversion below preserves this fused order.
+                lexical_components.extend(refined_lexical_components(
                     self.config.fusion_strategy,
                     lexical,
-                    &blended,
-                    &[],
-                    0.0,
-                    target,
-                    0,
-                    &RrfConfig {
-                        k: self.config.rrf_k,
-                        lexical_weight: self.rrf_lexical_weight,
-                        semantic_weight: query_semantic_weight,
-                        tiebreak: self.rrf_tiebreak,
-                    },
-                ),
+                    &fused,
+                    &rrf_config,
+                ));
+            }
+            fused_hits_to_scored_results(
+                fused,
                 lexical,
                 target,
-                &self.config,
+                None,
                 sync_fast_embedder_id(&self.index),
                 false,
             )
@@ -1518,6 +1531,7 @@ impl SyncTwoTierSearcher {
             let (fast_min, fast_max) = finite_score_bounds(fast_hits.iter().map(|hit| hit.score));
             let (quality_min, quality_max) =
                 finite_score_bounds(quality_scores_by_doc.values().copied());
+            let mut lexical_components = lexical_components.into_iter();
             for (rank, result) in refined_results.iter_mut().enumerate() {
                 result.explanation = Some(Box::new(build_refined_explanation(
                     result.score,
@@ -1532,6 +1546,7 @@ impl SyncTwoTierSearcher {
                     quality_max,
                     quality_weight,
                     sync_fast_embedder_id(&self.index),
+                    lexical_components.next().flatten(),
                 )));
             }
         }
@@ -2049,6 +2064,7 @@ fn build_refined_explanation(
     quality_max: f32,
     quality_weight: f32,
     fast_embedder_id: &str,
+    lexical_component: Option<ScoreComponent>,
 ) -> HitExplanation {
     let normalize = |score: f32, min: f32, max: f32| {
         if !score.is_finite() {
@@ -2061,7 +2077,8 @@ fn build_refined_explanation(
             f64::from(score.clamp(0.0, 1.0))
         }
     };
-    let mut components = Vec::with_capacity(2);
+    let mut components = Vec::with_capacity(2 + usize::from(lexical_component.is_some()));
+    components.extend(lexical_component);
     if let Some(score) = fast_score {
         components.push(ScoreComponent {
             // Refinement is reachable only for a semantic fast tier. The
@@ -2318,7 +2335,7 @@ fn fused_hits_to_scored_results(
     hits: Vec<FusedHit>,
     lexical: &[ScoredResult],
     k: usize,
-    config: &TwoTierConfig,
+    explanation_rrf_k: Option<f64>,
     fast_embedder_id: &str,
     hash_control: bool,
 ) -> Vec<ScoredResult> {
@@ -2356,14 +2373,14 @@ fn fused_hits_to_scored_results(
             } else {
                 ScoreSource::Hybrid
             };
-            let explanation = config.explain.then(|| {
+            let explanation = explanation_rrf_k.map(|rrf_k| {
                 let mut components = Vec::with_capacity(2);
                 if let (Some(rank), Some(raw_score)) = (hit.lexical_rank, hit.lexical_score) {
                     components.push(ScoreComponent {
                         source: ExplainedSource::LexicalBm25 { terms: Vec::new() },
                         raw_score: f64::from(raw_score),
                         normalized_score: f64::from(raw_score),
-                        rrf_contribution: rrf_rank_contribution(config.rrf_k, rank),
+                        rrf_contribution: rrf_rank_contribution(rrf_k, rank),
                         weight: 1.0,
                     });
                 }
@@ -2381,7 +2398,7 @@ fn fused_hits_to_scored_results(
                         ),
                         raw_score: f64::from(raw_score),
                         normalized_score: f64::from(raw_score),
-                        rrf_contribution: rrf_rank_contribution(config.rrf_k, rank),
+                        rrf_contribution: rrf_rank_contribution(rrf_k, rank),
                         weight: 1.0,
                     });
                 }
@@ -2397,7 +2414,7 @@ fn fused_hits_to_scored_results(
                 doc_id: hit.doc_id,
                 score,
                 source,
-                index: hit.semantic_index,
+                index: hit.semantic_index.filter(|&index| index != u32::MAX),
                 fast_score: hit.hash_score.or(hit.semantic_score),
                 quality_score: None,
                 lexical_score: hit.lexical_score,
@@ -5756,6 +5773,7 @@ mod tests {
         assert_eq!(results[0].fast_score, None);
         assert_eq!(results[0].lexical_score, None);
         assert_eq!(results[0].source, ScoreSource::SemanticQuality);
+        assert_eq!(results[0].index, None);
         assert!(phases.next().is_none());
     }
 
@@ -6222,6 +6240,7 @@ mod tests {
                         make_index(),
                         TwoTierConfig {
                             fast_only,
+                            explain: true,
                             ..TwoTierConfig::default()
                         },
                     )
@@ -6258,6 +6277,22 @@ mod tests {
                             assert_eq!(
                                 hit.metadata.as_ref().unwrap()["path"],
                                 format!("src/{}.rs", hit.doc_id),
+                            );
+                            let [component] =
+                                hit.explanation.as_ref().unwrap().components.as_slice()
+                            else {
+                                panic!("a lexical-only hit should have one BM25 component");
+                            };
+                            assert!(matches!(
+                                component.source,
+                                ExplainedSource::LexicalBm25 { .. }
+                            ));
+                            assert_eq!(
+                                component.raw_score.to_bits(),
+                                f64::from(hit.lexical_score.unwrap()).to_bits()
+                            );
+                            assert!(
+                                (component.rrf_contribution - f64::from(hit.score)).abs() < 1e-8
                             );
                         }
                     }

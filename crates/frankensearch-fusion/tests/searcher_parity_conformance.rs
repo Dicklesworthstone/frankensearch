@@ -19,7 +19,8 @@ use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::traits::{LexicalRead, SearchFuture};
 use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_core::{
-    Cx, Embedder, ModelCategory, ScoredResult, SearchPhase, TwoTierConfig, TwoTierMetrics,
+    Cx, Embedder, FusionStrategy, ModelCategory, ScoredResult, SearchPhase, TwoTierConfig,
+    TwoTierMetrics,
 };
 
 /// Bind a parity-suite query vector to an explicitly synthetic identity, for
@@ -507,12 +508,17 @@ fn phase_snapshots(
     (sync, async_phases)
 }
 
-fn lexical_phase_snapshots(query_vec: &[f32], config: TwoTierConfig) -> ParitySnapshots {
+fn lexical_phase_snapshots(
+    query_vec: &[f32],
+    config: TwoTierConfig,
+    hits: Vec<ScoredResult>,
+    k: usize,
+    lexical_weight: f64,
+) -> ParitySnapshots {
     let sync = SyncTwoTierSearcher::new(sync_index(true), config.clone())
-        .with_lexical(Arc::new(StaticLexical {
-            hits: lexical_hits(),
-        }))
-        .search_iter(&tiered_query(query_vec), 3)
+        .with_rrf_weights(lexical_weight, 1.0)
+        .with_lexical(Arc::new(StaticLexical { hits: hits.clone() }))
+        .search_iter(&tiered_query(query_vec), k)
         .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
         .collect();
     let (_index_dir, index) = async_index("lexical-phase-snapshots", true);
@@ -524,20 +530,19 @@ fn lexical_phase_snapshots(query_vec: &[f32], config: TwoTierConfig) -> ParitySn
         id: "parity-quality",
         vector: query_vec.to_vec(),
     });
-    let lexical = Arc::new(StaticLexical {
-        hits: lexical_hits(),
-    });
+    let lexical = Arc::new(StaticLexical { hits });
     let mut async_phases = Vec::new();
     asupersync::test_utils::run_test_with_cx(|cx| {
         let slot = &mut async_phases;
         async move {
             TwoTierSearcher::new(index, fast, config)
+                .with_rrf_weights(lexical_weight, 1.0)
                 .with_quality_embedder(quality)
                 .with_lexical(lexical)
                 .search(
                     &cx,
                     "how does this parity conformance query retrieve results",
-                    3,
+                    k,
                     |_| None,
                     |phase| slot.push((phase_label(&phase), phase_results(&phase).to_vec())),
                 )
@@ -1087,7 +1092,8 @@ fn lexical_explain_mode_preserves_field_parity_in_each_progressive_phase() {
         ..TwoTierConfig::default()
     };
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
-    let (sync_phases, async_phases) = lexical_phase_snapshots(&query, config);
+    let (sync_phases, async_phases) =
+        lexical_phase_snapshots(&query, config, lexical_hits(), 3, 1.0);
     let sync_labels = sync_phases
         .iter()
         .map(|(label, _)| *label)
@@ -1114,6 +1120,61 @@ fn lexical_explain_mode_preserves_field_parity_in_each_progressive_phase() {
                 .iter()
                 .all(|result| result.explanation.is_some())
         );
+    }
+}
+
+#[test]
+fn refined_explanation_preserves_lexical_scoring_in_both_fusion_strategies() {
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let mut hits = lexical_hits();
+    hits.insert(
+        2,
+        ScoredResult {
+            doc_id: "lexical-only".into(),
+            ..hits[1].clone()
+        },
+    );
+    for (fusion_strategy, expected_normalized, expected_rrf, expected_score) in [
+        (FusionStrategy::Rrf, 2.0, 2.0 / 63.0, 2.0 / 63.0),
+        (FusionStrategy::PoolMinMax, 0.5, 0.0, 1.0),
+    ] {
+        let config = TwoTierConfig {
+            fusion_strategy,
+            rrf_k: 60.0,
+            explain: true,
+            ..TwoTierConfig::default()
+        };
+        let (sync, asynchronous) = lexical_phase_snapshots(&query, config, hits.clone(), 5, 2.0);
+        for (api, phases) in [("sync", sync), ("async", asynchronous)] {
+            let (phase, results) = phases.last().expect("refined results");
+            assert_eq!(*phase, "refined");
+            assert_eq!(results.len(), 5);
+            for hit in results {
+                let components = &hit.explanation.as_ref().expect("explanation").components;
+                let lexical = components.iter().find(|component| {
+                    matches!(component.source, ExplainedSource::LexicalBm25 { .. })
+                });
+                match hit.doc_id.as_str() {
+                    "lexical-only" => {
+                        assert_eq!(components.len(), 1, "{api} {fusion_strategy:?}");
+                        let lexical = lexical.expect("lexical-only hit needs a BM25 component");
+                        assert!((lexical.raw_score - 2.0).abs() < 1e-7);
+                        assert!((lexical.normalized_score - expected_normalized).abs() < 1e-7);
+                        assert!((lexical.rrf_contribution - expected_rrf).abs() < 1e-7);
+                        assert!((lexical.weight - 2.0).abs() < 1e-7);
+                        assert!((f64::from(hit.score) - expected_score).abs() < 1e-7);
+                    }
+                    "doc-b" => assert!(lexical.is_none(), "vector-only hit has no BM25"),
+                    _ => {
+                        assert!(lexical.is_some(), "hybrid hit needs its BM25 evidence");
+                        assert!(components.iter().any(|component| matches!(
+                            component.source,
+                            ExplainedSource::SemanticQuality { .. }
+                        )));
+                    }
+                }
+            }
+        }
     }
 }
 
