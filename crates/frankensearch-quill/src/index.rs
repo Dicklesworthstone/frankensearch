@@ -4945,6 +4945,8 @@ struct QueryWorkShape {
     all_streams: u64,
     posting_streams: u64,
     dictionary_scans: u64,
+    wildcard_glob_scans: u64,
+    exact_glob_scans: u64,
     string_range_expansions: u64,
     phrase_streams: u64,
     phrase_fields: u64,
@@ -5051,9 +5053,13 @@ impl QueryWorkShape {
                             self.string_range_expansions.saturating_add(1);
                     }
                 }
-                QueryNode::Glob { field_ids, .. } => {
+                QueryNode::Glob { field_ids, pattern } => {
                     let fields = u64::try_from(field_ids.len()).unwrap_or(u64::MAX);
-                    self.dictionary_scans = self.dictionary_scans.saturating_add(fields);
+                    if pattern.as_bytes().contains(&b'*') {
+                        self.wildcard_glob_scans = self.wildcard_glob_scans.saturating_add(fields);
+                    } else {
+                        self.exact_glob_scans = self.exact_glob_scans.saturating_add(fields);
+                    }
                     self.posting_streams =
                         self.posting_streams.saturating_add(fields.saturating_mul(
                             u64::try_from(glob_expansion_limit).unwrap_or(u64::MAX),
@@ -5073,20 +5079,25 @@ impl QueryWorkShape {
     }
 }
 
-/// Snapshot-global BM25 statistics reused by lowered query terms.
+/// Snapshot-global term statistics and glob expansions reused by query leaves.
 ///
 /// Ranked and identifier-only search lower the same query independently for
-/// every sealed segment. Without this query-local table, each lowering opens
+/// every sealed segment and frozen Delta. Without this table, each lowering opens
 /// every sealed dictionary again to recompute an identical global document
-/// frequency. Entries are populated lazily at the exact-term lowering boundary
-/// so creating the table adds no unmetered query walk. The table lives for one
-/// pinned snapshot invocation and cannot cross either a query or publication
-/// boundary.
-struct PreparedSnapshotDocFreqs {
+/// frequency or expand the same glob against the complete snapshot. Entries
+/// are populated lazily at the corresponding lowering boundary, so creating
+/// the table adds no unmetered query walk. The table lives for one pinned
+/// snapshot invocation and cannot cross a query or publication boundary.
+struct PreparedSnapshotTerms {
     entries: StdMutex<HashMap<u16, HashMap<Vec<u8>, u64>>>,
+    glob_entries: StdMutex<SnapshotGlobEntries>,
     #[cfg(test)]
     reservation_overrides: SnapshotDocFreqReservationOverrides,
+    #[cfg(test)]
+    glob_reservation_overrides: SnapshotDocFreqReservationOverrides,
 }
+
+type SnapshotGlobEntries = HashMap<(u16, usize), HashMap<Vec<u8>, Arc<Vec<Vec<u8>>>>>;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -5097,12 +5108,15 @@ struct SnapshotDocFreqReservationOverrides {
     existing_field_map: Option<usize>,
 }
 
-impl PreparedSnapshotDocFreqs {
+impl PreparedSnapshotTerms {
     fn new() -> Self {
         Self {
             entries: StdMutex::new(HashMap::new()),
+            glob_entries: StdMutex::new(HashMap::new()),
             #[cfg(test)]
             reservation_overrides: SnapshotDocFreqReservationOverrides::default(),
+            #[cfg(test)]
+            glob_reservation_overrides: SnapshotDocFreqReservationOverrides::default(),
         }
     }
 
@@ -5211,19 +5225,134 @@ impl PreparedSnapshotDocFreqs {
         drop(entries);
         Ok(computed)
     }
+
+    fn glob_terms(
+        &self,
+        checkpoint: &QueryCheckpointHandle<'_>,
+        snapshot: &QuillSearchSnapshot,
+        schema: SchemaDescriptor,
+        field_ord: u16,
+        pattern: &[u8],
+        expansion_limit: usize,
+    ) -> Result<Arc<Vec<Vec<u8>>>, QuillIndexError> {
+        validate_string_query_field(schema, field_ord, "glob")?;
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+        let mut entries = self
+            .glob_entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (field_ord, expansion_limit);
+        if let Some(cached) = entries
+            .get(&key)
+            .and_then(|patterns| patterns.get(pattern))
+            .cloned()
+        {
+            drop(entries);
+            // A parallel leaf may have waited for the first expansion. Poll
+            // again after that wait, without charging work it did not repeat.
+            checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+            return Ok(cached);
+        }
+
+        // Reserve every cache slot before scanning. The work ceiling relies
+        // on one expansion per query, so allocation refusal cannot fall back
+        // to repeatedly scanning the snapshot without metering.
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+        let mut owned_pattern = Vec::new();
+        let pattern_capacity = pattern.len();
+        #[cfg(test)]
+        let pattern_capacity = self
+            .glob_reservation_overrides
+            .term
+            .unwrap_or(pattern_capacity);
+        owned_pattern
+            .try_reserve_exact(pattern_capacity)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "snapshot glob pattern",
+                count: pattern.len(),
+            })?;
+        owned_pattern.extend_from_slice(pattern);
+
+        let mut new_patterns = None;
+        let outer_capacity = 1;
+        #[cfg(test)]
+        let outer_capacity = self
+            .glob_reservation_overrides
+            .outer_map
+            .unwrap_or(outer_capacity);
+        let reserve_failed = if let Some(patterns) = entries.get_mut(&key) {
+            let pattern_capacity = 1;
+            #[cfg(test)]
+            let pattern_capacity = self
+                .glob_reservation_overrides
+                .existing_field_map
+                .unwrap_or(pattern_capacity);
+            patterns.try_reserve(pattern_capacity).is_err()
+        } else if entries.try_reserve(outer_capacity).is_err() {
+            true
+        } else {
+            let mut patterns = HashMap::new();
+            let pattern_capacity = 1;
+            #[cfg(test)]
+            let pattern_capacity = self
+                .glob_reservation_overrides
+                .new_field_map
+                .unwrap_or(pattern_capacity);
+            if patterns.try_reserve(pattern_capacity).is_err() {
+                true
+            } else {
+                new_patterns = Some(patterns);
+                false
+            }
+        };
+        if reserve_failed {
+            return Err(ArgusError::Allocation {
+                resource: "snapshot glob cache",
+                count: 1,
+            }
+            .into());
+        }
+
+        // Serialize misses so concurrent segment lowerings cannot each scan
+        // the complete snapshot. Scorers share the immutable result after
+        // releasing this lock; neither term bytes nor the result vector are
+        // copied for the remaining leaves. Errors never enter the cache.
+        let computed = Arc::new(snapshot_glob_terms(
+            Some(checkpoint),
+            snapshot,
+            schema,
+            field_ord,
+            pattern,
+            expansion_limit,
+        )?);
+        if let Some(mut patterns) = new_patterns {
+            patterns.insert(owned_pattern, Arc::clone(&computed));
+            entries.insert(key, patterns);
+        } else if let Some(patterns) = entries.get_mut(&key) {
+            patterns.insert(owned_pattern, Arc::clone(&computed));
+        }
+        drop(entries);
+        Ok(computed)
+    }
 }
 
-/// A snapshot with fewer sealed segments than this has nothing to reuse: a
+/// A snapshot with fewer query leaves than this has nothing to reuse: a
 /// single lowering already performs the one and only snapshot scan. The
 /// query-work ceiling has to charge whichever regime actually runs, so it
 /// reads the threshold from here rather than restating it.
-const SNAPSHOT_DOC_FREQ_TABLE_MIN_SEGMENTS: usize = 2;
+const SNAPSHOT_TERM_TABLE_MIN_LEAVES: usize = 2;
 
-fn prepare_snapshot_doc_freqs(snapshot: &QuillSearchSnapshot) -> Option<PreparedSnapshotDocFreqs> {
-    if snapshot.keeper_snapshot().segments().len() < SNAPSHOT_DOC_FREQ_TABLE_MIN_SEGMENTS {
-        return None;
-    }
-    Some(PreparedSnapshotDocFreqs::new())
+fn snapshot_reuses_term_preparation(snapshot: &QuillSearchSnapshot) -> bool {
+    snapshot
+        .keeper_snapshot()
+        .segments()
+        .len()
+        .saturating_add(snapshot.delta_count())
+        >= SNAPSHOT_TERM_TABLE_MIN_LEAVES
+}
+
+fn prepare_snapshot_terms(snapshot: &QuillSearchSnapshot) -> Option<PreparedSnapshotTerms> {
+    snapshot_reuses_term_preparation(snapshot).then(PreparedSnapshotTerms::new)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11942,7 +12071,7 @@ impl QuillReader {
         );
         let metering = concrete_checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
-        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
+        let prepared_doc_freqs = prepare_snapshot_terms(snapshot);
         self.collect_sealed_segments(
             cx,
             &checkpoint,
@@ -12066,7 +12195,7 @@ impl QuillReader {
         if let Some(profile) = profile {
             profile.bind_work_plan(work_upper_bound, metering)?;
         }
-        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
+        let prepared_doc_freqs = prepare_snapshot_terms(snapshot);
         let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
@@ -12231,7 +12360,7 @@ impl QuillReader {
         collector: &mut TopDocsCollector,
         query: &Query,
         snapshot: &QuillSearchSnapshot,
-        prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+        prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
         rank_pruning: bool,
         topdocs_root: bool,
         #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
@@ -12386,7 +12515,7 @@ impl QuillReader {
         collector: &mut DocSetCollector,
         query: &Query,
         snapshot: &QuillSearchSnapshot,
-        prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+        prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
@@ -12497,7 +12626,7 @@ impl QuillReader {
         );
         let metering = concrete_checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
-        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
+        let prepared_doc_freqs = prepare_snapshot_terms(snapshot);
         self.collect_docids_sealed(
             cx,
             &checkpoint,
@@ -12531,7 +12660,7 @@ impl QuillReader {
         );
         let metering = concrete_checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
-        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
+        let prepared_doc_freqs = prepare_snapshot_terms(snapshot);
         let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
@@ -12872,7 +13001,7 @@ impl QuillReader {
         // must spend the same fuel as the individual score contributions.
         let checkpoint: QueryCheckpointHandle<'_> =
             self.query_checkpoint(cx, "explain", self.config.query_fuel_budget, u64::MAX);
-        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
+        let prepared_doc_freqs = prepare_snapshot_terms(snapshot);
         let lower_explanation = |clause: &Query, topdocs_root| {
             validate_query_lowering(clause, 1.0, self.schema)?;
             checkpoint.admit(QueryWorkKind::Segment, 1)?;
@@ -13849,7 +13978,7 @@ impl QuillIndex {
         );
         let metering = concrete_checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
-        let prepared_doc_freqs = prepare_snapshot_doc_freqs(snapshot);
+        let prepared_doc_freqs = prepare_snapshot_terms(snapshot);
         self.reader.collect_sealed_segments(
             cx,
             &checkpoint,
@@ -16017,6 +16146,7 @@ fn query_work_upper_bound(
     let mut all_blocks_per_stream = 0_u64;
     let mut posting_blocks_per_stream = 0_u64;
     let mut dictionary_blocks = 0_u64;
+    let mut delta_dictionary_blocks = 0_u64;
     let mut string_range_term_ceiling = 0_u64;
     for segment in keeper.segments() {
         // Sealed cursors still visit tombstoned physical postings and phrase
@@ -16066,6 +16196,7 @@ fn query_work_upper_bound(
         posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
         let terms = u64::try_from(delta.segment().term_count()).unwrap_or(u64::MAX);
         dictionary_blocks = dictionary_blocks.saturating_add(terms.div_ceil(16));
+        delta_dictionary_blocks = delta_dictionary_blocks.saturating_add(terms.div_ceil(16));
         if shape.string_range_expansions != 0 {
             string_range_term_ceiling = string_range_term_ceiling.saturating_add(terms);
         }
@@ -16089,11 +16220,29 @@ fn query_work_upper_bound(
     let posting_blocks = posting_streams
         .saturating_mul(posting_blocks_per_stream)
         .saturating_mul(2);
-    // Snapshot-level expansions run while each segment scorer is lowered.
+    // Glob expansions are snapshot-global and shared by every lowered leaf.
+    // A single-leaf invocation has no table, but still expands only once.
+    // Other dictionary scans retain their existing conservative ceiling.
+    let glob_scan_repetitions = if snapshot_reuses_term_preparation(snapshot) {
+        1
+    } else {
+        segment_count
+    };
+    // Exact glob nodes probe every Keeper dictionary even when it has no
+    // blocks. Delta still admits its complete ordered view in either form.
+    let glob_dictionary_blocks = shape
+        .wildcard_glob_scans
+        .saturating_mul(dictionary_blocks)
+        .saturating_add(
+            shape
+                .exact_glob_scans
+                .saturating_mul(keeper_count.saturating_add(delta_dictionary_blocks)),
+        );
     let scanned_dictionary_blocks = shape
         .dictionary_scans
         .saturating_mul(dictionary_blocks)
-        .saturating_mul(segment_count);
+        .saturating_mul(segment_count)
+        .saturating_add(glob_dictionary_blocks.saturating_mul(glob_scan_repetitions));
     // Every posting stream is opened through `lower_leaf_term`, including
     // terms materialized by range and glob expansion, so use the complete
     // stream ceiling rather than only the syntactic exact-term count. Each
@@ -16104,15 +16253,14 @@ fn query_work_upper_bound(
     // reads every sealed dictionary, and without the query-local table each
     // of the `segment_count` lowerings repeated it, so the charge grew as
     // `streams x segments^2` and a few hundred segments exhausted any budget
-    // (#41). `PreparedSnapshotDocFreqs` computes it once per term, so above
+    // (#41). `PreparedSnapshotTerms` computes it once per term, so above
     // the table threshold the ceiling is one scan per stream; below it the
     // repeat is real and still has to be charged.
-    let snapshot_statistic_probes =
-        if keeper.segments().len() >= SNAPSHOT_DOC_FREQ_TABLE_MIN_SEGMENTS {
-            keeper_count
-        } else {
-            segment_count.saturating_mul(keeper_count)
-        };
+    let snapshot_statistic_probes = if snapshot_reuses_term_preparation(snapshot) {
+        keeper_count
+    } else {
+        segment_count.saturating_mul(keeper_count)
+    };
     let indexed_dictionary_blocks =
         posting_streams.saturating_mul(snapshot_statistic_probes.saturating_add(keeper_count));
     // Existing phrase lowering materializes positioned rows before candidate
@@ -17300,7 +17448,7 @@ fn lower_leaf_phrase_term<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     field_ord: u16,
     position: u32,
@@ -17355,7 +17503,7 @@ fn lower_leaf_exact_phrase<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     field_ord: u16,
     field_boost: f32,
@@ -17408,7 +17556,7 @@ fn lower_leaf_phrase_prefix<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     field_ord: u16,
     field_boost: f32,
@@ -17493,7 +17641,7 @@ fn lower_query<'a>(
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
     rank_pruning: bool,
@@ -17522,7 +17670,7 @@ fn lower_query_unscored<'a>(
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
@@ -17975,7 +18123,7 @@ fn lower_query_with_mode<'a>(
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
     mode: QueryLoweringMode,
@@ -18130,7 +18278,7 @@ fn lower_query_with_mode<'a>(
                                 prepared_doc_freqs,
                                 schema,
                                 field.field_id,
-                                expansions,
+                                &expansions,
                                 inherited_boost * field.boost,
                                 mode,
                             )?
@@ -18302,7 +18450,7 @@ fn lower_leaf_range<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     field_ord: u16,
     lower: &Bound<QueryValue>,
@@ -18332,7 +18480,7 @@ fn lower_leaf_range<'a>(
                 prepared_doc_freqs,
                 schema,
                 field_ord,
-                terms,
+                &terms,
                 boost,
                 mode,
             )
@@ -18759,7 +18907,7 @@ fn lower_leaf_set<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     field_ord: u16,
     values: &[QueryValue],
@@ -18784,7 +18932,7 @@ fn lower_leaf_set<'a>(
                 prepared_doc_freqs,
                 schema,
                 field_ord,
-                terms.into_iter().collect(),
+                &terms.into_iter().collect::<Vec<_>>(),
                 boost,
                 mode,
             )
@@ -18961,10 +19109,10 @@ fn lower_leaf_string_predicate<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     field_ord: u16,
-    terms: Vec<Vec<u8>>,
+    terms: &[Vec<u8>],
     boost: f32,
     mode: QueryLoweringMode,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
@@ -18984,7 +19132,7 @@ fn lower_leaf_string_predicate<'a>(
             snapshot,
             schema,
             field_ord,
-            &term,
+            term,
             prepared_doc_freqs,
             1.0,
             false,
@@ -19011,7 +19159,7 @@ fn lower_leaf_glob<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     schema: SchemaDescriptor,
     field_ids: &[u16],
     pattern: &[u8],
@@ -19024,14 +19172,32 @@ fn lower_leaf_glob<'a>(
         .try_reserve_exact(field_ids.len())
         .map_err(|_| invalid_state("could not allocate glob field clauses"))?;
     for &field_ord in field_ids {
-        let terms = snapshot_glob_terms(
-            Some(checkpoint),
-            snapshot,
-            schema,
-            field_ord,
-            pattern,
-            expansion_limit,
-        )?;
+        let prepared_terms = prepared_doc_freqs
+            .map(|prepared| {
+                prepared.glob_terms(
+                    checkpoint,
+                    snapshot,
+                    schema,
+                    field_ord,
+                    pattern,
+                    expansion_limit,
+                )
+            })
+            .transpose()?;
+        let uncached_terms;
+        let terms = if let Some(terms) = prepared_terms.as_deref() {
+            terms.as_slice()
+        } else {
+            uncached_terms = snapshot_glob_terms(
+                Some(checkpoint),
+                snapshot,
+                schema,
+                field_ord,
+                pattern,
+                expansion_limit,
+            )?;
+            uncached_terms.as_slice()
+        };
         let field_scorer = lower_leaf_string_predicate(
             checkpoint,
             leaf,
@@ -19474,7 +19640,7 @@ fn lower_leaf_term<'a>(
     schema: SchemaDescriptor,
     field_ord: u16,
     term: &[u8],
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    prepared_doc_freqs: Option<&PreparedSnapshotTerms>,
     boost: f32,
     rank_pruning: bool,
     checkpoint: &QueryCheckpointHandle<'a>,
@@ -24345,7 +24511,7 @@ mod tests {
         );
         let metering = checkpoint.metering();
         let checkpoint: QueryCheckpointHandle<'_> = checkpoint;
-        let prepared_doc_freqs = prepare_snapshot_doc_freqs(&snapshot);
+        let prepared_doc_freqs = prepare_snapshot_terms(&snapshot);
         index
             .reader
             .collect_docids_sealed(
@@ -28119,7 +28285,7 @@ mod tests {
             assert_eq!(snapshot.keeper_snapshot().segments().len(), 2);
             for site in 0..4 {
                 for metered in [false, true] {
-                    let mut prepared = PreparedSnapshotDocFreqs::new();
+                    let mut prepared = PreparedSnapshotTerms::new();
                     if site == 3 {
                         let seed: QueryCheckpointHandle<'_> =
                             QueryCheckpoint::new(&cx, "seed_df", 2, 3);
@@ -28226,7 +28392,7 @@ mod tests {
                 .search_snapshot()
                 .expect("cached DF fuel snapshot is authoritative");
             assert_eq!(snapshot.keeper_snapshot().segments().len(), 2);
-            let prepared = PreparedSnapshotDocFreqs::new();
+            let prepared = PreparedSnapshotTerms::new();
             // `upper_bound > budget` keeps metering live, so every assertion
             // below is about admissions that are really being counted. The
             // budget is exactly one snapshot scan: two sealed segments, one
@@ -28269,6 +28435,395 @@ mod tests {
                 }
             ));
         });
+    }
+
+    #[test]
+    fn snapshot_glob_preparation_keeps_fragmented_query_work_linear() {
+        let cx = Cx::for_testing();
+        for (leaf_count, sealed_count) in [
+            (1_usize, 0_usize),
+            (1, 1),
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (4, 2),
+            (4, 4),
+            (8, 8),
+        ] {
+            let leaves = (0..leaf_count)
+                .map(|ordinal| {
+                    let ordinal = u64::try_from(ordinal).expect("fixture ordinal fits u64");
+                    let base = ordinal * u64::from(DOC_ORDS_PER_LEASE);
+                    typed_delta_snapshot(
+                        base,
+                        u32::try_from(base).expect("fixture docid fits u32"),
+                        &format!("glob-{ordinal}"),
+                        "alpha",
+                        ordinal,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let index = typed_residency_index(
+                &leaves[..sealed_count],
+                &leaves[sealed_count..],
+                QuillConfig {
+                    glob_expansion_limit: 1,
+                    ..deterministic_config()
+                },
+            );
+            let snapshot = index.search_snapshot().expect("glob residency snapshot");
+            assert_eq!(snapshot.keeper_snapshot().segments().len(), sealed_count);
+            assert_eq!(snapshot.delta_count(), leaf_count - sealed_count);
+            assert_eq!(prepare_snapshot_terms(&snapshot).is_some(), leaf_count > 1);
+            let query = Query::glob(vec![1], "al*".to_owned());
+            let ceiling = query_work_upper_bound(&query, &snapshot, DELTA_PARITY_SCHEMA, 1)
+                .expect("bound fragmented glob query");
+            let leaf_units = u64::try_from(leaf_count).expect("leaf count fits u64");
+            let sealed_units = u64::try_from(sealed_count).expect("sealed count fits u64");
+            // One segment, two possible posting walks, and one expansion
+            // block per leaf; one global DF probe and one local term lookup
+            // per sealed leaf. There is no leaf_count-squared scan term.
+            assert_eq!(ceiling, 4 * leaf_units + 2 * sealed_units);
+            let dictionary_views = || {
+                snapshot
+                    .keeper_snapshot()
+                    .segments()
+                    .iter()
+                    .map(|segment| segment.term_dictionary_cache_counts().1)
+                    .sum::<u64>()
+            };
+            let before = dictionary_views();
+            // Keep metering live even though the declared ceiling fits the
+            // budget, so Delta-only scans are measured as well as sealed
+            // dictionary opens. Use the actual ranked execution path.
+            let metered = QueryCheckpoint::new(&cx, "glob_work", ceiling, ceiling + 1);
+            let handle: QueryCheckpointHandle<'_> = metered.clone();
+            let ranked = index
+                .reader
+                .execute_ranked_query_inner(
+                    &cx,
+                    &query,
+                    &snapshot,
+                    leaf_count,
+                    0,
+                    true,
+                    false,
+                    Vec::new(),
+                    Some(&handle),
+                    Some(true),
+                    #[cfg(feature = "pruning-conformance")]
+                    None,
+                    #[cfg(feature = "profile-internals")]
+                    None,
+                )
+                .expect("rank the fragmented glob query");
+            assert_eq!(
+                metered.state.dictionary_blocks.load(Ordering::Acquire),
+                leaf_units + 2 * sealed_units,
+                "Delta and sealed leaves share one admitted snapshot expansion"
+            );
+            assert_eq!(ranked.total_count, Some(leaf_units));
+            assert_eq!(ranked.hits.len(), leaf_count);
+            assert!(
+                ranked
+                    .hits
+                    .iter()
+                    .all(|hit| hit.score.to_bits() == 1.0_f32.to_bits())
+            );
+            assert_eq!(
+                dictionary_views() - before,
+                3 * sealed_units,
+                "ranking opens each dictionary once for expansion, once for DF, and once locally"
+            );
+            let before = dictionary_views();
+            let docids = index
+                .execute_docid_query(&cx, &query, &snapshot)
+                .expect("collect fragmented glob identifiers");
+            assert_eq!(
+                docids,
+                ranked
+                    .hits
+                    .iter()
+                    .map(|hit| hit.global_docid)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                dictionary_views() - before,
+                3 * sealed_units,
+                "identifier collection has its own invocation-local preparation"
+            );
+            let exact_set = Query::set(1, vec![QueryValue::Str("alpha".to_owned())]);
+            let reference = index
+                .execute_ranked_query(&cx, &exact_set, &snapshot, leaf_count, 0, true, Vec::new())
+                .expect("rank the equivalent exact set");
+            assert_eq!(
+                ranked, reference,
+                "cache reuse must preserve every result field"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_glob_preparation_preserves_patterns_fields_limits_and_cancellation() {
+        let cx = Cx::for_testing();
+        let second_base = u64::from(DOC_ORDS_PER_LEASE);
+        let first = typed_delta_snapshot(0, 0, "first", "alpha alpine", 1);
+        let second = typed_delta_snapshot(
+            second_base,
+            u32::try_from(second_base).expect("second docid fits u32"),
+            "second",
+            "alpine beta",
+            2,
+        );
+        let index = typed_residency_index(&[first], &[second], deterministic_config());
+        let snapshot = index.search_snapshot().expect("mixed glob snapshot");
+        let prepared = prepare_snapshot_terms(&snapshot).expect("mixed leaves share preparation");
+        let checkpoint: QueryCheckpointHandle<'_> =
+            QueryCheckpoint::new(&cx, "glob_keys", u64::MAX, u64::MAX);
+        for (field, pattern, expected) in [
+            (1, "al*", vec!["alpha", "alpine"]),
+            (1, "*pha", vec!["alpha"]),
+            (1, "a**e", vec!["alpine"]),
+            (1, "alpha", vec!["alpha"]),
+            (1, "z*", Vec::new()),
+            (0, "*", vec!["first", "second"]),
+        ] {
+            let terms = prepared
+                .glob_terms(
+                    &checkpoint,
+                    &snapshot,
+                    DELTA_PARITY_SCHEMA,
+                    field,
+                    pattern.as_bytes(),
+                    2,
+                )
+                .expect("compute a bounded expansion");
+            assert_eq!(
+                terms.as_ref(),
+                &expected
+                    .iter()
+                    .map(|term| term.as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                terms.as_ref(),
+                &snapshot_glob_terms(
+                    None,
+                    &snapshot,
+                    DELTA_PARITY_SCHEMA,
+                    field,
+                    pattern.as_bytes(),
+                    2
+                )
+                .expect("uncached expansion control")
+            );
+            let repeated = prepared
+                .glob_terms(
+                    &checkpoint,
+                    &snapshot,
+                    DELTA_PARITY_SCHEMA,
+                    field,
+                    pattern.as_bytes(),
+                    2,
+                )
+                .expect("reuse the exact immutable expansion");
+            assert!(Arc::ptr_eq(&terms, &repeated));
+        }
+        for (pattern, limit) in [("al*", 0), ("al*", 1), ("*", 2)] {
+            let control = snapshot_glob_terms(
+                None,
+                &snapshot,
+                DELTA_PARITY_SCHEMA,
+                1,
+                pattern.as_bytes(),
+                limit,
+            )
+            .expect_err("the global union exceeds the requested limit");
+            for _ in 0..2 {
+                let refused = prepared
+                    .glob_terms(
+                        &checkpoint,
+                        &snapshot,
+                        DELTA_PARITY_SCHEMA,
+                        1,
+                        pattern.as_bytes(),
+                        limit,
+                    )
+                    .expect_err("a wider cached expansion cannot satisfy a smaller limit");
+                assert_eq!(refused.to_string(), control.to_string());
+            }
+        }
+        let duplicate_fields = Query::glob(vec![1, 1], "al*".to_owned());
+        let duplicated = execute_typed_query(&index, &cx, &duplicate_fields);
+        assert_eq!(duplicated.0.total_count, Some(2));
+        assert!(
+            duplicated
+                .0
+                .hits
+                .iter()
+                .all(|hit| hit.score.to_bits() == 2.0_f32.to_bits()),
+            "sharing expansion bytes must retain each scoring clause"
+        );
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            prepared.glob_terms(&checkpoint, &snapshot, DELTA_PARITY_SCHEMA, 1, b"al*", 2),
+            Err(QuillIndexError::Cancelled { phase: "glob_keys" })
+        ));
+    }
+
+    #[test]
+    fn snapshot_glob_preparation_refuses_allocation_before_dictionary_work() {
+        let cx = Cx::for_testing();
+        let second_base = u64::from(DOC_ORDS_PER_LEASE);
+        let leaves = [
+            typed_delta_snapshot(0, 0, "first", "alpha", 1),
+            typed_delta_snapshot(
+                second_base,
+                u32::try_from(second_base).expect("second docid fits u32"),
+                "second",
+                "alpine",
+                2,
+            ),
+        ];
+        let index = typed_residency_index(&leaves, &[], deterministic_config());
+        let snapshot = index.search_snapshot().expect("glob allocation snapshot");
+        for site in 0..4 {
+            for metered in [false, true] {
+                let mut prepared = PreparedSnapshotTerms::new();
+                if site == 3 {
+                    let seed: QueryCheckpointHandle<'_> =
+                        QueryCheckpoint::new(&cx, "glob_seed", 2, 3);
+                    prepared
+                        .glob_terms(&seed, &snapshot, DELTA_PARITY_SCHEMA, 1, b"*pha", 2)
+                        .expect("seed an existing field-and-limit map");
+                }
+                match site {
+                    0 => prepared.glob_reservation_overrides.term = Some(usize::MAX),
+                    1 => prepared.glob_reservation_overrides.outer_map = Some(usize::MAX),
+                    2 => prepared.glob_reservation_overrides.new_field_map = Some(usize::MAX),
+                    _ => prepared.glob_reservation_overrides.existing_field_map = Some(usize::MAX),
+                }
+                let before = snapshot
+                    .keeper_snapshot()
+                    .segments()
+                    .iter()
+                    .map(RecoveredSegment::term_dictionary_cache_counts)
+                    .collect::<Vec<_>>();
+                let checkpoint = if metered {
+                    QueryCheckpoint::new(&cx, "glob_allocation", 0, 1)
+                } else {
+                    QueryCheckpoint::new(&cx, "glob_allocation", 2, 2)
+                };
+                let handle: QueryCheckpointHandle<'_> = checkpoint.clone();
+                let refused = prepared
+                    .glob_terms(&handle, &snapshot, DELTA_PARITY_SCHEMA, 1, b"al*", 2)
+                    .expect_err("allocation refusal cannot silently repeat snapshot work");
+                assert!(matches!(
+                    refused,
+                    QuillIndexError::Argus(ArgusError::Allocation { .. })
+                ));
+                assert_eq!(
+                    checkpoint.state.dictionary_blocks.load(Ordering::Acquire),
+                    0
+                );
+                assert_eq!(
+                    snapshot
+                        .keeper_snapshot()
+                        .segments()
+                        .iter()
+                        .map(RecoveredSegment::term_dictionary_cache_counts)
+                        .collect::<Vec<_>>(),
+                    before,
+                );
+                prepared.glob_reservation_overrides =
+                    SnapshotDocFreqReservationOverrides::default();
+                let retry = QueryCheckpoint::new(&cx, "glob_retry", 2, 3);
+                let handle: QueryCheckpointHandle<'_> = retry.clone();
+                for _ in 0..2 {
+                    assert_eq!(
+                        prepared
+                            .glob_terms(&handle, &snapshot, DELTA_PARITY_SCHEMA, 1, b"al*", 2)
+                            .expect("retry and cache hit both retain the complete expansion")
+                            .as_ref(),
+                        &vec![b"alpha".to_vec(), b"alpine".to_vec()],
+                    );
+                }
+                assert_eq!(retry.state.dictionary_blocks.load(Ordering::Acquire), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_glob_preparation_publishes_once_after_an_interrupted_miss() {
+        let cx = Cx::for_testing();
+        let second_base = u64::from(DOC_ORDS_PER_LEASE);
+        let leaves = [
+            typed_delta_snapshot(0, 0, "first", "alpha", 1),
+            typed_delta_snapshot(
+                second_base,
+                u32::try_from(second_base).expect("second docid fits u32"),
+                "second",
+                "alpine",
+                2,
+            ),
+        ];
+        let index = typed_residency_index(&leaves, &[], deterministic_config());
+        let snapshot = index.search_snapshot().expect("concurrent glob snapshot");
+        let prepared = prepare_snapshot_terms(&snapshot).expect("two leaves share preparation");
+        let limited: QueryCheckpointHandle<'_> = QueryCheckpoint::new(&cx, "glob_partial", 1, 2);
+        let refused = prepared
+            .glob_terms(&limited, &snapshot, DELTA_PARITY_SCHEMA, 1, b"al*", 2)
+            .expect_err("the second dictionary must exhaust the first attempt");
+        assert_eq!(fuel_diagnostics(&refused), (1, 1, 0, 1, 0, 0));
+        let before = snapshot
+            .keeper_snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.term_dictionary_cache_counts().1)
+            .sum::<u64>();
+        let retry = QueryCheckpoint::new(&cx, "glob_parallel", 2, 3);
+        let handle: QueryCheckpointHandle<'_> = retry.clone();
+        let expansions = (0..16)
+            .into_par_iter()
+            .map(|_| prepared.glob_terms(&handle, &snapshot, DELTA_PARITY_SCHEMA, 1, b"al*", 2))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parallel leaves must share one admitted complete scan");
+        assert_eq!(
+            expansions[0].as_ref(),
+            &vec![b"alpha".to_vec(), b"alpine".to_vec()]
+        );
+        assert!(
+            expansions
+                .iter()
+                .all(|terms| Arc::ptr_eq(&expansions[0], terms))
+        );
+        assert_eq!(retry.state.dictionary_blocks.load(Ordering::Acquire), 2);
+        let after = snapshot
+            .keeper_snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.term_dictionary_cache_counts().1)
+            .sum::<u64>();
+        assert_eq!(
+            after - before,
+            2,
+            "duplicate misses must not reopen dictionaries"
+        );
+
+        let next_query = prepare_snapshot_terms(&snapshot).expect("fresh query preparation");
+        let checkpoint: QueryCheckpointHandle<'_> =
+            QueryCheckpoint::new(&cx, "glob_next_query", 2, 3);
+        let fresh = next_query
+            .glob_terms(&checkpoint, &snapshot, DELTA_PARITY_SCHEMA, 1, b"al*", 2)
+            .expect("a separate query owns its own expansion");
+        assert!(!Arc::ptr_eq(&fresh, &expansions[0]));
+        let fresh_views = snapshot
+            .keeper_snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.term_dictionary_cache_counts().1)
+            .sum::<u64>();
+        assert_eq!(fresh_views - after, 2);
     }
 
     /// Publish `commits` single-document segments and return the query-work
@@ -28546,7 +29101,7 @@ mod tests {
             // 12, 32 and 96.
             assert_eq!((two, four, eight), (10, 20, 40));
 
-            // `PreparedSnapshotDocFreqs` computes a term's snapshot statistics
+            // `PreparedSnapshotTerms` computes a term's snapshot statistics
             // once, so the ceiling charges one scan per stream rather than one
             // per lowered segment. Doubling the segment count must therefore
             // double the ceiling exactly. The pre-#41 ceiling carried

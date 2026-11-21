@@ -676,10 +676,21 @@ mod tests {
                 ))
                 .await
                 .unwrap_err();
-                assert!(error.to_string().contains("regular file"), "{case}: {error}");
+                assert!(
+                    error.to_string().contains("regular file"),
+                    "{case}: {error}"
+                );
                 assert!(output.is_empty());
-                assert_eq!(fs::read_dir(&root).unwrap().count(), 1, "{case}: no staging");
-                assert_eq!(fs::read_dir(&cache).unwrap().count(), 1, "{case}: no acquisition");
+                assert_eq!(
+                    fs::read_dir(&root).unwrap().count(),
+                    1,
+                    "{case}: no staging"
+                );
+                assert_eq!(
+                    fs::read_dir(&cache).unwrap().count(),
+                    1,
+                    "{case}: no acquisition"
+                );
                 assert!(fs::symlink_metadata(&pointer).is_ok());
             }
         });
@@ -1574,7 +1585,10 @@ mod embedded_acquisition_tests {
         )
         .unwrap();
         assert_eq!(
-            missing.iter().map(|(manifest, _)| manifest.id.as_str()).collect::<Vec<_>>(),
+            missing
+                .iter()
+                .map(|(manifest, _)| manifest.id.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "potion-base-8m",
                 "all-minilm-l6-v2-native",
@@ -1582,6 +1596,9 @@ mod embedded_acquisition_tests {
                 "potion-multilingual-128m",
             ]
         );
-        assert!(!root.exists(), "planning neither downloads nor materializes bundled bytes");
+        assert!(
+            !root.exists(),
+            "planning neither downloads nor materializes bundled bytes"
+        );
     }
 }
