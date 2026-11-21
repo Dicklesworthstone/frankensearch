@@ -1016,6 +1016,45 @@ fn refined_explanations_are_present_on_both_sides() {
 }
 
 #[test]
+fn refined_explanations_reconstruct_flat_and_narrow_semantic_blends() {
+    for x in [0.0, 0.002] {
+        let query = normalize(vec![x, 0.0, 1.0, 0.0]);
+        let config = TwoTierConfig {
+            explain: true,
+            ..TwoTierConfig::default()
+        };
+        let (sync, asynchronous) = phase_snapshots(&query, true, config);
+        let mut incorrect = Vec::new();
+        for (api, phases) in [("sync", sync), ("async", asynchronous)] {
+            let [(initial, _), (refined, hits)] = phases.as_slice() else {
+                panic!("expected two phases for {api}: {phases:?}");
+            };
+            assert_eq!((*initial, *refined), ("initial", "refined"));
+            assert_eq!(hits.len(), 4);
+            for hit in hits {
+                let components = &hit
+                    .explanation
+                    .as_ref()
+                    .expect("refined explanation")
+                    .components;
+                assert_eq!(components.len(), 2);
+                let reconstructed = components
+                    .iter()
+                    .map(|component| component.normalized_score * component.weight)
+                    .sum::<f64>();
+                if (reconstructed - f64::from(hit.score)).abs() > 1e-7 {
+                    incorrect.push((api, hit.doc_id.clone(), reconstructed, hit.score));
+                }
+            }
+        }
+        assert!(
+            incorrect.is_empty(),
+            "phase-two blend evidence for x={x}: {incorrect:?}"
+        );
+    }
+}
+
+#[test]
 fn quality_index_unavailable_agrees_and_skips_phase_two_on_both_sides() {
     let config = TwoTierConfig::default();
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);

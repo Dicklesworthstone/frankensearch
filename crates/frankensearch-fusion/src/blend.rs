@@ -18,6 +18,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use ahash::{AHashMap, AHashSet};
+use frankensearch_core::explanation::{ExplainedSource, ScoreComponent};
 use frankensearch_core::{RankChanges, SearchError, SearchResult, VectorHit};
 use tracing::{debug, instrument};
 
@@ -73,6 +74,54 @@ impl NormBounds {
             1.0
         }
         .clamp(0.0, 1.0)
+    }
+}
+
+/// Reconstruct the semantic blend from the pools and factor used for ranking.
+pub(crate) struct BlendExplanation {
+    fast: NormBounds,
+    quality: NormBounds,
+    quality_weight: f32,
+}
+
+impl BlendExplanation {
+    pub(crate) fn new<'a>(
+        fast_hits: &[VectorHit],
+        quality_scores: impl Iterator<Item = &'a f32>,
+        blend_factor: f32,
+    ) -> Self {
+        Self {
+            fast: NormBounds::from_scores(fast_hits.iter().map(|hit| &hit.score)),
+            quality: NormBounds::from_scores(quality_scores),
+            quality_weight: sanitize_blend_factor(blend_factor),
+        }
+    }
+
+    pub(crate) fn components(
+        &self,
+        fast_score: Option<f32>,
+        quality_score: Option<f32>,
+        fast_source: impl FnOnce(f64) -> ExplainedSource,
+        quality_source: impl FnOnce(f64) -> ExplainedSource,
+    ) -> impl Iterator<Item = ScoreComponent> {
+        let both = fast_score.is_some() && quality_score.is_some();
+        let fast_weight = if both { 1.0 - self.quality_weight } else { 1.0 };
+        let quality_weight = if both { self.quality_weight } else { 1.0 };
+        let fast = fast_score.map(|score| ScoreComponent {
+            source: fast_source(f64::from(score)),
+            raw_score: f64::from(score),
+            normalized_score: f64::from(self.fast.apply(score)),
+            rrf_contribution: 0.0,
+            weight: f64::from(fast_weight),
+        });
+        let quality = quality_score.map(|score| ScoreComponent {
+            source: quality_source(f64::from(score)),
+            raw_score: f64::from(score),
+            normalized_score: f64::from(self.quality.apply(score)),
+            rrf_contribution: 0.0,
+            weight: f64::from(quality_weight),
+        });
+        fast.into_iter().chain(quality)
     }
 }
 

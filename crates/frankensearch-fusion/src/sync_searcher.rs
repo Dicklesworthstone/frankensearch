@@ -31,8 +31,8 @@ use frankensearch_index::{
 };
 
 use crate::blend::{
-    blend_two_tier, blend_two_tier_aligned_vector_index, complete_quality_evidence,
-    compute_rank_changes, missing_candidate_ids,
+    BlendExplanation, blend_two_tier, blend_two_tier_aligned_vector_index,
+    complete_quality_evidence, compute_rank_changes, missing_candidate_ids,
 };
 use crate::mmr::{MmrConfig, mmr_rerank};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
@@ -1320,6 +1320,7 @@ impl SyncTwoTierSearcher {
             .index
             .quality_index()
             .expect("admission binds a quality query only when a quality tier exists");
+        let quality_embedder_id = quality_index.embedder_id().unwrap_or("sync-quality-query");
 
         let phase2_started = Instant::now();
         // Retrieve independently after joining the quality query to its
@@ -1546,25 +1547,41 @@ impl SyncTwoTierSearcher {
                     .map(|(rank, hit)| (hit.doc_id.as_str(), rank))
                     .collect::<AHashMap<_, _>>()
             };
-            let (fast_min, fast_max) = finite_score_bounds(fast_hits.iter().map(|hit| hit.score));
-            let (quality_min, quality_max) =
-                finite_score_bounds(quality_scores_by_doc.values().copied());
+            let blend_explanation = match &quality_pool {
+                SyncQualityPool::Retrieved(hits) => BlendExplanation::new(
+                    &refined_fast_hits,
+                    hits.iter().map(|hit| &hit.score),
+                    quality_weight,
+                ),
+                SyncQualityPool::RescoredFastPool(scores) => BlendExplanation::new(
+                    &refined_fast_hits,
+                    scores.iter().flatten(),
+                    quality_weight,
+                ),
+            };
+            let fast_embedder_id = sync_fast_embedder_id(&self.index);
             let mut lexical_components = lexical_components.into_iter();
             for (rank, result) in refined_results.iter_mut().enumerate() {
+                let vector_components = blend_explanation.components(
+                    result.fast_score,
+                    result.quality_score,
+                    // Admission, rather than the model display name, determines this tier.
+                    |cosine_sim| ExplainedSource::SemanticFast {
+                        embedder: fast_embedder_id.to_owned(),
+                        cosine_sim,
+                    },
+                    |cosine_sim| ExplainedSource::SemanticQuality {
+                        embedder: quality_embedder_id.to_owned(),
+                        cosine_sim,
+                    },
+                );
                 result.explanation = Some(Box::new(build_refined_explanation(
                     result.score,
                     rank,
                     result.doc_id.as_str(),
-                    result.fast_score,
-                    result.quality_score,
                     &initial_ranks,
-                    fast_min,
-                    fast_max,
-                    quality_min,
-                    quality_max,
-                    quality_weight,
-                    sync_fast_embedder_id(&self.index),
                     lexical_components.next().flatten(),
+                    vector_components,
                 )));
             }
         }
@@ -1579,7 +1596,7 @@ impl SyncTwoTierSearcher {
             results: refined_results.clone(),
             latency: phase2_started.elapsed(),
             metrics: PhaseMetrics {
-                embedder_id: "sync-quality-query".to_owned(),
+                embedder_id: quality_embedder_id.to_owned(),
                 vectors_searched: quality_count,
                 lexical_candidates: metrics.lexical_candidates,
                 fused_count: refined_results.len(),
@@ -2059,70 +2076,18 @@ fn saturating_f64_to_f32(value: f64) -> f32 {
     value.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32
 }
 
-fn finite_score_bounds(scores: impl IntoIterator<Item = f32>) -> (f32, f32) {
-    scores
-        .into_iter()
-        .filter(|score| score.is_finite())
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), score| {
-            (min.min(score), max.max(score))
-        })
-}
-
-#[allow(clippy::too_many_arguments)]
 fn build_refined_explanation(
     final_score: f32,
     rank: usize,
     doc_id: &str,
-    fast_score: Option<f32>,
-    quality_score: Option<f32>,
     initial_ranks: &AHashMap<&str, usize>,
-    fast_min: f32,
-    fast_max: f32,
-    quality_min: f32,
-    quality_max: f32,
-    quality_weight: f32,
-    fast_embedder_id: &str,
     lexical_component: Option<ScoreComponent>,
+    vector_components: impl Iterator<Item = ScoreComponent>,
 ) -> HitExplanation {
-    let normalize = |score: f32, min: f32, max: f32| {
-        if !score.is_finite() {
-            return 0.0;
-        }
-        let range = max - min;
-        if range > 0.01 {
-            f64::from(((score - min) / range).clamp(0.0, 1.0))
-        } else {
-            f64::from(score.clamp(0.0, 1.0))
-        }
-    };
-    let mut components = Vec::with_capacity(2 + usize::from(lexical_component.is_some()));
-    components.extend(lexical_component);
-    if let Some(score) = fast_score {
-        components.push(ScoreComponent {
-            // Refinement is reachable only for a semantic fast tier. The
-            // display name cannot override that admitted kind.
-            source: ExplainedSource::SemanticFast {
-                embedder: fast_embedder_id.to_owned(),
-                cosine_sim: f64::from(score),
-            },
-            raw_score: f64::from(score),
-            normalized_score: normalize(score, fast_min, fast_max),
-            rrf_contribution: 0.0,
-            weight: 1.0 - f64::from(quality_weight),
-        });
-    }
-    if let Some(score) = quality_score {
-        components.push(ScoreComponent {
-            source: ExplainedSource::SemanticQuality {
-                embedder: "sync-quality-query".to_owned(),
-                cosine_sim: f64::from(score),
-            },
-            raw_score: f64::from(score),
-            normalized_score: normalize(score, quality_min, quality_max),
-            rrf_contribution: 0.0,
-            weight: f64::from(quality_weight),
-        });
-    }
+    let components = lexical_component
+        .into_iter()
+        .chain(vector_components)
+        .collect();
     let rank_movement = initial_ranks.get(doc_id).map(|&initial_rank| {
         let refined_rank = i64::try_from(rank).unwrap_or(i64::MAX);
         let initial_rank_i64 = i64::try_from(initial_rank).unwrap_or(i64::MAX);
@@ -2776,6 +2741,7 @@ mod tests {
         let mut writer =
             frankensearch_index::TwoTierIndex::create(dir.path(), TwoTierConfig::default())
                 .unwrap();
+        writer.set_quality_embedder_id("persisted-quality");
         writer.set_fast_identity(&fast).unwrap();
         writer.set_quality_identity(&quality).unwrap();
         for (id, fast_vector, quality_vector) in [
@@ -2789,6 +2755,7 @@ mod tests {
         }
         drop(writer.finish().unwrap());
         let index = Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap());
+        assert_eq!(index.quality_embedder_id(), Some("persisted-quality"));
         let searcher = SyncTwoTierSearcher::new(
             Arc::clone(&index),
             TwoTierConfig {
@@ -2807,7 +2774,11 @@ mod tests {
             SearchPhase::Initial {
                 results: initial, ..
             },
-            SearchPhase::Refined { results, .. },
+            SearchPhase::Refined {
+                results,
+                metrics: refined_metrics,
+                ..
+            },
         ] = phases.as_slice()
         else {
             panic!("expected progressive refinement: {phases:?}");
@@ -2830,6 +2801,24 @@ mod tests {
         assert_eq!(results[1].quality_score, Some(1.0));
         assert!(results[1].index.is_some(), "B has a real fast row");
         assert!((results[1].score - 0.7).abs() < 1e-6);
+        for hit in results {
+            let explanation = hit.explanation.as_ref().expect("refined explanation");
+            let reconstructed = explanation
+                .components
+                .iter()
+                .map(|component| component.normalized_score * component.weight)
+                .sum::<f64>();
+            assert!(
+                (reconstructed - f64::from(hit.score)).abs() < 1e-7,
+                "incorrect blend evidence for {}",
+                hit.doc_id
+            );
+            assert!(explanation.components.iter().any(|component| matches!(
+                &component.source,
+                ExplainedSource::SemanticQuality { embedder, .. } if embedder == "persisted-quality"
+            )));
+        }
+        assert_eq!(refined_metrics.embedder_id, "persisted-quality");
         let (_, metrics) = searcher.search_collect(&query, 2).unwrap();
         assert_eq!(metrics.semantic_candidates, 2);
         assert_eq!(metrics.phase2_vectors_searched, 3);
@@ -2858,6 +2847,7 @@ mod tests {
             TwoTierConfig {
                 candidate_multiplier: 1,
                 quality_weight: 1.0,
+                explain: true,
                 ..TwoTierConfig::default()
             },
         );
@@ -2874,6 +2864,21 @@ mod tests {
         assert_eq!(results[0].index, Some(0));
         assert_eq!(metrics.incomplete_embeddings, 1);
         assert_eq!(metrics.phase2_vectors_searched, 1);
+        let (both, _) = searcher.search_collect(&query, 2).unwrap();
+        assert_eq!(
+            both.iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a-uncovered", "z-quality"]
+        );
+        for hit in both {
+            let explanation = hit.explanation.expect("single-tier explanation");
+            let [component] = explanation.components.as_slice() else {
+                panic!("expected one source per document");
+            };
+            assert_eq!(component.weight.to_bits(), 1.0_f64.to_bits());
+            assert_eq!(component.normalized_score.to_bits(), 1.0_f64.to_bits());
+        }
     }
 
     #[test]

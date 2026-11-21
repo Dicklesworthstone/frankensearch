@@ -59,7 +59,7 @@ use frankensearch_index::{FsviV2IdentityBinding, SearchParams, TwoTierIndex};
 
 use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
-    blend_two_tier, blend_two_tier_aligned_vector_index, build_borrowed_rank_map,
+    BlendExplanation, blend_two_tier, blend_two_tier_aligned_vector_index, build_borrowed_rank_map,
     complete_quality_evidence, compute_rank_changes_with_maps, kendall_tau_with_refined_rank,
     missing_candidate_ids,
 };
@@ -3749,25 +3749,20 @@ impl TwoTierSearcher {
             .map(|hit| (hit.doc_id.as_str(), hit.score))
             .collect();
 
-        // Convert blended to scored results.
-        let mut fast_min = f32::INFINITY;
-        let mut fast_max = f32::NEG_INFINITY;
-        let mut qual_min = f32::INFINITY;
-        let mut qual_max = f32::NEG_INFINITY;
-        if self.config.explain {
-            for &s in fast_scores_by_doc.values() {
-                if s.is_finite() {
-                    fast_min = fast_min.min(s);
-                    fast_max = fast_max.max(s);
-                }
+        let blend_explanation = self.config.explain.then(|| match &quality_pool {
+            QualityPool::Retrieved(hits) => BlendExplanation::new(
+                &refined_fast_hits,
+                hits.iter().map(|hit| &hit.score),
+                blend_factor,
+            ),
+            QualityPool::RescoredFastPool(scores) => {
+                BlendExplanation::new(&refined_fast_hits, scores.iter().flatten(), blend_factor)
             }
-            for &s in quality_scores_by_doc.values() {
-                if s.is_finite() {
-                    qual_min = qual_min.min(s);
-                    qual_max = qual_max.max(s);
-                }
-            }
-        }
+        });
+        let quality_embedder_id = self
+            .quality_embedder
+            .as_ref()
+            .map_or("quality-embedder", |embedder| embedder.id());
 
         // Shared refined-phase explanation builder. `rank_map` supplies the
         // phase-1 ordering the movement delta is measured against: the fast
@@ -3781,63 +3776,18 @@ impl TwoTierSearcher {
                                          rank_map: &std::collections::HashMap<&str, usize>,
                                          lexical_component: Option<ScoreComponent>|
          -> Option<Box<HitExplanation>> {
-            if !self.config.explain {
-                return None;
-            }
-            let mut components = Vec::new();
+            let blend_explanation = blend_explanation.as_ref()?;
+            let mut components = Vec::with_capacity(3);
             components.extend(lexical_component);
-
-            let fast_norm = |s: f32| -> f64 {
-                if !s.is_finite() {
-                    return 0.0;
-                }
-                let range = fast_max - fast_min;
-                if range > 0.01 {
-                    f64::from(((s - fast_min) / range).clamp(0.0, 1.0))
-                } else {
-                    f64::from(s.clamp(0.0, 1.0))
-                }
-            };
-
-            let qual_norm = |s: f32| -> f64 {
-                if !s.is_finite() {
-                    return 0.0;
-                }
-                let range = qual_max - qual_min;
-                if range > 0.01 {
-                    f64::from(((s - qual_min) / range).clamp(0.0, 1.0))
-                } else {
-                    f64::from(s.clamp(0.0, 1.0))
-                }
-            };
-
-            // Fast component
-            if let Some(s) = fast_score {
-                components.push(ScoreComponent {
-                    source: ExplainedSource::vector_fast(self.fast_embedder.id(), f64::from(s)),
-                    raw_score: f64::from(s),
-                    normalized_score: fast_norm(s),
-                    rrf_contribution: 0.0,
-                    weight: 1.0 - f64::from(blend_factor),
-                });
-            }
-
-            // Quality component
-            if let Some(s) = quality_score {
-                components.push(ScoreComponent {
-                    source: ExplainedSource::SemanticQuality {
-                        embedder: self
-                            .quality_embedder
-                            .as_ref()
-                            .map_or_else(|| "quality-embedder".to_owned(), |e| e.id().to_owned()),
-                        cosine_sim: f64::from(s),
-                    },
-                    raw_score: f64::from(s),
-                    normalized_score: qual_norm(s),
-                    rrf_contribution: 0.0,
-                    weight: f64::from(blend_factor),
-                });
-            }
+            components.extend(blend_explanation.components(
+                fast_score,
+                quality_score,
+                |cosine_sim| ExplainedSource::vector_fast(self.fast_embedder.id(), cosine_sim),
+                |cosine_sim| ExplainedSource::SemanticQuality {
+                    embedder: quality_embedder_id.to_owned(),
+                    cosine_sim,
+                },
+            ));
 
             // Rank movement
             let rank_movement = rank_map.get(doc_id).map(|&i_rank| {
