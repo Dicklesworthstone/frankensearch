@@ -1925,6 +1925,16 @@ impl FsWatcher {
                 self.stats.mark_event(event.observed_at_ms);
             }
 
+            // Policy files are usually hidden and produce no ingest operation
+            // of their own, but can change eligibility throughout the tree.
+            // Retain that work even when pressure pauses this explicit batch.
+            if events
+                .iter()
+                .any(|event| is_ignore_policy_path(&event.path, &self.roots))
+            {
+                lock_or_recover(&self.reconciliation).require_full_scan()?;
+            }
+
             let policy = self.execution_policy();
             if !policy.watching_enabled {
                 self.stats.add_skipped(events.len());
@@ -1936,7 +1946,7 @@ impl FsWatcher {
             }
 
             if lock_or_recover(&self.reconciliation).required {
-                run_authoritative_reconciliation(
+                let reconciliation_result = run_authoritative_reconciliation(
                     cx,
                     &self.roots,
                     &self.discovery,
@@ -1949,7 +1959,11 @@ impl FsWatcher {
                     // Caller-driven path: its `Cx` is the cancellation channel.
                     &|| cx.is_cancel_requested(),
                 )
-                .await?;
+                .await;
+                if cx.is_cancel_requested() {
+                    return Err(cancelled_ingest_error(cx));
+                }
+                reconciliation_result?;
             }
 
             // Runs on the caller's executor under the caller's `Cx`: this path
@@ -2545,6 +2559,7 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
                 &mut pending,
                 Some(&mount_table),
                 &context.reconciliation,
+                &context.roots,
             ) {
                 Ok(count) => skipped += count,
                 Err(error) => {
@@ -2566,6 +2581,7 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
                 &mut pending,
                 Some(&mount_table),
                 &context.reconciliation,
+                &context.roots,
             ) {
                 Ok(count) => skipped += count,
                 Err(error) => {
@@ -2629,6 +2645,7 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         &mut pending,
         Some(&mount_table),
         &context.reconciliation,
+        &context.roots,
     );
     if !final_policy.watching_enabled || pressure_was_disabled {
         lock_or_recover(&context.reconciliation).require_full_scan()?;
@@ -2658,10 +2675,19 @@ fn drain_notify_channel(
     pending: &mut PendingEvents,
     mount_table: Option<&MountTable>,
     reconciliation: &ReconciliationTracker,
+    roots: &[PathBuf],
 ) -> SearchResult<()> {
     let mut failure = None;
     while let Ok(event) = event_rx.try_recv() {
-        match process_notify_result(event, policy, stats, pending, mount_table, reconciliation) {
+        match process_notify_result(
+            event,
+            policy,
+            stats,
+            pending,
+            mount_table,
+            reconciliation,
+            roots,
+        ) {
             Ok(_) => {}
             Err(error) if failure.is_none() => failure = Some(error),
             Err(_) => {}
@@ -3886,6 +3912,29 @@ fn watcher_task_error(message: impl Into<String>) -> SearchError {
     }
 }
 
+/// Changes to these names can alter discovery for files that emit no event.
+/// Match paths lexically so removal/rename still works after a policy is gone,
+/// without reading outside the selected roots or following event-path symlinks.
+fn is_ignore_policy_path(path: &Path, roots: &[PathBuf]) -> bool {
+    let policy_name = matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".ignore" | ".gitignore" | ".git" | ".jj")
+    ) || path.ends_with(".git/info")
+        || path.ends_with(".git/info/exclude");
+    policy_name
+        && path.to_str().is_some()
+        && !path
+            .components()
+            .any(|component| component == Component::ParentDir)
+        && roots.iter().any(|root| {
+            !root.as_os_str().is_empty()
+                && !root
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+                && path.starts_with(root)
+        })
+}
+
 /// Queue a notification's changes, or count those pressure makes this skip.
 /// A notification that names no change, such as a read, counts nothing.
 fn process_notify_result(
@@ -3895,14 +3944,21 @@ fn process_notify_result(
     pending: &mut PendingEvents,
     mount_table: Option<&MountTable>,
     reconciliation: &ReconciliationTracker,
+    roots: &[PathBuf],
 ) -> SearchResult<usize> {
     let mut skipped = 0_usize;
     match event {
         Ok(event) => {
             // Backend overflow can arrive as a successful, pathless `Other`
-            // event. Record the lost-notification debt before kind or pressure
-            // filtering, and invalidate any scan already in flight.
-            if event.need_rescan() {
+            // event. Policy changes also owe a full scan before hidden-file or
+            // pressure filtering, and invalidate any scan already in flight.
+            // Reads of those same policies during a scan must not rearm it.
+            let policy_changed = map_notify_kind(event.kind).is_some()
+                && event
+                    .paths
+                    .iter()
+                    .any(|path| is_ignore_policy_path(path, roots));
+            if event.need_rescan() || policy_changed {
                 lock_or_recover(reconciliation).require_full_scan()?;
             }
             for watch_event in map_notify_event_with_mount_table(event, mount_table) {
@@ -7400,6 +7456,290 @@ mod tests {
                     if file_key == &normalize_file_key(&deleted)
             ));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn watcher_policy_events_reconcile_exclusions_and_reinclusions() {
+        for policy_name in [".ignore", ".gitignore", ".git/info/exclude"] {
+            run_test_with_cx(|cx| async move {
+                let temp = tempdir().expect("tempdir");
+                let root = temp.path().join("project");
+                let nested = root.join("nested");
+                fs::create_dir_all(nested.join(".git/info")).unwrap();
+                let root = root.canonicalize().unwrap();
+                let nested = root.join("nested");
+                let public = root.join("public.md");
+                let private = nested.join("private.md");
+                fs::write(&public, "always searchable").unwrap();
+                fs::write(&private, "policy-controlled source").unwrap();
+                let policy_path = nested.join(policy_name);
+                let moved_policy = temp.path().join("moved-policy");
+                let pipeline = Arc::new(RecordingPipeline::default());
+                let watcher =
+                    FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+                let (baseline, completeness) = watcher.collect_snapshot().unwrap();
+                assert!(completeness.is_complete());
+                assert_eq!(baseline.len(), 2);
+                assert!(
+                    lock_or_recover(&watcher.reconciliation)
+                        .seed_initial_authority(baseline, completeness.root_identities().clone())
+                        .unwrap()
+                );
+
+                // The source files never change or emit events during this
+                // sequence. Only policy notifications can update membership.
+                for (step, excluded) in [
+                    ("create", true),
+                    ("include", false),
+                    ("exclude", true),
+                    ("rename away", false),
+                    ("rename back", true),
+                    ("remove", false),
+                ] {
+                    let events = match step {
+                        "create" => {
+                            fs::write(&policy_path, "private.md\n").unwrap();
+                            vec![WatchEvent::created(&policy_path, now_millis(), None)]
+                        }
+                        "include" | "exclude" => {
+                            fs::write(
+                                &policy_path,
+                                if excluded {
+                                    "private.md\n"
+                                } else {
+                                    "!private.md\n"
+                                },
+                            )
+                            .unwrap();
+                            vec![WatchEvent::modified(&policy_path, now_millis(), None)]
+                        }
+                        "rename away" | "rename back" => {
+                            let (from, to) = if excluded {
+                                (&moved_policy, &policy_path)
+                            } else {
+                                (&policy_path, &moved_policy)
+                            };
+                            fs::rename(from, to).unwrap();
+                            super::map_notify_event(
+                                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                                    .add_path(from.clone())
+                                    .add_path(to.clone()),
+                            )
+                        }
+                        "remove" => {
+                            // Move out of the fixture to model disappearance;
+                            // the removed endpoint is all a Remove event names.
+                            fs::rename(&policy_path, &moved_policy).unwrap();
+                            vec![WatchEvent::deleted(&policy_path, now_millis())]
+                        }
+                        _ => unreachable!("fixture step"),
+                    };
+                    lock_or_recover(&pipeline.batches).clear();
+                    watcher
+                        .process_events_now(&cx, &events)
+                        .await
+                        .unwrap_or_else(|error| panic!("{policy_name}/{step}: {error}"));
+                    let private_ops = pipeline
+                        .all_ops()
+                        .into_iter()
+                        .filter(|op| match op {
+                            WatchIngestOp::Upsert { file_key, .. }
+                            | WatchIngestOp::Delete { file_key, .. } => {
+                                file_key == &normalize_file_key(&private)
+                            }
+                        })
+                        .map(|op| matches!(op, WatchIngestOp::Delete { .. }))
+                        .collect::<Vec<_>>();
+                    assert_eq!(private_ops, [excluded], "{policy_name}/{step}");
+                    let state = lock_or_recover(&watcher.reconciliation);
+                    assert!(!state.required, "{policy_name}/{step}");
+                    let expected = if excluded {
+                        BTreeSet::from([&public])
+                    } else {
+                        BTreeSet::from([&public, &private])
+                    };
+                    assert_eq!(
+                        state.indexed_snapshot.keys().collect::<BTreeSet<_>>(),
+                        expected,
+                        "{policy_name}/{step}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_gitfile_events_reconcile_repository_and_common_excludes() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            let first_git = temp.path().join("first metadata");
+            let second_git = temp.path().join("second metadata");
+            for git_dir in [&first_git, &second_git] {
+                fs::create_dir_all(git_dir.join("info")).unwrap();
+            }
+            fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            fs::write(first_git.join("info/exclude"), "private.md\n").unwrap();
+            fs::write(second_git.join("info/exclude"), "").unwrap();
+            let public = root.join("public.md");
+            let private = root.join("private.md");
+            let git_ignored = root.join("git-ignored.md");
+            for path in [&public, &private, &git_ignored] {
+                fs::write(path, "unchanged source").unwrap();
+            }
+            fs::write(root.join(".gitignore"), "git-ignored.md\n").unwrap();
+            let gitfile = root.join(".git");
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+            let (baseline, completeness) = watcher.collect_snapshot().unwrap();
+            assert_eq!(baseline.len(), 3, "Git rules require a repository boundary");
+            assert!(
+                lock_or_recover(&watcher.reconciliation)
+                    .seed_initial_authority(baseline, completeness.root_identities().clone())
+                    .unwrap()
+            );
+            for step in ["first", "second", "removed"] {
+                let event = match step {
+                    "first" => {
+                        fs::write(&gitfile, "gitdir: ../first metadata\n").unwrap();
+                        WatchEvent::created(&gitfile, now_millis(), None)
+                    }
+                    "second" => {
+                        fs::write(&gitfile, "gitdir: ../second metadata\n").unwrap();
+                        WatchEvent::modified(&gitfile, now_millis(), None)
+                    }
+                    "removed" => {
+                        fs::rename(&gitfile, temp.path().join("removed-gitfile")).unwrap();
+                        WatchEvent::deleted(&gitfile, now_millis())
+                    }
+                    _ => unreachable!("fixture step"),
+                };
+                lock_or_recover(&pipeline.batches).clear();
+                watcher.process_events_now(&cx, &[event]).await.unwrap();
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(!state.required);
+                let expected = match step {
+                    "first" => BTreeSet::from([&public]),
+                    "second" => BTreeSet::from([&public, &private]),
+                    _ => BTreeSet::from([&public, &private, &git_ignored]),
+                };
+                assert_eq!(
+                    state.indexed_snapshot.keys().collect::<BTreeSet<_>>(),
+                    expected,
+                    "{step}"
+                );
+                let operations = pipeline.all_ops();
+                assert!(operations.iter().any(|op| match (step, op) {
+                    ("first", WatchIngestOp::Delete { file_key, .. }) => {
+                        file_key == &normalize_file_key(&private)
+                    }
+                    ("second", WatchIngestOp::Upsert { file_key, .. }) => {
+                        file_key == &normalize_file_key(&private)
+                    }
+                    ("removed", WatchIngestOp::Upsert { file_key, .. }) => {
+                        file_key == &normalize_file_key(&git_ignored)
+                    }
+                    _ => false,
+                }));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_policy_reconciliation_retains_debt_on_failure_pause_and_cancellation() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("project");
+            fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let private = root.join("private.md");
+            let policy_path = root.join(".ignore");
+            fs::write(&private, "policy-controlled source").unwrap();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+            let (baseline, completeness) = watcher.collect_snapshot().unwrap();
+            assert!(
+                lock_or_recover(&watcher.reconciliation)
+                    .seed_initial_authority(
+                        baseline.clone(),
+                        completeness.root_identities().clone()
+                    )
+                    .unwrap()
+            );
+            let authority = lock_or_recover(&watcher.reconciliation).authority.clone();
+            fs::write(&policy_path, "private.md\nprivate[9-0].md\n").unwrap();
+            let event = WatchEvent::modified(&policy_path, now_millis(), None);
+            assert_incomplete_ignore_policy(
+                watcher
+                    .process_events_now(&cx, std::slice::from_ref(&event))
+                    .await
+                    .expect_err("invalid policy cannot supply deletion authority"),
+                &policy_path,
+            );
+            assert!(lock_or_recover(&pipeline.attempts).is_empty());
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(state.required);
+                assert_eq!(state.indexed_snapshot, baseline);
+                assert_eq!(state.authority, authority);
+            }
+
+            fs::write(&policy_path, "private.md\n").unwrap();
+            pipeline.fail_next.store(true, Ordering::Release);
+            let error = watcher.process_events_now(&cx, &[]).await.unwrap_err();
+            assert!(error.to_string().contains("forced failure"));
+            assert!(pipeline.all_ops().is_empty());
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(state.required);
+                assert_eq!(state.indexed_snapshot, baseline);
+                assert_eq!(state.authority, authority);
+            }
+            watcher.process_events_now(&cx, &[]).await.unwrap();
+            assert!(pipeline.all_ops().iter().any(|op| matches!(
+                op, WatchIngestOp::Delete { file_key, .. }
+                    if file_key == &normalize_file_key(&private)
+            )));
+
+            // A policy event consumed while paused still invalidates any plan
+            // made before it; relief can retry without another notification.
+            watcher
+                .apply_pressure_state(PressureState::Emergency)
+                .unwrap();
+            let epoch = lock_or_recover(&watcher.reconciliation).epoch;
+            fs::write(&policy_path, "!private.md\n").unwrap();
+            let outcome = watcher
+                .process_events_now(&cx, std::slice::from_ref(&event))
+                .await
+                .unwrap();
+            assert_eq!(outcome.skipped, 1);
+            assert_eq!(lock_or_recover(&watcher.reconciliation).epoch, epoch + 1);
+            watcher.apply_pressure_state(PressureState::Normal).unwrap();
+            let attempts = lock_or_recover(&pipeline.attempts).len();
+            cx.set_cancel_requested(true);
+            let error = watcher.process_events_now(&cx, &[]).await.unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            assert_eq!(lock_or_recover(&pipeline.attempts).len(), attempts);
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(state.required);
+                assert!(!state.indexed_snapshot.contains_key(&private));
+            }
+            cx.set_cancel_requested(false);
+            watcher.process_events_now(&cx, &[]).await.unwrap();
+            let state = lock_or_recover(&watcher.reconciliation);
+            assert!(!state.required);
+            assert!(state.indexed_snapshot.contains_key(&private));
+            assert!(pipeline.all_ops().iter().any(|op| matches!(
+                op, WatchIngestOp::Upsert { file_key, .. }
+                    if file_key == &normalize_file_key(&private)
+            )));
+        });
     }
 
     #[test]
@@ -12039,6 +12379,7 @@ mod tests {
             &mut pending,
             None,
             &reconciliation,
+            &[temp.path().to_path_buf()],
         )
         .expect("a successful notify event drains cleanly");
         let queue: ReadyBatchQueue = Arc::new(Mutex::new(VecDeque::new()));
@@ -12069,6 +12410,7 @@ mod tests {
                 &mut pending,
                 None,
                 &reconciliation,
+                &[],
             )
             .unwrap()
         };
@@ -12087,6 +12429,244 @@ mod tests {
             1
         );
         assert!(pending.by_path.is_empty());
+    }
+
+    #[test]
+    fn ignore_policy_paths_stay_within_selected_roots() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        let roots = [root.clone()];
+        for relative in [
+            ".ignore",
+            ".gitignore",
+            "nested/.ignore",
+            "nested/.gitignore",
+            ".git",
+            "nested/.git",
+            ".jj",
+            ".git/info",
+            ".git/info/exclude",
+            "nested/.git/info/exclude",
+        ] {
+            assert!(
+                super::is_ignore_policy_path(&root.join(relative), &roots),
+                "{relative}"
+            );
+        }
+        for path in [
+            root.join("source.rs"),
+            root.join(".gitignore.lock"),
+            root.join(".git/HEAD"),
+            root.join(".git/objects/ab/cdef"),
+            root.join(".git/info/exclude.lock"),
+            root.join(".git/info/attributes"),
+            root.join("../.ignore"),
+            root.join("nested/../.gitignore"),
+            temp.path().join(".ignore"),
+            temp.path().join("project-sibling/.gitignore"),
+        ] {
+            assert!(
+                !super::is_ignore_policy_path(&path, &roots),
+                "{}",
+                path.display()
+            );
+        }
+        assert!(!super::is_ignore_policy_path(
+            &root.join(".ignore"),
+            &[PathBuf::new()]
+        ));
+        assert!(!super::is_ignore_policy_path(
+            &root.join("../.gitignore"),
+            &[root.join("..")]
+        ));
+    }
+
+    #[test]
+    fn notify_policy_changes_invalidate_plans_before_pressure_filtering() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        let roots = [root.clone()];
+        for pressure in [PressureState::Normal, PressureState::Emergency] {
+            for event in [
+                Event::new(EventKind::Create(CreateKind::File)).add_path(root.join(".ignore")),
+                Event::new(EventKind::Modify(ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(root.join(".gitignore")),
+                Event::new(EventKind::Remove(notify::event::RemoveKind::File))
+                    .add_path(root.join(".git/info/exclude")),
+                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(root.join("temporary-policy"))
+                    .add_path(root.join(".gitignore")),
+                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(root.join(".ignore"))
+                    .add_path(temp.path().join("moved-policy")),
+            ] {
+                let prior = WatchEvent::modified(root.join("prior.md"), 1, Some(13));
+                let mut initial = ReconciliationState::default();
+                initial
+                    .require_for_events(std::slice::from_ref(&prior))
+                    .unwrap();
+                initial.unsettled_passes = super::MAX_UNSETTLED_PASSES;
+                let old_token = initial.planning_token().unwrap();
+                let reconciliation = Arc::new(Mutex::new(initial));
+                let stats = WatcherStatsInner::default();
+                let mut pending = PendingEvents::default();
+                pending.push(prior.clone());
+                let policy = WatcherExecutionPolicy::for_pressure(pressure, 500, 10);
+                let expected_skipped = if policy.watching_enabled {
+                    0
+                } else {
+                    event.paths.len()
+                };
+                let skipped = super::process_notify_result(
+                    Ok(event),
+                    policy,
+                    &stats,
+                    &mut pending,
+                    None,
+                    &reconciliation,
+                    &roots,
+                )
+                .unwrap();
+                assert_eq!(skipped, expected_skipped);
+                assert_eq!(pending.by_path.get(&prior.path), Some(&prior));
+                let state = lock_or_recover(&reconciliation);
+                assert!(state.required);
+                assert_eq!(state.epoch, old_token.epoch + 1);
+                assert_ne!(state.planning_token().unwrap(), old_token);
+                assert_eq!(state.unsettled_passes, 0);
+                assert_eq!(state.affected_paths, BTreeSet::from([prior.path]));
+            }
+        }
+    }
+
+    #[test]
+    fn notify_policy_reads_and_unrelated_git_events_do_not_owe_scans() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        let roots = [root.clone()];
+        let stats = WatcherStatsInner::default();
+        let mut pending = PendingEvents::default();
+        let reconciliation = Arc::new(Mutex::new(ReconciliationState::default()));
+        for event in [
+            Event::new(EventKind::Access(AccessKind::Any)).add_path(root.join(".gitignore")),
+            Event::new(EventKind::Other).add_path(root.join(".ignore")),
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(".git/HEAD")),
+            Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(root.join(".git/objects/ab/cdef")),
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(".gitignore.lock")),
+            Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(temp.path().join("project-sibling/.ignore")),
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("../.gitignore")),
+        ] {
+            super::process_notify_result(
+                Ok(event),
+                WatcherExecutionPolicy::for_pressure(PressureState::Normal, 500, 10),
+                &stats,
+                &mut pending,
+                None,
+                &reconciliation,
+                &roots,
+            )
+            .unwrap();
+            let state = lock_or_recover(&reconciliation);
+            assert!(!state.required);
+            assert_eq!(state.epoch, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_policy_change_during_scan_prevents_stale_deletes() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().canonicalize().unwrap();
+            let private = root.join("private.md");
+            let policy_path = root.join(".ignore");
+            fs::write(&private, "unchanged source").unwrap();
+            let roots = [root];
+            let discovery = DiscoveryConfig::default();
+            let (baseline, completeness) =
+                collect_snapshot_from_roots(&roots, &discovery, &|| false).unwrap();
+            let mut initial = ReconciliationState::default();
+            assert!(
+                initial
+                    .seed_initial_authority(
+                        baseline.clone(),
+                        completeness.root_identities().clone()
+                    )
+                    .unwrap()
+            );
+            initial.require_full_scan().unwrap();
+            let reconciliation = Arc::new(Mutex::new(initial));
+            fs::write(&policy_path, "private.md\n").unwrap();
+            let reconciliation_during_scan = Arc::clone(&reconciliation);
+            let collector =
+                move |roots: &[PathBuf], discovery: &DiscoveryConfig, abort: &dyn Fn() -> bool| {
+                    let observed = collect_snapshot_from_roots(roots, discovery, abort)?;
+                    assert!(!observed.0.contains_key(&private));
+                    // The old scan has excluded the source, but the new policy
+                    // makes it live again before that scan can plan its deletes.
+                    fs::write(&policy_path, "!private.md\n")?;
+                    super::process_notify_result(
+                        Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                            notify::event::DataChange::Content,
+                        )))
+                        .add_path(policy_path.clone())),
+                        WatcherExecutionPolicy::for_pressure(PressureState::Normal, 500, 10),
+                        &WatcherStatsInner::default(),
+                        &mut PendingEvents::default(),
+                        None,
+                        &reconciliation_during_scan,
+                        roots,
+                    )?;
+                    Ok(observed)
+                };
+            let pipeline = RecordingPipeline::default();
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                &pipeline,
+                &reconciliation,
+                &queue,
+                &stats,
+                10,
+                &collector,
+                &|| false,
+            )
+            .await
+            .unwrap();
+            assert!(lock_or_recover(&pipeline.attempts).is_empty());
+            {
+                let state = lock_or_recover(&reconciliation);
+                assert!(state.required);
+                assert_eq!(state.indexed_snapshot, baseline);
+            }
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                &pipeline,
+                &reconciliation,
+                &queue,
+                &stats,
+                10,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                pipeline.all_ops().as_slice(),
+                [WatchIngestOp::Upsert { file_key, .. }]
+                    if file_key == &normalize_file_key(&roots[0].join("private.md"))
+            ));
+            assert!(!lock_or_recover(&reconciliation).required);
+        });
     }
 
     #[test]
@@ -12111,6 +12691,7 @@ mod tests {
                         &mut pending,
                         None,
                         &reconciliation,
+                        &[],
                     )
                     .expect("rescan ingress succeeds without a named path");
 
@@ -12152,6 +12733,7 @@ mod tests {
                 &mut pending,
                 None,
                 &reconciliation,
+                &[],
             )
             .expect("a flagged change retains normal event handling");
             assert_eq!(skipped, usize::from(!policy.watching_enabled));
@@ -12171,6 +12753,7 @@ mod tests {
                 &mut pending,
                 None,
                 &reconciliation,
+                &[],
             )
             .expect("ordinary read");
             let guard = lock_or_recover(&reconciliation);
@@ -12208,6 +12791,7 @@ mod tests {
             &mut pending,
             None,
             &reconciliation,
+            &[],
         )
         .expect_err("the first lineage failure must reach the producer");
         assert!(error.to_string().contains("epoch counter exhausted"));
@@ -12268,6 +12852,7 @@ mod tests {
                 &mut pending,
                 None,
                 &reconciliation,
+                &roots,
             )
             .expect("pathless overflow while watching is paused");
             assert!(lock_or_recover(&reconciliation).required);
@@ -12356,6 +12941,7 @@ mod tests {
             &mut pending,
             None,
             &reconciliation,
+            &[],
         )
         .expect_err("a notify ingress error must replace the producer");
 

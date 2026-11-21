@@ -588,6 +588,13 @@ the windows of a changed file current the same way, and a deleted file loses
 all of its rows. Complete-generation stores support windowed append and
 deletion through successor publication.
 
+Within watched roots, changes to `.ignore`, `.gitignore`, `.git/info/exclude`,
+or repository boundaries trigger a fresh membership scan. Newly excluded
+documents leave the index, and newly included files are discovered without
+modifying their contents or restarting the watcher. A policy change during a
+scan invalidates that scan. Failed reconciliation remains pending for retry,
+and an incomplete policy scan authorizes no deletions.
+
 ### Query syntax
 
 The word-matching (BM25) tier matches query words exactly, ignoring case,
