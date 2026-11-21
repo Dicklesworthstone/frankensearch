@@ -697,7 +697,7 @@ queue their inputs for the original quality producer and explicit completion.
 Stores first indexed from an empty corpus under forced deferral preserve that
 producer choice too, so their later appends can complete quality normally.
 
-To build a standalone quality-tier index, select a verified quality model in
+To build a standalone quality-tier index, select a registered quality model in
 the configuration and run:
 
 ```bash
@@ -705,6 +705,14 @@ fsfs index ~/projects --quality-only --no-fast-only --index-dir ./quality-store
 fsfs search "structured concurrency" --quality-only --no-fast-only --index-dir ./quality-store
 fsfs watch ~/projects --quality-only --no-fast-only --index-dir ./quality-store
 ```
+
+An online `index` or `watch` command in an interactive table terminal offers
+to download a missing required quality model before the build starts. The offer
+shows the exact model, revision, license, size and installation path, and uses
+the same verified download lifecycle as `fsfs download-models`. It does not
+request a fast model. A verified direct installation or an exact bundled model
+is reused. Declining, offline mode, non-interactive input or machine output
+preserves the typed missing-model error and leaves the selected generation intact.
 
 The build indexes the source into Quill and `vector/quality.fsvi`
 without loading the fast model. It publishes a complete generation; later

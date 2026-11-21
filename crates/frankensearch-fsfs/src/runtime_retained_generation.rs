@@ -612,6 +612,19 @@ impl FsfsRuntime {
                 self.validate_index_source_root(root, &self.resolve_target_root()?)?;
             }
             let mut control = IndexRunControl::new(&self.config)?;
+            if matches!(
+                self.cli_input.command,
+                CliCommand::Index | CliCommand::Watch
+            ) && self.cli_input.quality_only
+                && self.cli_input.command_source == crate::adapters::cli::CommandSource::Explicit
+            {
+                // The required primary must be provisioned before store routing
+                // changes. Explicit recovery keeps its separate acquisition
+                // authorization and never reaches this CLI-only offer.
+                control.admit_work(cx, "index.model_provisioning").await?;
+                self.maybe_offer_interactive_model_provisioning(cx, true)
+                    .await?;
+            }
             control.admit_work(cx, "index.quality_model_load").await?;
             // Quality is required for this topology. Prove it before creating
             // `generations`, which would otherwise redirect a legacy reader
@@ -625,7 +638,8 @@ impl FsfsRuntime {
             } else {
                 self.resolve_quality_embedder()
             };
-            let embedder = resolved?.ok_or_else(|| SearchError::EmbedderUnavailable {
+            let embedder = resolved?.ok_or_else(|| {
+                SearchError::EmbedderUnavailable {
                 model: self.config.indexing.quality_model.clone(),
                 reason: "quality-only indexing requires its verified quality producer".to_owned(),
             })?;
