@@ -689,10 +689,10 @@ impl SyncTwoTierSearcher {
             &mut context.metadata,
         ) {
             Ok(results) => Ok(Some(results)),
-            Err(SyncLexicalFailure::Metadata(error))
-            | Err(SyncLexicalFailure::Retrieval(error @ SearchError::Cancelled { .. })) => {
-                Err(error)
-            }
+            Err(
+                SyncLexicalFailure::Metadata(error)
+                | SyncLexicalFailure::Retrieval(error @ SearchError::Cancelled { .. }),
+            ) => Err(error),
             Err(SyncLexicalFailure::Retrieval(error)) => {
                 // Match the async searcher's optional-arm contract. Discard
                 // even a partially fetched prefix after a refill failure; it
@@ -2098,7 +2098,7 @@ fn search_filtered_lexical(
         for hit in &hits {
             let observation = metadata.entry(hit.doc_id.to_string()).or_default();
             if observation.is_none() {
-                *observation = hit.metadata.clone();
+                observation.clone_from(&hit.metadata);
             }
         }
         let unknown: Vec<_> = hits
@@ -2141,13 +2141,14 @@ struct MetadataCandidateFilter<'a>(&'a dyn SearchFilter);
 
 impl SearchFilter for MetadataCandidateFilter<'_> {
     fn matches(&self, doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
-        if let Some(ids) = self.0.candidate_doc_ids() {
-            ids.contains(doc_id)
-        } else {
-            self.0
-                .candidate_hashes()
-                .is_none_or(|hashes| hashes.contains(&fnv1a_hash(doc_id.as_bytes())))
-        }
+        self.0.candidate_doc_ids().map_or_else(
+            || {
+                self.0
+                    .candidate_hashes()
+                    .is_none_or(|hashes| hashes.contains(&fnv1a_hash(doc_id.as_bytes())))
+            },
+            |ids| ids.contains(doc_id),
+        )
     }
 
     fn matches_doc_id_hash(
@@ -5433,7 +5434,9 @@ mod tests {
         }
         impl SyncLexicalSearch for DelayedMetadata {
             fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
-                Ok([lexical_result("b", 1.0)].into_iter().take(limit).collect())
+                Ok(std::iter::once(lexical_result("b", 1.0))
+                    .take(limit)
+                    .collect())
             }
 
             fn metadata_for_documents(
