@@ -8205,6 +8205,32 @@ impl IdHashLookupPlan {
         }
     }
 
+    /// Borrow the identity represented by each occupied IDHASH slot. The walk
+    /// is bounded by hash capacity, not by a potentially sparse docid range.
+    pub(crate) fn document_ids<'a>(
+        self,
+        id_map_bytes: &'a [u8],
+        id_hash_bytes: &'a [u8],
+    ) -> impl Iterator<Item = (u32, &'a str)> {
+        let capacity =
+            if id_map_bytes.len() == self.id_map_len && id_hash_bytes.len() == self.id_hash_len {
+                self.capacity
+            } else {
+                0
+            };
+        (0..capacity).filter_map(move |slot| {
+            let entries = id_hash_bytes.get(ID_HASH_HEADER_LEN..)?;
+            let (_, doc_ord_plus1) = id_hash_slot(entries, slot)?;
+            let ordinal = usize::try_from(doc_ord_plus1.checked_sub(1)?).ok()?;
+            let global_docid = self.docid_lo.checked_add(u64::try_from(ordinal).ok()?)?;
+            let document_id = self.document_id_bytes(id_map_bytes, ordinal)?;
+            Some((
+                u32::try_from(global_docid).ok()?,
+                std::str::from_utf8(document_id).ok()?,
+            ))
+        })
+    }
+
     fn content_hash(self, id_map_bytes: &[u8], ordinal: usize) -> Option<u64> {
         if ordinal >= self.span {
             return None;

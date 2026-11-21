@@ -945,11 +945,6 @@ impl FsfsRuntime {
             )
         })?;
         let sentinel = Self::read_index_sentinel(predecessor.path())?;
-        let ids = normalize_delete_ids_for_index(
-            &self.cli_input.delete_ids,
-            sentinel.as_ref().map(|value| Path::new(&value.target_root)),
-            self.cli_input.delete_prefix,
-        )?;
         let candidate_mode = Self::retained_generation_search_mode(predecessor.path())?;
         let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
             .ok_or_else(|| {
@@ -958,36 +953,30 @@ impl FsfsRuntime {
                     "selected membership manifests disagree",
                 )
             })?;
-        // Use the union, not just the fast vector tier: lexical-only documents
-        // and partial quality coverage still belong to the same command.
-        let mut live_ids = manifests.keys().cloned().collect::<BTreeSet<_>>();
-        for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
-            let path = predecessor.path().join(relative);
-            if path.exists() {
-                let index = VectorIndex::open_read_only(&path)?;
-                if relative == FSFS_VECTOR_INDEX_FILE {
-                    semantic_windows::load_mapping(predecessor.path(), &index)?;
-                }
-                live_ids.extend(
-                    index
-                        .live_doc_ids()?
-                        .into_iter()
-                        .map(|row| semantic_windows::source_id(&row).to_owned()),
-                );
-            }
-        }
-        let targets = live_ids
-            .into_iter()
-            .filter(|id| {
-                ids.iter().any(|requested| {
-                    if self.cli_input.delete_prefix {
-                        id.starts_with(requested.as_str())
-                    } else {
-                        id == requested
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+        // Manifests can retain tombstoned entries. Resolve against the actual
+        // live source union, including lexical-only and partial quality rows.
+        let fast_path = predecessor.path().join(FSFS_VECTOR_INDEX_FILE);
+        let fast_rows = if fast_path.exists() {
+            let index = VectorIndex::open_read_only(&fast_path)?;
+            semantic_windows::load_mapping(predecessor.path(), &index)?;
+            index.live_doc_ids()?
+        } else {
+            HashSet::new()
+        };
+        let live_ids = Self::live_delete_sources_at_root(
+            cx,
+            predecessor.path(),
+            &fast_rows,
+            &self.cli_input.delete_ids,
+            sentinel.as_ref().map(|value| Path::new(&value.target_root)),
+            self.cli_input.delete_prefix,
+        )?;
+        let targets = select_delete_targets_for_index(
+            &self.cli_input.delete_ids,
+            sentinel.as_ref().map(|value| Path::new(&value.target_root)),
+            self.cli_input.delete_prefix,
+            &live_ids,
+        )?;
         if targets.is_empty() {
             return Ok((None, 0));
         }
@@ -2865,6 +2854,149 @@ mod retained_delete_tests {
     }
 
     #[test]
+    fn retained_delete_preserves_opaque_absolute_ids_and_refuses_ambiguous_selectors() {
+        run_test_with_cx(|cx| async move {
+            for prefix in [false, true] {
+                let parent = tempfile::tempdir().unwrap();
+                let _restore = RestoreQuality(test_quality_embedder_override());
+                let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                    changed_revision: false,
+                });
+                set_test_quality_embedder(Some(Arc::clone(&quality)));
+                let (runtime, source, root, _) =
+                    fixture_with_quality(&cx, parent.path(), false, Some(quality.as_ref())).await;
+                let ambiguous = source.join("alpha.md").display().to_string();
+                let inside = source.join("virtual").join("one.md").display().to_string();
+                let outside = parent
+                    .path()
+                    .join("external")
+                    .join("one.md")
+                    .display()
+                    .to_string();
+                let input = [&ambiguous, &inside, &outside]
+                    .into_iter()
+                    .map(|id| {
+                        serde_json::json!({"id": id, "text": "sharedtoken opaque document"})
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let (publication, appended) = append_input(&runtime, parent.path(), &input)
+                    .append_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                assert_eq!(appended, 3);
+                let Some(GenerationPublication::Durable(predecessor)) = publication else {
+                    panic!("opaque append must publish durably"); // ubs:ignore — cfg(test) assertion.
+                };
+                let before = file_bytes(predecessor.path());
+                let mut old = runtime.open_retained_search(&cx, &root).await.unwrap();
+
+                let invalid = deletion(&runtime, &["beta.md", &ambiguous], prefix);
+                assert!(matches!(
+                    invalid.delete_retained_generation(&cx, &root).await,
+                    Err(SearchError::InvalidConfig { field, reason, .. })
+                        if field == "complete_generation.delete_ids"
+                            && reason.contains("different root-relative documents")
+                ));
+                assert_eq!(file_bytes(predecessor.path()), before);
+                assert_eq!(
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap(),
+                    Some(predecessor.clone()),
+                    "an ambiguous selector must not publish even earlier valid selectors"
+                );
+                let selectors = if prefix {
+                    vec![
+                        format!(
+                            "{}{sep}",
+                            source.join("virtual").display(),
+                            sep = std::path::MAIN_SEPARATOR
+                        ),
+                        format!(
+                            "{}{sep}",
+                            parent.path().join("external").display(),
+                            sep = std::path::MAIN_SEPARATOR
+                        ),
+                        inside.clone(),
+                    ]
+                } else {
+                    vec![inside.clone(), outside.clone(), inside.clone()]
+                };
+                let refs = selectors.iter().map(String::as_str).collect::<Vec<_>>();
+                let (publication, deleted) = deletion(&runtime, &refs, prefix)
+                    .delete_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                assert_eq!(deleted, 2, "overlapping selectors count unique members");
+                let Some(GenerationPublication::Durable(next)) = publication else {
+                    panic!("opaque delete must publish durably"); // ubs:ignore — cfg(test) assertion.
+                };
+                let expected = BTreeSet::from([
+                    "alpha.md".to_owned(),
+                    "beta.md".to_owned(),
+                    "beta-notes.md".to_owned(),
+                    ambiguous.clone(),
+                ]);
+                assert_eq!(live_ids(next.path(), FSFS_VECTOR_INDEX_FILE), expected);
+                assert_eq!(
+                    live_ids(next.path(), FSFS_VECTOR_QUALITY_INDEX_FILE),
+                    BTreeSet::from([
+                        "alpha.md".to_owned(),
+                        "beta.md".to_owned(),
+                        ambiguous.clone(),
+                    ])
+                );
+                let manifests = FsfsRuntime::read_matching_manifest_generation(next.path())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(manifests.keys().cloned().collect::<BTreeSet<_>>(), expected);
+                let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+                assert_eq!(
+                    fresh
+                        .search(&cx, "sharedtoken", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.clone())
+                        .collect::<BTreeSet<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    old.search(&cx, "sharedtoken", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
+                    6,
+                    "retained readers keep both opaque and root-relative documents"
+                );
+                assert_eq!(file_bytes(predecessor.path()), before);
+                let catalog = inspect_catalog_copy(parent.path(), next.path());
+                for id in [&inside, &outside] {
+                    assert!(catalog.get_document(id).unwrap().is_none());
+                    assert!(catalog.get_document_content(id).unwrap().is_none());
+                }
+                assert!(catalog.get_document(&ambiguous).unwrap().is_some());
+                assert!(catalog.get_document("alpha.md").unwrap().is_some());
+                assert_eq!(
+                    fs::read_to_string(source.join("alpha.md")).unwrap(),
+                    "sharedtoken document alpha.md"
+                );
+                assert!(!Path::new(&inside).exists());
+                assert!(!Path::new(&outside).exists());
+            }
+        });
+    }
+
+    #[test]
     fn retained_delete_updates_both_tiers_catalog_and_manifests_without_retargeting_old_reader() {
         run_test_with_cx(|cx| async move {
             let parent = tempfile::tempdir().unwrap();
@@ -3198,6 +3330,132 @@ mod retained_delete_tests {
                 Some(GenerationPublication::Durable(_))
             ));
             assert_eq!(deleted, 1);
+        });
+    }
+
+    #[test]
+    fn retained_delete_ignores_tombstoned_manifest_aliases() {
+        run_test_with_cx(|cx| async move {
+            for tombstone_literal in [false, true] {
+                let parent = tempfile::tempdir().unwrap();
+                let _restore = RestoreQuality(test_quality_embedder_override());
+                let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                    changed_revision: false,
+                });
+                set_test_quality_embedder(Some(Arc::clone(&quality)));
+                let (runtime, source, root, _) =
+                    fixture_with_quality(&cx, parent.path(), false, Some(quality.as_ref())).await;
+                let absolute = source.join("alpha.md").display().to_string();
+                let input = serde_json::json!({
+                    "id": absolute,
+                    "text": "sharedtoken opaque document"
+                })
+                .to_string();
+                append_input(&runtime, parent.path(), &input)
+                    .append_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+
+                // Paired manifests and completion flags alone do not prove
+                // liveness. Seal a stale-metadata fixture whose chosen alias
+                // has been tombstoned in every engine, but still has its old
+                // manifest entry. The other spelling remains a live document.
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let build = store.begin(&cx).unwrap();
+                let mut input = runtime.cli_input.clone();
+                input.index_dir = Some(build.path().to_path_buf());
+                let candidate = runtime.clone().with_cli_input(input);
+                retained_reuse::copy_selected_generation(&cx, &candidate, &store, build.path())
+                    .unwrap();
+                let stale = if tombstone_literal {
+                    absolute.as_str()
+                } else {
+                    "alpha.md"
+                };
+                candidate
+                    .apply_candidate_lexical_mutations(
+                        &cx,
+                        build.path(),
+                        &[LexicalMutation::delete(
+                            stale.to_owned(),
+                            0,
+                            IngestionClass::Skip,
+                            "stale_manifest_fixture",
+                        )],
+                    )
+                    .await
+                    .unwrap();
+                for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
+                    let mut index =
+                        FsfsRuntime::open_vector_index_for_mutation(&build.path().join(relative))
+                            .unwrap();
+                    assert_eq!(index.soft_delete_batch(&[stale]).unwrap(), 1);
+                    assert!(!index.live_doc_ids().unwrap().iter().any(|id| id == stale));
+                }
+                {
+                    let storage = Storage::open(PipelineStorageConfig {
+                        db_path: candidate.resolve_storage_db_path().unwrap(),
+                        ..PipelineStorageConfig::default()
+                    })
+                    .unwrap();
+                    storage.delete_document(stale).unwrap();
+                }
+                assert!(
+                    FsfsRuntime::read_matching_manifest_generation(build.path())
+                        .unwrap()
+                        .unwrap()
+                        .contains_key(stale)
+                );
+                assert!(
+                    protect_vector_generations(build.path(), "stale manifest fixture").is_empty()
+                );
+                let publication = build
+                    .publish(&cx, |_, path| {
+                        FsfsRuntime::validate_search_generation_at_root(
+                            path,
+                            SearchExecutionMode::Full,
+                        )
+                    })
+                    .unwrap();
+                let GenerationPublication::Durable(predecessor) = publication else {
+                    panic!("stale manifest fixture must publish durably"); // ubs:ignore — cfg(test) assertion.
+                };
+                let before = file_bytes(predecessor.path());
+                let command = deletion(&runtime, &[&absolute], false);
+                let (publication, deleted) = command
+                    .delete_retained_generation(&cx, &root)
+                    .await
+                    .expect("a tombstoned alias must not make the live selector ambiguous");
+                assert_eq!(deleted, 1);
+                let Some(GenerationPublication::Durable(next)) = publication else {
+                    panic!("live alias deletion must publish durably"); // ubs:ignore — cfg(test) assertion.
+                };
+                assert_eq!(
+                    live_ids(next.path(), FSFS_VECTOR_INDEX_FILE),
+                    BTreeSet::from(["beta.md".to_owned(), "beta-notes.md".to_owned()])
+                );
+                assert_eq!(
+                    live_ids(next.path(), FSFS_VECTOR_QUALITY_INDEX_FILE),
+                    BTreeSet::from(["beta.md".to_owned()])
+                );
+                let live_target = if tombstone_literal {
+                    "alpha.md"
+                } else {
+                    absolute.as_str()
+                };
+                let manifests = FsfsRuntime::read_matching_manifest_generation(next.path())
+                    .unwrap()
+                    .unwrap();
+                assert!(!manifests.contains_key(live_target));
+                assert!(manifests.contains_key(stale));
+                assert_eq!(file_bytes(predecessor.path()), before);
+                let (publication, deleted) = command
+                    .delete_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                assert!(publication.is_none());
+                assert_eq!(deleted, 0, "stale manifest entries are not live documents");
+            }
         });
     }
 

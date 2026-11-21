@@ -18423,32 +18423,25 @@ impl FsfsRuntime {
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         let sentinel = Self::read_index_sentinel(&index_root)?;
-        let ids = normalize_delete_ids_for_index(
+        let live_rows = {
+            let index = VectorIndex::open_read_only(&vector_path)?;
+            semantic_windows::load_mapping(&index_root, &index)?;
+            index.live_doc_ids()?
+        };
+        let live_ids = Self::live_delete_sources_at_root(
+            cx,
+            &index_root,
+            &live_rows,
             ids,
             sentinel.as_ref().map(|value| Path::new(&value.target_root)),
             self.cli_input.delete_prefix,
         )?;
-        // Removing a source must not cost the next `fsfs index` every other
-        // file: keep the completed evidence this delete starts from (bd-lsuub).
-        // The receipt names the tree it indexed, which `fsfs delete` does not.
-        let indexed = match sentinel {
-            Some(sentinel) => {
-                retained_reuse::prepare_legacy_reuse(cx).await?;
-                Some(self.clone().with_cli_input(CliInput {
-                    target_path: Some(PathBuf::from(sentinel.target_root)),
-                    ..self.cli_input.clone()
-                }))
-            }
-            None => None,
-        };
-        let reuse = match indexed.as_ref() {
-            Some(indexed) => retained_reuse::reuse_ledger(cx, indexed, &index_root)?,
-            None => None,
-        };
-        {
-            let index = VectorIndex::open_read_only(&vector_path)?;
-            semantic_windows::load_mapping(&index_root, &index)?;
-        }
+        let targets = select_delete_targets_for_index(
+            ids,
+            sentinel.as_ref().map(|value| Path::new(&value.target_root)),
+            self.cli_input.delete_prefix,
+            &live_ids,
+        )?;
         let mut window_membership = if Self::fast_window_policy_at_root(&index_root)? > 1 {
             Self::validate_search_generation_at_root(&index_root, SearchExecutionMode::Full)?;
             let manifests =
@@ -18468,54 +18461,30 @@ impl FsfsRuntime {
         } else {
             None
         };
+        // Resolve every selector before opening a writer or changing reuse
+        // evidence: append-batch IDs can themselves be absolute-looking paths.
+        // Removing a source must not cost the next `fsfs index` every other
+        // file: keep the completed evidence this delete starts from (bd-lsuub).
+        // The receipt names the tree it indexed, which `fsfs delete` does not.
+        let indexed = match sentinel {
+            Some(sentinel) => {
+                retained_reuse::prepare_legacy_reuse(cx).await?;
+                Some(self.clone().with_cli_input(CliInput {
+                    target_path: Some(PathBuf::from(sentinel.target_root)),
+                    ..self.cli_input.clone()
+                }))
+            }
+            None => None,
+        };
+        let reuse = match indexed.as_ref() {
+            Some(indexed) => retained_reuse::reuse_ledger(cx, indexed, &index_root)?,
+            None => None,
+        };
 
         publication_lease.fence("delete WAL publication")?;
         #[cfg(unix)]
         self.quiesce_query_daemon("delete")?;
         let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
-
-        let mut total_deleted = 0usize;
-        let live_rows = index.live_doc_ids()?;
-
-        let targets: Vec<String> = if let Some((manifests, _)) = window_membership.as_ref() {
-            manifests
-                .keys()
-                .cloned()
-                .chain(
-                    live_rows
-                        .iter()
-                        .map(|row| semantic_windows::source_id(row).to_owned()),
-                )
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .filter(|source| {
-                    ids.iter().any(|requested| {
-                        if self.cli_input.delete_prefix {
-                            source.starts_with(requested.as_str())
-                        } else {
-                            source == requested
-                        }
-                    })
-                })
-                .collect()
-        } else if self.cli_input.delete_prefix {
-            // Prefix matching: scan all live doc IDs (main index + WAL) and
-            // collect those matching any prefix. soft_delete_batch handles
-            // both main-index tombstones and WAL tombstones idempotently.
-            let mut to_delete = Vec::new();
-            for doc_id in &live_rows {
-                for prefix in &ids {
-                    if doc_id.starts_with(prefix.as_str()) {
-                        to_delete.push(doc_id.clone());
-                        break;
-                    }
-                }
-            }
-            to_delete
-        } else {
-            // Exact match.
-            ids
-        };
 
         if !targets.is_empty() {
             let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
@@ -18529,9 +18498,8 @@ impl FsfsRuntime {
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 index.soft_delete_batch(&rows)?;
-                total_deleted = targets.len();
             } else {
-                total_deleted = index.soft_delete_batch(&refs)?;
+                index.soft_delete_batch(&refs)?;
             }
             // Mirror the tombstones into the quality tier so a deleted
             // document cannot resurface in REFINED results.
@@ -18577,6 +18545,7 @@ impl FsfsRuntime {
             }
         }
 
+        let total_deleted = targets.len();
         info!(
             total_deleted,
             tombstone_count = index.tombstone_count(),
@@ -18619,6 +18588,122 @@ impl FsfsRuntime {
             }
         }
         Ok(())
+    }
+
+    /// Actual members of a generation. Its source manifests can still name
+    /// tombstoned rows, while appended rows may exist only in WALs.
+    /// Include the lexical and quality arms so an absolute-looking opaque ID
+    /// cannot be mistaken for a different source path in another arm.
+    fn live_delete_sources_at_root(
+        cx: &Cx,
+        index_root: &Path,
+        fast_rows: &HashSet<String>,
+        selectors: &[String],
+        target_root: Option<&Path>,
+        prefix: bool,
+    ) -> SearchResult<BTreeSet<String>> {
+        let mut candidates = selectors.iter().cloned().collect::<BTreeSet<_>>();
+        candidates.extend(selectors.iter().filter_map(|selector| {
+            normalize_delete_id_for_index(selector, target_root, prefix).ok()
+        }));
+        let matches = |id: &str| {
+            if prefix {
+                candidates.iter().any(|candidate| id.starts_with(candidate))
+            } else {
+                candidates.contains(id)
+            }
+        };
+        let mut live_ids = fast_rows
+            .iter()
+            .map(|row| semantic_windows::source_id(row))
+            .filter(|id| matches(id))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let quality_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        if quality_path.exists() {
+            let quality = VectorIndex::open_read_only(&quality_path)?;
+            for row in 0..quality.record_count() {
+                if row % 1024 == 0 {
+                    retained_search_checkpoint(cx)?;
+                }
+                if !quality.is_deleted(row) {
+                    let id = quality.doc_id_at(row)?;
+                    if matches(id) {
+                        live_ids.insert(id.to_owned());
+                    }
+                }
+            }
+            for (id, _) in quality.wal_records() {
+                if matches(id) {
+                    live_ids.insert(id.to_owned());
+                }
+            }
+        }
+        let layout = Self::resolve_delete_lexical_engine(index_root)?;
+        if layout.engine() == Some(BlueGreenEngine::Tantivy) {
+            return Err(complete_cli::complete_cli_error(
+                "reuse",
+                "complete-generation mutations require a Quill or vector-only bundle; rebuild the legacy lexical generation first",
+            ));
+        }
+        if let (Some(BlueGreenEngine::Quill), Some(path)) = (layout.engine(), layout.engine_dir()) {
+            let snapshot = KeeperSnapshot::open(path, DEFAULT_SCHEMA)?;
+            if prefix {
+                for segment in snapshot.segments() {
+                    for (ordinal, id) in segment.live_document_ids()?.enumerate() {
+                        if ordinal % 1024 == 0 {
+                            retained_search_checkpoint(cx)?;
+                        }
+                        if matches(id) {
+                            live_ids.insert(id.to_owned());
+                        }
+                    }
+                }
+            } else {
+                for candidate in &candidates {
+                    retained_search_checkpoint(cx)?;
+                    if snapshot.resolve_document_id(candidate)?.is_some() {
+                        live_ids.insert(candidate.clone());
+                    }
+                }
+            }
+        }
+        retained_search_checkpoint(cx)?;
+        Ok(live_ids)
+    }
+
+    fn resolve_delete_lexical_engine(index_root: &Path) -> SearchResult<LexicalEngineLayout> {
+        match fs::symlink_metadata(
+            index_root.join(crate::generation_store::COMPLETE_GENERATION_MANIFEST),
+        ) {
+            Ok(_) => return Self::resolve_sealed_lexical_engine(index_root),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // A legacy writer may adopt one coherent unpointed child. Inspect it
+        // without publishing CURRENT until every selector has been validated.
+        let lexical_root = if index_root.join(CURRENT_FILE_NAME).try_exists()? {
+            index_root.to_path_buf()
+        } else {
+            index_root.join("lexical")
+        };
+        let inspected =
+            frankensearch_quill::inspect_lexical_layout(&lexical_root).map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.lexical.current",
+                    source: Box::new(source),
+                }
+            })?;
+        match inspected {
+            frankensearch_quill::LexicalLayout::BlueGreen {
+                pointer,
+                pointer_on_disk: false,
+            } => Ok(LexicalEngineLayout::BlueGreen {
+                lexical_root,
+                pointer,
+            }),
+            _ => Self::resolve_sealed_lexical_engine(index_root),
+        }
     }
 
     /// Merge the WAL into the main FSVI file, eliminating tombstones.
@@ -25881,37 +25966,33 @@ impl FsfsRuntime {
         index_root: &Path,
     ) -> SearchResult<()> {
         let publication_lease = crate::lifecycle::PublicationLease::acquire(index_root)?;
-        let membership = match (
-            Self::read_matching_manifest_generation(index_root)?,
-            Self::read_index_sentinel(index_root)?,
-        ) {
-            (Some(manifests), Some(sentinel)) => (manifests, sentinel),
-            _ => {
-                return Err(complete_cli::complete_cli_error(
-                    "delete_membership",
-                    "the lexical-only generation's manifests disagree; rerun `fsfs index`",
-                ));
-            }
-        };
-        let ids = normalize_delete_ids_for_index(
+        let sentinel = Self::read_index_sentinel(index_root)?.ok_or_else(|| {
+            complete_cli::complete_cli_error(
+                "delete_membership",
+                "the lexical-only generation has no completion sentinel; rerun `fsfs index`",
+            )
+        })?;
+        let live_ids = Self::live_delete_sources_at_root(
+            cx,
+            index_root,
+            &HashSet::new(),
             &self.cli_input.delete_ids,
-            Some(Path::new(&membership.1.target_root)),
+            Some(Path::new(&sentinel.target_root)),
             self.cli_input.delete_prefix,
         )?;
-        let targets = membership
-            .0
-            .keys()
-            .filter(|source| {
-                ids.iter().any(|requested| {
-                    if self.cli_input.delete_prefix {
-                        source.starts_with(requested.as_str())
-                    } else {
-                        *source == requested
-                    }
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let targets = select_delete_targets_for_index(
+            &self.cli_input.delete_ids,
+            Some(Path::new(&sentinel.target_root)),
+            self.cli_input.delete_prefix,
+            &live_ids,
+        )?;
+        let mut manifests =
+            Self::read_matching_manifest_generation(index_root)?.ok_or_else(|| {
+                complete_cli::complete_cli_error(
+                    "delete_membership",
+                    "the lexical-only generation's manifests disagree; rerun `fsfs index`",
+                )
+            })?;
         if !targets.is_empty() {
             publication_lease.fence("lexical-only delete publication")?;
             let mutations = targets
@@ -25927,7 +26008,6 @@ impl FsfsRuntime {
                 .collect::<Vec<_>>();
             self.apply_one_shot_lexical_mutations(cx, index_root, &mutations)
                 .await?;
-            let (mut manifests, sentinel) = membership;
             for id in &targets {
                 manifests.remove(id);
             }
@@ -34375,69 +34455,117 @@ fn normalize_file_key_for_index(path: &Path, target_root: &Path) -> String {
     }
 }
 
-/// Accept source paths in the same namespace as the recorded index root without
-/// consulting the live filesystem. A deleted source must still be removable
-/// from the index, and an opaque relative document ID must remain unchanged.
-fn normalize_delete_ids_for_index(
+/// Resolve selectors against the generation before any mutation. Append input
+/// preserves opaque IDs, including absolute-looking strings, so interpreting
+/// every absolute selector as a source path can remove the wrong document.
+/// Neither interpretation wins when both match different members.
+fn select_delete_targets_for_index(
     ids: &[String],
     target_root: Option<&Path>,
     prefix: bool,
+    live_ids: &BTreeSet<String>,
 ) -> SearchResult<Vec<String>> {
-    ids.iter()
-        .map(|id| {
-            if id.contains('\0') {
-                return Err(complete_cli::complete_cli_error(
-                    "delete_ids",
-                    "document IDs and prefixes cannot contain the reserved semantic-window NUL byte",
-                ));
+    let matches = |selector: &str| {
+        live_ids
+            .range::<str, _>((
+                std::ops::Bound::Included(selector),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|id| {
+                if prefix {
+                    id.starts_with(selector)
+                } else {
+                    id.as_str() == selector
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut targets = BTreeSet::new();
+    for id in ids {
+        if id.contains('\0') {
+            return Err(complete_cli::complete_cli_error(
+                "delete_ids",
+                "document IDs and prefixes cannot contain the reserved semantic-window NUL byte",
+            ));
+        }
+        let literal = matches(id);
+        let selected = match normalize_delete_id_for_index(id, target_root, prefix) {
+            Ok(normalized) if normalized == *id => literal,
+            Ok(normalized) => {
+                let relative = matches(&normalized);
+                if !literal.is_empty() && !relative.is_empty() && literal != relative {
+                    return Err(complete_cli::complete_cli_error(
+                        "delete_ids",
+                        "absolute deletion selector matches a literal document ID and different root-relative documents; use an unambiguous document ID or prefix",
+                    ));
+                }
+                if literal.is_empty() {
+                    relative
+                } else {
+                    literal
+                }
             }
-            let path = Path::new(id);
-            if !path.is_absolute() {
-                return Ok(id.clone());
-            }
-            let root = target_root.filter(|root| root.is_absolute()).ok_or_else(|| {
-                complete_cli::complete_cli_error(
-                    "delete_ids",
-                    "absolute deletion paths require a recorded absolute indexed source root; use a relative document ID",
-                )
-            })?;
-            if path.components().chain(root.components()).any(|component| {
-                matches!(component, std::path::Component::ParentDir)
-            }) {
-                return Err(complete_cli::complete_cli_error(
-                    "delete_ids",
-                    "absolute deletion paths and the indexed source root cannot contain parent traversal",
-                ));
-            }
-            let relative = path.strip_prefix(root).map_err(|_| {
-                complete_cli::complete_cli_error(
-                    "delete_ids",
-                    "absolute deletion path is outside the indexed source root; use a relative document ID",
-                )
-            })?;
-            if relative.as_os_str().is_empty() && !prefix {
-                return Err(complete_cli::complete_cli_error(
-                    "delete_ids",
-                    "the indexed source root is not a document ID; use --prefix to select its documents",
-                ));
-            }
-            let normalized_path = path.components().collect::<PathBuf>();
-            let mut normalized = normalize_file_key_for_index(&normalized_path, root);
-            // Path components can discard the final separator. Retain it for
-            // directory prefixes so `/root/a/` never also selects `ab/file`.
-            let directory_prefix = id.ends_with(std::path::is_separator)
-                || id.ends_with("/.")
-                || (cfg!(windows) && id.ends_with("\\."));
-            if prefix
-                && !normalized.is_empty()
-                && directory_prefix
-                && !normalized.ends_with('/')
-            {
-                normalized.push('/');
-            }
-            Ok(normalized)
-        })
-        .collect()
+            // An existing opaque ID has no filesystem scope to validate. An
+            // unmatched absolute path still gets the ordinary typed refusal.
+            Err(error) if literal.is_empty() => return Err(error),
+            Err(_) => literal,
+        };
+        targets.extend(selected);
+    }
+    Ok(targets.into_iter().cloned().collect())
+}
+
+/// Interpret a source path using the recorded root without consulting the live
+/// filesystem. A deleted source must still be removable from the index, and an
+/// opaque relative document ID must remain unchanged.
+fn normalize_delete_id_for_index(
+    id: &str,
+    target_root: Option<&Path>,
+    prefix: bool,
+) -> SearchResult<String> {
+    let path = Path::new(id);
+    if !path.is_absolute() {
+        return Ok(id.to_owned());
+    }
+    let root = target_root.filter(|root| root.is_absolute()).ok_or_else(|| {
+        complete_cli::complete_cli_error(
+            "delete_ids",
+            "absolute deletion paths require a recorded absolute indexed source root; use a relative document ID",
+        )
+    })?;
+    if path
+        .components()
+        .chain(root.components())
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(complete_cli::complete_cli_error(
+            "delete_ids",
+            "absolute deletion paths and the indexed source root cannot contain parent traversal",
+        ));
+    }
+    let relative = path.strip_prefix(root).map_err(|_| {
+        complete_cli::complete_cli_error(
+            "delete_ids",
+            "absolute deletion path is outside the indexed source root; use a relative document ID",
+        )
+    })?;
+    if relative.as_os_str().is_empty() && !prefix {
+        return Err(complete_cli::complete_cli_error(
+            "delete_ids",
+            "the indexed source root is not a document ID; use --prefix to select its documents",
+        ));
+    }
+    let normalized_path = path.components().collect::<PathBuf>();
+    let mut normalized = normalize_file_key_for_index(&normalized_path, root);
+    // Path components can discard the final separator. Retain it for directory
+    // prefixes so `/root/a/` never also selects `ab/file`.
+    let directory_prefix = id.ends_with(std::path::is_separator)
+        || id.ends_with("/.")
+        || (cfg!(windows) && id.ends_with("\\."));
+    if prefix && !normalized.is_empty() && directory_prefix && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    Ok(normalized)
 }
 
 const fn ingestion_class_label(class: IngestionClass) -> &'static str {
@@ -45217,45 +45345,42 @@ mod tests {
             "../literal.md".to_owned(),
             "a\\b.md".to_owned(),
         ];
+        for id in &relative {
+            assert_eq!(
+                super::normalize_delete_id_for_index(id, None, false).unwrap(),
+                *id
+            );
+        }
         assert_eq!(
-            super::normalize_delete_ids_for_index(&relative, None, false).unwrap(),
-            relative
+            super::normalize_delete_id_for_index(&absolute, Some(&root), false).unwrap(),
+            "a/missing.md"
         );
         assert_eq!(
-            super::normalize_delete_ids_for_index(&[absolute], Some(&root), false).unwrap(),
-            ["a/missing.md"]
-        );
-        assert_eq!(
-            super::normalize_delete_ids_for_index(
-                &[format!("{}/a//./missing.md", root.display())],
+            super::normalize_delete_id_for_index(
+                &format!("{}/a//./missing.md", root.display()),
                 Some(&root),
                 false,
             )
             .unwrap(),
-            ["a/missing.md"]
+            "a/missing.md"
         );
-        let prefixes =
-            super::normalize_delete_ids_for_index(&[directory], Some(&root), true).unwrap();
-        assert_eq!(prefixes, ["b/"]);
-        assert!("b/member.md".starts_with(&prefixes[0]));
-        assert!(!"b-sibling/keep.md".starts_with(&prefixes[0]));
+        let prefix = super::normalize_delete_id_for_index(&directory, Some(&root), true).unwrap();
+        assert_eq!(prefix, "b/");
+        assert!("b/member.md".starts_with(&prefix));
+        assert!(!"b-sibling/keep.md".starts_with(&prefix));
         assert_eq!(
-            super::normalize_delete_ids_for_index(
-                &[format!("{}/b/.", root.display())],
+            super::normalize_delete_id_for_index(
+                &format!("{}/b/.", root.display()),
                 Some(&root),
                 true,
             )
             .unwrap(),
-            ["b/"]
+            "b/"
         );
         assert_eq!(
-            super::normalize_delete_ids_for_index(
-                &[root.display().to_string()],
-                Some(&root),
-                true,
-            )
-            .unwrap(),
-            [""]
+            super::normalize_delete_id_for_index(&root.display().to_string(), Some(&root), true,)
+                .unwrap(),
+            ""
         );
         for (id, target) in [
             (root.display().to_string(), Some(root.as_path())),
@@ -45279,7 +45404,12 @@ mod tests {
             ("a\0window".to_owned(), Some(root.as_path())),
         ] {
             assert!(matches!(
-                super::normalize_delete_ids_for_index(&["valid.md".to_owned(), id], target, false),
+                super::select_delete_targets_for_index(
+                    &["valid.md".to_owned(), id],
+                    target,
+                    false,
+                    &BTreeSet::from(["valid.md".to_owned()]),
+                ),
                 Err(SearchError::InvalidConfig { field, .. })
                     if field == "complete_generation.delete_ids"
             ));
@@ -45288,6 +45418,260 @@ mod tests {
             !root.exists(),
             "normalization must not inspect or create sources"
         );
+    }
+
+    #[test]
+    fn absolute_delete_selectors_preserve_opaque_members_and_refuse_ambiguity() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("missing-source");
+        let ambiguous = root.join("alpha.md").display().to_string();
+        let inside = root.join("virtual").join("one.md").display().to_string();
+        let outside = parent
+            .path()
+            .join("external")
+            .join("one.md")
+            .display()
+            .to_string();
+        let sibling = parent
+            .path()
+            .join("external-sibling")
+            .join("keep.md")
+            .display()
+            .to_string();
+        let traversal = root.join("../opaque.md").display().to_string();
+        let live_ids = BTreeSet::from([
+            "alpha.md".to_owned(),
+            "keep.md".to_owned(),
+            ambiguous.clone(),
+            inside.clone(),
+            outside.clone(),
+            sibling,
+            traversal.clone(),
+        ]);
+        for prefix in [false, true] {
+            let selectors = if prefix {
+                vec![
+                    format!(
+                        "{}{sep}",
+                        root.join("virtual").display(),
+                        sep = std::path::MAIN_SEPARATOR
+                    ),
+                    format!(
+                        "{}{sep}",
+                        parent.path().join("external").display(),
+                        sep = std::path::MAIN_SEPARATOR
+                    ),
+                    outside.clone(),
+                ]
+            } else {
+                vec![inside.clone(), outside.clone(), inside.clone()]
+            };
+            assert_eq!(
+                super::select_delete_targets_for_index(&selectors, Some(&root), prefix, &live_ids,)
+                    .unwrap()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([inside.clone(), outside.clone()]),
+                "literal IDs inside and outside the root remain individually deletable"
+            );
+            assert!(matches!(
+                super::select_delete_targets_for_index(
+                    &["keep.md".to_owned(), ambiguous.clone()],
+                    Some(&root),
+                    prefix,
+                    &live_ids,
+                ),
+                Err(SearchError::InvalidConfig { field, reason, .. })
+                    if field == "complete_generation.delete_ids"
+                        && reason.contains("different root-relative documents")
+            ));
+        }
+        assert_eq!(
+            super::select_delete_targets_for_index(
+                &[outside.clone(), traversal.clone()],
+                None,
+                false,
+                &live_ids,
+            )
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+            BTreeSet::from([outside, traversal]),
+            "proven opaque members do not require a filesystem interpretation"
+        );
+        let mut relative_only = live_ids;
+        relative_only.remove(&ambiguous);
+        assert_eq!(
+            super::select_delete_targets_for_index(
+                &[ambiguous, "alpha.md".to_owned(), "absent.md".to_owned()],
+                Some(&root),
+                false,
+                &relative_only,
+            )
+            .unwrap(),
+            vec!["alpha.md"],
+            "ordinary absolute source paths still normalize and count one unique member"
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    #[cfg(not(feature = "embedded-models"))]
+    fn legacy_delete_resolves_opaque_ids_before_adopting_lexical_generation() {
+        run_test_with_cx(|cx| async move {
+            let _restore = AppendEmbedderOverrides::install();
+            for lexical_only in [false, true] {
+                for prefix in [false, true] {
+                    let parent = tempfile::tempdir().unwrap();
+                    let source = parent.path().join("source");
+                    let root = parent.path().join("index");
+                    fs::create_dir(&source).unwrap();
+                    for id in ["alpha.md", "keep.md"] {
+                        fs::write(source.join(id), format!("sharedtoken source {id}")).unwrap();
+                    }
+                    let mut config = FsfsConfig::default();
+                    config.indexing.offline = true;
+                    config.indexing.quality_model.clear();
+                    config.search.fast_only = true;
+                    config.search.rerank = false;
+                    let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                        command: CliCommand::Index,
+                        target_path: Some(source.clone()),
+                        index_dir: Some(root.clone()),
+                        format: OutputFormat::Json,
+                        quiet: true,
+                        ..CliInput::default()
+                    });
+                    let runtime = if lexical_only {
+                        runtime.with_lexical_only_indexing()
+                    } else {
+                        runtime
+                    };
+                    Box::pin(runtime.run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |_| Ok(()),
+                        false,
+                        false,
+                    ))
+                    .await
+                    .unwrap();
+                    let ambiguous = source.join("alpha.md").display().to_string();
+                    let inside = source.join("virtual").join("one.md").display().to_string();
+                    let outside = parent
+                        .path()
+                        .join("external")
+                        .join("one.md")
+                        .display()
+                        .to_string();
+                    let input = [&ambiguous, &inside, &outside]
+                        .into_iter()
+                        .map(|id| {
+                            serde_json::json!({"id": id, "text": "sharedtoken opaque document"})
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let input_path = parent.path().join("append.jsonl");
+                    fs::write(&input_path, input).unwrap();
+                    let mut command = runtime.clone();
+                    command.cli_input.input_file = Some(input_path);
+                    command
+                        .run_append_batch_command_with_writer(&cx, &mut Vec::new())
+                        .await
+                        .unwrap();
+                    let fast_path = root.join(super::FSFS_VECTOR_INDEX_FILE);
+                    if !lexical_only {
+                        // These live lexical identities are absent from the
+                        // fast arm and the legacy append's stale manifests.
+                        let mut fast =
+                            FsfsRuntime::open_vector_index_for_mutation(&fast_path).unwrap();
+                        fast.soft_delete_batch(&[&ambiguous, &outside]).unwrap();
+                    }
+                    let layout = FsfsRuntime::resolve_lexical_engine(&root).unwrap();
+                    let lexical_path = layout.engine_dir().unwrap();
+                    let super::LexicalEngineLayout::BlueGreen { lexical_root, .. } = layout else {
+                        panic!("one-shot fixture must publish a Quill child"); // ubs:ignore — cfg(test) assertion.
+                    };
+                    let pointer_path = lexical_root.join(super::CURRENT_FILE_NAME);
+                    fs::rename(&pointer_path, parent.path().join("saved-current")).unwrap();
+                    let lexical_before = fs::read(lexical_path.join("MANIFEST")).unwrap();
+                    let sentinel_before = fs::read(root.join(super::FSFS_SENTINEL_FILE)).unwrap();
+                    let fast_before = fs::read(&fast_path).ok();
+                    let wal_path = frankensearch_index::wal::wal_path_for(&fast_path);
+                    let wal_before = fs::read(&wal_path).ok();
+                    command.cli_input.delete_ids = vec!["keep.md".to_owned(), ambiguous.clone()];
+                    command.cli_input.delete_prefix = prefix;
+                    assert!(matches!(
+                        command.run_delete_command(&cx).await,
+                        Err(SearchError::InvalidConfig { field, reason, .. })
+                            if field == "complete_generation.delete_ids"
+                                && reason.contains("different root-relative documents")
+                    ));
+                    assert!(
+                        !pointer_path.exists(),
+                        "invalid selectors must not adopt CURRENT"
+                    );
+                    assert_eq!(
+                        fs::read(lexical_path.join("MANIFEST")).unwrap(),
+                        lexical_before
+                    );
+                    assert_eq!(
+                        fs::read(root.join(super::FSFS_SENTINEL_FILE)).unwrap(),
+                        sentinel_before
+                    );
+                    assert_eq!(fs::read(&fast_path).ok(), fast_before);
+                    assert_eq!(fs::read(&wal_path).ok(), wal_before);
+                    command.cli_input.delete_ids = if prefix {
+                        vec![
+                            format!(
+                                "{}{sep}",
+                                source.join("virtual").display(),
+                                sep = std::path::MAIN_SEPARATOR
+                            ),
+                            format!(
+                                "{}{sep}",
+                                parent.path().join("external").display(),
+                                sep = std::path::MAIN_SEPARATOR
+                            ),
+                            inside.clone(),
+                        ]
+                    } else {
+                        vec![inside.clone(), outside.clone(), inside.clone()]
+                    };
+                    command.run_delete_command(&cx).await.unwrap();
+                    assert!(
+                        pointer_path.exists(),
+                        "valid legacy mutation may adopt CURRENT"
+                    );
+                    let lexical =
+                        super::KeeperSnapshot::open(&lexical_path, super::DEFAULT_SCHEMA).unwrap();
+                    for id in [&inside, &outside] {
+                        assert!(lexical.resolve_document_id(id).unwrap().is_none());
+                    }
+                    for id in ["alpha.md", "keep.md", &ambiguous] {
+                        assert!(lexical.resolve_document_id(id).unwrap().is_some());
+                    }
+                    if !lexical_only {
+                        assert_eq!(
+                            VectorIndex::open_read_only(&fast_path)
+                                .unwrap()
+                                .live_doc_ids()
+                                .unwrap()
+                                .into_iter()
+                                .collect::<BTreeSet<_>>(),
+                            BTreeSet::from(["alpha.md".to_owned(), "keep.md".to_owned()])
+                        );
+                    }
+                    assert_eq!(
+                        fs::read_to_string(source.join("alpha.md")).unwrap(),
+                        "sharedtoken source alpha.md"
+                    );
+                    assert!(!Path::new(&inside).exists());
+                    assert!(!Path::new(&outside).exists());
+                }
+            }
+        });
     }
 
     #[test]
