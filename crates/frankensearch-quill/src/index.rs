@@ -35254,6 +35254,107 @@ mod tests {
         });
     }
 
+    #[test]
+    fn large_result_windows_preserve_sealed_and_delta_pages_and_counts() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                delta_budget_bytes: usize::MAX,
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            })
+            .expect("large-window index");
+            for exact_count in [false, true] {
+                let empty = index
+                    .search_paginated(&cx, "alpha", usize::MAX, 0, exact_count)
+                    .expect("empty queries need no request-sized heap");
+                assert!(empty.hits.is_empty());
+                assert_eq!(empty.total_count, exact_count.then_some(0));
+            }
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("sealed-a", "alpha beta"),
+                        IndexableDocument::new("sealed-b", "alpha beta"),
+                        IndexableDocument::new("deleted", "alpha beta"),
+                    ],
+                )
+                .await
+                .expect("stage sealed documents");
+            index.commit(&cx).await.expect("seal documents");
+            assert!(index.delete_document(&cx, "deleted").await.unwrap());
+            index
+                .index_documents_visible(
+                    &cx,
+                    &[
+                        IndexableDocument::new("delta-a", "alpha beta"),
+                        IndexableDocument::new("delta-other", "gamma"),
+                    ],
+                )
+                .await
+                .expect("publish unsealed documents");
+            let snapshot = index.search_snapshot().unwrap();
+            assert!(!snapshot.keeper_snapshot().segments().is_empty());
+            assert_eq!(snapshot.delta_count(), 1);
+            assert_eq!(snapshot.live_doc_count(), 4);
+            let fingerprint = |hits: &[QuillHit]| {
+                hits.iter()
+                    .map(|hit| {
+                        (
+                            hit.document_id.clone(),
+                            hit.global_docid,
+                            hit.score.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for query in ["alpha", "content:alpha OR content:beta", "*", "absent"] {
+                for exact_count in [false, true] {
+                    let expected = index
+                        .search_paginated(&cx, query, 10, 0, exact_count)
+                        .unwrap();
+                    let all = index
+                        .search_paginated(&cx, query, usize::MAX, 0, exact_count)
+                        .expect("all matches fit even when the request limit does not");
+                    assert_eq!(fingerprint(&all.hits), fingerprint(&expected.hits));
+                    assert_eq!(all.total_count, expected.total_count);
+                    assert_eq!(all.doc_count, 4);
+                    let tail = index
+                        .search_paginated(&cx, query, usize::MAX - 1, 1, exact_count)
+                        .expect("large limit with a valid offset");
+                    assert_eq!(
+                        fingerprint(&tail.hits),
+                        fingerprint(&expected.hits[expected.hits.len().min(1)..])
+                    );
+                    assert_eq!(tail.total_count, expected.total_count);
+                    for (limit, offset) in [(1, usize::MAX - 1), (0, usize::MAX)] {
+                        let beyond = index
+                            .search_paginated(&cx, query, limit, offset, exact_count)
+                            .expect("deep or count-only pages retain only actual matches");
+                        assert!(beyond.hits.is_empty());
+                        assert_eq!(beyond.total_count, expected.total_count);
+                    }
+                }
+            }
+            let results = LexicalRead::search(&index, &cx, "alpha", usize::MAX)
+                .await
+                .expect("the public lexical trait supports complete-result retrieval");
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["sealed-a", "sealed-b", "delta-a"]
+            );
+            assert!(matches!(
+                index.search_paginated(&cx, "alpha", 1, usize::MAX, true),
+                Err(QuillIndexError::Argus(
+                    ArgusError::CollectorWindowOverflow { .. }
+                ))
+            ));
+        });
+    }
+
     /// bd-quill-rejected-ingest-publishes-partial-batch-aihri: a rejected
     /// scalar ingest is a NO-OP, on every ingest route.
     ///
