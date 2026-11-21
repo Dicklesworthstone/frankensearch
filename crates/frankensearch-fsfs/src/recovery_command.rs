@@ -1180,13 +1180,9 @@ fn render(response: &Response, format: OutputFormat) -> SearchResult<Vec<u8>> {
     Ok(output.bytes)
 }
 
-pub(crate) fn entry(args: Vec<OsString>) -> u8 {
+pub fn entry(args: Vec<OsString>) -> u8 {
     if args.len() == 1 && args[0] == "--help" {
-        return if io::stdout().lock().write_all(HELP.as_bytes()).is_ok() {
-            0
-        } else {
-            1
-        };
+        return u8::from(io::stdout().lock().write_all(HELP.as_bytes()).is_err());
     }
     let parsed = Options::parse(args);
     let format = parsed
