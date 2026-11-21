@@ -3562,6 +3562,37 @@ impl RecoveredSegment {
             .materialize_global_docid(id_map, global_docid)
     }
 
+    /// Borrow each live external identifier in unspecified identity-table
+    /// order, without materializing documents or scanning docid range holes.
+    ///
+    /// The work is bounded by the validated IDHASH capacity. Tombstones are
+    /// applied from this retained snapshot, so a later deletion cannot change
+    /// an older reader's enumeration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed metadata error if an admitted identity section no
+    /// longer fits the immutable backing.
+    pub fn live_document_ids(&self) -> Result<impl Iterator<Item = &str>, KeeperError> {
+        let source = self.reader.source_bytes();
+        let id_map = source
+            .get(self.identity_sections.id_map.clone())
+            .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+                path: self.path.clone(),
+                detail: "validated IDMAP range exceeds the immutable backing".to_owned(),
+            })?;
+        let id_hash = source
+            .get(self.identity_sections.id_hash.clone())
+            .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+                path: self.path.clone(),
+                detail: "validated IDHASH range exceeds the immutable backing".to_owned(),
+            })?;
+        Ok(self
+            .id_lookup
+            .document_ids(id_map, id_hash)
+            .filter_map(move |(docid, id)| (!self.is_tombstoned(docid)).then_some(id)))
+    }
+
     #[cfg(test)]
     pub(crate) fn document_id_materialization_call_count(&self) -> u64 {
         self.document_id_materialization_calls
@@ -23468,6 +23499,15 @@ mod tests {
             return Err("fixture publishes two owned segments".into());
         };
         assert_eq!(
+            owned_dense.live_document_ids()?.collect::<BTreeSet<_>>(),
+            BTreeSet::from(["owned-dense-a", "owned-dense-b"])
+        );
+        assert_eq!(
+            owned_holes.live_document_ids()?.collect::<Vec<_>>(),
+            vec!["owned-hole"],
+            "identity enumeration skips sparse IDMAP holes"
+        );
+        assert_eq!(
             owned_dense.id_lookup.identity_row_presence(10),
             IdMapPresence::Present
         );
@@ -23512,6 +23552,15 @@ mod tests {
             "a dense physical row remains hidden by its manifest tombstone"
         );
         let tombstoned_dense = &tombstoned.segments()[0];
+        assert_eq!(
+            tombstoned_dense.live_document_ids()?.collect::<Vec<_>>(),
+            vec!["owned-dense-a"]
+        );
+        assert_eq!(
+            owned_dense.live_document_ids()?.count(),
+            2,
+            "a tombstone successor does not change retained identity enumeration"
+        );
         let tombstoned_dense_hits = crate::argus::ReferenceScorer::all(10, 12, 2)?
             .top_k(2, tombstoned_dense)?
             .into_iter()
@@ -23547,6 +23596,14 @@ mod tests {
         let [mapped_dense, mapped_holes] = mapped.segments() else {
             return Err("fixture opens two mapped segments".into());
         };
+        assert_eq!(
+            mapped_dense.live_document_ids()?.collect::<Vec<_>>(),
+            vec!["mapped-dense-a"]
+        );
+        assert_eq!(
+            mapped_holes.live_document_ids()?.collect::<Vec<_>>(),
+            vec!["mapped-hole"]
+        );
         assert_eq!(
             mapped_dense.id_lookup.identity_row_presence(50),
             IdMapPresence::Present

@@ -657,11 +657,15 @@ existing store in a parent directory when run from a project subdirectory.
 Corrupt selections and interrupted first publications produce errors at that
 store instead of redirecting the command to a different legacy index.
 
-`delete` accepts relative document IDs and absolute paths beneath the source
-root recorded by the index. Absolute paths are resolved without reading source
-files, so deletion still works after a source is moved or removed. An absolute
-path outside that root, or containing `..`, is rejected before any document is
-deleted. With `--prefix`, keep the trailing slash to select a directory:
+`delete` accepts document IDs and absolute paths beneath the source root
+recorded by the index. Absolute paths are resolved without reading source
+files, so deletion still works after a source is moved or removed. Opaque IDs
+added by `append-batch` keep their exact spelling, including absolute-looking
+IDs outside that source root. If a selector matches both an opaque ID and
+different root-relative documents, the entire request is rejected before any
+document is deleted; use an unambiguous ID or prefix. An unmatched absolute
+path outside the source root, or containing `..`, is also rejected.
+With `--prefix`, keep the trailing slash to select a directory:
 `fsfs delete ~/projects/src/ --prefix --index-dir ./search-store` selects `src/`
 but preserves `src-old/`. Relative IDs keep their exact spelling, and a valid
 request matching no documents still succeeds with `deleted: 0`.
