@@ -1,5 +1,33 @@
 # Dependency Upgrade Log
 
+## 2026-11-21 - v1.13.0 release dependency preparation
+
+Refreshed semver-compatible lockfile dependencies (130+ entries including
+`crc32fast` 1.5.5, `ignore` 0.4.34, `memmap2` 0.9.12, `notify` 8.2.2,
+`openssl` 0.10.82, `proptest` 1.12.0, `raptorq` 2.0.2, `rustls-webpki`
+0.103.17, `serde_json` 1.0.154, `sha2` 0.11.1, `signal-hook` 0.4.6, `toml`
+1.2.2, `unicode-normalization` 0.1.26, `ureq` 3.5.2, `webpki-roots` 1.0.12,
+and `xxhash-rust` 0.8.21), bumped exact patch pins `arc-swap` (`=1.9.2` ->
+`=1.9.5`) and `zeroize` (`=1.9.0` -> `=1.9.2`), and updated `toon-format`
+(`0.5.0` -> `0.7.0`) and dev-dependency `jsonschema` (`0.58.5` -> `0.62.0`,
+keeping `default-features = false, features = ["idna"]`).
+
+Preserved all audited pins and runtime invariants:
+- `asupersync` 0.6.2 (`default-features = false`), `fsqlite*` 0.5.0,
+  `frankentorch-*` 0.1.0, `frankenhnsw` `=0.3.5`, `hnsw_rs` `=0.3.4`,
+  `ftui-*` 0.9.0, `fastembed` `=7.1.0`, `tantivy` `=0.26.2`, `rustix`
+  `=1.1.6`, and `wide` 1.7.1.
+- Held `wasm-bindgen-futures` at 0.4.77 (and `wasm-bindgen` 0.2.127,
+  `js-sys`/`web-sys` 0.3.104) because `wasm-bindgen-futures` 0.4.80 pulls
+  `tokio` into `Cargo.lock`; zero forbidden async runtime crates exist in
+  `Cargo.lock`.
+- Held `sysinfo` at 0.39.6 (`0.40.4` changes `Disks::new_with_refreshed_list`
+  and `System::load_average` to return `Result`, breaking 10 call sites in
+  `frankensearch-fsfs`) and `notify` at 8.2.2 (`9.0.0` is a major break).
+- `cargo audit` reports 0 vulnerabilities (only the 5 pre-existing
+  unmaintained/informational warnings for `bincode`, `chrono`, `paste`,
+  `ttf-parser`, and Tantivy's `lru` 0.16.4).
+
 ## 2026-11-14 - FrankenSQLite 0.5.0 family
 
 The crates.io sparse index serves the FrankenSQLite 0.5.0 family, with the
