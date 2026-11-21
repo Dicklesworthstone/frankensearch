@@ -7556,6 +7556,8 @@ pub struct CollectedTopDocs {
 /// Feed every per-segment scorer into one instance, then call [`Self::finish`]
 /// exactly once. Offset slicing happens only after the global heap is sorted,
 /// preventing per-segment pagination from discarding valid winners.
+/// Heap storage grows fallibly as live matches arrive, so a large requested
+/// window does not allocate memory for documents the query never matches.
 #[derive(Debug)]
 pub struct TopDocsCollector {
     limit: usize,
@@ -7628,7 +7630,8 @@ impl TopDocsCollector {
     ///
     /// # Errors
     ///
-    /// Rejects `limit + offset` overflow and bounded heap allocation failure.
+    /// Rejects `limit + offset` overflow. Heap allocation is deferred until
+    /// matches arrive through [`Self::collect`] or [`Self::merge`].
     pub fn new(limit: usize, offset: usize) -> Result<Self, ArgusError> {
         Self::build(limit, offset, false)
     }
@@ -7639,7 +7642,8 @@ impl TopDocsCollector {
     ///
     /// # Errors
     ///
-    /// Rejects `limit + offset` overflow and bounded heap allocation failure.
+    /// Rejects `limit + offset` overflow. Heap allocation is deferred until
+    /// matches arrive through [`Self::collect`] or [`Self::merge`].
     pub fn with_exact_count(limit: usize, offset: usize) -> Result<Self, ArgusError> {
         Self::build(limit, offset, true)
     }
@@ -7652,19 +7656,13 @@ impl TopDocsCollector {
                 .checked_add(offset)
                 .ok_or(ArgusError::CollectorWindowOverflow { limit, offset })?
         };
-        let mut heap = BinaryHeap::new();
-        heap.try_reserve_exact(retained)
-            .map_err(|_| ArgusError::Allocation {
-                resource: "top-k heap",
-                count: retained,
-            })?;
         Ok(Self {
             limit,
             offset,
             retained,
             exact_count,
             total_count: 0,
-            heap,
+            heap: BinaryHeap::new(),
         })
     }
 
@@ -7676,7 +7674,8 @@ impl TopDocsCollector {
     ///
     /// # Errors
     ///
-    /// Rejects bounded heap allocation failure.
+    /// Propagates the window-overflow validation from [`Self::new`]. No heap
+    /// storage is allocated until the new collector receives live matches.
     pub fn empty_like(&self) -> Result<Self, ArgusError> {
         Self::build(self.limit, self.offset, self.exact_count)
     }
@@ -7692,7 +7691,7 @@ impl TopDocsCollector {
     /// # Errors
     ///
     /// Rejects collectors with mismatched limit/offset/count shape and exact
-    /// match-count overflow.
+    /// match-count overflow, and bounded heap allocation failure.
     pub fn merge(&mut self, other: Self) -> Result<(), ArgusError> {
         if self.limit != other.limit
             || self.offset != other.offset
@@ -7709,12 +7708,7 @@ impl TopDocsCollector {
                 .ok_or(ArgusError::MatchCountOverflow)?;
         }
         for key in other.heap {
-            if self.heap.len() < self.retained {
-                self.heap.push(key);
-            } else if self.heap.peek().is_some_and(|&cutoff| key < cutoff) {
-                let _ = self.heap.pop();
-                self.heap.push(key);
-            }
+            self.retain_key(key)?;
         }
         Ok(())
     }
@@ -7753,7 +7747,23 @@ impl TopDocsCollector {
             "top-k collector did not score a retained match",
         ))?;
         let key = packed_selection_key(global_docid, score);
+        self.retain_key(key)
+    }
+
+    fn retain_key(&mut self, key: u64) -> Result<(), ArgusError> {
         if self.heap.len() < self.retained {
+            if self.heap.len() == self.heap.capacity() {
+                // Geometric growth is bounded by both encountered matches and
+                // the logical window. Reserve before push to keep allocation
+                // failures typed, including during segment-parallel folding.
+                let capacity = self.heap.len().saturating_mul(2).max(1).min(self.retained);
+                self.heap
+                    .try_reserve_exact(capacity - self.heap.len())
+                    .map_err(|_| ArgusError::Allocation {
+                        resource: "top-k heap",
+                        count: capacity,
+                    })?;
+            }
             self.heap.push(key);
         } else if self.heap.peek().is_some_and(|&cutoff| key < cutoff) {
             let _ = self.heap.pop();
@@ -12514,6 +12524,65 @@ mod tests {
     }
 
     #[test]
+    fn topdocs_large_windows_allocate_only_for_encountered_matches() -> Result<(), ArgusError> {
+        let entries = [(7, 1.0), (9, 0.0), (3, 1.0), (4, -0.0), (2, -2.0), (1, 3.0)];
+        let expected = [
+            (1, 3.0_f32),
+            (3, 1.0),
+            (7, 1.0),
+            (9, 0.0),
+            (4, -0.0),
+            (2, -2.0),
+        ]
+        .map(|(doc, score)| (doc, score.to_bits()));
+        for (limit, offset) in [
+            (usize::MAX, 0),
+            (usize::MAX - 2, 2),
+            (1, usize::MAX - 1),
+            (0, usize::MAX),
+            (3, 0),
+        ] {
+            for exact_count in [false, true] {
+                let mut collector = if exact_count {
+                    TopDocsCollector::with_exact_count(limit, offset)?
+                } else {
+                    TopDocsCollector::new(limit, offset)?
+                };
+                assert_eq!(collector.heap.capacity(), 0);
+                let mut partial = collector.empty_like()?;
+                assert_eq!(partial.heap.capacity(), 0);
+                for (position, &(doc, score)) in entries.iter().enumerate() {
+                    let target = if position % 2 == 0 {
+                        &mut collector
+                    } else {
+                        &mut partial
+                    };
+                    target.record_live(doc, Some(score))?;
+                    assert!(target.heap.capacity() <= target.heap.len().saturating_mul(2));
+                    assert!(target.heap.capacity() <= target.retained);
+                }
+                collector.merge(partial)?;
+                assert!(collector.heap.capacity() <= entries.len() * 2);
+                assert!(collector.heap.capacity() <= collector.retained);
+                let result = collector.finish()?;
+                let start = offset.min(expected.len());
+                let end = start.saturating_add(limit).min(expected.len());
+                assert_eq!(
+                    result
+                        .hits
+                        .iter()
+                        .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                        .collect::<Vec<_>>(),
+                    expected[start..end],
+                    "limit={limit} offset={offset} exact_count={exact_count}"
+                );
+                assert_eq!(result.total_count, exact_count.then_some(6));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn topdocs_merge_reproduces_single_collector_under_any_partition_and_order()
     -> Result<(), ArgusError> {
         // Deterministic scored stream with heavy ties: seven score buckets
@@ -12557,6 +12626,9 @@ mod tests {
             (5, 7, true),
             (3, 1, false),
             (0, 0, true),
+            (usize::MAX, 0, false),
+            (usize::MAX - 7, 7, true),
+            (1, usize::MAX - 1, true),
         ] {
             let mut baseline = build(limit, offset, exact)?;
             for &(docid, score) in &entries {
