@@ -14675,7 +14675,8 @@ impl FsfsRuntime {
 
     /// All modes return Initial, even for zero hits or quality-only search.
     /// Only a full progressive search can also return a cached Refined.
-    fn cached_phases_match_request(
+    /// Replay must also agree with the stream's counts and displayed ranks.
+    fn cached_answer_matches_request(
         payloads: &[SearchPayload],
         query: &str,
         mode: SearchExecutionMode,
@@ -14689,7 +14690,17 @@ impl FsfsRuntime {
             }
             _ => false,
         };
-        valid_phases && payloads.iter().all(|payload| payload.query == query)
+        valid_phases
+            && payloads.iter().all(|payload| {
+                payload.query == query
+                    && payload.returned_hits == payload.hits.len()
+                    && payload.returned_hits <= payload.total_candidates
+                    && payload
+                        .hits
+                        .iter()
+                        .enumerate()
+                        .all(|(index, hit)| hit.rank == index + 1)
+            })
     }
 
     fn search_payloads_cacheable(payloads: &[SearchPayload]) -> bool {
@@ -14753,7 +14764,7 @@ impl FsfsRuntime {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
         // The request owns the query identity. A cache key alone cannot attest
         // that every stored phase answered it, including its exclusions.
-        if !Self::cached_phases_match_request(payloads, normalized_query, mode) {
+        if !Self::cached_answer_matches_request(payloads, normalized_query, mode) {
             return Ok(false);
         }
         if let Err(error) = Self::validate_cached_query_exclusions(cx, resources, payloads) {
@@ -15265,7 +15276,7 @@ impl FsfsRuntime {
             return Ok(None);
         }
         if !Self::search_payloads_cacheable(&record.payloads)
-            || !Self::cached_phases_match_request(&record.payloads, &key.query, key.mode)
+            || !Self::cached_answer_matches_request(&record.payloads, &key.query, key.mode)
         {
             return Ok(None);
         }
@@ -15279,7 +15290,7 @@ impl FsfsRuntime {
         index_fingerprint: &str,
     ) -> SearchResult<()> {
         if !Self::search_payloads_cacheable(payloads)
-            || !Self::cached_phases_match_request(payloads, &key.query, key.mode)
+            || !Self::cached_answer_matches_request(payloads, &key.query, key.mode)
         {
             return Ok(());
         }
@@ -69075,7 +69086,7 @@ mod tests {
     }
 
     #[test]
-    fn search_caches_bind_every_phase_to_the_requested_query_and_mode() {
+    fn search_caches_require_the_requested_query_and_consistent_ranked_phases() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("index");
@@ -69165,12 +69176,18 @@ mod tests {
             let mut refined = initial.clone();
             refined.phase = SearchOutputPhase::Refined;
             let pair = vec![initial.clone(), refined.clone()];
-            assert!(FsfsRuntime::cached_phases_match_request(
+            assert!(FsfsRuntime::cached_answer_matches_request(
                 &pair, &key.query, SearchExecutionMode::Full,
             ));
-            assert!(!FsfsRuntime::cached_phases_match_request(
+            assert!(!FsfsRuntime::cached_answer_matches_request(
                 &mixed, &key.query, SearchExecutionMode::Full,
             ));
+            let mut wrong_hit_count = initial.clone();
+            wrong_hit_count.returned_hits = 0;
+            let mut wrong_candidate_count = initial.clone();
+            wrong_candidate_count.total_candidates = 0;
+            let mut wrong_rank = initial.clone();
+            wrong_rank.hits[0].rank = 3;
             for mismatched in [
                 positive.clone(),
                 mixed,
@@ -69180,6 +69197,9 @@ mod tests {
                 vec![refined.clone(), initial.clone()],
                 vec![initial, refined.clone(), refined],
                 pair,
+                vec![wrong_hit_count],
+                vec![wrong_candidate_count],
+                vec![wrong_rank],
             ] {
                 runtime
                     .write_search_payload_cache(&key, &mismatched, &fingerprint)
@@ -69207,6 +69227,8 @@ mod tests {
                 assert_eq!(recovered[0].query, key.query);
                 assert_eq!(recovered[0].hits.len(), 1);
                 assert_eq!(recovered[0].hits[0].path, "kept.rs");
+                assert_eq!(recovered[0].returned_hits, 1);
+                assert_eq!(recovered[0].hits[0].rank, 1);
                 assert!(runtime.try_load_search_payload_cache(&key, &fingerprint).unwrap().is_some());
 
                 let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
@@ -69228,6 +69250,8 @@ mod tests {
                     assert_eq!(response.payloads[0].query, key.query);
                     assert_eq!(response.payloads[0].hits.len(), 1);
                     assert_eq!(response.payloads[0].hits[0].path, "kept.rs");
+                    assert_eq!(response.payloads[0].returned_hits, 1);
+                    assert_eq!(response.payloads[0].hits[0].rank, 1);
                 }
                 // Restore the exact valid record for the next invalid-write control.
                 fs::write(&path, &original_bytes).unwrap();

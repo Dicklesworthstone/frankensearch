@@ -911,6 +911,35 @@ fn complete_search_recovers_a_corrupt_cache_without_logging_private_values() {
     let path = records.next().unwrap().unwrap().path();
     assert!(records.next().is_none());
     let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut bad_counts = record.clone();
+    bad_counts["payloads"][0]["returned_hits"] = Value::from(0);
+    fs::write(&path, serde_json::to_vec(&bad_counts).unwrap()).unwrap();
+    let repaired_counts = json_output(&execute(&mut search), true);
+    assert_eq!(repaired_counts["data"]["returned_hits"], 1);
+    assert_eq!(repaired_counts["data"]["hits"], cold["data"]["hits"]);
+
+    let mut bad_rank = record.clone();
+    bad_rank["payloads"][0]["hits"][0]["rank"] = Value::from(3);
+    fs::write(&path, serde_json::to_vec(&bad_rank).unwrap()).unwrap();
+    let streamed = execute(fixture.lexical_discovery_command("search").args([
+        "--no-daemon",
+        "--format",
+        "jsonl",
+        "--stream",
+    ]));
+    assert!(streamed.status.success(), "{streamed:?}");
+    let frames: Vec<Value> = std::str::from_utf8(&streamed.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut results = frames.iter().filter(|frame| frame["event"] == "result");
+    let hit = &results.next().unwrap()["payload"];
+    assert_eq!(hit["rank"], 1);
+    assert_eq!(hit["item"], cold["data"]["hits"][0]);
+    assert!(results.next().is_none());
+    assert_eq!(frames.last().unwrap()["payload"]["status"], "completed");
+
     record["payloads"][0]["phase"] = Value::from(PRIVATE_VALUE);
     fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
 
