@@ -2210,13 +2210,13 @@ fn search_filtered_vectors(
             classified.zero_signal = Some(ZeroSignalReason::FilterEliminatedAll);
         }
         classified.hits.truncate(target);
-        if classified.hits.len() == target || fetched < limit || limit >= physical_upper_bound {
+        if classified.hits.len() == target || fetched == 0 || limit >= physical_upper_bound {
             return Ok(classified);
         }
         // The requested budget counts eligible public identities, not physical
-        // duplicates. Keep each ID's first (best) row and widen past duplicate
-        // leaders to find the eligible tail. Replace the complete prefix rather
-        // than appending windows; both retained owners stay fixed throughout.
+        // duplicates. The vector owner can deduplicate after taking a physical
+        // prefix, so a short nonempty result doesn't prove exhaustion. Replace
+        // the prefix at a wider limit while keeping both retained owners fixed.
         limit = limit
             .saturating_mul(2)
             .max(limit.saturating_add(1))
