@@ -93,6 +93,13 @@ pub enum ExplainedSource {
         cosine_sim: f64,
     },
 
+    /// Blended semantic arm of the final lexical-semantic fusion.
+    ///
+    /// Its raw score is the output of blending the available fast and
+    /// quality scores. The per-tier components describe that intermediate
+    /// blend and should not be added again to the final fusion score.
+    SemanticBlend,
+
     /// Cross-encoder reranker score.
     Rerank {
         /// Reranker model identifier.
@@ -202,6 +209,7 @@ impl std::fmt::Display for ExplainedSource {
             } => {
                 write!(f, "QualitySemantic({embedder}, cos={cosine_sim:.4})")
             }
+            Self::SemanticBlend => f.write_str("BlendedSemantic"),
             Self::Rerank {
                 model,
                 logit,

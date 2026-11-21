@@ -12853,6 +12853,17 @@ impl FsfsRuntime {
             });
         }
         if let Some(blend_components) = session.blend_components(&hit.path) {
+            if let Some((score, rank)) = hit.semantic_score.zip(hit.semantic_rank)
+                && !hit.lexical_fallback_tail
+            {
+                components.push(ScoreComponent {
+                    source: ExplainedSource::SemanticBlend,
+                    raw_score: f64::from(score),
+                    normalized_score: f64::from(score),
+                    rrf_contribution: rrf_contribution_for_rank(session.rrf_k, Some(rank)),
+                    weight: 1.0,
+                });
+            }
             components.extend(blend_components);
         } else if let Some(vector_score) = hit.hash_score.or(hit.semantic_score) {
             let embedder = session
@@ -39372,6 +39383,27 @@ mod tests {
             );
             assert!(!refined.hits.iter().any(|hit| hit.path == "excluded.txt"));
             let cold_session = filtered.load_explain_session().unwrap().unwrap();
+            for hit in &cold_session.hits {
+                use crate::explanation_payload::ScoreComponentSource;
+                let lexical = resources.lexical_index.as_ref().unwrap();
+                let (explanation, _) =
+                    FsfsRuntime::explain_session_hit(&cx, &cold_session, hit, Ok(lexical));
+                let blend = explanation
+                    .ranking
+                    .components
+                    .iter()
+                    .find(|component| component.source == ScoreComponentSource::SemanticBlend);
+                if let Some(rank) = hit.semantic_rank {
+                    let blend = blend.expect("the ranked semantic blend needs a component");
+                    assert!((blend.raw_score - f64::from(hit.semantic_score.unwrap())).abs() < 1e-7);
+                    let rank = f64::from(u32::try_from(rank).unwrap());
+                    assert!((blend.rrf_contribution - 1.0 / (cold_session.rrf_k + rank + 1.0)).abs() < 1e-7);
+                    assert!(explanation.to_toon().contains("source=semantic_blend"));
+                    assert!(explanation.to_cli_json().unwrap().contains("\"source\": \"semantic_blend\""));
+                } else {
+                    assert!(blend.is_none(), "lexical-only hit cannot have a blended arm");
+                }
+            }
             filtered
                 .persist_explain_session_for_cached_payloads(query, &payloads)
                 .unwrap();

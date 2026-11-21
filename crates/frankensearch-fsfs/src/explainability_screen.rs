@@ -549,30 +549,28 @@ fn build_fusion_row(fusion: &FusionContext) -> FusionRow {
     }
 }
 
-/// Build the RRF equation string with substituted values for expert mode.
+/// Show the recorded RRF contributions in expert mode.
 fn build_ranking_equation(ranking: &RankingExplanation) -> String {
-    let mut parts = Vec::new();
-    for c in &ranking.components {
-        parts.push(format!(
-            "1/(60+{rank}) [{src}]",
-            rank = format_rank_placeholder(c.source),
-            src = source_label(c.source),
-        ));
-    }
+    let parts: Vec<_> = ranking
+        .components
+        .iter()
+        .filter(|component| component.rrf_contribution > 0.0)
+        .map(|component| {
+            format!(
+                "{:.6} [{}]",
+                component.rrf_contribution,
+                source_label(component.source)
+            )
+        })
+        .collect();
     if parts.is_empty() {
         return format!("score = {:.6}", ranking.final_score);
     }
-    format!("score = {} = {:.6}", parts.join(" + "), ranking.final_score)
-}
-
-const fn format_rank_placeholder(source: ScoreComponentSource) -> &'static str {
-    match source {
-        ScoreComponentSource::LexicalBm25 => "rank_lex",
-        ScoreComponentSource::SemanticFast => "rank_fast",
-        ScoreComponentSource::SemanticQuality => "rank_qual",
-        ScoreComponentSource::Rerank => "rank_rerank",
-        ScoreComponentSource::HashControl => "rank_hash",
-    }
+    format!(
+        "RRF = {} | score = {:.6}",
+        parts.join(" + "),
+        ranking.final_score
+    )
 }
 
 fn source_label(source: ScoreComponentSource) -> String {
@@ -580,6 +578,7 @@ fn source_label(source: ScoreComponentSource) -> String {
         ScoreComponentSource::LexicalBm25 => "BM25".to_string(),
         ScoreComponentSource::SemanticFast => "FastSemantic".to_string(),
         ScoreComponentSource::SemanticQuality => "QualitySemantic".to_string(),
+        ScoreComponentSource::SemanticBlend => "BlendedSemantic".to_string(),
         ScoreComponentSource::Rerank => "Rerank".to_string(),
         ScoreComponentSource::HashControl => "HashControl".to_string(),
     }
@@ -788,8 +787,10 @@ mod tests {
 
         assert_eq!(card.components.len(), 2);
         assert!(card.components[0].raw_score.is_some()); // Raw at expert.
-        assert!(card.equation.is_some());
-        assert!(card.equation.as_ref().unwrap().contains("rank_lex"));
+        assert_eq!(
+            card.equation.as_deref(),
+            Some("RRF = 0.015900 [BM25] + 0.014900 [FastSemantic] | score = 0.023400")
+        );
         assert!(card.trace.is_some());
         assert_eq!(card.trace.as_ref().unwrap().trace_id, trace.trace_id);
     }
@@ -962,12 +963,15 @@ mod tests {
 
     #[test]
     fn ranking_equation_includes_component_sources() {
-        let ranking = sample_ranking();
+        let mut ranking = sample_ranking();
+        let mut blend = ranking.components[1].clone();
+        blend.source = ScoreComponentSource::SemanticBlend;
+        ranking.components[1].rrf_contribution = 0.0;
+        ranking.components.push(blend);
         let equation = build_ranking_equation(&ranking);
-        assert!(equation.contains("rank_lex"));
-        assert!(equation.contains("rank_fast"));
-        assert!(equation.contains("BM25"));
-        assert!(equation.contains("FastSemantic"));
+        assert!(equation.contains("0.015900 [BM25]"));
+        assert!(equation.contains("0.014900 [BlendedSemantic]"));
+        assert!(!equation.contains("FastSemantic"));
     }
 
     #[test]

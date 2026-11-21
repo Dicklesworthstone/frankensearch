@@ -73,7 +73,7 @@ use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
 use crate::rrf::{
-    InitialFusionExplanation, RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy,
+    FusionExplanation, RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy,
     fuse_by_strategy_for_vector_lane,
 };
 
@@ -2625,7 +2625,7 @@ impl TwoTierSearcher {
                     &fused,
                     lexical,
                     self.config.explain.then(|| {
-                        InitialFusionExplanation::new(
+                        FusionExplanation::new(
                             self.config.fusion_strategy,
                             lexical,
                             &hits,
@@ -3148,7 +3148,7 @@ impl TwoTierSearcher {
                                     &fused,
                                     &[],
                                     self.config.explain.then(|| {
-                                        InitialFusionExplanation::new(
+                                        FusionExplanation::new(
                                             self.config.fusion_strategy,
                                             &[],
                                             &fast_hits,
@@ -3185,7 +3185,7 @@ impl TwoTierSearcher {
                             &fused,
                             lexical,
                             self.config.explain.then(|| {
-                                InitialFusionExplanation::new(
+                                FusionExplanation::new(
                                     self.config.fusion_strategy,
                                     lexical,
                                     &fast_hits,
@@ -3774,11 +3774,11 @@ impl TwoTierSearcher {
                                          fast_score: Option<f32>,
                                          quality_score: Option<f32>,
                                          rank_map: &std::collections::HashMap<&str, usize>,
-                                         lexical_component: Option<ScoreComponent>|
+                                         fusion_components: [Option<ScoreComponent>; 2]|
          -> Option<Box<HitExplanation>> {
             let blend_explanation = blend_explanation.as_ref()?;
-            let mut components = Vec::with_capacity(3);
-            components.extend(lexical_component);
+            let mut components = Vec::with_capacity(4);
+            components.extend(fusion_components.into_iter().flatten());
             components.extend(blend_explanation.components(
                 fast_score,
                 quality_score,
@@ -3847,25 +3847,21 @@ impl TwoTierSearcher {
             cancellation_checkpoint(cx, "quality_refusion_to_result_construction")?;
             let mut results =
                 fused_hits_to_scored_results(&fused, lexical_pool, None, self.fast_embedder.id());
-            let mut lexical_components = self
-                .config
-                .explain
-                .then(|| {
-                    crate::rrf::refined_lexical_components(
-                        self.config.fusion_strategy,
-                        lexical_pool,
-                        &fused,
-                        &rrf_config,
-                    )
-                })
-                .into_iter()
-                .flatten();
+            let fusion_explanation = self.config.explain.then(|| {
+                FusionExplanation::new(
+                    self.config.fusion_strategy,
+                    lexical_pool,
+                    &blended,
+                    &[],
+                    &rrf_config,
+                )
+            });
             let initial_fused_rank: std::collections::HashMap<&str, usize> = initial_results
                 .iter()
                 .enumerate()
                 .map(|(rank, result)| (result.doc_id.as_str(), rank))
                 .collect();
-            for (rank, result) in results.iter_mut().enumerate() {
+            for (rank, (result, fused_hit)) in results.iter_mut().zip(&fused).enumerate() {
                 let initial = initial_by_doc.get(result.doc_id.as_str()).copied();
                 let fast_score = fast_scores_by_doc.get(result.doc_id.as_str()).copied();
                 let quality_score = quality_scores_by_doc.get(result.doc_id.as_str()).copied();
@@ -3887,7 +3883,9 @@ impl TwoTierSearcher {
                     fast_score,
                     quality_score,
                     &initial_fused_rank,
-                    lexical_components.next().flatten(),
+                    fusion_explanation.map_or([None, None], |evidence| {
+                        evidence.refined_components(fused_hit)
+                    }),
                 );
             }
             if let (Some(lexical), Some(context)) = (
@@ -3951,7 +3949,7 @@ impl TwoTierSearcher {
                     fast_score,
                     quality_score,
                     &initial_rank,
-                    None,
+                    [None, None],
                 );
 
                 ScoredResult {
@@ -4940,7 +4938,7 @@ const fn embedder_tier_for_stage(stage: EmbeddingStage, category: ModelCategory)
 fn fused_hits_to_scored_results(
     fused: &[frankensearch_core::types::FusedHit],
     lexical_results: &[ScoredResult],
-    explanation: Option<InitialFusionExplanation>,
+    explanation: Option<FusionExplanation>,
     fast_embedder_id: &str,
 ) -> Vec<ScoredResult> {
     // Borrow each candidate's metadata `&Value` into the map instead of cloning
@@ -17877,8 +17875,8 @@ mod tests {
         assert!(explanation.components[1].rrf_contribution > 0.0);
     }
 
-    fn default_rrf_explanation() -> InitialFusionExplanation {
-        InitialFusionExplanation::new(
+    fn default_rrf_explanation() -> FusionExplanation {
+        FusionExplanation::new(
             frankensearch_core::FusionStrategy::Rrf,
             &[],
             &[],

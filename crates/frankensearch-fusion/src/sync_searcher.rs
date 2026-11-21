@@ -37,8 +37,8 @@ use crate::blend::{
 use crate::mmr::{MmrConfig, mmr_rerank};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{
-    InitialFusionExplanation, RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy,
-    fuse_by_strategy_for_vector_lane, refined_lexical_components,
+    FusionExplanation, RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy,
+    fuse_by_strategy_for_vector_lane,
 };
 use crate::searcher::promoted_quality_source;
 
@@ -1013,7 +1013,7 @@ impl SyncTwoTierSearcher {
                     lexical,
                     target,
                     self.config.explain.then(|| {
-                        InitialFusionExplanation::new(
+                        FusionExplanation::new(
                             self.config.fusion_strategy,
                             lexical,
                             &fast_hits,
@@ -1249,7 +1249,7 @@ impl SyncTwoTierSearcher {
                     lexical,
                     k,
                     self.config.explain.then(|| {
-                        InitialFusionExplanation::new(
+                        FusionExplanation::new(
                             self.config.fusion_strategy,
                             lexical,
                             hits,
@@ -1477,7 +1477,7 @@ impl SyncTwoTierSearcher {
         let rank_changes = compute_rank_changes(&fast_hits, &blended);
 
         let target = self.final_candidate_target(k);
-        let mut lexical_components = Vec::new();
+        let mut fusion_components = Vec::new();
         let mut refined_results = if let Some(lexical) = lexical_hits.as_ref() {
             let rrf_config = RrfConfig {
                 k: self.config.rrf_k,
@@ -1497,12 +1497,14 @@ impl SyncTwoTierSearcher {
             );
             if self.config.explain {
                 // The conversion below preserves this fused order.
-                lexical_components.extend(refined_lexical_components(
+                let evidence = FusionExplanation::new(
                     self.config.fusion_strategy,
                     lexical,
-                    &fused,
+                    &blended,
+                    &[],
                     &rrf_config,
-                ));
+                );
+                fusion_components.extend(fused.iter().map(|hit| evidence.refined_components(hit)));
             }
             fused_hits_to_scored_results(
                 fused,
@@ -1560,7 +1562,7 @@ impl SyncTwoTierSearcher {
                 ),
             };
             let fast_embedder_id = sync_fast_embedder_id(&self.index);
-            let mut lexical_components = lexical_components.into_iter();
+            let mut fusion_components = fusion_components.into_iter();
             for (rank, result) in refined_results.iter_mut().enumerate() {
                 let vector_components = blend_explanation.components(
                     result.fast_score,
@@ -1580,7 +1582,7 @@ impl SyncTwoTierSearcher {
                     rank,
                     result.doc_id.as_str(),
                     &initial_ranks,
-                    lexical_components.next().flatten(),
+                    fusion_components.next().unwrap_or_default(),
                     vector_components,
                 )));
             }
@@ -2081,11 +2083,12 @@ fn build_refined_explanation(
     rank: usize,
     doc_id: &str,
     initial_ranks: &AHashMap<&str, usize>,
-    lexical_component: Option<ScoreComponent>,
+    fusion_components: [Option<ScoreComponent>; 2],
     vector_components: impl Iterator<Item = ScoreComponent>,
 ) -> HitExplanation {
-    let components = lexical_component
+    let components = fusion_components
         .into_iter()
+        .flatten()
         .chain(vector_components)
         .collect();
     let rank_movement = initial_ranks.get(doc_id).map(|&initial_rank| {
@@ -2318,7 +2321,7 @@ fn fused_hits_to_scored_results(
     hits: Vec<FusedHit>,
     lexical: &[ScoredResult],
     k: usize,
-    explanation: Option<InitialFusionExplanation>,
+    explanation: Option<FusionExplanation>,
     fast_embedder_id: &str,
     hash_control: bool,
 ) -> Vec<ScoredResult> {

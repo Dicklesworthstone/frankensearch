@@ -679,6 +679,7 @@ fn explained_source_kind(source: &ExplainedSource) -> &'static str {
         ExplainedSource::LexicalBm25 { .. } => "lexical",
         ExplainedSource::SemanticFast { .. } => "semantic_fast",
         ExplainedSource::SemanticQuality { .. } => "semantic_quality",
+        ExplainedSource::SemanticBlend => "semantic_blend",
         ExplainedSource::Rerank { .. } => "rerank",
         ExplainedSource::HashControl { .. } => "hash_control",
     }
@@ -1195,9 +1196,49 @@ fn explanations_preserve_scoring_in_both_fusion_strategies() {
             assert_eq!(results.len(), 5);
             for hit in results {
                 let components = &hit.explanation.as_ref().expect("explanation").components;
+                if fusion_strategy == FusionStrategy::Rrf {
+                    let total = hit.explanation.as_ref().unwrap().total_rrf_contribution();
+                    assert!(
+                        (total - f64::from(hit.score)).abs() < 1e-7,
+                        "{api} {}: RRF evidence sums to {total} for score {}",
+                        hit.doc_id,
+                        hit.score
+                    );
+                }
                 let lexical = components.iter().find(|component| {
                     matches!(component.source, ExplainedSource::LexicalBm25 { .. })
                 });
+                let semantic = components
+                    .iter()
+                    .find(|component| matches!(component.source, ExplainedSource::SemanticBlend));
+                if fusion_strategy == FusionStrategy::PoolMinMax {
+                    let total = lexical
+                        .into_iter()
+                        .chain(semantic)
+                        .map(|component| component.normalized_score * component.weight)
+                        .sum::<f64>();
+                    assert!(
+                        (total - f64::from(hit.score)).abs() < 1e-7,
+                        "{api} {}: min-max evidence sums to {total} for score {}",
+                        hit.doc_id,
+                        hit.score
+                    );
+                }
+                if let Some(semantic) = semantic {
+                    assert!((semantic.weight - 0.5).abs() < 1e-7);
+                    let blend = components
+                        .iter()
+                        .filter(|component| {
+                            matches!(
+                                component.source,
+                                ExplainedSource::SemanticFast { .. }
+                                    | ExplainedSource::SemanticQuality { .. }
+                            )
+                        })
+                        .map(|component| component.normalized_score * component.weight)
+                        .sum::<f64>();
+                    assert!((blend - semantic.raw_score).abs() < 1e-7);
+                }
                 match hit.doc_id.as_str() {
                     "lexical-only" => {
                         assert_eq!(components.len(), 1, "{api} {fusion_strategy:?}");
@@ -1208,9 +1249,16 @@ fn explanations_preserve_scoring_in_both_fusion_strategies() {
                         assert!((lexical.weight - 2.0).abs() < 1e-7);
                         assert!((f64::from(hit.score) - expected_score).abs() < 1e-7);
                     }
-                    "doc-b" => assert!(lexical.is_none(), "vector-only hit has no BM25"),
+                    "doc-b" => {
+                        assert!(lexical.is_none(), "vector-only hit has no BM25");
+                        assert!(semantic.is_some(), "vector-only hit needs its fused arm");
+                    }
                     _ => {
                         assert!(lexical.is_some(), "hybrid hit needs its BM25 evidence");
+                        assert!(
+                            semantic.is_some(),
+                            "hybrid hit needs its fused semantic arm"
+                        );
                         assert!(components.iter().any(|component| matches!(
                             component.source,
                             ExplainedSource::SemanticQuality { .. }

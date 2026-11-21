@@ -638,14 +638,14 @@ impl FusionArmExplanation {
     }
 }
 
-/// Retain the scoring settings and pool bounds used by initial fusion.
+/// Retain the scoring settings and pool bounds used by lexical-semantic fusion.
 #[derive(Clone, Copy)]
-pub(crate) struct InitialFusionExplanation {
+pub(crate) struct FusionExplanation {
     lexical: FusionArmExplanation,
     vector: FusionArmExplanation,
 }
 
-impl InitialFusionExplanation {
+impl FusionExplanation {
     pub(crate) fn new(
         strategy: FusionStrategy,
         lexical: &[ScoredResult],
@@ -707,23 +707,19 @@ impl InitialFusionExplanation {
             rank_movement: None,
         }
     }
-}
 
-/// Explain the lexical arm of a refinement, which fuses without a graph arm.
-/// Fused ranks identify the exact rows used, including after a filtered refill.
-pub(crate) fn refined_lexical_components<'a>(
-    strategy: FusionStrategy,
-    lexical: &[ScoredResult],
-    fused: &'a [FusedHit],
-    config: &RrfConfig,
-) -> impl Iterator<Item = Option<ScoreComponent>> + use<'a> {
-    let scoring = FusionArmExplanation::new(
-        strategy,
-        config.k,
-        config.lexical_weight,
-        lexical.iter().map(|result| result.score),
-    );
-    fused.iter().map(move |hit| scoring.lexical_component(hit))
+    /// Describe the final fusion arms independently of the per-tier blend.
+    pub(crate) fn refined_components(&self, hit: &FusedHit) -> [Option<ScoreComponent>; 2] {
+        [
+            self.lexical.lexical_component(hit),
+            hit.semantic_rank
+                .zip(hit.semantic_score)
+                .map(|(rank, score)| {
+                    self.vector
+                        .component(ExplainedSource::SemanticBlend, rank, score)
+                }),
+        ]
+    }
 }
 
 /// Fuse lexical and semantic results by **pool-local min-max score fusion** — a
@@ -1645,7 +1641,7 @@ mod tests {
             fused_ids(&via).contains(&"z".to_string()),
             "graph-only doc must survive; dropping it would be a silent correctness loss"
         );
-        let evidence = InitialFusionExplanation::new(
+        let evidence = FusionExplanation::new(
             FusionStrategy::PoolMinMax,
             &lexical,
             &semantic,

@@ -364,6 +364,7 @@ pub enum ScoreComponentSource {
     LexicalBm25,
     SemanticFast,
     SemanticQuality,
+    SemanticBlend,
     Rerank,
     HashControl,
 }
@@ -374,6 +375,7 @@ impl std::fmt::Display for ScoreComponentSource {
             Self::LexicalBm25 => "lexical_bm25",
             Self::SemanticFast => "semantic_fast",
             Self::SemanticQuality => "semantic_quality",
+            Self::SemanticBlend => "semantic_blend",
             Self::Rerank => "rerank",
             Self::HashControl => "hash_control",
         };
@@ -690,6 +692,7 @@ fn source_from_explained(source: &ExplainedSource) -> ScoreComponentSource {
         }
         ExplainedSource::SemanticFast { .. } => ScoreComponentSource::SemanticFast,
         ExplainedSource::SemanticQuality { .. } => ScoreComponentSource::SemanticQuality,
+        ExplainedSource::SemanticBlend => ScoreComponentSource::SemanticBlend,
         ExplainedSource::Rerank { .. } => ScoreComponentSource::Rerank,
     }
 }
