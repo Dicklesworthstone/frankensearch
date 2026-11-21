@@ -449,7 +449,7 @@ fn vector_exclusion_source(embedder: &dyn Embedder) -> &'static str {
 }
 
 /// Quality evidence may attach to any hit; it must not relabel retrieval
-/// provenance. Lexical, hybrid, and hash-control stays stay put even when a
+/// provenance. Lexical, hybrid, and hash-control labels stay put even when a
 /// quality cosine is present.
 #[must_use]
 const fn source_can_promote_to_quality(source: ScoreSource) -> bool {
@@ -460,7 +460,10 @@ const fn source_can_promote_to_quality(source: ScoreSource) -> bool {
 }
 
 #[must_use]
-const fn promoted_quality_source(source: ScoreSource, has_quality_score: bool) -> ScoreSource {
+pub(crate) const fn promoted_quality_source(
+    source: ScoreSource,
+    has_quality_score: bool,
+) -> ScoreSource {
     if has_quality_score && source_can_promote_to_quality(source) {
         ScoreSource::SemanticQuality
     } else {

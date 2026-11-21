@@ -39,6 +39,7 @@ use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{
     RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy, fuse_by_strategy_for_vector_lane,
 };
+use crate::searcher::promoted_quality_source;
 
 /// The per-tier query embeddings this search is authorized to read with
 /// (bd-sync-searcher-tiered-query-embeddings-dbp10).
@@ -1480,25 +1481,19 @@ impl SyncTwoTierSearcher {
                 false,
             )
         } else {
-            unique_vector_hits_to_scored_results_owned(
-                blended,
-                target,
-                ScoreSource::SemanticQuality,
-            )
+            unique_vector_hits_to_scored_results_owned(blended, target, ScoreSource::SemanticFast)
         };
         lexical_context.attach_metadata(&mut refined_results);
 
         // Re-fusion ranks on blended semantic scores, but `fast_score` and
         // `quality_score` are evidence fields: they must retain the raw
-        // per-tier values. The async searcher restores this provenance after
-        // lexical re-fusion; leaving the blended score in `fast_score` here
-        // made the two APIs report different evidence for identical hits.
-        // A document present in only one pool now truthfully reports `None`
-        // for the tier that never saw it, instead of borrowing a neighbour's
-        // row ordinal.
+        // per-tier values. Use the same source classification as async once
+        // the raw quality evidence is available, preserving lexical and
+        // hybrid provenance.
         for result in &mut refined_results {
             result.fast_score = fast_scores_by_doc.get(result.doc_id.as_str()).copied();
             result.quality_score = quality_scores_by_doc.get(result.doc_id.as_str()).copied();
+            result.source = promoted_quality_source(result.source, result.quality_score.is_some());
         }
 
         if self.config.explain {
@@ -2883,6 +2878,7 @@ mod tests {
         assert_eq!(results[0].score, 1.0);
         assert_eq!(results[0].fast_score, Some(1.0));
         assert_eq!(results[0].quality_score, None);
+        assert_eq!(results[0].source, ScoreSource::SemanticFast);
         assert_eq!(results[0].index, Some(0));
         assert_eq!(metrics.incomplete_embeddings, 1);
         assert_eq!(metrics.phase2_vectors_searched, 1);
@@ -5757,6 +5753,9 @@ mod tests {
         assert_eq!(results[0].doc_id, "b");
         assert_eq!(results[0].metadata.as_deref().unwrap()["doc_type"], "keep");
         assert!(results[0].quality_score.is_some());
+        assert_eq!(results[0].fast_score, None);
+        assert_eq!(results[0].lexical_score, None);
+        assert_eq!(results[0].source, ScoreSource::SemanticQuality);
         assert!(phases.next().is_none());
     }
 
@@ -7033,8 +7032,14 @@ mod tests {
             assert_eq!(results.len(), 4);
             for hit in results {
                 let expected = match hit.doc_id.as_str() {
-                    "lex-only" => &lexical_only,
-                    "a" => &hybrid,
+                    "lex-only" => {
+                        assert_eq!(hit.source, ScoreSource::Lexical);
+                        &lexical_only
+                    }
+                    "a" => {
+                        assert_eq!(hit.source, ScoreSource::Hybrid);
+                        &hybrid
+                    }
                     "b" | "c" => {
                         assert!(
                             hit.metadata.is_none(),
