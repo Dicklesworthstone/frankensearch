@@ -18429,7 +18429,8 @@ impl FsfsRuntime {
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         let sentinel = Self::read_index_sentinel(&index_root)?;
-        let live_rows = VectorIndex::open_read_only(&vector_path)?.live_doc_ids()?;
+        let index = VectorIndex::open_read_only(&vector_path)?;
+        let live_rows = index.live_doc_ids()?;
         let target_root = sentinel.as_ref().map(|value| Path::new(&value.target_root));
         let live_ids = Self::live_delete_sources_at_root(
             cx,
@@ -18467,6 +18468,12 @@ impl FsfsRuntime {
         } else {
             None
         };
+        // A writer open can repair the WAL, and quiescing the daemon drops
+        // live readers. Neither is needed when there are no matching rows.
+        if targets.is_empty() {
+            return self.emit_legacy_hybrid_delete_result(0, &index);
+        }
+        drop(index);
         // Resolve every selector before opening a writer or changing reuse
         // evidence: append-batch IDs can themselves be absolute-looking paths.
         // Removing a source must not cost the next `fsfs index` every other
@@ -18492,66 +18499,76 @@ impl FsfsRuntime {
         self.quiesce_query_daemon("delete")?;
         let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
 
-        if !targets.is_empty() {
-            let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-            if let Some((_, sentinel)) = window_membership.as_mut() {
-                sentinel.generation_complete = false;
-                self.write_index_sentinel(&index_root, sentinel)?;
-                let sources = refs.iter().copied().collect::<HashSet<_>>();
-                let rows = live_rows
-                    .iter()
-                    .filter(|row| sources.contains(semantic_windows::source_id(row)))
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
-                index.soft_delete_batch(&rows)?;
-            } else {
-                index.soft_delete_batch(&refs)?;
-            }
-            // Mirror the tombstones into the quality tier so a deleted
-            // document cannot resurface in REFINED results.
-            let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
-            if quality_vector_path.exists() {
-                publication_lease.fence("delete quality WAL publication")?;
-                let mut quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
-                let quality_deleted = quality_index.soft_delete_batch(&refs)?;
-                info!(
-                    quality_deleted,
-                    "delete mirrored tombstones into the quality tier"
-                );
-            }
-            // Tombstones are in-place writes: a RaptorQ sidecar built before
-            // them would restore the deleted records, so it goes now and the
-            // next compaction re-protects both tiers.
-            invalidate_vector_sidecars(
-                [vector_path.as_path(), quality_vector_path.as_path()],
-                "delete command",
-            );
-            // And the lexical arm: a deleted document must stop matching by
-            // BM25 in the same command that removes its vectors.
-            publication_lease.fence("delete lexical publication")?;
-            let lexical_mutations = targets
+        let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+        if let Some((_, sentinel)) = window_membership.as_mut() {
+            sentinel.generation_complete = false;
+            self.write_index_sentinel(&index_root, sentinel)?;
+            let sources = refs.iter().copied().collect::<HashSet<_>>();
+            let rows = live_rows
                 .iter()
-                .map(|doc_id| {
-                    LexicalMutation::delete(
-                        doc_id.clone(),
-                        0,
-                        IngestionClass::Skip,
-                        "delete_command",
-                    )
-                })
+                .filter(|row| sources.contains(semantic_windows::source_id(row)))
+                .map(String::as_str)
                 .collect::<Vec<_>>();
-            self.apply_one_shot_lexical_mutations(cx, &index_root, &lexical_mutations)
-                .await?;
-            if let Some((mut manifests, sentinel)) = window_membership {
-                for id in &targets {
-                    manifests.remove(id);
-                }
-                publication_lease.fence("delete window membership publication")?;
-                self.write_window_mutation_membership(&index_root, manifests, sentinel, "delete")?;
+            index.soft_delete_batch(&rows)?;
+        } else {
+            index.soft_delete_batch(&refs)?;
+        }
+        // Mirror the tombstones into the quality tier so a deleted
+        // document cannot resurface in REFINED results.
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        if quality_vector_path.exists() {
+            publication_lease.fence("delete quality WAL publication")?;
+            let mut quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
+            let quality_deleted = quality_index.soft_delete_batch(&refs)?;
+            info!(
+                quality_deleted,
+                "delete mirrored tombstones into the quality tier"
+            );
+        }
+        // Tombstones are in-place writes: a RaptorQ sidecar built before
+        // them would restore the deleted records, so it goes now and the
+        // next compaction re-protects both tiers.
+        invalidate_vector_sidecars(
+            [vector_path.as_path(), quality_vector_path.as_path()],
+            "delete command",
+        );
+        // And the lexical arm: a deleted document must stop matching by
+        // BM25 in the same command that removes its vectors.
+        publication_lease.fence("delete lexical publication")?;
+        let lexical_mutations = targets
+            .iter()
+            .map(|doc_id| {
+                LexicalMutation::delete(doc_id.clone(), 0, IngestionClass::Skip, "delete_command")
+            })
+            .collect::<Vec<_>>();
+        self.apply_one_shot_lexical_mutations(cx, &index_root, &lexical_mutations)
+            .await?;
+        if let Some((mut manifests, sentinel)) = window_membership {
+            for id in &targets {
+                manifests.remove(id);
             }
+            publication_lease.fence("delete window membership publication")?;
+            self.write_window_mutation_membership(&index_root, manifests, sentinel, "delete")?;
         }
 
-        let total_deleted = targets.len();
+        self.emit_legacy_hybrid_delete_result(targets.len(), &index)?;
+        drop(index);
+        if let (Some(ledger), Some(indexed)) = (reuse, &indexed) {
+            match publication_lease.fence("delete reuse evidence") {
+                Ok(()) => retained_reuse::retain_mutated_checkpoint(cx, indexed, &ledger)?,
+                Err(error) => {
+                    warn!(%error, "publication ownership changed; the next index re-embeds cold");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_legacy_hybrid_delete_result(
+        &self,
+        total_deleted: usize,
+        index: &VectorIndex,
+    ) -> SearchResult<()> {
         info!(
             total_deleted,
             tombstone_count = index.tombstone_count(),
@@ -18584,15 +18601,6 @@ impl FsfsRuntime {
             }
         }
 
-        drop(index);
-        if let (Some(ledger), Some(indexed)) = (reuse.filter(|_| !targets.is_empty()), &indexed) {
-            match publication_lease.fence("delete reuse evidence") {
-                Ok(()) => retained_reuse::retain_mutated_checkpoint(cx, indexed, &ledger)?,
-                Err(error) => {
-                    warn!(%error, "publication ownership changed; the next index re-embeds cold");
-                }
-            }
-        }
         Ok(())
     }
 
@@ -45772,35 +45780,31 @@ mod tests {
             ));
             assert_eq!(fs::read(&vector_path).unwrap(), before);
             assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
-            let mut live_after = Vec::new();
-            // Planted negative first (a prefix that matches nothing tombstones
-            // nothing), then an absolute directory prefix whose source no
-            // longer exists. Its trailing separator must exclude wal-sibling.
-            for ids in [
-                vec!["nope/".to_owned()],
-                vec![format!(
-                    "{}{sep}",
-                    source.join("wal").display(),
-                    sep = std::path::MAIN_SEPARATOR
-                )],
-            ] {
-                let mut command = runtime.clone();
-                command.cli_input.delete_ids = ids;
-                command
-                    .run_delete_command(&cx)
-                    .await
-                    .expect("delete --prefix succeeds");
-                // A sibling test forking at this instant inherits the writer
-                // descriptor the command just dropped until its exec, so the
-                // exclusive reopen can see a transient map-lock refusal; use
-                // the same bounded retry production mutations use.
-                let index = super::FsfsRuntime::open_vector_index_for_mutation(&vector_path)
-                    .expect("reopen vector index");
-                live_after.push(super::vector_live_doc_ids(&index).expect("read live doc ids"));
-            }
-            let untouched = &live_after[0];
+            let mut command = runtime.clone();
+            command.cli_input.delete_ids = vec!["nope/".to_owned()];
+            // A reader that stays open throughout the request rules out an
+            // exclusive writer. Check the published bytes as well as the IDs.
+            let reader = VectorIndex::open_read_only(&vector_path).unwrap();
+            command.run_delete_command(&cx).await.unwrap();
+            let untouched = super::vector_live_doc_ids(&reader).unwrap();
             assert!(untouched.contains("wal/only.md") && untouched.contains("main/keep.md"));
-            let after = &live_after[1];
+            assert_eq!(fs::read(&vector_path).unwrap(), before);
+            assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
+            drop(reader);
+
+            // The source no longer exists. Its trailing separator must still
+            // select the WAL-only document while excluding wal-sibling.
+            command.cli_input.delete_ids = vec![format!(
+                "{}{sep}",
+                source.join("wal").display(),
+                sep = std::path::MAIN_SEPARATOR
+            )];
+            command
+                .run_delete_command(&cx)
+                .await
+                .expect("delete --prefix succeeds");
+            let index = VectorIndex::open_read_only(&vector_path).expect("reopen vector index");
+            let after = super::vector_live_doc_ids(&index).unwrap();
             assert!(
                 !after.contains("wal/only.md"),
                 "WAL-only document must be tombstoned by prefix delete: {after:?}"
