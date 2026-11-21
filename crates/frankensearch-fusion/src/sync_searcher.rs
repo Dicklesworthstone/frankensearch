@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use frankensearch_core::explanation::{
     ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
 };
-use frankensearch_core::filter::{IncludeDocIdsFilter, SearchFilter};
+use frankensearch_core::filter::{DocIdHashSet, IncludeDocIdsFilter, SearchFilter, fnv1a_hash};
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_core::{
@@ -152,6 +152,36 @@ pub trait SyncLexicalSearch: Send + Sync {
     ///
     /// Returns backend-specific lexical retrieval errors.
     fn search_sync(&self, query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>>;
+
+    /// Retain one reader for a filtered progressive search, when supported.
+    ///
+    /// The returned source must keep candidate refills and metadata lookups on
+    /// one publication until it is dropped, including between iterator phases.
+    /// `None` keeps this source's existing per-call retrieval contract.
+    ///
+    /// # Errors
+    /// Returns snapshot-admission or cancellation failures before retrieval.
+    fn pin_search(&self) -> SearchResult<Option<Arc<dyn SyncLexicalSearch>>> {
+        Ok(None)
+    }
+
+    /// Read metadata for selected candidates from the retained reader.
+    ///
+    /// Results must follow the input order. A source without selected-document
+    /// hydration returns `None` entries; absent documents and genuinely absent
+    /// metadata also remain unknown. Filters receive that `None` unchanged.
+    /// Implementations supplying metadata must bind it to the publication used
+    /// by [`Self::search_sync`], normally through [`Self::pin_search`].
+    ///
+    /// # Errors
+    /// Returns hydration failures. They are terminal for filtering, since an
+    /// unreadable observation cannot be treated as permissive missing metadata.
+    fn metadata_for_documents(
+        &self,
+        document_ids: &[&str],
+    ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+        Ok(vec![None; document_ids.len()])
+    }
 }
 
 /// Per-query synchronous lexical adapter for Quill.
@@ -201,6 +231,41 @@ impl SyncLexicalSearch for QuillSyncLexicalSearch {
             frankensearch_core::traits::LexicalRead::query_text(self.index.as_ref(), &self.query);
         self.index
             .search_results(&self.cx, &query, limit)
+            .map_err(SearchError::from)
+    }
+
+    fn pin_search(&self) -> SearchResult<Option<Arc<dyn SyncLexicalSearch>>> {
+        let query =
+            frankensearch_core::traits::LexicalRead::query_text(self.index.as_ref(), &self.query);
+        Ok(Some(Arc::new(PinnedQuillSyncLexicalSearch {
+            index: self.index.pin_search(&self.cx)?,
+            cx: self.cx.clone(),
+            query: query.into_owned(),
+        })))
+    }
+}
+
+#[cfg(feature = "quill")]
+struct PinnedQuillSyncLexicalSearch {
+    index: frankensearch_quill::QuillSearchSession,
+    cx: asupersync::Cx,
+    query: String,
+}
+
+#[cfg(feature = "quill")]
+impl SyncLexicalSearch for PinnedQuillSyncLexicalSearch {
+    fn search_sync(&self, _query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+        self.index
+            .search_results(&self.cx, &self.query, limit)
+            .map_err(SearchError::from)
+    }
+
+    fn metadata_for_documents(
+        &self,
+        document_ids: &[&str],
+    ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+        self.index
+            .metadata_for_documents(&self.cx, document_ids)
             .map_err(SearchError::from)
     }
 }
@@ -608,18 +673,27 @@ impl SyncTwoTierSearcher {
     }
 
     fn search_optional_lexical(
-        &self,
+        context: &mut SyncLexicalContext,
         query_vec: &[f32],
         limit: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<Option<Vec<ScoredResult>>> {
-        let Some(lexical) = &self.lexical else {
+        let Some(lexical) = &context.source else {
             return Ok(None);
         };
-        match search_filtered_lexical(lexical.as_ref(), query_vec, limit, filter) {
+        match search_filtered_lexical(
+            lexical.as_ref(),
+            query_vec,
+            limit,
+            filter,
+            &mut context.metadata,
+        ) {
             Ok(results) => Ok(Some(results)),
-            Err(error @ SearchError::Cancelled { .. }) => Err(error),
-            Err(error) => {
+            Err(SyncLexicalFailure::Metadata(error))
+            | Err(SyncLexicalFailure::Retrieval(error @ SearchError::Cancelled { .. })) => {
+                Err(error)
+            }
+            Err(SyncLexicalFailure::Retrieval(error)) => {
                 // Match the async searcher's optional-arm contract. Discard
                 // even a partially fetched prefix after a refill failure; it
                 // cannot stand in for a successful lexical retrieval. A caller
@@ -628,6 +702,7 @@ impl SyncTwoTierSearcher {
                     error_code = error.diagnostic_code(),
                     "lexical search failed, continuing without lexical"
                 );
+                context.metadata.clear();
                 Ok(None)
             }
         }
@@ -662,7 +737,12 @@ impl SyncTwoTierSearcher {
         self.search_collect_with_filter(query, k, None)
     }
 
-    /// Execute a synchronous search with an optional doc-level filter.
+    /// Execute a synchronous search with an optional document filter.
+    ///
+    /// Available lexical metadata applies to every retrieval lane, including
+    /// semantic-only candidates. A snapshot-capable lexical source is pinned
+    /// once for both phases and every refill. Unknown metadata is still passed
+    /// as `None` to the caller's predicate; hydration errors are not unknowns.
     ///
     /// # Errors
     ///
@@ -840,6 +920,12 @@ impl SyncTwoTierSearcher {
         let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
 
         let phase1_started = Instant::now();
+        let mut lexical_context = SyncLexicalContext::new(self.lexical.clone(), filter.is_some())?;
+        let lexical_started = Instant::now();
+        let lexical_hits =
+            Self::search_optional_lexical(&mut lexical_context, query_vec, fetch, filter)?;
+        metrics.lexical_search_ms = ms(lexical_started.elapsed());
+        metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         let (classified, phase1_vectors_searched) = if query_vec.iter().all(|&value| value == 0.0) {
             // Zero signal belongs to this semantic lane (bd-tqhc), not the
             // whole query. Lexical matches and an independently admitted
@@ -848,7 +934,13 @@ impl SyncTwoTierSearcher {
         } else {
             // Count the vectors evaluated, not the bounded candidate pool.
             (
-                self.search_fast_hits(query_vec, fetch, filter)?,
+                search_filtered_vectors(
+                    &mut lexical_context,
+                    fetch,
+                    self.index.fast_index().record_count(),
+                    filter,
+                    |limit, candidates| self.search_fast_hits(query_vec, limit, candidates),
+                )?,
                 self.index.doc_count(),
             )
         };
@@ -866,11 +958,6 @@ impl SyncTwoTierSearcher {
             // hits and they do not schedule quality refinement.
             metrics.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
         }
-        let lexical_started = Instant::now();
-        let lexical_hits = self.search_optional_lexical(query_vec, fetch, filter)?;
-        metrics.lexical_search_ms = ms(lexical_started.elapsed());
-        metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
-
         let rrf_started = Instant::now();
         let query_semantic_weight = lexical_hits
             .as_ref()
@@ -919,6 +1006,7 @@ impl SyncTwoTierSearcher {
                 )
             },
         );
+        lexical_context.attach_metadata(&mut initial_results);
         metrics.rrf_fusion_ms = ms(rrf_started.elapsed());
 
         let phase1_latency = phase1_started.elapsed();
@@ -989,6 +1077,7 @@ impl SyncTwoTierSearcher {
                 quality_query,
                 fast_hits,
                 lexical_hits,
+                lexical_context,
                 query_semantic_weight,
                 fetch,
                 k,
@@ -1029,17 +1118,27 @@ impl SyncTwoTierSearcher {
         let started = Instant::now();
         let target = self.final_candidate_target(k);
         let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
+        let mut lexical_context = SyncLexicalContext::new(self.lexical.clone(), filter.is_some())?;
         let lexical_started = Instant::now();
-        let lexical_hits = self.search_optional_lexical(query.vector(), fetch, filter)?;
+        let lexical_hits =
+            Self::search_optional_lexical(&mut lexical_context, query.vector(), fetch, filter)?;
         metrics.lexical_search_ms = ms(lexical_started.elapsed());
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
 
         let quality_started = Instant::now();
-        let ClassifiedHits { hits, zero_signal } = index.search_top_k_classified_with_params(
-            query.vector(),
+        let ClassifiedHits { hits, zero_signal } = search_filtered_vectors(
+            &mut lexical_context,
             fetch,
+            index.record_count(),
             filter,
-            self.search_params.unwrap_or_default(),
+            |limit, candidates| {
+                index.search_top_k_classified_with_params(
+                    query.vector(),
+                    limit,
+                    candidates,
+                    self.search_params.unwrap_or_default(),
+                )
+            },
         )?;
         if zero_signal != Some(ZeroSignalReason::ZeroNormQuery) {
             // These are Phase-1 vectors because direct quality is the first
@@ -1053,6 +1152,7 @@ impl SyncTwoTierSearcher {
         let fusion_started = Instant::now();
         let mut results =
             self.quality_only_results(&hits, lexical_hits.as_deref(), target, embedder_id);
+        lexical_context.attach_metadata(&mut results);
         metrics.rrf_fusion_ms = ms(fusion_started.elapsed());
         let latency = started.elapsed();
         metrics.phase1_total_ms = ms(latency);
@@ -1173,6 +1273,7 @@ impl SyncTwoTierSearcher {
             quality_query,
             fast_hits,
             lexical_hits,
+            mut lexical_context,
             query_semantic_weight,
             fetch,
             k,
@@ -1195,32 +1296,39 @@ impl SyncTwoTierSearcher {
         let independent_quality = independently_retrievable_quality(quality_index);
         let mut refined_fast_hits = fast_hits.clone();
         let quality_pool = if independent_quality {
-            quality_index
-                .search_top_k_classified(quality_query.vector(), fetch, filter)
-                .and_then(|ClassifiedHits { mut hits, .. }| {
-                    complete_quality_evidence(&fast_hits, &mut hits, |missing| {
-                        self.index
-                            .quality_scores_for_hits(quality_query.vector(), missing)
-                    })?;
-                    let missing = missing_candidate_ids(&fast_hits, &hits);
-                    if !missing.is_empty() {
-                        let candidates = IncludeDocIdsFilter::new(missing);
-                        let fast_index = self.index.fast_index();
-                        // A physical-row limit of one per ID can lose other
-                        // requested IDs behind duplicate rows. The exact-ID
-                        // gather scores only the selected candidate union.
-                        refined_fast_hits.extend(
-                            fast_index
-                                .search_top_k_classified(
-                                    fast_query.vector(),
-                                    fast_index.record_count(),
-                                    Some(&candidates),
-                                )?
-                                .hits,
-                        );
-                    }
-                    Ok(SyncQualityPool::Retrieved(hits))
-                })
+            search_filtered_vectors(
+                &mut lexical_context,
+                fetch,
+                quality_index.record_count(),
+                filter,
+                |limit, candidates| {
+                    quality_index.search_top_k_classified(quality_query.vector(), limit, candidates)
+                },
+            )
+            .and_then(|ClassifiedHits { mut hits, .. }| {
+                complete_quality_evidence(&fast_hits, &mut hits, |missing| {
+                    self.index
+                        .quality_scores_for_hits(quality_query.vector(), missing)
+                })?;
+                let missing = missing_candidate_ids(&fast_hits, &hits);
+                if !missing.is_empty() {
+                    let candidates = IncludeDocIdsFilter::new(missing);
+                    let fast_index = self.index.fast_index();
+                    // A physical-row limit of one per ID can lose other
+                    // requested IDs behind duplicate rows. The exact-ID
+                    // gather scores only the selected candidate union.
+                    refined_fast_hits.extend(
+                        fast_index
+                            .search_top_k_classified(
+                                fast_query.vector(),
+                                fast_index.record_count(),
+                                Some(&candidates),
+                            )?
+                            .hits,
+                    );
+                }
+                Ok(SyncQualityPool::Retrieved(hits))
+            })
         } else {
             self.index
                 .quality_scores_for_hits(quality_query.vector(), &fast_hits)
@@ -1349,6 +1457,7 @@ impl SyncTwoTierSearcher {
                 ScoreSource::SemanticQuality,
             )
         };
+        lexical_context.attach_metadata(&mut refined_results);
 
         // Re-fusion ranks on blended semantic scores, but `fast_score` and
         // `quality_score` are evidence fields: they must retain the raw
@@ -1625,12 +1734,65 @@ struct SyncFinalRanking {
     space: SyncMmrSpace,
 }
 
+type SyncMetadata = AHashMap<String, Option<Arc<serde_json::Value>>>;
+
+/// Filtering observations and their reader survive from Initial to Refined.
+struct SyncLexicalContext {
+    source: Option<Arc<dyn SyncLexicalSearch>>,
+    metadata: SyncMetadata,
+}
+
+impl std::fmt::Debug for SyncLexicalContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncLexicalContext")
+            .field("has_source", &self.source.is_some())
+            .field("metadata_count", &self.metadata.len())
+            .finish()
+    }
+}
+
+impl SyncLexicalContext {
+    fn new(source: Option<Arc<dyn SyncLexicalSearch>>, filtered: bool) -> SearchResult<Self> {
+        let source = match source {
+            Some(source) if filtered => Some(source.pin_search()?.unwrap_or(source)),
+            source => source,
+        };
+        Ok(Self {
+            source,
+            metadata: AHashMap::new(),
+        })
+    }
+
+    fn hydrate_candidates(&mut self, hits: &[VectorHit]) -> SearchResult<()> {
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        let missing: Vec<_> = hits
+            .iter()
+            .map(|hit| hit.doc_id.as_str())
+            // A prior unknown observation cannot suppress an available lookup.
+            .filter(|id| self.metadata.get(*id).is_none_or(Option::is_none))
+            .collect();
+        hydrate_selected_metadata(source.as_ref(), &missing, &mut self.metadata)
+    }
+
+    fn attach_metadata(&self, results: &mut [ScoredResult]) {
+        for result in results {
+            if result.metadata.is_none() {
+                result.metadata = self.metadata.get(result.doc_id.as_str()).cloned().flatten();
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SyncRefinement<'query> {
     fast_query: &'query BoundQueryEmbedding,
     quality_query: &'query BoundQueryEmbedding,
     fast_hits: Vec<VectorHit>,
     lexical_hits: Option<Vec<ScoredResult>>,
+    lexical_context: SyncLexicalContext,
     query_semantic_weight: f64,
     fetch: usize,
     k: usize,
@@ -1879,19 +2041,84 @@ fn build_refined_explanation(
     }
 }
 
+enum SyncLexicalFailure {
+    Retrieval(SearchError),
+    Metadata(SearchError),
+}
+
+fn hydrate_selected_metadata(
+    source: &dyn SyncLexicalSearch,
+    document_ids: &[&str],
+    observations: &mut SyncMetadata,
+) -> SearchResult<()> {
+    if document_ids.is_empty() {
+        return Ok(());
+    }
+    let metadata = source.metadata_for_documents(document_ids)?;
+    if metadata.len() != document_ids.len() {
+        return Err(SearchError::InvalidConfig {
+            field: "sync_lexical.metadata".to_owned(),
+            value: metadata.len().to_string(),
+            reason: format!(
+                "metadata lookup returned {} observations for {} candidates",
+                metadata.len(),
+                document_ids.len(),
+            ),
+        });
+    }
+    for (id, metadata) in document_ids.iter().zip(metadata) {
+        observations.insert((*id).to_owned(), metadata);
+    }
+    Ok(())
+}
+
 fn search_filtered_lexical(
     lexical: &dyn SyncLexicalSearch,
     query_vec: &[f32],
     target: usize,
     filter: Option<&dyn SearchFilter>,
-) -> SearchResult<Vec<ScoredResult>> {
+    metadata: &mut SyncMetadata,
+) -> Result<Vec<ScoredResult>, SyncLexicalFailure> {
     let Some(filter) = filter else {
-        return lexical.search_sync(query_vec, target);
+        return lexical
+            .search_sync(query_vec, target)
+            .map_err(SyncLexicalFailure::Retrieval);
     };
     let mut limit = target;
     loop {
-        let mut hits = lexical.search_sync(query_vec, limit)?;
+        let mut hits = lexical
+            .search_sync(query_vec, limit)
+            .map_err(SyncLexicalFailure::Retrieval)?;
         let exhausted = hits.len() < limit;
+        // Keep rejected observations too: the vector lane must not reintroduce
+        // a document whose actual metadata this batch already ruled out.
+        // Unpinned custom sources may change between refills, so only the last
+        // complete batch supplies observations, just as it supplies scores.
+        metadata.clear();
+        for hit in &hits {
+            let observation = metadata.entry(hit.doc_id.to_string()).or_default();
+            if observation.is_none() {
+                *observation = hit.metadata.clone();
+            }
+        }
+        let unknown: Vec<_> = hits
+            .iter()
+            .filter(|hit| {
+                metadata
+                    .get(hit.doc_id.as_str())
+                    .is_none_or(Option::is_none)
+            })
+            .map(|hit| hit.doc_id.as_str())
+            .collect();
+        // Eager None is unknown, not proof that selected-document hydration
+        // cannot supply metadata. Hydrate before deciding lexical membership.
+        hydrate_selected_metadata(lexical, &unknown, metadata)
+            .map_err(SyncLexicalFailure::Metadata)?;
+        for hit in &mut hits {
+            if hit.metadata.is_none() {
+                hit.metadata = metadata.get(hit.doc_id.as_str()).cloned().flatten();
+            }
+        }
         hits.retain(|hit| filter.matches(&hit.doc_id, hit.metadata.as_deref()));
         hits.truncate(target);
         let next_limit = limit.saturating_mul(2);
@@ -1903,6 +2130,96 @@ fn search_filtered_lexical(
         // Replace the whole batch so scores and metadata always come from one
         // search; never append candidates from different reader generations.
         limit = next_limit;
+    }
+}
+
+/// Only enumerable identity bounds may reject a row before metadata is read.
+/// Calling an arbitrary predicate with None here can reject rows that it would
+/// accept with real metadata, or admit rows it would reject. Final membership
+/// is always checked below against the retained observation.
+struct MetadataCandidateFilter<'a>(&'a dyn SearchFilter);
+
+impl SearchFilter for MetadataCandidateFilter<'_> {
+    fn matches(&self, doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
+        if let Some(ids) = self.0.candidate_doc_ids() {
+            ids.contains(doc_id)
+        } else {
+            self.0
+                .candidate_hashes()
+                .is_none_or(|hashes| hashes.contains(&fnv1a_hash(doc_id.as_bytes())))
+        }
+    }
+
+    fn matches_doc_id_hash(
+        &self,
+        doc_id_hash: u64,
+        _metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        if self.0.candidate_doc_ids().is_some() {
+            None
+        } else {
+            Some(
+                self.0
+                    .candidate_hashes()
+                    .is_none_or(|hashes| hashes.contains(&doc_id_hash)),
+            )
+        }
+    }
+
+    fn candidate_doc_ids(&self) -> Option<&std::collections::HashSet<String>> {
+        self.0.candidate_doc_ids()
+    }
+
+    fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        self.0.candidate_hashes()
+    }
+
+    fn name(&self) -> &'static str {
+        "sync_metadata_candidates"
+    }
+}
+
+fn search_filtered_vectors(
+    context: &mut SyncLexicalContext,
+    target: usize,
+    physical_upper_bound: usize,
+    filter: Option<&dyn SearchFilter>,
+    mut retrieve: impl FnMut(usize, Option<&dyn SearchFilter>) -> SearchResult<ClassifiedHits>,
+) -> SearchResult<ClassifiedHits> {
+    let Some(filter) = filter.filter(|_| context.source.is_some()) else {
+        return retrieve(target, filter);
+    };
+    let candidates = MetadataCandidateFilter(filter);
+    let mut limit = target.min(physical_upper_bound.max(1));
+    loop {
+        let mut classified = retrieve(limit, Some(&candidates))?;
+        let fetched = classified.hits.len();
+        context.hydrate_candidates(&classified.hits)?;
+        let mut seen = AHashSet::with_capacity(classified.hits.len());
+        classified.hits.retain(|hit| {
+            filter.matches(
+                &hit.doc_id,
+                context
+                    .metadata
+                    .get(hit.doc_id.as_str())
+                    .and_then(Option::as_deref),
+            ) && seen.insert(hit.doc_id.clone())
+        });
+        if classified.hits.is_empty() && fetched != 0 {
+            classified.zero_signal = Some(ZeroSignalReason::FilterEliminatedAll);
+        }
+        classified.hits.truncate(target);
+        if classified.hits.len() == target || fetched < limit || limit >= physical_upper_bound {
+            return Ok(classified);
+        }
+        // The requested budget counts eligible public identities, not physical
+        // duplicates. Keep each ID's first (best) row and widen past duplicate
+        // leaders to find the eligible tail. Replace the complete prefix rather
+        // than appending windows; both retained owners stay fixed throughout.
+        limit = limit
+            .saturating_mul(2)
+            .max(limit.saturating_add(1))
+            .min(physical_upper_bound);
     }
 }
 
@@ -4875,6 +5192,644 @@ mod tests {
             failed.search_collect_with_filter(&query, 2, Some(&allowed)),
             Err(SearchError::Cancelled { ref phase, .. }) if phase == "lexical-refill"
         ));
+    }
+
+    #[test]
+    fn metadata_filter_refill_counts_unique_documents_and_keeps_best_rows() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        struct MetadataSource;
+        impl SyncLexicalSearch for MetadataSource {
+            fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+                Ok(Vec::new())
+            }
+
+            fn metadata_for_documents(
+                &self,
+                ids: &[&str],
+            ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+                Ok(ids
+                    .iter()
+                    .map(|id| {
+                        Some(Arc::new(serde_json::json!({
+                            "doc_type": if *id == "blocked" { "blocked" } else { "keep" }
+                        })))
+                    })
+                    .collect())
+            }
+        }
+
+        let fast = InMemoryVectorIndex::from_vectors(
+            ["repeat", "repeat", "repeat", "repeat", "blocked", "tail"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            [1.0_f32, 0.9, 0.8, 0.7, 0.6, 0.5]
+                .into_iter()
+                .map(|score| vec![score, (1.0 - score * score).sqrt()])
+                .collect(),
+            2,
+        )
+        .unwrap();
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(fast, None).unwrap()),
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                fast_only: true,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_lexical(Arc::new(MetadataSource));
+        let filter = DocTypeFilter::new(["keep"]);
+        let (results, _) = searcher
+            .search_collect_with_filter(&fast_only_query(vec![1.0, 0.0]), 2, Some(&filter))
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["repeat", "tail"],
+            "physical duplicate leaders cannot consume the eligible document budget",
+        );
+        assert_eq!(results[0].fast_score, Some(1.0));
+        assert_eq!(results[0].index, Some(0));
+        assert!(results.iter().all(|hit| {
+            hit.metadata.as_deref().unwrap()["doc_type"] == "keep" && hit.lexical_score.is_none()
+        }));
+    }
+
+    #[test]
+    fn metadata_filter_keeps_unknowns_and_rejects_known_eager_observations() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        let fast = InMemoryVectorIndex::from_vectors(
+            vec![
+                "blocked".to_owned(),
+                "unknown".to_owned(),
+                "bare".to_owned(),
+            ],
+            vec![vec![1.0, 0.0], vec![0.8, 0.6], vec![0.6, 0.8]],
+            2,
+        )
+        .unwrap();
+        let lexical = StaticLexical {
+            hits: vec![ScoredResult {
+                doc_id: "blocked".into(),
+                score: 1.0,
+                source: ScoreSource::Lexical,
+                index: None,
+                fast_score: None,
+                quality_score: None,
+                lexical_score: Some(1.0),
+                rerank_score: None,
+                explanation: None,
+                metadata: Some(Arc::new(serde_json::json!({"doc_type": "blocked"}))),
+            }],
+        };
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(fast, None).unwrap()),
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                fast_only: true,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_lexical(Arc::new(lexical));
+        let (results, _) = searcher
+            .search_collect_with_filter(
+                &fast_only_query(vec![1.0, 0.0]),
+                3,
+                Some(&DocTypeFilter::new(["keep"])),
+            )
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["unknown", "bare"],
+            "known lexical rejection applies to semantic hits; unknown metadata stays permissive",
+        );
+        assert!(results.iter().all(|hit| hit.metadata.is_none()));
+    }
+
+    #[test]
+    fn metadata_filter_hydrates_eager_unknowns_before_accepting_lexical_hits() {
+        use frankensearch_core::filter::{DateRangeFilter, DocTypeFilter};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct LazyMetadata {
+            fail_hydration: bool,
+        }
+        impl SyncLexicalSearch for LazyMetadata {
+            fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+                Ok([
+                    lexical_result("b", 4.0),
+                    lexical_result("lexical-blocked", 3.0),
+                    lexical_result("a", 2.0),
+                    lexical_result("c", 1.0),
+                ]
+                .into_iter()
+                .take(limit)
+                .collect())
+            }
+
+            fn metadata_for_documents(
+                &self,
+                ids: &[&str],
+            ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+                if self.fail_hydration {
+                    return Err(SearchError::InvalidConfig {
+                        field: "fixture.metadata".to_owned(),
+                        value: "unreadable".to_owned(),
+                        reason: "metadata decoding failed".to_owned(),
+                    });
+                }
+                Ok(ids
+                    .iter()
+                    .map(|id| {
+                        let blocked = matches!(*id, "b" | "lexical-blocked");
+                        Some(Arc::new(serde_json::json!({
+                            "doc_type": if blocked { "blocked" } else { "keep" },
+                            "created_at": if blocked { 1 } else { 200 },
+                        })))
+                    })
+                    .collect())
+            }
+        }
+
+        struct RequireMetadata;
+        impl SearchFilter for RequireMetadata {
+            fn matches(&self, _: &str, metadata: Option<&serde_json::Value>) -> bool {
+                metadata
+                    .and_then(|value| value.get("doc_type"))
+                    .is_some_and(|value| value == "keep")
+            }
+
+            fn name(&self) -> &'static str {
+                "require-metadata"
+            }
+        }
+
+        let directory = temp_dir("eager-unknown-metadata");
+        let (fast, quality) = persisted_producer_pair(directory.path());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(directory.path()).unwrap());
+        let progressive = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality.clone()).unwrap(),
+        );
+        let quality_only = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let types = DocTypeFilter::new(["keep"]);
+        let dates = DateRangeFilter::after(100);
+        let strict = RequireMetadata;
+        for fail_hydration in [false, true] {
+            let searcher = SyncTwoTierSearcher::new(
+                Arc::clone(&index),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_nqc_dense_downweight_disabled()
+            .with_lexical(Arc::new(LazyMetadata { fail_hydration }));
+            for filter in [&types as &dyn SearchFilter, &dates, &strict] {
+                for query in [&progressive, &quality_only] {
+                    if fail_hydration {
+                        assert!(matches!(
+                            searcher.search_collect_with_filter(query, 2, Some(filter)),
+                            Err(SearchError::InvalidConfig { .. }),
+                        ));
+                        continue;
+                    }
+                    let assert_hits = |hits: &[ScoredResult]| {
+                        let mut ids: Vec<_> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+                        ids.sort_unstable();
+                        assert_eq!(ids, ["a", "c"]);
+                        assert!(hits.iter().all(|hit| {
+                            filter.matches(&hit.doc_id, hit.metadata.as_deref())
+                                && hit.lexical_score.is_some()
+                        }));
+                    };
+                    let (hits, _) = searcher
+                        .search_collect_with_filter(query, 2, Some(filter))
+                        .unwrap();
+                    assert_hits(&hits);
+                    for phase in searcher.search_iter_with_filter(query, 2, Some(filter)) {
+                        match phase {
+                            SearchPhase::Initial { results, .. }
+                            | SearchPhase::Refined { results, .. } => assert_hits(&results),
+                            other => panic!("unexpected hydrated-metadata phase: {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
+
+        struct DelayedMetadata {
+            available: AtomicBool,
+        }
+        impl SyncLexicalSearch for DelayedMetadata {
+            fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+                Ok([lexical_result("b", 1.0)].into_iter().take(limit).collect())
+            }
+
+            fn metadata_for_documents(
+                &self,
+                ids: &[&str],
+            ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+                Ok(ids
+                    .iter()
+                    .map(|id| {
+                        (*id != "b" || self.available.load(Ordering::Relaxed))
+                            .then(|| Arc::new(serde_json::json!({"doc_type": "keep"})))
+                    })
+                    .collect())
+            }
+        }
+        let delayed = Arc::new(DelayedMetadata {
+            available: AtomicBool::new(false),
+        });
+        let searcher = SyncTwoTierSearcher::new(
+            index,
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_lexical(delayed.clone());
+        let mut phases = searcher.search_iter_with_filter(&progressive, 1, Some(&strict));
+        let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+            panic!("expected Initial while b's metadata is unknown");
+        };
+        assert_eq!(results[0].doc_id, "a");
+        delayed.available.store(true, Ordering::Relaxed);
+        let Some(SearchPhase::Refined { results, .. }) = phases.next() else {
+            panic!("expected Refined after selected metadata becomes available");
+        };
+        assert_eq!(results[0].doc_id, "b");
+        assert!(results[0].metadata.is_some());
+        assert!(phases.next().is_none());
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_metadata_filters_cover_semantic_lanes_and_eligible_tails() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_core::filter::{
+            DocTypeFilter, ExcludeDocIdsFilter, FilterChain, FilterMode,
+        };
+        use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
+
+        struct RequireMetadata;
+        impl SearchFilter for RequireMetadata {
+            fn matches(&self, _: &str, metadata: Option<&serde_json::Value>) -> bool {
+                metadata
+                    .and_then(|value| value.get("doc_type"))
+                    .is_some_and(|value| value == "keep")
+            }
+            fn name(&self) -> &'static str {
+                "require-metadata"
+            }
+        }
+
+        struct NegatedType(DocTypeFilter);
+        impl SearchFilter for NegatedType {
+            fn matches(&self, id: &str, metadata: Option<&serde_json::Value>) -> bool {
+                !self.0.matches(id, metadata)
+            }
+
+            fn name(&self) -> &'static str {
+                "not-blocked"
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let lexical_root = directory.path().join("lexical");
+            let vector_root = directory.path().join("vectors");
+            let config = QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            };
+            let writer = QuillIndex::create(&cx, &lexical_root, config.clone())
+                .await
+                .unwrap();
+            let fast_identity = semantic_identity("metadata-fast", 2);
+            let quality_identity = semantic_identity("metadata-quality", 3);
+            let mut vectors =
+                frankensearch_index::TwoTierIndex::create(&vector_root, TwoTierConfig::default())
+                    .unwrap();
+            vectors.set_fast_embedder_id("metadata-fast");
+            vectors.set_quality_embedder_id("metadata-quality");
+            vectors.set_fast_identity(&fast_identity).unwrap();
+            vectors.set_quality_identity(&quality_identity).unwrap();
+            let mut docs = Vec::new();
+            for ordinal in 0..32 {
+                let id = format!("blocked-{ordinal:02}");
+                vectors.add_fast_record(&id, &[1.0, 0.0]).unwrap();
+                vectors.add_quality_record(&id, &[1.0, 0.0, 0.0]).unwrap();
+                docs.push(
+                    IndexableDocument::new(id, if ordinal == 0 { "needle" } else { "unrelated" })
+                        .with_metadata("doc_type", "blocked"),
+                );
+            }
+            for (id, fast, quality) in [
+                ("allowed-a", [0.6, 0.8], [0.0, 1.0, 0.0]),
+                ("allowed-b", [0.0, 1.0], [0.6, 0.8, 0.0]),
+            ] {
+                vectors.add_fast_record(id, &fast).unwrap();
+                vectors.add_quality_record(id, &quality).unwrap();
+                docs.push(
+                    IndexableDocument::new(id, "unrelated").with_metadata("doc_type", "keep"),
+                );
+            }
+            drop(vectors.finish().unwrap());
+            writer.index_documents(&cx, &docs).await.unwrap();
+            writer.commit(&cx).await.unwrap();
+            let reader = Arc::new(
+                QuillSearchIndex::open(&cx, &lexical_root, config)
+                    .await
+                    .unwrap(),
+            );
+            let searcher = SyncTwoTierSearcher::new(
+                Arc::new(InMemoryTwoTierIndex::from_dir(&vector_root).unwrap()),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_nqc_dense_downweight_disabled()
+            .with_lexical(Arc::new(QuillSyncLexicalSearch::new(reader, cx, "needle")));
+            let progressive = TieredQueryEmbeddings::progressive(
+                BoundQueryEmbedding::new(vec![1.0, 0.0], fast_identity).unwrap(),
+                BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality_identity.clone()).unwrap(),
+            );
+            let quality_only = TieredQueryEmbeddings::quality_only(
+                BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality_identity).unwrap(),
+            );
+            let types = DocTypeFilter::new(["keep"]);
+            let exact = FilterChain::new(FilterMode::All)
+                .with(Box::new(IncludeDocIdsFilter::new([
+                    "blocked-00",
+                    "allowed-a",
+                    "allowed-b",
+                ])))
+                .with(Box::new(types.clone()));
+            let both = FilterChain::new(FilterMode::All)
+                .with(Box::new(types.clone()))
+                .with(Box::new(RequireMetadata));
+            let strict = RequireMetadata;
+            let negated = NegatedType(DocTypeFilter::new(["blocked"]));
+            for filter in [
+                &types as &dyn SearchFilter,
+                &exact,
+                &both,
+                &strict,
+                &negated,
+            ] {
+                for query in [&progressive, &quality_only] {
+                    let assert_hits = |hits: &[ScoredResult]| {
+                        assert_eq!(
+                            hits.len(),
+                            2,
+                            "eligible tail must fill the requested window"
+                        );
+                        let mut ids: Vec<_> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+                        ids.sort_unstable();
+                        assert_eq!(ids, ["allowed-a", "allowed-b"]);
+                        for hit in hits {
+                            assert!(filter.matches(&hit.doc_id, hit.metadata.as_deref()));
+                            assert!(hit.lexical_score.is_none(), "both winners are vector-only");
+                            assert_eq!(hit.metadata.as_deref().unwrap()["doc_type"], "keep");
+                        }
+                    };
+                    let (hits, _) = searcher
+                        .search_collect_with_filter(query, 2, Some(filter))
+                        .unwrap();
+                    assert_hits(&hits);
+                    let phases = searcher
+                        .search_iter_with_filter(query, 2, Some(filter))
+                        .collect::<Vec<_>>();
+                    assert_eq!(phases.len(), if query.fast().is_some() { 2 } else { 1 });
+                    for phase in phases {
+                        match phase {
+                            SearchPhase::Initial { results, .. }
+                            | SearchPhase::Refined { results, .. } => assert_hits(&results),
+                            other => panic!("unexpected metadata-filter phase: {other:?}"),
+                        }
+                    }
+                }
+            }
+            let excluded = ExcludeDocIdsFilter::new(Some(&types), ["allowed-a"]);
+            for query in [&progressive, &quality_only] {
+                let (hits, _) = searcher
+                    .search_collect_with_filter(query, 2, Some(&excluded))
+                    .unwrap();
+                assert_eq!(
+                    hits.iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["allowed-b"],
+                );
+            }
+            let either = FilterChain::new(FilterMode::Any)
+                .with(Box::new(types))
+                .with(Box::new(IncludeDocIdsFilter::new(["blocked-00"])));
+            let (hits, _) = searcher
+                .search_collect_with_filter(&progressive, 2, Some(&either))
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            assert!(hits.iter().any(|hit| hit.doc_id == "blocked-00"));
+            assert!(
+                hits.iter()
+                    .all(|hit| either.matches(&hit.doc_id, hit.metadata.as_deref()))
+            );
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_metadata_filter_pins_unseen_quality_candidates_across_refresh() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_core::filter::DocTypeFilter;
+        use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let vector_root = directory.path().join("vectors");
+            let (fast, quality) = persisted_producer_pair(&vector_root);
+            let lexical_root = directory.path().join("lexical");
+            let config = QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            };
+            let writer = QuillIndex::create(&cx, &lexical_root, config.clone())
+                .await
+                .unwrap();
+            writer
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("a", "unrelated").with_metadata("doc_type", "keep"),
+                        IndexableDocument::new("b", "unrelated").with_metadata("doc_type", "keep"),
+                        IndexableDocument::new("c", "unrelated")
+                            .with_metadata("doc_type", "blocked"),
+                    ],
+                )
+                .await
+                .unwrap();
+            writer.commit(&cx).await.unwrap();
+            let reader = Arc::new(
+                QuillSearchIndex::open(&cx, &lexical_root, config)
+                    .await
+                    .unwrap(),
+            );
+            let searcher = SyncTwoTierSearcher::new(
+                Arc::new(InMemoryTwoTierIndex::from_dir(&vector_root).unwrap()),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_nqc_dense_downweight_disabled()
+            .with_lexical(Arc::new(QuillSyncLexicalSearch::new(
+                Arc::clone(&reader),
+                cx.clone(),
+                "needle",
+            )));
+            let query = TieredQueryEmbeddings::progressive(
+                BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+                BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+            );
+            let filter = DocTypeFilter::new(["keep"]);
+            let mut phases = searcher.search_iter_with_filter(&query, 1, Some(&filter));
+            let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+                panic!("expected Initial");
+            };
+            assert_eq!(results[0].doc_id, "a");
+            writer
+                .upsert_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("b", "unrelated")
+                            .with_metadata("doc_type", "blocked"),
+                        IndexableDocument::new("c", "unrelated").with_metadata("doc_type", "keep"),
+                    ],
+                )
+                .await
+                .unwrap();
+            writer.commit(&cx).await.unwrap();
+            assert!(reader.refresh(&cx).await.unwrap());
+            let Some(SearchPhase::Refined { results, .. }) = phases.next() else {
+                panic!("expected Refined");
+            };
+            assert_eq!(
+                results[0].doc_id, "b",
+                "quality must use Initial's pinned metadata"
+            );
+            assert_eq!(results[0].metadata.as_deref().unwrap()["doc_type"], "keep");
+            assert!(phases.next().is_none());
+            let (fresh, _) = searcher
+                .search_collect_with_filter(&query, 1, Some(&filter))
+                .unwrap();
+            assert_eq!(
+                fresh[0].doc_id, "c",
+                "a new search must pin the refreshed publication"
+            );
+        });
+    }
+
+    #[test]
+    fn metadata_filter_hydration_errors_never_become_unknown_observations() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        struct FailingMetadata {
+            malformed: bool,
+        }
+        impl SyncLexicalSearch for FailingMetadata {
+            fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+                Ok(Vec::new())
+            }
+
+            fn metadata_for_documents(
+                &self,
+                ids: &[&str],
+            ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+                if ids.contains(&"b") {
+                    if self.malformed {
+                        return Ok(Vec::new());
+                    }
+                    return Err(SearchError::InvalidConfig {
+                        field: "fixture.metadata".to_owned(),
+                        value: "unreadable".to_owned(),
+                        reason: "metadata decoding failed".to_owned(),
+                    });
+                }
+                Ok(vec![
+                    Some(Arc::new(serde_json::json!({"doc_type": "keep"})));
+                    ids.len()
+                ])
+            }
+        }
+
+        let directory = temp_dir("metadata-filter-errors");
+        let (fast, quality) = persisted_producer_pair(directory.path());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(directory.path()).unwrap());
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality.clone()).unwrap(),
+        );
+        let quality_only = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let filter = DocTypeFilter::new(["keep"]);
+        for malformed in [false, true] {
+            let searcher = SyncTwoTierSearcher::new(
+                Arc::clone(&index),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_lexical(Arc::new(FailingMetadata { malformed }));
+            let mut phases = searcher.search_iter_with_filter(&query, 1, Some(&filter));
+            assert!(matches!(phases.next(), Some(SearchPhase::Initial { .. })));
+            let Some(SearchPhase::RefinementFailed {
+                initial_results,
+                error,
+                ..
+            }) = phases.next()
+            else {
+                panic!("a failed quality metadata observation must preserve Initial");
+            };
+            assert_eq!(initial_results.len(), 1);
+            assert_eq!(initial_results[0].doc_id, "a");
+            assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            assert!(phases.next().is_none());
+            assert!(matches!(
+                searcher.search_collect_with_filter(&quality_only, 1, Some(&filter)),
+                Err(SearchError::InvalidConfig { .. }),
+            ));
+            let fast =
+                InMemoryVectorIndex::from_vectors(vec!["b".to_owned()], vec![vec![1.0, 0.0]], 2)
+                    .unwrap();
+            let initial = SyncTwoTierSearcher::new(
+                Arc::new(InMemoryTwoTierIndex::new(fast, None).unwrap()),
+                TwoTierConfig::default(),
+            )
+            .with_lexical(Arc::new(FailingMetadata { malformed }));
+            assert!(matches!(
+                initial.search_collect_with_filter(
+                    &fast_only_query(vec![1.0, 0.0]),
+                    1,
+                    Some(&filter),
+                ),
+                Err(SearchError::InvalidConfig { .. }),
+            ));
+        }
     }
 
     #[cfg(feature = "quill")]

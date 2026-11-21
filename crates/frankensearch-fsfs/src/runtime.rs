@@ -17425,6 +17425,19 @@ impl FsfsRuntime {
     /// The bare download command retains its separate bulk catalog semantics.
     fn configured_model_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
         self.validate_registered_local_model_intent()?;
+        let quality_only = matches!(
+            self.indexing_search_mode(),
+            SearchExecutionMode::QualityOnly
+        );
+        if quality_only {
+            self.validate_semantic_model_selection(SearchExecutionMode::QualityOnly)?;
+            if self.indexing_quality_deferral().is_some() {
+                return Err(complete_cli::complete_cli_error(
+                    "quality_only",
+                    "the required quality producer cannot be deferred before provisioning",
+                ));
+            }
+        }
         let quality =
             if self.quality_disabled_by_policy() || self.indexing_quality_deferral().is_some() {
                 None
@@ -17435,14 +17448,21 @@ impl FsfsRuntime {
         {
             let _ = quality;
             Err(SearchError::EmbedderUnavailable {
-                model: self.config.indexing.fast_model.clone(),
-                reason: "this fsfs build has no semantic fast-model loader; use a build with semantic-loaders or semantic-native before provisioning semantic models".to_owned(),
+                model: if quality_only {
+                    self.config.indexing.quality_model.clone()
+                } else {
+                    self.config.indexing.fast_model.clone()
+                },
+                reason: "this fsfs build has no semantic-model loader; use a build with semantic-loaders or semantic-native before provisioning semantic models".to_owned(),
             })
         }
         #[cfg(feature = "semantic-support")]
         {
-            let fast = select_fast_model(&self.config.indexing.fast_model)?;
-            let mut selected = vec![fast.download_manifest().clone()];
+            let mut selected = Vec::new();
+            if !quality_only {
+                let fast = select_fast_model(&self.config.indexing.fast_model)?;
+                selected.push(fast.download_manifest().clone());
+            }
             if !self.quality_disabled_by_policy()
                 && let Some(quality) = quality
             {
@@ -17485,7 +17505,15 @@ impl FsfsRuntime {
             {
                 continue;
             }
-            let (_, verified, _) = Self::inspect_manifest_installation(&manifest, &destination);
+            #[cfg(feature = "embedded-models")]
+            if manifest == ModelManifest::potion_128m() || manifest == ModelManifest::minilm_v2() {
+                // These exact registered bytes are already bundled. The loader
+                // materializes them locally; first-run consent must not offer
+                // a network acquisition for a producer already available.
+                continue;
+            }
+            let installed = Self::registered_model_cache_path(&manifest, model_root)?;
+            let (_, verified, _) = Self::inspect_manifest_installation(&manifest, &installed);
             if verified != Some(true) {
                 missing.push((manifest, destination));
             }
@@ -17505,7 +17533,7 @@ impl FsfsRuntime {
     async fn maybe_offer_interactive_model_provisioning(
         &self,
         cx: &Cx,
-        require_missing_fast: bool,
+        require_missing_primary: bool,
     ) -> SearchResult<()> {
         let offline = self.config.indexing.offline;
         let interactive_terminal =
@@ -17523,16 +17551,19 @@ impl FsfsRuntime {
         }
         let model_root = self.resolve_download_model_root()?;
         let missing = self.missing_interactive_model_downloads(&model_root)?;
-        // Early legacy admission needs only the required fast producer. Leave
-        // optional-only offers to the indexer, so a declined quality download
-        // does not prompt again after fast admission succeeds. When fast is
-        // missing, offer every selected missing model together as usual.
-        if require_missing_fast {
-            let fast = self.selected_fast_model_id()?;
-            if !missing
-                .iter()
-                .any(|(manifest, _)| manifest.id == fast)
-            {
+        // Preflight offers acquisition only when the required primary is
+        // missing. Optional-only offers stay with the ordinary indexer, so a
+        // declined optional model is not offered again after admission.
+        if require_missing_primary {
+            let primary = if matches!(
+                self.indexing_search_mode(),
+                SearchExecutionMode::QualityOnly
+            ) {
+                self.selected_quality_model_id()?
+            } else {
+                self.selected_fast_model_id()?
+            };
+            if !missing.iter().any(|(manifest, _)| manifest.id == primary) {
                 return Ok(());
             }
         }
@@ -17552,14 +17583,19 @@ impl FsfsRuntime {
             return Ok(());
         }
 
+        crate::lifecycle::reject_sealed_ancestry(&model_root)?;
+        for (_, destination) in &missing {
+            crate::lifecycle::reject_sealed_ancestry(destination)?;
+        }
+
         #[cfg(unix)]
         let terminal = {
             use rustix::fs::{Mode, OFlags, fstat, open};
 
             Self::semantic_retry_checkpoint(cx, "interactive_model_provisioning")?;
             let stdin = std::io::stdin();
-            let name = rustix::termios::ttyname(&stdin, Vec::new())
-                .map_err(std::io::Error::from)?;
+            let name =
+                rustix::termios::ttyname(&stdin, Vec::new()).map_err(std::io::Error::from)?;
             // Open a separate file description: duplicating stdin would share
             // NONBLOCK with the shell, including after an ungraceful exit.
             let terminal = open(
@@ -17666,6 +17702,7 @@ impl FsfsRuntime {
             return Ok(());
         }
 
+        crate::lifecycle::reject_sealed_ancestry(&model_root)?;
         fs::create_dir_all(&model_root)?;
         let downloader = ModelDownloader::with_defaults();
         for (manifest, destination) in missing {
@@ -17675,6 +17712,8 @@ impl FsfsRuntime {
                     .cancel_reason()
                     .map_or_else(|| error.to_string(), |reason| reason.to_string()),
             })?;
+            crate::lifecycle::reject_sealed_ancestry(&model_root)?;
+            crate::lifecycle::reject_sealed_ancestry(&destination)?;
             let mut lifecycle = ModelLifecycle::new(
                 manifest.clone(),
                 DownloadConsent::granted(ConsentSource::Interactive),
@@ -17690,6 +17729,8 @@ impl FsfsRuntime {
                 },
             ))
             .await?;
+            Self::semantic_retry_checkpoint(cx, "interactive_model_provisioning")?;
+            crate::lifecycle::reject_sealed_ancestry(&destination)?;
             manifest.promote_verified_installation(&staged, &destination)?;
             println!("  verified {} -> {}", manifest.id, destination.display());
         }
@@ -28209,8 +28250,10 @@ impl FsfsRuntime {
             ));
         }
         self.cli_input.validate_quality_completion()?;
-        if matches!(self.cli_input.command, CliCommand::Index | CliCommand::Watch)
-            && self.cli_input.quality_only
+        if matches!(
+            self.cli_input.command,
+            CliCommand::Index | CliCommand::Watch
+        ) && self.cli_input.quality_only
         {
             if !matches!(command, CliCommand::Index | CliCommand::Watch) {
                 return Err(SearchError::InvalidConfig {
@@ -30242,7 +30285,8 @@ Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --q
               Recovery uses installed models by default. Add --acquire-models to download missing required models first; --offline still forbids acquisition.
               After provisioning, recovery captures the current selection; changes during rebuilding or preview prevent publication. It never retries automatically.
 Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>
-              --quality-only builds a standalone quality tier using installed models, without a fast producer.
+              --quality-only builds a standalone quality tier without a fast producer.
+              Online interactive table runs can offer the missing quality model before building; offline and machine output never prompt.
               Quality-only indexing and watching require complete generations; search them with --quality-only.
               --upgrade-reuse <same-executable|compatible-contract>
               Default: same-executable. On Linux, compatible-contract admits verified reuse across binary upgrades.
@@ -35822,26 +35866,142 @@ mod tests {
             .missing_interactive_model_downloads(&model_root)
             .expect("first-run download selection");
 
-        assert_eq!(missing.len(), 2, "only the enabled fast and quality tiers");
+        assert_eq!(selected.len(), 2, "only the enabled fast and quality tiers");
+        let expected_missing = selected
+            .iter()
+            .filter(|manifest| {
+                !cfg!(feature = "embedded-models")
+                    || (*manifest != &ModelManifest::potion_128m()
+                        && *manifest != &ModelManifest::minilm_v2())
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             missing
                 .iter()
                 .map(|(manifest, _)| manifest)
                 .collect::<Vec<_>>(),
-            selected.iter().collect::<Vec<_>>()
+            expected_missing
         );
-        for (manifest, destination) in missing {
+        for manifest in &selected {
             manifest.validate().expect("valid manifest before consent");
             assert!(manifest.is_production_ready(), "{}", manifest.id);
             assert!(manifest.total_size_bytes() > 0, "{}", manifest.id);
             assert!(manifest.files.iter().all(|file| file.size > 0));
             assert_ne!(manifest.id, "flashrank-nano");
+        }
+        for (manifest, destination) in missing {
             assert_eq!(
                 destination,
                 model_root.join(FsfsRuntime::manifest_install_dir_name(&manifest))
             );
         }
         assert!(!model_root.exists(), "selection must not install anything");
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn quality_only_provisioning_selects_required_models_without_a_fast_dependency() {
+        use frankensearch_embed::RegisteredQualityModel as Quality;
+
+        let directory = tempfile::tempdir().unwrap();
+        let model_root = directory.path().join("missing-models");
+        for command in [CliCommand::Index, CliCommand::Watch] {
+            for quality in [
+                Quality::MiniLmOnnx,
+                Quality::SnowflakeOnnx,
+                Quality::NomicOnnx,
+                Quality::MiniLmNative,
+                Quality::MultilingualNative,
+            ] {
+                let mut config = FsfsConfig::default();
+                "unused-invalid-fast-producer".clone_into(&mut config.indexing.fast_model);
+                config.indexing.quality_model = quality.manifest_id().to_owned();
+                config.search.fast_only = false;
+                config.search.rerank = false;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command,
+                    quality_only: true,
+                    ..CliInput::default()
+                });
+                let selected = runtime.configured_model_manifests();
+                #[allow(clippy::needless_bool)]
+                let supported = if quality.is_native() {
+                    cfg!(feature = "rerank")
+                } else {
+                    cfg!(feature = "semantic-loaders")
+                };
+                if supported {
+                    assert_eq!(selected.unwrap(), vec![quality.download_manifest()]);
+                    let missing = runtime
+                        .missing_interactive_model_downloads(&model_root)
+                        .unwrap();
+                    if cfg!(feature = "embedded-models")
+                        && quality.download_manifest() == ModelManifest::minilm_v2()
+                    {
+                        assert!(missing.is_empty(), "bundled quality needs no acquisition");
+                    } else {
+                        assert_eq!(missing.len(), 1);
+                        assert_eq!(missing[0].0, quality.download_manifest());
+                        assert_eq!(
+                            missing[0].1,
+                            model_root.join(FsfsRuntime::manifest_install_dir_name(&missing[0].0))
+                        );
+                    }
+                } else {
+                    assert!(matches!(
+                        selected,
+                        Err(SearchError::EmbedderUnavailable { model, .. })
+                            if model == quality.manifest_id()
+                    ));
+                }
+                assert!(!model_root.exists(), "selection must be read-only");
+            }
+        }
+    }
+
+    #[test]
+    fn quality_only_provisioning_refuses_disabled_or_deferred_primary() {
+        let mut config = FsfsConfig::default();
+        "unused-invalid-fast-producer".clone_into(&mut config.indexing.fast_model);
+        "all-minilm-l6-v2-native".clone_into(&mut config.indexing.quality_model);
+        config.search.fast_only = false;
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Index,
+            quality_only: true,
+            ..CliInput::default()
+        });
+        let mut missing = runtime.clone();
+        missing.config.indexing.quality_model.clear();
+        assert!(matches!(
+            missing.configured_model_manifests(),
+            Err(SearchError::EmbedderUnavailable { .. })
+        ));
+        let mut unknown = runtime.clone();
+        "not-a-registered-quality-producer".clone_into(&mut unknown.config.indexing.quality_model);
+        assert!(matches!(
+            unknown.configured_model_manifests(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "indexing.quality_model"
+        ));
+        let mut fast_only = runtime.clone();
+        fast_only.config.search.fast_only = true;
+        assert!(matches!(
+            fast_only.configured_model_manifests(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "search.fast_only"
+        ));
+        let mut deferred = runtime.clone();
+        deferred.indexing_quality_deferral =
+            Some(super::IndexingQualityDeferral::ProducerUnavailable);
+        assert!(deferred.configured_model_manifests().is_err());
+        for mode in [
+            DegradationOverrideMode::ForceEmbedDeferred,
+            DegradationOverrideMode::ForceLexicalOnly,
+            DegradationOverrideMode::ForceMetadataOnly,
+            DegradationOverrideMode::ForcePaused,
+        ] {
+            let mut refused = runtime.clone();
+            refused.config.pressure.degradation_override = mode;
+            assert!(refused.configured_model_manifests().is_err());
+        }
     }
 
     #[cfg(feature = "semantic-loaders")]
@@ -35914,9 +36074,15 @@ mod tests {
             };
             if supported {
                 let selected = selected.unwrap();
-                assert_eq!(selected.len(), 2);
                 assert_eq!(selected[0].0.id, "potion-base-32m");
-                assert_eq!(selected[1].0, quality.download_manifest());
+                if cfg!(feature = "embedded-models")
+                    && quality.download_manifest() == ModelManifest::minilm_v2()
+                {
+                    assert_eq!(selected.len(), 1, "bundled quality is already available");
+                } else {
+                    assert_eq!(selected.len(), 2);
+                    assert_eq!(selected[1].0, quality.download_manifest());
+                }
                 assert!(
                     selected
                         .iter()

@@ -3268,7 +3268,12 @@ mod lifecycle_tests {
                 SearchExecutionMode::QualityOnly
             );
             assert!(!generation.path().join(FSFS_VECTOR_INDEX_FILE).exists());
-            assert!(generation.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).is_file());
+            assert!(
+                generation
+                    .path()
+                    .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                    .is_file()
+            );
         }
 
         #[test]
@@ -3296,27 +3301,53 @@ mod lifecycle_tests {
                 let second = publish_tick(&mut watching, &cx).await;
                 assert_quality_primary(&second);
                 assert_eq!(
-                    quality.inputs.lock().unwrap().iter().cloned().collect::<BTreeSet<_>>(),
+                    quality
+                        .inputs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
                     BTreeSet::from([
                         "edited alpha document".to_owned(),
                         "created beta document".to_owned(),
                     ])
                 );
                 assert_eq!(
-                    pinned.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                    pinned
+                        .search(&cx, "document", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
                     1
                 );
                 assert_eq!(
-                    live.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                    live.search(&cx, "document", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
                     2
                 );
                 quality.inputs.lock().unwrap().clear();
 
                 fs::rename(source.join("alpha.md"), source.join("renamed.md")).unwrap();
-                fs::rename(source.join("beta.md"), directory.path().join("removed-beta.md")).unwrap();
+                fs::rename(
+                    source.join("beta.md"),
+                    directory.path().join("removed-beta.md"),
+                )
+                .unwrap();
                 let renamed = publish_tick(&mut watching, &cx).await;
                 assert_quality_primary(&renamed);
-                assert_eq!(*quality.inputs.lock().unwrap(), vec!["edited alpha document"]);
+                assert_eq!(
+                    *quality.inputs.lock().unwrap(),
+                    vec!["edited alpha document"]
+                );
                 let answer = live.search(&cx, "document", 10).await.unwrap();
                 assert_eq!(answer.last().unwrap().hits[0].path, "renamed.md");
                 assert_eq!(answer.last().unwrap().hits.len(), 1);
@@ -3328,7 +3359,8 @@ mod lifecycle_tests {
                 let deadline = watching.last_reconcile + RECONCILE_INTERVAL;
                 let reconciled = require_durable_publication(
                     watching.advance(&cx, deadline).await.unwrap().unwrap(),
-                ).unwrap();
+                )
+                .unwrap();
                 assert_quality_primary(&reconciled);
                 assert_eq!(
                     *quality.inputs.lock().unwrap(),
@@ -3352,11 +3384,24 @@ mod lifecycle_tests {
                     original
                 );
                 assert_eq!(
-                    pinned.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                    pinned
+                        .search(&cx, "document", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
                     1
                 );
                 assert_eq!(
-                    live.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                    live.search(&cx, "document", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
                     2
                 );
             });
@@ -3408,7 +3453,11 @@ mod lifecycle_tests {
 
                 for missing in [true, false] {
                     let mut changed = Producer::new("watch-resume-quality");
-                    changed.identity.producer.implementation_revision.push_str("-changed");
+                    changed
+                        .identity
+                        .producer
+                        .implementation_revision
+                        .push_str("-changed");
                     let changed = Arc::new(changed);
                     set_test_quality_embedder(
                         (!missing).then(|| changed.clone() as Arc<dyn Embedder>),
@@ -3416,7 +3465,10 @@ mod lifecycle_tests {
                     let now = Instant::now();
                     lock_changes(&watching.changes).unwrap().record(now, false);
                     assert!(watching.advance(&cx, now + MAX_DEBOUNCE).await.is_err());
-                    assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), selected);
+                    assert_eq!(
+                        fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                        selected
+                    );
                     assert_eq!(
                         fs::read(old.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap(),
                         vectors
@@ -3425,7 +3477,14 @@ mod lifecycle_tests {
                     assert!(changed.inputs.lock().unwrap().is_empty());
                     assert!(fast.inputs.lock().unwrap().is_empty());
                     assert_eq!(
-                        pinned.search(&cx, "document", 10).await.unwrap().last().unwrap().hits.len(),
+                        pinned
+                            .search(&cx, "document", 10)
+                            .await
+                            .unwrap()
+                            .last()
+                            .unwrap()
+                            .hits
+                            .len(),
                         1
                     );
                 }
@@ -3457,20 +3516,39 @@ mod lifecycle_tests {
                     Err(SearchError::InvalidConfig { field, .. }) if field == "cli.index.target"
                 ));
                 assert_eq!(candidate_count(&root), allocated);
-                assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), selected);
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    selected
+                );
                 assert!(quality.inputs.lock().unwrap().is_empty());
                 drop(other);
 
                 let outside = require_durable_publication(
-                    runtime.rebuild_retained_generation(&cx, &root).await.unwrap(),
-                ).unwrap();
+                    runtime
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
                 assert_ne!(outside, old);
                 let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
                 let allocated = candidate_count(&root);
-                fs::write(source.join("alpha.md"), "edited after another publisher won").unwrap();
-                assert!(watching.advance(&cx, Instant::now() + RECONCILE_INTERVAL).await.is_err());
+                fs::write(
+                    source.join("alpha.md"),
+                    "edited after another publisher won",
+                )
+                .unwrap();
+                assert!(
+                    watching
+                        .advance(&cx, Instant::now() + RECONCILE_INTERVAL)
+                        .await
+                        .is_err()
+                );
                 assert_eq!(candidate_count(&root), allocated);
-                assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), selected);
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    selected
+                );
                 assert!(quality.inputs.lock().unwrap().is_empty());
                 assert!(fast.inputs.lock().unwrap().is_empty());
             });

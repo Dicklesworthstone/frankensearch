@@ -1689,6 +1689,150 @@ fn complete_watch_binary_keeps_search_available() {
 }
 
 #[cfg(all(feature = "semantic-support", feature = "rerank"))]
+fn decline_model_offer_in_terminal(invocation: &Command) -> Value {
+    let arguments = std::iter::once(invocation.get_program())
+        .chain(invocation.get_args())
+        .map(|argument| argument.to_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    // Exercise the production terminal checks and consent reader with real
+    // terminal descriptors. The only response this harness can send is "no".
+    let mut terminal = Command::new("python3");
+    terminal
+        .arg("-c")
+        .arg(
+            r"import errno, json, os, pty, select, subprocess, sys, time
+master, slave = pty.openpty()
+child = subprocess.Popen(json.loads(sys.argv[1]), stdin=slave, stdout=slave, stderr=slave)
+os.close(slave)
+transcript = bytearray()
+answers = 0
+deadline = time.monotonic() + 30
+try:
+    while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError('quality-only provisioning deadline')
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if not readable:
+            if child.poll() is not None:
+                break
+            continue
+        try:
+            chunk = os.read(master, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        transcript.extend(chunk)
+        if len(transcript) > 1048576:
+            raise RuntimeError('unexpected terminal output volume')
+        prompts = transcript.count(b'consent>')
+        if prompts > 1:
+            raise RuntimeError('quality-only provisioning offered consent more than once')
+        if prompts == 1 and answers == 0:
+            if os.write(master, b'n\n') != 2:
+                raise RuntimeError('could not decline the model offer')
+            answers = 1
+    status = child.wait(timeout=5)
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.wait()
+    os.close(master)
+print(json.dumps({'exit_code': status, 'prompts': transcript.count(b'consent>'),
+                  'answers': answers, 'transcript': transcript.decode('utf-8', errors='replace')}))
+",
+        )
+        .arg(serde_json::to_string(&arguments).unwrap())
+        .current_dir(invocation.get_current_dir().unwrap());
+    for (name, value) in invocation.get_envs() {
+        if let Some(value) = value {
+            terminal.env(name, value);
+        } else {
+            terminal.env_remove(name);
+        }
+    }
+    let output = Process::start(&mut terminal).finish(Duration::from_secs(45));
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(all(feature = "semantic-support", feature = "rerank"))]
+#[test]
+fn complete_quality_only_provisioning_declines_once_and_never_prompts_machine_or_offline() {
+    for (command, index_watch) in [("index", false), ("watch", false), ("index", true)] {
+        for (offline, machine) in [(false, false), (true, false), (false, true)] {
+            let mut fixture = Fixture::new(None, true);
+            let models = fixture.directory.path().join("missing-quality-models");
+            fixture.configure_quality_only(&models);
+            let mut settings: FsfsConfig =
+                toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+            settings.indexing.offline = offline;
+            fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
+            let format = if machine {
+                if command == "watch" || index_watch {
+                    "jsonl"
+                } else {
+                    "json"
+                }
+            } else {
+                "table"
+            };
+            let mut invocation = fixture.command(command, format);
+            invocation
+                .args(["--quality-only", "--no-color"])
+                .env("FSFS_COMPLETE_GENERATIONS", "1");
+            if index_watch {
+                invocation.arg("--watch");
+            }
+            let result = decline_model_offer_in_terminal(&invocation);
+            assert_eq!(
+                result["exit_code"],
+                frankensearch_fsfs::adapters::cli::exit_code::MODEL_UNAVAILABLE,
+                "{command} --watch={index_watch} offline={offline} format={format}: {result}",
+            );
+            let offer = !offline && !machine;
+            assert_eq!(result["prompts"], usize::from(offer), "{result}");
+            assert_eq!(result["answers"], usize::from(offer), "{result}");
+            let transcript = result["transcript"].as_str().unwrap();
+            if offer {
+                assert_eq!(transcript.matches("Download 1 (").count(), 1, "{result}");
+                let offered: Vec<_> = transcript
+                    .lines()
+                    .filter(|line| line.contains("  revision "))
+                    .collect();
+                assert_eq!(offered.len(), 1, "{result}");
+                assert!(
+                    offered[0].contains("all-minilm-l6-v2-native  revision "),
+                    "{result}",
+                );
+                assert_eq!(
+                    transcript.matches("Not downloading.").count(),
+                    1,
+                    "{result}"
+                );
+            } else {
+                assert!(!transcript.contains("Download "), "{result}");
+            }
+            assert!(
+                !transcript.to_ascii_lowercase().contains("potion"),
+                "{result}"
+            );
+            assert!(
+                !transcript.contains("unused-invalid-fast-producer"),
+                "{result}"
+            );
+            assert!(!models.exists(), "refusal created a model cache: {result}");
+            assert!(
+                !fixture.store.exists(),
+                "refusal created a store, generation directory, or current pointer: {result}",
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "semantic-support", feature = "rerank"))]
 #[test]
 #[allow(clippy::too_many_lines)]
 #[ignore = "requires FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR with verified native MiniLM artifacts"]
