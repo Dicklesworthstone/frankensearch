@@ -1347,9 +1347,7 @@ impl FsfsRuntime {
             match prepared.try_load_search_payload_cache(key, &fingerprint) {
                 Ok(Some(payloads)) => {
                     if Box::pin(
-                        prepared.admit_cached_search_producers(
-                            cx, resources, mode, &key.query, &payloads,
-                        ),
+                        prepared.admit_cached_search_producers(cx, resources, key, &payloads),
                     )
                     .await?
                     {

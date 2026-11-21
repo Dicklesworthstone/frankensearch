@@ -11023,13 +11023,9 @@ impl FsfsRuntime {
             let cached = if options.hot_cache_enabled
                 && let Some(payloads) = hot_cache.get(&cache_key)
             {
-                match Box::pin(runtime.admit_cached_search_producers(
-                    cx,
-                    resources,
-                    mode,
-                    &cache_key.query,
-                    payloads,
-                ))
+                match Box::pin(
+                    runtime.admit_cached_search_producers(cx, resources, &cache_key, payloads),
+                )
                 .await
                 {
                     Ok(true) => true,
@@ -13496,8 +13492,7 @@ impl FsfsRuntime {
                     let replay = Box::pin(prepared.admit_cached_search_producers(
                         cx,
                         &mut resources,
-                        mode,
-                        &key.query,
+                        &key,
                         &payloads,
                     ))
                     .await?;
@@ -14677,32 +14672,42 @@ impl FsfsRuntime {
 
     /// All modes return Initial, even for zero hits or quality-only search.
     /// Only a full progressive search can also return a cached Refined.
-    /// Replay must also agree with the stream's counts and displayed ranks.
-    fn cached_answer_matches_request(
-        payloads: &[SearchPayload],
-        query: &str,
-        mode: SearchExecutionMode,
-    ) -> bool {
+    /// Replay must agree with the complete request, not just the stored key:
+    /// each phase is bounded by its limit and contains only eligible documents.
+    fn cached_answer_matches_request(payloads: &[SearchPayload], key: &SearchCacheKey) -> bool {
         let valid_phases = match payloads {
             [initial] => initial.phase == SearchOutputPhase::Initial,
             [initial, refined] => {
-                mode == SearchExecutionMode::Full
+                key.mode == SearchExecutionMode::Full
                     && initial.phase == SearchOutputPhase::Initial
                     && refined.phase == SearchOutputPhase::Refined
             }
             _ => false,
         };
-        valid_phases
-            && payloads.iter().all(|payload| {
-                payload.query == query
-                    && payload.returned_hits == payload.hits.len()
-                    && payload.returned_hits <= payload.total_candidates
-                    && payload
-                        .hits
-                        .iter()
-                        .enumerate()
-                        .all(|(index, hit)| hit.rank == index + 1)
+        if !valid_phases {
+            return false;
+        }
+        let Ok(filter) = SearchFilterExpr::parse(key.filter.as_deref().unwrap_or_default()) else {
+            return false;
+        };
+        payloads.iter().all(|payload| {
+            if payload.query != key.query
+                || payload.returned_hits != payload.hits.len()
+                || payload.returned_hits > payload.total_candidates
+                || payload.returned_hits > key.requested_limit
+            {
+                return false;
+            }
+            let mut documents = ahash::AHashSet::with_capacity(payload.hits.len());
+            payload.hits.iter().enumerate().all(|(index, hit)| {
+                hit.rank == index + 1
+                    && hit.score.is_finite()
+                    && documents.insert(hit.path.as_str())
+                    && filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.matches_doc_id(&hit.path))
             })
+        })
     }
 
     fn search_payloads_cacheable(payloads: &[SearchPayload]) -> bool {
@@ -14759,16 +14764,16 @@ impl FsfsRuntime {
         &self,
         cx: &Cx,
         resources: &mut SearchExecutionResources,
-        mode: SearchExecutionMode,
-        normalized_query: &str,
+        key: &SearchCacheKey,
         payloads: &[SearchPayload],
     ) -> SearchResult<bool> {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
         // The request owns the query identity. A cache key alone cannot attest
         // that every stored phase answered it, including its exclusions.
-        if !Self::cached_answer_matches_request(payloads, normalized_query, mode) {
+        if !Self::cached_answer_matches_request(payloads, key) {
             return Ok(false);
         }
+        let mode = key.mode;
         if let Err(error) = Self::validate_cached_query_exclusions(cx, resources, payloads) {
             Self::exclusion_membership_checkpoint(cx)?;
             if matches!(&error, SearchError::InvalidConfig { field, value, .. }
@@ -14824,7 +14829,7 @@ impl FsfsRuntime {
             // Every nonempty Full/FastOnly request requires primary readiness,
             // even if inference is skipped or returns no hits. Only the actual
             // request's normalized cache key can establish the empty exception.
-            if normalized_query.is_empty() {
+            if key.query.is_empty() {
                 // Empty requests use the live path.
                 return Ok(false);
             }
@@ -15278,7 +15283,7 @@ impl FsfsRuntime {
             return Ok(None);
         }
         if !Self::search_payloads_cacheable(&record.payloads)
-            || !Self::cached_answer_matches_request(&record.payloads, &key.query, key.mode)
+            || !Self::cached_answer_matches_request(&record.payloads, key)
         {
             return Ok(None);
         }
@@ -15292,7 +15297,7 @@ impl FsfsRuntime {
         index_fingerprint: &str,
     ) -> SearchResult<()> {
         if !Self::search_payloads_cacheable(payloads)
-            || !Self::cached_answer_matches_request(payloads, &key.query, key.mode)
+            || !Self::cached_answer_matches_request(payloads, key)
         {
             return Ok(());
         }
@@ -48136,13 +48141,7 @@ mod tests {
             );
             assert!(
                 !runtime
-                    .admit_cached_search_producers(
-                        &cx,
-                        &mut resources,
-                        SearchExecutionMode::Full,
-                        &key.query,
-                        &failed.payloads,
-                    )
+                    .admit_cached_search_producers(&cx, &mut resources, &key, &failed.payloads,)
                     .await
                     .unwrap()
             );
@@ -58017,12 +58016,9 @@ mod tests {
     fn cached_negations_require_membership_before_replay_and_keep_cancellation_terminal() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
-            let (runtime, mut resources) = exclusion_membership_fixture(
-                &cx,
-                temp.path(),
-                &["a.rs", "b.rs", "fast-only.rs"],
-            )
-            .await;
+            let (runtime, mut resources) =
+                exclusion_membership_fixture(&cx, temp.path(), &["a.rs", "b.rs", "fast-only.rs"])
+                    .await;
             let mut payloads = runtime
                 .execute_search_payloads_with_mode_using_resources(
                     &cx,
@@ -58039,25 +58035,28 @@ mod tests {
                 .unwrap();
             assert_eq!(payloads.last().unwrap().phase, SearchOutputPhase::Refined);
             assert!(
-                payloads.last().unwrap().hits.iter().any(|hit| hit.path == "quality-only.rs"),
+                payloads
+                    .last()
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .any(|hit| hit.path == "quality-only.rs"),
             );
             FsfsRuntime::validate_cached_query_exclusions(&cx, &resources, &payloads).unwrap();
             let query = "how do alpha documents rank -banned";
+            let key = runtime
+                .search_cache_key(query, 10, SearchExecutionMode::Full)
+                .unwrap();
             for payload in &mut payloads {
                 payload.query = query.to_owned();
             }
-            FsfsRuntime::validate_cached_query_exclusions(&cx, &resources, &payloads[..1])
-                .unwrap();
-            assert!(!runtime
-                .admit_cached_search_producers(
-                    &cx,
-                    &mut resources,
-                    SearchExecutionMode::Full,
-                    query,
-                    &payloads,
-                )
-                .await
-                .unwrap());
+            FsfsRuntime::validate_cached_query_exclusions(&cx, &resources, &payloads[..1]).unwrap();
+            assert!(
+                !runtime
+                    .admit_cached_search_producers(&cx, &mut resources, &key, &payloads,)
+                    .await
+                    .unwrap()
+            );
             let generation = resources.generation_fingerprint.clone();
             let mut emitted = 0;
             let replay = runtime
@@ -58079,27 +58078,32 @@ mod tests {
             assert!(matches!(
                 runtime
                     .admit_cached_search_producers(
-                        &cx, &mut resources, SearchExecutionMode::Full, query, &payloads,
+                        &cx, &mut resources, &key, &payloads,
                     )
                     .await,
                 Err(SearchError::InvalidConfig { value, .. })
                     if value == "exclusions_without_lexical_index"
             ));
             resources.lexical_index = lexical;
-            cx.cancel_with(asupersync::CancelKind::User, Some("cancel exclusion replay"));
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("cancel exclusion replay"),
+            );
             assert!(matches!(
                 runtime
-                    .admit_cached_search_producers(
-                        &cx, &mut resources, SearchExecutionMode::Full, query, &payloads,
-                    )
+                    .admit_cached_search_producers(&cx, &mut resources, &key, &payloads,)
                     .await,
                 Err(SearchError::Cancelled { .. })
             ));
             assert!(matches!(
                 runtime
                     .replay_cached_search_payloads(
-                        &cx, &mut resources, SearchExecutionMode::Full,
-                        &generation, &payloads, None,
+                        &cx,
+                        &mut resources,
+                        SearchExecutionMode::Full,
+                        &generation,
+                        &payloads,
+                        None,
                     )
                     .await,
                 Err(SearchError::Cancelled { .. })
@@ -58591,8 +58595,7 @@ mod tests {
             assert_exclusions_refused_before_work(runtime.admit_cached_search_producers(
                 &cx,
                 &mut resources,
-                SearchExecutionMode::Full,
-                &key.query,
+                &key,
                 &payloads,
             ));
             assert_exclusions_refused_before_work(runtime.replay_cached_search_payloads(
@@ -69624,7 +69627,12 @@ mod tests {
             };
             let positive = runtime
                 .execute_search_payloads_with_mode_using_resources(
-                    &cx, "catalog", 10, mode, &mut resources, flags,
+                    &cx,
+                    "catalog",
+                    10,
+                    mode,
+                    &mut resources,
+                    flags,
                 )
                 .await
                 .unwrap();
@@ -69640,7 +69648,12 @@ mod tests {
             assert_eq!(key.query, "catalog -banned");
             let valid = runtime
                 .execute_search_payloads_with_mode_using_resources(
-                    &cx, request_query, 10, mode, &mut resources, flags,
+                    &cx,
+                    request_query,
+                    10,
+                    mode,
+                    &mut resources,
+                    flags,
                 )
                 .await
                 .unwrap();
@@ -69648,23 +69661,31 @@ mod tests {
             assert_eq!(valid[0].query, key.query);
             assert_eq!(valid[0].hits.len(), 1);
             assert_eq!(valid[0].hits[0].path, "kept.rs");
-            assert!(runtime
-                .admit_cached_search_producers(&cx, &mut resources, mode, &key.query, &valid)
-                .await
-                .unwrap());
+            assert!(
+                runtime
+                    .admit_cached_search_producers(&cx, &mut resources, &key, &valid)
+                    .await
+                    .unwrap()
+            );
             // The key and generation can agree while the stored answer names
             // a different query. Its positive query must not bypass exclusions.
-            assert!(!runtime
-                .admit_cached_search_producers(&cx, &mut resources, mode, &key.query, &positive)
-                .await
-                .unwrap());
+            assert!(
+                !runtime
+                    .admit_cached_search_producers(&cx, &mut resources, &key, &positive)
+                    .await
+                    .unwrap()
+            );
 
             let fingerprint = resources.generation_fingerprint.clone();
-            runtime.write_search_payload_cache(&key, &valid, &fingerprint).unwrap();
+            runtime
+                .write_search_payload_cache(&key, &valid, &fingerprint)
+                .unwrap();
             let path = runtime.search_cache_path(&key).unwrap();
             let original_bytes = fs::read(&path).unwrap();
             assert_eq!(
-                runtime.try_load_search_payload_cache(&key, &fingerprint).unwrap(),
+                runtime
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap(),
                 Some(valid.clone())
             );
             let mut mixed = valid.clone();
@@ -69674,11 +69695,13 @@ mod tests {
             let mut refined = initial.clone();
             refined.phase = SearchOutputPhase::Refined;
             let pair = vec![initial.clone(), refined.clone()];
-            assert!(FsfsRuntime::cached_answer_matches_request(
-                &pair, &key.query, SearchExecutionMode::Full,
-            ));
+            let full_key = super::SearchCacheKey {
+                mode: SearchExecutionMode::Full,
+                ..key.clone()
+            };
+            assert!(FsfsRuntime::cached_answer_matches_request(&pair, &full_key,));
             assert!(!FsfsRuntime::cached_answer_matches_request(
-                &mixed, &key.query, SearchExecutionMode::Full,
+                &mixed, &full_key,
             ));
             let mut wrong_hit_count = initial.clone();
             wrong_hit_count.returned_hits = 0;
@@ -69703,17 +69726,23 @@ mod tests {
                     .write_search_payload_cache(&key, &mismatched, &fingerprint)
                     .unwrap();
                 assert_eq!(fs::read(&path).unwrap(), original_bytes);
-                let mut record: SearchCacheRecord = serde_json::from_slice(&original_bytes).unwrap();
+                let mut record: SearchCacheRecord =
+                    serde_json::from_slice(&original_bytes).unwrap();
                 record.payloads = mismatched.clone();
                 fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-                assert!(runtime
-                    .try_load_search_payload_cache(&key, &fingerprint)
-                    .unwrap()
-                    .is_none());
+                assert!(
+                    runtime
+                        .try_load_search_payload_cache(&key, &fingerprint)
+                        .unwrap()
+                        .is_none()
+                );
                 let mut emitted = Vec::new();
                 let recovered = runtime
                     .execute_search_payloads_cached_for_cli_with_phase_sink(
-                        &cx, request_query, 10, &mut |payload| {
+                        &cx,
+                        request_query,
+                        10,
+                        &mut |payload| {
                             emitted.push(payload.clone());
                             Ok(())
                         },
@@ -69727,7 +69756,12 @@ mod tests {
                 assert_eq!(recovered[0].hits[0].path, "kept.rs");
                 assert_eq!(recovered[0].returned_hits, 1);
                 assert_eq!(recovered[0].hits[0].rank, 1);
-                assert!(runtime.try_load_search_payload_cache(&key, &fingerprint).unwrap().is_some());
+                assert!(
+                    runtime
+                        .try_load_search_payload_cache(&key, &fingerprint)
+                        .unwrap()
+                        .is_some()
+                );
 
                 let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
                     "query": request_query,
@@ -69739,7 +69773,11 @@ mod tests {
                 for expected_cached in [false, true] {
                     let response = runtime
                         .execute_search_serve_request(
-                            &cx, request.clone(), &mut resources, &mut hot_cache, true,
+                            &cx,
+                            request.clone(),
+                            &mut resources,
+                            &mut hot_cache,
+                            true,
                         )
                         .await
                         .unwrap();
@@ -69754,13 +69792,220 @@ mod tests {
                 // Restore the exact valid record for the next invalid-write control.
                 fs::write(&path, &original_bytes).unwrap();
             }
-            cx.cancel_with(asupersync::CancelKind::User, Some("cancel mismatched cache admission"));
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("cancel mismatched cache admission"),
+            );
             assert!(matches!(
                 runtime
-                    .admit_cached_search_producers(&cx, &mut resources, mode, &key.query, &positive)
+                    .admit_cached_search_producers(&cx, &mut resources, &key, &positive)
                     .await,
                 Err(SearchError::Cancelled { .. })
             ));
+        });
+    }
+
+    #[test]
+    fn search_caches_enforce_limits_filters_and_unique_finite_hits() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("index");
+            let lexical = create_test_quill(&cx, &root.join(super::FSFS_QUILL_ENGINE_DIR)).await;
+            for id in ["kept.rs", "extra.rs", "outside.md"] {
+                lexical
+                    .index_document(&cx, &IndexableDocument::new(id, "catalog cache"))
+                    .await
+                    .unwrap();
+            }
+            lexical.commit(&cx).await.unwrap();
+            drop(lexical);
+            let pointer = CurrentPointer::new(
+                BlueGreenEngine::Quill,
+                super::FSFS_QUILL_ENGINE_DIR,
+                frankensearch_quill::FSLX_FORMAT_VERSION,
+            )
+            .unwrap();
+            publish_current(&root, &pointer).unwrap();
+            let mut config = FsfsConfig::default();
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(root.clone()),
+                ..CliInput::default()
+            });
+            let mode = SearchExecutionMode::LexicalOnly;
+            let query = "catalog";
+            let flags = SearchExecutionFlags {
+                include_snippets: false,
+                persist_explain_session: false,
+            };
+            let mut resources = runtime
+                .prepare_search_execution_resources_at_root_with_modes(&cx, &root, mode, mode)
+                .await
+                .unwrap();
+            let all = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    &cx,
+                    query,
+                    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                    mode,
+                    &mut resources,
+                    flags,
+                )
+                .await
+                .unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].hits.len(), 3);
+            let unbounded_key = runtime
+                .search_cache_key(query, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, mode)
+                .unwrap();
+            assert!(FsfsRuntime::cached_answer_matches_request(
+                &all,
+                &unbounded_key
+            ));
+            // A document may appear in both progressive phases; uniqueness
+            // belongs to each ranked list, not the complete progressive answer.
+            let mut progressive = all.clone();
+            let mut refined = all[0].clone();
+            refined.phase = SearchOutputPhase::Refined;
+            progressive.push(refined);
+            let progressive_key = super::SearchCacheKey {
+                mode: SearchExecutionMode::Full,
+                ..unbounded_key.clone()
+            };
+            assert!(FsfsRuntime::cached_answer_matches_request(
+                &progressive,
+                &progressive_key,
+            ));
+            for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut nonfinite = all.clone();
+                nonfinite[0].hits[0].score = score;
+                assert!(
+                    !runtime
+                        .admit_cached_search_producers(
+                            &cx,
+                            &mut resources,
+                            &unbounded_key,
+                            &nonfinite
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+            let mut duplicate = all.clone();
+            let duplicate_path = duplicate[0].hits[0].path.clone();
+            duplicate[0].hits[1].path = duplicate_path;
+            for (limit, filter, invalid) in [
+                (1, None, all.clone()),
+                (0, None, all.clone()),
+                (10, Some("ext:rs"), all.clone()),
+                (10, Some("path:kept ext:rs"), all),
+                (FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, None, duplicate),
+            ] {
+                let runtime = runtime.clone().with_cli_input(CliInput {
+                    index_dir: Some(root.clone()),
+                    filter: filter.map(str::to_owned),
+                    ..CliInput::default()
+                });
+                let key = runtime.search_cache_key(query, limit, mode).unwrap();
+                let expected = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        &cx,
+                        query,
+                        limit,
+                        mode,
+                        &mut resources,
+                        flags,
+                    )
+                    .await
+                    .unwrap();
+                let expected_hits = expected[0]
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.rank, hit.path.clone(), hit.score))
+                    .collect::<Vec<_>>();
+                assert!(!FsfsRuntime::cached_answer_matches_request(&invalid, &key));
+                let fingerprint = resources.generation_fingerprint.clone();
+                runtime
+                    .write_search_payload_cache(&key, &expected, &fingerprint)
+                    .unwrap();
+                let path = runtime.search_cache_path(&key).unwrap();
+                let original = fs::read(&path).unwrap();
+                assert_eq!(
+                    runtime
+                        .try_load_search_payload_cache(&key, &fingerprint)
+                        .unwrap(),
+                    Some(expected.clone()),
+                );
+                runtime
+                    .write_search_payload_cache(&key, &invalid, &fingerprint)
+                    .unwrap();
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let mut record: SearchCacheRecord = serde_json::from_slice(&original).unwrap();
+                record.payloads = invalid.clone();
+                fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+                assert!(
+                    runtime
+                        .try_load_search_payload_cache(&key, &fingerprint)
+                        .unwrap()
+                        .is_none()
+                );
+                let mut emitted = Vec::new();
+                let recovered = runtime
+                    .execute_search_payloads_cached_for_cli_with_phase_sink(
+                        &cx,
+                        query,
+                        limit,
+                        &mut |payload| {
+                            emitted.push(payload.clone());
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(emitted, recovered);
+                assert!(FsfsRuntime::cached_answer_matches_request(&recovered, &key));
+                assert_eq!(
+                    recovered[0]
+                        .hits
+                        .iter()
+                        .map(|hit| (hit.rank, hit.path.clone(), hit.score))
+                        .collect::<Vec<_>>(),
+                    expected_hits,
+                );
+                let mut hot_cache = HashMap::from([(key.clone(), invalid)]);
+                let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                    "query": query,
+                    "limit": limit,
+                    "mode": mode.label(),
+                    "filter": filter,
+                }))
+                .unwrap();
+                for cached in [false, true] {
+                    let response = runtime
+                        .execute_search_serve_request(
+                            &cx,
+                            request.clone(),
+                            &mut resources,
+                            &mut hot_cache,
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.cached, cached);
+                    assert!(FsfsRuntime::cached_answer_matches_request(
+                        &response.payloads,
+                        &key
+                    ));
+                    assert_eq!(
+                        response.payloads[0]
+                            .hits
+                            .iter()
+                            .map(|hit| (hit.rank, hit.path.clone(), hit.score))
+                            .collect::<Vec<_>>(),
+                        expected_hits,
+                    );
+                }
+            }
         });
     }
 
@@ -71819,13 +72064,7 @@ mod tests {
                 ] {
                     assert!(
                         !runtime
-                            .admit_cached_search_producers(
-                                &cx,
-                                &mut resources,
-                                SearchExecutionMode::Full,
-                                &key.query,
-                                &payloads,
-                            )
+                            .admit_cached_search_producers(&cx, &mut resources, &key, &payloads,)
                             .await
                             .unwrap(),
                         "cached answers without Initial must run the live planner"
