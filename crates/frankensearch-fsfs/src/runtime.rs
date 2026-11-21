@@ -18498,7 +18498,16 @@ impl FsfsRuntime {
         #[cfg(unix)]
         self.quiesce_query_daemon("delete")?;
         let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        // A quality-only reader can outlive fast-tier writer admission. Open
+        // both writers before changing completion state or document membership.
+        let quality_index = if quality_vector_path.try_exists()? {
+            Some(Self::open_vector_index_for_mutation(&quality_vector_path)?)
+        } else {
+            None
+        };
 
+        publication_lease.fence("delete vector tombstones")?;
         let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
         if let Some((_, sentinel)) = window_membership.as_mut() {
             sentinel.generation_complete = false;
@@ -18515,10 +18524,8 @@ impl FsfsRuntime {
         }
         // Mirror the tombstones into the quality tier so a deleted
         // document cannot resurface in REFINED results.
-        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
-        if quality_vector_path.exists() {
+        if let Some(mut quality_index) = quality_index {
             publication_lease.fence("delete quality WAL publication")?;
-            let mut quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
             let quality_deleted = quality_index.soft_delete_batch(&refs)?;
             info!(
                 quality_deleted,
@@ -45815,6 +45822,47 @@ mod tests {
             );
             assert!(after.contains("wal-sibling/keep.md"));
             assert!(!source.exists());
+        });
+    }
+
+    #[test]
+    fn legacy_hybrid_delete_admits_quality_writer_before_tombstoning() {
+        let temp = tempfile::tempdir().expect("index root");
+        let root = temp.path();
+        let fast_path = root.join(super::FSFS_VECTOR_INDEX_FILE);
+        let quality_path = root.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE);
+        fs::create_dir_all(root.join("vector")).expect("vector directory");
+        for path in [&fast_path, &quality_path] {
+            let mut writer = VectorIndex::create(path, "hash-2", 2).expect("create vector tier");
+            writer.write_record("target.md", &[1.0, 0.0]).unwrap();
+            writer.write_record("keep.md", &[0.0, 1.0]).unwrap();
+            writer.finish().expect("publish vector tier");
+        }
+        let fast_before = fs::read(&fast_path).unwrap();
+        let quality_before = fs::read(&quality_path).unwrap();
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            index_dir: Some(root.to_path_buf()),
+            delete_ids: vec!["target.md".to_owned()],
+            format: OutputFormat::Json,
+            ..CliInput::default()
+        });
+        run_test_with_cx(|cx| async move {
+            let quality_reader = VectorIndex::open_read_only(&quality_path).unwrap();
+            let refused = runtime.run_delete_command(&cx).await;
+            assert!(
+                matches!(&refused, Err(SearchError::InvalidConfig { field, value, .. })
+                    if field == "fsvi.map_lock" && Path::new(value) == quality_path),
+                "{refused:?}"
+            );
+            assert_eq!(fs::read(&fast_path).unwrap(), fast_before);
+            assert_eq!(fs::read(&quality_path).unwrap(), quality_before);
+            drop(quality_reader);
+
+            runtime.run_delete_command(&cx).await.expect("retry delete");
+            for path in [&fast_path, &quality_path] {
+                let tier = VectorIndex::open_read_only(path).expect("read published tier");
+                assert_eq!(tier.live_doc_ids().unwrap(), HashSet::from(["keep.md".to_owned()]));
+            }
         });
     }
 
