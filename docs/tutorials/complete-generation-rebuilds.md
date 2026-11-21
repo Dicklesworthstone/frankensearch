@@ -170,6 +170,28 @@ the original selection, then runs the original quality query once against the
 published reader. There is no fast vector artifact, and quality inference failure
 leaves the old selection intact.
 
+To acquire missing models and recover in one command, explicitly add
+`--acquire-models` to the ordinary `fsfs search` recovery request:
+
+```bash
+fsfs search "how does the retry policy work" \
+  --recover-source ./project --index-dir ../project-search \
+  --acquire-models
+```
+
+Acquisition checks the source, destination, query and effective search policy
+before downloading. It uses the registered model manifests and verified model
+installer, reuses already verified models, and acquires only the tiers needed by
+the selected build and search. The rebuild, preview, publication and final search
+then run offline through the same guarded recovery flow. `--offline` and an
+effective offline configuration refuse acquisition. Plain `--recover-source`
+and the dedicated `fsfs-recover` command continue to require installed models.
+After provisioning completes, rebuilding captures the then-current selection.
+A competing publication during rebuilding or preview invalidates that guard;
+recovery never rebases the prepared candidate onto the newer selection.
+The acquisition flag does not authorize release checks, background downloading,
+or daemon forwarding.
+
 Quality-only source builds use one canonical input per semantic document;
 the fast passage-window setting does not expand those rows. Saved incomplete
 builds bind this primary tier as part of their indexing contract, so resume must

@@ -307,9 +307,10 @@ fn run(args: Vec<String>, error_context: &mut ProcessErrorContext) -> SearchResu
     // collect (default), report (dry run), or off.
     let generation_retention = parse_generation_retention(&env_map)?;
     let mut resolved_config = loaded.config;
-    if runtime_cli_input.recover_source.is_some() {
-        // Source recovery is explicitly local, including startup work before
-        // the recovery runtime is entered. Do not refresh release metadata.
+    let source_recovery_requested = runtime_cli_input.recover_source.is_some();
+    if source_recovery_requested && !runtime_cli_input.acquire_models {
+        // Ordinary source recovery remains local. Explicit model acquisition
+        // preserves resolved offline policy for the recovery preflight to check.
         resolved_config.indexing.offline = true;
     }
     let resolved_offline = resolved_config.indexing.offline;
@@ -387,7 +388,10 @@ fn run(args: Vec<String>, error_context: &mut ProcessErrorContext) -> SearchResu
     if !updates_disabled && !cli_quiet && command != CliCommand::Update {
         let _ = maybe_print_update_notice(false);
         // If cache is expired or missing, refresh in background.
+        // Recovery model consent never authorizes an unrelated release request,
+        // including before its source and query preflight has completed.
         let needs_refresh = !resolved_offline
+            && !source_recovery_requested
             && read_version_cache()
                 .as_ref()
                 .is_none_or(|c| !is_cache_valid(c));

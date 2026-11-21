@@ -30235,7 +30235,8 @@ Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --o
 Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --quality-only --ranking-priors --no-ranking-priors --rerank --expand
               --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>
               --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once.
-              Recovery requires installed models; it never downloads, retries automatically, or replaces a newer concurrent publication.
+              Recovery uses installed models by default. Add --acquire-models to download missing required models first; --offline still forbids acquisition.
+              After provisioning, recovery captures the current selection; changes during rebuilding or preview prevent publication. It never retries automatically.
 Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>
               --quality-only builds a standalone quality tier using installed models, without a fast producer.
               Quality-only indexing is one-shot and requires complete generations; search it with --quality-only.
