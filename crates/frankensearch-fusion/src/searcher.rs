@@ -1273,6 +1273,11 @@ impl TwoTierSearcher {
     /// support and document text for every candidate examined. No embedding
     /// identity, vector tier, quality model or reranker participates.
     ///
+    /// Fast inference and lexical retrieval progress independently: a pending
+    /// embedding provider does not defer lexical work. API and transformer
+    /// futures stay on the caller's executor, including after suspension.
+    /// Cancellation from either source ends the phase and drops its sibling.
+    ///
     /// # Errors
     ///
     /// Returns `SearchError::Cancelled` if the operation is cancelled via `cx`.
@@ -2215,35 +2220,14 @@ impl TwoTierSearcher {
             )
         };
 
-        let (embed_timed, lexical_timed) = if is_async_embedder {
-            let start_embed = Instant::now();
-            let embed_res = embed_fast().await;
-            let embed_elapsed = start_embed.elapsed();
-
-            let lex_res = if embed_res
-                .as_ref()
-                .is_err_and(terminal_query_embedding_error)
-            {
-                (None, Duration::ZERO)
-            } else if let Some(lex) = self.lexical.as_ref() {
-                let start_lex = Instant::now();
-                let res = frankensearch_core::with_cancellation(
-                    cx,
-                    "lexical_candidates",
-                    lex.search_candidates(cx, &lexical_query, lexical_budget),
-                )
-                .await;
-                (Some(res), start_lex.elapsed())
-            } else {
-                (None, Duration::ZERO)
-            };
-
-            ((embed_res, embed_elapsed), lex_res)
-        } else {
-            // The common static embedding / lexical pair still executes its
-            // synchronous work in parallel. Retain any suspended future and
-            // continue polling it on the caller's lane with its real Waker;
-            // never drop and retry an operation that has already begun.
+        let (embed_timed, lexical_timed) = {
+            // Both providers are independent phase-one work, even when fast
+            // inference uses I/O or a runtime-owned worker. Poll both before
+            // waiting so a suspended embedder neither serializes retrieval
+            // nor prevents a lexical cancellation from ending the phase.
+            // Static providers keep their first-poll Rayon overlap; every
+            // suspended future resumes on the caller's lane with its real
+            // Waker, without dropping and resubmitting an operation.
             let mut embedding = SearchLane::new(Box::pin(embed_fast()));
             let mut lexical = self.lexical.as_ref().map(|lex| {
                 SearchLane::new(Box::pin(frankensearch_core::with_cancellation(
@@ -2254,7 +2238,9 @@ impl TwoTierSearcher {
             });
             let mut first_poll = true;
             std::future::poll_fn(|task| {
-                let ambient = first_poll.then(Cx::current).flatten();
+                let ambient = (first_poll && !is_async_embedder)
+                    .then(Cx::current)
+                    .flatten();
                 first_poll = false;
                 if let Some(ambient) = ambient {
                     // Context itself is not Sync; the Waker can safely be
@@ -2275,9 +2261,10 @@ impl TwoTierSearcher {
                         },
                     );
                 } else {
-                    // With no caller ambient context, stay here: installing
-                    // None on a Rayon worker cannot mask an unrelated nested
-                    // task's context. Later polls also stay on this async lane.
+                    // API/transformer futures always stay on the caller's
+                    // executor, as do subsequent polls of static providers.
+                    // Without an ambient context, never install None on a
+                    // Rayon worker: it cannot mask an unrelated nested task.
                     embedding.poll(task);
                     if !embedding.has_error(terminal_query_embedding_error)
                         && let Some(lane) = lexical.as_mut()
@@ -5211,6 +5198,8 @@ mod tests {
     struct SilentPendingProvider {
         identity: Option<EmbeddingIdentityBundleV1>,
         category: Option<ModelCategory>,
+        expected_thread: Option<std::thread::ThreadId>,
+        expected_ambient: Option<Cx>,
         started: AtomicU64,
         dropped: AtomicU64,
         cancel_on_drop: bool,
@@ -5237,6 +5226,12 @@ mod tests {
         fn pending<'a, T: Send + 'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, T> {
             Box::pin(async move {
                 let _drop = SilentProviderDrop { provider: self, cx };
+                if let Some(expected) = self.expected_thread {
+                    assert_eq!(std::thread::current().id(), expected);
+                }
+                if let Some(expected) = &self.expected_ambient {
+                    assert_current_ambient(expected);
+                }
                 self.started.fetch_add(1, Ordering::SeqCst);
                 // Deliberately neither observe cancellation nor register a Waker.
                 std::future::pending().await
@@ -7584,6 +7579,72 @@ mod tests {
     }
 
     #[test]
+    fn async_phase_one_starts_both_lanes_and_cancels_pending_work() {
+        for category in [
+            ModelCategory::TransformerEmbedder,
+            ModelCategory::ApiEmbedder,
+        ] {
+            for abandon in [false, true] {
+                let cx = Cx::for_testing();
+                let _ambient = Cx::set_current(Some(cx.clone()));
+                let _restriction = Cx::push_restriction(asupersync::cx::cap::CapMask::none());
+                let expected = Cx::current().unwrap();
+                let (_index_dir, index) = query_admission_index("exact-v2");
+                let fast = Arc::new(SilentPendingProvider {
+                    identity: Some(query_admission_identity("response-fast", 4)),
+                    category: Some(category),
+                    expected_thread: Some(std::thread::current().id()),
+                    expected_ambient: Some(expected.clone()),
+                    ..SilentPendingProvider::default()
+                });
+                let lexical = Arc::new(SilentPendingProvider {
+                    expected_thread: Some(std::thread::current().id()),
+                    expected_ambient: Some(expected.clone()),
+                    ..SilentPendingProvider::default()
+                });
+                let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                    .with_lexical(lexical.clone());
+                let phases = Mutex::new(Vec::new());
+                let mut future = Box::pin(searcher.search(
+                    &cx,
+                    "find the related documents",
+                    5,
+                    |_| None,
+                    |phase| phases.lock().unwrap().push(phase),
+                ));
+                let wake = Arc::new(PendingSearchWake::default());
+                let waker = Waker::from(wake.clone());
+                let mut task = Context::from_waker(&waker);
+                assert!(future.as_mut().poll(&mut task).is_pending());
+                assert_eq!(fast.started.load(Ordering::SeqCst), 1, "{category:?}");
+                assert_eq!(
+                    lexical.started.load(Ordering::SeqCst),
+                    1,
+                    "{category:?}: lexical work must start while inference is suspended"
+                );
+                assert_eq!(fast.dropped.load(Ordering::SeqCst), 0);
+                assert_eq!(lexical.dropped.load(Ordering::SeqCst), 0);
+                if !abandon {
+                    let wakes_before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("cancel both lanes"));
+                    assert!(wake.0.load(Ordering::SeqCst) > wakes_before);
+                    let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
+                        panic!(
+                            "{category:?}: cancellation must finish without provider cooperation"
+                        );
+                    };
+                    assert!(matches!(error, SearchError::Cancelled { .. }));
+                }
+                drop(future);
+                assert_eq!(fast.dropped.load(Ordering::SeqCst), 1);
+                assert_eq!(lexical.dropped.load(Ordering::SeqCst), 1);
+                assert!(phases.lock().unwrap().is_empty());
+                assert_current_ambient(&expected);
+            }
+        }
+    }
+
+    #[test]
     fn yielding_phase_one_providers_preserve_vector_and_hybrid_results() {
         const QUERY: &str = "find the quality document beyond the fast pool";
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -7684,105 +7745,120 @@ mod tests {
 
     #[test]
     fn yielding_parallel_providers_preserve_ambient_context_and_restrictions() {
-        let cx = Cx::for_testing();
-        let (_index_dir, index) = query_admission_index("exact-v2");
-        let original = Cx::current().map(|current| (current.task_id(), current.capabilities()));
-        {
-            let _ambient = Cx::set_current(Some(cx.clone()));
-            let _restriction = Cx::push_restriction(asupersync::cx::cap::CapMask::none());
-            let expected = Cx::current().unwrap();
-            assert!(!expected.capabilities().spawn);
-            assert!(!expected.capabilities().io);
-            let mut fast = query_admission_embedder("fast").with_async_bound_response();
-            fast.category = ModelCategory::StaticEmbedder;
-            fast.expected_ambient = Some(expected.clone());
-            let lexical = Arc::new(YieldingLexical {
-                expected_ambient: Some(expected.clone()),
-                ..YieldingLexical::default()
-            });
-            let searcher = TwoTierSearcher::new(
-                index,
-                Arc::new(fast),
-                TwoTierConfig {
-                    fast_only: true,
-                    ..TwoTierConfig::default()
-                },
-            )
-            .with_lexical(lexical.clone());
-            let mut future = Box::pin(searcher.search_collect(&cx, "find related documents", 5));
-            let wake = Arc::new(PendingSearchWake::default());
-            let waker = Waker::from(wake.clone());
-            let mut task = Context::from_waker(&waker);
-            assert!(future.as_mut().poll(&mut task).is_pending());
-            assert!(wake.0.load(Ordering::SeqCst) >= 2);
-            assert_current_ambient(&expected);
-            let Poll::Ready(Ok((results, metrics))) = future.as_mut().poll(&mut task) else {
-                panic!("both retained operations must finish without resubmission");
-            };
-            assert_eq!(results.len(), 5);
-            assert_eq!(metrics.semantic_candidates, 2);
-            assert_eq!(metrics.lexical_candidates, 3);
-            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(lexical.polls.load(Ordering::SeqCst), 2);
-            assert_current_ambient(&expected);
+        for category in [
+            ModelCategory::StaticEmbedder,
+            ModelCategory::TransformerEmbedder,
+            ModelCategory::ApiEmbedder,
+        ] {
+            let cx = Cx::for_testing();
+            let (_index_dir, index) = query_admission_index("exact-v2");
+            let original = Cx::current().map(|current| (current.task_id(), current.capabilities()));
+            {
+                let _ambient = Cx::set_current(Some(cx.clone()));
+                let _restriction = Cx::push_restriction(asupersync::cx::cap::CapMask::none());
+                let expected = Cx::current().unwrap();
+                assert!(!expected.capabilities().spawn);
+                assert!(!expected.capabilities().io);
+                let mut fast = query_admission_embedder("fast").with_async_bound_response();
+                fast.category = category;
+                fast.expected_ambient = Some(expected.clone());
+                let lexical = Arc::new(YieldingLexical {
+                    expected_ambient: Some(expected.clone()),
+                    ..YieldingLexical::default()
+                });
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(fast),
+                    TwoTierConfig {
+                        fast_only: true,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_lexical(lexical.clone());
+                let mut future =
+                    Box::pin(searcher.search_collect(&cx, "find related documents", 5));
+                let wake = Arc::new(PendingSearchWake::default());
+                let waker = Waker::from(wake.clone());
+                let mut task = Context::from_waker(&waker);
+                assert!(future.as_mut().poll(&mut task).is_pending());
+                assert!(wake.0.load(Ordering::SeqCst) >= 2);
+                assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(lexical.polls.load(Ordering::SeqCst), 1);
+                assert_current_ambient(&expected);
+                let Poll::Ready(Ok((results, metrics))) = future.as_mut().poll(&mut task) else {
+                    panic!("both retained operations must finish without resubmission");
+                };
+                assert_eq!(results.len(), 5);
+                assert_eq!(metrics.semantic_candidates, 2);
+                assert_eq!(metrics.lexical_candidates, 3);
+                assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(lexical.polls.load(Ordering::SeqCst), 2);
+                assert_current_ambient(&expected);
+            }
+            assert_eq!(
+                Cx::current().map(|current| (current.task_id(), current.capabilities())),
+                original
+            );
         }
-        assert_eq!(
-            Cx::current().map(|current| (current.task_id(), current.capabilities())),
-            original
-        );
     }
 
     #[test]
     fn yielding_fast_response_refusal_drops_pending_lexical_without_publishing() {
-        for fault in ["identity", "dimension", "non-finite"] {
-            let cx = Cx::for_testing();
-            let (_index_dir, index) = query_admission_index("exact-v2");
-            let mut fast = query_admission_embedder("fast").with_async_bound_response();
-            fast.category = ModelCategory::StaticEmbedder;
-            match fault {
-                "identity" => {
-                    fast.bound_response_identity = Some(in_memory_identity("foreign", 4));
+        for category in [
+            ModelCategory::StaticEmbedder,
+            ModelCategory::TransformerEmbedder,
+            ModelCategory::ApiEmbedder,
+        ] {
+            for fault in ["identity", "dimension", "non-finite"] {
+                let cx = Cx::for_testing();
+                let (_index_dir, index) = query_admission_index("exact-v2");
+                let mut fast = query_admission_embedder("fast").with_async_bound_response();
+                fast.category = category;
+                match fault {
+                    "identity" => {
+                        fast.bound_response_identity = Some(in_memory_identity("foreign", 4));
+                    }
+                    "dimension" => fast.bound_response_values = Some(vec![1.0]),
+                    _ => fast.bound_response_values = Some(vec![f32::NAN; 4]),
                 }
-                "dimension" => fast.bound_response_values = Some(vec![1.0]),
-                _ => fast.bound_response_values = Some(vec![f32::NAN; 4]),
+                let fast = Arc::new(fast);
+                let lexical = Arc::new(SilentPendingProvider::default());
+                let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                    .with_lexical(lexical.clone());
+                let phases = Mutex::new(Vec::new());
+                let text_reads = AtomicU64::new(0);
+                let mut future = Box::pin(searcher.search(
+                    &cx,
+                    "find the related documents -excluded",
+                    5,
+                    |_| {
+                        text_reads.fetch_add(1, Ordering::SeqCst);
+                        Some("candidate text".to_owned())
+                    },
+                    |phase| phases.lock().unwrap().push(phase),
+                ));
+                let wake = Arc::new(PendingSearchWake::default());
+                let waker = Waker::from(wake.clone());
+                let mut task = Context::from_waker(&waker);
+                assert!(future.as_mut().poll(&mut task).is_pending());
+                assert!(
+                    wake.0.load(Ordering::SeqCst) > 0,
+                    "first poll retains the task Waker"
+                );
+                assert_eq!(lexical.started.load(Ordering::SeqCst), 1);
+                assert_eq!(lexical.dropped.load(Ordering::SeqCst), 0);
+                let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
+                    panic!("{fault}: response refusal must not wait for pending lexical work");
+                };
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { .. } | SearchError::DimensionMismatch { .. }
+                ));
+                assert!(phases.lock().unwrap().is_empty());
+                assert_eq!(text_reads.load(Ordering::SeqCst), 0);
+                assert_eq!(fast.bound_embeds.load(Ordering::SeqCst), 1);
+                assert_eq!(lexical.dropped.load(Ordering::SeqCst), 1);
             }
-            let fast = Arc::new(fast);
-            let lexical = Arc::new(SilentPendingProvider::default());
-            let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
-                .with_lexical(lexical.clone());
-            let phases = Mutex::new(Vec::new());
-            let text_reads = AtomicU64::new(0);
-            let mut future = Box::pin(searcher.search(
-                &cx,
-                "find the related documents -excluded",
-                5,
-                |_| {
-                    text_reads.fetch_add(1, Ordering::SeqCst);
-                    Some("candidate text".to_owned())
-                },
-                |phase| phases.lock().unwrap().push(phase),
-            ));
-            let wake = Arc::new(PendingSearchWake::default());
-            let waker = Waker::from(wake.clone());
-            let mut task = Context::from_waker(&waker);
-            assert!(future.as_mut().poll(&mut task).is_pending());
-            assert!(
-                wake.0.load(Ordering::SeqCst) > 0,
-                "first poll retains the task Waker"
-            );
-            assert_eq!(lexical.started.load(Ordering::SeqCst), 1);
-            assert_eq!(lexical.dropped.load(Ordering::SeqCst), 0);
-            let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
-                panic!("{fault}: response refusal must not wait for pending lexical work");
-            };
-            assert!(matches!(
-                error,
-                SearchError::InvalidConfig { .. } | SearchError::DimensionMismatch { .. }
-            ));
-            assert!(phases.lock().unwrap().is_empty());
-            assert_eq!(text_reads.load(Ordering::SeqCst), 0);
-            assert_eq!(fast.bound_embeds.load(Ordering::SeqCst), 1);
-            assert_eq!(lexical.dropped.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -7813,43 +7889,49 @@ mod tests {
 
     #[test]
     fn yielding_lexical_cancellation_drops_a_suspended_fast_provider() {
-        let cx = Cx::for_testing();
-        let (_index_dir, index) = build_test_index(4);
-        let fast = Arc::new(SilentPendingProvider {
-            category: Some(ModelCategory::StaticEmbedder),
-            ..SilentPendingProvider::default()
-        });
-        let lexical = Arc::new(YieldingLexical {
-            failure: Some(true),
-            ..YieldingLexical::default()
-        });
-        let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
-            .with_lexical(lexical.clone());
-        let phases = Mutex::new(Vec::new());
-        let mut future = Box::pin(searcher.search(
-            &cx,
-            "find the related documents",
-            5,
-            |_| None,
-            |phase| phases.lock().unwrap().push(phase),
-        ));
-        let wake = Arc::new(PendingSearchWake::default());
-        let waker = Waker::from(wake);
-        let mut task = Context::from_waker(&waker);
-        assert!(future.as_mut().poll(&mut task).is_pending());
-        assert_eq!(fast.started.load(Ordering::SeqCst), 1);
-        assert_eq!(fast.dropped.load(Ordering::SeqCst), 0);
-        let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
-            panic!("lexical cancellation must not wait for suspended inference");
-        };
-        assert!(matches!(
-            error,
-            SearchError::Cancelled { phase, .. } if phase == "yielding_lexical"
-        ));
-        assert_eq!(fast.dropped.load(Ordering::SeqCst), 1);
-        assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(lexical.polls.load(Ordering::SeqCst), 2);
-        assert!(phases.lock().unwrap().is_empty());
+        for category in [
+            ModelCategory::StaticEmbedder,
+            ModelCategory::TransformerEmbedder,
+            ModelCategory::ApiEmbedder,
+        ] {
+            let cx = Cx::for_testing();
+            let (_index_dir, index) = build_test_index(4);
+            let fast = Arc::new(SilentPendingProvider {
+                category: Some(category),
+                ..SilentPendingProvider::default()
+            });
+            let lexical = Arc::new(YieldingLexical {
+                failure: Some(true),
+                ..YieldingLexical::default()
+            });
+            let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                .with_lexical(lexical.clone());
+            let phases = Mutex::new(Vec::new());
+            let mut future = Box::pin(searcher.search(
+                &cx,
+                "find the related documents",
+                5,
+                |_| None,
+                |phase| phases.lock().unwrap().push(phase),
+            ));
+            let wake = Arc::new(PendingSearchWake::default());
+            let waker = Waker::from(wake);
+            let mut task = Context::from_waker(&waker);
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            assert_eq!(fast.started.load(Ordering::SeqCst), 1);
+            assert_eq!(fast.dropped.load(Ordering::SeqCst), 0);
+            let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
+                panic!("lexical cancellation must not wait for suspended inference");
+            };
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, .. } if phase == "yielding_lexical"
+            ));
+            assert_eq!(fast.dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.polls.load(Ordering::SeqCst), 2);
+            assert!(phases.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
