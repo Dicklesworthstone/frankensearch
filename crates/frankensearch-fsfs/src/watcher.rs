@@ -7729,12 +7729,14 @@ mod tests {
                 let state = lock_or_recover(&watcher.reconciliation);
                 assert!(state.required);
                 assert!(!state.indexed_snapshot.contains_key(&private));
+                drop(state);
             }
             cx.set_cancel_requested(false);
             watcher.process_events_now(&cx, &[]).await.unwrap();
             let state = lock_or_recover(&watcher.reconciliation);
             assert!(!state.required);
             assert!(state.indexed_snapshot.contains_key(&private));
+            drop(state);
             assert!(pipeline.all_ops().iter().any(|op| matches!(
                 op, WatchIngestOp::Upsert { file_key, .. }
                     if file_key == &normalize_file_key(&private)
@@ -12531,12 +12533,15 @@ mod tests {
                 .unwrap();
                 assert_eq!(skipped, expected_skipped);
                 assert_eq!(pending.by_path.get(&prior.path), Some(&prior));
-                let state = lock_or_recover(&reconciliation);
-                assert!(state.required);
-                assert_eq!(state.epoch, old_token.epoch + 1);
-                assert_ne!(state.planning_token().unwrap(), old_token);
-                assert_eq!(state.unsettled_passes, 0);
-                assert_eq!(state.affected_paths, BTreeSet::from([prior.path]));
+                let reconciliation_state = lock_or_recover(&reconciliation);
+                assert!(reconciliation_state.required);
+                assert_eq!(reconciliation_state.epoch, old_token.epoch + 1);
+                assert_ne!(reconciliation_state.planning_token().unwrap(), old_token);
+                assert_eq!(reconciliation_state.unsettled_passes, 0);
+                assert_eq!(
+                    reconciliation_state.affected_paths,
+                    BTreeSet::from([prior.path])
+                );
             }
         }
     }
@@ -12570,9 +12575,9 @@ mod tests {
                 &roots,
             )
             .unwrap();
-            let state = lock_or_recover(&reconciliation);
-            assert!(!state.required);
-            assert_eq!(state.epoch, 0);
+            let reconciliation_state = lock_or_recover(&reconciliation);
+            assert!(!reconciliation_state.required);
+            assert_eq!(reconciliation_state.epoch, 0);
         }
     }
 
@@ -12642,9 +12647,9 @@ mod tests {
             .unwrap();
             assert!(lock_or_recover(&pipeline.attempts).is_empty());
             {
-                let state = lock_or_recover(&reconciliation);
-                assert!(state.required);
-                assert_eq!(state.indexed_snapshot, baseline);
+                let reconciliation_state = lock_or_recover(&reconciliation);
+                assert!(reconciliation_state.required);
+                assert_eq!(reconciliation_state.indexed_snapshot, baseline);
             }
             run_authoritative_reconciliation(
                 &cx,
