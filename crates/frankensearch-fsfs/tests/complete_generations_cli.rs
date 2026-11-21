@@ -159,13 +159,13 @@ impl Fixture {
         config.indexing.offline = true;
         config.indexing.watch_mode = false;
         // A successful build or query must never resolve this fast producer.
-        config.indexing.fast_model = "unused-invalid-fast-producer".to_owned();
-        config.indexing.quality_model = "all-minilm-l6-v2-native".to_owned();
+        "unused-invalid-fast-producer".clone_into(&mut config.indexing.fast_model);
+        "all-minilm-l6-v2-native".clone_into(&mut config.indexing.quality_model);
         config.indexing.model_dir = model_dir.display().to_string();
         config.search.fast_only = false;
         config.search.rerank = false;
         config.search.quality_timeout_ms = 30_000;
-        config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
         fs::write(&self.config, config.to_toml().expect("TOML")).expect("quality config");
     }
 
