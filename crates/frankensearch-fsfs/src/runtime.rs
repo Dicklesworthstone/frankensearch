@@ -59304,7 +59304,14 @@ mod tests {
         });
     }
 
-    fn assert_exclusions_refused_before_work<T>(
+    fn assert_exclusions_refused_before_work<T>(operation: impl Future<Output = SearchResult<T>>) {
+        assert_exclusions_refused_before_work_with_value(
+            operation,
+            "exclusions_without_lexical_index",
+        );
+    }
+
+    fn assert_exclusions_refused_before_work_with_value<T>(
         operation: impl Future<Output = SearchResult<T>>,
         expected_value: &str,
     ) {
@@ -59389,7 +59396,7 @@ mod tests {
                         } else {
                             "exclusions_without_lexical_index"
                         };
-                    assert_exclusions_refused_before_work(
+                    assert_exclusions_refused_before_work_with_value(
                         runtime.execute_search_phase_artifacts_with_mode_using_resources(
                             &cx,
                             query,
