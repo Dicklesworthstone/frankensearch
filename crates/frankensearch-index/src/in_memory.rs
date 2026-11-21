@@ -3483,6 +3483,36 @@ impl InMemoryVectorIndex {
         let Some(f) = filter else {
             return Ok(None);
         };
+        if let Some(ids) = f.candidate_doc_ids()
+            && ids.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) < count
+        {
+            if ids.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let mut positions = Vec::with_capacity(ids.len());
+            if let Some(map) = self.hash_to_pos() {
+                for id in ids {
+                    if let Some(&position) = map.get(&fnv1a_hash(id.as_bytes()))
+                        && self.doc_ids[position] == *id
+                        && f.matches(id, None)
+                    {
+                        positions.push(position);
+                    }
+                }
+            } else {
+                // Duplicates or hash collisions disable the single-position
+                // map. Gather every matching copy by exact identity so even a
+                // full-width request sizes its heap to selected rows, not N.
+                for (position, id) in self.doc_ids.iter().enumerate() {
+                    if ids.contains(id) && f.matches(id, None) {
+                        positions.push(position);
+                    }
+                }
+            }
+            positions.sort_unstable();
+            let heap = self.scan_gather(&positions, query, limit)?;
+            return Ok(Some(self.resolve_heap(heap)?));
+        }
         let Some(allowed) = f.candidate_hashes() else {
             return Ok(None);
         };
@@ -5973,6 +6003,83 @@ mod tests {
                 two_pass, exact,
                 "filtered two-pass != exact (qseed={qseed})"
             );
+        }
+    }
+
+    #[test]
+    fn exact_id_gather_matches_predicate_scan_and_preserves_duplicate_rows() {
+        use frankensearch_core::{FilterChain, FilterMode, IncludeDocIdsFilter, PredicateFilter};
+
+        for duplicate in [false, true] {
+            let mut ids: Vec<String> = (0..512).map(|i| format!("doc-{i:04}")).collect();
+            let mut vectors: Vec<Vec<f32>> = (0..512)
+                .map(|i| make_normalized_vec(16, i as f32))
+                .collect();
+            if duplicate {
+                ids.push("doc-0003".to_owned());
+                vectors.push(make_normalized_vec(16, 900.0));
+            }
+            let index = InMemoryVectorIndex::from_vectors(ids, vectors, 16).unwrap();
+            let allowed = ["doc-0003", "doc-0097", "doc-0203", "absent"];
+            let exact = FilterChain::new(FilterMode::All)
+                .with(Box::new(IncludeDocIdsFilter::new(allowed)))
+                .with(Box::new(PredicateFilter::new("narrow-candidates", |id| {
+                    id != "doc-0097"
+                })));
+            let predicate = PredicateFilter::new("reference", move |id| {
+                allowed.contains(&id) && id != "doc-0097"
+            });
+            let fingerprint = |hits: Vec<VectorHit>| {
+                hits.into_iter()
+                    .map(|hit| (hit.doc_id, hit.index, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            for seed in [1.0, 42.0, 900.0] {
+                let query = make_normalized_vec(16, seed);
+                for limit in [32, index.record_count()] {
+                    let reference = fingerprint(
+                        index
+                            .bench_scan_filtered(&query, limit, Some(&predicate))
+                            .unwrap(),
+                    );
+                    assert_eq!(reference.len(), if duplicate { 3 } else { 2 });
+                    assert_eq!(
+                        fingerprint(
+                            index
+                                .try_gather_filtered(
+                                    &query,
+                                    limit,
+                                    Some(&exact),
+                                    index.record_count(),
+                                )
+                                .unwrap()
+                                .expect("duplicate rows must still use a selected-row heap")
+                        ),
+                        reference
+                    );
+                    assert_eq!(
+                        fingerprint(index.search_top_k(&query, limit, Some(&exact)).unwrap()),
+                        reference
+                    );
+                    assert_eq!(
+                        fingerprint(
+                            index
+                                .search_top_k_int8_two_pass_filtered(&query, limit, 3, Some(&exact))
+                                .unwrap()
+                        ),
+                        reference
+                    );
+                    assert_eq!(
+                        fingerprint(
+                            index
+                                .search_top_k_4bit_two_pass_filtered(&query, limit, 3, Some(&exact))
+                                .unwrap()
+                        ),
+                        reference
+                    );
+                }
+            }
+            assert_eq!(index.hash_to_pos().is_none(), duplicate);
         }
     }
 

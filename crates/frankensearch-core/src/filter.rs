@@ -51,6 +51,19 @@ pub trait SearchFilter: Send + Sync {
         None
     }
 
+    /// Optional exact document IDs bounding every possible match.
+    ///
+    /// A selective scanner can look up these IDs instead of walking the corpus.
+    /// Unlike [`Self::candidate_hashes`], this set may be a **superset** of the
+    /// matches: scanners must still call [`Self::matches`] for each gathered ID.
+    /// This permits an allow-list to retain its efficient lookup through an
+    /// intersection or exact-ID exclusion, without treating hash collisions as
+    /// document identity. Every matching document must appear in the set,
+    /// independently of metadata, for the duration of a search.
+    fn candidate_doc_ids(&self) -> Option<&HashSet<String>> {
+        None
+    }
+
     /// An exact allow-set that can be safely compiled into a parent chain.
     ///
     /// This has the same membership contract as [`Self::candidate_hashes`],
@@ -146,6 +159,12 @@ impl SearchFilter for ExcludeDocIdsFilter<'_> {
         }
     }
 
+    fn candidate_doc_ids(&self) -> Option<&HashSet<String>> {
+        // Exclusions can only narrow the inner candidate set. Gatherers still
+        // apply this view's exact predicate before admitting a row.
+        self.inner.and_then(SearchFilter::candidate_doc_ids)
+    }
+
     fn immutable_candidate_hashes(&self) -> Option<&DocIdHashSet> {
         if self.excluded.is_empty() {
             self.inner
@@ -157,6 +176,65 @@ impl SearchFilter for ExcludeDocIdsFilter<'_> {
 
     fn name(&self) -> &'static str {
         "exclude_doc_ids"
+    }
+}
+
+/// An exact document-ID allow-list with collision-safe hash pre-screening.
+///
+/// Hash misses are conclusive; hash hits always require a full string match.
+/// Selective vector searches can enumerate the IDs and gather their stored
+/// rows without scanning unrelated documents. Debug output includes only the
+/// count, never the document identifiers.
+#[derive(Clone)]
+pub struct IncludeDocIdsFilter {
+    included: HashSet<String>,
+    included_hashes: DocIdHashSet,
+}
+
+impl IncludeDocIdsFilter {
+    /// Include exactly the supplied IDs. Repeated IDs are deduplicated.
+    #[must_use]
+    pub fn new(ids: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let included: HashSet<String> = ids.into_iter().map(|id| id.as_ref().to_owned()).collect();
+        let included_hashes = included
+            .iter()
+            .map(|id| fnv1a_hash(id.as_bytes()))
+            .collect();
+        Self {
+            included,
+            included_hashes,
+        }
+    }
+}
+
+impl fmt::Debug for IncludeDocIdsFilter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IncludeDocIdsFilter")
+            .field("included_count", &self.included.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SearchFilter for IncludeDocIdsFilter {
+    fn matches(&self, doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
+        self.included.contains(doc_id)
+    }
+
+    fn matches_doc_id_hash(
+        &self,
+        doc_id_hash: u64,
+        _metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        (!self.included_hashes.contains(&doc_id_hash)).then_some(false)
+    }
+
+    fn candidate_doc_ids(&self) -> Option<&HashSet<String>> {
+        Some(&self.included)
+    }
+
+    fn name(&self) -> &'static str {
+        "include_doc_ids"
     }
 }
 
@@ -292,6 +370,19 @@ impl SearchFilter for FilterChain {
         match self.filters.as_slice() {
             [filter] => filter.candidate_hashes(),
             _ => self.compiled_hashes.as_ref(),
+        }
+    }
+
+    fn candidate_doc_ids(&self) -> Option<&HashSet<String>> {
+        match self.filters.as_slice() {
+            [filter] => filter.candidate_doc_ids(),
+            _ if self.mode == FilterMode::All => self
+                .filters
+                .iter()
+                .filter_map(|filter| filter.candidate_doc_ids())
+                .min_by_key(|ids| ids.len()),
+            // An OR can match outside any individual child's allow-list.
+            _ => None,
         }
     }
 
@@ -618,6 +709,63 @@ pub fn fnv1a_hash(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exact_inclusions_require_identity_after_a_hash_match() {
+        let mut filter = IncludeDocIdsFilter::new(["private-canary", "private-canary", "café"]);
+        assert_eq!(filter.candidate_doc_ids().unwrap().len(), 2);
+        assert!(filter.matches("private-canary", None));
+        assert!(filter.matches("café", None));
+        assert!(!filter.matches("cafe", None));
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"cafe"), None),
+            Some(false)
+        );
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"private-canary"), None),
+            None
+        );
+        // Inject a hash pre-screen collision. It must never authorize the ID.
+        filter.included_hashes.insert(fnv1a_hash(b"different"));
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"different"), None),
+            None
+        );
+        assert!(!filter.matches("different", None));
+        assert!(filter.candidate_hashes().is_none());
+        assert!(filter.immutable_candidate_hashes().is_none());
+        assert!(!format!("{filter:?}").contains("private-canary"));
+
+        let empty = IncludeDocIdsFilter::new(std::iter::empty::<&str>());
+        assert!(empty.candidate_doc_ids().unwrap().is_empty());
+        assert!(!empty.matches("anything", None));
+    }
+
+    #[test]
+    fn exact_candidate_bounds_survive_intersection_and_exclusion() {
+        let included = IncludeDocIdsFilter::new(["keep.rs", "drop.rs", "keep.txt"]);
+        let excluded = ExcludeDocIdsFilter::new(Some(&included), ["drop.rs"]);
+        assert_eq!(excluded.candidate_doc_ids(), included.candidate_doc_ids());
+        assert!(!excluded.matches("drop.rs", None));
+        assert!(excluded.matches("keep.rs", None));
+
+        let chain = FilterChain::new(FilterMode::All)
+            .with(Box::new(included))
+            .with(Box::new(PredicateFilter::new("keep-rust", |id| {
+                id == "keep.rs"
+            })))
+            .with(Box::new(IncludeDocIdsFilter::new(["keep.rs", "keep.txt"])));
+        assert_eq!(chain.candidate_doc_ids().unwrap().len(), 2);
+        assert!(chain.matches("keep.rs", None));
+        assert!(!chain.matches("keep.txt", None));
+        assert!(!chain.matches("drop.rs", None));
+
+        let disjunction = FilterChain::new(FilterMode::Any)
+            .with(Box::new(chain))
+            .with(Box::new(PredicateFilter::new("anything", |_| true)));
+        assert!(disjunction.candidate_doc_ids().is_none());
+        assert!(disjunction.matches("outside", None));
+    }
 
     struct ExclusionMetadataFilter;
 

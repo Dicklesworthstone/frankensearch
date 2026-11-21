@@ -112,8 +112,8 @@ pub use explanation::{
     ScoreComponent,
 };
 pub use filter::{
-    BitsetFilter, DateRangeFilter, DocTypeFilter, FilterChain, FilterMode, PredicateFilter,
-    SearchFilter, fnv1a_hash,
+    BitsetFilter, DateRangeFilter, DocTypeFilter, FilterChain, FilterMode, IncludeDocIdsFilter,
+    PredicateFilter, SearchFilter, fnv1a_hash,
 };
 pub use fingerprint::{
     DEFAULT_SEMANTIC_CHANGE_THRESHOLD, DocumentFingerprint, SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD,

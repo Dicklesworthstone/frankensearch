@@ -17,6 +17,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use frankensearch_core::config::ZeroSignalReason;
+use frankensearch_core::filter::IncludeDocIdsFilter;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::{
     BoundQueryEmbedding, Cx, RetrievalTopology, SearchCoverageV1, SearchError, SearchResult,
@@ -1969,6 +1970,46 @@ impl TwoTierIndex {
             });
         }
         Ok(index.search_top_k_classified(query.vector(), k, None)?.hits)
+    }
+
+    /// Complete fast-tier evidence for an already selected document union.
+    ///
+    /// The original fast query must carry its actual producer identity. V2
+    /// owners repeat the full admission join; producer-stamped v1 indices
+    /// require the same complete fingerprint as their revision header. Only
+    /// the requested IDs are scored, exactly and without ANN truncation. Hits
+    /// retain their fast physical or WAL ordinals; absent, deleted and unusable
+    /// vectors contribute no observation. This does not mint retrieval coverage.
+    ///
+    /// # Errors
+    /// Returns a typed identity, dimension, decode or cancellation error before
+    /// allowing incomplete evidence to escape as a successful refinement.
+    pub fn fast_candidates_with_producer(
+        &self,
+        cx: &Cx,
+        query: &BoundQueryEmbedding,
+        doc_ids: &[&str],
+    ) -> SearchResult<Vec<VectorHit>> {
+        tier_checkpoint(cx, "fast_candidate_evidence")?;
+        let index = self.fast_tier();
+        if let Some(pair) = self.fast_source.admitted_pair() {
+            activate_tier(cx, Some(pair), query, "fast", None)?;
+        } else if index.embedder_revision() != query.identity_fingerprint() {
+            return Err(SearchError::InvalidConfig {
+                field: "search_activation.fast.producer_revision".to_owned(),
+                value: index.embedder_revision().to_owned(),
+                reason: "candidate evidence requires the fast query's complete producer identity"
+                    .to_owned(),
+            });
+        }
+        let filter = IncludeDocIdsFilter::new(doc_ids);
+        // The candidate cutoff is in physical rows. Score every admitted copy
+        // of these IDs so duplicate rows cannot hide a different requested ID.
+        // The gather allocates for matched rows, never the corpus-wide bound.
+        let limit = index.record_count().saturating_add(index.wal_entries.len());
+        Ok(index
+            .search_top_k_classified_cancellable(cx, query.vector(), limit, Some(&filter))?
+            .hits)
     }
 
     /// Compute quality-tier scores for fast-index document positions.
@@ -4012,6 +4053,75 @@ mod tests {
         assert_eq!(hits[0].doc_id, "doc-a");
         #[cfg(feature = "ann")]
         assert_eq!(index.ann_fallback_count(), 0);
+    }
+
+    #[test]
+    fn fast_candidate_evidence_is_complete_admitted_and_cancellable() {
+        let dir = temp_index_dir("fast-candidate-evidence");
+        fs::create_dir_all(&dir).unwrap();
+        let identity = EmbeddingIdentityBundleV1::explicit_test_model("candidate-fast", 2);
+        let mut writer = VectorIndex::create_with_revision(
+            &dir.join(VECTOR_INDEX_FAST_FILENAME),
+            "candidate-fast",
+            &identity.fingerprint(),
+            2,
+            Quantization::F16,
+        )
+        .unwrap();
+        for (id, vector) in [
+            ("unrequested", [1.0, 0.0]),
+            ("b", [1.0, 0.0]),
+            ("b", [0.8, 0.6]),
+            ("c", [0.0, 1.0]),
+            ("unusable", [0.0, 0.0]),
+            ("negative", [-1.0, 0.0]),
+        ] {
+            writer.write_record(id, &vector).unwrap();
+        }
+        writer.finish().unwrap();
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+        let cx = Cx::for_testing();
+        let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity.clone()).unwrap();
+        let hits = index
+            .fast_candidates_with_producer(
+                &cx,
+                &query,
+                &["b", "c", "negative", "missing", "unusable", "b"],
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c", "negative"]
+        );
+        assert_eq!(
+            hits.iter().map(|hit| hit.score).collect::<Vec<_>>(),
+            [1.0, 0.0, -1.0]
+        );
+        assert!(hits.iter().all(|hit| hit.index != u32::MAX));
+        let zero = BoundQueryEmbedding::new(vec![0.0, 0.0], identity).unwrap();
+        assert!(
+            index
+                .fast_candidates_with_producer(&cx, &zero, &["b"])
+                .unwrap()
+                .is_empty()
+        );
+        let foreign = BoundQueryEmbedding::new(
+            vec![1.0, 0.0],
+            EmbeddingIdentityBundleV1::explicit_test_model("foreign-fast", 2),
+        )
+        .unwrap();
+        assert!(matches!(
+            index.fast_candidates_with_producer(&cx, &foreign, &[]),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "search_activation.fast.producer_revision"
+        ));
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            index.fast_candidates_with_producer(&cx, &query, &["b"]),
+            Err(SearchError::Cancelled { .. })
+        ));
     }
 
     #[test]

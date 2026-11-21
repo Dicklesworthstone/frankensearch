@@ -27,7 +27,9 @@ use asupersync::fs::remove_file as async_file_remove;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
 use frankensearch_core::config::ZeroSignalReason;
-use frankensearch_core::filter::{ExcludeDocIdsFilter, PredicateFilter, SearchFilter};
+use frankensearch_core::filter::{
+    ExcludeDocIdsFilter, IncludeDocIdsFilter, PredicateFilter, SearchFilter,
+};
 use frankensearch_core::parsed_query::{
     ParsedQuery, normalize_query_whitespace, quote_query_phrase,
 };
@@ -27105,19 +27107,21 @@ impl FsfsRuntime {
             // lacks a quality vector. Score those exact eligible IDs too, with
             // the same embedding and deadline. A retained fast candidate gets
             // the blend's single-source fallback only when its quality vector
-            // is actually absent; quality-discovered IDs are not rescored fast.
+            // is actually absent.
             for hit in &hits {
                 fast_ids.remove(hit.doc_id.as_str());
             }
             if !fast_ids.is_empty() {
                 Self::semantic_retry_checkpoint(&work_cx, "fsfs.quality.score_fast_candidates")?;
-                // Native top-k resolves WAL supersession before selection
-                // (0dc3df2f), so one slot per exact ID holds every live row.
-                let missing_limit = fast_ids.len();
-                let missing_fast =
-                    PredicateFilter::new("fsfs.quality.fast_candidates", move |id| {
-                        fast_ids.contains(id)
-                    });
+                // The native cutoff counts physical rows before deduplicating
+                // document IDs. Include every matching copy so duplicates of
+                // a higher-scoring ID cannot hide a different candidate.
+                let missing_limit = index
+                    .record_count()
+                    .saturating_add(index.wal_record_count());
+                // Expose exact IDs so the native index gathers only their
+                // hash ranges instead of rescanning every document ID.
+                let missing_fast = IncludeDocIdsFilter::new(fast_ids);
                 hits.extend(
                     index
                         .search_top_k_classified(
@@ -57445,6 +57449,106 @@ mod tests {
                     }
                 }
             }
+        });
+    }
+
+    #[test]
+    fn quality_candidate_completion_gathers_sparse_live_ids_with_wal() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().expect("sparse quality completion fixture");
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let path = temp.path().join("sparse-quality.fsvi");
+            let mut writer = VectorIndex::create_with_revision(
+                &path,
+                "blend-quality-2",
+                &test_identity("blend-quality-2", 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            // The retained fast IDs lie below hundreds of unrelated quality
+            // hits. Completion must gather their scores independently of the
+            // quality top-k window, preserving exact document membership.
+            for position in 0..512 {
+                writer
+                    .write_record(&format!("docs/distractor-{position}.md"), &[0.75, 0.25])
+                    .unwrap();
+            }
+            for (doc_id, vector) in [
+                ("src/quality-discovery.rs", [1.0, 0.0]),
+                ("src/retained.rs", [0.25, 0.75]),
+                ("src/replaced.rs", [0.5, 0.5]),
+                ("src/deleted.rs", [0.875, 0.125]),
+                ("src/retained.rs.backup", [0.875, 0.125]),
+            ] {
+                writer.write_record(doc_id, &vector).unwrap();
+            }
+            // Physical copies must not consume the budget for a distinct
+            // candidate whose replacement WAL has a lower score.
+            for _ in 0..32 {
+                writer
+                    .write_record("src/retained.rs", &[0.25, 0.75])
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+
+            let mut writable = VectorIndex::open(&path).unwrap();
+            assert!(writable.soft_delete("src/deleted.rs").unwrap());
+            // Simulate a crash after the replacement WAL is durable but
+            // before its main row is tombstoned. The exact-ID gather must not
+            // bring that stale, higher-scoring row back during completion.
+            let prior_main = fs::read(&path).unwrap();
+            writable.append("src/replaced.rs", &[-0.5, 0.5]).unwrap();
+            writable.append("src/wal-only.rs", &[0.5, 0.5]).unwrap();
+            drop(writable);
+            fs::write(&path, prior_main).unwrap();
+            let quality = VectorIndex::open_read_only(&path).unwrap();
+            assert_eq!(quality.wal_record_count(), 2);
+            assert_eq!(
+                quality.search_top_k(&[1.0, 0.0], 1, None).unwrap()[0].doc_id,
+                "src/quality-discovery.rs"
+            );
+            resources.quality_vector_index = Some(Arc::new(quality));
+
+            let fast_candidates = [
+                "src/retained.rs",
+                "src/replaced.rs",
+                "src/wal-only.rs",
+                "src/deleted.rs",
+                "src/absent.rs",
+                "src/retained.rs",
+            ]
+            .into_iter()
+            .map(|doc_id| SemanticCandidate::new(doc_id, 1.0))
+            .collect::<Vec<_>>();
+            let batch = FsfsRuntime::new(FsfsConfig::default())
+                .quality_candidates(
+                    &cx,
+                    &mut resources,
+                    "how do semantic policies affect ranking",
+                    1,
+                    None,
+                    None,
+                    &fast_candidates,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(batch.zero_signal, None);
+            assert_eq!(
+                batch
+                    .candidates
+                    .iter()
+                    .map(|candidate| (candidate.doc_id.as_str(), candidate.score))
+                    .collect::<Vec<_>>(),
+                [
+                    ("src/quality-discovery.rs", 1.0),
+                    ("src/wal-only.rs", 0.5),
+                    ("src/retained.rs", 0.25),
+                    ("src/replaced.rs", -0.5),
+                ],
+                "quality discovery, sparse completion and WAL supersession must agree"
+            );
         });
     }
 

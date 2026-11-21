@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use frankensearch_core::filter::{PredicateFilter, SearchFilter};
+#[cfg(test)]
+use frankensearch_core::filter::PredicateFilter;
+use frankensearch_core::filter::{IncludeDocIdsFilter, SearchFilter};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use frankensearch_index::{ClassifiedHits, VectorIndex};
 use serde::{Deserialize, Serialize};
@@ -458,27 +460,40 @@ pub(super) fn score_sources(
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    // Budget for every live row the named sources own, at most max_windows
-    // each. Top-k resolves WAL supersession before selection so every usable
-    // source can contribute its best row.
-    let limit = sources
-        .len()
-        .saturating_mul(mapping.map_or(1, |mapping| mapping.max_windows));
-    let named = PredicateFilter::new("fsfs.fast_windows.named_sources", move |source| {
-        sources.contains(source)
-    });
-    let Some(mapping) = mapping else {
-        return Ok(index
-            .search_top_k_classified(query, limit, Some(&named))?
-            .hits);
+    // The native cutoff counts physical rows before ID deduplication. Keep
+    // every matching copy so repeated rows cannot hide another named source.
+    // Sparse gather allocates its heap only for the matching positions.
+    let limit = index
+        .record_count()
+        .saturating_add(index.wal_record_count());
+    // Name the exact vector rows so a small refinement pool can use the
+    // index's sparse gather. The source mapping owns this correspondence;
+    // never infer a source solely from a caller-supplied window-shaped ID.
+    let row_ids = if let Some(mapping) = mapping {
+        let mut row_ids = HashSet::new();
+        for source in &sources {
+            for ordinal in 0..mapping.max_windows {
+                let row = row_id(source, ordinal);
+                if mapping
+                    .rows
+                    .get(&row)
+                    .is_some_and(|window| window.source == *source)
+                {
+                    row_ids.insert(row);
+                }
+            }
+        }
+        row_ids
+    } else {
+        sources
     };
-    let filter = SourceFilter {
-        mapping,
-        inner: Some(&named),
-    };
+    let filter = IncludeDocIdsFilter::new(row_ids);
     let rows = index
         .search_top_k_classified(query, limit, Some(&filter))?
         .hits;
+    let Some(mapping) = mapping else {
+        return Ok(rows);
+    };
     Ok(collapse_rows(mapping, rows)?
         .into_iter()
         .map(|(hit, _)| hit)
@@ -711,6 +726,14 @@ mod tests {
         let plan = plan(&"x".repeat(4_000), 3).unwrap();
         assert_eq!(plan.windows.len(), 3);
         let mut writer = VectorIndex::create(&path, "test", 2).unwrap();
+        // Keep named rows sparse enough to exercise the exact-ID gather,
+        // with unrelated sources all outranking the requested documents.
+        let distractors = (0..512)
+            .map(|position| format!("docs/unrequested-{position}.rs"))
+            .collect::<Vec<_>>();
+        for source in &distractors {
+            writer.write_record(source, &[1.0, 0.0]).unwrap();
+        }
         for ordinal in 0..3 {
             // Every src/b.rs window outranks src/a.rs's best one, so a budget
             // of one row per named source loses src/a.rs entirely.
@@ -723,6 +746,13 @@ mod tests {
                 .unwrap();
             writer
                 .write_record(&row_id("src/unnamed.rs", ordinal), &[1.0, 0.0])
+                .unwrap();
+        }
+        // Duplicate physical rows must not displace src/orthogonal.rs even
+        // though its score is below every usable row of the other sources.
+        for _ in 0..40 {
+            writer
+                .write_record(&row_id("src/a.rs", 2), &[0.4, 0.0])
                 .unwrap();
         }
         writer.write_record("src/legacy.rs", &[1.0, 0.0]).unwrap();
@@ -748,7 +778,8 @@ mod tests {
             ["src/a.rs", "src/b.rs", "src/unnamed.rs"]
                 .into_iter()
                 .map(|source| (source, &plan))
-                .chain([("src/legacy.rs", &single), ("src/orthogonal.rs", &single)]),
+                .chain([("src/legacy.rs", &single), ("src/orthogonal.rs", &single)])
+                .chain(distractors.iter().map(|source| (source.as_str(), &single))),
             &index.live_doc_ids().unwrap(),
         )
         .unwrap();
@@ -788,6 +819,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let internal_id = row_id("src/a.rs", 2);
+        assert!(
+            score_sources(&index, &[1.0, 0.0], named(&[&internal_id]), Some(&mapping))
+                .unwrap()
+                .is_empty(),
+            "an internal row ID must not impersonate an admitted source"
+        );
 
         // A crash between a WAL append and the main-row tombstone leaves both
         // physical rows live; the named source scores as its WAL replacement.
@@ -804,7 +842,8 @@ mod tests {
         std::fs::write(&flat_path, prior_main).unwrap();
         let flat = VectorIndex::open_read_only(&flat_path).unwrap();
         assert_eq!(flat.wal_record_count(), 1);
-        let flat_scores = score_sources(&flat, &[1.0, 0.0], named(&["x.rs", "y.rs"]), None).unwrap();
+        let flat_scores =
+            score_sources(&flat, &[1.0, 0.0], named(&["x.rs", "y.rs"]), None).unwrap();
         assert_eq!(
             scores(flat_scores),
             [("y.rs".to_owned(), 300.0), ("x.rs".to_owned(), 100.0)]

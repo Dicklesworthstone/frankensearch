@@ -1,13 +1,13 @@
 //! Brute-force top-k vector search over an opened [`crate::VectorIndex`].
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::OnceLock;
 
 use ahash::AHashSet;
 
 use frankensearch_core::config::ZeroSignalReason;
-use frankensearch_core::filter::{DocIdHashSet, ExcludeDocIdsFilter, SearchFilter};
+use frankensearch_core::filter::{DocIdHashSet, ExcludeDocIdsFilter, SearchFilter, fnv1a_hash};
 use frankensearch_core::{Cx, SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
 
@@ -478,6 +478,109 @@ impl VectorIndex {
         )
     }
 
+    /// Classified exact scoring for an already admitted query, retaining
+    /// physical copies until unusable rows have been removed. Cancellation
+    /// never returns a partial candidate batch.
+    pub(crate) fn search_top_k_classified_cancellable(
+        &self,
+        cx: &Cx,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<ClassifiedHits> {
+        ScanCancellation::checkpoint(cx)?;
+        self.ensure_query_dimension(query)?;
+        if let Some(reason) = query_zero_signal(query, limit)? {
+            return Ok(ClassifiedHits::empty(reason));
+        }
+        let result = classified_candidates_controlled(
+            limit,
+            self.record_count().saturating_add(self.wal_entries.len()),
+            |candidate_limit| {
+                self.search_top_k_controlled::<false>(
+                    query,
+                    candidate_limit,
+                    filter,
+                    SearchParams::default(),
+                    cx,
+                )
+            },
+            |hit| self.classified_hit_is_usable(hit),
+            || self.classified_search_census_cancellable(cx, filter.is_some()),
+            cx,
+        );
+        ScanCancellation::checkpoint(cx)?;
+        let mut classified = result?;
+        classified.hits = deduplicate_ranked_hits(classified.hits);
+        ScanCancellation::checkpoint(cx)?;
+        Ok(classified)
+    }
+
+    fn classified_search_census_cancellable(
+        &self,
+        cx: &Cx,
+        had_filter: bool,
+    ) -> SearchResult<(bool, ZeroSignalReason)> {
+        if self.wal_entries.is_empty() {
+            let (usable, reason) = self.owner_search_census(cx, false)?;
+            return Ok((
+                usable,
+                if usable && had_filter {
+                    ZeroSignalReason::FilterEliminatedAll
+                } else {
+                    reason
+                },
+            ));
+        }
+        let mut replaced = AHashSet::with_capacity(self.wal_entries.len());
+        let mut usable_wal = false;
+        for (offset, entry) in self.wal_entries.iter().enumerate() {
+            cx.checkpoint_at(offset)?;
+            replaced.insert(entry.doc_id.as_str());
+            usable_wal = usable_wal || crate::vector_signal_usable(&entry.embedding);
+            if usable_wal && had_filter {
+                ScanCancellation::checkpoint(cx)?;
+                return Ok((true, ZeroSignalReason::FilterEliminatedAll));
+            }
+        }
+        let mut has_usable = usable_wal;
+        let mut all_main_shadowed = true;
+        for row in 0..self.record_count() {
+            cx.checkpoint_at(row)?;
+            if self.is_deleted(row) {
+                continue;
+            }
+            match self.doc_id_at(row) {
+                Ok(id) if replaced.contains(id) => {}
+                Ok(_) => {
+                    all_main_shadowed = false;
+                    has_usable = has_usable || self.is_vector_usable(row);
+                }
+                Err(_) => all_main_shadowed = false,
+            }
+            if has_usable && !all_main_shadowed {
+                ScanCancellation::checkpoint(cx)?;
+                return Ok((
+                    true,
+                    if had_filter {
+                        ZeroSignalReason::FilterEliminatedAll
+                    } else {
+                        ZeroSignalReason::NoUsableVectors
+                    },
+                ));
+            }
+        }
+        ScanCancellation::checkpoint(cx)?;
+        let reason = if has_usable && had_filter {
+            ZeroSignalReason::FilterEliminatedAll
+        } else if usable_wal && all_main_shadowed {
+            ZeroSignalReason::WalOnlyNoLiveRecords
+        } else {
+            ZeroSignalReason::NoUsableVectors
+        };
+        Ok((has_usable, reason))
+    }
+
     /// Rank visible physical copies so their caller can validate them before collapsing IDs.
     pub(super) fn search_top_k_rows(
         &self,
@@ -701,11 +804,14 @@ impl VectorIndex {
         if limit == 0 || (self.record_count() == 0 && self.wal_entries.is_empty()) {
             return Ok(Vec::new());
         }
-        let Some(allowed) = filter.candidate_hashes() else {
-            return self.bench_scan_filtered(query, limit, Some(filter));
-        };
         let mut heap = if self.record_count() > 0 {
-            self.scan_gather_hashes(allowed, query, limit, UncancelledScan)?
+            if let Some(ids) = filter.candidate_doc_ids() {
+                self.scan_gather_doc_ids(ids, filter, query, limit, UncancelledScan)?
+            } else if let Some(allowed) = filter.candidate_hashes() {
+                self.scan_gather_hashes(allowed, query, limit, UncancelledScan)?
+            } else {
+                return self.bench_scan_filtered(query, limit, Some(filter));
+            }
         } else {
             BinaryHeap::with_capacity(limit.min(self.wal_entries.len()).saturating_add(1))
         };
@@ -778,9 +884,14 @@ impl VectorIndex {
             cancel.checkpoint()?;
             // Only an actual superseded winner takes the extra scan. Normal
             // WAL appends preserve the existing selective gather and SIMD path.
-            // Do not forward candidate_hashes: hashes alone cannot represent
-            // the exact-ID exclusion when a collision occurs.
-            heap = if params.parallel_enabled && self.record_count() >= params.parallel_threshold {
+            // Exact-ID candidate bounds survive exclusions: their gather still
+            // checks the full predicate. Hash-only allow-lists cannot safely
+            // represent this view when a collision occurs.
+            heap = if let Some(gathered) =
+                self.try_gather_filtered(query, limit, Some(&visible_main), cancel)?
+            {
+                gathered
+            } else if params.parallel_enabled && self.record_count() >= params.parallel_threshold {
                 self.scan_parallel(
                     query,
                     limit,
@@ -1549,10 +1660,17 @@ impl VectorIndex {
         let Some(active_filter) = filter else {
             return Ok(None);
         };
+        let count = self.record_count();
+        if let Some(ids) = active_filter.candidate_doc_ids()
+            && ids.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) < count
+        {
+            return self
+                .scan_gather_doc_ids(ids, active_filter, query, limit, cancel)
+                .map(Some);
+        }
         let Some(allowed) = active_filter.candidate_hashes() else {
             return Ok(None);
         };
-        let count = self.record_count();
         if count == 0 || allowed.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) >= count {
             return Ok(None);
         }
@@ -1568,6 +1686,39 @@ impl VectorIndex {
         cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         let positions = self.gather_positions_for_hashes(allowed, cancel)?;
+        self.scan_gather_positions(&positions, query, limit, cancel)
+    }
+
+    fn scan_gather_doc_ids(
+        &self,
+        ids: &HashSet<String>,
+        filter: &dyn SearchFilter,
+        query: &[f32],
+        limit: usize,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        cancel.checkpoint()?;
+        let mut positions = Vec::with_capacity(ids.len());
+        for (offset, id) in ids.iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
+            let Some((start, end)) = self.hash_range(fnv1a_hash(id.as_bytes()))? else {
+                continue;
+            };
+            // All physical copies must participate in top-k. A hash collision
+            // is only a lookup candidate and never establishes ID membership.
+            for index in start..end {
+                cancel.checkpoint_at(index - start)?;
+                if !self.is_deleted(index)
+                    && self.doc_id_at(index)? == id
+                    && filter.matches(id, None)
+                {
+                    positions.push(index);
+                }
+            }
+        }
+        cancel.checkpoint()?;
+        positions.sort_unstable();
+        cancel.checkpoint()?;
         self.scan_gather_positions(&positions, query, limit, cancel)
     }
 
@@ -3163,6 +3314,63 @@ mod tests {
     }
 
     #[test]
+    fn selective_exact_ids_gather_matches_scan_and_bounds_predicate_work() {
+        use frankensearch_core::IncludeDocIdsFilter;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct Candidates {
+            ids: IncludeDocIdsFilter,
+            visits: AtomicUsize,
+        }
+        impl SearchFilter for Candidates {
+            fn matches(&self, id: &str, metadata: Option<&serde_json::Value>) -> bool {
+                self.visits.fetch_add(1, AtomicOrdering::Relaxed);
+                self.ids.matches(id, metadata) && id != "doc-097"
+            }
+            fn candidate_doc_ids(&self) -> Option<&HashSet<String>> {
+                self.ids.candidate_doc_ids()
+            }
+            fn name(&self) -> &'static str {
+                "counted-exact-candidates"
+            }
+        }
+
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let path = temp_index_path("exact-id-gather");
+            let mut writer =
+                VectorIndex::create_with_revision(&path, "hash", "test", 2, quantization).unwrap();
+            for i in 0_u16..512 {
+                writer
+                    .write_record(&format!("doc-{i:03}"), &[f32::from(i) + 1.0, 1.0])
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            let index = VectorIndex::open(&path).unwrap();
+            let filter = Candidates {
+                ids: IncludeDocIdsFilter::new(["doc-003", "doc-097", "doc-203", "absent"]),
+                visits: AtomicUsize::new(0),
+            };
+            let query = [1.0, 0.0];
+            let gathered = index
+                .search_top_k(&query, usize::MAX, Some(&filter))
+                .unwrap();
+            assert_eq!(filter.visits.load(AtomicOrdering::Relaxed), 3);
+            assert_eq!(hit_ids(&gathered), ["doc-203", "doc-003"]);
+            filter.visits.store(0, AtomicOrdering::Relaxed);
+            let scanned = index
+                .bench_scan_filtered(&query, usize::MAX, Some(&filter))
+                .unwrap();
+            assert_eq!(filter.visits.load(AtomicOrdering::Relaxed), 512);
+            let fingerprint = |hits: &[VectorHit]| {
+                hits.iter()
+                    .map(|hit| (hit.doc_id.clone(), hit.index, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(fingerprint(&gathered), fingerprint(&scanned));
+        }
+    }
+
+    #[test]
     fn selective_bitset_filter_uses_file_backed_gather() {
         let path = temp_index_path("fsvi-selective-gather");
         let rows: Vec<(String, Vec<f32>)> = (0..256)
@@ -3540,6 +3748,11 @@ mod tests {
         let classified = index.search_top_k_classified(&[1.0, 0.0], 1, None).unwrap();
         assert_eq!(hit_ids(&classified.hits), ["negative"]);
         assert_eq!(classified.zero_signal, None);
+        let cancellable = index
+            .search_top_k_classified_cancellable(&Cx::for_testing(), &[1.0, 0.0], 1, None)
+            .unwrap();
+        assert_eq!(cancellable.hits, classified.hits);
+        assert_eq!(cancellable.zero_signal, classified.zero_signal);
     }
 
     #[test]
