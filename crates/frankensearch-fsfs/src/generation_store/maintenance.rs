@@ -114,6 +114,14 @@ impl fmt::Debug for PreparedGenerationRestore {
 }
 
 impl CompleteGenerationStore {
+    /// Check the existing recovery selection without creating a store or
+    /// retaining publication authority. Missing or malformed bounded text is
+    /// repairable; aliases, special files and oversized evidence are refused.
+    pub(crate) fn validate_recovery_selection(root: &Path) -> SearchResult<()> {
+        super::require_supported_platform()?;
+        selection_evidence(root).map(|_| ())
+    }
+
     /// Begin an explicit independent rebuild when the current selection is damaged.
     ///
     /// Unlike [`Self::begin`], this does not admit or decode the old selection.

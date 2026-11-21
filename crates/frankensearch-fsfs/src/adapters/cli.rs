@@ -206,8 +206,11 @@ pub struct CliInput {
     /// Search or build only the independently admitted quality vector tier.
     pub quality_only: bool,
     /// Explicitly rebuild a complete store from these sources before searching.
-    /// This operation uses locally available models and never downloads them.
+    /// Models must already be available unless acquisition is explicitly requested.
     pub recover_source: Option<PathBuf>,
+    /// Explicit consent to acquire required models before source recovery.
+    /// Only valid for search with `recover_source`; offline policy still applies.
+    pub acquire_models: bool,
     /// Optional target path for index/watch.
     pub target_path: Option<PathBuf>,
     /// Optional explicit index directory override for index/status commands.
@@ -313,6 +316,13 @@ impl CliInput {
 
     pub(crate) fn validate_search_recovery(&self) -> SearchResult<()> {
         let Some(source) = &self.recover_source else {
+            if self.acquire_models {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.search.acquire_models".into(),
+                    value: "--acquire-models".into(),
+                    reason: "--acquire-models requires search with --recover-source DIR and --index-dir STORE".into(),
+                });
+            }
             return Ok(());
         };
         let reason = if self.command != CliCommand::Search {
@@ -343,9 +353,13 @@ impl CliInput {
             Some(
                 "--recover-source cannot be combined with --expand; recovery must verify and replay the exact original query",
             )
-        } else if self.overrides.offline == Some(false) {
+        } else if self.acquire_models && self.overrides.offline == Some(true) {
             Some(
-                "--recover-source uses locally available models and cannot be combined with --online; provision models explicitly before recovery",
+                "--acquire-models cannot be combined with --offline; omit acquisition to recover with installed models",
+            )
+        } else if self.overrides.offline == Some(false) && !self.acquire_models {
+            Some(
+                "--recover-source uses locally available models; --online also requires --acquire-models to authorize recovery model downloads",
             )
         } else if self.target_path.is_some()
             || self.watch
@@ -562,6 +576,7 @@ where
                 input.command = CliCommand::Help;
                 input.command_source = CommandSource::Explicit;
                 input.recover_source = None;
+                input.acquire_models = false;
                 return Ok(input);
             }
             "--roots" => {
@@ -965,6 +980,17 @@ where
                 input.recover_source = Some(PathBuf::from(value));
                 idx += 2;
             }
+            "--acquire-models" => {
+                input.acquire_models = true;
+                idx += 1;
+            }
+            value if value.starts_with("--acquire-models=") => {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.search.acquire_models".into(),
+                    value: value.into(),
+                    reason: "--acquire-models takes no value; use the bare flag to authorize model acquisition, or omit it".into(),
+                });
+            }
             _ => {
                 if command == CliCommand::Search && input.query.is_none() {
                     if flag == "--" {
@@ -1256,6 +1282,7 @@ fn split_long_flag_values(tokens: Vec<String>) -> Vec<String> {
             literal_next = true;
         } else if let Some((flag, value)) = token.split_once('=')
             && flag.starts_with("--")
+            && flag != "--acquire-models"
             && is_known_cli_flag(flag)
         {
             split.push(flag.to_owned());
@@ -1268,62 +1295,66 @@ fn split_long_flag_values(tokens: Vec<String>) -> Vec<String> {
 }
 
 fn is_known_cli_flag(token: &str) -> bool {
-    matches!(
-        token,
-        "--roots"
-            | "--exclude"
-            | "--limit"
-            | "-l"
-            | "--format"
-            | "-f"
-            | "--fast-only"
-            | "--no-fast-only"
-            | "--ranking-priors"
-            | "--no-ranking-priors"
-            | "--quality-only"
-            | "--rerank"
-            | "--no-rerank"
-            | "--offline"
-            | "--online"
-            | "--watch-mode"
-            | "--no-watch-mode"
-            | "--explain"
-            | "-e"
-            | "--stream"
-            | "--daemon"
-            | "--no-daemon"
-            | "--daemon-socket"
-            | "--watch"
-            | "--model"
-            | "--list"
-            | "--verify"
-            | "--output"
-            | "--force"
-            | "--full"
-            | "--complete-quality"
-            | "--upgrade-reuse"
-            | "--check"
-            | "--purge"
-            | "--yes"
-            | "--dry-run"
-            | "--verbose"
-            | "-v"
-            | "--quiet"
-            | "-q"
-            | "--no-color"
-            | "--filter"
-            | "--profile"
-            | "--theme"
-            | "--config"
-            | "--index-dir"
-            | "--recover-source"
-            | "--expand"
-            | "--file"
-            | "--prefix"
-            | "--poll-ms"
-            | "--idle-timeout-ms"
-            | "--stop"
-    )
+    // Keep malformed consent flags in the flag parser. Otherwise an initial
+    // `--acquire-models=false` could become a query plus a bare authorization.
+    token.starts_with("--acquire-models=")
+        || matches!(
+            token,
+            "--roots"
+                | "--exclude"
+                | "--limit"
+                | "-l"
+                | "--format"
+                | "-f"
+                | "--fast-only"
+                | "--no-fast-only"
+                | "--ranking-priors"
+                | "--no-ranking-priors"
+                | "--quality-only"
+                | "--rerank"
+                | "--no-rerank"
+                | "--offline"
+                | "--online"
+                | "--watch-mode"
+                | "--no-watch-mode"
+                | "--explain"
+                | "-e"
+                | "--stream"
+                | "--daemon"
+                | "--no-daemon"
+                | "--daemon-socket"
+                | "--watch"
+                | "--model"
+                | "--list"
+                | "--verify"
+                | "--output"
+                | "--force"
+                | "--full"
+                | "--complete-quality"
+                | "--upgrade-reuse"
+                | "--check"
+                | "--purge"
+                | "--yes"
+                | "--dry-run"
+                | "--verbose"
+                | "-v"
+                | "--quiet"
+                | "-q"
+                | "--no-color"
+                | "--filter"
+                | "--profile"
+                | "--theme"
+                | "--config"
+                | "--index-dir"
+                | "--recover-source"
+                | "--acquire-models"
+                | "--expand"
+                | "--file"
+                | "--prefix"
+                | "--poll-ms"
+                | "--idle-timeout-ms"
+                | "--stop"
+        )
 }
 
 #[cfg(test)]
@@ -1350,6 +1381,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(input.recover_source.as_deref(), Some(Path::new("/sources")));
+        assert!(!input.acquire_models);
         assert_eq!(input.index_dir.as_deref(), Some(Path::new("/store")));
         assert_eq!(input.query.as_deref(), Some("original query"));
         assert_eq!(input.filter.as_deref(), Some("path:src"));
@@ -1362,6 +1394,105 @@ mod tests {
         assert_eq!(input.format, OutputFormat::Toon);
         assert!(!input.daemon);
         assert!(input.target_path.is_none());
+    }
+
+    #[test]
+    fn recovery_model_acquisition_is_explicit_and_preserves_search_policy() {
+        for modifiers in [vec![], vec!["--online"], vec!["--offline", "--online"]] {
+            let mut arguments = vec![
+                "search",
+                "--acquire-models",
+                "original query",
+                "--recover-source=/sources",
+                "--index-dir=/store",
+                "--quality-only",
+                "--filter=path:src ext:rs",
+                "--limit=all",
+                "--rerank",
+                "--stream",
+                "--format=jsonl",
+            ];
+            arguments.extend(modifiers);
+            let input = parse_cli_args(arguments).unwrap();
+            assert!(input.acquire_models);
+            assert!(!input.daemon);
+            assert!(input.quality_only);
+            assert_eq!(input.query.as_deref(), Some("original query"));
+            assert_eq!(input.filter.as_deref(), Some("path:src ext:rs"));
+            assert_eq!(input.overrides.limit, Some(usize::MAX));
+            assert_eq!(input.overrides.rerank, Some(true));
+            assert!(input.stream);
+            assert_eq!(input.format, OutputFormat::Jsonl);
+        }
+    }
+
+    #[test]
+    fn recovery_model_acquisition_refuses_missing_scope_and_offline_policy() {
+        for arguments in [
+            vec!["search", "query", "--acquire-models"],
+            vec!["index", "/sources", "--acquire-models"],
+            vec!["download-models", "--acquire-models"],
+            vec!["--acquire-models"],
+        ] {
+            let error = parse_cli_args(arguments.clone()).unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref field, .. }
+                    if field == "cli.search.acquire_models"),
+                "{arguments:?}: {error}"
+            );
+        }
+        for modifiers in [vec!["--offline"], vec!["--online", "--offline"]] {
+            let mut arguments = vec![
+                "search",
+                "original query",
+                "--recover-source=/sources",
+                "--index-dir=/store",
+                "--acquire-models",
+            ];
+            arguments.extend(modifiers);
+            let error = parse_cli_args(arguments).unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { ref field, ref reason, .. }
+                    if field == "cli.search.recover_source" && reason.contains("--offline")
+            ));
+        }
+        let help = parse_cli_args([
+            "search",
+            "original query",
+            "--recover-source=/sources",
+            "--acquire-models",
+            "--help",
+        ])
+        .unwrap();
+        assert_eq!(help.command, CliCommand::Help);
+        assert!(help.recover_source.is_none());
+        assert!(!help.acquire_models);
+    }
+
+    #[test]
+    fn recovery_model_acquisition_rejects_values_without_converting_them_to_consent() {
+        for value in ["false", "true", "0", "1", "invalid", ""] {
+            let flag = format!("--acquire-models={value}");
+            for query in [None, Some("original query")] {
+                let mut arguments = vec!["search"];
+                arguments.extend(query);
+                arguments.extend([
+                    flag.as_str(),
+                    "--recover-source=/sources",
+                    "--index-dir=/store",
+                ]);
+                let error = parse_cli_args(arguments.clone()).unwrap_err();
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { ref field, .. }
+                        if field == "cli.search.acquire_models"),
+                    "{arguments:?}: {error}"
+                );
+            }
+        }
+        let literal = parse_cli_args(["search", "--", "--acquire-models=false"]).unwrap();
+        assert_eq!(literal.query.as_deref(), Some("--acquire-models=false"));
+        assert!(!literal.acquire_models);
     }
 
     #[test]
