@@ -500,7 +500,17 @@ impl FsfsRuntime {
                 cx,
                 generation.path(),
                 mode,
-                mode,
+                if matches!(
+                    self.cli_input.command,
+                    CliCommand::Serve | CliCommand::Daemon
+                ) {
+                    // Match legacy serving: Quill-present generations narrow
+                    // themselves to lexical, while standalone vector stores
+                    // must open their available tiers before the first query.
+                    SearchExecutionMode::Full
+                } else {
+                    mode
+                },
             ),
         )
         .await?;

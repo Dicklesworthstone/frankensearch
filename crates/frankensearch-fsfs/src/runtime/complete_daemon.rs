@@ -2844,6 +2844,106 @@ mod generation_tests {
 
     #[cfg(feature = "semantic-support")]
     #[test]
+    fn complete_daemon_opens_and_caches_a_published_quality_vector_only_bundle() {
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        scheduler.block_on(async {
+            let cx = Cx::current().unwrap();
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let vectors = directory.path().join("unit-vectors");
+            fs::create_dir(&vectors).unwrap();
+            let mut template = crate::runtime::tests::published_blend_resources(&vectors);
+            let producer = Arc::new(CacheAdmissionEmbedder {
+                inner: template.quality_embedder.take().unwrap().embedder,
+                refuse: std::sync::atomic::AtomicBool::new(false),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                before_identity: std::sync::Mutex::new(None),
+                before_embed: std::sync::Mutex::new(None),
+            });
+            let root = directory.path().join("store");
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let quality_file = crate::runtime::FSFS_VECTOR_QUALITY_INDEX_FILE;
+            fs::create_dir(build.path().join("vector")).unwrap();
+            fs::copy(vectors.join(quality_file), build.path().join(quality_file)).unwrap();
+            // A standalone quality primary is a valid consumer-admitted bundle;
+            // its sealed inventory intentionally contains no lexical or fast tier.
+            let publication = build
+                .publish(&cx, |_, path| {
+                    let index =
+                        frankensearch_index::VectorIndex::open_read_only(path.join(quality_file))?;
+                    FsfsRuntime::admit_quality_generation_for_embedder(&index, producer.as_ref())
+                })
+                .unwrap();
+            let GenerationPublication::Durable(generation) = publication else {
+                panic!("quality fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
+            };
+            assert!(!generation.path().join("lexical").exists());
+            assert!(
+                !generation
+                    .path()
+                    .join(crate::runtime::FSFS_VECTOR_INDEX_FILE)
+                    .exists()
+            );
+            for command in [CliCommand::Serve, CliCommand::Daemon] {
+                let mut config = FsfsConfig::default();
+                config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+                config.indexing.fast_model = "unavailable-fast-model".to_owned();
+                config.indexing.offline = true;
+                config.search.rerank = false;
+                config.search.quality_timeout_ms = 5_000;
+                let runtime = FsfsRuntime::new(config)
+                    .with_daemon_coalescers()
+                    .with_cli_input(CliInput {
+                        command,
+                        index_dir: Some(root.clone()),
+                        ..CliInput::default()
+                    });
+                let mut session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+                let resources = &mut session.reader.resources;
+                assert!(resources.lexical_index.is_none());
+                assert!(resources.vector_index.is_none());
+                assert!(resources.quality_vector_index.is_some());
+                assert!(resources.fast_embedder.is_none() && resources.quality_embedder.is_none());
+                assert!(
+                    !resources.fast_embedder_attempted && !resources.quality_embedder_attempted
+                );
+                // Install the deterministic producer only after proving startup
+                // opened storage without selecting or loading any model.
+                resources.quality_embedder =
+                    Some(crate::runtime::tests::admitted_shared(&producer));
+                let shared = Arc::new(asupersync::sync::Mutex::new((session, HashMap::new())));
+                let bound =
+                    BoundCompleteSocket::bind(root.join(format!("{command:?}.sock"))).unwrap();
+                let cold = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(cold["ok"], true, "{command:?}: {cold}");
+                assert_eq!(cold["cached"], false);
+                assert!(!cold["payloads"][0]["hits"].as_array().unwrap().is_empty());
+                let calls = producer.calls.load(Ordering::SeqCst);
+                let warm = complete_cache_exchange(&cx, &runtime, &shared, &bound).await;
+                assert_eq!(warm["ok"], true, "{command:?}: {warm}");
+                assert_eq!(warm["cached"], true, "{command:?}: {warm}");
+                assert_eq!(warm["payloads"], cold["payloads"]);
+                assert_eq!(producer.calls.load(Ordering::SeqCst), calls);
+                assert!(
+                    shared
+                        .try_lock_owned()
+                        .unwrap()
+                        .0
+                        .reader
+                        .resources
+                        .fast_embedder
+                        .is_none()
+                );
+            }
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
     fn complete_daemon_lexical_startup_retains_positive_resources_and_cached_answers() {
         struct RestoreProviders {
             fast: Option<Arc<dyn frankensearch_core::Embedder>>,
