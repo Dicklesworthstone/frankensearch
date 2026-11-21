@@ -2873,7 +2873,7 @@ mod generation_tests {
             let publication = build
                 .publish(&cx, |_, path| {
                     let index =
-                        frankensearch_index::VectorIndex::open_read_only(path.join(quality_file))?;
+                        frankensearch_index::VectorIndex::open_read_only(&path.join(quality_file))?;
                     FsfsRuntime::admit_quality_generation_for_embedder(&index, producer.as_ref())
                 })
                 .unwrap();
