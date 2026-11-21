@@ -780,6 +780,41 @@ This is the cooperative local store. The complete FSVI v2 authority migration
 remains unfinished. Commands refuse to create a nested index inside a sealed
 generation.
 
+### Recovery from a trusted receipt
+
+The installed CLI exposes receipt-directed recovery through `fsfs recover`.
+Use the generation ID and manifest SHA-256 from a trusted publication receipt;
+recovery never chooses a target by scanning abandoned directories. Inspection
+is read-only by default and does not download models:
+
+```bash
+fsfs recover --index-dir ./search-store \
+  --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256"
+```
+
+To validate a target now and restore it later, save a preparation outside the
+store, then explicitly apply that exact preparation:
+
+```bash
+fsfs recover --index-dir ./search-store \
+  --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256" \
+  --prepare --save-preparation ./recovery-preparation.json
+fsfs recover --index-dir ./search-store \
+  --resume-file ./recovery-preparation.json --apply
+```
+
+A competing publication, changed query policy, missing target, or incompatible
+producer refuses restoration. A saved preparation is not a retention pin.
+After an uncertain publication outcome, use the same preparation with
+`--confirm-durability` to confirm the exact selected target without restoring
+again or loading models.
+
+`fsfs recover --help` also describes source rebuilds with query previews,
+interruptible build handoffs, and artifact repair into new copied generations.
+These operations preserve the original bundles and keep the existing complete
+store's identity and publication checks. The standalone `fsfs-recover` utility
+remains available with the same options and shared implementation.
+
 ## Reproducible Showcase Suite
 
 Use this sequence to reproduce the core demo + benchmark evidence bundle:

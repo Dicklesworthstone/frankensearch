@@ -2830,9 +2830,12 @@ mod tests {
     ];
 
     /// Commands `main` dispatches before `parse_cli_args` ever sees argv. The
-    /// binary's own tests prove them (`tests/live_search_command.rs`); the
-    /// source scan checks that `main.rs` still dispatches each one.
-    const PRE_DISPATCH_COMMANDS: &[(&str, &str)] = &[("fsfs live-search", "\"live-search\"")];
+    /// binary's own tests prove them (`tests/live_search_command.rs` and
+    /// `tests/recovery_cli.rs`); this scan verifies each dispatch in `main.rs`.
+    const PRE_DISPATCH_COMMANDS: &[(&str, &str)] = &[
+        ("fsfs live-search", "\"live-search\""),
+        ("fsfs recover", "\"recover\""),
+    ];
 
     /// Advertised forms that must NEVER parse: the fictional dry-run flags
     /// this contract retired, the nonexistent profile/repro/trace
@@ -3015,8 +3018,8 @@ mod tests {
         }
     }
 
-    /// Help text and completion scripts advertise exactly the commands the
-    /// parser accepts — no more, no less.
+    /// Completion scripts cover parser commands and the installed recovery
+    /// process boundary without reviving fictional commands.
     #[test]
     fn help_and_completion_advertisements_match_the_parser() {
         for shell in [
@@ -3038,6 +3041,10 @@ mod tests {
                     "{shell:?} completion advertises fictional command {fictional}"
                 );
             }
+            assert!(
+                script.contains("recover"),
+                "{shell:?} completion is missing the recovery process entry point"
+            );
         }
     }
 

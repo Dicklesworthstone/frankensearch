@@ -248,7 +248,7 @@ pub fn write_receipt(cx: &Cx, path: &Path, root: &Path, bytes: &[u8]) -> SearchR
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Options, RecoveryAction};
+    use super::super::{Options, RecoveryAction, RecoveryTarget};
     use super::*;
     use std::ffi::OsString;
 
@@ -554,7 +554,7 @@ mod tests {
             assert_eq!(resumed.action, RecoveryAction::Apply);
             assert!(matches!(
                 &resumed.target,
-                crate::RecoveryTarget::Retained { generation, digest }
+                RecoveryTarget::Retained { generation, digest }
                     if generation == &report().generation_id && digest == &report().manifest_sha256
             ));
             assert_eq!(
@@ -572,7 +572,7 @@ mod tests {
             assert!(confirmation.expected_selection_sha256.is_none());
             assert!(matches!(
                 &confirmation.target,
-                crate::RecoveryTarget::Retained { generation, digest }
+                RecoveryTarget::Retained { generation, digest }
                     if generation == &report().generation_id && digest == &report().manifest_sha256
             ));
             for flags in [

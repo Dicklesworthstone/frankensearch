@@ -4,6 +4,7 @@
 #![recursion_limit = "512"]
 
 mod live_search_command;
+mod recovery_command;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -112,6 +113,17 @@ fn allow_missing_explicit_config(command: CliCommand, action: Option<&ConfigActi
 }
 
 fn main() {
+    // Receipt-directed recovery owns its explicit root, configuration and
+    // output. Route it before normal discovery or generic error reporting,
+    // which must never retry a restore or append another recovery response.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "recover")
+    {
+        std::process::exit(i32::from(recovery_command::entry(
+            std::env::args_os().skip(2).collect(),
+        )));
+    }
     // Live subscriptions have a dedicated read-only process boundary. Handle
     // it before UTF-8 conversion, model/config loading and ordinary output
     // envelopes, which must never be appended to the live NDJSON stream.

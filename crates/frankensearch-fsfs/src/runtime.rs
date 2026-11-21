@@ -30179,6 +30179,7 @@ Commands:
   config <action>           Manage configuration
   download-models [model]   Download/verify embedding models
   doctor                    Run local health checks
+  recover [options]         Inspect, prepare, restore or repair a receipted generation (see recover --help)
   update [--check]          Check/apply binary updates
   completions <shell>       Generate shell completions
   uninstall [--yes] [--dry-run] [--purge]  Remove local fsfs artifacts
@@ -30218,7 +30219,7 @@ pub(crate) const fn completion_script(shell: CompletionShell) -> &'static str {
         CompletionShell::Bash => {
             r#"_fsfs_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local choices="search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon --upgrade-reuse"
+    local choices="search serve index watch explain status flush config download-models download doctor recover update completions uninstall help tui version append-batch delete compact daemon --upgrade-reuse"
     if (( COMP_CWORD > 0 )) && [[ "${COMP_WORDS[COMP_CWORD-1]}" == "--upgrade-reuse" ]]; then
         choices="same-executable compatible-contract"
     fi
@@ -30227,10 +30228,10 @@ pub(crate) const fn completion_script(shell: CompletionShell) -> &'static str {
 complete -F _fsfs_complete fsfs"#
         }
         CompletionShell::Zsh => {
-            r#"compdef '_arguments "1: :((search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon))" "--upgrade-reuse[Executable upgrade reuse policy]:policy:(same-executable compatible-contract)"' fsfs"#
+            r#"compdef '_arguments "1: :((search serve index watch explain status flush config download-models download doctor recover update completions uninstall help tui version append-batch delete compact daemon))" "--upgrade-reuse[Executable upgrade reuse policy]:policy:(same-executable compatible-contract)"' fsfs"#
         }
         CompletionShell::Fish => {
-            r#"complete -c fsfs -f -a "search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon"
+            r#"complete -c fsfs -f -a "search serve index watch explain status flush config download-models download doctor recover update completions uninstall help tui version append-batch delete compact daemon"
 complete -c fsfs -l upgrade-reuse -x -a "same-executable compatible-contract" -d "Executable upgrade reuse policy""#
         }
         CompletionShell::PowerShell => {
@@ -30240,7 +30241,7 @@ complete -c fsfs -l upgrade-reuse -x -a "same-executable compatible-contract" -d
     $choices = if ($previous -and $previous.Extent.Text -eq '--upgrade-reuse') {
         'same-executable','compatible-contract'
     } else {
-        'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','update','completions','uninstall','help','tui','version','append-batch','delete','compact','daemon','--upgrade-reuse'
+        'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','recover','update','completions','uninstall','help','tui','version','append-batch','delete','compact','daemon','--upgrade-reuse'
     }
     $choices | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
