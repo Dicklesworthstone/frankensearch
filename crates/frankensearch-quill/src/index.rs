@@ -5273,45 +5273,41 @@ impl PreparedSnapshotTerms {
             })?;
         owned_pattern.extend_from_slice(pattern);
 
-        let mut new_patterns = None;
         let outer_capacity = 1;
         #[cfg(test)]
         let outer_capacity = self
             .glob_reservation_overrides
             .outer_map
             .unwrap_or(outer_capacity);
-        let reserve_failed = if let Some(patterns) = entries.get_mut(&key) {
-            let pattern_capacity = 1;
-            #[cfg(test)]
-            let pattern_capacity = self
-                .glob_reservation_overrides
-                .existing_field_map
-                .unwrap_or(pattern_capacity);
-            patterns.try_reserve(pattern_capacity).is_err()
-        } else if entries.try_reserve(outer_capacity).is_err() {
-            true
-        } else {
-            let mut patterns = HashMap::new();
-            let pattern_capacity = 1;
-            #[cfg(test)]
-            let pattern_capacity = self
-                .glob_reservation_overrides
-                .new_field_map
-                .unwrap_or(pattern_capacity);
-            if patterns.try_reserve(pattern_capacity).is_err() {
-                true
-            } else {
-                new_patterns = Some(patterns);
-                false
-            }
-        };
-        if reserve_failed {
-            return Err(ArgusError::Allocation {
+        let existing_capacity = 1;
+        #[cfg(test)]
+        let existing_capacity = self
+            .glob_reservation_overrides
+            .existing_field_map
+            .unwrap_or(existing_capacity);
+        let existing_reservation = entries
+            .get_mut(&key)
+            .map(|patterns| patterns.try_reserve(existing_capacity));
+        let new_patterns = existing_reservation
+            .map_or_else(
+                || {
+                    entries.try_reserve(outer_capacity)?;
+                    let mut patterns = HashMap::new();
+                    let pattern_capacity = 1;
+                    #[cfg(test)]
+                    let pattern_capacity = self
+                        .glob_reservation_overrides
+                        .new_field_map
+                        .unwrap_or(pattern_capacity);
+                    patterns.try_reserve(pattern_capacity)?;
+                    Ok(Some(patterns))
+                },
+                |reserved| reserved.map(|()| None),
+            )
+            .map_err(|_| ArgusError::Allocation {
                 resource: "snapshot glob cache",
                 count: 1,
-            }
-            .into());
-        }
+            })?;
 
         // Serialize misses so concurrent segment lowerings cannot each scan
         // the complete snapshot. Scorers share the immutable result after

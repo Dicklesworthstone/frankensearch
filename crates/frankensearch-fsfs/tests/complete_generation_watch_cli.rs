@@ -1710,34 +1710,46 @@ fn complete_quality_only_watch_binary_updates_and_restarts_without_a_fast_model(
         let first = wait_for_visible_paths(&fixture, &mut watching, &["alpha.md"], None);
         let first_vectors = fs::read(first.path().join("vector/quality.fsvi")).unwrap();
         let first_manifest = fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap();
-        fs::write(fixture.source.join("alpha.md"), "sharedtoken revised alpha document").unwrap();
-        fs::write(fixture.source.join("beta.md"), "sharedtoken new beta document").unwrap();
+        fs::write(
+            fixture.source.join("alpha.md"),
+            "sharedtoken revised alpha document",
+        )
+        .unwrap();
+        fs::write(
+            fixture.source.join("beta.md"),
+            "sharedtoken new beta document",
+        )
+        .unwrap();
         let edited = wait_for_visible_paths(
             &fixture,
             &mut watching,
             &["alpha.md", "beta.md"],
             Some(first.id()),
         );
-        fs::rename(fixture.source.join("alpha.md"), fixture.source.join("renamed.md")).unwrap();
+        fs::rename(
+            fixture.source.join("alpha.md"),
+            fixture.source.join("renamed.md"),
+        )
+        .unwrap();
         fs::rename(
             fixture.source.join("beta.md"),
             fixture.directory.path().join("removed-beta.md"),
         )
         .unwrap();
-        let renamed = wait_for_visible_paths(
-            &fixture,
-            &mut watching,
-            &["renamed.md"],
-            Some(edited.id()),
+        let renamed =
+            wait_for_visible_paths(&fixture, &mut watching, &["renamed.md"], Some(edited.id()));
+        assert_eq!(
+            fs::read(first.path().join("vector/quality.fsvi")).unwrap(),
+            first_vectors
         );
-        assert_eq!(fs::read(first.path().join("vector/quality.fsvi")).unwrap(), first_vectors);
-        assert_eq!(fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap(), first_manifest);
+        assert_eq!(
+            fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap(),
+            first_manifest
+        );
         watching.stop_gracefully();
 
         // Fresh executable, same standalone quality topology and native producer.
-        let mut restarted = Process::start(
-            fixture.command("watch", "jsonl").arg("--quality-only"),
-        );
+        let mut restarted = Process::start(fixture.command("watch", "jsonl").arg("--quality-only"));
         let warm = wait_for_visible_paths(
             &fixture,
             &mut restarted,
@@ -1755,8 +1767,14 @@ fn complete_quality_only_watch_binary_updates_and_restarts_without_a_fast_model(
             !refused.status.success(),
             "required quality cannot degrade into fast or lexical output"
         );
-        assert_eq!(fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(), selection);
-        assert_eq!(fs::read(warm.path().join("vector/quality.fsvi")).unwrap(), vectors);
+        assert_eq!(
+            fs::read(fixture.store.join("FSFS-CURRENT")).unwrap(),
+            selection
+        );
+        assert_eq!(
+            fs::read(warm.path().join("vector/quality.fsvi")).unwrap(),
+            vectors
+        );
     }
 }
 

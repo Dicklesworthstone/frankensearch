@@ -1634,22 +1634,23 @@ impl TwoTierSearcher {
                     telemetry_root_request_id.as_deref(),
                 ),
             );
-            match timeout(
+            timeout(
                 cx.now(),
                 Duration::from_millis(self.config.quality_timeout_ms),
                 quality_initial,
             )
             .await
-            {
-                Ok(outcome) => outcome,
-                Err(_) => Err(SearchError::SearchTimeout {
+            .unwrap_or_else(|_| {
+                Err(SearchError::SearchTimeout {
                     elapsed_ms: u64::try_from(phase1_start.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
                     budget_ms: self.config.quality_timeout_ms,
-                }),
-            }
+                })
+            })
         } else {
-            self.run_phase1(
+            // Keep the retrieval frame out of the caller's suspended search
+            // future, as the quality paths do with their retrieval futures.
+            let progressive_initial = self.run_phase1(
                 cx,
                 semantic_query,
                 &parsed_query,
@@ -1662,8 +1663,8 @@ impl TwoTierSearcher {
                 &text_fn,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
-            )
-            .await
+            );
+            Box::pin(progressive_initial).await
         };
         let initial = match initial {
             Err(error @ SearchError::Cancelled { .. }) => Err(error),
@@ -2597,33 +2598,34 @@ impl TwoTierSearcher {
 
         cancellation_checkpoint(cx, "quality_initial_search_to_fusion")?;
         let fusion_start = Instant::now();
-        let mut results = if let Some(lexical) = lexical_results.as_ref() {
-            let rrf_config = RrfConfig {
-                k: self.effective_rrf_k(query_class),
-                lexical_weight: self.rrf_lexical_weight,
-                semantic_weight: self.effective_semantic_weight(lexical),
-                tiebreak: self.rrf_tiebreak,
-            };
-            let fused = fuse_by_strategy(
-                self.config.fusion_strategy,
-                lexical,
-                &hits,
-                &[],
-                0.0,
-                target,
-                0,
-                &rrf_config,
-            );
-            fused_hits_to_scored_results(
-                &fused,
-                lexical,
-                self.config.explain,
-                embedder.id(),
-                rrf_config.k,
-            )
-        } else {
-            vector_hits_to_scored_results(&hits, target, &self.config, embedder.id())
-        };
+        let mut results = lexical_results.as_ref().map_or_else(
+            || vector_hits_to_scored_results(&hits, target, &self.config, embedder.id()),
+            |lexical| {
+                let rrf_config = RrfConfig {
+                    k: self.effective_rrf_k(query_class),
+                    lexical_weight: self.rrf_lexical_weight,
+                    semantic_weight: self.effective_semantic_weight(lexical),
+                    tiebreak: self.rrf_tiebreak,
+                };
+                let fused = fuse_by_strategy(
+                    self.config.fusion_strategy,
+                    lexical,
+                    &hits,
+                    &[],
+                    0.0,
+                    target,
+                    0,
+                    &rrf_config,
+                );
+                fused_hits_to_scored_results(
+                    &fused,
+                    lexical,
+                    self.config.explain,
+                    embedder.id(),
+                    rrf_config.k,
+                )
+            },
+        );
         // Shared converters name their input fast. Its admitted identity here
         // is exclusively quality; never expose a quality ordinal as a fast row.
         for result in &mut results {
@@ -7682,7 +7684,7 @@ mod tests {
                     "missing_identity" => quality.identity_refusal = Some("embedder.identity"),
                     "control" => quality.identity = in_memory_identity("response-quality", 6),
                     "wrong_space" => {
-                        quality.identity = query_admission_identity("foreign-quality", 6)
+                        quality.identity = query_admission_identity("foreign-quality", 6);
                     }
                     "wrong_producer" => {
                         quality.identity.producer.backend = "foreign-quality-backend".to_owned();
@@ -7744,7 +7746,7 @@ mod tests {
                 match failure {
                     "space" => {
                         quality.bound_response_identity =
-                            Some(query_admission_identity("foreign", 6))
+                            Some(query_admission_identity("foreign", 6));
                     }
                     "producer" => {
                         let mut identity = quality.identity.clone();
@@ -7907,7 +7909,7 @@ mod tests {
                     .await;
                 match case {
                     "refill_cancel" => {
-                        assert!(matches!(result, Err(SearchError::Cancelled { .. })))
+                        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
                     }
                     "missing_text" => assert!(
                         matches!(result, Err(SearchError::InvalidConfig { field, .. }) if field == "search.exclusion_text")

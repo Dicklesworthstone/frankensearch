@@ -17,15 +17,16 @@ use frankensearch_embed::{
 };
 use frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME;
 
-use super::super::{PreparedRetainedRecovery, retained_recovery_error};
-use super::{
-    FSFS_RERANKER_MODEL_ID, FsfsRuntime, GenerationPublication, RetainedSearchReader,
-    STORE_OVERLAP_REASON, SearchExecutionMode, canonical_store_root, complete_entry_exists,
-    degraded_search_mode, require_durable_publication, retained_search_checkpoint,
+use super::super::{
+    FSFS_RERANKER_MODEL_ID, FsfsRuntime, PreparedRetainedRecovery, RetainedSearchReader,
+    STORE_OVERLAP_REASON, SearchExecutionMode, canonical_store_root, degraded_search_mode,
+    retained_recovery_error, retained_search_checkpoint,
     store_overlaps_source, validate_retained_catalog_path,
 };
 #[cfg(feature = "semantic-support")]
-use super::{select_fast_model, select_quality_model};
+use super::super::{select_fast_model, select_quality_model};
+use super::{complete_entry_exists, require_durable_publication};
+use crate::generation_store::GenerationPublication;
 
 fn validate_cooperative_recovery_root(root: &Path) -> SearchResult<()> {
     // Resolve existing aliases before checking ancestry, just as sealed-bundle
@@ -538,7 +539,7 @@ mod tests {
                             .path()
                             .join("catalog.sqlite")
                             .display()
-                            .to_string()
+                            .to_string();
                     }
                     "shadow" => search.config.search.shadow_mode = true,
                     "filter" => search.cli_input.filter = Some("unsupported:value".to_owned()),
