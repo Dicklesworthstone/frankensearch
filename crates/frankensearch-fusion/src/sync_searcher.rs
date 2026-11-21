@@ -22,8 +22,9 @@ use frankensearch_core::filter::{DocIdHashSet, IncludeDocIdsFilter, SearchFilter
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_core::{
-    FusedHit, PhaseMetrics, ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult,
-    SpaceIdentityAdmission, TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
+    DocId, FusedHit, PhaseMetrics, ScoreSource, ScoredResult, SearchError, SearchPhase,
+    SearchResult, SpaceIdentityAdmission, TwoTierConfig, TwoTierMetrics, VectorHit,
+    ZeroSignalReason,
 };
 use frankensearch_index::{
     ClassifiedHits, InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams, ValidatedFsviBytes,
@@ -145,9 +146,9 @@ pub trait SyncLexicalSearch: Send + Sync {
     ///
     /// Implementations may ignore `query_vec` when they already have external
     /// query context. Return at most `limit` candidates in relevance order;
-    /// fewer candidates means the matching corpus is exhausted. Filtered
-    /// searches count each document ID once and may repeat this call with a
-    /// larger limit to fill the eligible candidate budget.
+    /// fewer candidates means the matching corpus is exhausted. The searcher
+    /// counts each document ID once and may repeat this call with a larger
+    /// limit to fill the eligible candidate budget.
     ///
     /// # Errors
     ///
@@ -682,7 +683,7 @@ impl SyncTwoTierSearcher {
         let Some(lexical) = &context.source else {
             return Ok(None);
         };
-        match search_filtered_lexical(
+        match search_lexical_candidates(
             lexical.as_ref(),
             query_vec,
             limit,
@@ -1735,7 +1736,7 @@ struct SyncFinalRanking {
     space: SyncMmrSpace,
 }
 
-type SyncMetadata = AHashMap<String, Option<Arc<serde_json::Value>>>;
+type SyncMetadata = AHashMap<DocId, Option<Arc<serde_json::Value>>>;
 
 /// Filtering observations and their reader survive from Initial to Refined.
 struct SyncLexicalContext {
@@ -2068,23 +2069,18 @@ fn hydrate_selected_metadata(
         });
     }
     for (id, metadata) in document_ids.iter().zip(metadata) {
-        observations.insert((*id).to_owned(), metadata);
+        observations.insert(DocId::from(*id), metadata);
     }
     Ok(())
 }
 
-fn search_filtered_lexical(
+fn search_lexical_candidates(
     lexical: &dyn SyncLexicalSearch,
     query_vec: &[f32],
     target: usize,
     filter: Option<&dyn SearchFilter>,
     metadata: &mut SyncMetadata,
 ) -> Result<Vec<ScoredResult>, SyncLexicalFailure> {
-    let Some(filter) = filter else {
-        return lexical
-            .search_sync(query_vec, target)
-            .map_err(SyncLexicalFailure::Retrieval);
-    };
     let mut limit = target;
     loop {
         let mut hits = lexical
@@ -2098,7 +2094,7 @@ fn search_filtered_lexical(
         metadata.clear();
         // Keep the best ranked row for each public ID. A later row can still
         // supply its metadata when earlier rows had none.
-        hits.retain(|hit| match metadata.entry(hit.doc_id.to_string()) {
+        hits.retain(|hit| match metadata.entry(hit.doc_id.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(hit.metadata.clone());
                 true
@@ -2110,32 +2106,30 @@ fn search_filtered_lexical(
                 false
             }
         });
-        let unknown: Vec<_> = hits
-            .iter()
-            .filter(|hit| {
-                metadata
-                    .get(hit.doc_id.as_str())
-                    .is_none_or(Option::is_none)
-            })
-            .map(|hit| hit.doc_id.as_str())
-            .collect();
-        // Eager None is unknown, not proof that selected-document hydration
-        // cannot supply metadata. Hydrate before deciding lexical membership.
-        hydrate_selected_metadata(lexical, &unknown, metadata)
-            .map_err(SyncLexicalFailure::Metadata)?;
-        for hit in &mut hits {
-            if hit.metadata.is_none() {
-                hit.metadata = metadata.get(hit.doc_id.as_str()).cloned().flatten();
-            }
+        if filter.is_some() {
+            let unknown: Vec<_> = hits
+                .iter()
+                .filter(|hit| metadata.get(&hit.doc_id).is_some_and(Option::is_none))
+                .map(|hit| hit.doc_id.as_str())
+                .collect();
+            // Eager None is unknown, not proof that selected-document hydration
+            // cannot supply metadata. Hydrate before deciding lexical membership.
+            hydrate_selected_metadata(lexical, &unknown, metadata)
+                .map_err(SyncLexicalFailure::Metadata)?;
         }
-        hits.retain(|hit| filter.matches(&hit.doc_id, hit.metadata.as_deref()));
+        hits.retain_mut(|hit| {
+            if hit.metadata.is_none() {
+                hit.metadata = metadata.get(&hit.doc_id).cloned().flatten();
+            }
+            filter.is_none_or(|filter| filter.matches(&hit.doc_id, hit.metadata.as_deref()))
+        });
         hits.truncate(target);
         let next_limit = limit.saturating_mul(2);
         if hits.len() == target || exhausted || next_limit == limit {
             return Ok(hits);
         }
-        // A fixed pre-filter top-k can contain only rejected documents even
-        // when eligible lexical-only matches exist farther down the ranking.
+        // Duplicate and rejected rows can hide eligible documents below the
+        // requested prefix, even if the backend filled every row in that prefix.
         // Replace the whole batch so scores and metadata always come from one
         // search; never append candidates from different reader generations.
         limit = next_limit;
@@ -5205,7 +5199,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_lexical_refill_counts_distinct_documents() {
+    fn lexical_refill_counts_distinct_documents() {
         use frankensearch_core::filter::DocTypeFilter;
 
         let mut duplicate = lexical_result("repeat", 9.0);
@@ -5241,6 +5235,21 @@ mod tests {
         assert_eq!(metrics.lexical_candidates, 2);
         assert_eq!(results[0].lexical_score, Some(10.0));
         assert_eq!(results[0].metadata.as_deref().unwrap()["doc_type"], "keep");
+
+        let (unfiltered, metrics) = searcher.search_collect(&query, 2).unwrap();
+        assert_eq!(
+            unfiltered
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["repeat", "blocked"]
+        );
+        assert_eq!(metrics.lexical_candidates, 2);
+        assert_eq!(unfiltered[0].lexical_score, Some(10.0));
+        assert_eq!(
+            unfiltered[0].metadata.as_deref().unwrap()["doc_type"],
+            "keep"
+        );
     }
 
     #[test]
