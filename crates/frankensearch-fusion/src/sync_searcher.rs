@@ -924,10 +924,9 @@ impl SyncTwoTierSearcher {
         let phase1_started = Instant::now();
         let mut lexical_context = SyncLexicalContext::new(self.lexical.clone(), filter.is_some())?;
         let lexical_started = Instant::now();
-        let lexical_hits =
+        let mut lexical_hits =
             Self::search_optional_lexical(&mut lexical_context, query_vec, fetch, filter)?;
         metrics.lexical_search_ms = ms(lexical_started.elapsed());
-        metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         let (classified, phase1_vectors_searched) = if query_vec.iter().all(|&value| value == 0.0) {
             // Zero signal belongs to this semantic lane (bd-tqhc), not the
             // whole query. Lexical matches and an independently admitted
@@ -950,6 +949,8 @@ impl SyncTwoTierSearcher {
             hits: fast_hits,
             zero_signal,
         } = classified;
+        lexical_context.revalidate_lexical(lexical_hits.as_mut(), filter);
+        metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         metrics.phase1_vectors_searched = phase1_vectors_searched;
         metrics.zero_signal = zero_signal;
         let hash_control = sync_fast_is_hash_control(&self.index);
@@ -1122,10 +1123,9 @@ impl SyncTwoTierSearcher {
         let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
         let mut lexical_context = SyncLexicalContext::new(self.lexical.clone(), filter.is_some())?;
         let lexical_started = Instant::now();
-        let lexical_hits =
+        let mut lexical_hits =
             Self::search_optional_lexical(&mut lexical_context, query.vector(), fetch, filter)?;
         metrics.lexical_search_ms = ms(lexical_started.elapsed());
-        metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
 
         let quality_started = Instant::now();
         let ClassifiedHits { hits, zero_signal } = search_filtered_vectors(
@@ -1142,6 +1142,8 @@ impl SyncTwoTierSearcher {
                 )
             },
         )?;
+        lexical_context.revalidate_lexical(lexical_hits.as_mut(), filter);
+        metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         if zero_signal != Some(ZeroSignalReason::ZeroNormQuery) {
             // These are Phase-1 vectors because direct quality is the first
             // and only phase. The embedder and quality timing identify its tier.
@@ -1273,8 +1275,8 @@ impl SyncTwoTierSearcher {
         let SyncRefinement {
             fast_query,
             quality_query,
-            fast_hits,
-            lexical_hits,
+            mut fast_hits,
+            mut lexical_hits,
             mut lexical_context,
             query_semantic_weight,
             fetch,
@@ -1296,7 +1298,6 @@ impl SyncTwoTierSearcher {
         // coverage. Caller-declared spaces and unstamped control fixtures keep
         // their existing rescoring contract.
         let independent_quality = independently_retrievable_quality(quality_index);
-        let mut refined_fast_hits = fast_hits.clone();
         let quality_pool = if independent_quality {
             search_filtered_vectors(
                 &mut lexical_context,
@@ -1308,6 +1309,12 @@ impl SyncTwoTierSearcher {
                 },
             )
             .and_then(|ClassifiedHits { mut hits, .. }| {
+                lexical_context.revalidate_lexical(lexical_hits.as_mut(), filter);
+                if let Some(filter) = filter {
+                    fast_hits
+                        .retain(|hit| lexical_context.permits_known_metadata(&hit.doc_id, filter));
+                }
+                let mut refined_fast_hits = fast_hits.clone();
                 complete_quality_evidence(&fast_hits, &mut hits, |missing| {
                     self.index
                         .quality_scores_for_hits(quality_query.vector(), missing)
@@ -1329,14 +1336,14 @@ impl SyncTwoTierSearcher {
                             .hits,
                     );
                 }
-                Ok(SyncQualityPool::Retrieved(hits))
+                Ok((SyncQualityPool::Retrieved(hits), refined_fast_hits))
             })
         } else {
             self.index
                 .quality_scores_for_hits(quality_query.vector(), &fast_hits)
-                .map(SyncQualityPool::RescoredFastPool)
+                .map(|scores| (SyncQualityPool::RescoredFastPool(scores), fast_hits.clone()))
         };
-        let quality_pool = match quality_pool {
+        let (quality_pool, refined_fast_hits) = match quality_pool {
             Ok(pool) => pool,
             Err(error) => {
                 let final_ranking = if matches!(&error, SearchError::Cancelled { .. }) {
@@ -1360,6 +1367,7 @@ impl SyncTwoTierSearcher {
                 };
             }
         };
+        metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
 
         let blend_started = Instant::now();
         // Per-tier evidence is keyed by canonical doc_id in BOTH shapes. The
@@ -1777,6 +1785,28 @@ impl SyncLexicalContext {
             .filter(|id| self.metadata.get(*id).is_none_or(Option::is_none))
             .collect();
         hydrate_selected_metadata(source.as_ref(), &missing, &mut self.metadata)
+    }
+
+    fn permits_known_metadata(&self, doc_id: &DocId, filter: &dyn SearchFilter) -> bool {
+        self.metadata
+            .get(doc_id)
+            .and_then(Option::as_deref)
+            .is_none_or(|metadata| filter.matches(doc_id, Some(metadata)))
+    }
+
+    fn revalidate_lexical(
+        &self,
+        hits: Option<&mut Vec<ScoredResult>>,
+        filter: Option<&dyn SearchFilter>,
+    ) {
+        if let (Some(hits), Some(filter)) = (hits, filter) {
+            // Vector retrieval can resolve an observation that was unknown
+            // when lexical retrieval admitted this row. Known observations
+            // are never replaced by selected-vector hydration.
+            hits.retain(|hit| {
+                hit.metadata.is_some() || self.permits_known_metadata(&hit.doc_id, filter)
+            });
+        }
     }
 
     fn attach_metadata(&self, results: &mut [ScoredResult]) {
@@ -2459,6 +2489,7 @@ mod tests {
         EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1,
     };
     use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Bind one synthetic vector to an explicitly synthetic identity.
     ///
@@ -5531,6 +5562,130 @@ mod tests {
         };
         assert_eq!(results[0].doc_id, "b");
         assert!(results[0].metadata.is_some());
+        assert!(phases.next().is_none());
+    }
+
+    struct LateBlockingLexical {
+        blocked_id: &'static str,
+        unknown_reads: AtomicUsize,
+    }
+
+    impl SyncLexicalSearch for LateBlockingLexical {
+        fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+            Ok(std::iter::once(lexical_result(self.blocked_id, 10.0))
+                .take(limit)
+                .collect())
+        }
+
+        fn metadata_for_documents(
+            &self,
+            ids: &[&str],
+        ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+            Ok(ids
+                .iter()
+                .map(|id| {
+                    let doc_type = if *id == self.blocked_id {
+                        if self
+                            .unknown_reads
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                                remaining.checked_sub(1)
+                            })
+                            .is_ok()
+                        {
+                            return None;
+                        }
+                        "blocked"
+                    } else {
+                        "keep"
+                    };
+                    Some(Arc::new(serde_json::json!({"doc_type": doc_type})))
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn late_blocking_metadata_updates_initial_lexical_eligibility() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        let directory = temp_dir("late-blocking-initial");
+        let (fast, quality) = persisted_producer_pair(directory.path());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(directory.path()).unwrap());
+        let filter = DocTypeFilter::new(["keep"]);
+        let quality_only = TieredQueryEmbeddings::quality_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let fast_only = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+        );
+        for (query, blocked_id, expected) in
+            [(&quality_only, "b", &["c"][..]), (&fast_only, "a", &[])]
+        {
+            let searcher = SyncTwoTierSearcher::new(
+                Arc::clone(&index),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_lexical(Arc::new(LateBlockingLexical {
+                blocked_id,
+                unknown_reads: AtomicUsize::new(1),
+            }));
+            let (hits, metrics) = searcher
+                .search_collect_with_filter(query, 1, Some(&filter))
+                .unwrap();
+            let ids: Vec<_> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+            assert_eq!(ids, expected, "newly known rejection for {blocked_id}");
+            assert_eq!(metrics.lexical_candidates, 0);
+            assert!(
+                hits.iter()
+                    .all(|hit| filter.matches(&hit.doc_id, hit.metadata.as_deref()))
+            );
+        }
+    }
+
+    #[test]
+    fn late_blocking_metadata_updates_retained_pools_before_refinement() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        let directory = temp_dir("late-blocking-refined");
+        let (fast, quality) = persisted_producer_pair(directory.path());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(directory.path()).unwrap());
+        let lexical = Arc::new(LateBlockingLexical {
+            blocked_id: "a",
+            unknown_reads: AtomicUsize::new(usize::MAX),
+        });
+        let searcher = SyncTwoTierSearcher::new(
+            index,
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_lexical(lexical.clone());
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![0.5, 0.0, 0.866], quality).unwrap(),
+        );
+        let filter = DocTypeFilter::new(["keep"]);
+        let mut phases = searcher.search_iter_with_filter(&query, 1, Some(&filter));
+        let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+            panic!("expected Initial while a's metadata is unknown");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "a");
+        assert!(results[0].fast_score.is_some() && results[0].lexical_score.is_some());
+        assert!(results[0].metadata.is_none());
+
+        lexical.unknown_reads.store(0, Ordering::Relaxed);
+        let Some(SearchPhase::Refined { results, .. }) = phases.next() else {
+            panic!("expected Refined after a's metadata becomes available");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "b");
+        assert_eq!(results[0].metadata.as_deref().unwrap()["doc_type"], "keep");
+        assert!(results[0].quality_score.is_some());
         assert!(phases.next().is_none());
     }
 

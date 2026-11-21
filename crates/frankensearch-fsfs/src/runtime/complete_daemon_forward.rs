@@ -2055,12 +2055,12 @@ mod generation_tests {
                 // Forwarded fast-only admission is distinct from the common
                 // executor's Full mode plus fast_only policy. Projecting the
                 // admission mode or daemon's original policy misses this key.
-                let (_, snapshot) = runtime
+                let ((_, snapshot), _) = runtime
                     .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, true)
                     .await
                     .unwrap();
                 assert_eq!(snapshot, HashMap::from([(key.clone(), payloads.clone())]));
-                let (_, disabled) = runtime
+                let ((_, disabled), _) = runtime
                     .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, false)
                     .await
                     .unwrap();
@@ -2071,7 +2071,7 @@ mod generation_tests {
             let expanded = make_request(&expanding, &root, "sharedtoken", 10).unwrap();
             for request in [&explained, &expanded] {
                 for bytes in wire_requests(request) {
-                    let (_, snapshot) = runtime
+                    let ((_, snapshot), _) = runtime
                         .snapshot_complete_daemon_request(&cx, &shared, &bytes, false, true)
                         .await
                         .unwrap();
