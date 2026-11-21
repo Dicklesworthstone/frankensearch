@@ -52,8 +52,37 @@ fn run(command: &mut Command, directory: &Path, timeout: Duration) -> Output {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RecoveryEntry {
+    Standalone,
+    Installed,
+}
+
+impl RecoveryEntry {
+    fn command(self) -> Command {
+        match self {
+            Self::Standalone => Command::new(env!("CARGO_BIN_EXE_fsfs-recover")),
+            Self::Installed => {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+                command.arg("recover");
+                command
+            }
+        }
+    }
+}
+
 fn recover(directory: &Path, store: &Path, id: &str, digest: &str) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    recover_with_entry(RecoveryEntry::Standalone, directory, store, id, digest)
+}
+
+fn recover_with_entry(
+    entry: RecoveryEntry,
+    directory: &Path,
+    store: &Path,
+    id: &str,
+    digest: &str,
+) -> Command {
+    let mut command = entry.command();
     command
         .current_dir(directory)
         .arg("--index-dir")
@@ -107,24 +136,57 @@ fn files(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
 fn command_help_and_usage_errors_do_not_create_a_store() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("absent-store");
-    let mut help = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
-    help.arg("--help").current_dir(directory.path());
+    for entry in [RecoveryEntry::Standalone, RecoveryEntry::Installed] {
+        let mut help = entry.command();
+        help.arg("--help").current_dir(directory.path());
+        let output = run(&mut help, directory.path(), Duration::from_secs(10));
+        assert!(output.status.success(), "{entry:?}");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("fsfs recover --index-dir STORE"));
+        assert!(text.contains("--confirm-durability"));
+        for suffix in [
+            vec!["--apply", "--apply"],
+            vec!["--apply", "--confirm-durability"],
+            vec!["--unknown"],
+        ] {
+            let id = format!("g-{}-{}-{}", "a".repeat(32), "b".repeat(8), "c".repeat(16));
+            let mut command =
+                recover_with_entry(entry, directory.path(), &root, &id, &"a".repeat(64));
+            command.args(suffix);
+            let output = run(&mut command, directory.path(), Duration::from_secs(10));
+            assert!(!output.status.success(), "{entry:?}");
+            // Parsing the entire stdout also rejects an appended ordinary
+            // fsfs error envelope after recovery has emitted its own result.
+            assert_eq!(body(&output)["ok"], false);
+            assert!(!root.exists());
+        }
+    }
+}
+
+#[test]
+fn installed_help_advertises_recovery_and_non_utf8_arguments_return_typed_errors() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut help = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+    help.arg("help")
+        .current_dir(directory.path())
+        .env("HOME", directory.path())
+        .env("XDG_CONFIG_HOME", directory.path().join("empty-config"))
+        .env("FRANKENSEARCH_CHECK_UPDATES", "0");
     let output = run(&mut help, directory.path(), Duration::from_secs(10));
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("--confirm-durability"));
-    for suffix in [
-        vec!["--apply", "--apply"],
-        vec!["--apply", "--confirm-durability"],
-        vec!["--unknown"],
-    ] {
-        let id = format!("g-{}-{}-{}", "a".repeat(32), "b".repeat(8), "c".repeat(16));
-        let mut command = recover(directory.path(), &root, &id, &"a".repeat(64));
-        command.args(suffix);
-        let output = run(&mut command, directory.path(), Duration::from_secs(10));
-        assert!(!output.status.success());
-        assert_eq!(body(&output)["ok"], false);
-        assert!(!root.exists());
-    }
+    assert!(String::from_utf8_lossy(&output.stdout).contains("recover [options]"));
+
+    let mut invalid = RecoveryEntry::Installed.command();
+    invalid
+        .current_dir(directory.path())
+        .arg(OsString::from_vec(vec![0xff]));
+    let output = run(&mut invalid, directory.path(), Duration::from_secs(10));
+    assert!(!output.status.success());
+    assert_eq!(body(&output)["ok"], false);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
 }
 
 #[test]
@@ -436,6 +498,15 @@ fn assert_keyword_hits(payload: &serde_json::Value) {
 
 #[test]
 fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() {
+    for (prepare_entry, apply_entry) in [
+        (RecoveryEntry::Installed, RecoveryEntry::Standalone),
+        (RecoveryEntry::Standalone, RecoveryEntry::Installed),
+    ] {
+        exercise_source_rebuild(prepare_entry, apply_entry);
+    }
+}
+
+fn exercise_source_rebuild(prepare_entry: RecoveryEntry, apply_entry: RecoveryEntry) {
     use frankensearch_fsfs::FsfsConfig;
     use frankensearch_fsfs::config::DegradationOverrideMode;
 
@@ -476,7 +547,7 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
             )
             .env("FRANKENSEARCH_CHECK_UPDATES", "0");
     };
-    let mut prepare = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    let mut prepare = prepare_entry.command();
     configure(&mut prepare);
     prepare
         .arg("--rebuild-source")
@@ -548,7 +619,7 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
     ] {
         let mut policy = original_policy;
         policy[index] = replacement;
-        let mut changed = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+        let mut changed = apply_entry.command();
         configure(&mut changed);
         changed
             .arg("--resume-file")
@@ -564,7 +635,7 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
         assert_eq!(files(&root), store_before);
     }
     for extra in [vec!["--limit", "9"], vec!["--format", "jsonl"]] {
-        let mut changed = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+        let mut changed = apply_entry.command();
         configure(&mut changed);
         changed
             .arg("--resume-file")
@@ -587,7 +658,7 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
             "--no-rerank",
         ],
     ] {
-        let mut changed = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+        let mut changed = apply_entry.command();
         configure(&mut changed);
         changed
             .arg("--resume-file")
@@ -600,7 +671,7 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
     }
     config.search.quality_timeout_ms += 1;
     fs::write(&config_path, config.to_toml().unwrap()).unwrap();
-    let mut changed = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    let mut changed = apply_entry.command();
     configure(&mut changed);
     changed
         .arg("--resume-file")
@@ -613,7 +684,7 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
     config.search.quality_timeout_ms -= 1;
     fs::write(&config_path, config.to_toml().unwrap()).unwrap();
 
-    let mut apply = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    let mut apply = apply_entry.command();
     configure(&mut apply);
     apply
         .arg("--resume-file")
@@ -677,34 +748,43 @@ fn confirmation_survives_invalid_config_and_missing_models_without_republication
         let inode = fs::metadata(&pointer).unwrap().ino();
         let old_files = files(old.path());
         let current_files = files(current.path());
-        let mut command = recover(
-            directory.path(),
-            &root,
-            current.id(),
-            current.manifest_sha256(),
-        );
-        command.arg("--confirm-durability");
-        let output = run(&mut command, directory.path(), Duration::from_secs(20));
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let result = body(&output);
-        assert_eq!(result["data"]["state"], "durability_confirmed");
-        assert_eq!(result["data"]["generation_id"], current.id());
-        assert_eq!(result["data"]["selection_write_performed"], false);
-        assert_eq!(result["data"]["producer_admission_checked"], false);
-        let mut stale = recover(directory.path(), &root, old.id(), old.manifest_sha256());
-        stale.arg("--confirm-durability");
-        let output = run(&mut stale, directory.path(), Duration::from_secs(20));
-        assert!(!output.status.success());
-        assert_eq!(body(&output)["ok"], false);
-        assert_eq!(fs::read(&pointer).unwrap(), before);
-        assert_eq!(fs::metadata(&pointer).unwrap().ino(), inode);
-        assert_eq!(files(old.path()), old_files);
-        assert_eq!(files(current.path()), current_files);
-        assert!(!directory.path().join("missing-models").exists());
+        for entry in [RecoveryEntry::Standalone, RecoveryEntry::Installed] {
+            let mut command = recover_with_entry(
+                entry,
+                directory.path(),
+                &root,
+                current.id(),
+                current.manifest_sha256(),
+            );
+            command.arg("--confirm-durability");
+            let output = run(&mut command, directory.path(), Duration::from_secs(20));
+            assert!(
+                output.status.success(),
+                "{entry:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result = body(&output);
+            assert_eq!(result["data"]["state"], "durability_confirmed");
+            assert_eq!(result["data"]["generation_id"], current.id());
+            assert_eq!(result["data"]["selection_write_performed"], false);
+            assert_eq!(result["data"]["producer_admission_checked"], false);
+            let mut stale = recover_with_entry(
+                entry,
+                directory.path(),
+                &root,
+                old.id(),
+                old.manifest_sha256(),
+            );
+            stale.arg("--confirm-durability");
+            let output = run(&mut stale, directory.path(), Duration::from_secs(20));
+            assert!(!output.status.success(), "{entry:?}");
+            assert_eq!(body(&output)["ok"], false);
+            assert_eq!(fs::read(&pointer).unwrap(), before);
+            assert_eq!(fs::metadata(&pointer).unwrap().ino(), inode);
+            assert_eq!(files(old.path()), old_files);
+            assert_eq!(files(current.path()), current_files);
+            assert!(!directory.path().join("missing-models").exists());
+        }
     });
 }
 

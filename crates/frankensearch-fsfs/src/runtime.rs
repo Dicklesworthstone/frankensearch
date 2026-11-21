@@ -1053,9 +1053,9 @@ enum SearchExecutionMode {
     LexicalOnly,
 }
 
-/// The required semantic producer for a source build. Ordinary indexing uses
-/// fast vectors plus an optional quality tier; explicit quality-only recovery
-/// builds the quality space directly, without acquiring a fast dependency.
+/// The required semantic producer for a source build. Default indexing uses
+/// fast vectors plus an optional quality tier; explicit quality-only indexing
+/// and recovery build quality directly, without acquiring a fast dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexingPrimaryTier {
     Fast,
@@ -7889,6 +7889,12 @@ impl FsfsRuntime {
 
     #[must_use]
     pub fn with_cli_input(mut self, cli_input: CliInput) -> Self {
+        self.indexing_primary_tier =
+            if cli_input.command == CliCommand::Index && cli_input.quality_only {
+                IndexingPrimaryTier::Quality
+            } else {
+                IndexingPrimaryTier::Fast
+            };
         self.cli_input = cli_input;
         self
     }
@@ -9357,6 +9363,12 @@ impl FsfsRuntime {
             return Err(complete_cli::complete_cli_error(
                 "quality_completion",
                 "quality completion requires an existing complete-generation store; use run_mode_with_complete_generations or complete_retained_quality",
+            ));
+        }
+        if command == CliCommand::Index && self.cli_input.quality_only {
+            return Err(complete_cli::complete_cli_error(
+                "quality_only",
+                "quality-only indexing requires complete generations; use FSFS_COMPLETE_GENERATIONS=1 with a store outside the source or beneath a hidden source directory",
             ));
         }
         std::future::ready(()).await;
@@ -22242,16 +22254,28 @@ impl FsfsRuntime {
             None
         } else if quality_only {
             control.admit_work(cx, "index.quality_model_load").await?;
-            let embedder = self.resolve_quality_embedder()?.ok_or_else(|| {
+            // Complete-store indexing admits and probes its required producer
+            // before initializing store routing. Keep that exact producer alive
+            // through source indexing instead of loading a second set of weights.
+            let admitted_primary = admitted_quality
+                .as_ref()
+                .and_then(|(embedder, _)| embedder.as_ref());
+            let embedder = match admitted_primary {
+                Some(embedder) => Some(Arc::clone(embedder)),
+                None => self.resolve_quality_embedder()?,
+            }
+            .ok_or_else(|| {
                 SearchError::EmbedderUnavailable {
                     model: self.config.indexing.quality_model.clone(),
-                    reason: "quality-only source recovery requires its verified quality producer"
+                    reason: "quality-only indexing requires its verified quality producer"
                         .to_owned(),
                 }
             })?;
             control.checkpoint(cx, "index.quality_model_loaded", true)?;
             Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
-            Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+            if admitted_primary.is_none() {
+                Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+            }
             Some(embedder)
         } else {
             control.admit_work(cx, "index.model_provisioning").await?;
@@ -28175,6 +28199,7 @@ impl FsfsRuntime {
     }
 
     fn validate_command_inputs(&self, command: CliCommand) -> SearchResult<()> {
+        self.cli_input.validate_quality_only()?;
         self.cli_input.validate_search_recovery()?;
         if self.cli_input.recover_source.is_some() && command != CliCommand::Search {
             return Err(retained_recovery_error(
@@ -28182,6 +28207,23 @@ impl FsfsRuntime {
             ));
         }
         self.cli_input.validate_quality_completion()?;
+        if self.cli_input.command == CliCommand::Index && self.cli_input.quality_only {
+            if command != CliCommand::Index || self.watch_requested(command) {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.quality_only".to_owned(),
+                    value: "--quality-only".to_owned(),
+                    reason: "quality-only indexing requires a one-shot index command; use --no-watch-mode to override configured watching".to_owned(),
+                });
+            }
+            self.validate_semantic_model_selection(SearchExecutionMode::QualityOnly)?;
+            if self.indexing_quality_deferral().is_some() {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.quality_only".to_owned(),
+                    value: "--quality-only".to_owned(),
+                    reason: "the required quality producer cannot be deferred".to_owned(),
+                });
+            }
+        }
         // Refuse before the initial scan/build, not merely before starting the
         // watcher after that build has already changed the index.
         if self.watch_requested(command) {
@@ -30175,6 +30217,7 @@ Commands:
   config <action>           Manage configuration
   download-models [model]   Download/verify embedding models
   doctor                    Run local health checks
+  recover [options]         Inspect, prepare, restore or repair a receipted generation (see recover --help)
   update [--check]          Check/apply binary updates
   completions <shell>       Generate shell completions
   uninstall [--yes] [--dry-run] [--purge]  Remove local fsfs artifacts
@@ -30194,6 +30237,8 @@ Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --q
               --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once.
               Recovery requires installed models; it never downloads, retries automatically, or replaces a newer concurrent publication.
 Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>
+              --quality-only builds a standalone quality tier using installed models, without a fast producer.
+              Quality-only indexing is one-shot and requires complete generations; search it with --quality-only.
               --upgrade-reuse <same-executable|compatible-contract>
               Default: same-executable. On Linux, compatible-contract admits verified reuse across binary upgrades.
               Other platforms retain indexed work within the same process.
@@ -30212,7 +30257,7 @@ pub(crate) const fn completion_script(shell: CompletionShell) -> &'static str {
         CompletionShell::Bash => {
             r#"_fsfs_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local choices="search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon --upgrade-reuse"
+    local choices="search serve index watch explain status flush config download-models download doctor recover update completions uninstall help tui version append-batch delete compact daemon --upgrade-reuse"
     if (( COMP_CWORD > 0 )) && [[ "${COMP_WORDS[COMP_CWORD-1]}" == "--upgrade-reuse" ]]; then
         choices="same-executable compatible-contract"
     fi
@@ -30221,10 +30266,10 @@ pub(crate) const fn completion_script(shell: CompletionShell) -> &'static str {
 complete -F _fsfs_complete fsfs"#
         }
         CompletionShell::Zsh => {
-            r#"compdef '_arguments "1: :((search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon))" "--upgrade-reuse[Executable upgrade reuse policy]:policy:(same-executable compatible-contract)"' fsfs"#
+            r#"compdef '_arguments "1: :((search serve index watch explain status flush config download-models download doctor recover update completions uninstall help tui version append-batch delete compact daemon))" "--upgrade-reuse[Executable upgrade reuse policy]:policy:(same-executable compatible-contract)"' fsfs"#
         }
         CompletionShell::Fish => {
-            r#"complete -c fsfs -f -a "search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon"
+            r#"complete -c fsfs -f -a "search serve index watch explain status flush config download-models download doctor recover update completions uninstall help tui version append-batch delete compact daemon"
 complete -c fsfs -l upgrade-reuse -x -a "same-executable compatible-contract" -d "Executable upgrade reuse policy""#
         }
         CompletionShell::PowerShell => {
@@ -30234,7 +30279,7 @@ complete -c fsfs -l upgrade-reuse -x -a "same-executable compatible-contract" -d
     $choices = if ($previous -and $previous.Extent.Text -eq '--upgrade-reuse') {
         'same-executable','compatible-contract'
     } else {
-        'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','update','completions','uninstall','help','tui','version','append-batch','delete','compact','daemon','--upgrade-reuse'
+        'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','recover','update','completions','uninstall','help','tui','version','append-batch','delete','compact','daemon','--upgrade-reuse'
     }
     $choices | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
@@ -57000,6 +57045,84 @@ mod tests {
                 assert_eq!(found, expected, "lexical hits for {query:?}");
             }
         });
+    }
+
+    #[test]
+    fn quality_only_index_selects_required_primary_without_affecting_query_selection() {
+        let input = CliInput {
+            command: CliCommand::Index,
+            quality_only: true,
+            ..CliInput::default()
+        };
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(input.clone());
+        assert_eq!(
+            runtime.indexing_search_mode(),
+            SearchExecutionMode::QualityOnly
+        );
+        let ordinary = runtime.clone().with_cli_input(CliInput {
+            quality_only: false,
+            ..input.clone()
+        });
+        assert_eq!(
+            ordinary.indexing_primary_tier,
+            super::IndexingPrimaryTier::Fast
+        );
+        let search = runtime.with_cli_input(CliInput {
+            command: CliCommand::Search,
+            query: Some("quality query".to_owned()),
+            ..input
+        });
+        assert_eq!(
+            search.requested_search_mode(),
+            SearchExecutionMode::QualityOnly
+        );
+        assert_eq!(
+            search.indexing_primary_tier,
+            super::IndexingPrimaryTier::Fast
+        );
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn quality_only_index_refuses_effective_watch_and_deferred_or_disabled_quality() {
+        let mut config = FsfsConfig::default();
+        config.search.fast_only = false;
+        "unused-invalid-fast-producer".clone_into(&mut config.indexing.fast_model);
+        "all-minilm-l6-v2".clone_into(&mut config.indexing.quality_model);
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Index,
+            quality_only: true,
+            ..CliInput::default()
+        });
+        runtime.validate_command_inputs(CliCommand::Index).unwrap();
+        for mode in [
+            DegradationOverrideMode::ForceEmbedDeferred,
+            DegradationOverrideMode::ForceLexicalOnly,
+            DegradationOverrideMode::ForceMetadataOnly,
+            DegradationOverrideMode::ForcePaused,
+        ] {
+            let mut refused = runtime.clone();
+            refused.config.pressure.degradation_override = mode;
+            assert!(refused.validate_command_inputs(CliCommand::Index).is_err());
+        }
+        let mut watching = runtime.clone();
+        watching.config.indexing.watch_mode = true;
+        assert!(watching.validate_command_inputs(CliCommand::Index).is_err());
+        watching.cli_input.overrides.allow_background_indexing = Some(false);
+        watching.validate_command_inputs(CliCommand::Index).unwrap();
+        let mut disabled = runtime.clone();
+        disabled.config.search.fast_only = true;
+        assert!(disabled.validate_command_inputs(CliCommand::Index).is_err());
+        let mut deferred = runtime.clone();
+        deferred.indexing_quality_deferral =
+            Some(super::IndexingQualityDeferral::ProducerUnavailable);
+        assert!(deferred.validate_command_inputs(CliCommand::Index).is_err());
+        let mut missing = runtime;
+        missing.config.indexing.quality_model.clear();
+        assert!(matches!(
+            missing.validate_command_inputs(CliCommand::Index),
+            Err(SearchError::EmbedderUnavailable { .. })
+        ));
     }
 
     #[test]

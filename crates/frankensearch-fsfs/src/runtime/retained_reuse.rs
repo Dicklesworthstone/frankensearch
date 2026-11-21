@@ -206,10 +206,10 @@ fn indexing_contract_digest(runtime: &FsfsRuntime) -> SearchResult<String> {
         runtime.indexing_primary_tier,
         super::IndexingPrimaryTier::Quality
     ) {
-        // This topology is explicit recovery intent, not a query tuning knob
+        // This topology is explicit indexing intent, not a query tuning knob
         // or a configuration field. Bind it into both incomplete-build and
         // completed-input receipts so a resume cannot reinterpret quality as
-        // fast (or inherit it as a full indexing generation). Ordinary
+        // fast (or inherit it as a full indexing generation). Default fast
         // indexing retains its historical contract bytes.
         Ok(content_sha256_hex(
             format!("fsfs.indexing_primary.quality.v1\0{contract}").as_bytes(),
@@ -311,6 +311,16 @@ fn compatible_receipt(runtime: &FsfsRuntime, receipt: &ReuseReceipt) -> SearchRe
         return Ok(false);
     }
     let expected_contract = indexing_contract_digest(runtime)?;
+    // Historical receipts predate standalone quality builds. Under either
+    // executable policy they cannot certify a quality primary without its
+    // exact contract; otherwise copying them could inherit a fast artifact.
+    if matches!(
+        runtime.indexing_primary_tier,
+        super::IndexingPrimaryTier::Quality
+    ) && receipt.indexing_contract_sha256.as_deref() != Some(expected_contract.as_str())
+    {
+        return Ok(false);
+    }
     let execution_ok = if runtime.contract_upgrade_reuse_enabled() {
         compatible_contract_upgrade_execution(
             receipt,
@@ -1199,7 +1209,10 @@ fn seed_candidate(
             "retained checkpoint is inconsistent with its selected generation",
         ));
     }
-    FsfsRuntime::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
+    FsfsRuntime::validate_search_generation_at_root(
+        predecessor.path(),
+        runtime.indexing_search_mode(),
+    )?;
     let mut sentinel = FsfsRuntime::read_index_sentinel(predecessor.path())?
         .ok_or_else(|| reuse_error("selected generation has no sentinel"))?;
     if !fs::symlink_metadata(destination)?.file_type().is_dir()
@@ -3225,6 +3238,122 @@ mod generation_tests {
                 assert_index_calls(&changed, 1, 1);
                 let warm = run_counted(&cx, parent.path(), "index").await;
                 assert_index_calls(&warm, 0, 0);
+            });
+        }
+
+        #[cfg(feature = "semantic-support")]
+        #[test]
+        fn ordinary_quality_only_index_reuses_only_its_own_primary_topology() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (mut runtime, source, root) = fixture(parent.path(), 2);
+                runtime.config.search.fast_only = false;
+                "unused-invalid-fast-producer".clone_into(&mut runtime.config.indexing.fast_model);
+                "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
+                let mut input = runtime.cli_input.clone();
+                input.quality_only = true;
+                let runtime = runtime.with_cli_input(input);
+                let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
+                let quality = Arc::new(CountingEmbedder::new("reuse-quality", 6, false));
+                let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
+
+                let first = publish(&runtime, &cx, &root).await;
+                assert!(
+                    !first
+                        .path()
+                        .join(super::super::super::FSFS_VECTOR_INDEX_FILE)
+                        .exists()
+                );
+                assert!(
+                    first
+                        .path()
+                        .join(super::super::super::FSFS_VECTOR_QUALITY_INDEX_FILE)
+                        .is_file()
+                );
+                assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 2);
+                assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 1);
+                assert_eq!(fast.counts.documents.load(Ordering::SeqCst), 0);
+                assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 0);
+                let mut receipt: ReuseReceipt =
+                    read_json(&cx, &first.path().join(RECEIPT_FILE)).unwrap();
+                assert!(compatible_receipt(&runtime, &receipt).unwrap());
+                let mut fast_input = runtime.cli_input.clone();
+                fast_input.quality_only = false;
+                let fast_primary = runtime.clone().with_cli_input(fast_input);
+                assert!(!compatible_receipt(&fast_primary, &receipt).unwrap());
+                receipt.indexing_contract_sha256 =
+                    Some(indexing_contract_digest(&fast_primary).unwrap());
+                assert!(!compatible_receipt(&runtime, &receipt).unwrap());
+                receipt.indexing_contract_sha256 = None;
+                assert!(!compatible_receipt(&runtime, &receipt).unwrap());
+                let contract_upgrade = runtime.clone().with_contract_upgrade_reuse(true);
+                assert!(!compatible_receipt(&contract_upgrade, &receipt).unwrap());
+
+                quality.counts.documents.store(0, Ordering::SeqCst);
+                quality.counts.probes.store(0, Ordering::SeqCst);
+                let second = publish(&runtime, &cx, &root).await;
+                assert_ne!(first.id(), second.id());
+                assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 1);
+                assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 0);
+
+                fs::write(
+                    source.join("doc-0.md"),
+                    "sharedtoken changed quality source",
+                )
+                .unwrap();
+                publish(&runtime, &cx, &root).await;
+                assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 1);
+                assert_eq!(fast.counts.documents.load(Ordering::SeqCst), 0);
+                quality.counts.documents.store(0, Ordering::SeqCst);
+                let mut forced = runtime;
+                forced.cli_input.full_reindex = true;
+                publish(&forced, &cx, &root).await;
+                assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 2);
+            });
+        }
+
+        #[cfg(feature = "semantic-support")]
+        #[test]
+        fn ordinary_quality_only_index_admits_required_model_before_creating_store() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (mut runtime, _, root) = fixture(parent.path(), 0);
+                runtime.config.search.fast_only = false;
+                "unused-invalid-fast-producer".clone_into(&mut runtime.config.indexing.fast_model);
+                "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
+                let mut input = runtime.cli_input.clone();
+                input.quality_only = true;
+                let runtime = runtime.with_cli_input(input);
+                let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
+                let quality = Arc::new(CountingEmbedder::new("reuse-quality", 6, false));
+                let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
+                super::super::super::set_test_quality_embedder(None);
+                assert!(matches!(
+                    runtime.rebuild_retained_generation(&cx, &root).await,
+                    Err(SearchError::EmbedderUnavailable { .. })
+                ));
+                assert!(!root.exists());
+                assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 0);
+
+                super::super::super::set_test_quality_embedder(Some(quality.clone()));
+                let empty = publish(&runtime, &cx, &root).await;
+                assert!(
+                    !empty
+                        .path()
+                        .join(super::super::super::FSFS_VECTOR_INDEX_FILE)
+                        .exists()
+                );
+                let vectors = frankensearch_index::VectorIndex::open_read_only(
+                    &empty
+                        .path()
+                        .join(super::super::super::FSFS_VECTOR_QUALITY_INDEX_FILE),
+                )
+                .unwrap();
+                assert_eq!(vectors.record_count(), 0);
+                assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 1);
+                assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 0);
             });
         }
 

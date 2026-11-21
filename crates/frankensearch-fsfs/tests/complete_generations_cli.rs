@@ -154,6 +154,21 @@ impl Fixture {
         fs::write(&self.config, config.to_toml().expect("TOML")).expect("fixture config");
     }
 
+    fn write_quality_only_config(&self, model_dir: &Path) {
+        let mut config = FsfsConfig::default();
+        config.indexing.offline = true;
+        config.indexing.watch_mode = false;
+        // A successful build or query must never resolve this fast producer.
+        config.indexing.fast_model = "unused-invalid-fast-producer".to_owned();
+        config.indexing.quality_model = "all-minilm-l6-v2-native".to_owned();
+        config.indexing.model_dir = model_dir.display().to_string();
+        config.search.fast_only = false;
+        config.search.rerank = false;
+        config.search.quality_timeout_ms = 30_000;
+        config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+        fs::write(&self.config, config.to_toml().expect("TOML")).expect("quality config");
+    }
+
     fn command(&self, command: &str, format: &str) -> Command {
         let mut child = Command::new(&self.executable);
         if let Some((uid, gid)) = self.child_identity {
@@ -1296,6 +1311,138 @@ fn complete_cli_binary_rejects_malformed_opt_in_before_writing() {
             .contains("FSFS_COMPLETE_GENERATIONS")
     );
     assert!(!fixture.store.exists());
+}
+
+#[test]
+fn complete_cli_binary_quality_only_conflicts_do_not_create_a_store() {
+    for flag in ["--fast-only", "--watch", "--complete-quality"] {
+        let fixture = Fixture::new();
+        fixture.write_quality_only_config(&fixture.directory.path().join("missing-models"));
+        let output = execute(
+            fixture
+                .command("index", "json")
+                .args(["--quality-only", flag]),
+        );
+        let refused = json_output(&output, false);
+        assert_eq!(
+            refused["error"]["code"], "invalid_config",
+            "{flag}: {refused}"
+        );
+        assert!(!fixture.store.exists(), "{flag} created a store");
+        assert_eq!(
+            fs::read_to_string(fixture.source.join("alpha.md")).unwrap(),
+            "sharedtoken alpha document"
+        );
+    }
+}
+
+#[cfg(all(feature = "semantic-support", feature = "rerank"))]
+#[test]
+#[ignore = "requires FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR with verified native MiniLM artifacts"]
+fn complete_cli_binary_quality_only_build_reopen_and_mutate_without_fast_model() {
+    fn search_paths(fixture: &Fixture) -> BTreeSet<String> {
+        let result = json_output(
+            &execute(fixture.command("search", "json").args([
+                "--quality-only",
+                "--no-daemon",
+                "--limit",
+                "all",
+            ])),
+            true,
+        );
+        result["data"]["hits"]
+            .as_array()
+            .expect("quality hits")
+            .iter()
+            .map(|hit| {
+                assert!(hit["semantic_rank"].is_number(), "{result}");
+                assert!(hit["lexical_rank"].is_null(), "{result}");
+                assert!(hit["score"].as_f64().is_some_and(f64::is_finite));
+                hit["path"].as_str().expect("quality hit path").to_owned()
+            })
+            .collect()
+    }
+
+    fn assert_standalone_quality(receipt: &Value) -> PathBuf {
+        assert_eq!(receipt["data"]["publication"], "durable", "{receipt}");
+        let path = PathBuf::from(receipt["data"]["generation_path"].as_str().unwrap());
+        assert!(path.join("vector/quality.fsvi").is_file());
+        assert!(!path.join("vector/index.fsvi").exists());
+        path
+    }
+
+    let models = fs::canonicalize(
+        std::env::var_os("FSFS_COMPLETE_GENERATION_TEST_MODEL_DIR")
+            .expect("provide a verified native MiniLM model-cache root"),
+    )
+    .expect("model-cache root");
+    let fixture = Fixture::new();
+    fixture.write_quality_only_config(&models);
+    let first = json_output(
+        &execute(fixture.command("index", "json").arg("--quality-only")),
+        true,
+    );
+    let first_path = assert_standalone_quality(&first);
+    let first_files = generation_files(&first_path);
+    assert_eq!(
+        search_paths(&fixture),
+        BTreeSet::from(["alpha.md".to_owned()])
+    );
+
+    fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
+    let second = json_output(
+        &execute(fixture.command("index", "json").arg("--quality-only")),
+        true,
+    );
+    let second_path = assert_standalone_quality(&second);
+    assert_ne!(first_path, second_path);
+    assert_eq!(generation_files(&first_path), first_files);
+    assert_eq!(
+        search_paths(&fixture),
+        BTreeSet::from(["alpha.md".to_owned(), "beta.md".to_owned()])
+    );
+
+    // Both a topology switch requiring a missing fast producer and a missing
+    // required quality producer must leave the selected quality generation intact.
+    let selected = fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap();
+    let second_files = generation_files(&second_path);
+    json_output(&execute(&mut fixture.command("index", "json")), false);
+    assert_eq!(
+        fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+        selected
+    );
+    fixture.write_quality_only_config(&fixture.directory.path().join("missing-models"));
+    json_output(
+        &execute(fixture.command("index", "json").arg("--quality-only")),
+        false,
+    );
+    assert_eq!(
+        fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+        selected
+    );
+    assert_eq!(generation_files(&second_path), second_files);
+    fixture.write_quality_only_config(&models);
+    assert_eq!(search_paths(&fixture).len(), 2);
+
+    // Maintenance derives topology from the retained generation. It needs
+    // neither a quality-only flag nor an available fast model.
+    let appended = json_output(
+        &execute_with_input(
+            &mut fixture.command("append-batch", "json"),
+            b"{\"id\":\"beta.md\",\"text\":\"sharedtoken revised beta document\"}\n{\"id\":\"gamma.md\",\"text\":\"sharedtoken gamma document\"}\n",
+        ),
+        true,
+    );
+    assert_standalone_quality(&appended);
+    assert_eq!(
+        search_paths(&fixture),
+        BTreeSet::from([
+            "alpha.md".to_owned(),
+            "beta.md".to_owned(),
+            "gamma.md".to_owned(),
+        ])
+    );
+    assert_eq!(generation_files(&second_path), second_files);
 }
 
 #[cfg(feature = "semantic-support")]

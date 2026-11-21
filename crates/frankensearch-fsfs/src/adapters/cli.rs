@@ -203,7 +203,7 @@ pub struct CliInput {
     pub format_explicit: bool,
     /// Search query text (for search command).
     pub query: Option<String>,
-    /// Search only the independently admitted quality vector tier.
+    /// Search or build only the independently admitted quality vector tier.
     pub quality_only: bool,
     /// Explicitly rebuild a complete store from these sources before searching.
     /// This operation uses locally available models and never downloads them.
@@ -281,6 +281,36 @@ pub struct CliInput {
 }
 
 impl CliInput {
+    pub(crate) fn validate_quality_only(&self) -> SearchResult<()> {
+        if !self.quality_only {
+            return Ok(());
+        }
+        let reason = if !matches!(self.command, CliCommand::Search | CliCommand::Index) {
+            Some("--quality-only is only valid for search and one-shot index commands")
+        } else if self.overrides.fast_only == Some(true) {
+            Some("quality-only and fast-only are mutually exclusive")
+        } else if self.command == CliCommand::Index && self.complete_quality {
+            Some("--quality-only builds a standalone quality generation; omit --complete-quality")
+        } else if self.command == CliCommand::Index
+            && self
+                .overrides
+                .allow_background_indexing
+                .unwrap_or(self.watch)
+        {
+            Some("quality-only indexing is one-shot; omit --watch and --watch-mode")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.quality_only".into(),
+                value: "--quality-only".into(),
+                reason: reason.into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_search_recovery(&self) -> SearchResult<()> {
         let Some(source) = &self.recover_source else {
             return Ok(());
@@ -577,13 +607,6 @@ where
                 idx += 1;
             }
             "--quality-only" => {
-                if command != CliCommand::Search {
-                    return Err(SearchError::InvalidConfig {
-                        field: "cli.quality_only".into(),
-                        value: flag.into(),
-                        reason: "--quality-only is only valid for the search command".into(),
-                    });
-                }
                 input.quality_only = true;
                 idx += 1;
             }
@@ -1000,15 +1023,9 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
 }
 
 fn validate_required_args(input: &CliInput) -> SearchResult<()> {
+    input.validate_quality_only()?;
     input.validate_search_recovery()?;
     input.validate_quality_completion()?;
-    if input.quality_only && input.overrides.fast_only == Some(true) {
-        return Err(SearchError::InvalidConfig {
-            field: "cli.quality_only".into(),
-            value: "--quality-only --fast-only".into(),
-            reason: "quality-only and fast-only search are mutually exclusive".into(),
-        });
-    }
     if input.command == CliCommand::Search && input.query.is_none() {
         return Err(SearchError::InvalidConfig {
             field: "cli.search_query".into(),
@@ -1527,11 +1544,21 @@ mod tests {
     }
 
     #[test]
-    fn quality_only_refuses_conflicting_tiers_and_non_search_commands() {
+    fn quality_only_refuses_conflicting_tiers_and_unsupported_commands() {
         for args in [
             vec!["search", "query", "--quality-only", "--fast-only"],
             vec!["search", "query", "--fast-only", "--quality-only"],
-            vec!["index", "--quality-only"],
+            vec!["index", "--quality-only", "--fast-only"],
+            vec!["index", "--quality-only", "--watch"],
+            vec!["index", "--quality-only", "--watch-mode"],
+            vec![
+                "index",
+                "--quality-only",
+                "--complete-quality",
+                "--index-dir",
+                "store",
+            ],
+            vec!["watch", "--quality-only"],
             vec!["serve", "--quality-only"],
             vec!["doctor", "--quality-only"],
         ] {
@@ -1543,6 +1570,36 @@ mod tests {
             .expect("literal query after separator");
         assert!(!input.quality_only);
         assert_eq!(input.query.as_deref(), Some("--quality-only"));
+    }
+
+    #[test]
+    fn quality_only_index_accepts_source_full_rebuild_and_explicit_one_shot() {
+        for args in [
+            vec!["index", "source", "--quality-only", "--index-dir", "store"],
+            vec![
+                "index",
+                "source",
+                "--quality-only",
+                "--full",
+                "--index-dir",
+                "store",
+            ],
+            vec![
+                "index",
+                "source",
+                "--quality-only",
+                "--watch",
+                "--no-watch-mode",
+                "--index-dir",
+                "store",
+            ],
+        ] {
+            let input = parse_cli_args(args).expect("one-shot quality-only index");
+            assert_eq!(input.command, CliCommand::Index);
+            assert!(input.quality_only);
+            assert_eq!(input.target_path.as_deref(), Some(Path::new("source")));
+            assert_eq!(input.index_dir.as_deref(), Some(Path::new("store")));
+        }
     }
 
     #[test]
@@ -2773,9 +2830,12 @@ mod tests {
     ];
 
     /// Commands `main` dispatches before `parse_cli_args` ever sees argv. The
-    /// binary's own tests prove them (`tests/live_search_command.rs`); the
-    /// source scan checks that `main.rs` still dispatches each one.
-    const PRE_DISPATCH_COMMANDS: &[(&str, &str)] = &[("fsfs live-search", "\"live-search\"")];
+    /// binary's own tests prove them (`tests/live_search_command.rs` and
+    /// `tests/recovery_cli.rs`); this scan verifies each dispatch in `main.rs`.
+    const PRE_DISPATCH_COMMANDS: &[(&str, &str)] = &[
+        ("fsfs live-search", "\"live-search\""),
+        ("fsfs recover", "\"recover\""),
+    ];
 
     /// Advertised forms that must NEVER parse: the fictional dry-run flags
     /// this contract retired, the nonexistent profile/repro/trace
@@ -2958,8 +3018,8 @@ mod tests {
         }
     }
 
-    /// Help text and completion scripts advertise exactly the commands the
-    /// parser accepts — no more, no less.
+    /// Completion scripts cover parser commands and the installed recovery
+    /// process boundary without reviving fictional commands.
     #[test]
     fn help_and_completion_advertisements_match_the_parser() {
         for shell in [
@@ -2981,6 +3041,10 @@ mod tests {
                     "{shell:?} completion advertises fictional command {fictional}"
                 );
             }
+            assert!(
+                script.contains("recover"),
+                "{shell:?} completion is missing the recovery process entry point"
+            );
         }
     }
 

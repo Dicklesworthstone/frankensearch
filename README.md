@@ -690,6 +690,27 @@ queue their inputs for the original quality producer and explicit completion.
 Stores first indexed from an empty corpus under forced deferral preserve that
 producer choice too, so their later appends can complete quality normally.
 
+To build a standalone quality-tier index, select a verified quality model in
+the configuration and run:
+
+```bash
+fsfs index ~/projects --quality-only --no-fast-only --index-dir ./quality-store
+fsfs search "structured concurrency" --quality-only --no-fast-only --index-dir ./quality-store
+```
+
+This one-shot build indexes the source into Quill and `vector/quality.fsvi`
+without loading the fast model. It publishes a complete generation; later
+quality-only builds can reuse compatible unchanged quality rows. `append-batch`,
+`delete`, and `compact` preserve the stored topology. Use `--quality-only` when
+searching this store, since ordinary hybrid search requires a fast tier.
+
+Quality-only indexing requires a pressure profile that permits quality and a
+complete-generation store on Linux or macOS. It refuses watch mode, forced
+embedding deferral, metadata-only or lexical-only policy, and combination with
+`--complete-quality`. If configuration enables watch mode, add
+`--no-watch-mode`. A missing or incompatible required quality producer is an
+error; an unsuccessful successor build leaves the selected generation intact.
+
 `append-batch` accepts JSONL objects with string `id` and `text` fields, from
 `--file` or standard input. It inserts or replaces the supplied documents in
 lexical data, every present vector tier, and an existing catalog, then publishes
@@ -758,6 +779,41 @@ reports what would be removed without removing anything, and
 This is the cooperative local store. The complete FSVI v2 authority migration
 remains unfinished. Commands refuse to create a nested index inside a sealed
 generation.
+
+### Recovery from a trusted receipt
+
+The installed CLI exposes receipt-directed recovery through `fsfs recover`.
+Use the generation ID and manifest SHA-256 from a trusted publication receipt;
+recovery never chooses a target by scanning abandoned directories. Inspection
+is read-only by default and does not download models:
+
+```bash
+fsfs recover --index-dir ./search-store \
+  --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256"
+```
+
+To validate a target now and restore it later, save a preparation outside the
+store, then explicitly apply that exact preparation:
+
+```bash
+fsfs recover --index-dir ./search-store \
+  --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256" \
+  --prepare --save-preparation ./recovery-preparation.json
+fsfs recover --index-dir ./search-store \
+  --resume-file ./recovery-preparation.json --apply
+```
+
+A competing publication, changed query policy, missing target, or incompatible
+producer refuses restoration. A saved preparation is not a retention pin.
+After an uncertain publication outcome, use the same preparation with
+`--confirm-durability` to confirm the exact selected target without restoring
+again or loading models.
+
+`fsfs recover --help` also describes source rebuilds with query previews,
+interruptible build handoffs, and artifact repair into new copied generations.
+These operations preserve the original bundles and keep the existing complete
+store's identity and publication checks. The standalone `fsfs-recover` utility
+remains available with the same options and shared implementation.
 
 ## Reproducible Showcase Suite
 
