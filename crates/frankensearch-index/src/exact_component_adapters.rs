@@ -432,8 +432,9 @@ mod tests {
             fsvi_whole_image_sha256: hex32(0xA1),
             fsvi_physical_row_count: 5,
             graph_basename: "fast.fshnsw".to_owned(),
-            // Deliberately different from the FSVI image's 8_192.
-            graph_byte_len: 4_096,
+            // A five-point v1 graph fits this length. Keep the ANN size
+            // distinct from the associated FSVI image's 8_192 bytes.
+            graph_byte_len: 256,
             graph_sha256: hex32(0xD1),
             native_format_version: 1,
             params: NativeHnswParamsIdentityV1 {

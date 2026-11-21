@@ -304,12 +304,19 @@ pub(super) fn load_mapping(
     let sentinel = super::FsfsRuntime::read_index_sentinel(index_root)?;
     let live_rows = index.live_doc_ids()?;
     let manifests = super::FsfsRuntime::read_matching_manifest_generation(index_root)?;
+    validate_mapping(sentinel.as_ref(), manifests.as_ref(), &live_rows)
+}
+
+pub(super) fn validate_mapping(
+    sentinel: Option<&super::IndexSentinel>,
+    manifests: Option<&BTreeMap<String, super::IndexManifestEntry>>,
+    live_rows: &HashSet<String>,
+) -> SearchResult<Option<FastWindowMapping>> {
     if sentinel
-        .as_ref()
         .is_none_or(|sentinel| sentinel.fast_window_max_per_file == 1)
     {
         if live_rows.iter().any(|id| id.contains('\0'))
-            || manifests.as_ref().is_some_and(|manifests| {
+            || manifests.is_some_and(|manifests| {
                 manifests.values().any(|entry| entry.fast_windows.is_some())
             })
         {
@@ -348,7 +355,7 @@ pub(super) fn load_mapping(
             .as_ref()
             .map(|plan| (source.as_str(), plan))
     });
-    FastWindowMapping::from_plans(sentinel.fast_window_max_per_file, plans, &live_rows).map(Some)
+    FastWindowMapping::from_plans(sentinel.fast_window_max_per_file, plans, live_rows).map(Some)
 }
 
 struct SourceFilter<'a> {

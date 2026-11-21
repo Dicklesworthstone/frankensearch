@@ -27,9 +27,7 @@ use asupersync::fs::remove_file as async_file_remove;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::spawn_blocking;
 use frankensearch_core::config::ZeroSignalReason;
-use frankensearch_core::filter::{
-    ExcludeDocIdsFilter, IncludeDocIdsFilter, PredicateFilter, SearchFilter,
-};
+use frankensearch_core::filter::{ExcludeDocIdsFilter, IncludeDocIdsFilter, SearchFilter};
 use frankensearch_core::parsed_query::{
     ParsedQuery, normalize_query_whitespace, quote_query_phrase,
 };
@@ -14691,14 +14689,15 @@ impl FsfsRuntime {
             return false;
         };
         payloads.iter().all(|payload| {
+            let hit_count = payload.hits.len();
             if payload.query != key.query
-                || payload.returned_hits != payload.hits.len()
-                || payload.returned_hits > payload.total_candidates
-                || payload.returned_hits > key.requested_limit
+                || payload.returned_hits != hit_count
+                || hit_count > payload.total_candidates
+                || hit_count > key.requested_limit
             {
                 return false;
             }
-            let mut documents = ahash::AHashSet::with_capacity(payload.hits.len());
+            let mut documents = ahash::AHashSet::with_capacity(hit_count);
             payload.hits.iter().enumerate().all(|(index, hit)| {
                 hit.rank == index + 1
                     && hit.score.is_finite()
@@ -18430,8 +18429,7 @@ impl FsfsRuntime {
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         let sentinel = Self::read_index_sentinel(&index_root)?;
-        let fast_index = VectorIndex::open_read_only(&vector_path)?;
-        let live_rows = fast_index.live_doc_ids()?;
+        let live_rows = VectorIndex::open_read_only(&vector_path)?.live_doc_ids()?;
         let target_root = sentinel.as_ref().map(|value| Path::new(&value.target_root));
         let live_ids = Self::live_delete_sources_at_root(
             cx,
@@ -18447,26 +18445,25 @@ impl FsfsRuntime {
             self.cli_input.delete_prefix,
             &live_ids,
         )?;
-        // Loading the mapping may adopt an unpointed lexical child to read
-        // its manifest. Resolve every selector before that adoption.
-        semantic_windows::load_mapping(&index_root, &fast_index)?;
-        drop(fast_index);
-        let mut window_membership = if Self::fast_window_policy_at_root(&index_root)? > 1 {
+        // Keep manifest validation read-only too. A valid selector can still
+        // fail when the recorded fast windows disagree with the live rows.
+        let manifests = Self::read_matching_manifest_generation_with(
+            &index_root,
+            Self::resolve_delete_lexical_engine,
+        )?;
+        semantic_windows::validate_mapping(sentinel.as_ref(), manifests.as_ref(), &live_rows)?;
+        let mut window_membership = if let Some(sentinel) = sentinel
+            .as_ref()
+            .filter(|sentinel| sentinel.fast_window_max_per_file > 1)
+        {
             Self::validate_search_generation_at_root(&index_root, SearchExecutionMode::Full)?;
-            let manifests =
-                Self::read_matching_manifest_generation(&index_root)?.ok_or_else(|| {
-                    complete_cli::complete_cli_error(
-                        "delete_membership",
-                        "window generation membership manifests disagree",
-                    )
-                })?;
-            let sentinel = Self::read_index_sentinel(&index_root)?.ok_or_else(|| {
+            let manifests = manifests.ok_or_else(|| {
                 complete_cli::complete_cli_error(
                     "delete_membership",
-                    "window generation has no completion sentinel",
+                    "window generation membership manifests disagree",
                 )
             })?;
-            Some((manifests, sentinel))
+            Some((manifests, sentinel.clone()))
         } else {
             None
         };
@@ -21646,12 +21643,19 @@ impl FsfsRuntime {
     fn read_matching_manifest_generation(
         index_root: &Path,
     ) -> SearchResult<Option<BTreeMap<String, IndexManifestEntry>>> {
+        Self::read_matching_manifest_generation_with(index_root, Self::resolve_lexical_engine)
+    }
+
+    fn read_matching_manifest_generation_with(
+        index_root: &Path,
+        resolve_lexical: impl FnOnce(&Path) -> SearchResult<LexicalEngineLayout>,
+    ) -> SearchResult<Option<BTreeMap<String, IndexManifestEntry>>> {
         let Some(vector_manifest) =
             Self::read_index_manifest_file(index_root, FSFS_VECTOR_MANIFEST_FILE)?
         else {
             return Ok(None);
         };
-        let lexical_layout = Self::resolve_lexical_engine(index_root)?;
+        let lexical_layout = resolve_lexical(index_root)?;
         let lexical_manifest_path = if lexical_layout.lexical_root() == index_root {
             lexical_layout
                 .engine_dir()
@@ -25996,7 +26000,8 @@ impl FsfsRuntime {
             &live_ids,
         )?;
         let mut manifests =
-            Self::read_matching_manifest_generation(index_root)?.ok_or_else(|| {
+            Self::read_matching_manifest_generation_with(index_root, Self::resolve_delete_lexical_engine)?
+            .ok_or_else(|| {
                 complete_cli::complete_cli_error(
                     "delete_membership",
                     "the lexical-only generation's manifests disagree; rerun `fsfs index`",
@@ -45531,7 +45536,7 @@ mod tests {
     fn legacy_delete_resolves_opaque_ids_before_adopting_lexical_generation() {
         run_test_with_cx(|cx| async move {
             let _restore = AppendEmbedderOverrides::install();
-            for lexical_only in [false, true] {
+            for (lexical_only, max_windows) in [(false, 1), (true, 1), (false, 128)] {
                 for prefix in [false, true] {
                     let parent = tempfile::tempdir().unwrap();
                     let source = parent.path().join("source");
@@ -45543,10 +45548,7 @@ mod tests {
                     let mut config = FsfsConfig::default();
                     config.indexing.offline = true;
                     config.indexing.quality_model.clear();
-                    // This fixture deliberately leaves stale source manifests
-                    // after a fast-only tombstone. Windowed generations require
-                    // those manifests to match live rows before any mutation.
-                    config.indexing.fast_window_max_per_file = 1;
+                    config.indexing.fast_window_max_per_file = max_windows;
                     config.search.fast_only = true;
                     config.search.rerank = false;
                     let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
@@ -45631,6 +45633,23 @@ mod tests {
                         !pointer_path.exists(),
                         "invalid selectors must not adopt CURRENT"
                     );
+                    if max_windows > 1 {
+                        // The low-level fast-only tombstone leaves a declared
+                        // window missing. Even a valid selector must fail
+                        // before publishing the unpointed lexical generation.
+                        command.cli_input.delete_ids = vec!["keep.md".to_owned()];
+                        let refused = command.run_delete_command(&cx).await;
+                        assert!(
+                            matches!(
+                                &refused,
+                                Err(SearchError::InvalidConfig { field, value, .. })
+                                    if field == "index.fast_windows"
+                                        && value == "source_window_mapping"
+                            ),
+                            "{refused:?}"
+                        );
+                        assert!(!pointer_path.exists(), "damaged windows must not adopt CURRENT");
+                    }
                     assert_eq!(
                         fs::read(lexical_path.join("MANIFEST")).unwrap(),
                         lexical_before
@@ -45641,6 +45660,9 @@ mod tests {
                     );
                     assert_eq!(fs::read(&fast_path).ok(), fast_before);
                     assert_eq!(fs::read(&wal_path).ok(), wal_before);
+                    if max_windows > 1 {
+                        continue;
+                    }
                     command.cli_input.delete_ids = if prefix {
                         vec![
                             format!(

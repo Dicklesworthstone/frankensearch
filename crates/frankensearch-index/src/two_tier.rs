@@ -4073,11 +4073,11 @@ mod tests {
             ("b", [1.0, 0.0]),
             ("b", [0.8, 0.6]),
             ("c", [0.0, 1.0]),
-            ("unusable", [0.0, 0.0]),
             ("negative", [-1.0, 0.0]),
         ] {
             writer.write_record(id, &vector).unwrap();
         }
+        writer.write_legacy_f16_zero_fixture("unusable");
         writer.finish().unwrap();
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
         let cx = Cx::for_testing();
