@@ -85,6 +85,11 @@ pub const NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V2: u16 = 2;
 /// Canonical sidecar suffix appended to the complete `.fshnsw` basename.
 pub const NATIVE_HNSW_GENERATION_RECEIPT_SUFFIX: &str = ".receipt";
 const NATIVE_HNSW_MAX_BASENAME_BYTES: usize = 255 - NATIVE_HNSW_GENERATION_RECEIPT_SUFFIX.len();
+// All wire fields except the basename have fixed widths, including the final
+// receipt seal. Bound receipt allocation by its schema, not file metadata alone.
+const NATIVE_HNSW_RECEIPT_FIXED_BYTES: usize = 514;
+const NATIVE_HNSW_RECEIPT_MAX_BYTES: usize =
+    NATIVE_HNSW_RECEIPT_FIXED_BYTES + NATIVE_HNSW_MAX_BASENAME_BYTES;
 const SHA256_HEX_LEN: usize = 64;
 const SHA256_BYTES: usize = 32;
 
@@ -647,7 +652,11 @@ impl NativeHnswGenerationBindingV2 {
         reject_non_regular_receipt_destination(&receipt_path)?;
 
         let metadata = graph.save(graph_path)?;
-        let graph_bytes = read_regular_file_bytes(graph_path, "native HNSW artifact")?;
+        let graph_bytes = read_regular_file_bytes(
+            graph_path,
+            "native HNSW artifact",
+            FileReadBound::Exact(metadata.byte_len()),
+        )?;
         if u64::try_from(graph_bytes.len()).ok() != Some(metadata.byte_len()) {
             return Err(native_hnsw_corrupted(
                 graph_path,
@@ -720,27 +729,38 @@ impl NativeHnswGenerationBindingV2 {
         }
         let receipt_path = native_hnsw_generation_receipt_path(graph_path)?;
         reject_symlink_ancestors(graph_path)?;
-        let receipt_bytes =
-            read_regular_file_bytes(&receipt_path, "native HNSW generation receipt")?;
+        let receipt_bytes = read_regular_file_bytes(
+            &receipt_path,
+            "native HNSW generation receipt",
+            FileReadBound::AtMost(usize_to_u64(
+                NATIVE_HNSW_RECEIPT_MAX_BYTES,
+                "receipt.maximum_encoded_length",
+            )?),
+        )?;
         let receipt = NativeHnswGenerationReceiptV2::from_bytes(&receipt_bytes, &receipt_path)?;
         self.validate_receipt_identity(&receipt, graph_path, &receipt_path)?;
 
-        let graph_bytes_before = read_regular_file_bytes(graph_path, "native HNSW artifact")?;
+        let graph_bytes_before = read_regular_file_bytes(
+            graph_path,
+            "native HNSW artifact",
+            FileReadBound::Exact(receipt.graph_byte_len),
+        )?;
         Self::validate_graph_bytes(&receipt, graph_path, &graph_bytes_before)?;
         after_first_observation()?;
-        let (graph, metadata) = NativeHnsw::load_with_metadata(graph_path, owner)?;
+        // Decode the integrity-checked image itself. Reopening the pathname here
+        // could parse different bytes after the hash check and would read the
+        // entire artifact a third time.
+        let (graph, metadata) = NativeHnsw::read_with_metadata(
+            graph_path,
+            &mut Cursor::new(graph_bytes_before.as_slice()),
+            receipt.graph_byte_len,
+            owner,
+        )?;
         Self::validate_graph_identity(&receipt, graph_path, &graph, metadata)?;
 
-        // A second exact byte observation closes the replacement window
-        // between the cryptographic check and the owned graph parser.
-        let graph_bytes_after = read_regular_file_bytes(graph_path, "native HNSW artifact")?;
-        // ubs:ignore — public artifact bytes are integrity material, not a secret.
-        if graph_bytes_after != graph_bytes_before {
-            return Err(native_hnsw_corrupted(
-                graph_path,
-                "native HNSW artifact changed during receipt verification",
-            ));
-        }
+        // Preserve the fail-closed replacement check without retaining another
+        // complete serialized graph alongside the integrity-checked image.
+        verify_regular_file_bytes_unchanged(graph_path, &graph_bytes_before)?;
         Ok((graph, receipt))
     }
 
@@ -1629,6 +1649,19 @@ impl NativeHnswGenerationReceiptV2 {
                 "must be below the native HNSW layer bound",
             ));
         }
+        // The receipt seal is public integrity metadata. Its declared length
+        // cannot authorize arbitrary allocation, even when the on-disk graph
+        // has that same length. Owner identity is checked before graph I/O.
+        let maximum_graph_byte_len = self.maximum_graph_byte_len()?;
+        if u128::from(self.graph_byte_len) > maximum_graph_byte_len {
+            return Err(native_hnsw_receipt_config_error(
+                "graph_byte_len",
+                &self.graph_byte_len.to_string(),
+                &format!(
+                    "exceeds structural maximum {maximum_graph_byte_len} for the graph's point count, layers, and degree budgets"
+                ),
+            ));
+        }
         match (self.point_count, self.entry_point, self.max_level) {
             (0, None, 0) => {}
             (0, Some(_), _) => {
@@ -1713,6 +1746,42 @@ impl NativeHnswGenerationReceiptV2 {
         Ok(receipt)
     }
 
+    /// Conservative wire-size bound after validating format, count, and layer
+    /// fields. No layer can contain self-edges or repeated neighbours, so large
+    /// declared degrees cannot authorize more than `point_count - 1` ids per row.
+    /// Use `u128` because a valid graph's worst-case bound may exceed `u64` even
+    /// though its actual serialized length fits the format's `u64` length field.
+    fn maximum_graph_byte_len(&self) -> SearchResult<u128> {
+        let overflow = || {
+            native_hnsw_receipt_config_error(
+                "graph_byte_len",
+                "overflow",
+                "structural graph-size bound cannot be represented",
+            )
+        };
+        let neighbour_limit = self.point_count.saturating_sub(1);
+        let layer_bytes = |degree: u64| {
+            u128::from(degree.min(neighbour_limit))
+                .checked_mul(4)
+                .and_then(|bytes| bytes.checked_add(4))
+                .ok_or_else(overflow)
+        };
+        let base_layer_bytes = layer_bytes(self.params.m0)?;
+        let upper_layer_bytes = layer_bytes(self.params.m)?;
+        let row_prefix_bytes = if self.native_format_version == 1 {
+            4
+        } else {
+            8
+        };
+        u128::from(self.max_level)
+            .checked_mul(upper_layer_bytes)
+            .and_then(|bytes| bytes.checked_add(base_layer_bytes))
+            .and_then(|bytes| bytes.checked_add(row_prefix_bytes))
+            .and_then(|bytes| bytes.checked_mul(u128::from(self.point_count)))
+            .and_then(|bytes| bytes.checked_add(u128::from(NATIVE_HNSW_HEADER_LEN_U64)))
+            .ok_or_else(overflow)
+    }
+
     fn seal(&mut self) -> SearchResult<()> {
         self.receipt_sha256 = sha256_hex(&self.canonical_body_bytes()?);
         Ok(())
@@ -1733,7 +1802,8 @@ impl NativeHnswGenerationReceiptV2 {
                 "basename length must fit the canonical u16 field",
             )
         })?;
-        let mut bytes = Vec::with_capacity(488 + basename.len());
+        let mut bytes =
+            Vec::with_capacity(NATIVE_HNSW_RECEIPT_FIXED_BYTES - SHA256_BYTES + basename.len());
         bytes.extend_from_slice(&NATIVE_HNSW_RECEIPT_MAGIC);
         bytes.extend_from_slice(&self.schema_version.to_be_bytes());
         bytes.extend_from_slice(&self.artifact_generation.schema_version.to_be_bytes());
@@ -2923,6 +2993,7 @@ impl NativeHnsw {
     ///
     /// Returns not-found, corruption, owner-cardinality, and filesystem
     /// errors from bounded parsing and structural attestation.
+    #[cfg(test)]
     fn load_with_metadata<D: VectorDistance>(
         path: &Path,
         store: &D,
@@ -3036,13 +3107,18 @@ impl NativeHnsw {
                     u64::from(payload.read_u32(path, "layer neighbour count")?),
                     "neighbour_count",
                 )?;
-                let budget = header.params.degree_at(layer);
+                // The verifier forbids self-edges and duplicate ids. Apply
+                // that cardinality limit before reserving an untrusted list.
+                let budget = header
+                    .params
+                    .degree_at(layer)
+                    .min(header.point_count.saturating_sub(1));
                 if neighbour_count > budget {
                     return Err(native_hnsw_corrupted(
                         path,
                         format!(
                             "point {point_id} layer {layer} holds {neighbour_count} neighbours, \
-                             exceeding degree budget {budget}"
+                             exceeding degree/cardinality budget {budget}"
                         ),
                     ));
                 }
@@ -4022,57 +4098,135 @@ fn reject_symlink_ancestors(path: &Path) -> SearchResult<()> {
     Ok(())
 }
 
-fn read_regular_file_bytes(path: &Path, kind: &str) -> SearchResult<Vec<u8>> {
-    let path_metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        // ubs:ignore — this compares a public I/O error enum, not secret material.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SearchError::IndexNotFound {
-                path: path.to_path_buf(),
-            });
+/// Receipt schema bounds and validated graph lengths constrain allocation
+/// before any file payload is read. Graphs have no arbitrary global size cap.
+#[derive(Clone, Copy)]
+enum FileReadBound {
+    Exact(u64),
+    AtMost(u64),
+}
+
+impl FileReadBound {
+    fn check(self, path: &Path, kind: &str, observed_len: u64) -> SearchResult<()> {
+        match self {
+            Self::Exact(expected) if observed_len != expected => Err(native_hnsw_corrupted(
+                path,
+                format!(
+                    "{kind} length {observed_len} disagrees with the expected graph length {expected} from its receipt or save metadata"
+                ),
+            )),
+            Self::AtMost(maximum) if observed_len > maximum => Err(native_hnsw_corrupted(
+                path,
+                format!("{kind} length {observed_len} exceeds the schema limit {maximum}"),
+            )),
+            _ => Ok(()),
         }
-        Err(error) => return Err(SearchError::Io(error)),
-    };
-    if !path_metadata.file_type().is_file() {
-        return Err(SearchError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{kind} '{}' must be a regular file, not a symlink or special file",
-                path.display()
-            ),
-        )));
     }
-    let mut file = File::open(path).map_err(SearchError::Io)?;
+}
+
+fn read_regular_file_bytes(path: &Path, kind: &str, bound: FileReadBound) -> SearchResult<Vec<u8>> {
+    let mut file = open_regular_file(path)?;
     let opened_metadata = file.metadata().map_err(SearchError::Io)?;
-    ensure_same_open_file(&path_metadata, &opened_metadata).map_err(SearchError::Io)?;
-    let expected_len = opened_metadata.len();
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(usize::try_from(expected_len).map_err(|_| {
-            SearchError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{kind} '{}' is too large for this platform", path.display()),
-            ))
-        })?)
-        .map_err(|error| {
-            SearchError::Io(std::io::Error::other(format!(
-                "could not allocate {expected_len} bytes for {kind} '{}': {error}",
-                path.display()
-            )))
-        })?;
-    file.read_to_end(&mut bytes).map_err(SearchError::Io)?;
-    if u64::try_from(bytes.len()).ok() != Some(expected_len) {
-        return Err(SearchError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!(
-                "{kind} '{}' changed length while being read",
-                path.display()
-            ),
-        )));
-    }
-    let final_path_metadata = std::fs::symlink_metadata(path).map_err(SearchError::Io)?;
-    ensure_same_open_file(&final_path_metadata, &opened_metadata).map_err(SearchError::Io)?;
+    let bytes = read_bounded_file_bytes(&mut file, path, kind, opened_metadata.len(), bound)?;
+    check_file_after_read(path, &file, &opened_metadata)?;
     Ok(bytes)
+}
+
+/// Read precisely the admitted length plus at most one EOF-probe byte. A file
+/// that grows after metadata admission cannot turn this into an unbounded read.
+fn read_bounded_file_bytes(
+    reader: &mut impl Read,
+    path: &Path,
+    kind: &str,
+    observed_len: u64,
+    bound: FileReadBound,
+) -> SearchResult<Vec<u8>> {
+    bound.check(path, kind, observed_len)?;
+    let capacity = usize::try_from(observed_len).map_err(|_| {
+        SearchError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{kind} '{}' is too large for this platform", path.display()),
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        SearchError::Io(std::io::Error::other(format!(
+            "could not allocate {observed_len} bytes for {kind} '{}': {error}",
+            path.display()
+        )))
+    })?;
+    bytes.resize(capacity, 0);
+    reader.read_exact(&mut bytes).map_err(SearchError::Io)?;
+    check_file_eof(reader, path)?;
+    Ok(bytes)
+}
+
+fn check_file_eof(reader: &mut impl Read, path: &Path) -> SearchResult<()> {
+    let mut extra = [0_u8; 1];
+    loop {
+        match reader.read(&mut extra) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err(native_hnsw_corrupted(
+                    path,
+                    "native HNSW artifact changed length while being read",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(SearchError::Io(error)),
+        }
+    }
+}
+
+fn check_file_after_read(
+    path: &Path,
+    file: &File,
+    opened_metadata: &std::fs::Metadata,
+) -> SearchResult<()> {
+    let final_metadata = file.metadata().map_err(SearchError::Io)?;
+    let final_path_metadata = std::fs::symlink_metadata(path).map_err(SearchError::Io)?;
+    if !final_path_metadata.file_type().is_file() {
+        return Err(native_hnsw_corrupted(
+            path,
+            "native HNSW artifact ceased to be a regular file while being read",
+        ));
+    }
+    ensure_same_open_file(&final_path_metadata, opened_metadata).map_err(SearchError::Io)?;
+    if final_metadata.len() != opened_metadata.len()
+        || final_path_metadata.len() != opened_metadata.len()
+    {
+        return Err(native_hnsw_corrupted(
+            path,
+            "native HNSW artifact changed length while being read",
+        ));
+    }
+    Ok(())
+}
+
+/// Reobserve exactly the integrity-checked bytes using fixed-size scratch space.
+/// The parser has already consumed that retained image, never a new pathname.
+fn verify_regular_file_bytes_unchanged(path: &Path, expected: &[u8]) -> SearchResult<()> {
+    let mut file = open_regular_file(path)?;
+    let opened_metadata = file.metadata().map_err(SearchError::Io)?;
+    FileReadBound::Exact(usize_to_u64(expected.len(), "graph.verified_length")?).check(
+        path,
+        "native HNSW artifact",
+        opened_metadata.len(),
+    )?;
+    let mut buffer = [0_u8; 8 * 1024];
+    for chunk in expected.chunks(buffer.len()) {
+        let actual = &mut buffer[..chunk.len()];
+        file.read_exact(actual).map_err(SearchError::Io)?;
+        // ubs:ignore — these are public artifact integrity bytes, not secrets.
+        if actual != chunk {
+            return Err(native_hnsw_corrupted(
+                path,
+                "native HNSW artifact changed during receipt verification",
+            ));
+        }
+    }
+    check_file_eof(&mut file, path)?;
+    check_file_after_read(path, &file, &opened_metadata)
 }
 
 fn persist_native_hnsw_receipt(path: &Path, bytes: &[u8]) -> SearchResult<()> {
@@ -7466,6 +7620,396 @@ mod tests {
                 if detail.contains("SHA-256")),
             "unexpected resealed graph error: {resealed:?}"
         );
+    }
+
+    #[test]
+    fn native_file_read_bound_refuses_oversized_inputs_before_reading() {
+        struct UnexpectedRead;
+
+        impl Read for UnexpectedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("a refused length must not read or allocate its payload");
+            }
+        }
+
+        let path = Path::new("bounded.fshnsw");
+        for (observed, bound) in [
+            (u64::MAX, FileReadBound::AtMost(1024)),
+            (u64::MAX, FileReadBound::Exact(96)),
+            (97, FileReadBound::Exact(96)),
+            (95, FileReadBound::Exact(96)),
+        ] {
+            assert!(matches!(
+                read_bounded_file_bytes(
+                    &mut UnexpectedRead,
+                    path,
+                    "test artifact",
+                    observed,
+                    bound,
+                ),
+                Err(SearchError::IndexCorrupted { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn native_file_read_stops_after_one_growth_probe() {
+        struct AppendAfterFirstRead {
+            reader: File,
+            writer: File,
+            appended: bool,
+            bytes_read: usize,
+        }
+
+        impl Read for AppendAfterFirstRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.reader.read(buffer)?;
+                self.bytes_read += count;
+                if !self.appended {
+                    self.writer.write_all(&[0xa5; 16 * 1024])?;
+                    self.appended = true;
+                }
+                Ok(count)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("growing.fshnsw");
+        let initial = b"fixed payload";
+        std::fs::write(&path, initial).unwrap();
+        let mut growing = AppendAfterFirstRead {
+            reader: File::open(&path).unwrap(),
+            writer: std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            appended: false,
+            bytes_read: 0,
+        };
+        let admitted_len = u64::try_from(initial.len()).unwrap();
+        let error = read_bounded_file_bytes(
+            &mut growing,
+            &path,
+            "growing graph",
+            admitted_len,
+            FileReadBound::Exact(admitted_len),
+        )
+        .expect_err("growth after metadata admission must fail");
+        assert!(matches!(error, SearchError::IndexCorrupted { .. }));
+        assert_eq!(
+            growing.bytes_read,
+            initial.len() + 1,
+            "growth detection must not read the appended tail"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            admitted_len + 16 * 1024,
+            "refused reads leave the artifact intact"
+        );
+    }
+
+    #[test]
+    fn native_file_read_rejects_truncation_and_preserves_io_errors() {
+        let path = Path::new("short.fshnsw");
+        let mut shortened = Cursor::new(b"short".as_slice());
+        let error = read_bounded_file_bytes(
+            &mut shortened,
+            path,
+            "truncated graph",
+            6,
+            FileReadBound::Exact(6),
+        )
+        .expect_err("truncation after metadata admission must fail");
+        assert!(matches!(error, SearchError::Io(ref error)
+            if error.kind() == std::io::ErrorKind::UnexpectedEof));
+
+        struct FailedRead;
+
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected payload-read failure",
+                ))
+            }
+        }
+
+        let error = read_bounded_file_bytes(
+            &mut FailedRead,
+            path,
+            "unreadable graph",
+            6,
+            FileReadBound::Exact(6),
+        )
+        .expect_err("I/O failures must not become empty or partially decoded graphs");
+        assert!(matches!(error, SearchError::Io(ref error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn native_receipt_schema_bound_accepts_longest_graph_basename() {
+        let directory = tempfile::tempdir().unwrap();
+        let basename = format!(
+            "{}.fshnsw",
+            "g".repeat(NATIVE_HNSW_MAX_BASENAME_BYTES - ".fshnsw".len()),
+        );
+        let path = directory.path().join(&basename);
+        let owner = generation_owner(121, 0x21, "longest-receipt-name", 4, 8);
+        let graph =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 17)
+                .unwrap();
+        let receipt = graph.save(&path).unwrap();
+        assert_eq!(
+            receipt.to_bytes().unwrap().len(),
+            NATIVE_HNSW_RECEIPT_FIXED_BYTES + basename.len(),
+        );
+        assert_eq!(
+            std::fs::metadata(native_hnsw_generation_receipt_path(&path).unwrap())
+                .unwrap()
+                .len(),
+            u64::try_from(NATIVE_HNSW_RECEIPT_MAX_BYTES).unwrap(),
+        );
+        let (loaded, observed) = ValidatedNativeHnsw::load(owner, &path).unwrap();
+        assert_eq!(observed, receipt);
+        assert_eq!(
+            loaded
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 8, Some(8))
+                .unwrap(),
+            graph
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 8, Some(8))
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn bound_load_rejects_oversized_sparse_receipt_before_graph_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.fshnsw");
+        let receipt_path = native_hnsw_generation_receipt_path(&path).unwrap();
+        let oversized_len = 64 * 1024 * 1024;
+        File::create(&receipt_path)
+            .unwrap()
+            .set_len(oversized_len)
+            .unwrap();
+        let owner = generation_owner(122, 0x22, "oversized-receipt", 4, 8);
+
+        let error = ValidatedNativeHnsw::load(owner, &path)
+            .expect_err("a sparse receipt cannot control loader allocation");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { path: ref rejected, ref detail }
+            if rejected == &receipt_path && detail.contains("schema limit"))
+        );
+        assert_eq!(
+            std::fs::metadata(&receipt_path).unwrap().len(),
+            oversized_len
+        );
+        assert!(
+            !path.exists(),
+            "receipt rejection must not create or repair a graph"
+        );
+    }
+
+    #[test]
+    fn native_receipt_graph_size_bound_handles_wire_variants_and_wide_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("structural-bound.fshnsw");
+        let owner = generation_owner(125, 0x25, "structural-size-bound", 4, 1);
+        let graph = ValidatedNativeHnsw::build(&Cx::for_testing(), owner, params(), 31).unwrap();
+        let mut receipt = graph.save(&path).unwrap();
+
+        // Independently counted layouts cover the empty and single-row cases,
+        // the v2 row-map field, upper layers, and degree limits above N - 1.
+        for (version, points, level, m, m0, expected) in [
+            (1, 0, 0, 8, 16, 96_u128),
+            (2, 0, 0, 8, 16, 96),
+            (1, 1, 0, 8, 16, 104),
+            (2, 1, 0, 8, 16, 108),
+            (2, 1, 15, 8, 16, 168),
+            (1, 3, 2, 1, 9, 192),
+            (2, 3, 2, 1, 9, 204),
+            (2, 3, 2, u64::MAX, u64::MAX, 228),
+        ] {
+            receipt.native_format_version = version;
+            receipt.point_count = points;
+            receipt.max_level = level;
+            receipt.params.m = m;
+            receipt.params.m0 = m0;
+            assert_eq!(
+                receipt.maximum_graph_byte_len().unwrap(),
+                expected,
+                "format={version}, points={points}, level={level}, m={m}, m0={m0}",
+            );
+        }
+
+        receipt.point_count = u64::from(u32::MAX);
+        receipt.max_level = u64::try_from(MAX_LEVEL - 1).unwrap();
+        assert!(
+            receipt.maximum_graph_byte_len().unwrap() > u128::from(u64::MAX),
+            "a conservative bound above u64 must not reject a representable sparse graph",
+        );
+        receipt.point_count = u64::MAX;
+        receipt.max_level = u64::MAX;
+        assert!(matches!(
+            receipt.maximum_graph_byte_len(),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn bound_load_rejects_resealed_oversized_sparse_graph_before_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resealed-large.fshnsw");
+        let receipt_path = native_hnsw_generation_receipt_path(&path).unwrap();
+        let owner = generation_owner(126, 0x26, "resealed-large-graph", 4, 8);
+        let graph =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 37)
+                .unwrap();
+        let original = graph.save(&path).unwrap();
+        let oversized_len = 64 * 1024 * 1024;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(oversized_len)
+            .unwrap();
+
+        for inflate_owner_count in [false, true] {
+            let mut receipt = original.clone();
+            receipt.graph_byte_len = oversized_len;
+            // A receipt seal is reproducible. Inflate every graph-size input
+            // that is not supplied by the admitted vector owner.
+            receipt.params.m = u64::from(u32::MAX);
+            receipt.params.m0 = u64::from(u32::MAX);
+            receipt.max_level = u64::try_from(MAX_LEVEL - 1).unwrap();
+            if inflate_owner_count {
+                receipt.point_count = u64::from(u32::MAX);
+                receipt.fsvi_physical_row_count = receipt.point_count;
+            }
+            write_resealed_receipt(&receipt_path, &mut receipt);
+            let expected_detail = if inflate_owner_count {
+                "FSVI physical row count"
+            } else {
+                "structural maximum"
+            };
+            let error = ValidatedNativeHnsw::load(Arc::clone(&owner), &path)
+                .expect_err("a resealed receipt cannot authorize an oversized sparse allocation");
+            assert!(
+                matches!(error, SearchError::IndexCorrupted { path: ref rejected, ref detail }
+                    if rejected == &receipt_path && detail.contains(expected_detail)),
+                "{error:?}",
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), oversized_len);
+            assert_eq!(
+                std::fs::read(&receipt_path).unwrap(),
+                receipt.encode_unchecked().unwrap(),
+                "refused artifacts must not be repaired or resealed by the reader",
+            );
+        }
+    }
+
+    #[test]
+    fn native_parser_rejects_impossible_neighbour_count_before_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("impossible-neighbours.fshnsw");
+        let store = TestStore::synthetic(1, 4);
+        let graph = NativeHnsw::build(params(), 41, &store).unwrap();
+        graph.save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let count_offset = NATIVE_HNSW_HEADER_LEN + 8;
+        assert_eq!(get_u32(&bytes, count_offset), 0);
+        put_u32(&mut bytes, count_offset, 1);
+        drop(bytes.splice(count_offset + 4..count_offset + 4, 0_u32.to_be_bytes()));
+        let payload_len = get_u64(&bytes, 80) + 4;
+        put_u64(&mut bytes, 80, payload_len);
+        reseal_persisted_checksums(&mut bytes);
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = NativeHnsw::load(&path, &store)
+            .expect_err("a one-point graph cannot allocate even one neighbour id");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+            if detail.contains("degree/cardinality budget 0"))
+        );
+    }
+
+    #[test]
+    fn bound_load_rejects_graph_length_before_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("length.fshnsw");
+        let owner = generation_owner(123, 0x23, "bounded-graph-length", 4, 8);
+        let graph =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 23)
+                .unwrap();
+        let receipt = graph.save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let receipt_path = native_hnsw_generation_receipt_path(&path).unwrap();
+        let receipt_bytes = std::fs::read(&receipt_path).unwrap();
+
+        for length in [
+            receipt.graph_byte_len - 1,
+            receipt.graph_byte_len + 1,
+            64 * 1024 * 1024,
+        ] {
+            std::fs::write(&path, &original).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(length)
+                .unwrap();
+            let error = ValidatedNativeHnsw::load(Arc::clone(&owner), &path)
+                .expect_err("the receipt must constrain graph allocation before payload reads");
+            assert!(
+                matches!(error, SearchError::IndexCorrupted { path: ref rejected, ref detail }
+                if rejected == &path && detail.contains("expected graph length"))
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+            assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes);
+        }
+    }
+
+    #[test]
+    fn bound_load_rejects_growth_truncation_and_same_size_mutation_after_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("changed.fshnsw");
+        let owner = generation_owner(124, 0x24, "bounded-recheck", 4, 16);
+        let graph =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 29)
+                .unwrap();
+
+        for mutation in ["growth", "truncation", "same-size"] {
+            let receipt = graph.save(&path).unwrap();
+            let error = ValidatedNativeHnsw::load_with_after_first_observation(
+                Arc::clone(&owner),
+                &path,
+                || {
+                    let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+                    match mutation {
+                        "growth" => file.set_len(receipt.graph_byte_len + 1)?,
+                        "truncation" => file.set_len(receipt.graph_byte_len - 1)?,
+                        _ => {
+                            file.seek(SeekFrom::Start(receipt.graph_byte_len - 1))?;
+                            let original = std::fs::read(&path)?;
+                            file.write_all(&[original[original.len() - 1] ^ 0x80])?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("changes after checking the retained image must still be refused");
+            assert!(
+                matches!(error, SearchError::IndexCorrupted { .. }),
+                "{error:?}"
+            );
+            assert_eq!(
+                graph
+                    .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 16, Some(16))
+                    .unwrap()
+                    .len(),
+                16,
+                "refused reloads do not affect an already admitted graph",
+            );
+        }
     }
 
     #[test]
