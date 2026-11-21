@@ -5723,6 +5723,64 @@ pub struct QuillSearchIndex {
     directory: PathBuf,
 }
 
+/// Related lexical reads bound to one admitted process-local publication.
+///
+/// Candidate refills and selected-document metadata lookups use the same
+/// Keeper-plus-Delta snapshot even if the originating reader is refreshed.
+/// This session has no writer, refresh or generation-discovery operation.
+#[derive(Clone)]
+pub struct QuillSearchSession {
+    reader: QuillReader,
+    snapshot: Arc<QuillSearchSnapshot>,
+}
+
+impl QuillSearchSession {
+    /// Search this session's publication with canonical stored metadata.
+    ///
+    /// # Errors
+    /// Returns typed cancellation, parsing, scoring, metadata or allocation errors.
+    pub fn search_results(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredResult>, QuillIndexError> {
+        self.reader
+            .scored_results_on(cx, query, limit, true, self.snapshot.as_ref())
+    }
+
+    /// Hydrate selected identities from the exact publication used for scoring.
+    ///
+    /// Results follow the input order, including repeated identities. Missing
+    /// documents and documents without stored metadata produce `None`.
+    ///
+    /// # Errors
+    /// Returns typed cancellation, dictionary, metadata or allocation failures.
+    pub fn metadata_for_documents(
+        &self,
+        cx: &Cx,
+        document_ids: &[&str],
+    ) -> Result<Vec<Option<Arc<serde_json::Value>>>, QuillIndexError> {
+        check_cancel(cx, "selected metadata hydration")?;
+        let mut metadata = Vec::new();
+        metadata
+            .try_reserve(document_ids.len())
+            .map_err(|_| invalid_state("could not reserve selected metadata batch"))?;
+        for document_id in document_ids {
+            check_cancel(cx, "selected metadata hydration")?;
+            metadata.push(
+                self.snapshot
+                    .resolve_document_id(document_id)?
+                    .map(|global_docid| self.snapshot.materialize_metadata(global_docid))
+                    .transpose()?
+                    .flatten(),
+            );
+        }
+        check_cancel(cx, "selected metadata hydration")?;
+        Ok(metadata)
+    }
+}
+
 /// A query-capable reader for one admitted immutable lexical image.
 ///
 /// Construct the snapshot with [`KeeperSnapshot::from_exact_image`] under the
@@ -13387,6 +13445,23 @@ impl PreparsedQuillIndex {
 }
 
 impl QuillSearchIndex {
+    /// Pin one proven-readable publication for related searches and hydration.
+    ///
+    /// A later refresh changes this handle, never the returned session. No
+    /// files are reopened and no writer lease is acquired.
+    ///
+    /// # Errors
+    /// Returns typed cancellation or publication-state admission failures.
+    pub fn pin_search(&self, cx: &Cx) -> Result<QuillSearchSession, QuillIndexError> {
+        check_cancel(cx, "pin lexical search")?;
+        let snapshot = self.reader.checked_published_snapshot()?;
+        check_cancel(cx, "pin lexical search")?;
+        Ok(QuillSearchSession {
+            reader: self.reader.clone(),
+            snapshot,
+        })
+    }
+
     /// Actual prefix hashes in this handle's snapshot, for Linux receipt regressions.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn authenticated_file_witness_hash_count(&self) -> u64 {
@@ -13767,22 +13842,8 @@ impl QuillSearchIndex {
         document_ids: &[&str],
     ) -> Result<Vec<Option<Arc<serde_json::Value>>>, QuillIndexError> {
         check_cancel(cx, "selected metadata hydration")?;
-        let snapshot = self.reader.checked_published_snapshot()?;
-        let mut metadata = Vec::new();
-        metadata
-            .try_reserve(document_ids.len())
-            .map_err(|_| invalid_state("could not reserve selected metadata batch"))?;
-        for document_id in document_ids {
-            check_cancel(cx, "selected metadata hydration")?;
-            metadata.push(
-                snapshot
-                    .resolve_document_id(document_id)?
-                    .map(|global_docid| snapshot.materialize_metadata(global_docid))
-                    .transpose()?
-                    .flatten(),
-            );
-        }
-        Ok(metadata)
+        self.pin_search(cx)?
+            .metadata_for_documents(cx, document_ids)
     }
 
     /// Search the pinned publication and generate snippets from stored content.
@@ -36560,12 +36621,19 @@ mod tests {
             assert!(metadata[2].is_none());
             assert_eq!(metadata[0], metadata[3]);
             assert!(reader.metadata_for_documents(&cx, &[]).unwrap().is_empty());
+            let session = reader.pin_search(&cx).expect("pin related reads");
+            let before = session.search_results(&cx, "alpha", 10).unwrap();
+            let prefix = session.search_results(&cx, "alpha", 1).unwrap();
+            assert_eq!(prefix[0].doc_id, before[0].doc_id);
 
             writer
                 .upsert_documents(
                     &cx,
-                    &[IndexableDocument::new("annotated", "alpha")
-                        .with_metadata("revision", "second")],
+                    &[
+                        IndexableDocument::new("annotated", "alpha")
+                            .with_metadata("revision", "second"),
+                        IndexableDocument::new("new", "alpha").with_metadata("revision", "second"),
+                    ],
                 )
                 .await
                 .expect("replace annotated metadata");
@@ -36580,6 +36648,32 @@ mod tests {
             assert_eq!(updated[0], updated[3]);
             assert!(updated[1].is_none());
             assert!(updated[2].is_none());
+            assert_eq!(
+                session.metadata_for_documents(&cx, &ids).unwrap(),
+                metadata,
+                "selected metadata stays bound to the scoring publication after refresh",
+            );
+            let refilled = session.search_results(&cx, "alpha", 10).unwrap();
+            assert_eq!(
+                refilled
+                    .iter()
+                    .map(|hit| (
+                        hit.doc_id.as_str(),
+                        hit.score.to_bits(),
+                        hit.metadata.as_deref()
+                    ))
+                    .collect::<Vec<_>>(),
+                before
+                    .iter()
+                    .map(|hit| (
+                        hit.doc_id.as_str(),
+                        hit.score.to_bits(),
+                        hit.metadata.as_deref()
+                    ))
+                    .collect::<Vec<_>>(),
+                "refills cannot observe refreshed membership, scores or metadata",
+            );
+            assert_eq!(reader.search_results(&cx, "alpha", 10).unwrap().len(), 3);
 
             cx.set_cancel_requested(true);
             for ids in [&ids[..], &[][..]] {
@@ -36589,7 +36683,17 @@ mod tests {
                         phase: "selected metadata hydration"
                     }),
                 ));
+                assert!(matches!(
+                    session.metadata_for_documents(&cx, ids),
+                    Err(QuillIndexError::Cancelled { .. }),
+                ));
             }
+            assert!(matches!(
+                reader.pin_search(&cx),
+                Err(QuillIndexError::Cancelled {
+                    phase: "pin lexical search"
+                }),
+            ));
         });
     }
 
