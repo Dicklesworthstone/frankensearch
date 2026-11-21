@@ -689,6 +689,7 @@ impl SyncTwoTierSearcher {
             limit,
             filter,
             &mut context.metadata,
+            None,
         ) {
             Ok(results) => Ok(Some(results)),
             Err(
@@ -949,7 +950,12 @@ impl SyncTwoTierSearcher {
             hits: fast_hits,
             zero_signal,
         } = classified;
-        lexical_context.revalidate_lexical(lexical_hits.as_mut(), filter);
+        metrics.lexical_search_ms += ms(lexical_context.revalidate_lexical(
+            query_vec,
+            fetch,
+            lexical_hits.as_mut(),
+            filter,
+        )?);
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         metrics.phase1_vectors_searched = phase1_vectors_searched;
         metrics.zero_signal = zero_signal;
@@ -1142,7 +1148,13 @@ impl SyncTwoTierSearcher {
                 )
             },
         )?;
-        lexical_context.revalidate_lexical(lexical_hits.as_mut(), filter);
+        metrics.quality_search_ms = ms(quality_started.elapsed());
+        metrics.lexical_search_ms += ms(lexical_context.revalidate_lexical(
+            query.vector(),
+            fetch,
+            lexical_hits.as_mut(),
+            filter,
+        )?);
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         if zero_signal != Some(ZeroSignalReason::ZeroNormQuery) {
             // These are Phase-1 vectors because direct quality is the first
@@ -1150,7 +1162,6 @@ impl SyncTwoTierSearcher {
             metrics.phase1_vectors_searched = index.record_count();
         }
         metrics.zero_signal = zero_signal;
-        metrics.quality_search_ms = ms(quality_started.elapsed());
         metrics.vector_search_ms = metrics.quality_search_ms;
         metrics.semantic_candidates = hits.len();
         let fusion_started = Instant::now();
@@ -1298,6 +1309,7 @@ impl SyncTwoTierSearcher {
         // coverage. Caller-declared spaces and unstamped control fixtures keep
         // their existing rescoring contract.
         let independent_quality = independently_retrievable_quality(quality_index);
+        let mut lexical_refill_time = Duration::ZERO;
         let quality_pool = if independent_quality {
             search_filtered_vectors(
                 &mut lexical_context,
@@ -1309,7 +1321,12 @@ impl SyncTwoTierSearcher {
                 },
             )
             .and_then(|ClassifiedHits { mut hits, .. }| {
-                lexical_context.revalidate_lexical(lexical_hits.as_mut(), filter);
+                lexical_refill_time = lexical_context.revalidate_lexical(
+                    fast_query.vector(),
+                    fetch,
+                    lexical_hits.as_mut(),
+                    filter,
+                )?;
                 if let Some(filter) = filter {
                     fast_hits
                         .retain(|hit| lexical_context.permits_known_metadata(&hit.doc_id, filter));
@@ -1367,6 +1384,7 @@ impl SyncTwoTierSearcher {
                 };
             }
         };
+        metrics.lexical_search_ms += ms(lexical_refill_time);
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
 
         let blend_started = Instant::now();
@@ -1427,7 +1445,8 @@ impl SyncTwoTierSearcher {
             }
         };
         metrics.blend_ms = ms(blend_started.elapsed());
-        metrics.quality_search_ms = ms(phase2_started.elapsed());
+        metrics.quality_search_ms =
+            ms(phase2_started.elapsed().saturating_sub(lexical_refill_time));
         metrics.quality_embed_ms = 0.0;
 
         // Keep this diagnostic on the full phase candidate pools, not only
@@ -1795,18 +1814,50 @@ impl SyncLexicalContext {
     }
 
     fn revalidate_lexical(
-        &self,
+        &mut self,
+        query_vec: &[f32],
+        target: usize,
         hits: Option<&mut Vec<ScoredResult>>,
         filter: Option<&dyn SearchFilter>,
-    ) {
-        if let (Some(hits), Some(filter)) = (hits, filter) {
-            // Vector retrieval can resolve an observation that was unknown
-            // when lexical retrieval admitted this row. Known observations
-            // are never replaced by selected-vector hydration.
-            hits.retain(|hit| {
-                hit.metadata.is_some() || self.permits_known_metadata(&hit.doc_id, filter)
-            });
+    ) -> SearchResult<Duration> {
+        let (Some(source), Some(hits), Some(filter)) = (&self.source, hits, filter) else {
+            return Ok(Duration::ZERO);
+        };
+        // Vector retrieval can resolve an observation that was unknown when
+        // lexical retrieval admitted this row. If the original pool had room
+        // left, that retrieval already exhausted the lexical results.
+        let filled_budget = hits.len() == target;
+        hits.retain(|hit| {
+            hit.metadata.is_some() || self.permits_known_metadata(&hit.doc_id, filter)
+        });
+        if !filled_budget || hits.len() == target {
+            return Ok(Duration::ZERO);
         }
+
+        let started = Instant::now();
+        let mut observations = SyncMetadata::new();
+        match search_lexical_candidates(
+            source.as_ref(),
+            query_vec,
+            target,
+            Some(filter),
+            &mut observations,
+            Some(&self.metadata),
+        ) {
+            Ok(refilled) => {
+                *hits = refilled;
+                self.metadata.extend(observations);
+            }
+            Err(
+                SyncLexicalFailure::Metadata(error)
+                | SyncLexicalFailure::Retrieval(error @ SearchError::Cancelled { .. }),
+            ) => return Err(error),
+            Err(SyncLexicalFailure::Retrieval(error)) => tracing::warn!(
+                error_code = error.diagnostic_code(),
+                "lexical refill failed after metadata revalidation"
+            ),
+        }
+        Ok(started.elapsed())
     }
 
     fn attach_metadata(&self, results: &mut [ScoredResult]) {
@@ -2110,8 +2161,9 @@ fn search_lexical_candidates(
     target: usize,
     filter: Option<&dyn SearchFilter>,
     metadata: &mut SyncMetadata,
+    retained_metadata: Option<&SyncMetadata>,
 ) -> Result<Vec<ScoredResult>, SyncLexicalFailure> {
-    let mut limit = target;
+    let mut limit = retained_metadata.map_or(target, |_| target.saturating_mul(2));
     loop {
         let mut hits = lexical
             .search_sync(query_vec, limit)
@@ -2124,22 +2176,32 @@ fn search_lexical_candidates(
         metadata.clear();
         // Keep the best ranked row for each public ID. A later row can still
         // supply its metadata when earlier rows had none.
-        hits.retain(|hit| match metadata.entry(hit.doc_id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(hit.metadata.clone());
-                true
+        hits.retain_mut(|hit| {
+            // A refill may widen ranks, but it must keep the observations
+            // already used to filter the retained vector candidates.
+            if let Some(observation) = retained_metadata.and_then(|prior| prior.get(&hit.doc_id)) {
+                hit.metadata.clone_from(observation);
             }
-            Entry::Occupied(mut entry) => {
-                if entry.get().is_none() {
-                    entry.get_mut().clone_from(&hit.metadata);
+            match metadata.entry(hit.doc_id.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(hit.metadata.clone());
+                    true
                 }
-                false
+                Entry::Occupied(mut entry) => {
+                    if entry.get().is_none() {
+                        entry.get_mut().clone_from(&hit.metadata);
+                    }
+                    false
+                }
             }
         });
         if filter.is_some() {
             let unknown: Vec<_> = hits
                 .iter()
-                .filter(|hit| metadata.get(&hit.doc_id).is_some_and(Option::is_none))
+                .filter(|hit| {
+                    metadata.get(&hit.doc_id).is_some_and(Option::is_none)
+                        && retained_metadata.is_none_or(|prior| !prior.contains_key(&hit.doc_id))
+                })
                 .map(|hit| hit.doc_id.as_str())
                 .collect();
             // Eager None is unknown, not proof that selected-document hydration
@@ -5568,13 +5630,20 @@ mod tests {
     struct LateBlockingLexical {
         blocked_id: &'static str,
         unknown_reads: AtomicUsize,
+        include_tail: bool,
     }
 
     impl SyncLexicalSearch for LateBlockingLexical {
         fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
-            Ok(std::iter::once(lexical_result(self.blocked_id, 10.0))
-                .take(limit)
-                .collect())
+            let mut leading = lexical_result(self.blocked_id, 10.0);
+            if self.include_tail && self.unknown_reads.load(Ordering::Relaxed) == 0 {
+                // An unpinned refill may offer an older eager observation.
+                leading.metadata = Some(Arc::new(serde_json::json!({"doc_type": "keep"})));
+            }
+            let tail = self
+                .include_tail
+                .then(|| lexical_result("lexical-tail", 9.0));
+            Ok(std::iter::once(leading).chain(tail).take(limit).collect())
         }
 
         fn metadata_for_documents(
@@ -5631,6 +5700,7 @@ mod tests {
             .with_lexical(Arc::new(LateBlockingLexical {
                 blocked_id,
                 unknown_reads: AtomicUsize::new(1),
+                include_tail: false,
             }));
             let (hits, metrics) = searcher
                 .search_collect_with_filter(query, 1, Some(&filter))
@@ -5655,6 +5725,7 @@ mod tests {
         let lexical = Arc::new(LateBlockingLexical {
             blocked_id: "a",
             unknown_reads: AtomicUsize::new(usize::MAX),
+            include_tail: false,
         });
         let searcher = SyncTwoTierSearcher::new(
             index,
@@ -5687,6 +5758,41 @@ mod tests {
         assert_eq!(results[0].metadata.as_deref().unwrap()["doc_type"], "keep");
         assert!(results[0].quality_score.is_some());
         assert!(phases.next().is_none());
+    }
+
+    #[test]
+    fn late_blocking_metadata_refills_the_vacated_lexical_slot() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        let directory = temp_dir("late-blocking-lexical-tail");
+        let (fast, _) = persisted_producer_pair(directory.path());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(directory.path()).unwrap());
+        let searcher = SyncTwoTierSearcher::new(
+            index,
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                fast_only: true,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_lexical(Arc::new(LateBlockingLexical {
+            blocked_id: "a",
+            unknown_reads: AtomicUsize::new(1),
+            include_tail: true,
+        }));
+        let query = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+        );
+        let filter = DocTypeFilter::new(["keep"]);
+        let (hits, metrics) = searcher
+            .search_collect_with_filter(&query, 1, Some(&filter))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "lexical-tail");
+        assert_eq!(hits[0].source, ScoreSource::Lexical);
+        assert_eq!(hits[0].metadata.as_deref().unwrap()["doc_type"], "keep");
+        assert_eq!(metrics.lexical_candidates, 1);
+        assert_eq!(metrics.semantic_candidates, 0);
     }
 
     #[cfg(feature = "quill")]
