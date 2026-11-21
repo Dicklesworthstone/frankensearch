@@ -1953,6 +1953,7 @@ mod generation_tests {
 
     #[test]
     fn forwarded_searches_answer_from_the_serve_cache_unless_explained() {
+        const CACHED_SNIPPET: &str = "snippet saved in the serve cache";
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
             let source = directory.path().join("source");
@@ -1996,12 +1997,11 @@ mod generation_tests {
             .await
             .unwrap();
             assert_eq!(first.hits.len(), 1);
+            assert_ne!(first.hits[0].snippet.as_deref(), Some(CACHED_SNIPPET));
             assert_eq!(cache.len(), 1, "a completed search is kept");
-            // Empty the kept phases: only an answer read from the cache can
-            // come back without the hit the index still holds.
-            for payload in cache.values_mut().flatten() {
-                payload.hits.clear();
-            }
+            // Only replay can return this snippet. Keep the original count and rank.
+            cache.values_mut().next().unwrap()[0].hits[0].snippet =
+                Some(CACHED_SNIPPET.to_owned());
             let cached = Box::pin(execute(
                 &cx,
                 &runtime,
@@ -2011,12 +2011,14 @@ mod generation_tests {
             ))
             .await
             .unwrap();
-            assert!(
-                cached.hits.is_empty(),
+            assert_eq!(cached.hits.len(), 1);
+            assert_eq!(
+                cached.hits[0].snippet.as_deref(),
+                Some(CACHED_SNIPPET),
                 "the identical search answers from the cache"
             );
 
-            let mut explaining = runtime.clone();
+            let mut explaining = client.clone();
             explaining.config.search.explain = true;
             let explained = make_request(&explaining, &root, "sharedtoken", 10).unwrap();
             let fresh = Box::pin(execute(
@@ -2028,11 +2030,11 @@ mod generation_tests {
             ))
             .await
             .unwrap();
-            assert_eq!(fresh.hits.len(), 1, "an explained search always runs");
+            assert_eq!(fresh.hits, first.hits, "an explained search always runs");
             let uncached = Box::pin(execute(&cx, &runtime, &mut session, &request, None))
                 .await
                 .unwrap();
-            assert_eq!(uncached.hits.len(), 1, "a disabled cache is not read");
+            assert_eq!(uncached.hits, first.hits, "a disabled cache is not read");
 
             let (key, payloads) = cache
                 .iter()
