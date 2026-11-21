@@ -26,7 +26,7 @@ use crate::generation_store::{
     GenerationPublication, GenerationRetention, PublishedGeneration, RETAINED_PREDECESSORS,
     RetentionPlan, RetentionReport,
 };
-use crate::output_schema::OutputEnvelope;
+use crate::output_schema::{OutputEnvelope, error_code_for};
 use crate::{CliCommand, OutputFormat, ShutdownCoordinator};
 
 #[path = "search_recovery.rs"]
@@ -1368,14 +1368,20 @@ impl FsfsRuntime {
                             && let Err(error) = prepared
                                 .persist_explain_session_for_cached_payloads(query, &payloads)
                         {
-                            tracing::warn!(%error, "failed to persist cached complete search explanation context");
+                            tracing::warn!(
+                                error_code = error_code_for(&error),
+                                "failed to persist cached complete search explanation context"
+                            );
                         }
                         return Ok(payloads);
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(%error, "complete search cache read failed; continuing with uncached execution");
+                    tracing::warn!(
+                        error_code = error_code_for(&error),
+                        "complete search cache read failed; continuing with uncached execution"
+                    );
                 }
             }
         }
@@ -1392,7 +1398,10 @@ impl FsfsRuntime {
                 .map(|artifact| artifact.payload.clone())
                 .collect::<Vec<_>>();
             if let Err(error) = prepared.write_search_payload_cache(key, &payloads, &fingerprint) {
-                tracing::warn!(%error, "complete search cache write failed; continuing without cache persistence");
+                tracing::warn!(
+                    error_code = error_code_for(&error),
+                    "complete search cache write failed; continuing without cache persistence"
+                );
             }
         }
         if let Some(last) = artifacts.last_mut() {

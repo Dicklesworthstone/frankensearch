@@ -890,6 +890,47 @@ fn complete_cli_binary_rejects_corrupt_selection_without_legacy_fallback() {
 }
 
 #[test]
+fn complete_search_recovers_a_corrupt_cache_without_logging_private_values() {
+    const PRIVATE_VALUE: &str = "private-cache-content-canary";
+    let fixture = Fixture::new();
+    json_output(
+        &execute(
+            fixture
+                .lexical_discovery_command("index")
+                .arg("--no-watch-mode"),
+        ),
+        true,
+    );
+    let mut search = fixture.lexical_discovery_command("search");
+    search
+        .arg("--no-daemon")
+        .env("FRANKENSEARCH_LOG", "frankensearch_fsfs=warn");
+    let cold = json_output(&execute(&mut search), true);
+    assert_eq!(cold["data"]["hits"][0]["path"], "alpha.md");
+    let mut records = fs::read_dir(fixture.store.join("query_cache")).unwrap();
+    let path = records.next().unwrap().unwrap().path();
+    assert!(records.next().is_none());
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["payloads"][0]["phase"] = Value::from(PRIVATE_VALUE);
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let repaired = execute(&mut search);
+    assert_eq!(
+        json_output(&repaired, true)["data"]["hits"],
+        cold["data"]["hits"]
+    );
+    let warning = std::str::from_utf8(&repaired.stderr).unwrap();
+    assert!(
+        warning.contains("complete search cache read failed"),
+        "{warning}"
+    );
+    assert!(warning.contains("subsystem_error"), "{warning}");
+    assert!(!warning.contains(PRIVATE_VALUE), "{warning}");
+    let recovered: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(recovered["payloads"][0]["phase"], "initial");
+}
+
+#[test]
 fn complete_cli_binary_default_search_without_a_daemon_runs_in_process() {
     let fixture = Fixture::new();
     fs::create_dir(&fixture.store).unwrap();

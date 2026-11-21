@@ -1044,7 +1044,8 @@ impl DashboardSearchStage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum SearchExecutionMode {
     Full,
     FastOnly,
@@ -1864,7 +1865,7 @@ struct SearchCacheKey {
     quality_model: String,
     query: String,
     requested_limit: usize,
-    mode: String,
+    mode: SearchExecutionMode,
     filter: Option<String>,
     fast_only: bool,
     ranking_priors: bool,
@@ -14511,7 +14512,7 @@ impl FsfsRuntime {
             quality_model,
             query: Self::normalize_search_query(query),
             requested_limit,
-            mode: mode.label().to_owned(),
+            mode,
             filter: self.cli_input.filter.clone(),
             fast_only: self.quality_disabled_by_policy(),
             ranking_priors: self.config.search.ranking_priors,
@@ -14569,7 +14570,7 @@ impl FsfsRuntime {
         hasher.update([0]);
         hasher.update(key.query.as_bytes());
         hasher.update(key.requested_limit.to_le_bytes());
-        hasher.update(key.mode.as_bytes());
+        hasher.update(key.mode.label().as_bytes());
         hasher.update(key.filter.as_deref().unwrap_or("").as_bytes());
         hasher.update([u8::from(key.fast_only)]);
         hasher.update([u8::from(key.ranking_priors)]);
@@ -14672,6 +14673,25 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    /// All modes return Initial, even for zero hits or quality-only search.
+    /// Only a full progressive search can also return a cached Refined.
+    fn cached_phases_match_request(
+        payloads: &[SearchPayload],
+        query: &str,
+        mode: SearchExecutionMode,
+    ) -> bool {
+        let valid_phases = match payloads {
+            [initial] => initial.phase == SearchOutputPhase::Initial,
+            [initial, refined] => {
+                mode == SearchExecutionMode::Full
+                    && initial.phase == SearchOutputPhase::Initial
+                    && refined.phase == SearchOutputPhase::Refined
+            }
+            _ => false,
+        };
+        valid_phases && payloads.iter().all(|payload| payload.query == query)
+    }
+
     fn search_payloads_cacheable(payloads: &[SearchPayload]) -> bool {
         !payloads.iter().any(|payload| {
             payload.phase == SearchOutputPhase::RefinementFailed
@@ -14733,7 +14753,7 @@ impl FsfsRuntime {
         Self::semantic_retry_checkpoint(cx, "fsfs.search.cache")?;
         // The request owns the query identity. A cache key alone cannot attest
         // that every stored phase answered it, including its exclusions.
-        if payloads.iter().any(|payload| payload.query != normalized_query) {
+        if !Self::cached_phases_match_request(payloads, normalized_query, mode) {
             return Ok(false);
         }
         if let Err(error) = Self::validate_cached_query_exclusions(cx, resources, payloads) {
@@ -14791,12 +14811,8 @@ impl FsfsRuntime {
             // Every nonempty Full/FastOnly request requires primary readiness,
             // even if inference is skipped or returns no hits. Only the actual
             // request's normalized cache key can establish the empty exception.
-            if normalized_query.is_empty()
-                || !payloads
-                    .iter()
-                    .any(|payload| payload.phase == SearchOutputPhase::Initial)
-            {
-                // Empty requests and incomplete phase layouts use the live path.
+            if normalized_query.is_empty() {
+                // Empty requests use the live path.
                 return Ok(false);
             }
             if resources.vector_index.is_none() {
@@ -15249,7 +15265,7 @@ impl FsfsRuntime {
             return Ok(None);
         }
         if !Self::search_payloads_cacheable(&record.payloads)
-            || record.payloads.iter().any(|payload| payload.query != key.query)
+            || !Self::cached_phases_match_request(&record.payloads, &key.query, key.mode)
         {
             return Ok(None);
         }
@@ -15263,7 +15279,7 @@ impl FsfsRuntime {
         index_fingerprint: &str,
     ) -> SearchResult<()> {
         if !Self::search_payloads_cacheable(payloads)
-            || payloads.iter().any(|payload| payload.query != key.query)
+            || !Self::cached_phases_match_request(payloads, &key.query, key.mode)
         {
             return Ok(());
         }
@@ -46182,9 +46198,15 @@ mod tests {
             );
             assert_eq!(answer.returned_hits, 2);
             answer.rerank = Some(scored.payload);
+            let initial =
+                SearchPayload::new("recover network", SearchOutputPhase::Initial, 0, Vec::new());
             let fingerprint = "registered-reranker-fixture";
             available
-                .write_search_payload_cache(&available_key, &[answer.clone()], fingerprint)
+                .write_search_payload_cache(
+                    &available_key,
+                    &[initial.clone(), answer.clone()],
+                    fingerprint,
+                )
                 .unwrap();
             let cache_path = available.search_cache_path(&available_key).unwrap();
             let cache_bytes = fs::read(&cache_path).unwrap();
@@ -46329,7 +46351,7 @@ mod tests {
                 restored
                     .try_load_search_payload_cache(&restored_key, fingerprint)
                     .unwrap(),
-                Some(vec![answer])
+                Some(vec![initial, answer])
             );
         });
         assert!(scheduler.shutdown_timeout(Duration::from_secs(5)));
@@ -47078,12 +47100,10 @@ mod tests {
             Some(frankensearch_rerank::NativeReranker::registered_cache_contract().unwrap())
         );
         assert_eq!(key.embedding_contracts, plain_key.embedding_contracts);
-        let payloads = vec![SearchPayload::new(
-            "recover network",
-            SearchOutputPhase::Refined,
-            0,
-            Vec::new(),
-        )];
+        let payloads = vec![
+            SearchPayload::new("recover network", SearchOutputPhase::Initial, 0, vec![]),
+            SearchPayload::new("recover network", SearchOutputPhase::Refined, 0, vec![]),
+        ];
         let fingerprint = "same-retained-generation";
         runtime
             .write_search_payload_cache(&key, &payloads, fingerprint)
@@ -47128,12 +47148,10 @@ mod tests {
         let key = runtime
             .search_cache_key(query, 2, SearchExecutionMode::Full)
             .unwrap();
-        let payloads = vec![SearchPayload::new(
-            query,
-            SearchOutputPhase::Refined,
-            2,
-            Vec::new(),
-        )];
+        let payloads = vec![
+            SearchPayload::new(query, SearchOutputPhase::Initial, 0, vec![]),
+            SearchPayload::new(query, SearchOutputPhase::Refined, 0, vec![]),
+        ];
         let fingerprint = "same-retained-generation";
         runtime
             .write_search_payload_cache(&key, &payloads, fingerprint)
@@ -47191,36 +47209,31 @@ mod tests {
         let key = runtime
             .search_cache_key("recover network", 2, SearchExecutionMode::Full)
             .unwrap();
-        let mut payload = crate::output_schema::SearchPayload::new(
-            "recover network",
-            SearchOutputPhase::Refined,
-            2,
-            Vec::new(),
-        );
+        let mut phases = [
+            SearchPayload::new("recover network", SearchOutputPhase::Initial, 0, vec![]),
+            SearchPayload::new("recover network", SearchOutputPhase::Refined, 0, vec![]),
+        ];
         for reason in [super::REASON_RERANK_TIMEOUT, super::REASON_RERANK_FAILED] {
             let mut stage = crate::output_schema::RerankStagePayload::skipped(reason, 2);
             stage.status = crate::output_schema::RerankStageStatus::Failed;
-            payload.rerank = Some(stage);
+            phases[1].rerank = Some(stage);
             assert!(
-                !FsfsRuntime::search_payloads_cacheable(std::slice::from_ref(&payload)),
+                !FsfsRuntime::search_payloads_cacheable(&phases),
                 "daemon memory cache must reject failed reranking: {reason}"
             );
             runtime
-                .write_search_payload_cache(
-                    &key,
-                    std::slice::from_ref(&payload),
-                    "deadline-test-generation",
-                )
+                .write_search_payload_cache(&key, &phases, "deadline-test-generation")
                 .unwrap();
             assert!(
                 !runtime.search_cache_path(&key).unwrap().exists(),
                 "disk cache must reject failed reranking: {reason}"
             );
         }
-        payload.rerank.as_mut().unwrap().status = crate::output_schema::RerankStageStatus::Applied;
-        payload.rerank.as_mut().unwrap().reason_code = super::REASON_RERANK_APPLIED.to_owned();
+        let stage = phases[1].rerank.as_mut().unwrap();
+        stage.status = crate::output_schema::RerankStageStatus::Applied;
+        stage.reason_code = super::REASON_RERANK_APPLIED.to_owned();
         assert!(
-            FsfsRuntime::search_payloads_cacheable(&[payload]),
+            FsfsRuntime::search_payloads_cacheable(&phases),
             "successful reranking remains cacheable"
         );
     }
@@ -69062,7 +69075,7 @@ mod tests {
     }
 
     #[test]
-    fn search_caches_bind_every_payload_to_the_requested_query() {
+    fn search_caches_bind_every_phase_to_the_requested_query_and_mode() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("index");
@@ -69148,7 +69161,26 @@ mod tests {
             let mut mixed = valid.clone();
             mixed.extend(positive.clone());
             mixed[1].phase = SearchOutputPhase::Refined;
-            for mismatched in [positive.clone(), mixed] {
+            let initial = valid[0].clone();
+            let mut refined = initial.clone();
+            refined.phase = SearchOutputPhase::Refined;
+            let pair = vec![initial.clone(), refined.clone()];
+            assert!(FsfsRuntime::cached_phases_match_request(
+                &pair, &key.query, SearchExecutionMode::Full,
+            ));
+            assert!(!FsfsRuntime::cached_phases_match_request(
+                &mixed, &key.query, SearchExecutionMode::Full,
+            ));
+            for mismatched in [
+                positive.clone(),
+                mixed,
+                Vec::new(),
+                vec![refined.clone()],
+                vec![initial.clone(), initial.clone()],
+                vec![refined.clone(), initial.clone()],
+                vec![initial, refined.clone(), refined],
+                pair,
+            ] {
                 runtime
                     .write_search_payload_cache(&key, &mismatched, &fingerprint)
                     .unwrap();
@@ -69489,7 +69521,7 @@ mod tests {
                 .unwrap();
             let stale_payloads = vec![SearchPayload::new(
                 "stale computation",
-                SearchOutputPhase::Refined,
+                SearchOutputPhase::Initial,
                 1,
                 vec![SearchHitPayload {
                     rank: 1,
@@ -71426,7 +71458,7 @@ mod tests {
             let key = runtime
                 .search_cache_key("cached semantic", 10, SearchExecutionMode::Full)
                 .unwrap();
-            let cached_payloads = vec![SearchPayload::new(
+            let refined = SearchPayload::new(
                 "cached semantic",
                 SearchOutputPhase::Refined,
                 1,
@@ -71441,7 +71473,11 @@ mod tests {
                     hash_rank: None,
                     in_both_sources: false,
                 }],
-            )];
+            );
+            let cached_payloads = vec![
+                SearchPayload::new("cached semantic", SearchOutputPhase::Initial, 0, vec![]),
+                refined,
+            ];
             let cache_fingerprint = runtime
                 .search_index_fingerprint()
                 .expect("fingerprint incomplete generation");
