@@ -55,6 +55,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use ahash::AHashMap;
+
 use crate::ValidatedFsviBytes;
 use frankensearch_core::{
     Cx,
@@ -2027,7 +2029,19 @@ impl PartialOrd for Nearest {
     }
 }
 
-/// Reusable "have I seen this point?" set for a beam search.
+/// Membership tracking shared by construction and query traversal.
+///
+/// Implementations only answer membership questions: their iteration order
+/// never participates in candidate selection or graph topology.
+trait VisitTracker {
+    /// Begin a new layer search over `len` points, forgetting previous marks.
+    fn begin(&mut self, len: usize);
+
+    /// Mark a point, returning whether it was already visited or is out of range.
+    fn visit(&mut self, id: u32) -> bool;
+}
+
+/// Reusable "have I seen this point?" set for graph construction.
 ///
 /// A fresh `vec![false; len]` per beam search would make construction
 /// quadratic in the corpus size purely in zeroing cost — every insert runs
@@ -2041,7 +2055,7 @@ struct VisitedSet {
     epoch: u32,
 }
 
-impl VisitedSet {
+impl VisitTracker for VisitedSet {
     /// Begin a new search over `len` points, discarding previous marks.
     fn begin(&mut self, len: usize) {
         if self.marks.len() < len {
@@ -2072,6 +2086,40 @@ impl VisitedSet {
         }
         *mark = self.epoch;
         false
+    }
+}
+
+/// Per-query visited bits, allocated only for blocks reached by traversal.
+///
+/// Construction reuses one dense epoch array across insertions, but a query
+/// cannot borrow that mutable scratch from a shared graph. Allocating another
+/// dense array for every query would initialize four bytes per physical row
+/// even for a tiny beam. Sparse 64-row blocks keep that allocation proportional
+/// to visited blocks instead. Full-width traversal needs at most ceil(n / 64)
+/// map entries, rather than one hash entry per visited node. Clearing between
+/// layers retains the query's allocation without retaining a corpus-size slab
+/// or sharing mutable state between concurrent readers.
+#[derive(Debug, Default)]
+struct QueryVisitedSet {
+    blocks: AHashMap<u32, u64>,
+    len: usize,
+}
+
+impl VisitTracker for QueryVisitedSet {
+    fn begin(&mut self, len: usize) {
+        self.blocks.clear();
+        self.len = len;
+    }
+
+    fn visit(&mut self, id: u32) -> bool {
+        if id as usize >= self.len {
+            return true;
+        }
+        let bit = 1_u64 << (id % 64);
+        let block = self.blocks.entry(id / 64).or_default();
+        let visited = *block & bit != 0;
+        *block |= bit;
+        visited
     }
 }
 
@@ -3274,14 +3322,14 @@ impl NativeHnsw {
     }
 
     /// Beam search at `layer` against a raw query vector.
-    fn search_layer_query<D: VectorDistance>(
+    fn search_layer_query<D: VectorDistance, V: VisitTracker>(
         &self,
         entry_points: &[u32],
         query: &[f32],
         layer: usize,
         ef: usize,
         store: &D,
-        visited: &mut VisitedSet,
+        visited: &mut V,
     ) -> SearchResult<Vec<Candidate>> {
         self.beam_search(entry_points, layer, ef, store, visited, &mut |id, store| {
             store.distance_to_query(id, query)
@@ -3293,13 +3341,13 @@ impl NativeHnsw {
     /// Maintains a visited set, a min-heap frontier and a max-heap result
     /// set of size `ef`, expanding the nearest unexplored candidate until
     /// nothing closer than the current worst result remains.
-    fn beam_search<D: VectorDistance>(
+    fn beam_search<D: VectorDistance, V: VisitTracker>(
         &self,
         entry_points: &[u32],
         layer: usize,
         ef: usize,
         store: &D,
-        visited: &mut VisitedSet,
+        visited: &mut V,
         distance: &mut dyn FnMut(u32, &D) -> SearchResult<f32>,
     ) -> SearchResult<Vec<Candidate>> {
         let ef = ef.max(1);
@@ -3572,6 +3620,17 @@ impl NativeHnsw {
         ef: Option<usize>,
         store: &D,
     ) -> SearchResult<Vec<(u32, f32)>> {
+        self.search_with_visited(query, k, ef, store, &mut QueryVisitedSet::default())
+    }
+
+    fn search_with_visited<D: VectorDistance, V: VisitTracker>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+        store: &D,
+        visited: &mut V,
+    ) -> SearchResult<Vec<(u32, f32)>> {
         store.checkpoint()?;
         self.verify_store_cardinality(store)
             .map_err(|source| SearchError::SubsystemError {
@@ -3585,24 +3644,19 @@ impl NativeHnsw {
             return Ok(Vec::new());
         };
         let ef = ef.unwrap_or(self.params.ef_search).max(k);
-        // One buffer for the whole query rather than one per layer.
-        let mut visited = VisitedSet::default();
-
         // Descend the upper layers greedily, then run one wide beam search
         // at layer 0 where every point participates.
         let mut current = entry;
         let mut layer = self.max_level;
         while layer > 0 {
-            let found =
-                self.search_layer_query(&[current], query, layer, 1, store, &mut visited)?;
+            let found = self.search_layer_query(&[current], query, layer, 1, store, visited)?;
             if let Some(best) = found.first() {
                 current = best.id;
             }
             layer -= 1;
         }
 
-        let mut candidates =
-            self.search_layer_query(&[current], query, 0, ef, store, &mut visited)?;
+        let mut candidates = self.search_layer_query(&[current], query, 0, ef, store, visited)?;
         store.checkpoint()?;
         candidates.truncate(k);
         Ok(candidates
@@ -4316,7 +4370,7 @@ mod tests {
     use crate::{FsviRecordFlags, FsviV2IdentityBinding, VectorIndex, fnv1a_hash};
     use ::tempfile as raw_tempfile;
     use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     /// Test-only facade that preserves the production no-symlink-ancestor
     /// contract on hosts whose default temporary path contains an alias.
@@ -4459,6 +4513,32 @@ mod tests {
 
         fn len(&self) -> usize {
             self.vectors.len()
+        }
+    }
+
+    /// Records the real distance requests, so a visited-set differential must
+    /// preserve traversal as well as the final (possibly approximate) top-k.
+    struct RecordingQueryStore<'a, D> {
+        inner: &'a D,
+        rows: RefCell<Vec<u32>>,
+    }
+
+    impl<D: VectorDistance> VectorDistance for RecordingQueryStore<'_, D> {
+        fn checkpoint(&self) -> SearchResult<()> {
+            self.inner.checkpoint()
+        }
+
+        fn distance_to_query(&self, id: u32, query: &[f32]) -> SearchResult<f32> {
+            self.rows.borrow_mut().push(id);
+            self.inner.distance_to_query(id, query)
+        }
+
+        fn distance_between(&self, a: u32, b: u32) -> SearchResult<f32> {
+            self.inner.distance_between(a, b)
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
         }
     }
 
@@ -6738,6 +6818,40 @@ mod tests {
             owner.record_count(),
             "the physical-row bound is a fixed point"
         );
+
+        let mapped = MappedFsviStore {
+            owner: owner.as_ref(),
+            source_rows: &bound.graph.source_rows,
+        };
+        for width in widths {
+            let dense_store = RecordingQueryStore {
+                inner: &mapped,
+                rows: RefCell::new(Vec::new()),
+            };
+            let sparse_store = RecordingQueryStore {
+                inner: &mapped,
+                rows: RefCell::new(Vec::new()),
+            };
+            let expected = bound
+                .graph
+                .search_with_visited(
+                    &query,
+                    width,
+                    Some(width),
+                    &dense_store,
+                    &mut VisitedSet::default(),
+                )
+                .expect("dense reference through tombstones");
+            assert_eq!(
+                bound
+                    .graph
+                    .search(&query, width, Some(width), &sparse_store)
+                    .unwrap(),
+                expected,
+                "widening width={width} preserves candidates, including tombstone routes"
+            );
+            assert_eq!(*sparse_store.rows.borrow(), *dense_store.rows.borrow());
+        }
     }
 
     #[test]
@@ -8624,6 +8738,164 @@ mod tests {
     }
 
     // ─── Differential recall against exact search ───────────────────────
+
+    #[test]
+    fn query_visited_blocks_match_dense_membership_and_reset_between_layers() {
+        let mut sparse = QueryVisitedSet::default();
+        for len in [0, 1, 63, 64, 65, 257, 64, 0, 257] {
+            let mut dense = VisitedSet::default();
+            sparse.begin(len);
+            dense.begin(len);
+            assert!(sparse.blocks.is_empty());
+            // Revisit both ends of each bitmap block and reject indices beyond
+            // the current layer's row universe, even after a larger prior layer.
+            for id in [0, 63, 64, 65, 127, 128, 255, 256, 0, 64, 256, u32::MAX] {
+                assert_eq!(sparse.visit(id), dense.visit(id), "len={len} row={id}");
+            }
+            assert!(sparse.blocks.len() <= len.div_ceil(64));
+        }
+    }
+
+    #[test]
+    fn query_visited_allocation_depends_on_touched_blocks_not_source_size() {
+        let mut sparse = QueryVisitedSet::default();
+        // A billion-row universe must be cheap to BEGIN: the former query
+        // tracker allocated and zeroed roughly four GiB here. No such corpus
+        // or vector slab is needed to exercise the allocation boundary.
+        let rows = 1_usize << 30;
+        sparse.begin(rows);
+        assert_eq!(sparse.blocks.capacity(), 0);
+        for id in [0, 1, 63, 64, 127, 65_536, (1 << 30) - 1] {
+            assert!(!sparse.visit(id));
+            assert!(sparse.visit(id));
+        }
+        assert_eq!(sparse.blocks.len(), 4);
+        assert!(sparse.blocks.capacity() <= 14);
+        let capacity = sparse.blocks.capacity();
+        assert!(sparse.visit(1 << 30));
+        assert_eq!(sparse.blocks.capacity(), capacity);
+
+        sparse.begin(rows);
+        assert!(sparse.blocks.is_empty());
+        assert_eq!(sparse.blocks.capacity(), capacity);
+        assert!(!sparse.visit(64));
+
+        // Broad beams also stay compact: 64 adjacent visited nodes share one
+        // allocation entry, instead of one hash entry per node.
+        sparse.begin(4_097);
+        for id in 0..4_097 {
+            assert!(!sparse.visit(id));
+        }
+        assert_eq!(sparse.blocks.len(), 65);
+    }
+
+    #[test]
+    fn sparse_query_tracking_preserves_dense_traversal_and_persisted_results() {
+        let directory = tempfile::tempdir().expect("query differential directory");
+        for (case, store) in [
+            ("varied", TestStore::synthetic(257, 8)),
+            ("tied", TestStore::new(vec![vec![1.0, 0.0]; 65])),
+        ] {
+            let graph = NativeHnsw::build(params(), 42, &store).expect("build graph");
+            let path = directory.path().join(format!("{case}.fshnsw"));
+            graph.save(&path).expect("save graph");
+            let reopened = NativeHnsw::load(&path, &store).expect("reopen graph");
+            let topology = graph.topology_sha256().expect("topology digest");
+            for seed in 0..4 {
+                let query = TestStore::query(seed, store.vectors[0].len());
+                for ef in [1, 8, 64, store.len()] {
+                    for k in [0, 1, 11, store.len() + 1] {
+                        let dense_store = RecordingQueryStore {
+                            inner: &store,
+                            rows: RefCell::new(Vec::new()),
+                        };
+                        let sparse_store = RecordingQueryStore {
+                            inner: &store,
+                            rows: RefCell::new(Vec::new()),
+                        };
+                        let expected = graph
+                            .search_with_visited(
+                                &query,
+                                k,
+                                Some(ef),
+                                &dense_store,
+                                &mut VisitedSet::default(),
+                            )
+                            .expect("dense reference search");
+                        let actual = graph
+                            .search(&query, k, Some(ef), &sparse_store)
+                            .expect("shipping sparse search");
+                        let bits = |hits: Vec<(u32, f32)>| {
+                            hits.into_iter()
+                                .map(|(row, score)| (row, score.to_bits()))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(
+                            bits(actual),
+                            bits(expected.clone()),
+                            "case={case} seed={seed} ef={ef} k={k}"
+                        );
+                        assert_eq!(
+                            *sparse_store.rows.borrow(),
+                            *dense_store.rows.borrow(),
+                            "scratch storage must not change which distances are evaluated"
+                        );
+                        assert_eq!(
+                            bits(reopened.search(&query, k, Some(ef), &store).unwrap()),
+                            bits(expected),
+                            "persisted graph uses the same traversal and score bits"
+                        );
+                    }
+                }
+            }
+            assert_eq!(graph.topology_sha256().unwrap(), topology);
+        }
+    }
+
+    #[test]
+    fn sparse_and_dense_query_tracking_cancel_at_the_same_distance_boundary() {
+        let store = TestStore::synthetic(257, 8);
+        let graph = NativeHnsw::build(params(), 42, &store).expect("build graph");
+        let query = TestStore::query(19, 8);
+        let recording = RecordingQueryStore {
+            inner: &store,
+            rows: RefCell::new(Vec::new()),
+        };
+        let expected = graph.search(&query, 11, Some(64), &recording).unwrap();
+        let distances = recording.rows.borrow().len();
+        assert!(distances > 3);
+        for boundary in [1, distances / 2, distances] {
+            for sparse in [false, true] {
+                let cx = Cx::for_testing();
+                let cancelling = CancellingStore::new(&store, &cx, boundary);
+                let checked = CheckedDistanceStore {
+                    cx: &cx,
+                    phase: "native_hnsw.search",
+                    inner: &cancelling,
+                };
+                let outcome = if sparse {
+                    graph.search(&query, 11, Some(64), &checked)
+                } else {
+                    graph.search_with_visited(
+                        &query,
+                        11,
+                        Some(64),
+                        &checked,
+                        &mut VisitedSet::default(),
+                    )
+                };
+                assert!(matches!(
+                    outcome,
+                    Err(SearchError::Cancelled { phase, .. }) if phase == "native_hnsw.search"
+                ));
+                assert_eq!(cancelling.distance_calls.get(), boundary);
+            }
+            assert_eq!(
+                graph.search(&query, 11, Some(64), &store).unwrap(),
+                expected
+            );
+        }
+    }
 
     /// The property that actually matters: the graph must find what an
     /// exhaustive scan finds. Exact search is the oracle.
