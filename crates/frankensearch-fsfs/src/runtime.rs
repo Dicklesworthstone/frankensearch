@@ -18423,25 +18423,27 @@ impl FsfsRuntime {
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
         let sentinel = Self::read_index_sentinel(&index_root)?;
-        let live_rows = {
-            let index = VectorIndex::open_read_only(&vector_path)?;
-            semantic_windows::load_mapping(&index_root, &index)?;
-            index.live_doc_ids()?
-        };
+        let fast_index = VectorIndex::open_read_only(&vector_path)?;
+        let live_rows = fast_index.live_doc_ids()?;
+        let target_root = sentinel.as_ref().map(|value| Path::new(&value.target_root));
         let live_ids = Self::live_delete_sources_at_root(
             cx,
             &index_root,
             &live_rows,
             ids,
-            sentinel.as_ref().map(|value| Path::new(&value.target_root)),
+            target_root,
             self.cli_input.delete_prefix,
         )?;
         let targets = select_delete_targets_for_index(
             ids,
-            sentinel.as_ref().map(|value| Path::new(&value.target_root)),
+            target_root,
             self.cli_input.delete_prefix,
             &live_ids,
         )?;
+        // Loading the mapping may adopt an unpointed lexical child to read
+        // its manifest. Resolve every selector before that adoption.
+        semantic_windows::load_mapping(&index_root, &fast_index)?;
+        drop(fast_index);
         let mut window_membership = if Self::fast_window_policy_at_root(&index_root)? > 1 {
             Self::validate_search_generation_at_root(&index_root, SearchExecutionMode::Full)?;
             let manifests =
@@ -45532,6 +45534,10 @@ mod tests {
                     let mut config = FsfsConfig::default();
                     config.indexing.offline = true;
                     config.indexing.quality_model.clear();
+                    // This fixture deliberately leaves stale source manifests
+                    // after a fast-only tombstone. Windowed generations require
+                    // those manifests to match live rows before any mutation.
+                    config.indexing.fast_window_max_per_file = 1;
                     config.search.fast_only = true;
                     config.search.rerank = false;
                     let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
@@ -45602,12 +45608,16 @@ mod tests {
                     let wal_before = fs::read(&wal_path).ok();
                     command.cli_input.delete_ids = vec!["keep.md".to_owned(), ambiguous.clone()];
                     command.cli_input.delete_prefix = prefix;
-                    assert!(matches!(
-                        command.run_delete_command(&cx).await,
-                        Err(SearchError::InvalidConfig { field, reason, .. })
-                            if field == "complete_generation.delete_ids"
-                                && reason.contains("different root-relative documents")
-                    ));
+                    let refused = command.run_delete_command(&cx).await;
+                    assert!(
+                        matches!(
+                            &refused,
+                            Err(SearchError::InvalidConfig { field, reason, .. })
+                                if field == "complete_generation.delete_ids"
+                                    && reason.contains("different root-relative documents")
+                        ),
+                        "lexical_only={lexical_only} prefix={prefix}: {refused:?}"
+                    );
                     assert!(
                         !pointer_path.exists(),
                         "invalid selectors must not adopt CURRENT"
