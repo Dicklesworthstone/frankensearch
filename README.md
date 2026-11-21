@@ -732,7 +732,10 @@ successor build leaves the selected generation intact. A quality-only watcher
 stops on a required-producer failure instead of publishing a deferred tier.
 
 `append-batch` accepts JSONL objects with string `id` and `text` fields, from
-`--file` or standard input. It inserts or replaces the supplied documents in
+`--file` or standard input. `--file` requires a regular file; send streams and
+named pipes through standard input. On Linux, cancellation also interrupts an
+idle input pipe without waiting for its writer to close or changing inherited
+descriptor flags. It inserts or replaces the supplied documents in
 lexical data, every present vector tier, and an existing catalog, then publishes
 one complete successor. Repeated IDs use their final body in the batch; the
 reported count is the number of unique inserted or replaced IDs. Lexical search

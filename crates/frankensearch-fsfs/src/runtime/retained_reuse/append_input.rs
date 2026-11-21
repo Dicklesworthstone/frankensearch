@@ -62,27 +62,138 @@ fn limit_error(location: impl Into<String>, name: &str, limit: usize) -> SearchE
 
 /// Read explicit bodies without interpreting IDs as source paths. Both file
 /// and stdin inputs obey the same admission limits and atomicity contract.
-/// File reads use Asupersync's async I/O. Stdin retains the owning-lane blocking
-/// contract: cancellation is checked around each read, not promised to interrupt
-/// an idle blocked OS read. No task is detached to bypass that limitation.
+/// Named files must be regular files; Unix opens stay nonblocking until that
+/// has been verified on the descriptor, so a FIFO cannot strand admission.
+/// Linux pipe stdin uses an independently opened nonblocking descriptor and
+/// cancellable waits. Other stdin kinds retain the owning-lane read contract;
+/// no reader task is detached and inherited descriptor flags are never changed.
 pub(in crate::runtime) async fn read_append_documents(
     cx: &Cx,
     runtime: &FsfsRuntime,
 ) -> SearchResult<BTreeMap<String, AppendDocument>> {
     retained_search_checkpoint(cx)?;
     if let Some(path) = runtime.cli_input.input_file.as_ref() {
-        // The operator named this file; a bare I/O error would not say which.
-        let mut file =
-            asupersync::fs::File::open(path)
-                .await
-                .map_err(|error| SearchError::InvalidConfig {
-                    field: "cli.append_batch.file".to_owned(),
-                    value: path.display().to_string(),
-                    reason: format!("cannot open the --file input: {error}"),
-                })?;
+        let mut file = open_append_file(cx, path).await?;
         read_async(cx, &mut file, INPUT_LIMITS).await
     } else {
-        read_sync(cx, &mut io::stdin().lock(), INPUT_LIMITS)
+        let stdin = io::stdin();
+        #[cfg(target_os = "linux")]
+        if let Some(mut pipe) = open_nonblocking_pipe(cx, &stdin)? {
+            return read_nonblocking(cx, &mut pipe, INPUT_LIMITS).await;
+        }
+        read_sync(cx, &mut stdin.lock(), INPUT_LIMITS)
+    }
+}
+
+async fn open_append_file(cx: &Cx, path: &std::path::Path) -> SearchResult<asupersync::fs::File> {
+    let file_error = |reason: String| SearchError::InvalidConfig {
+        field: "cli.append_batch.file".to_owned(),
+        value: path.display().to_string(),
+        reason,
+    };
+    let nonregular = || {
+        file_error(
+            "--file requires a regular file; pipe JSONL through stdin for streaming input"
+                .to_owned(),
+        )
+    };
+    retained_search_checkpoint(cx)?;
+    let observed = asupersync::fs::metadata(path)
+        .await
+        .map_err(|error| file_error(format!("cannot inspect the --file input: {error}")))?;
+    retained_search_checkpoint(cx)?;
+    if !observed.is_file() {
+        return Err(nonregular());
+    }
+    let options = asupersync::fs::OpenOptions::new().read(true);
+    // Metadata alone is insufficient: a regular file can be replaced by a
+    // FIFO before open. These flags also avoid acquiring a controlling tty.
+    #[cfg(unix)]
+    let options = options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    let file = options
+        .open(path)
+        .await
+        .map_err(|error| file_error(format!("cannot open the --file input: {error}")))?;
+    retained_search_checkpoint(cx)?;
+    let opened = file
+        .metadata()
+        .await
+        .map_err(|error| file_error(format!("cannot inspect the opened --file input: {error}")))?;
+    retained_search_checkpoint(cx)?;
+    if !opened.is_file() {
+        return Err(nonregular());
+    }
+    Ok(file)
+}
+
+/// Linux procfs creates a separate open file description for a pipe. `dup`
+/// would share NONBLOCK with the caller (and possibly its shell), while
+/// reopening a regular file would lose the caller's current file offset.
+/// Restrict this transport to pipes and keep the original descriptor alive.
+#[cfg(target_os = "linux")]
+fn open_nonblocking_pipe(
+    cx: &Cx,
+    source: &impl std::os::fd::AsFd,
+) -> SearchResult<Option<std::fs::File>> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    use std::os::fd::AsRawFd;
+
+    retained_search_checkpoint(cx)?;
+    let original = fstat(source).map_err(io::Error::from)?;
+    if FileType::from_raw_mode(original.st_mode) != FileType::Fifo {
+        return Ok(None);
+    }
+    let path = format!("/proc/self/fd/{}", source.as_fd().as_raw_fd());
+    let pipe = open(
+        path.as_str(),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| SearchError::InvalidConfig {
+        field: "cli.append_batch.stdin".to_owned(),
+        value: "pipe".to_owned(),
+        reason: format!(
+            "cannot open cancellable pipe input through /proc/self/fd: {error}; save the JSONL to a regular file and pass --file"
+        ),
+    })?;
+    let opened = fstat(&pipe).map_err(io::Error::from)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::Fifo
+        || (original.st_dev, original.st_ino) != (opened.st_dev, opened.st_ino)
+    {
+        return Err(input_error(
+            "stdin",
+            "pipe identity changed during admission",
+        ));
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(Some(std::fs::File::from(pipe)))
+}
+
+#[cfg(target_os = "linux")]
+async fn read_nonblocking(
+    cx: &Cx,
+    reader: &mut std::fs::File,
+    limits: InputLimits,
+) -> SearchResult<BTreeMap<String, AppendDocument>> {
+    retained_search_checkpoint(cx)?;
+    let mut input = AppendInput::new(limits);
+    let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+    loop {
+        retained_search_checkpoint(cx)?;
+        let read = reader.read(&mut buffer);
+        retained_search_checkpoint(cx)?;
+        let count = match read {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(25)).await;
+                continue;
+            }
+            other => other?,
+        };
+        if count == 0 {
+            return input.finish(cx);
+        }
+        input.push(cx, &buffer[..count])?;
     }
 }
 
@@ -765,6 +876,188 @@ mod tests {
                 expected,
             );
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonblocking_pipe_preserves_final_bytes_limits_and_original_flags() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+        use std::io::Write;
+
+        run_test_with_cx(|cx| async move {
+            let mut bytes = record("x", "superseded");
+            bytes.extend(record("x", "café 🦀"));
+            bytes.pop();
+            for wire_bytes in [INPUT_LIMITS.wire_bytes, bytes.len() - 1] {
+                let (source, mut writer) = io::pipe().unwrap();
+                let inherited_flags = fcntl_getfl(&source).unwrap();
+                assert!(!inherited_flags.contains(OFlags::NONBLOCK));
+                let mut reader = open_nonblocking_pipe(&cx, &source).unwrap().unwrap();
+                assert!(fcntl_getfl(&reader).unwrap().contains(OFlags::NONBLOCK));
+                assert_eq!(fcntl_getfl(&source).unwrap(), inherited_flags);
+                // Pause inside the final multibyte character. The record must
+                // survive WouldBlock and finish when the producer closes.
+                let split = bytes.len() - 3;
+                writer.write_all(&bytes[..split]).unwrap();
+                let mut pending = Box::pin(read_nonblocking(
+                    &cx,
+                    &mut reader,
+                    InputLimits {
+                        wire_bytes,
+                        ..INPUT_LIMITS
+                    },
+                ));
+                let first = std::future::poll_fn(|task| {
+                    Poll::Ready(std::future::Future::poll(pending.as_mut(), task))
+                })
+                .await;
+                assert!(first.is_pending());
+                assert_eq!(fcntl_getfl(&source).unwrap(), inherited_flags);
+                writer.write_all(&bytes[split..]).unwrap();
+                drop(writer);
+                let result = pending.await;
+                if wire_bytes == INPUT_LIMITS.wire_bytes {
+                    assert_eq!(result.unwrap()["x"].embedding_text, "café 🦀");
+                } else {
+                    assert_limit(result.unwrap_err(), "encoded-byte");
+                }
+                drop(reader);
+                assert_eq!(fcntl_getfl(&source).unwrap(), inherited_flags);
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regular_stdin_is_not_reopened_or_rewound() {
+        use std::io::{Seek, Write};
+
+        run_test_with_cx(|cx| async move {
+            let mut file = tempfile::tempfile().unwrap();
+            let prefix = record("already-consumed", "old body");
+            file.write_all(&prefix).unwrap();
+            file.write_all(&record("remaining", "new body")).unwrap();
+            file.seek(io::SeekFrom::Start(u64::try_from(prefix.len()).unwrap()))
+                .unwrap();
+            assert!(open_nonblocking_pipe(&cx, &file).unwrap().is_none());
+            let documents = read_sync(&cx, &mut file, INPUT_LIMITS).unwrap();
+            assert_eq!(documents.len(), 1);
+            assert_eq!(documents["remaining"].embedding_text, "new body");
+            assert_eq!(
+                file.stream_position().unwrap(),
+                file.metadata().unwrap().len()
+            );
+        });
+    }
+
+    /// Exercise the real stdin branch in a subprocess, so no test mutates fd 0
+    /// for its neighbors. The parent keeps a writer open and enforces a deadline:
+    /// the old blocking reader cannot yield to request cancellation, and the old
+    /// --file open cannot return on a FIFO with no writer. Neither failure may
+    /// hang the test suite or leave a reader thread behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_special_input_admission_is_bounded() {
+        use rustix::fs::{Mode, fcntl_getfl, mkfifoat};
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const PROBE: &str = "FSFS_APPEND_SPECIAL_INPUT_PROBE";
+        const TEST: &str = "runtime::retained_reuse::append_input::tests::production_special_input_admission_is_bounded";
+        if let Ok(mode) = std::env::var(PROBE) {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let root = parent.path().join("store");
+                let path = parent.path().join("input.fifo");
+                let input_file = if mode == "fifo" {
+                    mkfifoat(rustix::fs::CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
+                    Some(path.clone())
+                } else {
+                    assert_eq!(mode, "pipe");
+                    None
+                };
+                let runtime = FsfsRuntime::new(crate::FsfsConfig::default()).with_cli_input(
+                    crate::CliInput {
+                        command: crate::CliCommand::AppendBatch,
+                        input_file,
+                        index_dir: Some(root.clone()),
+                        ..crate::CliInput::default()
+                    },
+                );
+                let inherited_flags = fcntl_getfl(io::stdin()).unwrap();
+                if mode == "pipe" {
+                    let mut pending = Box::pin(read_append_documents(&cx, &runtime));
+                    let first = std::future::poll_fn(|task| {
+                        Poll::Ready(std::future::Future::poll(pending.as_mut(), task))
+                    })
+                    .await;
+                    assert!(
+                        first.is_pending(),
+                        "held-open input must await its next chunk"
+                    );
+                    cx.set_cancel_requested(true);
+                    let result = pending.await;
+                    cx.set_cancel_requested(false);
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                } else {
+                    assert!(matches!(
+                        read_append_documents(&cx, &runtime).await,
+                        Err(SearchError::InvalidConfig { field, reason, .. })
+                            if field == "cli.append_batch.file" && reason.contains("regular file")
+                    ));
+                }
+                assert_eq!(fcntl_getfl(io::stdin()).unwrap(), inherited_flags);
+                assert!(
+                    !root.exists(),
+                    "admission must finish before store mutation"
+                );
+            });
+            println!("append admission probe completed");
+            return;
+        }
+
+        for mode in ["pipe", "fifo"] {
+            let (reader, mut writer) = io::pipe().unwrap();
+            let inherited_flags = fcntl_getfl(&reader).unwrap();
+            writer
+                .write_all(&record("accepted-before-cancel", "private body"))
+                .unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(PROBE, mode)
+                .stdin(reader.try_clone().unwrap())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let finished = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(fcntl_getfl(&reader).unwrap(), inherited_flags);
+            // The writer stays open until after the child has returned.
+            drop(writer);
+            assert!(
+                finished && output.status.success(),
+                "{mode} admission did not finish independently of its writer: status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("append admission probe completed")
+            );
+        }
     }
 
     #[test]
