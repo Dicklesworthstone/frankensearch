@@ -35407,7 +35407,7 @@ fn emit_model_free_build_hint() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::fs;
     use std::future::{Future, poll_fn};
 
