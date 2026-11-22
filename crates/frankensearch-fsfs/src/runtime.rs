@@ -147,8 +147,9 @@ use crate::lifecycle::{
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::output_schema::{
     IndexFreshnessPayload, OutputEnvelope, OutputError, OutputWarning, OutputWarningCode,
-    RerankHitScore, RerankStagePayload, RerankStageStatus, SearchHitPayload, SearchOutputPhase,
-    SearchPayload, SemanticBlendHit, SemanticBlendPayload, SemanticTierScore, error_code_for,
+    RerankHitScore, RerankStagePayload, RerankStageStatus, SearchHitPayload, SearchHitScoreEvidence,
+    SearchOutputPhase, SearchPayload, SemanticBlendHit, SemanticBlendPayload, SemanticTierScore,
+    error_code_for,
 };
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
@@ -700,7 +701,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v44: planner fanout and ranking priors bind the pressure profile and override.
 // v45: exclusion-only queries browse the lexical complement without embedding.
 // v46: quality-only evidence retains the raw similarity supplied to RRF.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v46";
+// v47: retain raw vector scores and per-hit code-navigation priors.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v47";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -743,8 +745,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v41 / stream v39: attest the serving pressure profile and degradation override.
 // v42 / stream v40: exclusion-only requests admit only the lexical complement.
 // v43 / stream v41: quality-only evidence retains the actual similarity.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v43";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v41";
+// v44 / stream v42: retain raw vector scores and per-hit code-navigation priors.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v44";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v42";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -13833,6 +13836,9 @@ impl FsfsRuntime {
             .lexical_scores
             .retain(|path, _| displayed.contains(path.as_str()));
         payload
+            .score_evidence
+            .retain(|path, _| displayed.contains(path.as_str()));
+        payload
             .lexical_fallback_tail
             .retain(|path| displayed.contains(path.as_str()));
         payload
@@ -15455,17 +15461,24 @@ impl FsfsRuntime {
         let fused = last
             .hits
             .iter()
-            .map(|hit| FusedCandidate {
-                doc_id: hit.path.clone(),
-                fused_score: hit.score,
-                prior_boost: 0.0,
-                lexical_rank: hit.lexical_rank,
-                semantic_rank: hit.semantic_rank,
-                hash_rank: hit.hash_rank,
-                lexical_score: None,
-                semantic_score: None,
-                hash_score: None,
-                in_both_sources: hit.in_both_sources,
+            .map(|hit| {
+                let evidence = last
+                    .score_evidence
+                    .get(&hit.path)
+                    .copied()
+                    .unwrap_or_default();
+                FusedCandidate {
+                    doc_id: hit.path.clone(),
+                    fused_score: hit.score,
+                    prior_boost: evidence.prior_boost.unwrap_or_default(),
+                    lexical_rank: hit.lexical_rank,
+                    semantic_rank: hit.semantic_rank,
+                    hash_rank: hit.hash_rank,
+                    lexical_score: None,
+                    semantic_score: evidence.semantic_score,
+                    hash_score: evidence.hash_score,
+                    in_both_sources: hit.in_both_sources,
+                }
             })
             .collect::<Vec<_>>();
         let index_root = self.resolve_status_index_root()?;
@@ -15587,6 +15600,26 @@ impl FsfsRuntime {
                 hit.lexical_score
                     .filter(|score| score.is_finite())
                     .map(|score| (hit.doc_id.clone(), score))
+            })
+            .collect();
+        payload.score_evidence = limited
+            .iter()
+            .filter_map(|hit| {
+                let semantic_score = hit.semantic_score.filter(|score| score.is_finite());
+                let hash_score = hit.hash_score.filter(|score| score.is_finite());
+                let prior_boost = (hit.prior_boost.is_finite() && hit.prior_boost > 0.0)
+                    .then_some(hit.prior_boost);
+                if semantic_score.is_none() && hash_score.is_none() && prior_boost.is_none() {
+                    return None;
+                }
+                Some((
+                    hit.doc_id.clone(),
+                    SearchHitScoreEvidence {
+                        semantic_score,
+                        hash_score,
+                        prior_boost,
+                    },
+                ))
             })
             .collect();
         payload
@@ -36572,11 +36605,49 @@ mod tests {
                 .unwrap();
             let mut hot = HashMap::new();
             let cold = performance
-                .execute_search_serve_request(&cx, request.clone(), &mut resources, &mut hot, true)
+                .execute_search_serve_request_with_sink(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut hot,
+                    super::SearchServeOptions {
+                        hot_cache_enabled: true,
+                        persist_explain_session: true,
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
             assert!(!cold.cached);
             assert_eq!(cold.payloads.len(), 1);
+            let cold_session = performance.load_explain_session().unwrap().unwrap();
+            let code = cold_session
+                .hits
+                .iter()
+                .find(|hit| hit.path == "src/query_execution.rs")
+                .unwrap();
+            assert_eq!(code.semantic_score, Some(0.0));
+            assert!(code.prior_boost.is_some_and(|prior| prior > 0.0));
+            let warm = performance
+                .execute_search_serve_request_with_sink(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut hot,
+                    super::SearchServeOptions {
+                        hot_cache_enabled: true,
+                        persist_explain_session: true,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(warm.cached);
+            assert_eq!(
+                performance.load_explain_session().unwrap().unwrap().hits,
+                cold_session.hits,
+                "daemon replay must preserve the ranked cosine and positive prior"
+            );
             let code_score = |payloads: &[SearchPayload]| {
                 payloads[0]
                     .hits
@@ -36589,11 +36660,27 @@ mod tests {
             performance
                 .write_search_payload_cache(&key, &cold.payloads, &fingerprint)
                 .unwrap();
+            let reloaded = performance
+                .try_load_search_payload_cache(&key, &fingerprint)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded, cold.payloads);
+            performance
+                .persist_explain_session_for_cached_payloads(&request.query, &reloaded)
+                .unwrap();
             assert_eq!(
-                performance
-                    .try_load_search_payload_cache(&key, &fingerprint)
-                    .unwrap(),
-                Some(cold.payloads.clone()),
+                performance.load_explain_session().unwrap().unwrap().hits,
+                cold_session.hits,
+                "disk replay must preserve the ranked cosine and positive prior"
+            );
+            let mut preview = reloaded[0].clone();
+            assert_eq!(preview.score_evidence.len(), 2);
+            FsfsRuntime::limit_expanded_search_payload(&mut preview, 1);
+            assert_eq!(preview.score_evidence.len(), 1);
+            let displayed = &preview.hits[0].path;
+            assert_eq!(
+                preview.score_evidence.get(displayed),
+                reloaded[0].score_evidence.get(displayed),
             );
 
             for (profile, degradation) in [
@@ -50204,7 +50291,9 @@ mod tests {
             let fused = FsfsRuntime::fuse_expanded_payloads(&queries[0].text, &variants, 2, 60.0);
             assert_eq!(fused.phase, SearchOutputPhase::RefinementFailed);
             assert!(!variants[1].degradation_advice.is_empty());
+            assert!(fused.score_evidence.is_empty());
             for source in &variants {
+                assert!(!source.score_evidence.is_empty());
                 for (reason, advice) in &source.degradation_advice {
                     assert_eq!(fused.degradation_advice.get(reason), Some(advice));
                 }
@@ -67749,7 +67838,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_cached_hash_payload_keeps_hash_rank_without_fsvi() {
+    fn persist_cached_hash_payload_keeps_hash_evidence_without_fsvi() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_root = temp.path().join("index");
         fs::create_dir_all(&index_root).expect("create index dir");
@@ -67757,23 +67846,28 @@ mod tests {
             index_dir: Some(index_root),
             ..CliInput::default()
         });
-        let payload = SearchPayload::new(
+        let orchestrator = super::QueryExecutionOrchestrator::new(super::QueryFusionPolicy {
+            rrf_k: runtime.config.search.rrf_k,
+        });
+        let fused = orchestrator.fuse_rankings_for_vector_lane(
+            &[],
+            &[SemanticCandidate::new("src/lib.rs".to_owned(), 0.2)],
+            1,
+            0,
+            true,
+        );
+        let payload = FsfsRuntime::build_limited_payload(
+            orchestrator,
             "ownership",
             SearchOutputPhase::Initial,
+            &fused,
+            &fused,
+            &HashMap::new(),
             1,
-            vec![SearchHitPayload {
-                rank: 1,
-                path: "src/lib.rs".to_owned(),
-                line: None,
-                score: 0.2,
-                snippet: None,
-                lexical_rank: None,
-                semantic_rank: None,
-                hash_rank: Some(0),
-                in_both_sources: false,
-            }],
+            true,
         )
         .with_vector_generation("fnv1a-256", true);
+        let payload = serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
         runtime
             .persist_explain_session_for_cached_payloads("ownership", &[payload])
             .expect("persist cached hash explain session");
@@ -67785,6 +67879,8 @@ mod tests {
         assert!(session.vector_generation_is_hash);
         assert_eq!(session.hits[0].hash_rank, Some(0));
         assert_eq!(session.hits[0].semantic_rank, None);
+        assert_eq!(session.hits[0].hash_score, Some(0.2));
+        assert_eq!(session.hits[0].semantic_score, None);
         let raw = fs::read_to_string(
             runtime
                 .resolve_status_index_root()
@@ -71461,6 +71557,8 @@ mod tests {
                 "fsfs.search.cache.v43",
                 // Quality-only evidence could store min-max scores instead of similarities.
                 "fsfs.search.cache.v45",
+                // Could replay results without their vector scores or ranking priors.
+                "fsfs.search.cache.v46",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

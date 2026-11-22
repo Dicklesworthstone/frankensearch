@@ -816,6 +816,25 @@ mod loader_only {
             }
         };
         let search = |label: &str, config: &Path| run_search(fsfs, label, config, false);
+        let explain = |label: &str| {
+            let outcome = fsfs.run_with_env(
+                root,
+                label,
+                [
+                    "explain",
+                    "1",
+                    "--config",
+                    selected.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &[],
+            );
+            parse_success_envelope("real fast-model explanation", &outcome)
+        };
         let cold = search("fast-model-cache-cold", &selected);
         let original = parse_success_envelope("real fast-model cache seed", &cold);
         assert!(cold.stderr.contains("Model2Vec model loaded"), "{cold:?}");
@@ -823,6 +842,14 @@ mod loader_only {
             original["data"]["hits"]
                 .as_array()
                 .is_some_and(|hits| !hits.is_empty())
+        );
+        let cold_explain = explain("fast-model-cache-cold-explain");
+        assert!(
+            cold_explain
+                .pointer("/data/ranking/fusion/semantic_score")
+                .and_then(Value::as_f64)
+                .is_some_and(f64::is_finite),
+            "cold explanation must carry the observed cosine: {cold_explain}"
         );
         let matching_records = || {
             fs::read_dir(index.join("query_cache"))
@@ -838,7 +865,7 @@ mod loader_only {
         let mut records = matching_records();
         assert_eq!(records.len(), 1, "the real query must persist one answer");
         let (cache_path, cache_bytes, record) = records.pop().unwrap();
-        assert_eq!(record["schema_version"], "fsfs.search.cache.v46");
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v47");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
         assert_eq!(record["key"]["pressure_profile"], "performance");
         assert_eq!(record["key"]["degradation_override"], "auto");
@@ -861,6 +888,11 @@ mod loader_only {
             );
             assert_hash_attempts("warm JSON with valid receipt", &warm, 0);
             assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            let warm_explain = explain(&format!("fast-model-cache-warm-{ordinal}-explain"));
+            assert_eq!(
+                warm_explain["data"]["ranking"],
+                cold_explain["data"]["ranking"]
+            );
             warm_elapsed.push(warm.elapsed);
         }
         warm_elapsed.sort_unstable();
@@ -3068,7 +3100,7 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v43");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v44");
                     assert_eq!(response["policy"]["pressure_profile"], "performance");
                     assert_eq!(response["policy"]["degradation_override"], "auto");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;

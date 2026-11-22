@@ -466,13 +466,16 @@ pub struct SearchPayload {
     /// `--rerank`), so consumers can tell "not requested" from "skipped".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rerank: Option<RerankStagePayload>,
-    /// The semantic blend ranked by RRF in this refined phase. Carried through
+    /// Tier evidence for refined or quality-only search. Carried through
     /// caches and query serving so a later explain uses the policy that ran.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub semantic_blend: Option<SemanticBlendPayload>,
     /// Raw lexical evidence retained for the same explanation after cache reuse.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub lexical_scores: BTreeMap<String, f32>,
+    /// Vector scores supplied to fusion and additive priors for returned hits.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub score_evidence: BTreeMap<String, SearchHitScoreEvidence>,
     /// Hits appended after the RRF head whose retained score is raw BM25.
     /// A later quality promotion removes the hit from this set.
     #[serde(skip_serializing_if = "BTreeSet::is_empty", default)]
@@ -488,6 +491,17 @@ pub struct SearchPayload {
     /// ranking so forwarding and streaming cannot silently discard a warning.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub explanation_warnings: Vec<OutputWarning>,
+}
+
+/// Observed ranking inputs retained through server and cache replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SearchHitScoreEvidence {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub semantic_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hash_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prior_boost: Option<f64>,
 }
 
 /// A quality deadline expires after Initial. Backend shutdown may take longer
@@ -619,6 +633,7 @@ impl SearchPayload {
             rerank: None,
             semantic_blend: None,
             lexical_scores: BTreeMap::new(),
+            score_evidence: BTreeMap::new(),
             lexical_fallback_tail: BTreeSet::new(),
             quality_timeout: None,
             explanations: BTreeMap::new(),
