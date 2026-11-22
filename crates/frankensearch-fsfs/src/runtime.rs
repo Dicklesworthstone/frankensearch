@@ -699,7 +699,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v43: an empty quality query reports no candidates even without a cross-encoder.
 // v44: planner fanout and ranking priors bind the pressure profile and override.
 // v45: exclusion-only queries browse the lexical complement without embedding.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v45";
+// v46: quality-only evidence retains the raw similarity supplied to RRF.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v46";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -741,8 +742,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v40 / stream v38: reranker eligibility uses the normalized query and retained tiers.
 // v41 / stream v39: attest the serving pressure profile and degradation override.
 // v42 / stream v40: exclusion-only requests admit only the lexical complement.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v42";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v40";
+// v43 / stream v41: quality-only evidence retains the actual similarity.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v43";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v41";
 const FSFS_SEARCH_SERVE_ERROR_MESSAGE_MAX_CHARS: usize = 512;
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
@@ -4097,13 +4099,44 @@ impl ExplainSessionHit {
 }
 
 impl ExplainSession {
-    fn blend_components(&self, path: &str) -> Option<Vec<ScoreComponent>> {
+    fn has_quality_only_evidence(&self) -> bool {
+        self.phase == SearchOutputPhase::Initial
+            && self
+                .semantic_blend
+                .as_ref()
+                .is_some_and(|blend| blend.fast_embedder.is_empty())
+    }
+
+    fn semantic_components(
+        &self,
+        hit: &ExplainSessionHit,
+    ) -> Option<(Vec<ScoreComponent>, Option<f32>)> {
         let blend = self.semantic_blend.as_ref()?;
-        let hit = blend.hits.iter().find(|hit| hit.path == path)?;
-        let mut components = Vec::with_capacity(2);
+        let evidence = blend.hits.iter().find(|evidence| evidence.path == hit.path)?;
+        // Quality-only sessions have always saved tier evidence in Initial.
+        // Older sessions put a normalized value in semantic_score, but kept
+        // the actual ranked similarity in the quality tier's raw score.
+        let quality_only = self.has_quality_only_evidence();
+        let semantic_score = if quality_only {
+            evidence.quality.as_ref().and_then(|tier| tier.raw_score)
+        } else {
+            hit.semantic_score
+        };
+        let rrf_rank = hit.semantic_rank.filter(|_| !hit.lexical_fallback_tail);
+        let rrf_contribution = rrf_contribution_for_rank(self.rrf_k, rrf_rank);
+        let mut components = Vec::with_capacity(3);
+        if !quality_only && rrf_rank.is_some() && let Some(score) = semantic_score {
+            components.push(ScoreComponent {
+                source: ExplainedSource::SemanticBlend,
+                raw_score: f64::from(score),
+                normalized_score: f64::from(score),
+                rrf_contribution,
+                weight: 1.0,
+            });
+        }
         for (tier, embedder, quality) in [
-            (&hit.fast, &blend.fast_embedder, false),
-            (&hit.quality, &blend.quality_embedder, true),
+            (&evidence.fast, &blend.fast_embedder, false),
+            (&evidence.quality, &blend.quality_embedder, true),
         ] {
             let Some(tier) = tier else { continue };
             let Some(raw_score) = tier.raw_score else {
@@ -4123,15 +4156,14 @@ impl ExplainSession {
             components.push(ScoreComponent {
                 source,
                 raw_score: f64::from(raw_score),
-                normalized_score: f64::from(tier.normalized_score),
-                // RRF ranks the combined semantic score once. Individual
-                // tier components are not independent RRF contributions;
-                // the joint rank/contribution is reported by FusionContext.
-                rrf_contribution: 0.0,
+                normalized_score: f64::from(if quality_only { raw_score } else { tier.normalized_score }),
+                // The final fusion ranks either the combined semantic score
+                // or the sole quality tier, once per document.
+                rrf_contribution: if quality_only && quality { rrf_contribution } else { 0.0 },
                 weight: f64::from(tier.weight),
             });
         }
-        Some(components)
+        Some((components, semantic_score))
     }
 
     fn from_fused(
@@ -12852,19 +12884,10 @@ impl FsfsRuntime {
                 },
             });
         }
-        if let Some(blend_components) = session.blend_components(&hit.path) {
-            if let Some((score, rank)) = hit.semantic_score.zip(hit.semantic_rank)
-                && !hit.lexical_fallback_tail
-            {
-                components.push(ScoreComponent {
-                    source: ExplainedSource::SemanticBlend,
-                    raw_score: f64::from(score),
-                    normalized_score: f64::from(score),
-                    rrf_contribution: rrf_contribution_for_rank(session.rrf_k, Some(rank)),
-                    weight: 1.0,
-                });
-            }
-            components.extend(blend_components);
+        let mut semantic_score = hit.semantic_score;
+        if let Some((semantic_components, ranked_score)) = session.semantic_components(hit) {
+            semantic_score = ranked_score;
+            components.extend(semantic_components);
         } else if let Some(vector_score) = hit.hash_score.or(hit.semantic_score) {
             let embedder = session
                 .vector_generation_id
@@ -12937,6 +12960,8 @@ impl FsfsRuntime {
             &explanation,
             if hit.lexical_fallback_tail {
                 "query.explain.lexical_fallback_tail"
+            } else if session.has_quality_only_evidence() {
+                "query.explain.quality_only"
             } else if session.semantic_blend.is_some() {
                 "query.explain.semantic_blend"
             } else {
@@ -12951,7 +12976,7 @@ impl FsfsRuntime {
             semantic_rank: hit.semantic_rank,
             hash_rank: hit.hash_rank,
             lexical_score: hit.lexical_score,
-            semantic_score: hit.semantic_score,
+            semantic_score,
             hash_score: hit.hash_score,
             in_both_sources: hit.in_both_sources,
             vector_generation_is_hash: session.vector_generation_is_hash,
@@ -27247,13 +27272,23 @@ impl FsfsRuntime {
         if self.config.search.rerank {
             payload.rerank = Some(rerank_payload);
         }
-        let (_, mut quality_hits) = self.blend_semantic_candidates(&[], &candidates, None);
-        let returned = payload
-            .hits
+        let quality_hits = fused
             .iter()
-            .map(|hit| hit.path.as_str())
-            .collect::<HashSet<_>>();
-        quality_hits.retain(|hit| returned.contains(hit.path.as_str()));
+            .take(payload.hits.len())
+            .filter_map(|hit| {
+                let score = hit.semantic_score.filter(|score| score.is_finite())?;
+                Some(SemanticBlendHit {
+                    path: hit.doc_id.clone(),
+                    score,
+                    fast: None,
+                    quality: Some(SemanticTierScore {
+                        raw_score: Some(score),
+                        normalized_score: score,
+                        weight: 1.0,
+                    }),
+                })
+            })
+            .collect();
         payload.semantic_blend = Some(SemanticBlendPayload {
             quality_weight: 1.0,
             fast_embedder: String::new(),
@@ -30476,6 +30511,8 @@ fn render_explain_table(
         tier_component(crate::explanation_payload::ScoreComponentSource::SemanticFast);
     let quality_component =
         tier_component(crate::explanation_payload::ScoreComponentSource::SemanticQuality);
+    let blend_component =
+        tier_component(crate::explanation_payload::ScoreComponentSource::SemanticBlend);
     let semantic_fast_score = fast_component.map_or_else(
         || {
             (quality_component.is_none())
@@ -30493,6 +30530,9 @@ fn render_explain_table(
     let quality_score = quality_component.map_or_else(
         || "n/a".to_owned(),
         |component| {
+            if component.rrf_contribution > 0.0 {
+                return format!("{:.6}", component.raw_score);
+            }
             format!(
                 "{:.6} (normalized {:.6}, weight {:.6})",
                 component.raw_score, component.normalized_score, component.weight
@@ -30549,7 +30589,7 @@ fn render_explain_table(
         lines.push(format!("Semantic (fast): {semantic_fast_score}"));
     }
     lines.push(format!("Semantic (quality): {quality_score}"));
-    if quality_component.is_some() {
+    if quality_component.is_some() && blend_component.is_some() {
         lines.push(
             "RRF ranks the combined semantic blend once; tier weights apply before fusion."
                 .to_owned(),
@@ -30575,10 +30615,12 @@ fn render_explain_table(
             "RRF: k={rrf_k:.1}, lexical_rank={lexical_rank}, semantic_rank={semantic_rank}, lexical_contrib={lexical_rrf:.6}, semantic_contrib={semantic_rrf:.6}, total={total_rrf:.6}"
         ));
     }
-    lines.push(format!(
-        "Final blended score: {:.6}",
-        payload.ranking.final_score
-    ));
+    let final_label = if quality_component.is_some_and(|part| part.rrf_contribution > 0.0) {
+        "Final score"
+    } else {
+        "Final blended score"
+    };
+    lines.push(format!("{final_label}: {:.6}", payload.ranking.final_score));
 
     // The document ID, query and matched terms are indexed or caller text.
     lines
@@ -38544,6 +38586,24 @@ mod tests {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
             let mut resources = disagreeing_blend_resources(temp.path());
+            let path = temp.path().join("nontrivial-quality.fsvi");
+            let mut writer = VectorIndex::create_with_revision(
+                &path,
+                "blend-quality-2",
+                &test_identity("blend-quality-2", 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            for (id, vector) in [
+                ("b.rs", [0.8, 0.6]),
+                ("quality-only.rs", [0.5, 0.866_025_4]),
+                ("a.rs", [0.0, 1.0]),
+            ] {
+                writer.write_record(id, &vector).unwrap();
+            }
+            writer.finish().unwrap();
+            resources.quality_vector_index = Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
             let fast = Arc::new(PendingSemanticEmbedder::new("blend-fast-2", 2));
             resources.fast_embedder = Some(admitted_shared(&fast));
             let lexical = create_test_quill(&cx, &temp.path().join("lexical")).await;
@@ -38571,6 +38631,7 @@ mod tests {
                 FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
             let mut config = FsfsConfig::default();
             config.search.quality_timeout_ms = 5_000;
+            config.storage.index_dir = temp.path().display().to_string();
             let runtime = FsfsRuntime::new(config);
             let flags = SearchExecutionFlags {
                 include_snippets: true,
@@ -38614,6 +38675,15 @@ mod tests {
                     .all(|hit| hit.lexical_rank.is_none() && hit.semantic_rank.is_some())
             );
             let evidence = payload.semantic_blend.as_ref().unwrap();
+            let winner = &phases[0].fused[0];
+            let raw = winner.semantic_score.unwrap();
+            assert!((raw - 0.8).abs() < 0.001);
+            assert_eq!(evidence.hits[0].path, winner.doc_id);
+            assert_eq!(
+                evidence.hits[0].score.to_bits(),
+                raw.to_bits(),
+                "quality-only evidence must report the score that ranked the document"
+            );
             assert!(evidence.fast_embedder.is_empty());
             assert_eq!(evidence.quality_weight, 1.0);
             assert!(evidence.hits.iter().all(|hit| {
@@ -38623,6 +38693,75 @@ mod tests {
                         .as_ref()
                         .is_some_and(|quality| quality.weight.to_bits() == 1.0_f32.to_bits())
             }));
+            let assert_ranked_quality = |session: &super::ExplainSession| {
+                for (hit, fused) in session.hits.iter().zip(&phases[0].fused) {
+                    assert_eq!(hit.path, fused.doc_id);
+                    let (explanation, warnings) = FsfsRuntime::explain_session_hit(
+                        &cx,
+                        session,
+                        hit,
+                        Ok(resources.lexical_index.as_ref().unwrap()),
+                    );
+                    assert!(warnings.is_empty());
+                    assert_eq!(explanation.ranking.reason_code, "query.explain.quality_only");
+                    let [quality] = explanation.ranking.components.as_slice() else {
+                        panic!("expected one quality component for {}", hit.path);
+                    };
+                    assert_eq!(
+                        quality.source,
+                        crate::explanation_payload::ScoreComponentSource::SemanticQuality
+                    );
+                    let expected_raw = f64::from(fused.semantic_score.unwrap());
+                    assert_eq!(quality.raw_score.to_bits(), expected_raw.to_bits());
+                    assert_eq!(quality.normalized_score.to_bits(), expected_raw.to_bits());
+                    assert_eq!(quality.rrf_contribution.to_bits(), fused.fused_score.to_bits());
+                    assert_eq!(
+                        explanation.ranking.fusion.as_ref().unwrap().semantic_score,
+                        fused.semantic_score
+                    );
+                    let table = super::render_explain_table(
+                        &hit.result_id,
+                        &explanation,
+                        hit,
+                        session.rrf_k,
+                        false,
+                        session.vector_generation_id.as_deref(),
+                    );
+                    assert!(table.contains(&format!("Semantic (quality): {expected_raw:.6}\n")));
+                    assert!(!table.contains("combined semantic blend"));
+                    assert!(!table.contains("Final blended score"));
+                }
+            };
+            let session = runtime
+                .explain_session_with_payload(
+                    temp.path(),
+                    "quality search",
+                    payload.phase,
+                    &phases[0].fused,
+                    Some(payload),
+                )
+                .unwrap();
+            assert_eq!(session.hits.len(), 3);
+            assert_ranked_quality(&session);
+            let mut legacy_session = session.clone();
+            legacy_session.hits[0].semantic_score = Some(1.0);
+            let legacy = &mut legacy_session.semantic_blend.as_mut().unwrap().hits[0];
+            legacy.score = 1.0;
+            legacy.quality.as_mut().unwrap().normalized_score = 1.0;
+            assert_ranked_quality(&legacy_session);
+
+            let mode = SearchExecutionMode::QualityOnly;
+            let key = runtime.search_cache_key("quality search", FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, mode).unwrap();
+            let fingerprint = &resources.generation_fingerprint;
+            runtime
+                .write_search_payload_cache(&key, std::slice::from_ref(payload), fingerprint)
+                .unwrap();
+            let cached = runtime.try_load_search_payload_cache(&key, fingerprint).unwrap().unwrap();
+            assert_eq!(cached.as_slice(), std::slice::from_ref(payload));
+            runtime.persist_explain_session_for_cached_payloads("quality search", &cached).unwrap();
+            let replayed = runtime.load_explain_session().unwrap().unwrap();
+            assert_eq!(replayed.hits, session.hits);
+            assert_ranked_quality(&replayed);
             assert_eq!(
                 fast.calls.load(Ordering::SeqCst),
                 0,
@@ -39298,11 +39437,16 @@ mod tests {
                 let session = effective.load_explain_session().unwrap().unwrap();
                 assert_eq!(session.hits[0].path, winner);
                 assert_eq!(session.hits[0].semantic_score, Some(expected_score));
-                let components = session.blend_components(winner).unwrap();
-                assert_eq!(components.len(), 2);
+                let (components, ranked_score) = session.semantic_components(&session.hits[0]).unwrap();
+                assert_eq!(ranked_score, Some(expected_score));
+                assert_eq!(components.len(), 3);
                 assert!(
                     (components
                         .iter()
+                        .filter(|part| !matches!(
+                            part.source,
+                            frankensearch_core::ExplainedSource::SemanticBlend
+                        ))
                         .map(|part| part.normalized_score * part.weight)
                         .sum::<f64>()
                         - f64::from(session.hits[0].semantic_score.unwrap()))
@@ -71087,6 +71231,8 @@ mod tests {
                 "fsfs.search.cache.v42",
                 // Could replay another pressure profile or override's scores.
                 "fsfs.search.cache.v43",
+                // Quality-only evidence could store min-max scores instead of similarities.
+                "fsfs.search.cache.v45",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

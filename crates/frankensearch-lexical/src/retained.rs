@@ -14,11 +14,7 @@ use super::{
 
 /// Parse with the same shipping repairs and field boosts as the mutable facade.
 /// The gauntlet's deliberately unmodified oracle parser remains separate.
-pub(super) fn parse_shipping_query(
-    index: &Index,
-    fields: SchemaFields,
-    query: &str,
-) -> Box<dyn Query> {
+pub fn parse_shipping_query(index: &Index, fields: SchemaFields, query: &str) -> Box<dyn Query> {
     let mut parser = QueryParser::for_index(index, vec![fields.content, fields.title]);
     parser.set_field_boost(fields.title, TITLE_BOOST);
     let conjunction = repair_negated_conjunction(query);
@@ -76,7 +72,7 @@ fn document_metadata(
 
 /// Holds a fixed segment set without retaining the writer or a reload surface.
 #[derive(Clone)]
-pub(super) struct PinnedTantivyReader {
+pub struct PinnedTantivyReader {
     index: Index,
     fields: SchemaFields,
     searcher: Searcher,

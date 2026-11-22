@@ -499,12 +499,13 @@ pub struct QualityTimeoutPayload {
     pub reason_code: String,
 }
 
-/// One present tier's input and normalized contribution to a semantic blend.
+/// One present tier's input and contribution to the ranked semantic score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticTierScore {
     /// Non-finite inputs have no representable raw score; normalization still
     /// follows the library's finite fallback policy.
     pub raw_score: Option<f32>,
+    /// Score after the tier's normalization, or the raw score for quality-only search.
     pub normalized_score: f32,
     pub weight: f32,
 }
@@ -518,7 +519,7 @@ pub struct SemanticBlendHit {
     pub quality: Option<SemanticTierScore>,
 }
 
-/// Effective policy and score inputs for the returned refined head.
+/// Score evidence for the returned refined head or quality-only results.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticBlendPayload {
     pub quality_weight: f32,
