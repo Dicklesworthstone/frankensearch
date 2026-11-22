@@ -16,7 +16,8 @@ use crate::{Cx, Embedder, LexicalRead, ScoreSource, ScoredResult, SearchResult, 
 /// The actual query response stays with its retrieved pool. Supplementary
 /// evidence must use these exact values, never a second inference of the text.
 pub(super) struct RetainedCandidates<T> {
-    pub query: Option<BoundQueryEmbedding>,
+    // Keep the identity bundle out of line while this pool is held across phases.
+    pub query: Option<Box<BoundQueryEmbedding>>,
     pub hits: Vec<T>,
 }
 
@@ -293,11 +294,11 @@ impl NativeAnnIndex {
                 hits: Vec::new(),
             });
         }
-        let query = self.embed_query(cx, embedder, text).await?;
+        let query = Box::new(self.embed_query(cx, embedder, text).await?);
         let hits = match worker {
             Some((owner, pool)) => {
                 owner
-                    .search_filtered_with_pool(cx, query.clone(), k, ef, pool, accept)
+                    .search_filtered_with_pool(cx, (*query).clone(), k, ef, pool, accept)
                     .await?
             }
             None => self.search_filtered(cx, &query, k, ef, accept)?,
@@ -315,7 +316,7 @@ impl NativeAnnIndex {
         candidates: &[VectorHit],
         worker: Option<(Arc<Self>, BlockingPoolHandle)>,
     ) -> SearchResult<Vec<VectorHit>> {
-        let Some(query) = observed.query.as_ref() else {
+        let Some(query) = observed.query.as_deref() else {
             checkpoint(cx, "native_ann.candidate_evidence.empty")?;
             return Ok(Vec::new());
         };

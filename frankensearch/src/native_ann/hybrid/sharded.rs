@@ -409,11 +409,11 @@ impl NativeShardSet {
                 hits: Vec::new(),
             });
         }
-        let query = first.embed_query(cx, embedder, text).await?;
+        let query = Box::new(first.embed_query(cx, embedder, text).await?);
         let hits = match worker {
             Some((owner, pool)) => {
                 owner
-                    .search_filtered_with_pool(cx, query.clone(), k, ef, pool, accept)
+                    .search_filtered_with_pool(cx, (*query).clone(), k, ef, pool, accept)
                     .await?
             }
             None => self.search_filtered(cx, &query, k, ef, accept)?,
@@ -431,7 +431,7 @@ impl NativeShardSet {
         candidates: &[NativeShardHit],
         worker: Option<(Self, BlockingPoolHandle)>,
     ) -> SearchResult<Vec<NativeShardHit>> {
-        let Some(query) = observed.query.as_ref() else {
+        let Some(query) = observed.query.as_deref() else {
             checkpoint(cx, "native_ann.shards.candidate_evidence.empty")?;
             return Ok(Vec::new());
         };
