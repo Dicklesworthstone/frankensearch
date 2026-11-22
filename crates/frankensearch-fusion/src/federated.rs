@@ -14,6 +14,7 @@ use std::time::Duration;
 use ahash::{AHashMap, AHashSet};
 use asupersync::Cx;
 use asupersync::time::timeout;
+use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult};
 use tracing::{debug, warn};
 
@@ -307,6 +308,41 @@ impl FederatedSearcher {
         .await
     }
 
+    /// Execute federated search with one request-scoped document filter.
+    ///
+    /// Each shard applies `filter` within its own search, using that shard's
+    /// metadata and filter semantics before the federated cutoff. Rejected
+    /// documents never reach text hydration or reranking. Each shard resolves
+    /// metadata independently, even for equal document IDs.
+    ///
+    /// `text_fn` resolves global document IDs. Use
+    /// [`Self::search_with_index_filter`] when filters or text stores differ
+    /// between indices. Both the filter and provider may borrow request data.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search_with_index_text`].
+    pub async fn search_with_filter<F>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        text_fn: F,
+    ) -> SearchResult<FederatedResponse>
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync,
+    {
+        self.search_with_index_filter(
+            cx,
+            query,
+            limit,
+            |_index| filter,
+            |_index, doc_id| text_fn(doc_id),
+        )
+        .await
+    }
+
     /// Execute federated search with text resolved from each originating index.
     ///
     /// `text_fn(index_name, doc_id)` receives the exact name registered with
@@ -347,6 +383,42 @@ impl FederatedSearcher {
     where
         F: Fn(&str, &str) -> Option<String> + Send + Sync,
     {
+        self.search_with_index_filter(cx, query, limit, |_index| None, text_fn)
+            .await
+    }
+
+    /// Execute federated search with filters and text bound to each index.
+    ///
+    /// `filter_fn(index_name)` is called once per dispatched index and returns
+    /// its request-scoped filter, or `None` for an unfiltered shard. Filtering
+    /// runs before that shard's candidate cutoff, text hydration and reranking,
+    /// using that shard's own metadata and filter semantics. The filter and
+    /// both callbacks may borrow request data and need not be `'static`.
+    ///
+    /// `text_fn(index_name, doc_id)` has the same source binding as
+    /// [`Self::search_with_index_text`]. Equal document IDs still denote one
+    /// global fusion identity, but only shards whose filter admits the document
+    /// contribute its score or appear in [`FederatedHit::appeared_in`]. An
+    /// answered shard with no matching documents still counts toward coverage.
+    /// Neither callback is called for an undispatched index or a no-op request.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search_with_index_text`]. Duplicate dispatched names are
+    /// rejected before either callback runs. Per-shard metadata failures
+    /// follow the ordinary shard error and minimum-response policy.
+    pub async fn search_with_index_filter<'filter, F, P>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        filter_fn: P,
+        text_fn: F,
+    ) -> SearchResult<FederatedResponse>
+    where
+        F: Fn(&str, &str) -> Option<String> + Send + Sync,
+        P: Fn(&str) -> Option<&'filter dyn SearchFilter> + Send + Sync,
+    {
         if query.is_empty() || limit == 0 || self.indices.is_empty() {
             return Ok(FederatedResponse {
                 hits: Vec::new(),
@@ -359,7 +431,14 @@ impl FederatedSearcher {
         let per_index_limit = limit.saturating_mul(candidate_pool_factor);
         let timeout_budget = Duration::from_millis(self.config.per_index_timeout_ms);
         let (shard_results, coverage) = self
-            .collect_shard_results(cx, query, per_index_limit, timeout_budget, &text_fn)
+            .collect_shard_results(
+                cx,
+                query,
+                per_index_limit,
+                timeout_budget,
+                &filter_fn,
+                &text_fn,
+            )
             .await?;
 
         if shard_results.len() < self.config.min_indices {
@@ -384,16 +463,18 @@ impl FederatedSearcher {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn collect_shard_results<F>(
+    async fn collect_shard_results<'filter, F, P>(
         &self,
         cx: &Cx,
         query: &str,
         per_index_limit: usize,
         timeout_budget: Duration,
+        filter_fn: &P,
         text_fn: &F,
     ) -> SearchResult<(Vec<ShardResult>, FederatedCoverage)>
     where
         F: Fn(&str, &str) -> Option<String> + Send + Sync,
+        P: Fn(&str) -> Option<&'filter dyn SearchFilter> + Send + Sync,
     {
         let mut coverage = FederatedCoverage {
             queried: self
@@ -412,6 +493,7 @@ impl FederatedSearcher {
                 let index_name = index.name.clone();
                 let index_weight = index.weight;
                 let searcher = Arc::clone(&index.searcher);
+                let filter = filter_fn(index.name.as_str());
                 Box::pin(async move {
                     let timeout_start = cx.now();
                     let mut last_results = None;
@@ -419,10 +501,11 @@ impl FederatedSearcher {
                         // Bind before the shard starts: exclusion and rerank
                         // lookups must never hydrate from another index's store.
                         let shard_text = |doc_id: &str| text_fn(index_name.as_str(), doc_id);
-                        let future = Box::pin(searcher.search(
+                        let future = Box::pin(searcher.search_with_filter(
                             cx,
                             query,
                             per_index_limit,
+                            filter,
                             shard_text,
                             |phase| match phase {
                                 SearchPhase::Initial { results, .. }
@@ -2360,6 +2443,292 @@ mod tests {
             assert_eq!(response.hits.len(), 1);
             assert_eq!(response.coverage.queried, vec!["selected".to_owned()]);
             assert!(response.coverage.is_complete());
+        });
+    }
+
+    #[test]
+    fn filters_select_local_tail_before_the_federated_cutoff() {
+        use frankensearch_core::filter::IncludeDocIdsFilter;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut documents = (0..96)
+                .map(|number| (format!("denied-{number}"), vec![1.0, 0.0]))
+                .collect::<Vec<_>>();
+            documents.push(("allowed-tail".to_owned(), vec![0.1, 0.9]));
+            let records = documents
+                .iter()
+                .map(|(id, vector)| (id.as_str(), vector.as_slice()))
+                .collect::<Vec<_>>();
+            let (_directory, searcher) = build_searcher(&records);
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    candidate_pool_factor: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("primary", searcher, 1.0);
+            let filter = IncludeDocIdsFilter::new(["allowed-tail"]);
+            let hydrated = AtomicU64::new(0);
+            let response = federated
+                .search_with_filter(&cx, "query -omit", 1, Some(&filter), |doc_id| {
+                    assert_eq!(doc_id, "allowed-tail", "denied text must not be read");
+                    hydrated.fetch_add(1, Ordering::Relaxed);
+                    Some("permitted source".to_owned())
+                })
+                .await
+                .unwrap();
+            assert!(hydrated.load(Ordering::Relaxed) > 0);
+            assert!(response.coverage.is_complete());
+            assert_eq!(response.hits.len(), 1);
+            assert_eq!(response.hits[0].result.doc_id, "allowed-tail");
+            assert_eq!(response.hits[0].source_rank, 0);
+        });
+    }
+
+    #[test]
+    fn indexed_filters_borrow_request_state_and_keep_equal_ids_source_local() {
+        use frankensearch_core::filter::{IncludeDocIdsFilter, SearchFilter};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_first_directory, first) = build_searcher(&[("shared", &[1.0, 0.0])]);
+            let (_second_directory, second) = build_yielding_searcher(&[("shared", &[1.0, 0.0])]);
+            let deny = IncludeDocIdsFilter::new(std::iter::empty::<&str>());
+            let allow = IncludeDocIdsFilter::new(["shared"]);
+            let filters = std::collections::BTreeMap::from([
+                ("first", &deny as &dyn SearchFilter),
+                ("second", &allow as &dyn SearchFilter),
+            ]);
+            let first_calls = AtomicU64::new(0);
+            let second_calls = AtomicU64::new(0);
+            let text_calls = AtomicU64::new(0);
+            let request_text = String::from("allowed source from second");
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    candidate_pool_factor: 1,
+                    min_indices: 2,
+                    max_indices: 2,
+                    ..FederatedConfig::default()
+                })
+                .add_index("first", Arc::clone(&first), 10.0)
+                .add_index("second", second, 2.0)
+                .add_index("undispatched", first, 100.0);
+            let response = federated
+                .search_with_index_filter(
+                    &cx,
+                    "query -omit",
+                    1,
+                    |name| {
+                        match name {
+                            "first" => first_calls.fetch_add(1, Ordering::Relaxed),
+                            "second" => second_calls.fetch_add(1, Ordering::Relaxed),
+                            _ => panic!("an undispatched shard cannot resolve a filter"),
+                        };
+                        filters.get(name).copied()
+                    },
+                    |name, doc_id| {
+                        assert_eq!(name, "second", "denied shards cannot hydrate this ID");
+                        assert_eq!(doc_id, "shared");
+                        text_calls.fetch_add(1, Ordering::Relaxed);
+                        Some(request_text.clone())
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+            assert!(text_calls.load(Ordering::Relaxed) > 0);
+            assert!(response.coverage.is_complete());
+            assert_eq!(response.coverage.answered.len(), 2);
+            assert_eq!(response.hits.len(), 1);
+            let hit = &response.hits[0];
+            assert_eq!(hit.result.doc_id, "shared");
+            assert_eq!(hit.source_index, "second");
+            assert_eq!(hit.source_rank, 0);
+            assert_eq!(hit.appeared_in, vec!["second"]);
+            assert_eq!(hit.result.score.to_bits(), (2.0_f32 / 61.0).to_bits());
+        });
+    }
+
+    #[test]
+    fn absent_federated_filters_preserve_existing_fusion_and_text_behavior() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, searcher) =
+                build_searcher(&[("shared", &[1.0, 0.0]), ("excluded", &[0.5, 0.5])]);
+            let texts =
+                std::collections::BTreeMap::from([("shared", "keep"), ("excluded", "omit")]);
+            let federated = FederatedSearcher::new()
+                .add_index("first", Arc::clone(&searcher), 1.0)
+                .add_index("second", searcher, 2.0);
+            let expected = federated
+                .search_with_index_text(&cx, "query -omit", 10, |_, id| {
+                    texts.get(id).map(|text| (*text).to_owned())
+                })
+                .await
+                .unwrap();
+            let shared = federated
+                .search_with_filter(&cx, "query -omit", 10, None, |id| {
+                    texts.get(id).map(|text| (*text).to_owned())
+                })
+                .await
+                .unwrap();
+            let indexed = federated
+                .search_with_index_filter(
+                    &cx,
+                    "query -omit",
+                    10,
+                    |_| None,
+                    |_, id| texts.get(id).map(|text| (*text).to_owned()),
+                )
+                .await
+                .unwrap();
+            assert_same_federated_hits(&shared.hits, &expected.hits);
+            assert_same_federated_hits(&indexed.hits, &expected.hits);
+            assert!(shared.coverage.is_complete());
+            assert!(indexed.coverage.is_complete());
+            assert_eq!(indexed.hits.len(), 1);
+            assert_eq!(indexed.hits[0].appeared_in, vec!["first", "second"]);
+        });
+    }
+
+    #[test]
+    fn federated_filters_preserve_shard_failure_and_minimum_coverage() {
+        use frankensearch_core::filter::IncludeDocIdsFilter;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_healthy_directory, healthy) =
+                build_searcher(&[("denied", &[1.0, 0.0]), ("allowed", &[0.1, 0.9])]);
+            let (_failed_directory, failed) = build_failing_searcher(&[("allowed", &[1.0, 0.0])]);
+            let filter = IncludeDocIdsFilter::new(["allowed"]);
+            for required in [1, 2] {
+                let federated = FederatedSearcher::new()
+                    .with_config(FederatedConfig {
+                        min_indices: required,
+                        candidate_pool_factor: 1,
+                        ..FederatedConfig::default()
+                    })
+                    .add_index("healthy", Arc::clone(&healthy), 1.0)
+                    .add_index("failed", Arc::clone(&failed), 1.0);
+                let result = federated
+                    .search_with_filter(&cx, "query", 1, Some(&filter), |_| None)
+                    .await;
+                if required == 1 {
+                    let response = result.unwrap();
+                    assert_eq!(response.hits.len(), 1);
+                    assert_eq!(response.hits[0].result.doc_id, "allowed");
+                    assert_eq!(response.coverage.answered, vec!["healthy"]);
+                    assert_eq!(response.coverage.failed.len(), 1);
+                    assert_eq!(response.coverage.failed[0].index, "failed");
+                    assert!(!response.coverage.is_complete());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::FederatedInsufficientResponses {
+                            required: 2,
+                            received: 1,
+                        })
+                    ));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn filtered_timeout_retains_only_admitted_hits_and_never_hides_cancellation() {
+        use frankensearch_core::filter::IncludeDocIdsFilter;
+
+        for cancel_on_drop in [false, true] {
+            asupersync::test_utils::run_test_with_cx(move |cx| async move {
+                let quality = Arc::new(PendingEmbedder {
+                    cancel_on_drop,
+                    ..PendingEmbedder::new("pending-quality", 2)
+                });
+                let (_directory, searcher) = build_refining_searcher(
+                    &[
+                        ("denied", &[1.0, 0.0], &[1.0, 0.0]),
+                        ("allowed", &[0.1, 0.9], &[0.1, 0.9]),
+                    ],
+                    quality.clone(),
+                );
+                let federated = FederatedSearcher::new()
+                    .with_config(FederatedConfig {
+                        per_index_timeout_ms: 1_000,
+                        candidate_pool_factor: 1,
+                        ..FederatedConfig::default()
+                    })
+                    .add_index("pending-quality", searcher, 1.0);
+                let filter = IncludeDocIdsFilter::new(["allowed"]);
+                let result = federated
+                    .search_with_filter(
+                        &cx,
+                        "find related retry behavior",
+                        1,
+                        Some(&filter),
+                        |doc_id| {
+                            assert_eq!(doc_id, "allowed", "denied text must not be read");
+                            Some("permitted source".to_owned())
+                        },
+                    )
+                    .await;
+                assert_eq!(quality.started.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.dropped.load(Ordering::SeqCst), 1);
+                if cancel_on_drop {
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                } else {
+                    let response = result.unwrap();
+                    assert_eq!(response.hits.len(), 1);
+                    assert_eq!(response.hits[0].result.doc_id, "allowed");
+                    assert_eq!(response.coverage.answered, vec!["pending-quality"]);
+                    assert_eq!(
+                        response.coverage.refinement_timed_out,
+                        vec!["pending-quality"]
+                    );
+                    assert!(response.coverage.timed_out.is_empty());
+                    assert!(!response.coverage.is_complete());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn federated_filter_providers_do_no_work_before_noop_or_duplicate_refusal() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, searcher) = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let duplicate = FederatedSearcher::new()
+                .add_index("duplicate", Arc::clone(&searcher), 1.0)
+                .add_index("duplicate", searcher, 1.0);
+            for (query, limit) in [("", 10), ("query", 0), ("query", 1)] {
+                let result = duplicate
+                    .search_with_index_filter(
+                        &cx,
+                        query,
+                        limit,
+                        |_| panic!("no-op and invalid requests cannot resolve filters"),
+                        |_, _| panic!("no-op and invalid requests cannot read text"),
+                    )
+                    .await;
+                if query.is_empty() || limit == 0 {
+                    let response = result.unwrap();
+                    assert!(response.hits.is_empty());
+                    assert!(response.coverage.queried.is_empty());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::InvalidConfig { field, .. })
+                            if field == "federated.indices"
+                    ));
+                }
+            }
+            let empty = FederatedSearcher::new()
+                .search_with_index_filter(
+                    &cx,
+                    "query",
+                    1,
+                    |_| panic!("an empty federation cannot resolve filters"),
+                    |_, _| panic!("an empty federation cannot read text"),
+                )
+                .await
+                .unwrap();
+            assert!(empty.hits.is_empty());
+            assert!(empty.coverage.queried.is_empty());
         });
     }
 
