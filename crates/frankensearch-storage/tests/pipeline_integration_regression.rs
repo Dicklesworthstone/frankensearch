@@ -7,12 +7,12 @@ use std::sync::atomic::AtomicBool;
 use asupersync::Cx;
 use frankensearch_core::traits::{ModelCategory, SearchFuture};
 use frankensearch_core::{
-    Canonicalizer, Embedder, EmbeddingIdentityBundleV1, IdentityBoundEmbedding, SearchError,
-    SearchResult,
+    Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult,
 };
 use frankensearch_storage::{
-    EmbeddingVectorSink, InMemoryVectorSink, IngestAction, IngestRequest, JobQueueConfig,
-    PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
+    ClaimOutcome, ClaimedEmbeddingWrite, EmbeddingVectorSink, InMemoryVectorSink, IngestAction,
+    IngestRequest, JobQueueConfig, PersistentJobQueue, PipelineConfig, Storage,
+    StorageBackedJobRunner,
 };
 use fsqlite_types::value::SqliteValue;
 
@@ -186,12 +186,7 @@ impl Embedder for CancelledEmbedder {
 struct CancelledVectorSink;
 
 impl EmbeddingVectorSink for CancelledVectorSink {
-    fn persist(
-        &self,
-        _doc_id: &str,
-        _embedder_id: &str,
-        _embedding: &IdentityBoundEmbedding,
-    ) -> Result<(), SearchError> {
+    fn persist(&self, _request: &ClaimedEmbeddingWrite<'_>) -> SearchResult<ClaimOutcome<()>> {
         Err(SearchError::Cancelled {
             phase: "storage-pipeline-persist".to_owned(),
             reason: "test sink cancellation".to_owned(),
