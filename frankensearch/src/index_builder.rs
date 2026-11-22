@@ -1411,6 +1411,32 @@ fn validate_build_producer(
     Ok(())
 }
 
+/// Own the provider future and a separate cancellation wake registration.
+/// Custom/remote providers need not poll `Cx` or retain the task's waker, so
+/// checkpoints around a bare `.await` cannot release a parked build's writers.
+async fn await_build_inference<T>(
+    cx: &Cx,
+    phase: &'static str,
+    inference: impl std::future::Future<Output = SearchResult<T>>,
+) -> SearchResult<T> {
+    let mut response = None;
+    let completion = frankensearch_core::with_cancellation(cx, phase, async {
+        response = Some(inference.await);
+        Ok(())
+    })
+    .await;
+    match response {
+        // Preserve the provider's typed cancellation, including its phase and
+        // reason. Other responses lose to caller cancellation, as before.
+        Some(Err(error @ SearchError::Cancelled { .. })) => Err(error),
+        response => {
+            build_checkpoint(cx, phase)?;
+            completion?;
+            response.expect("completed embedding inference has a response")
+        }
+    }
+}
+
 async fn embed_build_document(
     cx: &Cx,
     embedder: &dyn Embedder,
@@ -1424,13 +1450,8 @@ async fn embed_build_document(
         _ => "quality document embedding completion",
     };
     let values = if let Some(expected) = identity {
-        let response = embedder.embed_bound(cx, text).await;
-        // Preserve an already-typed cancellation; otherwise caller cancellation
-        // wins before validating or accepting a late response or provider error.
-        if !matches!(&response, Err(SearchError::Cancelled { .. })) {
-            build_checkpoint(cx, completion_phase)?;
-        }
-        let bound = response?;
+        let bound =
+            await_build_inference(cx, completion_phase, embedder.embed_bound(cx, text)).await?;
         if &bound.identity != expected {
             return Err(SearchError::UnverifiableRemoteSpace {
                 producer: format!("index_builder.{tier}"),
@@ -1441,11 +1462,7 @@ async fn embed_build_document(
         bound.validate()?;
         bound.values
     } else {
-        let response = embedder.embed(cx, text).await;
-        if !matches!(&response, Err(SearchError::Cancelled { .. })) {
-            build_checkpoint(cx, completion_phase)?;
-        }
-        response?
+        await_build_inference(cx, completion_phase, embedder.embed(cx, text)).await?
     };
     validate_build_producer(embedder, identity, tier)?;
     // Bound responses already validate their declared dimension. Explicit
@@ -1571,9 +1588,10 @@ async fn embed_build_bound_batch(
         _ => "quality document embedding completion",
     };
     let started = Instant::now();
-    let response = embedder.embed_batch_bound(cx, texts).await;
-    if !matches!(&response, Err(SearchError::Cancelled { .. })) {
-        build_checkpoint(cx, completion_phase)?;
+    let response =
+        await_build_inference(cx, completion_phase, embedder.embed_batch_bound(cx, texts)).await;
+    if let Err(error @ SearchError::Cancelled { .. }) = response {
+        return Err(error);
     }
     validate_build_producer(embedder, Some(expected), tier)?;
     let bound = response?;
@@ -2983,6 +3001,144 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ParkedBuildOperation {
+        Legacy,
+        Bound,
+        NativeBatch,
+    }
+
+    struct ParkedBuildEmbedder {
+        inner: IdentityStubEmbedder,
+        operation: ParkedBuildOperation,
+        park: bool,
+        calls: Mutex<Vec<Vec<String>>>,
+        parked: AtomicUsize,
+        dropped: AtomicUsize,
+    }
+
+    struct ParkedBuildDrop<'a>(&'a AtomicUsize);
+
+    impl Drop for ParkedBuildDrop<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ParkedBuildEmbedder {
+        fn record(&self, texts: &[&str]) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(texts.iter().map(|text| (*text).to_owned()).collect());
+            self.park && texts.contains(&"park")
+        }
+
+        // Deliberately never checks Cx, saves a waker, or wakes itself.
+        fn pending<'a, T: Send + 'a>(&'a self) -> SearchFuture<'a, T> {
+            Box::pin(async move {
+                self.parked.fetch_add(1, Ordering::SeqCst);
+                let _drop = ParkedBuildDrop(&self.dropped);
+                std::future::pending::<SearchResult<T>>().await
+            })
+        }
+    }
+
+    impl Embedder for ParkedBuildEmbedder {
+        fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            assert_eq!(self.operation, ParkedBuildOperation::Legacy);
+            if self.record(&[text]) {
+                self.pending()
+            } else {
+                self.inner.embed(cx, text)
+            }
+        }
+
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, frankensearch_core::IdentityBoundEmbedding> {
+            assert_eq!(self.operation, ParkedBuildOperation::Bound);
+            if self.record(&[text]) {
+                self.pending()
+            } else {
+                self.inner.embed_bound(cx, text)
+            }
+        }
+
+        fn embed_batch_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
+            assert_eq!(self.operation, ParkedBuildOperation::NativeBatch);
+            if self.record(texts) {
+                self.pending()
+            } else {
+                self.inner.embed_batch_bound(cx, texts)
+            }
+        }
+
+        fn bound_batch_is_native(&self) -> bool {
+            self.operation == ParkedBuildOperation::NativeBatch
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            if self.operation == ParkedBuildOperation::Legacy {
+                return Err(SearchError::InvalidConfig {
+                    field: "embedder.identity".to_owned(),
+                    value: self.id().to_owned(),
+                    reason: "explicit legacy test provider".to_owned(),
+                });
+            }
+            self.inner.identity()
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            self.inner.category()
+        }
+    }
+
+    fn parked_build_stack(
+        operation: ParkedBuildOperation,
+        parked_tier: &str,
+    ) -> (
+        EmbedderStack,
+        Arc<ParkedBuildEmbedder>,
+        Arc<ParkedBuildEmbedder>,
+    ) {
+        let make = |id, dim, tier| {
+            Arc::new(ParkedBuildEmbedder {
+                inner: IdentityStubEmbedder::new(id, dim),
+                operation,
+                park: parked_tier == tier,
+                calls: Mutex::default(),
+                parked: AtomicUsize::new(0),
+                dropped: AtomicUsize::new(0),
+            })
+        };
+        let fast = make("parked-fast", 4, "fast");
+        let quality = make("parked-quality", 6, "quality");
+        let stack = EmbedderStack::from_parts(
+            Arc::clone(&fast) as Arc<dyn Embedder>,
+            Some(Arc::clone(&quality) as Arc<dyn Embedder>),
+        );
+        (stack, fast, quality)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum BoundBuildFault {
         None,
         ForeignIdentity,
@@ -3471,6 +3627,167 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// A parked provider cannot retain a build or its admitted lexical writer
+    /// after cancellation. Exercise the actual public builder, including a
+    /// completed earlier batch, every inference operation, and both tiers.
+    #[test]
+    fn build_cancellation_wakes_parked_inference_and_preserves_persisted_generation() {
+        use std::future::{Future, poll_fn};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        #[derive(Default)]
+        struct CountingWake(AtomicUsize);
+
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for operation in [
+            ParkedBuildOperation::Legacy,
+            ParkedBuildOperation::Bound,
+            ParkedBuildOperation::NativeBatch,
+        ] {
+            for tier in ["fast", "quality"] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let dir = tempfile::tempdir().unwrap();
+                    let (seed, _, _) = parked_build_stack(operation, "");
+                    IndexBuilder::new(dir.path())
+                        .with_embedder_stack(seed)
+                        .add_document("retained", "previous complete document")
+                        .build(&cx)
+                        .await
+                        .unwrap();
+                    let before = [VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME]
+                        .map(|name| (name, std::fs::read(dir.path().join(name)).unwrap()));
+                    let exporter = Arc::new(RecordingExporter::default());
+                    let (stack, fast, quality) = parked_build_stack(operation, tier);
+                    let faulty = if tier == "fast" { &fast } else { &quality };
+                    let progress = Arc::new(AtomicUsize::new(0));
+                    let progress_counter = Arc::clone(&progress);
+                    let mut build = Box::pin(
+                        IndexBuilder::new(dir.path())
+                            .with_config(
+                                TwoTierConfig::default().with_metrics_exporter(exporter.clone()),
+                            )
+                            .with_embedder_stack(stack)
+                            .with_batch_size(2)
+                            .with_progress(move |_| {
+                                progress_counter.fetch_add(1, Ordering::SeqCst);
+                            })
+                            .add_document("accepted-1", "first")
+                            .add_document("accepted-2", "second")
+                            .add_document("parked", "park")
+                            .add_document("unreached", "unreached")
+                            .add_document("later-batch", "later-batch")
+                            .build(&cx),
+                    );
+                    // Let any asynchronous writer admission finish under the
+                    // executor's waker before installing the counted waker.
+                    poll_fn(|task| match build.as_mut().poll(task) {
+                        Poll::Pending if faulty.parked.load(Ordering::SeqCst) == 1 => {
+                            Poll::Ready(())
+                        }
+                        Poll::Pending => Poll::Pending,
+                        Poll::Ready(result) => panic!("provider did not park: {result:?}"),
+                    })
+                    .await;
+                    let counter = Arc::new(CountingWake::default());
+                    let waker = Waker::from(Arc::clone(&counter));
+                    let baseline = Arc::strong_count(&counter);
+                    let mut task = Context::from_waker(&waker);
+                    assert!(build.as_mut().poll(&mut task).is_pending());
+                    assert_eq!(progress.load(Ordering::SeqCst), 1);
+                    let calls =
+                        [&fast, &quality].map(|embedder| embedder.calls.lock().unwrap().clone());
+                    let faulty_calls = faulty.calls.lock().unwrap().clone();
+                    if operation == ParkedBuildOperation::NativeBatch {
+                        assert_eq!(faulty_calls, [["first", "second"], ["park", "unreached"]]);
+                    } else {
+                        assert_eq!(faulty_calls, [["first"], ["second"], ["park"]]);
+                    }
+
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| {
+                                cx.cancel_with(
+                                    asupersync::CancelKind::User,
+                                    Some("cancel parked build"),
+                                );
+                            })
+                            .join()
+                            .unwrap();
+                    });
+                    // Observe the wake BEFORE manually polling again. Merely
+                    // adding post-await checkpoints cannot pass this assertion.
+                    assert!(counter.0.load(Ordering::SeqCst) > 0);
+                    let error = match build.as_mut().poll(&mut task) {
+                        Poll::Ready(Err(error)) => error,
+                        result => panic!("cancelled build did not terminate: {result:?}"),
+                    };
+                    assert!(
+                        matches!(
+                            &error,
+                            SearchError::Cancelled { phase, reason }
+                                if phase == &format!("{tier} document embedding completion")
+                                    && reason.contains("cancel parked build")
+                        ),
+                        "{operation:?}/{tier}: {error:?}"
+                    );
+                    assert_eq!(faulty.parked.load(Ordering::SeqCst), 1);
+                    assert_eq!(faulty.dropped.load(Ordering::SeqCst), 1);
+                    assert_eq!(Arc::strong_count(&counter), baseline);
+                    for (embedder, before_calls) in [&fast, &quality].into_iter().zip(calls) {
+                        assert_eq!(*embedder.calls.lock().unwrap(), before_calls);
+                    }
+                    assert_eq!(progress.load(Ordering::SeqCst), 1);
+                    assert_eq!(exporter.errors.lock().unwrap().len(), 1);
+                    assert!(exporter.index.lock().unwrap().is_empty());
+                    for (name, bytes) in &before {
+                        assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), *bytes);
+                    }
+                    let reopened =
+                        TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+                    assert_eq!(reopened.doc_count(), 1);
+                    drop(reopened);
+
+                    let observer = Cx::for_testing();
+                    #[cfg(feature = "quill")]
+                    {
+                        let lexical = QuillIndex::open(
+                            &observer,
+                            &dir.path().join("lexical"),
+                            QuillConfig::default(),
+                        )
+                        .await
+                        .expect("completed cancellation releases the admitted lexical writer");
+                        let docs = lexical.search_doc_ids(&observer, "*", 10).unwrap();
+                        assert_eq!(docs.len(), 1);
+                        assert_eq!(docs[0].document_id, "retained");
+                    }
+                    // Retain the completed outer future while opening a new
+                    // builder: its inference and writer resources must already
+                    // be released when cancellation reaches the caller.
+                    let (retry, _, _) = parked_build_stack(operation, "");
+                    let rebuilt = IndexBuilder::new(dir.path())
+                        .with_embedder_stack(retry)
+                        .add_document("replacement", "replacement")
+                        .build(&observer)
+                        .await
+                        .unwrap();
+                    assert_eq!(rebuilt.doc_count, 1);
+                    drop(build);
+                    assert_eq!(faulty.dropped.load(Ordering::SeqCst), 1);
+                });
+            }
+        }
     }
 
     #[test]
