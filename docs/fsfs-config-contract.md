@@ -128,6 +128,13 @@ indexing uses the same receipt admission policy. An unchanged, already selected
 two-tier generation can skip startup inference after the source, both producer
 identities, and both tiers' complete row coverage have been verified.
 
+During the first conversion of a completed legacy index, foreground `search`
+and `explain` can use the legacy index while the migration is pending, including
+after a failed or cancelled candidate. Foreground search runs in-process during
+this interval. Complete-generation selection and reader pins take precedence,
+including pins created during recovery preview. Once a complete generation has
+been published, a missing or corrupt selection requires complete-store recovery.
+
 `--full` and `--force` still bypass completed-work reuse. The upgrade policy is
 excluded from the indexing configuration fingerprint because it changes
 admission, not indexed bytes. Its default is omitted from serialization so that

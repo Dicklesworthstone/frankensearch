@@ -834,7 +834,11 @@ impl FsfsRuntime {
                         if predecessor.is_none() {
                             self.validate_first_migration_discovery(cx, store.root(), &target_root)?;
                         }
-                        Ok(())
+                        Ok(predecessor.is_none()
+                            && Self::read_index_sentinel(store.root())
+                                .ok()
+                                .flatten()
+                                .is_some_and(|sentinel| sentinel.generation_complete))
                     })?
                 }
                 RetainedBuildKind::Recovery => store.begin_recovery_rebuild(cx)?,

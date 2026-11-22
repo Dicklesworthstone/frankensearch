@@ -185,6 +185,19 @@ impl FsfsRuntime {
                 None => Box::pin(self.run_mode(cx, mode)).await,
             };
         };
+        if matches!(effective_command, CliCommand::Search | CliCommand::Explain)
+            && self.cli_input.recover_source.is_none()
+            && CompleteGenerationStore::legacy_migration_pending(&root)?
+            && Self::read_index_sentinel(&root)?.is_some_and(|sentinel| sentinel.generation_complete)
+        {
+            // An in-flight foreground read may finish on the legacy index. Do
+            // not start or reuse a daemon that could keep serving that layout
+            // to new callers after successful cutover.
+            let mut legacy = self.clone();
+            legacy.cli_input.index_dir = Some(root);
+            legacy.cli_input.daemon = false;
+            return Box::pin(legacy.run_cli_inner(cx, shutdown)).await;
+        }
         let writes = !dashboard
             && (matches!(
                 effective_command,

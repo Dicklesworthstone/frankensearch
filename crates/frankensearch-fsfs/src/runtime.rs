@@ -24475,6 +24475,12 @@ impl FsfsRuntime {
                 ),
             });
         }
+        if complete_cli::complete_entry_exists(&index_root.join("generations"))? {
+            return Err(complete_cli::complete_cli_error(
+                "selection",
+                "the legacy lexical index requires an upgrade; finish the complete-generation build before searching",
+            ));
+        }
 
         let sentinel =
             Self::read_index_sentinel(index_root)?.ok_or_else(|| SearchError::InvalidConfig {

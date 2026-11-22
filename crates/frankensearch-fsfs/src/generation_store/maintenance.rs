@@ -574,10 +574,7 @@ impl PreparedGenerationRestore {
         checkpoint(cx)?;
         lease.fence("complete-generation restore publication")?;
         ensure_selection(&self.store.root, self.expected_selection.as_deref())?;
-        fs::rename(
-            &temporary,
-            self.store.root.join(COMPLETE_GENERATION_POINTER),
-        )?;
+        super::install_selection(&self.store.root, &temporary)?;
         // The selected generation is now visible. Never turn a post-rename
         // cancellation or sync error into a claimed abort, and never roll back.
         let outcome = synced_outcome(target, final_sync(&self.store.root));

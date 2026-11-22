@@ -44,6 +44,8 @@ pub const COMPLETE_GENERATION_POINTER: &str = "FSFS-CURRENT";
 /// The presence of a sealed inventory makes a generation read-only to writers.
 pub const COMPLETE_GENERATION_MANIFEST: &str = "FSFS-BUNDLE.json";
 const GENERATIONS: &str = "generations";
+const LEGACY_MIGRATION: &str = ".FSFS-LEGACY-MIGRATION";
+const LEGACY_MIGRATION_PENDING: &[u8] = b"FSFS-LEGACY-MIGRATION-PENDING-v1\n";
 /// Per-generation reader pin files; never part of a sealed bundle.
 const READER_PINS: &str = "readers";
 const POINTER_MAGIC: &str = "FSFS-COMPLETE-GENERATION-v1";
@@ -451,19 +453,21 @@ impl CompleteGenerationStore {
     /// # Errors
     /// Returns contention, cancellation, corrupt-current, or filesystem errors.
     pub fn begin(&self, cx: &Cx) -> SearchResult<GenerationBuild> {
-        self.begin_with_predecessor_check(cx, |_| Ok(()))
+        self.begin_with_predecessor_check(cx, |_| Ok(false))
     }
 
     /// Validate a consumer's source scope under the same publication lease
     /// that selects the predecessor, before allocating an inactive generation.
-    /// The check is read-only and cannot authorize a corrupt predecessor.
+    /// The check is read-only and cannot authorize a corrupt predecessor. It
+    /// may identify a completed legacy index whose foreground reads should
+    /// continue until the first complete publication.
     pub(crate) fn begin_with_predecessor_check<F>(
         &self,
         cx: &Cx,
         check: F,
     ) -> SearchResult<GenerationBuild>
     where
-        F: FnOnce(Option<&PublishedGeneration>) -> SearchResult<()>,
+        F: FnOnce(Option<&PublishedGeneration>) -> SearchResult<bool>,
     {
         checkpoint(cx)?;
         self.require_mutation_authorized()?;
@@ -473,7 +477,7 @@ impl CompleteGenerationStore {
         // A corrupt predecessor must be repaired explicitly, not silently
         // overwritten just because a new rebuild could be started.
         let active = self.active(cx)?;
-        check(active.as_ref())?;
+        let protect_legacy = check(active.as_ref())?;
         checkpoint(cx)?;
         lease.fence("complete-generation predecessor admission")?;
         if read_pointer(&self.root)? != predecessor {
@@ -482,7 +486,38 @@ impl CompleteGenerationStore {
                 "selection changed during predecessor admission",
             ));
         }
+        if protect_legacy
+            && predecessor.is_none()
+            && entry_is_absent(&self.root.join(GENERATIONS))?
+            && entry_is_absent(&self.root.join(READER_PINS))?
+            && entry_is_absent(&self.root.join(ACTIVATION_HISTORY))?
+        {
+            let marker = self.root.join(LEGACY_MIGRATION);
+            if entry_is_absent(&marker)? {
+                write_new_synced(&marker, LEGACY_MIGRATION_PENDING)?;
+            }
+            File::open(&self.root)?.sync_all()?;
+        }
         self.allocate_build(cx, lease, predecessor, true)
+    }
+
+    /// Whether an ordinary first conversion left legacy foreground reads in
+    /// place. Even older publishers create `readers` before replacing CURRENT;
+    /// a pin namespace can also be left by recovery preview, so it is treated
+    /// conservatively. A missing/corrupt CURRENT never grants legacy authority.
+    pub(crate) fn legacy_migration_pending(root: &Path) -> SearchResult<bool> {
+        let pointer = root.join(COMPLETE_GENERATION_POINTER);
+        let pins = root.join(READER_PINS);
+        if !entry_is_absent(&pointer)?
+            || !entry_is_absent(&pins)?
+            || !has_legacy_migration_marker(root)?
+        {
+            return Ok(false);
+        }
+        require_supported_platform()?;
+        require_directory(root)?;
+        require_directory(&root.join(GENERATIONS))?;
+        Ok(entry_is_absent(&pins)? && entry_is_absent(&pointer)?)
     }
 
     fn allocate_build(
@@ -610,10 +645,7 @@ impl GenerationBuild {
             manifest_sha256,
             _pin: pin,
         };
-        fs::rename(
-            &temporary,
-            self.store.root.join(COMPLETE_GENERATION_POINTER),
-        )?;
+        install_selection(&self.store.root, &temporary)?;
         // No cancellation point follows the linearization point. An observed
         // cancel cannot turn an already visible commit into a claimed abort.
         match File::open(&self.store.root).and_then(|directory| directory.sync_all()) {
@@ -1558,6 +1590,39 @@ fn sync_tree(cx: &Cx, root: &Path, depth: usize) -> SearchResult<()> {
         }
     }
     File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+fn entry_is_absent(path: &Path) -> SearchResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn has_legacy_migration_marker(root: &Path) -> SearchResult<bool> {
+    match read_bounded_regular(&root.join(LEGACY_MIGRATION), MAX_POINTER_BYTES) {
+        Ok(bytes) => Ok(bytes == LEGACY_MIGRATION_PENDING),
+        Err(SearchError::IndexCorrupted { .. }) => Ok(false),
+        Err(SearchError::Io(error)) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+// Runs under the root's publication lease, after predecessor, consumer and
+// durability admission. Consume the pending marker with the selection rename.
+// A crash between renames leaves descriptor bytes where the marker was; those
+// bytes cannot authorize legacy reads. The caller syncs the common directory.
+fn install_selection(root: &Path, temporary: &Path) -> SearchResult<()> {
+    let destination = root.join(COMPLETE_GENERATION_POINTER);
+    if has_legacy_migration_marker(root)? {
+        let marker = root.join(LEGACY_MIGRATION);
+        fs::rename(temporary, &marker)?;
+        fs::rename(marker, destination)?;
+    } else {
+        fs::rename(temporary, destination)?;
+    }
     Ok(())
 }
 
@@ -2522,6 +2587,54 @@ mod tests {
                 panic!("sync: {source}"); // ubs:ignore — cfg(test) assertion: uncertain durability must fail the test.
             }
         }
+    }
+
+    #[test]
+    fn pending_legacy_migration_is_consumed_by_restore_and_cannot_be_reissued() {
+        run_test_with_cx(|cx| async move {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("store");
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            let build = store
+                .begin_with_predecessor_check(&cx, |_| Ok(true))
+                .unwrap();
+            assert!(CompleteGenerationStore::legacy_migration_pending(&root).unwrap());
+            let alias = fixture.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert!(CompleteGenerationStore::legacy_migration_pending(&alias).is_err());
+            write_bundle(build.path(), "first candidate");
+
+            let prepared = build.prepare(&cx, |_, _| Ok(())).unwrap();
+            assert!(!CompleteGenerationStore::legacy_migration_pending(&root).unwrap());
+            assert!(has_legacy_migration_marker(&root).unwrap());
+            assert!(matches!(
+                prepared.restore(&cx, |_, _| Ok(())).unwrap(),
+                GenerationPublication::Durable(_)
+            ));
+            assert!(entry_is_absent(&root.join(LEGACY_MIGRATION)).unwrap());
+
+            // A malformed marker cannot hide an ordinary selected generation.
+            fs::create_dir(root.join(LEGACY_MIGRATION)).unwrap();
+            assert!(!CompleteGenerationStore::legacy_migration_pending(&root).unwrap());
+            let successor = publish(&store, &cx, "ordinary successor");
+            assert_eq!(store.active(&cx).unwrap(), Some(successor));
+            fs::rename(root.join(LEGACY_MIGRATION), root.join("malformed-marker")).unwrap();
+
+            fs::rename(
+                root.join(COMPLETE_GENERATION_POINTER),
+                root.join("saved-selection"),
+            )
+            .unwrap();
+            // An older writer would keep the marker but still leave the pin
+            // namespace. It suppresses legacy reads even with CURRENT lost.
+            write_new_synced(&root.join(LEGACY_MIGRATION), LEGACY_MIGRATION_PENDING).unwrap();
+            assert!(!CompleteGenerationStore::legacy_migration_pending(&root).unwrap());
+            fs::rename(root.join(LEGACY_MIGRATION), root.join("obsolete-marker")).unwrap();
+            let _retry = store
+                .begin_with_predecessor_check(&cx, |_| Ok(true))
+                .unwrap();
+            assert!(entry_is_absent(&root.join(LEGACY_MIGRATION)).unwrap());
+        });
     }
 
     fn generation_names(root: &Path) -> Vec<String> {

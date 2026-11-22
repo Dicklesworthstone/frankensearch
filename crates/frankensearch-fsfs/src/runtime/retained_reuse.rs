@@ -3048,6 +3048,77 @@ mod generation_tests {
         }
 
         #[test]
+        fn aborted_first_migration_keeps_foreground_legacy_search_and_explain() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                fixture(parent.path(), 2);
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
+                let (runtime, _, root) = two_tier_fixture(parent.path(), 1);
+                let runtime = runtime.with_contract_upgrade_reuse(true);
+                let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
+                let quality = Arc::new(CountingEmbedder::new("reuse-quality", 6, false));
+                let _restore = RestoreEmbedders::install(fast, quality);
+                let receipt = fs::read(root.join(LEGACY_RECEIPT_FILE)).unwrap();
+                let error = runtime
+                    .rebuild_retained_generation_with_precommit(&cx, &root, |_| {
+                        Err(SearchError::Cancelled {
+                            phase: "test.migration.precommit".to_owned(),
+                            reason: "abort after sealing the first candidate".to_owned(),
+                        })
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::Cancelled { phase, .. }
+                    if phase == "test.migration.precommit"));
+                assert!(root.join("generations").is_dir());
+                let pointer = root.join(crate::generation_store::COMPLETE_GENERATION_POINTER);
+                assert!(!pointer.exists());
+                assert_eq!(fs::read(root.join(LEGACY_RECEIPT_FILE)).unwrap(), receipt);
+
+                let mut search = runtime.clone();
+                search.cli_input.command = CliCommand::Search;
+                search.cli_input.query = Some("sharedtoken".to_owned());
+                search
+                    .run_mode_with_complete_generations(
+                        &cx, super::super::super::InterfaceMode::Cli, None, false,
+                    )
+                    .await
+                    .unwrap();
+                let mut explain = search.clone();
+                explain.cli_input.command = CliCommand::Explain;
+                explain.cli_input.result_id = Some("1".to_owned());
+                explain
+                    .run_mode_with_complete_generations(
+                        &cx, super::super::super::InterfaceMode::Cli, None, false,
+                    )
+                    .await
+                    .unwrap();
+
+                for command in [CliCommand::AppendBatch, CliCommand::Daemon] {
+                    let mut writer = runtime.clone();
+                    writer.cli_input.command = command;
+                    assert_eq!(writer.complete_generation_command_root(false).unwrap(), Some(root.clone()));
+                }
+
+                let migrated = publish(&runtime, &cx, &root).await;
+                let saved_pointer = parent.path().join("published-pointer");
+                fs::rename(&pointer, &saved_pointer).unwrap();
+                for corrupt in [false, true] {
+                    if corrupt {
+                        fs::write(&pointer, "damaged selection").unwrap();
+                    }
+                    assert!(search.run_mode_with_complete_generations(
+                        &cx, super::super::super::InterfaceMode::Cli, None, false,
+                    ).await.is_err());
+                }
+                fs::rename(&pointer, parent.path().join("damaged-pointer")).unwrap();
+                fs::rename(saved_pointer, pointer).unwrap();
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                assert_eq!(store.active(&cx).unwrap(), Some(migrated));
+            });
+        }
+
+        #[test]
         fn an_mtime_only_change_keeps_vectors_and_records_the_new_revision() {
             run_test_with_cx(|cx| async move {
                 let parent = tempfile::tempdir().unwrap();
