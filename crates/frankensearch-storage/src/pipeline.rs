@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
-use frankensearch_core::generation::QuantizationFormat;
+use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
 use frankensearch_core::{
     Canonicalizer, Embedder, IdentityBoundEmbedding, SearchError, SearchResult, with_cancellation,
 };
@@ -29,6 +29,9 @@ const PIPELINE_SUBSYSTEM: &str = "storage_pipeline";
 const CORRELATION_METADATA_KEY: &str = "correlation_id";
 const MAX_CONTENT_PREVIEW_CHARS: usize = 400;
 const MAX_SOURCE_FILE_BYTES: usize = 2 * 1024 * 1024;
+// Keep several large retained bodies from multiplying a native request's
+// residency. An individual larger document still runs intact on its own.
+const MAX_NATIVE_BATCH_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestRequest {
@@ -351,6 +354,16 @@ pub struct StorageBackedJobRunner {
     metrics: Arc<PipelineMetrics>,
 }
 
+/// One admitted input and the exact queue attempt that may publish its response.
+struct PreparedEmbeddingJob<'a> {
+    claim: &'a ClaimedJob,
+    content_hash: [u8; 32],
+    text: String,
+    correlation_id: String,
+    started: Instant,
+    embedder: Arc<dyn Embedder>,
+}
+
 impl std::fmt::Debug for StorageBackedJobRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageBackedJobRunner")
@@ -656,6 +669,14 @@ impl StorageBackedJobRunner {
         Ok(summary)
     }
 
+    /// Process a bounded set of claimed jobs, using native bound batches when
+    /// the selected producer declares them equivalent to its single operation.
+    ///
+    /// Only consecutive jobs for the same producer are grouped, preserving
+    /// queue priority and input order. Each response still passes its own
+    /// claim, input-revision, identity and sink-admission checks. Input-specific
+    /// batch failures are split through the same producer so healthy neighbors
+    /// can complete; protocol and identity refusals never trigger that fallback.
     #[allow(clippy::too_many_lines, clippy::future_not_send)]
     pub async fn process_batch(
         &self,
@@ -683,35 +704,148 @@ impl StorageBackedJobRunner {
             .fetch_add(usize_to_u64(claimed.len()), Ordering::Relaxed);
 
         let embed_start = Instant::now();
-        for job in &claimed {
-            pipeline_checkpoint(cx, "storage.pipeline.process_batch")?;
-            let job_started = Instant::now();
-            // Claimed batches may outlive their leases while an earlier item
-            // awaits inference. Bind this exact attempt to the current catalog
-            // hash before resolving a producer or reading embedding input.
-            let Some(doc) =
-                record_claim_outcome(job, self.queue.check_claim(job, None)?, &mut result)
-            else {
-                continue;
+        let mut cursor = 0;
+        let mut carried: Option<PreparedEmbeddingJob<'_>> = None;
+        while carried.is_some() || cursor < claimed.len() {
+            let first = if let Some(first) = carried.take() {
+                first
+            } else {
+                let job = &claimed[cursor];
+                cursor += 1;
+                let Some(first) = self.prepare_embedding_job(cx, worker_id, job, &mut result)?
+                else {
+                    continue;
+                };
+                first
             };
+            let job = first.claim;
+            let embedder = Arc::clone(&first.embedder);
+            if !embedder.bound_batch_is_native() {
+                let response = embed_for_persistence(cx, embedder.as_ref(), &first.text).await;
+                self.finish_embedding_job(cx, worker_id, &first, response.as_ref(), &mut result)?;
+                continue;
+            }
 
-            let correlation_id = extract_correlation_id(doc.metadata.as_ref())
-                .unwrap_or_else(|| fallback_correlation_id(&job.doc_id));
-
-            let input = resolve_embedding_text(
-                self.storage.connection(),
-                self.canonicalizer.as_ref(),
-                &doc,
-            );
-            // Cancellation must not turn an input-resolution failure into a
-            // queue mutation, just as it must not do so after inference.
-            pipeline_checkpoint(cx, "storage.pipeline.input_admitted")?;
-            let text = match input {
-                Ok(text) => text,
-                Err(error) => {
-                    if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
-                        continue;
+            // Do not reorder priorities or combine independently selected
+            // producers. The queue's bounded claim set also bounds residency.
+            let mut prepared_bytes = first.text.len();
+            let mut prepared = vec![first];
+            while let Some(next) = claimed.get(cursor)
+                && next.embedder_id == job.embedder_id
+                && prepared_bytes < MAX_NATIVE_BATCH_INPUT_BYTES
+            {
+                cursor += 1;
+                if let Some(next) = self.prepare_embedding_job(cx, worker_id, next, &mut result)? {
+                    let combined = prepared_bytes.saturating_add(next.text.len());
+                    if combined > MAX_NATIVE_BATCH_INPUT_BYTES {
+                        carried = Some(next);
+                        break;
                     }
+                    prepared_bytes = combined;
+                    prepared.push(next);
+                }
+            }
+            // Preparing a later source can take time or invoke a custom
+            // canonicalizer. Recheck every earlier attempt before batching
+            // its retained input, as well as again after inference.
+            let mut admitted = Vec::with_capacity(prepared.len());
+            for job in prepared {
+                pipeline_checkpoint(cx, "storage.pipeline.batch_admission")?;
+                if record_claim_outcome(
+                    job.claim,
+                    self.queue.check_claim(job.claim, Some(&job.content_hash))?,
+                    &mut result,
+                )
+                .is_some()
+                {
+                    admitted.push(job);
+                }
+            }
+            if admitted.is_empty() {
+                continue;
+            }
+            let texts: Vec<_> = admitted.iter().map(|job| job.text.as_str()).collect();
+            let mut owned = vec![true; admitted.len()];
+            let responses = embed_batch_for_persistence(cx, embedder.as_ref(), &texts, |slot| {
+                pipeline_checkpoint(cx, "storage.pipeline.batch_attempt_admission")?;
+                let job = &admitted[slot];
+                if owned[slot] {
+                    owned[slot] = record_claim_outcome(
+                        job.claim,
+                        self.queue.check_claim(job.claim, Some(&job.content_hash))?,
+                        &mut result,
+                    )
+                    .is_some();
+                }
+                Ok(owned[slot])
+            })
+            .await;
+            match responses {
+                Ok(responses) => {
+                    for (job, response) in admitted.iter().zip(&responses) {
+                        if let Some(response) = response {
+                            self.finish_embedding_job(
+                                cx,
+                                worker_id,
+                                job,
+                                response.as_ref(),
+                                &mut result,
+                            )?;
+                        }
+                    }
+                }
+                Err(BatchInferenceError::Admission(error)) => return Err(error),
+                Err(BatchInferenceError::Inference(error @ SearchError::Cancelled { .. })) => {
+                    return Err(error);
+                }
+                Err(BatchInferenceError::Inference(error)) => {
+                    for (job, owned) in admitted.iter().zip(&owned) {
+                        if *owned {
+                            self.finish_embedding_job(
+                                cx,
+                                worker_id,
+                                job,
+                                Err(&error),
+                                &mut result,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        result.embed_time = embed_start.elapsed();
+        result.total_time = total_start.elapsed();
+        self.record_process_metrics(&result);
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prepare_embedding_job<'a>(
+        &self,
+        cx: &Cx,
+        worker_id: &str,
+        job: &'a ClaimedJob,
+        result: &mut BatchProcessResult,
+    ) -> SearchResult<Option<PreparedEmbeddingJob<'a>>> {
+        pipeline_checkpoint(cx, "storage.pipeline.process_batch")?;
+        let started = Instant::now();
+        // Claimed batches may outlive their leases while an earlier item
+        // awaits inference. Bind this exact attempt to the current catalog
+        // hash before resolving a producer or reading embedding input.
+        let Some(doc) = record_claim_outcome(job, self.queue.check_claim(job, None)?, result)
+        else {
+            return Ok(None);
+        };
+        let correlation_id = extract_correlation_id(doc.metadata.as_ref())
+            .unwrap_or_else(|| fallback_correlation_id(&job.doc_id));
+        let input =
+            resolve_embedding_text(self.storage.connection(), self.canonicalizer.as_ref(), &doc);
+        pipeline_checkpoint(cx, "storage.pipeline.input_admitted")?;
+        let text = match input {
+            Ok(text) => text,
+            Err(error) => {
+                if self.handle_job_failure(job, &doc.content_hash, &error, result)? {
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
                         stage = "resolve_input",
@@ -720,21 +854,28 @@ impl StorageBackedJobRunner {
                         error = %error,
                         "exact embedding input unavailable; no vector was persisted"
                     );
-                    continue;
                 }
-            };
-
-            if text.trim().is_empty() {
-                let skip_reason = "empty content preview";
-                if record_claim_outcome(
-                    job,
-                    self.queue.skip(job, &doc.content_hash, skip_reason)?,
-                    &mut result,
-                )
-                .is_none()
-                {
-                    continue;
-                }
+                return Ok(None);
+            }
+        };
+        let skip = if text.trim().is_empty() {
+            Some(("empty content preview", "empty_content_preview"))
+        } else if is_hash_embedder(&job.embedder_id) {
+            Some((
+                "hash embeddings computed on-the-fly",
+                "hash_embedder_on_the_fly",
+            ))
+        } else {
+            None
+        };
+        if let Some((skip_reason, reason)) = skip {
+            if record_claim_outcome(
+                job,
+                self.queue.skip(job, &doc.content_hash, skip_reason)?,
+                result,
+            )
+            .is_some()
+            {
                 result.jobs_skipped += 1;
                 tracing::info!(
                     target: "frankensearch.storage.pipeline",
@@ -743,80 +884,73 @@ impl StorageBackedJobRunner {
                     correlation_id = %correlation_id,
                     doc_id = %job.doc_id,
                     embedder_id = %job.embedder_id,
-                    reason = "empty_content_preview",
+                    reason,
                     "embedding job skipped"
                 );
-                continue;
             }
-
-            if is_hash_embedder(&job.embedder_id) {
-                let skip_reason = "hash embeddings computed on-the-fly";
-                if record_claim_outcome(
-                    job,
-                    self.queue.skip(job, &doc.content_hash, skip_reason)?,
-                    &mut result,
-                )
-                .is_none()
-                {
-                    continue;
-                }
-                result.jobs_skipped += 1;
-                tracing::info!(
-                    target: "frankensearch.storage.pipeline",
-                    stage = "process_batch",
-                    worker_id,
-                    correlation_id = %correlation_id,
-                    doc_id = %job.doc_id,
-                    embedder_id = %job.embedder_id,
-                    reason = "hash_embedder_on_the_fly",
-                    "embedding job skipped"
-                );
-                continue;
-            }
-
-            let embedder = match self.embedder_for_id(&job.embedder_id) {
-                Ok(embedder) => embedder,
-                Err(error) => {
-                    let error_message = error.to_string();
-                    if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
-                        continue;
-                    }
+            return Ok(None);
+        }
+        let embedder = match self.embedder_for_id(&job.embedder_id) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                if self.handle_job_failure(job, &doc.content_hash, &error, result)? {
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
                         stage = "process_batch",
                         worker_id,
                         doc_id = %job.doc_id,
                         embedder_id = %job.embedder_id,
-                        error = %error_message,
+                        error = %error,
                         "failed to resolve embedder for queued job"
                     );
-                    continue;
                 }
-            };
-            let response = embed_for_persistence(cx, embedder.as_ref(), &text).await;
-            pipeline_checkpoint(cx, "storage.pipeline.embedding_admitted")?;
-            let response = match response {
-                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                response => response,
-            };
-            // Cancellation wins before a stale attempt is retired. Check
-            // ownership before interpreting either success or provider error:
-            // a late failure has no authority to fail a successor's work.
-            if record_claim_outcome(
-                job,
-                self.queue.check_claim(job, Some(&doc.content_hash))?,
-                &mut result,
-            )
-            .is_none()
-            {
-                continue;
+                return Ok(None);
             }
-            let embedding = match response {
-                Ok(embedding) => embedding,
-                Err(error) => {
-                    if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
-                        continue;
-                    }
+        };
+        Ok(Some(PreparedEmbeddingJob {
+            claim: job,
+            content_hash: doc.content_hash,
+            text,
+            correlation_id,
+            started,
+            embedder,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn finish_embedding_job(
+        &self,
+        cx: &Cx,
+        worker_id: &str,
+        prepared: &PreparedEmbeddingJob<'_>,
+        response: Result<&IdentityBoundEmbedding, &SearchError>,
+        result: &mut BatchProcessResult,
+    ) -> SearchResult<()> {
+        pipeline_checkpoint(cx, "storage.pipeline.embedding_admitted")?;
+        if let Err(SearchError::Cancelled { phase, reason }) = response {
+            return Err(SearchError::Cancelled {
+                phase: phase.clone(),
+                reason: reason.clone(),
+            });
+        }
+        let job = prepared.claim;
+        let content_hash = &prepared.content_hash;
+        let correlation_id = &prepared.correlation_id;
+        // Cancellation wins before stale attempts are retired. A late success
+        // or failure cannot complete or fail a successor's work.
+        if record_claim_outcome(
+            job,
+            self.queue.check_claim(job, Some(content_hash))?,
+            result,
+        )
+        .is_none()
+        {
+            return Ok(());
+        }
+        let embedding = match response {
+            Ok(embedding) => embedding,
+            Err(error) => {
+                if self.handle_job_failure(job, content_hash, error, result)? {
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
                         stage = "embed",
@@ -827,29 +961,24 @@ impl StorageBackedJobRunner {
                         error = %error,
                         "embedding inference failed"
                     );
-                    continue;
                 }
+                return Ok(());
+            }
+        };
+        // Reject unusable rows before any sink sees them (bd-tqhc).
+        let norm_sq: f32 = embedding.values.iter().map(|value| value * value).sum();
+        if embedding.values.iter().any(|value| !value.is_finite())
+            || norm_sq == 0.0
+            || !norm_sq.is_finite()
+        {
+            let error = SearchError::InvalidConfig {
+                field: "embedding".to_owned(),
+                value: "<unusable vector>".to_owned(),
+                reason: "embedding must be finite with non-zero norm; refusing to persist \
+                         an unsearchable record"
+                    .to_owned(),
             };
-
-            // Reject unusable embeddings before any sink sees them: an
-            // all-zero or non-finite vector can never match a query, and a
-            // persisted one becomes a permanently dead record that drags the
-            // index toward the NoUsableVectors zero-signal state (bd-tqhc).
-            let norm_sq: f32 = embedding.values.iter().map(|value| value * value).sum();
-            if embedding.values.iter().any(|value| !value.is_finite())
-                || norm_sq == 0.0
-                || !norm_sq.is_finite()
-            {
-                let error = SearchError::InvalidConfig {
-                    field: "embedding".to_owned(),
-                    value: "<unusable vector>".to_owned(),
-                    reason: "embedding must be finite with non-zero norm; refusing to persist \
-                             an unsearchable record"
-                        .to_owned(),
-                };
-                if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
-                    continue;
-                }
+            if self.handle_job_failure(job, content_hash, &error, result)? {
                 tracing::warn!(
                     target: "frankensearch.storage.pipeline",
                     stage = "validate",
@@ -860,29 +989,25 @@ impl StorageBackedJobRunner {
                     "embedder produced an unusable (zero-norm or non-finite) vector; \
                      job failed without persisting"
                 );
-                continue;
             }
+            return Ok(());
+        }
 
-            pipeline_checkpoint(cx, "storage.pipeline.persist")?;
-            let request =
-                ClaimedEmbeddingWrite::new(cx, &self.queue, job, &doc.content_hash, &embedding);
-            // The sink rechecks this exact attempt after acquiring its writer
-            // lock. Checking here alone would allow a delayed lock waiter to
-            // overwrite a newer worker's successfully published coordinates.
-            let write_result = self.vector_sink.persist(&request);
-            // A synchronous sink may request cancellation while writing and
-            // still return success or an ordinary error. Leave that attempt
-            // unfinished in either case; already-written bytes cannot roll back.
-            pipeline_checkpoint(cx, "storage.pipeline.persisted")?;
-            let outcome = match write_result {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    if matches!(error, SearchError::Cancelled { .. }) {
-                        return Err(error);
-                    }
-                    if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
-                        continue;
-                    }
+        pipeline_checkpoint(cx, "storage.pipeline.persist")?;
+        let request = ClaimedEmbeddingWrite::new(cx, &self.queue, job, content_hash, embedding);
+        // Recheck the exact attempt under the sink's writer lock, not only
+        // before waiting for it.
+        let write_result = self.vector_sink.persist(&request);
+        // A synchronous sink can cancel even while returning success or an
+        // ordinary error. Already-written bytes cannot be rolled back.
+        pipeline_checkpoint(cx, "storage.pipeline.persisted")?;
+        let outcome = match write_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if matches!(error, SearchError::Cancelled { .. }) {
+                    return Err(error);
+                }
+                if self.handle_job_failure(job, content_hash, &error, result)? {
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
                         stage = "persist",
@@ -893,44 +1018,31 @@ impl StorageBackedJobRunner {
                         error = %error,
                         "embedding persistence failed"
                     );
-                    continue;
                 }
-            };
-            if record_claim_outcome(job, outcome, &mut result).is_none() {
-                continue;
+                return Ok(());
             }
-
-            // The sink is outside the queue transaction. Its successful write
-            // does not authorize a stale attempt to change catalog or queue
-            // state, even if ownership changed during synchronous persistence.
-            if record_claim_outcome(
-                job,
-                self.queue.complete(job, &doc.content_hash)?,
-                &mut result,
-            )
-            .is_none()
-            {
-                continue;
-            }
-            result.jobs_completed += 1;
-            tracing::info!(
-                target: "frankensearch.storage.pipeline",
-                stage = "complete",
-                event = "job_completed",
-                worker_id,
-                correlation_id = %correlation_id,
-                job_id = job.job_id,
-                doc_id = %job.doc_id,
-                embedder_id = %job.embedder_id,
-                duration_ms = duration_as_u64(job_started.elapsed().as_millis()),
-                "embedding job completed"
-            );
+        };
+        if record_claim_outcome(job, outcome, result).is_none() {
+            return Ok(());
         }
-
-        result.embed_time = embed_start.elapsed();
-        result.total_time = total_start.elapsed();
-        self.record_process_metrics(&result);
-        Ok(result)
+        // The external sink is not transactional with catalog completion.
+        if record_claim_outcome(job, self.queue.complete(job, content_hash)?, result).is_none() {
+            return Ok(());
+        }
+        result.jobs_completed += 1;
+        tracing::info!(
+            target: "frankensearch.storage.pipeline",
+            stage = "complete",
+            event = "job_completed",
+            worker_id,
+            correlation_id = %correlation_id,
+            job_id = job.job_id,
+            doc_id = %job.doc_id,
+            embedder_id = %job.embedder_id,
+            duration_ms = duration_as_u64(prepared.started.elapsed().as_millis()),
+            "embedding job completed"
+        );
+        Ok(())
     }
 
     #[allow(clippy::future_not_send)]
@@ -1449,6 +1561,128 @@ async fn embed_for_persistence(
     text: &str,
 ) -> SearchResult<IdentityBoundEmbedding> {
     pipeline_checkpoint(cx, "storage.pipeline.embed")?;
+    let (expected, dimension) = capture_persistence_producer(embedder)?;
+
+    // A remote/custom provider may park without checking the caller's context
+    // or retaining its waker. Cancellation must still wake this worker and
+    // drop its owned inference before leaving the claim to lease recovery.
+    let response = with_cancellation(
+        cx,
+        "storage.pipeline.inference",
+        embedder.embed_bound(cx, text),
+    )
+    .await;
+    // Cancellation dominates both a successful response and a provider error.
+    // A cancelled worker must not persist, fail, or complete a claimed job.
+    pipeline_checkpoint(cx, "storage.pipeline.embed_complete")?;
+    let bound = admit_persistence_embedding(response?, &expected)?;
+    validate_persistence_producer(embedder, &expected, dimension)?;
+    Ok(bound)
+}
+
+/// Native batching changes inference width, never response or job authority.
+/// Cardinality and producer drift invalidate the entire batch before writes;
+/// a malformed individual response is accounted for only against its own job.
+/// An input-specific provider error is bisected through the same bound method
+/// under one captured identity, with at most `2 * texts.len() - 1` attempts.
+/// `None` marks a slot whose claim/input lost authority before a split attempt;
+/// its caller has already recorded suppression, and must not account it again.
+#[allow(clippy::future_not_send)] // Admission uses the worker's thread-local storage connection.
+async fn embed_batch_for_persistence(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    texts: &[&str],
+    mut admit: impl FnMut(usize) -> SearchResult<bool>,
+) -> Result<Vec<Option<SearchResult<IdentityBoundEmbedding>>>, BatchInferenceError> {
+    pipeline_checkpoint(cx, "storage.pipeline.embed_batch")?;
+    let (expected, dimension) = capture_persistence_producer(embedder)?;
+    let mut outcomes: Vec<Option<SearchResult<IdentityBoundEmbedding>>> =
+        std::iter::repeat_with(|| None).take(texts.len()).collect();
+    let mut pending = vec![(0..texts.len()).collect::<Vec<_>>()];
+    while let Some(slots) = pending.pop() {
+        pipeline_checkpoint(cx, "storage.pipeline.batch_inference")?;
+        let mut current = Vec::with_capacity(slots.len());
+        for slot in slots {
+            if admit(slot).map_err(BatchInferenceError::Admission)? {
+                current.push(slot);
+            }
+        }
+        if current.is_empty() {
+            continue;
+        }
+        validate_persistence_producer(embedder, &expected, dimension)?;
+        pipeline_checkpoint(cx, "storage.pipeline.batch_inference")?;
+        let inputs: Vec<_> = current.iter().map(|&slot| texts[slot]).collect();
+        let response = with_cancellation(
+            cx,
+            "storage.pipeline.batch_inference",
+            embedder.embed_batch_bound(cx, &inputs),
+        )
+        .await;
+        pipeline_checkpoint(cx, "storage.pipeline.embed_batch_complete")?;
+        if let Err(error @ SearchError::Cancelled { .. }) = response {
+            return Err(error.into());
+        }
+        // Revalidate even an ordinary failure BEFORE deciding to split. A
+        // provider cannot fail under one identity and retry under another.
+        validate_persistence_producer(embedder, &expected, dimension)?;
+        pipeline_checkpoint(cx, "storage.pipeline.embed_batch_complete")?;
+        let bound = match response {
+            Ok(bound) => bound,
+            Err(error) if splittable_persistence_batch_error(&error) => {
+                if current.len() == 1 {
+                    outcomes[current[0]] = Some(Err(error));
+                } else {
+                    let right = current.split_off(current.len() / 2);
+                    pending.push(right);
+                    pending.push(current);
+                }
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if bound.len() != current.len() {
+            return Err(SearchError::InvalidConfig {
+                field: "storage_pipeline.embedding_batch".to_owned(),
+                value: "cardinality".to_owned(),
+                reason: "a native bound batch must return exactly one response per input"
+                    .to_owned(),
+            }
+            .into());
+        }
+        for (slot, embedding) in current.into_iter().zip(bound) {
+            pipeline_checkpoint(cx, "storage.pipeline.batch_response")?;
+            outcomes[slot] = Some(admit_persistence_embedding(embedding, &expected));
+        }
+    }
+    Ok(outcomes)
+}
+
+#[derive(Debug)]
+enum BatchInferenceError {
+    // Queue/read failures must propagate, not fail every job as though a
+    // provider rejected its input. Cancellation keeps its original type too.
+    Admission(SearchError),
+    Inference(SearchError),
+}
+
+impl From<SearchError> for BatchInferenceError {
+    fn from(error: SearchError) -> Self {
+        Self::Inference(error)
+    }
+}
+
+fn splittable_persistence_batch_error(error: &SearchError) -> bool {
+    matches!(
+        error,
+        SearchError::EmbeddingFailed { .. } | SearchError::DimensionMismatch { .. }
+    ) || matches!(error, SearchError::InvalidConfig { field, .. }
+            if field == "identity_bound_embedding.values")
+}
+
+fn capture_persistence_producer(
+    embedder: &dyn Embedder,
+) -> SearchResult<(EmbeddingIdentityBundleV1, usize)> {
     let expected = embedder.identity()?.clone();
     expected.validate()?;
     let dimension =
@@ -1473,36 +1707,37 @@ async fn embed_for_persistence(
                     .to_owned(),
         });
     }
+    Ok((expected, dimension))
+}
 
-    // A remote/custom provider may park without checking the caller's context
-    // or retaining its waker. Cancellation must still wake this worker and
-    // drop its owned inference before leaving the claim to lease recovery.
-    let response = with_cancellation(
-        cx,
-        "storage.pipeline.inference",
-        embedder.embed_bound(cx, text),
-    )
-    .await;
-    // Cancellation dominates both a successful response and a provider error.
-    // A cancelled worker must not persist, fail, or complete a claimed job.
-    pipeline_checkpoint(cx, "storage.pipeline.embed_complete")?;
-    let bound = response?;
+fn admit_persistence_embedding(
+    bound: IdentityBoundEmbedding,
+    expected: &EmbeddingIdentityBundleV1,
+) -> SearchResult<IdentityBoundEmbedding> {
     bound.validate()?;
-    if bound.identity != expected {
+    if &bound.identity != expected {
         return Err(SearchError::InvalidConfig {
             field: "storage_pipeline.embedding_identity".to_owned(),
             value: "response_mismatch".to_owned(),
             reason: "embedding response belongs to a different space or producer".to_owned(),
         });
     }
-    if embedder.identity()? != &expected || embedder.dimension() != dimension {
+    Ok(bound)
+}
+
+fn validate_persistence_producer(
+    embedder: &dyn Embedder,
+    expected: &EmbeddingIdentityBundleV1,
+    dimension: usize,
+) -> SearchResult<()> {
+    if embedder.identity()? != expected || embedder.dimension() != dimension {
         return Err(SearchError::InvalidConfig {
             field: "storage_pipeline.embedding_identity".to_owned(),
             value: "producer_changed".to_owned(),
             reason: "provider changed its declared identity during inference".to_owned(),
         });
     }
-    Ok(bound)
+    Ok(())
 }
 
 fn usize_to_u64(value: usize) -> u64 {
@@ -2578,6 +2813,643 @@ mod tests {
             runner = runner.with_quality_embedder(quality_embedder);
         }
         runner
+    }
+
+    mod native_batch {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        use super::*;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Fault {
+            None,
+            ForeignIdentity,
+            WrongDimension,
+            NonFinite,
+            ZeroNorm,
+            TooFew,
+            TooMany,
+            ProducerDrift,
+            ProducerDriftWithFailure,
+            IdentityFailure,
+            ProviderFailure,
+            InvalidValuesError,
+            Park,
+        }
+
+        struct BatchProbe {
+            id: &'static str,
+            dimension: usize,
+            native: bool,
+            fault: Fault,
+            identity: EmbeddingIdentityBundleV1,
+            foreign: EmbeddingIdentityBundleV1,
+            drifted: AtomicBool,
+            single_calls: AtomicUsize,
+            batches: Mutex<Vec<Vec<String>>>,
+            dropped: AtomicUsize,
+        }
+
+        impl BatchProbe {
+            fn new(id: &'static str, dimension: usize, native: bool, fault: Fault) -> Self {
+                let dimension_u32 = u32::try_from(dimension).unwrap();
+                Self {
+                    id,
+                    dimension,
+                    native,
+                    fault,
+                    identity: EmbeddingIdentityBundleV1::explicit_test_model(id, dimension_u32),
+                    foreign: EmbeddingIdentityBundleV1::explicit_test_model(
+                        "foreign-batch-producer",
+                        dimension_u32,
+                    ),
+                    drifted: AtomicBool::new(false),
+                    single_calls: AtomicUsize::new(0),
+                    batches: Mutex::new(Vec::new()),
+                    dropped: AtomicUsize::new(0),
+                }
+            }
+
+            fn response(&self, text: &str) -> IdentityBoundEmbedding {
+                IdentityBoundEmbedding {
+                    values: vec![
+                        f32::from(u16::try_from(text.len() % 1000 + 1).unwrap());
+                        self.dimension
+                    ],
+                    identity: self.identity.clone(),
+                }
+            }
+        }
+
+        struct DropProbe<'a>(&'a AtomicUsize);
+
+        impl Drop for DropProbe<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl Embedder for BatchProbe {
+            fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                Box::pin(async { panic!("durable workers must never bypass bound inference") })
+            }
+
+            fn embed_bound<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                text: &'a str,
+            ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+                assert!(!self.native, "native work must use one batch operation");
+                self.single_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(self.response(text)) })
+            }
+
+            fn embed_batch_bound<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                texts: &'a [&'a str],
+            ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+                assert!(
+                    self.native,
+                    "a single-operation override must remain authoritative"
+                );
+                Box::pin(async move {
+                    self.batches
+                        .lock()
+                        .unwrap()
+                        .push(texts.iter().map(|text| (*text).to_owned()).collect());
+                    run_claim_hook(ClaimHookStage::Inference);
+                    if self.fault == Fault::Park {
+                        // Deliberately does not check Cx or register a waker.
+                        let _drop = DropProbe(&self.dropped);
+                        return std::future::pending().await;
+                    }
+                    if self.fault == Fault::ProducerDriftWithFailure {
+                        self.drifted.store(true, Ordering::SeqCst);
+                    }
+                    let has_damaged = texts.iter().any(|text| text.contains("damaged"));
+                    if has_damaged && self.fault == Fault::IdentityFailure {
+                        return Err(SearchError::UnverifiableRemoteSpace {
+                            producer: self.id.to_owned(),
+                            reason: "provider refused the admitted identity".to_owned(),
+                        });
+                    }
+                    if has_damaged && self.fault == Fault::InvalidValuesError {
+                        // The default bound-batch contract validates values
+                        // all-or-error, before returning any neighboring rows.
+                        return Err(SearchError::InvalidConfig {
+                            field: "identity_bound_embedding.values".to_owned(),
+                            value: "non-finite coordinate".to_owned(),
+                            reason: "input-specific malformed vector".to_owned(),
+                        });
+                    }
+                    if has_damaged
+                        && matches!(
+                            self.fault,
+                            Fault::ProviderFailure | Fault::ProducerDriftWithFailure
+                        )
+                    {
+                        return Err(SearchError::EmbeddingFailed {
+                            model: self.id.to_owned(),
+                            source: io::Error::other("native batch failed").into(),
+                        });
+                    }
+                    let mut responses: Vec<_> =
+                        texts.iter().map(|text| self.response(text)).collect();
+                    for (text, response) in texts.iter().zip(&mut responses) {
+                        if text.contains("damaged") {
+                            match self.fault {
+                                Fault::ForeignIdentity => response.identity = self.foreign.clone(),
+                                Fault::WrongDimension => {
+                                    response.values.pop();
+                                }
+                                Fault::NonFinite => response.values[0] = f32::NAN,
+                                Fault::ZeroNorm => response.values.fill(0.0),
+                                _ => {}
+                            }
+                        }
+                    }
+                    match self.fault {
+                        Fault::TooFew => {
+                            responses.pop();
+                        }
+                        Fault::TooMany => responses.push(self.response("extra")),
+                        Fault::ProducerDrift => self.drifted.store(true, Ordering::SeqCst),
+                        _ => {}
+                    }
+                    Ok(responses)
+                })
+            }
+
+            fn bound_batch_is_native(&self) -> bool {
+                self.native
+            }
+
+            fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                Ok(if self.drifted.load(Ordering::SeqCst) {
+                    &self.foreign
+                } else {
+                    &self.identity
+                })
+            }
+
+            fn dimension(&self) -> usize {
+                self.dimension
+            }
+            fn id(&self) -> &str {
+                self.id
+            }
+            fn model_name(&self) -> &str {
+                self.id
+            }
+            fn is_semantic(&self) -> bool {
+                true
+            }
+            fn category(&self) -> ModelCategory {
+                ModelCategory::StaticEmbedder
+            }
+        }
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        fn runner_for(
+            quality: bool,
+            fault: Fault,
+            sink: Arc<dyn EmbeddingVectorSink>,
+        ) -> (Rc<StorageBackedJobRunner>, Arc<BatchProbe>) {
+            let probe = Arc::new(BatchProbe::new(
+                if quality {
+                    "quality-batch"
+                } else {
+                    "fast-batch"
+                },
+                2,
+                true,
+                fault,
+            ));
+            let storage = Arc::new(Storage::open_in_memory().unwrap());
+            let queue = Arc::new(PersistentJobQueue::new(
+                storage.clone(),
+                JobQueueConfig {
+                    max_retries: 0,
+                    ..JobQueueConfig::default()
+                },
+            ));
+            let fast: Arc<dyn Embedder> = if quality {
+                Arc::new(StubEmbedder::new("fnv1a-384", 2, None, 1.0))
+            } else {
+                probe.clone()
+            };
+            let mut runner = StorageBackedJobRunner::new(
+                storage,
+                queue,
+                Arc::new(DefaultCanonicalizer::default()),
+                fast,
+                sink,
+            );
+            if quality {
+                runner = runner.with_quality_embedder(probe.clone());
+            }
+            (Rc::new(runner), probe)
+        }
+
+        fn ingest_three(runner: &StorageBackedJobRunner) {
+            for (id, text) in [
+                ("first", "first input"),
+                ("damaged", "damaged input"),
+                ("last", "last input"),
+            ] {
+                runner.ingest(IngestRequest::new(id, text)).unwrap();
+            }
+        }
+
+        #[test]
+        fn native_batches_preserve_full_inputs_tier_identity_and_claim_bound() {
+            for fast_native in [false, true] {
+                for batch_size in [4, 32] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let fast =
+                            Arc::new(BatchProbe::new("fast-batch", 2, fast_native, Fault::None));
+                        let quality =
+                            Arc::new(BatchProbe::new("quality-batch", 3, true, Fault::None));
+                        let sink = Arc::new(InMemoryVectorSink::default());
+                        let runner = make_runner(
+                            JobQueueConfig::default(),
+                            PipelineConfig {
+                                process_batch_size: batch_size,
+                                ..PipelineConfig::default()
+                            },
+                            fast.clone(),
+                            Some(quality.clone()),
+                            sink.clone(),
+                        );
+                        let inputs: Vec<_> = (0..5)
+                            .map(|index| {
+                                let text = format!(
+                                    "document {index}: {}",
+                                    "retained café 東京 searchable content ".repeat(30 + index)
+                                );
+                                let canonical = runner.canonicalizer.canonicalize(&text);
+                                assert!(canonical.chars().count() > MAX_CONTENT_PREVIEW_CHARS);
+                                let id = format!("doc-{index}");
+                                runner.ingest(IngestRequest::new(&id, text)).unwrap();
+                                (id, canonical)
+                            })
+                            .collect();
+                        let mut completed = 0;
+                        loop {
+                            let result = runner.process_batch(&cx, "native-worker").await.unwrap();
+                            assert!(result.jobs_claimed <= batch_size);
+                            assert_eq!(
+                                result.jobs_failed + result.jobs_skipped + result.jobs_suppressed,
+                                0
+                            );
+                            completed += result.jobs_completed;
+                            if result.jobs_claimed == 0 {
+                                break;
+                            }
+                        }
+                        assert_eq!(completed, 10);
+                        assert_eq!(runner.queue.queue_depth().unwrap().completed, 10);
+                        let entries = sink.entries();
+                        assert_eq!(entries.len(), 10);
+                        for probe in [&fast, &quality] {
+                            let batches = probe.batches.lock().unwrap();
+                            assert!(
+                                batches
+                                    .iter()
+                                    .all(|batch| !batch.is_empty() && batch.len() <= batch_size)
+                            );
+                            if probe.native {
+                                assert_eq!(probe.single_calls.load(Ordering::SeqCst), 0);
+                                assert_eq!(batches.iter().flatten().count(), inputs.len());
+                                if batch_size == 32 {
+                                    assert_eq!(batches.len(), 1);
+                                }
+                                for (_, text) in &inputs {
+                                    assert_eq!(
+                                        batches
+                                            .iter()
+                                            .flatten()
+                                            .filter(|input| *input == text)
+                                            .count(),
+                                        1
+                                    );
+                                }
+                            } else {
+                                assert!(batches.is_empty());
+                                assert_eq!(probe.single_calls.load(Ordering::SeqCst), inputs.len());
+                            }
+                            for (id, text) in &inputs {
+                                let row = entries
+                                    .iter()
+                                    .find(|row| row.doc_id == *id && row.embedder_id == probe.id)
+                                    .unwrap();
+                                assert_eq!(row.embedding, probe.response(text));
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn native_batch_admits_rows_individually_and_refuses_ambiguous_batches() {
+            for quality in [false, true] {
+                for fault in [
+                    Fault::ForeignIdentity,
+                    Fault::WrongDimension,
+                    Fault::NonFinite,
+                    Fault::ZeroNorm,
+                    Fault::TooFew,
+                    Fault::TooMany,
+                    Fault::ProducerDrift,
+                    Fault::ProducerDriftWithFailure,
+                    Fault::IdentityFailure,
+                    Fault::ProviderFailure,
+                    Fault::InvalidValuesError,
+                ] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let sink = Arc::new(InMemoryVectorSink::default());
+                        let (runner, probe) = runner_for(quality, fault, sink.clone());
+                        ingest_three(&runner);
+                        let result = runner.process_batch(&cx, "native-worker").await.unwrap();
+                        let split =
+                            matches!(fault, Fault::ProviderFailure | Fault::InvalidValuesError);
+                        let per_row = split
+                            || matches!(
+                                fault,
+                                Fault::ForeignIdentity
+                                    | Fault::WrongDimension
+                                    | Fault::NonFinite
+                                    | Fault::ZeroNorm
+                            );
+                        let failed = if per_row { 1 } else { 3 };
+                        assert_eq!(result.jobs_claimed, 3);
+                        assert_eq!(result.jobs_failed, failed, "{fault:?}");
+                        assert_eq!(result.terminal_failures, failed);
+                        assert_eq!(result.jobs_completed, 3 - failed);
+                        assert_eq!(result.jobs_suppressed + result.jobs_skipped, 0);
+                        let entries = sink.entries();
+                        assert_eq!(entries.len(), 3 - failed);
+                        assert!(entries.iter().all(|row| row.doc_id != "damaged"));
+                        let calls = probe.batches.lock().unwrap().len();
+                        if split {
+                            assert!(
+                                calls > 1 && calls <= 5,
+                                "splitting isolates the bad input within 2n-1 calls"
+                            );
+                        } else {
+                            assert_eq!(
+                                calls, 1,
+                                "identity/protocol refusal must never retry: {fault:?}"
+                            );
+                        }
+                        assert_eq!(probe.single_calls.load(Ordering::SeqCst), 0);
+                        let depth = runner.queue.queue_depth().unwrap();
+                        assert_eq!(depth.failed, failed);
+                        assert_eq!(depth.completed, 3 - failed);
+                        assert_eq!(depth.pending + depth.processing, 0);
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn native_batch_bounds_retained_input_bytes_without_truncating_large_documents() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let (runner, probe) = runner_for(false, Fault::None, sink.clone());
+                let inputs: Vec<_> = [
+                    MAX_NATIVE_BATCH_INPUT_BYTES / 2,
+                    MAX_NATIVE_BATCH_INPUT_BYTES / 2,
+                    MAX_NATIVE_BATCH_INPUT_BYTES + 1,
+                    10,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, length)| {
+                    let id = format!("large-{index}");
+                    let text = format!("{id} {}", "x".repeat(length));
+                    runner
+                        .ingest_canonical(IngestRequest::new(&id, &text))
+                        .unwrap();
+                    (id, text)
+                })
+                .collect();
+                let result = runner.process_batch(&cx, "native-worker").await.unwrap();
+                assert_eq!(result.jobs_completed, inputs.len());
+                assert_eq!(
+                    result.jobs_failed + result.jobs_skipped + result.jobs_suppressed,
+                    0
+                );
+                let batches = probe.batches.lock().unwrap();
+                assert!(batches.len() > 1);
+                for batch in batches.iter() {
+                    let bytes: usize = batch.iter().map(String::len).sum();
+                    assert!(bytes <= MAX_NATIVE_BATCH_INPUT_BYTES || batch.len() == 1);
+                }
+                let entries = sink.entries();
+                for (id, text) in &inputs {
+                    assert_eq!(
+                        batches
+                            .iter()
+                            .flatten()
+                            .filter(|input| *input == text)
+                            .count(),
+                        1
+                    );
+                    let row = entries.iter().find(|row| row.doc_id == *id).unwrap();
+                    assert_eq!(row.embedding, probe.response(text));
+                }
+            });
+        }
+
+        #[test]
+        fn native_batch_suppresses_only_the_superseded_claim_or_input() {
+            for quality in [false, true] {
+                for replace_document in [false, true] {
+                    for fault in [Fault::None, Fault::ProviderFailure] {
+                        asupersync::test_utils::run_test_with_cx(|cx| async move {
+                            let sink = Arc::new(InMemoryVectorSink::default());
+                            let (runner, probe) = runner_for(quality, fault, sink.clone());
+                            ingest_three(&runner);
+                            let successor = Rc::new(RefCell::new(None));
+                            let hook_runner = Rc::clone(&runner);
+                            let hook_successor = Rc::clone(&successor);
+                            let _hook =
+                                ScopedClaimHook::install(ClaimHookStage::Inference, move || {
+                                    if replace_document {
+                                        hook_runner
+                                            .ingest(IngestRequest::new(
+                                                "damaged",
+                                                "replacement input",
+                                            ))
+                                            .unwrap();
+                                    }
+                                    expire_processing_document(&hook_runner, "damaged");
+                                    let mut claims =
+                                        hook_runner.queue.claim_batch("successor", 1).unwrap();
+                                    assert_eq!(claims.len(), 1);
+                                    assert_eq!(claims[0].doc_id, "damaged");
+                                    *hook_successor.borrow_mut() = claims.pop();
+                                });
+                            let result = runner.process_batch(&cx, "native-worker").await.unwrap();
+                            assert_eq!(result.jobs_claimed, 3);
+                            assert_eq!(result.jobs_completed, 2);
+                            assert_eq!(result.jobs_suppressed, 1);
+                            assert_eq!(
+                                result.jobs_failed + result.jobs_skipped + result.terminal_failures,
+                                0
+                            );
+                            let entries = sink.entries();
+                            assert_eq!(entries.len(), 2);
+                            assert!(entries.iter().all(|row| row.doc_id != "damaged"));
+                            let batches = probe.batches.lock().unwrap();
+                            if fault == Fault::None {
+                                assert_eq!(batches.len(), 1);
+                            } else {
+                                assert!((2..=3).contains(&batches.len()));
+                            }
+                            assert!(
+                                batches
+                                    .iter()
+                                    .skip(1)
+                                    .flatten()
+                                    .all(|text| text != "damaged input"
+                                        && text != "replacement input"),
+                                "split retries must not infer a superseded attempt or its successor's input"
+                            );
+                            let successor = successor.borrow();
+                            let claim = successor.as_ref().unwrap();
+                            assert!(matches!(
+                                runner
+                                    .queue
+                                    .check_claim(claim, claim.content_hash.as_ref())
+                                    .unwrap(),
+                                ClaimOutcome::Applied(_)
+                            ));
+                            assert_eq!(runner.queue.queue_depth().unwrap().processing, 1);
+                        });
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn native_batch_keeps_admission_errors_separate_from_provider_failures() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let probe = BatchProbe::new("fast-batch", 2, true, Fault::ProviderFailure);
+                let mut admissions = 0;
+                let response = embed_batch_for_persistence(
+                    &cx,
+                    &probe,
+                    &["first input", "damaged input", "last input"],
+                    |_| {
+                        admissions += 1;
+                        if admissions > 3 {
+                            Err(SearchError::Io(io::Error::other(
+                                "queue unavailable during retry admission",
+                            )))
+                        } else {
+                            Ok(true)
+                        }
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    response,
+                    Err(BatchInferenceError::Admission(SearchError::Io(_)))
+                ));
+                assert_eq!(
+                    probe.batches.lock().unwrap().len(),
+                    1,
+                    "queue errors cannot become provider retries"
+                );
+            });
+        }
+
+        #[derive(Default)]
+        struct CountingWake(AtomicUsize);
+
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn native_batch_cancellation_wakes_and_drops_parked_inference_without_mutation() {
+            for quality in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = runner_for(quality, Fault::Park, sink.clone());
+                    ingest_three(&runner);
+                    let counter = Arc::new(CountingWake::default());
+                    let waker = Waker::from(Arc::clone(&counter));
+                    let mut context = Context::from_waker(&waker);
+                    let mut work = Box::pin(runner.process_batch(&cx, "native-worker"));
+                    assert!(work.as_mut().poll(&mut context).is_pending());
+                    assert_eq!(probe.batches.lock().unwrap().len(), 1);
+                    let before = counter.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("cancel native batch"));
+                    assert!(
+                        counter.0.load(Ordering::SeqCst) > before,
+                        "cancellation must wake the worker without provider cooperation"
+                    );
+                    assert!(matches!(
+                        work.as_mut().poll(&mut context),
+                        Poll::Ready(Err(SearchError::Cancelled { .. }))
+                    ));
+                    assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+                    assert_eq!(probe.batches.lock().unwrap().len(), 1);
+                    assert!(sink.entries().is_empty());
+                    let depth = runner.queue.queue_depth().unwrap();
+                    assert_eq!(depth.processing, 3);
+                    assert_eq!(
+                        depth.pending + depth.failed + depth.completed + depth.skipped,
+                        0
+                    );
+                });
+            }
+        }
+
+        #[test]
+        fn native_batch_sink_cancellation_stops_before_later_responses() {
+            for quality in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(ClaimProbeSink::default());
+                    let (runner, probe) = runner_for(quality, Fault::None, sink.clone());
+                    ingest_three(&runner);
+                    let hook_cx = cx.clone();
+                    let _hook = ScopedClaimHook::install(ClaimHookStage::Persistence, move || {
+                        hook_cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("cancel during first batch write"),
+                        );
+                    });
+                    assert!(matches!(
+                        runner.process_batch(&cx, "native-worker").await,
+                        Err(SearchError::Cancelled { .. })
+                    ));
+                    assert_eq!(probe.batches.lock().unwrap().len(), 1);
+                    assert_eq!(
+                        sink.stored.entries().len(),
+                        1,
+                        "bytes already accepted are recoverable, but later responses must not be written"
+                    );
+                    let depth = runner.queue.queue_depth().unwrap();
+                    assert_eq!(depth.processing, 3);
+                    assert_eq!(
+                        depth.pending + depth.failed + depth.completed + depth.skipped,
+                        0
+                    );
+                });
+            }
+        }
     }
 
     #[test]
