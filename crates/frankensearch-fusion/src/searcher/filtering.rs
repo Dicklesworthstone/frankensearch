@@ -19,6 +19,16 @@ pub(super) struct RequestFilter<'a> {
     metadata: AHashMap<DocId, Option<Arc<serde_json::Value>>>,
 }
 
+/// The lexical pool and scoring snapshot that must remain eligible while a
+/// semantic arm learns metadata. Borrowing keeps ownership with the caller's
+/// phase; reconciliation never replaces the retained lexical reader.
+pub(super) struct LexicalRevalidation<'a> {
+    pub(super) query: &'a str,
+    pub(super) target: usize,
+    pub(super) results: &'a mut Option<Vec<ScoredResult>>,
+    pub(super) context: &'a mut Option<super::LexicalHydrationContext>,
+}
+
 impl<'a> RequestFilter<'a> {
     pub(super) fn new(predicate: Option<&'a dyn SearchFilter>) -> Self {
         Self {
@@ -265,13 +275,13 @@ impl<'a> RequestFilter<'a> {
         &mut self,
         cx: &Cx,
         lexical: Option<&dyn LexicalRead>,
-        mut hits: Vec<VectorHit>,
+        hits: Vec<VectorHit>,
         target: usize,
         physical_upper_bound: usize,
         exclusions: Option<&NormalizedExclusions>,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         source: &'static str,
-        mut retrieve: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
+        retrieve: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
     ) -> SearchResult<(Vec<VectorHit>, usize)> {
         if !self.is_active() {
             return refill_vector_after_exclusions(
@@ -285,7 +295,35 @@ impl<'a> RequestFilter<'a> {
                 retrieve,
             );
         }
-        let mut limit = target;
+        self.refill_filtered_vectors(
+            cx,
+            lexical,
+            hits,
+            target,
+            target,
+            physical_upper_bound,
+            exclusions,
+            text_fn,
+            source,
+            retrieve,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn refill_filtered_vectors(
+        &mut self,
+        cx: &Cx,
+        lexical: Option<&dyn LexicalRead>,
+        mut hits: Vec<VectorHit>,
+        target: usize,
+        mut limit: usize,
+        physical_upper_bound: usize,
+        exclusions: Option<&NormalizedExclusions>,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        source: &'static str,
+        mut retrieve: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
+    ) -> SearchResult<(Vec<VectorHit>, usize)> {
         loop {
             let fetched = hits.len();
             let ids: Vec<_> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
@@ -321,6 +359,90 @@ impl<'a> RequestFilter<'a> {
             limit = next;
             hits = retrieve(limit)?;
             cancellation_checkpoint(cx, "filter_vector_refill_complete")?;
+        }
+    }
+
+    /// Refill both pools until newly discovered metadata no longer revokes a
+    /// retained vector. A lexical refill can reject a formerly unknown vector,
+    /// and fetching its replacement can in turn revoke a lexical candidate.
+    ///
+    /// A replaced vector pool contains raw retrieval scores; `true` tells the
+    /// caller to apply calibration/corrections once to that replacement. The
+    /// callback retains the admitted query, owner and retrieval policy. Reopen
+    /// the same physical window before widening: its previously truncated tail
+    /// may already contain enough eligible replacements, even at the row bound.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn reconcile_vectors(
+        &mut self,
+        cx: &Cx,
+        lexical: Option<&dyn LexicalRead>,
+        lexical_pool: LexicalRevalidation<'_>,
+        hits: &mut Vec<VectorHit>,
+        target: usize,
+        retrieval_limit: &mut usize,
+        physical_upper_bound: usize,
+        exclusions: Option<&NormalizedExclusions>,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        source: &'static str,
+        mut retrieve: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
+    ) -> SearchResult<bool> {
+        if !self.is_active() {
+            return Ok(false);
+        }
+        let mut replaced = false;
+        let mut revoked = AHashSet::new();
+        loop {
+            self.revalidate_lexical(
+                cx,
+                lexical,
+                lexical_pool.query,
+                lexical_pool.target,
+                lexical_pool.results,
+                lexical_pool.context,
+                exclusions,
+                text_fn,
+            )
+            .await?;
+            let mut changed = false;
+            for hit in hits.iter() {
+                if !self.includes(cx, &hit.doc_id)? {
+                    // Known observations persist between arms. Rejecting the
+                    // same refilled ID again therefore means the predicate is
+                    // unstable; fail rather than retry forever or lose recall.
+                    if !revoked.insert(hit.doc_id.clone()) {
+                        return Err(SearchError::InvalidConfig {
+                            field: "search.filter".to_owned(),
+                            value: "unstable_predicate".to_owned(),
+                            reason: "filter eligibility changed repeatedly during candidate refill"
+                                .to_owned(),
+                        });
+                    }
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(replaced);
+            }
+            cancellation_checkpoint(cx, "filter_vector_revalidation")?;
+            let candidates = retrieve(*retrieval_limit)?;
+            cancellation_checkpoint(cx, "filter_vector_revalidation_complete")?;
+            let (replacement, limit) = self
+                .refill_filtered_vectors(
+                    cx,
+                    lexical,
+                    candidates,
+                    target,
+                    *retrieval_limit,
+                    physical_upper_bound,
+                    exclusions,
+                    text_fn,
+                    source,
+                    &mut retrieve,
+                )
+                .await?;
+            *hits = replacement;
+            *retrieval_limit = limit;
+            replaced = true;
         }
     }
 
