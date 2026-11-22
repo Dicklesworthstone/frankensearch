@@ -40,12 +40,13 @@ This crate owns the persistent storage layer for frankensearch, backed by Franke
 - `IngestRequest` / `IngestResult` / `IngestAction` - ingestion request/result types
 - `PipelineConfig` / `PipelineMetrics` - pipeline configuration and performance metrics
 - `EmbeddingVectorSink` / `InMemoryVectorSink` - sinks for produced embedding vectors
+- `ClaimedEmbeddingWrite` - identity-bound response plus its original queue claim and document content hash
 
 Persistent jobs require an identity-aware embedder. The runner calls
 `Embedder::embed_bound`, validates the returned vector and complete identity,
 and rejects a producer that changes identity during inference. Custom
 embedders must provide `Embedder::identity`; a model name and dimension alone
-do not authorize persistence. Cancellation after inference leaves the claim
+do not authorize persistence. Cancellation observed before persistence leaves the claim
 unfinished for the existing lease-recovery path, without writing a vector or
 recording a job failure.
 
@@ -62,13 +63,24 @@ separately from actual skipped jobs and failures. The current document hash is
 the authority: a document that changes from A to B and back to A can still admit
 an A response even while an obsolete B job remains queued.
 
-A sink must still admit the producer against its own index generation. The
-runner deliberately holds no database transaction across the synchronous sink
-call. If ownership or content changes during that call, its guarded completion
-leaves the newer queue and catalog untouched, but vector bytes may already have
-been written. Atomic vector publication requires a version-aware sink or a
-compare-and-swap publication protocol; these queue fences alone do not provide
-that boundary.
+A sink receives a `ClaimedEmbeddingWrite`. It must acquire the lock that
+serializes its vector writes, call `request.persist_if_current(...)` while
+holding that lock, and perform the complete write inside the callback. The
+request rechecks the original claim epoch, worker and content hash after the
+lock is acquired. A worker delayed behind a newer write therefore returns
+`LostClaim` or `Superseded` without touching vectors. The built-in memory sink
+and fsfs live vector sink use this ordering. Custom sinks must use the same
+serialization for every writer, and still admit the response's complete
+producer identity against their own retained index generation.
+
+No database transaction remains open during the callback. The queue and vector
+store are still separate resources: an input can change after this admission,
+and catalog completion can fail after a successful vector write. Guarded
+completion preserves the newer queue and catalog but cannot undo written
+bytes. Cancellation observed after the synchronous write leaves the claim
+unfinished, even if the sink returned success or an ordinary error; already
+written bytes remain. Use the storage crate's transactional embedding publication APIs when
+vector payloads and catalog selection must commit together.
 
 ### History and Bookmarks
 

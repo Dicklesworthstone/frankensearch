@@ -35,9 +35,8 @@ use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::traits::ModelTier;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
-    HitExplanation, IdentityBoundEmbedding, IndexableDocument, LexicalTermScore, ModelCategory,
-    RerankDocument, Reranker, ScoreComponent, SearchError, SearchResult, VectorHit,
-    with_cancellation,
+    HitExplanation, IndexableDocument, LexicalTermScore, ModelCategory, RerankDocument, Reranker,
+    ScoreComponent, SearchError, SearchResult, VectorHit, with_cancellation,
 };
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
@@ -68,8 +67,9 @@ use frankensearch_quill::{
     resolve_current,
 };
 use frankensearch_storage::{
-    EmbeddingVectorSink, IngestRequest, IngestResult, JobQueueConfig, PersistentJobQueue,
-    PipelineConfig, Storage, StorageBackedJobRunner, StorageConfig as PipelineStorageConfig,
+    ClaimOutcome, ClaimedEmbeddingWrite, EmbeddingVectorSink, IngestRequest, IngestResult,
+    JobQueueConfig, PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
+    StorageConfig as PipelineStorageConfig,
 };
 #[cfg(unix)]
 use ftui_backend::{BackendEventSource, BackendFeatures};
@@ -4359,28 +4359,29 @@ struct LiveVectorSink {
 }
 
 impl EmbeddingVectorSink for LiveVectorSink {
-    fn persist(
-        &self,
-        doc_id: &str,
-        embedder_id: &str,
-        embedding: &IdentityBoundEmbedding,
-    ) -> SearchResult<()> {
-        embedding.validate()?;
+    fn persist(&self, request: &ClaimedEmbeddingWrite<'_>) -> SearchResult<ClaimOutcome<()>> {
         let mut vi = self
             .vector_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The runner's response admission does not establish compatibility
-        // with this retained generation. Keep that check and the append under
-        // the same index lock, using the response's actual complete identity.
-        FsfsRuntime::validate_fast_producer_shape(&vi, embedder_id, embedding.values.len())?;
-        FsfsRuntime::validate_vector_producer_identity(&vi, &embedding.identity)?;
-        // `VectorIndex::append` is the atomic replacement primitive: it
-        // durably logs the new value before superseding older resident copies.
-        // Deleting first would turn a failed WAL append into durable data loss.
-        vi.append(doc_id, &embedding.values)?;
-        drop(vi);
-        Ok(())
+        // Revalidate after waiting for this exact writer lock. A newer worker
+        // may have published while this attempt was waiting; it must not be
+        // overwritten by a late append from the superseded attempt.
+        request.persist_if_current(&mut *vi, |vi, embedding| {
+            // The runner's response admission does not establish compatibility
+            // with this retained generation. Keep that check and the append
+            // under the index lock, using the response's complete identity.
+            FsfsRuntime::validate_fast_producer_shape(
+                vi,
+                request.embedder_id(),
+                embedding.values.len(),
+            )?;
+            FsfsRuntime::validate_vector_producer_identity(vi, &embedding.identity)?;
+            // Append logs the replacement before superseding resident copies;
+            // deleting first would turn a failed WAL append into data loss.
+            vi.append(request.doc_id(), &embedding.values)?;
+            Ok(())
+        })
     }
 }
 
@@ -36414,7 +36415,10 @@ mod tests {
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
     use frankensearch_core::{ExplanationPhase, HitExplanation};
-    use frankensearch_storage::EmbeddingVectorSink;
+    use frankensearch_storage::{
+        ClaimOutcome, ClaimedEmbeddingWrite, ClaimedJob, ContentHasher, DocumentRecord,
+        EmbeddingVectorSink, JobQueueConfig, PersistentJobQueue, Storage,
+    };
 
     use std::process::{Command, Output, Stdio};
 
@@ -39395,13 +39399,26 @@ mod tests {
                     .find(|component| component.source == ScoreComponentSource::SemanticBlend);
                 if let Some(rank) = hit.semantic_rank {
                     let blend = blend.expect("the ranked semantic blend needs a component");
-                    assert!((blend.raw_score - f64::from(hit.semantic_score.unwrap())).abs() < 1e-7);
+                    assert!(
+                        (blend.raw_score - f64::from(hit.semantic_score.unwrap())).abs() < 1e-7
+                    );
                     let rank = f64::from(u32::try_from(rank).unwrap());
-                    assert!((blend.rrf_contribution - 1.0 / (cold_session.rrf_k + rank + 1.0)).abs() < 1e-7);
+                    assert!(
+                        (blend.rrf_contribution - 1.0 / (cold_session.rrf_k + rank + 1.0)).abs()
+                            < 1e-7
+                    );
                     assert!(explanation.to_toon().contains("source=semantic_blend"));
-                    assert!(explanation.to_cli_json().unwrap().contains("\"source\": \"semantic_blend\""));
+                    assert!(
+                        explanation
+                            .to_cli_json()
+                            .unwrap()
+                            .contains("\"source\": \"semantic_blend\"")
+                    );
                 } else {
-                    assert!(blend.is_none(), "lexical-only hit cannot have a blended arm");
+                    assert!(
+                        blend.is_none(),
+                        "lexical-only hit cannot have a blended arm"
+                    );
                 }
             }
             filtered
@@ -53291,10 +53308,35 @@ mod tests {
         });
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn live_sink_claim_fixture(
+        embedder_id: &str,
+    ) -> (Arc<Storage>, PersistentJobQueue, ClaimedJob) {
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let hash = ContentHasher::hash("original input");
+        storage
+            .upsert_document(&DocumentRecord::new(
+                "doc.md",
+                "original input",
+                hash,
+                "original input".len(),
+                1,
+                1,
+            ))
+            .unwrap();
+        let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
+        queue.enqueue("doc.md", embedder_id, &hash, 0).unwrap();
+        let claim = queue.claim_batch("sink-worker", 1).unwrap().pop().unwrap();
+        (storage, queue, claim)
+    }
+
     #[test]
     fn live_vector_sink_requires_the_complete_bound_response_before_writing() {
         use frankensearch_core::{EmbeddingIdentityBundleV1, IdentityBoundEmbedding};
 
+        let cx = Cx::for_testing();
+        let (_storage, queue, claim) = live_sink_claim_fixture("sink-fast");
+        let hash = claim.content_hash.as_ref().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let vector_path = temp.path().join("fast.fsvi");
         let identity = EmbeddingIdentityBundleV1::explicit_test_model("sink-fast", 2);
@@ -53341,7 +53383,9 @@ mod tests {
                 identity: foreign,
             };
             assert!(matches!(
-                sink.persist("doc.md", "sink-fast", &response),
+                sink.persist(&ClaimedEmbeddingWrite::new(
+                    &cx, &queue, &claim, hash, &response,
+                )),
                 Err(SearchError::UnverifiableRemoteSpace { .. })
             ));
             assert_eq!(fs::read(&vector_path).unwrap(), original_bytes);
@@ -53358,15 +53402,21 @@ mod tests {
             drop(index);
         }
 
-        sink.persist(
-            "doc.md",
-            "sink-fast",
-            &IdentityBoundEmbedding {
-                values: vec![1.0, 0.0],
-                identity,
-            },
-        )
-        .unwrap();
+        let replacement = IdentityBoundEmbedding {
+            values: vec![1.0, 0.0],
+            identity,
+        };
+        assert_eq!(
+            sink.persist(&ClaimedEmbeddingWrite::new(
+                &cx,
+                &queue,
+                &claim,
+                hash,
+                &replacement,
+            ))
+            .unwrap(),
+            ClaimOutcome::Applied(())
+        );
         drop(sink);
         let durable = VectorIndex::open_read_only(&vector_path).unwrap();
         let hits = durable.search_top_k(&[1.0, 0.0], 2, None).unwrap();
@@ -53380,7 +53430,111 @@ mod tests {
     }
 
     #[test]
+    fn live_vector_sink_suppresses_old_claims_after_newer_wal_publication() {
+        use frankensearch_core::{EmbeddingIdentityBundleV1, IdentityBoundEmbedding};
+
+        for replace_document in [false, true] {
+            let cx = Cx::for_testing();
+            let (storage, queue, old_claim) = live_sink_claim_fixture("sink-fast");
+            let old_hash = old_claim.content_hash.as_ref().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let vector_path = temp.path().join("fast.fsvi");
+            let identity = EmbeddingIdentityBundleV1::explicit_test_model("sink-fast", 2);
+            let mut writer = VectorIndex::create_with_revision(
+                &vector_path,
+                "sink-fast",
+                &identity.fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer.write_record("doc.md", &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let original_bytes = fs::read(&vector_path).unwrap();
+            let sink = LiveVectorSink {
+                vector_index: Arc::new(Mutex::new(VectorIndex::open(&vector_path).unwrap())),
+            };
+            let old_response = IdentityBoundEmbedding {
+                values: vec![1.0, 0.0],
+                identity: identity.clone(),
+            };
+            let old_write =
+                ClaimedEmbeddingWrite::new(&cx, &queue, &old_claim, old_hash, &old_response);
+            // The old worker was authorized before waiting on the sink. This
+            // earlier check is deliberately insufficient to authorize its write.
+            assert!(matches!(
+                queue.check_claim(&old_claim, Some(old_hash)).unwrap(),
+                ClaimOutcome::Applied(_)
+            ));
+
+            if replace_document {
+                let mut document = storage.get_document("doc.md").unwrap().unwrap();
+                document.content_preview = "replacement input".to_owned();
+                document.content_length = document.content_preview.len();
+                document.content_hash = ContentHasher::hash(&document.content_preview);
+                storage.upsert_document(&document).unwrap();
+                queue
+                    .enqueue("doc.md", "sink-fast", &document.content_hash, 0)
+                    .unwrap();
+            } else {
+                storage
+                    .connection()
+                    .execute_sync("UPDATE embedding_jobs SET started_at = 0;")
+                    .unwrap();
+                assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
+            }
+            let new_claim = queue.claim_batch("sink-worker", 1).unwrap().pop().unwrap();
+            let new_hash = new_claim.content_hash.as_ref().unwrap();
+            let new_response = IdentityBoundEmbedding {
+                values: vec![0.0, 1.0],
+                identity,
+            };
+            assert_eq!(
+                sink.persist(&ClaimedEmbeddingWrite::new(
+                    &cx,
+                    &queue,
+                    &new_claim,
+                    new_hash,
+                    &new_response,
+                ))
+                .unwrap(),
+                ClaimOutcome::Applied(())
+            );
+            assert_eq!(
+                queue.complete(&new_claim, new_hash).unwrap(),
+                ClaimOutcome::Applied(())
+            );
+            let wal_path = frankensearch_index::wal_path_for(&vector_path);
+            let published_wal = fs::read(&wal_path).unwrap();
+            assert_eq!(
+                sink.persist(&old_write).unwrap(),
+                if replace_document {
+                    ClaimOutcome::Superseded
+                } else {
+                    ClaimOutcome::LostClaim
+                }
+            );
+            assert_eq!(fs::read(&vector_path).unwrap(), original_bytes);
+            assert_eq!(fs::read(&wal_path).unwrap(), published_wal);
+            assert_eq!(queue.queue_depth().unwrap().completed, 1);
+            drop(sink);
+
+            let durable = VectorIndex::open_read_only(&vector_path).unwrap();
+            let hits = durable.search_top_k(&[0.0, 1.0], 2, None).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc.md");
+            assert!(
+                hits[0].score > 0.99,
+                "old attempt changed the durable successor"
+            );
+        }
+    }
+
+    #[test]
     fn live_vector_sink_preserves_old_vector_on_append_failure() {
+        let cx = Cx::for_testing();
+        let (_storage, queue, claim) = live_sink_claim_fixture("publication-lease-test");
+        let hash = claim.content_hash.as_ref().unwrap();
         let temp = tempfile::tempdir().expect("tempdir");
         let index_root = temp.path().join("index");
         fs::create_dir_all(&index_root).expect("create index root");
@@ -53419,7 +53573,13 @@ mod tests {
             identity,
         };
         let error = sink
-            .persist("doc.md", "publication-lease-test", &replacement)
+            .persist(&ClaimedEmbeddingWrite::new(
+                &cx,
+                &queue,
+                &claim,
+                hash,
+                &replacement,
+            ))
             .expect_err("blocked WAL append must fail");
         assert!(
             matches!(error, SearchError::Io(_)),

@@ -13,6 +13,14 @@
   Streamed and sharded refinement use the same complete evidence, preserving
   lazy quality inference, retrieved candidate counts, and per-tier shard/row
   coordinates.
+- Storage-backed embedding writes now revalidate their exact queue attempt and
+  input revision after acquiring the sink's writer lock. A delayed stale worker
+  cannot overwrite a newer serialized publication in the memory or fsfs live
+  vector sink. Cancellation observed after a synchronous write also leaves the
+  claim unfinished, without claiming rollback of already-written vector bytes.
+  Custom `EmbeddingVectorSink` implementations now receive a
+  `ClaimedEmbeddingWrite` and must use its guarded callback under their writer
+  lock; catalog completion remains a separate guarded operation.
 
 ## [1.13.0] — 2026-11-21
 

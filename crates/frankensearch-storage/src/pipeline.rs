@@ -21,7 +21,7 @@ use crate::document_content::{
     read_document_content, upsert_document_content, verify_document_text,
 };
 use crate::job_queue::{
-    ClaimOutcome, EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner,
+    ClaimOutcome, ClaimedJob, EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner,
 };
 use crate::schema::row_i64;
 
@@ -180,25 +180,115 @@ impl PipelineMetrics {
     }
 }
 
-pub trait EmbeddingVectorSink: Send + Sync {
-    /// Persist the actual identity-bound response after the job runner has
-    /// validated it. Implementations must admit its complete identity against
-    /// their own retained index generation before writing any vector bytes.
-    /// The operational `embedder_id` routes work; it cannot establish producer
-    /// compatibility or replace the response's original identity.
+/// An actual embedding response bound to the queue attempt and input revision
+/// that produced it. The sink must acquire its writer lock before calling
+/// [`Self::persist_if_current`] and keep that lock through the supplied write.
+///
+/// Checking only before acquiring the lock is insufficient: a newer worker
+/// could write while the old worker waits, after which the old append would
+/// overwrite the newer coordinates. The under-lock check makes sink writes
+/// follow claim ownership even when inference and lock acquisition finish out
+/// of order. Every writer to the same sink must use the same serialization.
+///
+/// This is not a transaction across the database and vector store. The queue
+/// transaction ends before the write callback starts. An input can change
+/// after admission, or a successful sink write can precede a failed catalog
+/// completion; those bytes cannot be rolled back by this request. Catalog
+/// completion therefore has a separate claim/revision fence.
+pub struct ClaimedEmbeddingWrite<'a> {
+    cx: &'a Cx,
+    queue: &'a PersistentJobQueue,
+    claim: &'a ClaimedJob,
+    document_hash: &'a [u8; 32],
+    embedding: &'a IdentityBoundEmbedding,
+}
+
+impl std::fmt::Debug for ClaimedEmbeddingWrite<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimedEmbeddingWrite")
+            .field("job_id", &self.claim.job_id)
+            .field("claim_epoch", &self.claim.claim_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> ClaimedEmbeddingWrite<'a> {
+    /// Bind a response to its original attempt and the document hash captured
+    /// before inference. Construction performs no I/O or publication. The
+    /// caller must have admitted the actual response against its producer;
+    /// the sink additionally admits it against its own retained generation.
+    #[must_use]
+    pub const fn new(
+        cx: &'a Cx,
+        queue: &'a PersistentJobQueue,
+        claim: &'a ClaimedJob,
+        document_hash: &'a [u8; 32],
+        embedding: &'a IdentityBoundEmbedding,
+    ) -> Self {
+        Self {
+            cx,
+            queue,
+            claim,
+            document_hash,
+            embedding,
+        }
+    }
+
+    #[must_use]
+    pub fn doc_id(&self) -> &str {
+        &self.claim.doc_id
+    }
+
+    #[must_use]
+    pub fn embedder_id(&self) -> &str {
+        &self.claim.embedder_id
+    }
+
+    /// Revalidate this attempt while the caller holds the sink's writer lock,
+    /// then invoke `write` with that borrowed writer and the original response.
+    /// The writer borrow must come from the sink's held serialization guard;
+    /// it remains borrowed through the callback. Lost or superseded attempts
+    /// do not invoke `write`; errors and cancellation propagate without
+    /// completing or failing the job.
     ///
-    /// The runner checks claim ownership and document version immediately
-    /// before this call, without holding a database transaction across it.
-    /// A replacement during this call cannot be committed to the catalog by
-    /// the stale worker, but this interface cannot undo already written vector
-    /// bytes. Sinks that need atomic version publication must provide their
-    /// own version-aware compare-and-swap boundary.
-    fn persist(
+    /// No storage transaction is held across `write`, so a sink callback may
+    /// use storage without nesting inside this method's claim transaction.
+    pub fn persist_if_current<W>(
         &self,
-        doc_id: &str,
-        embedder_id: &str,
-        embedding: &IdentityBoundEmbedding,
-    ) -> SearchResult<()>;
+        writer: &mut W,
+        write: impl FnOnce(&mut W, &IdentityBoundEmbedding) -> SearchResult<()>,
+    ) -> SearchResult<ClaimOutcome<()>> {
+        pipeline_checkpoint(self.cx, "storage.pipeline.sink_admission")?;
+        let ownership = self
+            .queue
+            .check_claim(self.claim, Some(self.document_hash))?;
+        pipeline_checkpoint(self.cx, "storage.pipeline.sink_admitted")?;
+        match ownership {
+            ClaimOutcome::Applied(_) => {
+                self.embedding.validate()?;
+                write(writer, self.embedding)?;
+                Ok(ClaimOutcome::Applied(()))
+            }
+            ClaimOutcome::LostClaim => Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => Ok(ClaimOutcome::Superseded),
+        }
+    }
+}
+
+pub trait EmbeddingVectorSink: Send + Sync {
+    /// Persist an actual identity-bound response for its still-current attempt.
+    ///
+    /// Implementations MUST acquire their write-serialization lock first,
+    /// invoke [`ClaimedEmbeddingWrite::persist_if_current`] under that lock,
+    /// and perform the complete write inside its callback before unlocking.
+    /// Returning a lost/superseded outcome must leave vector bytes unchanged.
+    /// The callback must also admit the complete response identity against the
+    /// retained index generation: the operational model name is not identity.
+    ///
+    /// The request prevents delayed old attempts from overwriting a newer
+    /// serialized write. It does not make an external sink transactional with
+    /// catalog completion or undo bytes after a failed write/commit.
+    fn persist(&self, request: &ClaimedEmbeddingWrite<'_>) -> SearchResult<ClaimOutcome<()>>;
 }
 
 #[derive(Debug, Default)]
@@ -230,28 +320,22 @@ impl InMemoryVectorSink {
 }
 
 impl EmbeddingVectorSink for InMemoryVectorSink {
-    fn persist(
-        &self,
-        doc_id: &str,
-        embedder_id: &str,
-        embedding: &IdentityBoundEmbedding,
-    ) -> SearchResult<()> {
-        embedding.validate()?;
-        {
-            let mut guard = self.entries.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!(
-                    target: "frankensearch.pipeline",
-                    "vector sink lock poisoned; using recovered state"
-                );
-                poisoned.into_inner()
-            });
-            guard.push(PersistedEmbedding {
-                doc_id: doc_id.to_owned(),
-                embedder_id: embedder_id.to_owned(),
+    fn persist(&self, request: &ClaimedEmbeddingWrite<'_>) -> SearchResult<ClaimOutcome<()>> {
+        let mut entries = self.entries.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                target: "frankensearch.pipeline",
+                "vector sink lock poisoned; using recovered state"
+            );
+            poisoned.into_inner()
+        });
+        request.persist_if_current(&mut *entries, |entries, embedding| {
+            entries.push(PersistedEmbedding {
+                doc_id: request.doc_id().to_owned(),
+                embedder_id: request.embedder_id().to_owned(),
                 embedding: embedding.clone(),
             });
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -779,35 +863,39 @@ impl StorageBackedJobRunner {
             }
 
             pipeline_checkpoint(cx, "storage.pipeline.persist")?;
-            if record_claim_outcome(
-                job,
-                self.queue.check_claim(job, Some(&doc.content_hash))?,
-                &mut result,
-            )
-            .is_none()
-            {
-                continue;
-            }
-            let write_result = self
-                .vector_sink
-                .persist(&job.doc_id, &job.embedder_id, &embedding);
-            if let Err(error) = write_result {
-                if matches!(error, SearchError::Cancelled { .. }) {
-                    return Err(error);
-                }
-                if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
+            let request =
+                ClaimedEmbeddingWrite::new(cx, &self.queue, job, &doc.content_hash, &embedding);
+            // The sink rechecks this exact attempt after acquiring its writer
+            // lock. Checking here alone would allow a delayed lock waiter to
+            // overwrite a newer worker's successfully published coordinates.
+            let write_result = self.vector_sink.persist(&request);
+            // A synchronous sink may request cancellation while writing and
+            // still return success or an ordinary error. Leave that attempt
+            // unfinished in either case; already-written bytes cannot roll back.
+            pipeline_checkpoint(cx, "storage.pipeline.persisted")?;
+            let outcome = match write_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if matches!(error, SearchError::Cancelled { .. }) {
+                        return Err(error);
+                    }
+                    if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
+                        continue;
+                    }
+                    tracing::warn!(
+                        target: "frankensearch.storage.pipeline",
+                        stage = "persist",
+                        worker_id,
+                        correlation_id = %correlation_id,
+                        doc_id = %job.doc_id,
+                        embedder_id = %job.embedder_id,
+                        error = %error,
+                        "embedding persistence failed"
+                    );
                     continue;
                 }
-                tracing::warn!(
-                    target: "frankensearch.storage.pipeline",
-                    stage = "persist",
-                    worker_id,
-                    correlation_id = %correlation_id,
-                    doc_id = %job.doc_id,
-                    embedder_id = %job.embedder_id,
-                    error = %error,
-                    "embedding persistence failed"
-                );
+            };
+            if record_claim_outcome(job, outcome, &mut result).is_none() {
                 continue;
             }
 
@@ -2253,6 +2341,7 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ClaimHookStage {
         Inference,
+        BeforePersistenceLock,
         Persistence,
     }
 
@@ -2307,6 +2396,7 @@ mod tests {
         id: &'static str,
         identity: EmbeddingIdentityBundleV1,
         inputs: Mutex<Vec<String>>,
+        values: Mutex<Vec<f32>>,
         fail_next: AtomicBool,
     }
 
@@ -2326,6 +2416,7 @@ mod tests {
         ) -> SearchFuture<'a, IdentityBoundEmbedding> {
             Box::pin(async move {
                 self.inputs.lock().unwrap().push(text.to_owned());
+                let values = self.values.lock().unwrap().clone();
                 run_claim_hook(ClaimHookStage::Inference);
                 if self.fail_next.swap(false, Ordering::SeqCst) {
                     return Err(SearchError::EmbeddingFailed {
@@ -2334,7 +2425,7 @@ mod tests {
                     });
                 }
                 Ok(IdentityBoundEmbedding {
-                    values: vec![0.6, 0.8],
+                    values,
                     identity: self.identity.clone(),
                 })
             })
@@ -2368,21 +2459,20 @@ mod tests {
     }
 
     impl EmbeddingVectorSink for ClaimProbeSink {
-        fn persist(
-            &self,
-            doc_id: &str,
-            embedder_id: &str,
-            embedding: &IdentityBoundEmbedding,
-        ) -> SearchResult<()> {
-            self.stored.persist(doc_id, embedder_id, embedding)?;
+        fn persist(&self, request: &ClaimedEmbeddingWrite<'_>) -> SearchResult<ClaimOutcome<()>> {
+            run_claim_hook(ClaimHookStage::BeforePersistenceLock);
+            let outcome = self.stored.persist(request)?;
+            if !matches!(outcome, ClaimOutcome::Applied(())) {
+                return Ok(outcome);
+            }
             run_claim_hook(ClaimHookStage::Persistence);
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 return Err(SearchError::EmbeddingFailed {
-                    model: embedder_id.to_owned(),
+                    model: request.embedder_id().to_owned(),
                     source: io::Error::other("sink failed after its independent write").into(),
                 });
             }
-            Ok(())
+            Ok(outcome)
         }
     }
 
@@ -2397,6 +2487,7 @@ mod tests {
             id,
             identity: EmbeddingIdentityBundleV1::explicit_test_model(id, 2),
             inputs: Mutex::new(Vec::new()),
+            values: Mutex::new(vec![0.6, 0.8]),
             fail_next: AtomicBool::new(fail_inference),
         });
         let storage = Arc::new(Storage::open_in_memory().unwrap());
@@ -3174,6 +3265,154 @@ mod tests {
                 );
                 assert_eq!(sink.entries().len(), 2);
             });
+        }
+    }
+
+    #[test]
+    fn delayed_sink_write_cannot_overwrite_a_published_successor() {
+        for quality in [false, true] {
+            for replace_document in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(ClaimProbeSink::default());
+                    let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                    runner
+                        .ingest(IngestRequest::new("doc-delayed", "old content"))
+                        .unwrap();
+                    let hook_runner = Rc::clone(&runner);
+                    let hook_probe = Arc::clone(&probe);
+                    let hook_cx = cx.clone();
+                    let newer = Rc::new(RefCell::new(None));
+                    let hook_newer = Rc::clone(&newer);
+                    let _hook = ScopedClaimHook::install(
+                        ClaimHookStage::BeforePersistenceLock,
+                        move || {
+                            // The old worker has finished inference and is
+                            // paused immediately before acquiring the sink
+                            // writer lock. Run a complete newer attempt first.
+                            if replace_document {
+                                hook_runner
+                                    .ingest(IngestRequest::new(
+                                        "doc-delayed",
+                                        "replacement content",
+                                    ))
+                                    .unwrap();
+                            } else {
+                                expire_processing_document(&hook_runner, "doc-delayed");
+                            }
+                            *hook_probe.values.lock().unwrap() = vec![0.8, -0.6];
+                            let future = hook_runner.process_batch(&hook_cx, "same-worker");
+                            let mut future = std::pin::pin!(future);
+                            let mut context =
+                                std::task::Context::from_waker(std::task::Waker::noop());
+                            let std::task::Poll::Ready(result) =
+                                std::future::Future::poll(future.as_mut(), &mut context)
+                            else {
+                                panic!("the deterministic test provider must finish in one poll");
+                            };
+                            *hook_newer.borrow_mut() = Some(result.unwrap());
+                        },
+                    );
+
+                    let old = runner.process_batch(&cx, "same-worker").await.unwrap();
+                    assert_only_suppressed(&old, 1);
+                    let newer = newer.borrow();
+                    let newer = newer
+                        .as_ref()
+                        .expect("successor ran before the old lock wait");
+                    assert_eq!(newer.jobs_completed, 1);
+                    assert_eq!(newer.jobs_failed + newer.jobs_suppressed, 0);
+                    let entries = sink.stored.entries();
+                    assert_eq!(
+                        entries.len(),
+                        1,
+                        "old worker must not append after the successor"
+                    );
+                    assert_eq!(entries[0].embedding.values, vec![0.8, -0.6]);
+                    assert_catalog_status(&runner, probe.id, EmbeddingStatus::Embedded);
+                    let depth = runner.queue.queue_depth().unwrap();
+                    assert_eq!(depth.completed, 1);
+                    assert_eq!(depth.pending + depth.processing + depth.failed, 0);
+                    assert_eq!(runner.queue.metrics().snapshot().total_completed, 1);
+                    assert_eq!(runner.metrics().snapshot().total_jobs_suppressed, 1);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn sink_lock_wait_cancellation_preserves_claim_without_writing() {
+        for quality in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let sink = Arc::new(ClaimProbeSink::default());
+                let (runner, _) = make_claim_probe_runner(quality, false, sink.clone());
+                runner
+                    .ingest(IngestRequest::new("doc-cancelled-sink", "retained content"))
+                    .unwrap();
+                let hook_cx = cx.clone();
+                let _hook =
+                    ScopedClaimHook::install(ClaimHookStage::BeforePersistenceLock, move || {
+                        hook_cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("cancelled while waiting for the sink"),
+                        );
+                    });
+                assert!(matches!(
+                    runner.process_batch(&cx, "cancelled-worker").await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert!(sink.stored.entries().is_empty());
+                let depth = runner.queue.queue_depth().unwrap();
+                assert_eq!(depth.processing, 1);
+                assert_eq!(depth.completed + depth.failed + depth.skipped, 0);
+            });
+        }
+    }
+
+    #[test]
+    fn sink_cancellation_after_write_preserves_claim_and_written_bytes() {
+        for quality in [false, true] {
+            for fail_sink in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(ClaimProbeSink::default());
+                    sink.fail_next.store(fail_sink, Ordering::SeqCst);
+                    let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                    runner
+                        .ingest(IngestRequest::new(
+                            "doc-cancel-after-write",
+                            "retained content",
+                        ))
+                        .unwrap();
+                    let hook_cx = cx.clone();
+                    let _hook = ScopedClaimHook::install(ClaimHookStage::Persistence, move || {
+                        hook_cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("cancelled during the independent sink write"),
+                        );
+                    });
+
+                    assert!(matches!(
+                        runner.process_batch(&cx, "cancelled-worker").await,
+                        Err(SearchError::Cancelled { .. })
+                    ));
+                    // Cancellation fences catalog transitions, not bytes that
+                    // the independent sink already accepted. Reclaim can retry.
+                    let entries = sink.stored.entries();
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].doc_id, "doc-cancel-after-write");
+                    assert_catalog_status(&runner, probe.id, EmbeddingStatus::Pending);
+                    let depth = runner.queue.queue_depth().unwrap();
+                    assert_eq!(depth.processing, 1);
+                    assert_eq!(
+                        depth.pending + depth.completed + depth.failed + depth.skipped,
+                        0
+                    );
+                    let metrics = runner.queue.metrics().snapshot();
+                    assert_eq!(
+                        metrics.total_completed + metrics.total_failed + metrics.total_skipped,
+                        0
+                    );
+                });
+            }
         }
     }
 
@@ -4406,8 +4645,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn in_memory_vector_sink_persist_accumulates() {
         let sink = InMemoryVectorSink::default();
+        let cx = Cx::for_testing();
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
         let first = IdentityBoundEmbedding {
             values: vec![1.0, 2.0],
             identity: EmbeddingIdentityBundleV1::explicit_test_model("fast", 2),
@@ -4416,8 +4659,28 @@ mod tests {
             values: vec![3.0, 4.0],
             identity: EmbeddingIdentityBundleV1::explicit_test_model("fast", 2),
         };
-        sink.persist("doc-1", "fast", &first).unwrap();
-        sink.persist("doc-2", "fast", &second).unwrap();
+        for (doc_id, embedding) in [("doc-1", &first), ("doc-2", &second)] {
+            let hash = ContentHasher::hash(doc_id);
+            storage
+                .upsert_document(&DocumentRecord::new(
+                    doc_id,
+                    doc_id,
+                    hash,
+                    doc_id.len(),
+                    1,
+                    1,
+                ))
+                .unwrap();
+            queue.enqueue(doc_id, "fast", &hash, 0).unwrap();
+            let claim = queue.claim_batch("sink-test", 1).unwrap().pop().unwrap();
+            assert!(matches!(
+                sink.persist(&ClaimedEmbeddingWrite::new(
+                    &cx, &queue, &claim, &hash, embedding,
+                ))
+                .unwrap(),
+                ClaimOutcome::Applied(())
+            ));
+        }
         let entries = sink.entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].doc_id, "doc-1");

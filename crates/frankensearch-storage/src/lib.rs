@@ -68,9 +68,9 @@ pub use job_queue::{
 };
 pub use metrics::{StorageMetrics, StorageMetricsSnapshot};
 pub use pipeline::{
-    BatchIngestResult, BatchProcessResult, EmbeddingVectorSink, InMemoryVectorSink, IngestAction,
-    IngestRequest, IngestResult, PersistedEmbedding, PipelineConfig, PipelineMetrics,
-    PipelineMetricsSnapshot, StorageBackedJobRunner, WorkerReport,
+    BatchIngestResult, BatchProcessResult, ClaimedEmbeddingWrite, EmbeddingVectorSink,
+    InMemoryVectorSink, IngestAction, IngestRequest, IngestResult, PersistedEmbedding,
+    PipelineConfig, PipelineMetrics, PipelineMetricsSnapshot, StorageBackedJobRunner, WorkerReport,
 };
 pub use publication_cohort::{
     PublishedSearchCohort, PublishedSearchTextQuery, PublishedSearchTierHits,
