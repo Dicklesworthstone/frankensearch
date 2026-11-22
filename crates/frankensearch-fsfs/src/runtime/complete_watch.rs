@@ -671,6 +671,7 @@ impl CompleteWatchSession {
                 .first
                 .min(pending.map_or(now, |pending| pending.first));
         }
+        drop(changes);
         Ok(())
     }
 
