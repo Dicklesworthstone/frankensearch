@@ -332,13 +332,14 @@ impl ScanCompleteness {
 /// collector that cannot be told to stop turns every long walk into a window
 /// where a stop is ignored, which is exactly what shipping a hardcoded `false`
 /// produced.
-type SnapshotCollector = dyn Fn(
+type SnapshotCollector<'a> = dyn Fn(
         &[PathBuf],
         &DiscoveryConfig,
         &dyn Fn() -> bool,
     ) -> SearchResult<(FileSnapshot, ScanCompleteness)>
     + Send
-    + Sync;
+    + Sync
+    + 'a;
 
 /// Public watcher statistics snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1943,9 +1944,10 @@ impl FsWatcher {
                     .collect::<Vec<_>>();
                 &scoped_events
             };
-            let scan = |roots: &[PathBuf], discovery: &DiscoveryConfig, abort: &dyn Fn() -> bool| {
-                collect_scoped_snapshot(roots, &self.excluded_roots, discovery, abort)
-            };
+            let scan =
+                |roots: &[PathBuf], discovery: &DiscoveryConfig, abort: &dyn Fn() -> bool| {
+                    collect_scoped_snapshot(roots, &self.excluded_roots, discovery, abort)
+                };
             for event in events {
                 self.stats.mark_event(event.observed_at_ms);
             }
@@ -2049,7 +2051,9 @@ impl FsWatcher {
     ///
     /// Returns errors from filesystem traversal that are not safe to ignore.
     pub fn collect_snapshot(&self) -> SearchResult<(FileSnapshot, ScanCompleteness)> {
-        collect_scoped_snapshot(&self.roots, &self.excluded_roots, &self.discovery, &|| false)
+        collect_scoped_snapshot(&self.roots, &self.excluded_roots, &self.discovery, &|| {
+            false
+        })
     }
 
     /// Grant one-shot authority to rebuild deletion authority over names the
@@ -3030,7 +3034,7 @@ fn run_ingest_loop<'a>(
     reconciliation: &'a ReconciliationTracker,
     batch_size: usize,
     producer_done: &'a AtomicBool,
-    snapshot_collector: &'a SnapshotCollector,
+    snapshot_collector: &'a SnapshotCollector<'a>,
     watching_enabled: &'a dyn Fn() -> bool,
 ) -> WatchIngestFuture<'a, ()> {
     Box::pin(with_foreign_reactor_wake(cx, async move {
@@ -3292,7 +3296,7 @@ fn drain_final_batches<'a>(
     stats: &'a WatcherStatsInner,
     reconciliation: &'a ReconciliationTracker,
     producer_done: &'a AtomicBool,
-    snapshot_collector: &'a SnapshotCollector,
+    snapshot_collector: &'a SnapshotCollector<'a>,
 ) -> WatchIngestFuture<'a, ()> {
     Box::pin(async move {
         const PRODUCER_FLUSH_POLLS: usize = 2_000;
@@ -3559,7 +3563,7 @@ fn run_authoritative_reconciliation<'a>(
     ready_batches: &'a ReadyBatchQueue,
     stats: &'a WatcherStatsInner,
     batch_size: usize,
-    snapshot_collector: &'a SnapshotCollector,
+    snapshot_collector: &'a SnapshotCollector<'a>,
     abort: &'a dyn Fn() -> bool,
 ) -> WatchIngestFuture<'a, ()> {
     Box::pin(async move {
@@ -3909,7 +3913,7 @@ fn record_successful_events(
     discovery: &DiscoveryConfig,
     reconciliation: &ReconciliationTracker,
     events: &[WatchEvent],
-    snapshot_collector: &SnapshotCollector,
+    snapshot_collector: &SnapshotCollector<'_>,
     scan_abort: &dyn Fn() -> bool,
     commit_abort: &dyn Fn() -> bool,
 ) -> SearchResult<RecordSuccessfulEventsOutcome> {
@@ -4097,13 +4101,10 @@ fn process_notify_result(
             // pressure filtering, and invalidate any scan already in flight.
             // Reads of those same policies during a scan must not rearm it.
             let policy_changed = map_notify_kind(event.kind).is_some()
-                && event
-                    .paths
-                    .iter()
-                    .any(|path| {
-                        !path_is_excluded(path, &pending.excluded_roots)
-                            && is_ignore_policy_path(path, roots)
-                    });
+                && event.paths.iter().any(|path| {
+                    !path_is_excluded(path, &pending.excluded_roots)
+                        && is_ignore_policy_path(path, roots)
+                });
             if event.need_rescan() || policy_changed {
                 lock_or_recover(reconciliation).require_full_scan()?;
             }
