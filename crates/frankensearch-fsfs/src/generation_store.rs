@@ -231,6 +231,48 @@ pub struct GenerationBuild {
     lease: PublicationLease,
 }
 
+/// Holds the writer lease during read-only admission, before allocating a
+/// candidate directory or changing first-migration routing.
+pub(crate) struct GenerationBuildAdmission<'a> {
+    store: &'a CompleteGenerationStore,
+    lease: PublicationLease,
+    pointer: Option<Vec<u8>>,
+    predecessor: Option<PublishedGeneration>,
+}
+
+impl GenerationBuildAdmission<'_> {
+    pub(crate) const fn predecessor(&self) -> Option<&PublishedGeneration> {
+        self.predecessor.as_ref()
+    }
+
+    pub(crate) fn allocate(self, cx: &Cx, protect_legacy: bool) -> SearchResult<GenerationBuild> {
+        let root = &self.store.root;
+        checkpoint(cx)?;
+        self.lease
+            .fence("complete-generation predecessor admission")?;
+        if read_pointer(root)? != self.pointer {
+            return Err(invalid(
+                root,
+                "selection changed during predecessor admission",
+            ));
+        }
+        if protect_legacy
+            && self.pointer.is_none()
+            && entry_is_absent(&root.join(GENERATIONS))?
+            && entry_is_absent(&root.join(READER_PINS))?
+            && entry_is_absent(&root.join(ACTIVATION_HISTORY))?
+        {
+            let marker = root.join(LEGACY_MIGRATION);
+            if entry_is_absent(&marker)? {
+                write_new_synced(&marker, LEGACY_MIGRATION_PENDING)?;
+            }
+            File::open(root)?.sync_all()?;
+        }
+        self.store
+            .allocate_build(cx, self.lease, self.pointer, true)
+    }
+}
+
 impl std::fmt::Debug for GenerationBuild {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -453,52 +495,25 @@ impl CompleteGenerationStore {
     /// # Errors
     /// Returns contention, cancellation, corrupt-current, or filesystem errors.
     pub fn begin(&self, cx: &Cx) -> SearchResult<GenerationBuild> {
-        self.begin_with_predecessor_check(cx, |_| Ok(false))
+        self.admit_build(cx)?.allocate(cx, false)
     }
 
-    /// Validate a consumer's source scope under the same publication lease
-    /// that selects the predecessor, before allocating an inactive generation.
-    /// The check is read-only and cannot authorize a corrupt predecessor. It
-    /// may identify a completed legacy index whose foreground reads should
-    /// continue until the first complete publication.
-    pub(crate) fn begin_with_predecessor_check<F>(
-        &self,
-        cx: &Cx,
-        check: F,
-    ) -> SearchResult<GenerationBuild>
-    where
-        F: FnOnce(Option<&PublishedGeneration>) -> SearchResult<bool>,
-    {
+    /// Select the predecessor under the publisher's lease before allocating.
+    pub(crate) fn admit_build(&self, cx: &Cx) -> SearchResult<GenerationBuildAdmission<'_>> {
         checkpoint(cx)?;
         self.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation build entry")?;
-        let predecessor = read_pointer(&self.root)?;
+        let pointer = read_pointer(&self.root)?;
         // A corrupt predecessor must be repaired explicitly, not silently
         // overwritten just because a new rebuild could be started.
-        let active = self.active(cx)?;
-        let protect_legacy = check(active.as_ref())?;
-        checkpoint(cx)?;
-        lease.fence("complete-generation predecessor admission")?;
-        if read_pointer(&self.root)? != predecessor {
-            return Err(invalid(
-                &self.root,
-                "selection changed during predecessor admission",
-            ));
-        }
-        if protect_legacy
-            && predecessor.is_none()
-            && entry_is_absent(&self.root.join(GENERATIONS))?
-            && entry_is_absent(&self.root.join(READER_PINS))?
-            && entry_is_absent(&self.root.join(ACTIVATION_HISTORY))?
-        {
-            let marker = self.root.join(LEGACY_MIGRATION);
-            if entry_is_absent(&marker)? {
-                write_new_synced(&marker, LEGACY_MIGRATION_PENDING)?;
-            }
-            File::open(&self.root)?.sync_all()?;
-        }
-        self.allocate_build(cx, lease, predecessor, true)
+        let predecessor = self.active(cx)?;
+        Ok(GenerationBuildAdmission {
+            store: self,
+            lease,
+            pointer,
+            predecessor,
+        })
     }
 
     /// Whether an ordinary first conversion left legacy foreground reads in
@@ -2595,9 +2610,7 @@ mod tests {
             let fixture = tempfile::tempdir().unwrap();
             let root = fixture.path().join("store");
             let store = CompleteGenerationStore::create(&cx, &root).unwrap();
-            let build = store
-                .begin_with_predecessor_check(&cx, |_| Ok(true))
-                .unwrap();
+            let build = store.admit_build(&cx).unwrap().allocate(&cx, true).unwrap();
             assert!(CompleteGenerationStore::legacy_migration_pending(&root).unwrap());
             let alias = fixture.path().join("alias");
             std::os::unix::fs::symlink(&root, &alias).unwrap();
@@ -2630,9 +2643,7 @@ mod tests {
             write_new_synced(&root.join(LEGACY_MIGRATION), LEGACY_MIGRATION_PENDING).unwrap();
             assert!(!CompleteGenerationStore::legacy_migration_pending(&root).unwrap());
             fs::rename(root.join(LEGACY_MIGRATION), root.join("obsolete-marker")).unwrap();
-            let _retry = store
-                .begin_with_predecessor_check(&cx, |_| Ok(true))
-                .unwrap();
+            let _retry = store.admit_build(&cx).unwrap().allocate(&cx, true).unwrap();
             assert!(entry_is_absent(&root.join(LEGACY_MIGRATION)).unwrap());
         });
     }

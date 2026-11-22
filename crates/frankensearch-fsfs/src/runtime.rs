@@ -22442,6 +22442,10 @@ impl FsfsRuntime {
             && !self.cli_input.full_reindex
             && admitted_producers.fast.is_none()
             && admitted_producers.quality.is_none();
+        // Legacy admission can defer probes based on the source and artifacts
+        // before allocation. Recheck the actual seed and fresh discovery
+        // before honoring that decision.
+        let legacy_probes_deferred = admitted_producers.probes_deferred;
         let embedder = if lexical_only {
             None
         } else if quality_only {
@@ -22584,7 +22588,8 @@ impl FsfsRuntime {
         } else {
             None
         };
-        let probe_free_digests = if can_reuse_without_inference
+        let probe_free_digests = if (can_reuse_without_inference
+            || (legacy_probes_deferred && self.receipt_seed == Some(retained_reuse::ReceiptSeed::Legacy)))
             && let Some(producers) = primary_admission.as_ref().zip(quality_admission.as_ref())
             && let Some(checkpoint) = existing_checkpoint.as_ref().zip(checkpoint_manifests.as_ref())
         {
@@ -22600,7 +22605,7 @@ impl FsfsRuntime {
         } else {
             None
         };
-        if can_reuse_without_inference && probe_free_digests.is_none() {
+        if (can_reuse_without_inference || legacy_probes_deferred) && probe_free_digests.is_none() {
             if let Some(embedder) = embedder.as_ref() {
                 Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
             }

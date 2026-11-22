@@ -454,13 +454,13 @@ rebuilds the index. Contract v5 also checks the fast semantic window overlap
 and the file classifier's default policies. A change to either can alter
 which text is indexed even when the files and models are identical.
 Reuse skips document embedding for verified unchanged rows. With
-`compatible-contract`, an already selected two-tier generation can also skip
-startup health probes when the current producers, source files, and both
-vector tiers agree in full. Models are still verified and loaded. An absent
-optional quality model allows fast-only indexing. If the run requests an
-installed quality model and that model fails verification or loading, the
-upgrade stops and preserves the previous selection. Restore the verified
-model before retrying.
+`compatible-contract`, converting a completed legacy index or rebuilding a
+selected complete generation can also skip startup health probes when the
+current producers, source files, and both vector tiers agree in full. Models
+are still verified and loaded. An absent optional quality model allows
+fast-only indexing. If the run requests an installed quality model and that
+model fails verification or loading, the upgrade stops and preserves the
+previous selection. Restore the verified model before retrying.
 On complete-generation stores, `compact` and `delete` preserve admitted reuse
 evidence for surviving documents without running embedding inference. A later
 index reuses those documents and embeds changed or restored source rows.

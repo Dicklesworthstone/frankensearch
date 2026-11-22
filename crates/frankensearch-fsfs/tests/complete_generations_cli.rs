@@ -1761,6 +1761,14 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
             .count()
     }
 
+    fn startup_probes(output: &Output) -> usize {
+        std::str::from_utf8(&output.stderr)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("event=\"fsfs.semantic_probe_succeeded\""))
+            .count()
+    }
+
     fn search_ranks(fixture: &Fixture) -> Vec<(Value, Value, Value)> {
         let output = execute(fixture.command("s", "json").args([
             "find a relevant document",
@@ -1815,19 +1823,29 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
         .build()
         .unwrap();
     let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
-    for (seed_complete, policy, drift, carried, embeds) in [
-        (true, "same-executable", "none", 0, true),
-        (true, "compatible-contract", "none", 2, false),
-        (true, "compatible-contract", "source", 1, true),
-        (true, "compatible-contract", "window", 0, true),
-        (false, "same-executable", "none", 0, true),
-        (false, "compatible-contract", "none", 2, false),
+    for (seed_complete, two_tier, policy, drift, carried, embeds) in [
+        (true, false, "same-executable", "none", 0, true),
+        (true, false, "compatible-contract", "none", 2, false),
+        (true, false, "compatible-contract", "source", 1, true),
+        (true, false, "compatible-contract", "window", 0, true),
+        (false, false, "same-executable", "none", 0, true),
+        (false, false, "compatible-contract", "none", 2, false),
+        (false, true, "same-executable", "none", 0, true),
+        (false, true, "compatible-contract", "none", 2, false),
+        (false, true, "compatible-contract", "source", 1, true),
     ] {
         eprintln!(
-            "cross-executable case prior={prior_sha} current={current_sha} seed_complete={seed_complete} policy={policy} drift={drift}"
+            "cross-executable case prior={prior_sha} current={current_sha} seed_complete={seed_complete} two_tier={two_tier} policy={policy} drift={drift}"
         );
         let mut fixture = Fixture::new();
         fixture.write_config(Some(&models), "{index_dir}/catalog.sqlite");
+        if two_tier {
+            let mut config: FsfsConfig =
+                toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
+            config.indexing.quality_model = "all-MiniLM-L6-v2".to_owned();
+            config.search.fast_only = false;
+            fs::write(&fixture.config, config.to_toml().unwrap()).unwrap();
+        }
         fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
         fixture.executable.clone_from(&prior);
         let indexing = |fixture: &Fixture, policy: &str, complete: bool| {
@@ -1837,7 +1855,10 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
             }
             execute(
                 command
-                    .env("FRANKENSEARCH_LOG", "frankensearch_fsfs::indexing=debug")
+                    .env(
+                        "FRANKENSEARCH_LOG",
+                        "frankensearch_fsfs=info,frankensearch_fsfs::indexing=debug",
+                    )
                     .args(["--no-color", "--upgrade-reuse", policy]),
             )
         };
@@ -1846,6 +1867,9 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
         assert_eq!(first["data"]["generation_complete"], true);
         assert_eq!(first["data"]["semantic_indexed_files"], 2);
         let seed_batches = document_embedding_batches(&first_output);
+        if two_tier {
+            assert_eq!(startup_probes(&first_output), 2, "cold two-tier control");
+        }
         assert!(
             seed_batches > 0,
             "the log control must observe document inference"
@@ -1874,11 +1898,26 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
         let before = generation_files(predecessor);
 
         if drift == "source" {
-            fs::write(
-                fixture.source.join("alpha.md"),
-                "sharedtoken alpha revised document",
-            )
-            .unwrap();
+            let path = fixture.source.join("alpha.md");
+            if two_tier {
+                // Equal size and mtime still require content revalidation.
+                let previous = fs::metadata(&path).unwrap();
+                let before = fs::read_to_string(&path).unwrap();
+                let changed = before.replace("alpha", "omega");
+                assert_ne!(changed, before);
+                fs::write(&path, changed).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(previous.modified().unwrap()))
+                    .unwrap();
+                let after = fs::metadata(&path).unwrap();
+                assert_eq!(after.len(), previous.len());
+                assert_eq!(after.modified().unwrap(), previous.modified().unwrap());
+            } else {
+                fs::write(path, "sharedtoken alpha revised document").unwrap();
+            }
         } else if drift == "window" {
             let mut config: FsfsConfig =
                 toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
@@ -1916,6 +1955,10 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
         );
         let batches = document_embedding_batches(&second_output);
         assert_eq!(batches > 0, embeds, "{policy}/{drift}: {second}");
+        let probes = startup_probes(&second_output);
+        if two_tier {
+            assert_eq!(probes, if embeds { 2 } else { 0 }, "{policy}/{drift}");
+        }
         if seed_complete {
             assert_eq!(generation_files(predecessor), before);
         } else {
@@ -1961,7 +2004,7 @@ fn complete_cli_binary_reuses_compatible_prior_executable_with_real_models() {
             assert_eq!(index_artifacts(after), expected);
         }
         eprintln!(
-            "cross-executable reuse prior={prior_sha} current={current_sha} seed_complete={seed_complete} policy={policy} drift={drift} carried={carried} seed_document_batches={seed_batches} current_document_batches={batches}"
+            "cross-executable reuse prior={prior_sha} current={current_sha} seed_complete={seed_complete} two_tier={two_tier} policy={policy} drift={drift} carried={carried} seed_document_batches={seed_batches} current_document_batches={batches} current_startup_probes={probes}"
         );
     }
 }

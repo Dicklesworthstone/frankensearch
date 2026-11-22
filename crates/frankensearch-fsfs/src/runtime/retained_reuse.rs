@@ -178,7 +178,7 @@ struct ReuseReceipt {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LegacyReuseReceipt {
+pub(super) struct LegacyReuseReceipt {
     version: u16,
     receipt: ReuseReceipt,
     // Bind the receipt itself as well as the artifacts: changing a content
@@ -447,7 +447,7 @@ impl FsfsRuntime {
         store: &CompleteGenerationStore,
         candidate_root: &Path,
         resumed: bool,
-        admitted_producers: super::RetainedBuildProducers,
+        mut admitted_producers: super::RetainedBuildProducers,
         on_progress: F,
     ) -> SearchResult<FsfsIndexPayload>
     where
@@ -456,6 +456,8 @@ impl FsfsRuntime {
         execution::prepare(cx).await?;
         let seed = if resumed {
             None
+        } else if let Some(evidence) = admitted_producers.legacy_evidence.take() {
+            copy_legacy_seed(cx, self, store.root(), candidate_root, evidence)?
         } else {
             seed_candidate(cx, self, store, candidate_root)?
         };
@@ -481,8 +483,8 @@ impl FsfsRuntime {
     }
 }
 
-/// Given the validated checkpoint of a seeded complete generation, prove that
-/// every row can be carried without invoking either producer. Return the files
+/// Given a validated completion checkpoint, prove that every row can be
+/// carried without invoking either producer. Return the files
 /// whose bytes were read so ordinary checkpoint validation can reuse the digests.
 pub(super) async fn prove_two_tier_reuse_without_inference(
     cx: &Cx,
@@ -587,6 +589,25 @@ pub(super) async fn prove_two_tier_reuse_without_inference(
     Ok(Some(digest_proven))
 }
 
+pub(super) async fn prove_legacy_seed_without_inference(
+    cx: &Cx,
+    root: &Path,
+    candidates: &[IndexCandidate],
+    source_policy: IndexSourcePolicy,
+    evidence: &LegacyReuseReceipt,
+    producers: (&AdmittedEmbedder, &AdmittedEmbedder),
+) -> SearchResult<bool> {
+    let checkpoint = &evidence.receipt.checkpoint;
+    let Some(manifests) = FsfsRuntime::read_checkpoint_manifest_generation(root, checkpoint)? else {
+        return Ok(false);
+    };
+    Ok(prove_two_tier_reuse_without_inference(
+        cx, root, candidates, source_policy, (checkpoint, &manifests), producers,
+    )
+    .await?
+    .is_some())
+}
+
 fn completed_receipt(
     runtime: &FsfsRuntime,
     root: &Path,
@@ -683,7 +704,7 @@ pub(super) fn legacy_checkpoint(
 }
 
 /// The completion evidence whose receipt still binds the root's artifacts.
-fn admitted_legacy_evidence(
+pub(super) fn admitted_legacy_evidence(
     cx: &Cx,
     runtime: &FsfsRuntime,
     root: &Path,
@@ -1388,6 +1409,19 @@ fn seed_candidate_from_legacy(
     let Some(evidence) = admitted_legacy_evidence(cx, runtime, root)? else {
         return Ok(None);
     };
+    copy_legacy_seed(cx, runtime, root, destination, evidence)
+}
+
+// The evidence was admitted under the store's still-held publication lease.
+// The candidate must independently match it even if legacy artifacts change
+// outside that protocol before or during the copy.
+fn copy_legacy_seed(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    root: &Path,
+    destination: &Path,
+    evidence: LegacyReuseReceipt,
+) -> SearchResult<Option<(ReceiptSeed, usize)>> {
     if !fs::symlink_metadata(destination)?.file_type().is_dir()
         || fs::read_dir(destination)?.next().transpose()?.is_some()
     {
@@ -2937,10 +2971,14 @@ mod generation_tests {
                     let parent = tempfile::tempdir().unwrap();
                     fixture(parent.path(), 2);
                     assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
-                    let (runtime, _, root) = two_tier_fixture(parent.path(), 1);
+                    let (runtime, source, root) = two_tier_fixture(parent.path(), 1);
                     let runtime = runtime.with_contract_upgrade_reuse(true);
                     let receipt_path = root.join(LEGACY_RECEIPT_FILE);
                     let receipt = fs::read(&receipt_path).unwrap();
+                    // New membership cannot carry completely, so probes are
+                    // still required before the first candidate is allocated.
+                    let added = source.join("added.md");
+                    fs::write(&added, "sharedtoken new document").unwrap();
                     let mut fast = CountingEmbedder::new("reuse-fast", 4, false);
                     let mut quality = CountingEmbedder::new("reuse-quality", 6, false);
                     fast.fail_probe = fail_fast;
@@ -2959,6 +2997,7 @@ mod generation_tests {
                     );
                     assert_eq!(fs::read(receipt_path).unwrap(), receipt);
                     drop(original);
+                    fs::rename(added, parent.path().join("unused.md")).unwrap();
 
                     let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
                     let quality = Arc::new(CountingEmbedder::new("reuse-quality", 6, false));
@@ -2973,8 +3012,8 @@ mod generation_tests {
                     fast.counts.documents.store(0, Ordering::SeqCst);
                     quality.counts.documents.store(0, Ordering::SeqCst);
                     publish(&runtime, &cx, &root).await;
-                    assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 1);
-                    assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 1);
+                    assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 0);
                     assert_eq!(fast.counts.documents.load(Ordering::SeqCst), 0);
                     assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 0);
                 }
@@ -3057,7 +3096,7 @@ mod generation_tests {
                 let runtime = runtime.with_contract_upgrade_reuse(true);
                 let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
                 let quality = Arc::new(CountingEmbedder::new("reuse-quality", 6, false));
-                let _restore = RestoreEmbedders::install(fast, quality);
+                let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
                 let receipt = fs::read(root.join(LEGACY_RECEIPT_FILE)).unwrap();
                 let error = runtime
                     .rebuild_retained_generation_with_precommit(&cx, &root, |_| {
@@ -3074,6 +3113,8 @@ mod generation_tests {
                 let pointer = root.join(crate::generation_store::COMPLETE_GENERATION_POINTER);
                 assert!(!pointer.exists());
                 assert_eq!(fs::read(root.join(LEGACY_RECEIPT_FILE)).unwrap(), receipt);
+                assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 0);
 
                 let mut search = runtime.clone();
                 search.cli_input.command = CliCommand::Search;
@@ -3100,7 +3141,11 @@ mod generation_tests {
                     assert_eq!(writer.complete_generation_command_root(false).unwrap(), Some(root.clone()));
                 }
 
+                fast.counts.probes.store(0, Ordering::SeqCst);
+                quality.counts.probes.store(0, Ordering::SeqCst);
                 let migrated = publish(&runtime, &cx, &root).await;
+                assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 0);
                 let saved_pointer = parent.path().join("published-pointer");
                 fs::rename(&pointer, &saved_pointer).unwrap();
                 for corrupt in [false, true] {

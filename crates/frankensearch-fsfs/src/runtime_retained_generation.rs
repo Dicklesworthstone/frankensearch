@@ -17,9 +17,11 @@ enum RetainedRebuildStart<'a> {
 
 #[derive(Default)]
 struct RetainedBuildProducers {
-    // Hold the exact producers whose readiness was verified before routing.
+    // Keep the same loaded producers through admission and source indexing.
     fast: Option<Arc<dyn Embedder>>,
     quality: Option<IndexingQualityTier>,
+    probes_deferred: bool,
+    legacy_evidence: Option<retained_reuse::LegacyReuseReceipt>,
 }
 
 /// A reusable search reader bound to one admitted complete generation.
@@ -671,6 +673,7 @@ impl FsfsRuntime {
             return Ok(RetainedBuildProducers {
                 fast: None,
                 quality: Some((Some(embedder), REASON_VECTOR_QUALITY_TIER_BUILT)),
+                ..RetainedBuildProducers::default()
             });
         }
         if !matches!(
@@ -682,7 +685,8 @@ impl FsfsRuntime {
                 | DegradationOverrideMode::ForceMetadataOnly
                 | DegradationOverrideMode::ForcePaused
         ) || complete_cli::complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
-            || complete_cli::complete_entry_exists(&root.join("generations"))?
+            || (complete_cli::complete_entry_exists(&root.join("generations"))?
+                && !crate::generation_store::CompleteGenerationStore::legacy_migration_pending(root)?)
             || !Self::read_index_sentinel(root)?
                 .is_some_and(|sentinel| sentinel.generation_complete)
         {
@@ -716,7 +720,10 @@ impl FsfsRuntime {
         let embedder = resolved?;
         control.checkpoint(cx, "index.fast_model_loaded", true)?;
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
-        Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+        let probes_deferred = self.contract_upgrade_reuse_enabled() && !self.cli_input.full_reindex;
+        if !probes_deferred {
+            Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+        }
         let quality = {
             control.admit_work(cx, "index.quality_model_load").await?;
             // Unit tests inject providers on the caller's thread.
@@ -731,7 +738,7 @@ impl FsfsRuntime {
                 self.resolve_indexing_quality_embedder()?
             };
             control.checkpoint(cx, "index.quality_model_loaded", true)?;
-            if let Some(quality_embedder) = tier.0.as_ref() {
+            if !probes_deferred && let Some(quality_embedder) = tier.0.as_ref() {
                 Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
             }
             tier
@@ -740,6 +747,8 @@ impl FsfsRuntime {
         Ok(RetainedBuildProducers {
             fast: Some(embedder),
             quality: Some(quality),
+            probes_deferred,
+            legacy_evidence: None,
         })
     }
 
@@ -748,13 +757,9 @@ impl FsfsRuntime {
         cx: &Cx,
         root: &Path,
         target_root: &Path,
+        source_policy: IndexSourcePolicy,
+        on_candidate: impl FnMut(IndexCandidate),
     ) -> SearchResult<()> {
-        let source_policy = IndexSourcePolicy::for_index_root(root)?;
-        if source_policy == IndexSourcePolicy::BestEffort
-            || complete_cli::complete_entry_exists(&root.join("generations"))?
-        {
-            return Ok(());
-        }
         // Creating `generations` takes over routing from the legacy index. Run
         // normal discovery under the root's writer lease before that boundary.
         // The indexer takes a fresh observation after seeding; the lease does
@@ -762,8 +767,44 @@ impl FsfsRuntime {
         let source = IndexSourceRoot::open(target_root)?;
         let mut control = IndexRunControl::new(&self.config)?;
         control.checkpoint(cx, "index.discovery", true)?;
-        self.discover_index_candidates(cx, &mut control, target_root, root, source_policy, drop)?;
+        self.discover_index_candidates(cx, &mut control, target_root, root, source_policy, on_candidate)?;
         source.check()?;
+        Ok(())
+    }
+
+    async fn complete_legacy_probe_admission(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        candidates: &[IndexCandidate],
+        source_policy: IndexSourcePolicy,
+        has_predecessor: bool,
+        producers: &mut RetainedBuildProducers,
+    ) -> SearchResult<()> {
+        if !producers.probes_deferred {
+            return Ok(());
+        }
+        let fast = producers.fast.as_ref().expect("deferred fast producer");
+        let quality = producers.quality.as_ref().and_then(|tier| tier.0.as_ref());
+        if !has_predecessor && let Some(quality) = quality {
+            retained_reuse::prepare_legacy_reuse(cx).await?;
+            if let Some(evidence) = retained_reuse::admitted_legacy_evidence(cx, self, root)? {
+                let fast_admission = self.admit_workload_embedder(cx, Arc::clone(fast), WorkloadClass::Embed)?;
+                let quality_admission = self.admit_workload_embedder(cx, Arc::clone(quality), WorkloadClass::Embed)?;
+                let proven = retained_reuse::prove_legacy_seed_without_inference(
+                    cx, root, candidates, source_policy, &evidence, (&fast_admission, &quality_admission),
+                ).await?;
+                producers.legacy_evidence = Some(evidence);
+                if proven {
+                    return Ok(());
+                }
+            }
+        }
+        Self::probe_indexing_embedder(cx, fast.as_ref()).await?;
+        if let Some(quality) = quality {
+            Self::probe_indexing_embedder(cx, quality.as_ref()).await?;
+        }
+        producers.probes_deferred = false;
         Ok(())
     }
 
@@ -808,7 +849,7 @@ impl FsfsRuntime {
         // Refuse incompatible installed producers before taking over routing
         // from a searchable legacy index. Reuse the ready producers and check
         // their identities against any rows the indexer carries.
-        let producers =
+        let mut producers =
             if kind == RetainedBuildKind::Index && matches!(start, RetainedRebuildStart::Fresh) {
                 self.admit_retained_build_producers(cx, &canonical_root)
                     .await?
@@ -825,21 +866,35 @@ impl FsfsRuntime {
             RetainedRebuildStart::Resume(receipt) => receipt.resume(cx, &store)?,
             _ => match kind {
                 RetainedBuildKind::Index => {
-                    store.begin_with_predecessor_check(cx, |predecessor| {
-                        self.validate_index_source_root(
-                            predecessor
-                                .map_or_else(|| store.root(), |generation| generation.path()),
-                            &target_root,
-                        )?;
-                        if predecessor.is_none() {
-                            self.validate_first_migration_discovery(cx, store.root(), &target_root)?;
-                        }
-                        Ok(predecessor.is_none()
-                            && Self::read_index_sentinel(store.root())
-                                .ok()
-                                .flatten()
-                                .is_some_and(|sentinel| sentinel.generation_complete))
-                    })?
+                    let admission = store.admit_build(cx)?;
+                    let predecessor = admission.predecessor();
+                    let root = store.root();
+                    self.validate_index_source_root(
+                        predecessor.map_or(root, |generation| generation.path()),
+                        &target_root,
+                    )?;
+                    let source_policy = IndexSourcePolicy::for_index_root(root)?;
+                    let mut candidates = Vec::new();
+                    if predecessor.is_none()
+                        && source_policy == IndexSourcePolicy::RequireReadable
+                        && (producers.probes_deferred
+                            || !complete_cli::complete_entry_exists(&root.join("generations"))?)
+                    {
+                        self.validate_first_migration_discovery(cx, root, &target_root, source_policy, |candidate| {
+                            if producers.probes_deferred {
+                                candidates.push(candidate);
+                            }
+                        })?;
+                    }
+                    Box::pin(self.complete_legacy_probe_admission(
+                        cx, root, &candidates, source_policy, predecessor.is_some(), &mut producers,
+                    )).await?;
+                    let protect_legacy = predecessor.is_none()
+                        && Self::read_index_sentinel(root)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|sentinel| sentinel.generation_complete);
+                    admission.allocate(cx, protect_legacy)?
                 }
                 RetainedBuildKind::Recovery => store.begin_recovery_rebuild(cx)?,
             },

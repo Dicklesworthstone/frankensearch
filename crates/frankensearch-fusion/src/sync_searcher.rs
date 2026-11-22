@@ -6186,7 +6186,10 @@ mod tests {
                 serde_json::to_value(results).unwrap(),
                 "the failure preserves the exact previously published ranking"
             );
-            assert!(phases.next().is_none(), "cancelled searches must not run MMR");
+            assert!(
+                phases.next().is_none(),
+                "cancelled searches must not run MMR"
+            );
             assert!(phases.next().is_none(), "terminal iteration cannot retry");
             assert_eq!(lexical.cancellations.load(Ordering::SeqCst), 2);
 
