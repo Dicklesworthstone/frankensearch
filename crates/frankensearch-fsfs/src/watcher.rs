@@ -3723,6 +3723,7 @@ fn run_authoritative_reconciliation<'a>(
                 } else {
                     reconciliation_state.require_for_events(&attempted_prefix)?;
                 }
+                drop(reconciliation_state);
                 return Err(SearchError::SubsystemError {
                     subsystem: "fsfs-watcher",
                     source: Box::new(io::Error::other(
@@ -7765,6 +7766,7 @@ mod tests {
                         .snapshot
                         .contains_key(&excluded)
                 );
+                drop(state);
             });
         }
     }
@@ -8093,6 +8095,7 @@ mod tests {
                 assert!(state.required);
                 assert!(state.indexed_snapshot.contains_key(&public));
                 assert!(!state.indexed_snapshot.contains_key(&excluded));
+                drop(state);
             }
             watcher.process_events_now(&cx, &[]).await.unwrap();
             assert!(matches!(
@@ -13374,6 +13377,7 @@ mod tests {
                     assert!(!reconciliation_state.required);
                     assert!(reconciliation_state.indexed_snapshot.is_empty());
                     assert!(reconciliation_state.affected_paths.is_empty());
+                    drop(reconciliation_state);
                 });
             }
         }
@@ -13510,6 +13514,7 @@ mod tests {
                         .unwrap()
                         .covers(&roots)
                 );
+                drop(reconciliation_state);
             });
         }
     }

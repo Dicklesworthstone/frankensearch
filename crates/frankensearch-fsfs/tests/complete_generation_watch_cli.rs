@@ -1152,12 +1152,17 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                 "watch upgrade prior={prior_sha} current={current_sha} quality={quality} legacy_seed={legacy_seed} policy={policy} drift={drift}"
             );
             let mut fixture = Fixture::new(Some(&models), quality);
-            if drift == "tier" && !quality {
-                // Keep the selected producer fixed across A and B. Only the
-                // effective tier-coverage switch changes after the A build.
+            if quality || drift == "tier" {
                 let mut settings: FsfsConfig =
                     toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
-                settings.indexing.quality_model = FsfsConfig::default().indexing.quality_model;
+                // This matrix checks ranking and retained tier coverage on
+                // cold CLI readers while a watcher is running.
+                settings.search.quality_timeout_ms = 5_000;
+                if !quality {
+                    // Keep the selected producer fixed across A and B. Only
+                    // effective tier coverage changes after the A build.
+                    settings.indexing.quality_model = FsfsConfig::default().indexing.quality_model;
+                }
                 fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
             }
             fixture.executable.clone_from(&prior);
