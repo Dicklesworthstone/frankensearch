@@ -3717,11 +3717,11 @@ fn run_authoritative_reconciliation<'a>(
                 // before preparation. Committing that snapshot would claim an
                 // unapplied upsert and clear its deletion debt. Earlier chunks
                 // may have landed; the rejected chunk has no mutation evidence.
-                let mut state = lock_or_recover(reconciliation);
+                let mut reconciliation_state = lock_or_recover(reconciliation);
                 if attempted_prefix.is_empty() {
-                    state.require_full_scan()?;
+                    reconciliation_state.require_full_scan()?;
                 } else {
-                    state.require_for_events(&attempted_prefix)?;
+                    reconciliation_state.require_for_events(&attempted_prefix)?;
                 }
                 return Err(SearchError::SubsystemError {
                     subsystem: "fsfs-watcher",
@@ -13292,7 +13292,7 @@ mod tests {
                                 fs::OpenOptions::new()
                                     .write(true)
                                     .open(&changing_for_scan)?
-                                    .set_len(1024 * 1024 + 1)?;
+                                    .set_len(4 * 1024 * 1024 + 1)?;
                             }
                             Ok(observed)
                         };
@@ -13320,11 +13320,11 @@ mod tests {
                         BTreeSet::new()
                     };
                     {
-                        let state = lock_or_recover(&reconciliation);
-                        assert!(state.required);
-                        assert_eq!(state.indexed_snapshot, baseline);
-                        assert_eq!(state.authority, authority);
-                        assert_eq!(state.affected_paths, expected_debt);
+                        let reconciliation_state = lock_or_recover(&reconciliation);
+                        assert!(reconciliation_state.required);
+                        assert_eq!(reconciliation_state.indexed_snapshot, baseline);
+                        assert_eq!(reconciliation_state.authority, authority);
+                        assert_eq!(reconciliation_state.affected_paths, expected_debt);
                     }
                     let applied = pipeline.all_ops();
                     if batch_size == 1 {
@@ -13370,10 +13370,10 @@ mod tests {
                         expected_deletes.insert(normalize_file_key(&accepted));
                     }
                     assert_eq!(deletes, expected_deletes);
-                    let state = lock_or_recover(&reconciliation);
-                    assert!(!state.required);
-                    assert!(state.indexed_snapshot.is_empty());
-                    assert!(state.affected_paths.is_empty());
+                    let reconciliation_state = lock_or_recover(&reconciliation);
+                    assert!(!reconciliation_state.required);
+                    assert!(reconciliation_state.indexed_snapshot.is_empty());
+                    assert!(reconciliation_state.affected_paths.is_empty());
                 });
             }
         }
@@ -13439,10 +13439,17 @@ mod tests {
                 [WatchIngestOp::Upsert { file_key, .. }]
                     if file_key == &normalize_file_key(&valid)
             ));
-            let state = lock_or_recover(&reconciliation);
-            assert!(!state.required);
-            assert_eq!(state.indexed_snapshot, snapshot);
-            assert_eq!(state.authority.established().unwrap().snapshot, snapshot);
+            let reconciliation_state = lock_or_recover(&reconciliation);
+            assert!(!reconciliation_state.required);
+            assert_eq!(reconciliation_state.indexed_snapshot, snapshot);
+            assert_eq!(
+                reconciliation_state
+                    .authority
+                    .established()
+                    .unwrap()
+                    .snapshot,
+                snapshot
+            );
         });
     }
 
@@ -13493,10 +13500,16 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(pipeline.all_ops().is_empty());
-                let state = lock_or_recover(&reconciliation);
-                assert!(!state.required);
-                assert!(state.indexed_snapshot.is_empty());
-                assert!(state.authority.established().unwrap().covers(&roots));
+                let reconciliation_state = lock_or_recover(&reconciliation);
+                assert!(!reconciliation_state.required);
+                assert!(reconciliation_state.indexed_snapshot.is_empty());
+                assert!(
+                    reconciliation_state
+                        .authority
+                        .established()
+                        .unwrap()
+                        .covers(&roots)
+                );
             });
         }
     }
