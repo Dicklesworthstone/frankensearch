@@ -3296,9 +3296,19 @@ mod tests {
                                         "replacement content",
                                     ))
                                     .unwrap();
-                            } else {
-                                expire_processing_document(&hook_runner, "doc-delayed");
+                                assert!(
+                                    hook_runner
+                                        .queue
+                                        .claim_batch("blocked-successor", 1)
+                                        .unwrap()
+                                        .is_empty(),
+                                    "a replacement stays pending while the old lease is processing"
+                                );
                             }
+                            // Reclamation releases the old processing lease
+                            // before either same-input or replacement work can
+                            // be claimed. The old in-flight response still exists.
+                            expire_processing_document(&hook_runner, "doc-delayed");
                             *hook_probe.values.lock().unwrap() = vec![0.8, -0.6];
                             let future = hook_runner.process_batch(&hook_cx, "same-worker");
                             let mut future = std::pin::pin!(future);
