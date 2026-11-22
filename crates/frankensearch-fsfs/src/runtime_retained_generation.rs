@@ -17,8 +17,8 @@ enum RetainedRebuildStart<'a> {
 
 #[derive(Default)]
 struct RetainedBuildProducers {
-    // Keep the shared fast loader's weak cache alive through candidate admission.
-    _fast: Option<Arc<dyn Embedder>>,
+    // Hold the exact producers whose readiness was verified before routing.
+    fast: Option<Arc<dyn Embedder>>,
     quality: Option<IndexingQualityTier>,
 }
 
@@ -669,7 +669,7 @@ impl FsfsRuntime {
             Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
             retained_search_checkpoint(cx)?;
             return Ok(RetainedBuildProducers {
-                _fast: None,
+                fast: None,
                 quality: Some((Some(embedder), REASON_VECTOR_QUALITY_TIER_BUILT)),
             });
         }
@@ -716,7 +716,8 @@ impl FsfsRuntime {
         let embedder = resolved?;
         control.checkpoint(cx, "index.fast_model_loaded", true)?;
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
-        let quality = if self.contract_upgrade_reuse_enabled() {
+        Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+        let quality = {
             control.admit_work(cx, "index.quality_model_load").await?;
             // Unit tests inject providers on the caller's thread.
             #[cfg(test)]
@@ -730,14 +731,15 @@ impl FsfsRuntime {
                 self.resolve_indexing_quality_embedder()?
             };
             control.checkpoint(cx, "index.quality_model_loaded", true)?;
-            Some(tier)
-        } else {
-            None
+            if let Some(quality_embedder) = tier.0.as_ref() {
+                Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
+            }
+            tier
         };
         retained_search_checkpoint(cx)?;
         Ok(RetainedBuildProducers {
-            _fast: Some(embedder),
-            quality,
+            fast: Some(embedder),
+            quality: Some(quality),
         })
     }
 
@@ -780,8 +782,8 @@ impl FsfsRuntime {
         }
         // Creating `generations` makes complete-store routing authoritative.
         // Refuse incompatible installed producers before taking over routing
-        // from a searchable legacy index. The indexer probes the admitted
-        // models and checks their identities against any rows it carries.
+        // from a searchable legacy index. Reuse the ready producers and check
+        // their identities against any rows the indexer carries.
         let producers =
             if kind == RetainedBuildKind::Index && matches!(start, RetainedRebuildStart::Fresh) {
                 self.admit_retained_build_producers(cx, &canonical_root)
@@ -847,7 +849,7 @@ impl FsfsRuntime {
             &store,
             build.path(),
             resumed,
-            producers.quality,
+            producers,
             on_progress,
         ))
         .await?;

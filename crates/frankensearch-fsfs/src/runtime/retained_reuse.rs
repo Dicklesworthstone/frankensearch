@@ -420,8 +420,15 @@ impl FsfsRuntime {
         store: &CompleteGenerationStore,
         candidate_root: &Path,
     ) -> SearchResult<FsfsIndexPayload> {
-        self.run_retained_index_with_progress(cx, store, candidate_root, false, None, |_| Ok(()))
-            .await
+        self.run_retained_index_with_progress(
+            cx,
+            store,
+            candidate_root,
+            false,
+            super::RetainedBuildProducers::default(),
+            |_| Ok(()),
+        )
+        .await
     }
 
     pub(super) async fn run_retained_index_with_progress<F>(
@@ -430,7 +437,7 @@ impl FsfsRuntime {
         store: &CompleteGenerationStore,
         candidate_root: &Path,
         resumed: bool,
-        admitted_quality: Option<super::IndexingQualityTier>,
+        admitted_producers: super::RetainedBuildProducers,
         on_progress: F,
     ) -> SearchResult<FsfsIndexPayload>
     where
@@ -446,13 +453,13 @@ impl FsfsRuntime {
         } else {
             self
         };
-        let payload = Box::pin(runtime.run_one_shot_index_with_quality(
+        let payload = Box::pin(runtime.run_one_shot_index_with_producers(
             cx,
             CliCommand::Index,
             on_progress,
             false,
             false,
-            admitted_quality,
+            admitted_producers,
         ))
         .await?;
         Self::validate_search_generation_at_root(candidate_root, self.indexing_search_mode())?;
@@ -2010,6 +2017,7 @@ mod generation_tests {
             counts: Arc<InferenceCounts>,
             dimension: usize,
             fail_after_documents: Option<usize>,
+            fail_probe: bool,
             cancel_on_failure: bool,
         }
 
@@ -2032,6 +2040,7 @@ mod generation_tests {
                     counts: Arc::default(),
                     dimension,
                     fail_after_documents: None,
+                    fail_probe: false,
                     cancel_on_failure: false,
                 }
             }
@@ -2055,6 +2064,9 @@ mod generation_tests {
                 Box::pin(async move {
                     if text == "probe" {
                         self.counts.probes.fetch_add(1, Ordering::SeqCst);
+                        if self.fail_probe {
+                            return Ok(Vec::new());
+                        }
                     } else {
                         let previous = self.counts.documents.fetch_add(1, Ordering::SeqCst);
                         if self
@@ -2796,6 +2808,58 @@ mod generation_tests {
                 assert_eq!(removed["indexed_files"], 1);
                 fs::write(source.join("added.md"), "sharedtoken newly added content").unwrap();
                 assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 1, 1);
+            });
+        }
+
+        #[test]
+        fn failed_migration_probes_preserve_legacy_search_routing() {
+            run_test_with_cx(|cx| async move {
+                for fail_fast in [true, false] {
+                    let failed_tier = if fail_fast { "fast" } else { "quality" };
+                    let parent = tempfile::tempdir().unwrap();
+                    fixture(parent.path(), 2);
+                    assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
+                    let (runtime, _, root) = two_tier_fixture(parent.path(), 1);
+                    let runtime = runtime.with_contract_upgrade_reuse(true);
+                    let receipt_path = root.join(LEGACY_RECEIPT_FILE);
+                    let receipt = fs::read(&receipt_path).unwrap();
+                    let mut fast = CountingEmbedder::new("reuse-fast", 4, false);
+                    let mut quality = CountingEmbedder::new("reuse-quality", 6, false);
+                    fast.fail_probe = fail_fast;
+                    quality.fail_probe = !fail_fast;
+                    let original = RestoreEmbedders::install(Arc::new(fast), Arc::new(quality));
+                    assert!(matches!(
+                        runtime.rebuild_retained_generation(&cx, &root).await,
+                        Err(SearchError::InvalidConfig { field, value, .. })
+                            if field == "semantic.embedding_output" && value == "empty"
+                    ));
+                    let mut search = runtime.clone();
+                    search.cli_input.command = CliCommand::Search;
+                    assert!(
+                        search.complete_generation_command_root(false).unwrap().is_none(),
+                        "failed {failed_tier} probe redirected the legacy search route"
+                    );
+                    assert_eq!(fs::read(receipt_path).unwrap(), receipt);
+                    drop(original);
+
+                    let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
+                    let quality = Arc::new(CountingEmbedder::new("reuse-quality", 6, false));
+                    let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
+                    let legacy = search
+                        .execute_search_payload(&cx, "sharedtoken", 10)
+                        .await
+                        .unwrap();
+                    assert_eq!(legacy.hits.len(), 2);
+                    fast.counts.probes.store(0, Ordering::SeqCst);
+                    quality.counts.probes.store(0, Ordering::SeqCst);
+                    fast.counts.documents.store(0, Ordering::SeqCst);
+                    quality.counts.documents.store(0, Ordering::SeqCst);
+                    publish(&runtime, &cx, &root).await;
+                    assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 1);
+                    assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 1);
+                    assert_eq!(fast.counts.documents.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 0);
+                }
             });
         }
 

@@ -13309,15 +13309,21 @@ impl FsfsRuntime {
         index_root: &Path,
         payload: Option<&SearchPayload>,
     ) {
+        // The payload describes the lane actually searched. In quality-only
+        // mode the root can also contain a fast or hash artifact we never used.
+        if let Some(payload) = payload
+            && let Some(id) = &payload.vector_generation_id
+        {
+            session.vector_generation_id = Some(id.clone());
+            session.vector_generation_is_hash = payload.vector_generation_is_hash;
+            return;
+        }
         if let Some(published) = Self::inspect_published_vector_generation(index_root) {
             session.vector_generation_id = Some(published.id);
             session.vector_generation_is_hash = published.is_hash_control;
             return;
         }
         if let Some(payload) = payload {
-            session
-                .vector_generation_id
-                .clone_from(&payload.vector_generation_id);
             session.vector_generation_is_hash = payload.vector_generation_is_hash;
         }
     }
@@ -22235,25 +22241,25 @@ impl FsfsRuntime {
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
     {
-        self.run_one_shot_index_with_quality(
+        self.run_one_shot_index_with_producers(
             cx,
             command,
             on_progress,
             emit_user_output,
             retain_legacy_reuse,
-            None,
+            RetainedBuildProducers::default(),
         )
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run_one_shot_index_with_quality<F>(
+    async fn run_one_shot_index_with_producers<F>(
         &self,
         cx: &Cx,
         command: CliCommand,
         mut on_progress: F,
         emit_user_output: bool,
         retain_legacy_reuse: bool,
-        admitted_quality: Option<IndexingQualityTier>,
+        admitted_producers: RetainedBuildProducers,
     ) -> SearchResult<FsfsIndexPayload>
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
@@ -22454,7 +22460,8 @@ impl FsfsRuntime {
             // Complete-store indexing admits and probes its required producer
             // before initializing store routing. Keep that exact producer alive
             // through source indexing instead of loading a second set of weights.
-            let admitted_primary = admitted_quality
+            let admitted_primary = admitted_producers
+                .quality
                 .as_ref()
                 .and_then(|(embedder, _)| embedder.as_ref());
             let embedder = match admitted_primary {
@@ -22470,6 +22477,8 @@ impl FsfsRuntime {
             if admitted_primary.is_none() {
                 Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
             }
+            Some(embedder)
+        } else if let Some(embedder) = admitted_producers.fast {
             Some(embedder)
         } else {
             control.admit_work(cx, "index.model_provisioning").await?;
@@ -22491,6 +22500,7 @@ impl FsfsRuntime {
         // set as the fast tier whenever the configuration allows a quality
         // stage and a verified quality model is present; otherwise the reason
         // is recorded on the generation and search serves INITIAL only.
+        let quality_already_admitted = admitted_producers.quality.is_some();
         let (quality_embedder, mut quality_tier_reason) = if lexical_only {
             (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY)
         } else if quality_only {
@@ -22499,13 +22509,15 @@ impl FsfsRuntime {
             (None, REASON_VECTOR_QUALITY_TIER_BUILT)
         } else {
             control.admit_work(cx, "index.quality_model_load").await?;
-            match admitted_quality {
+            match admitted_producers.quality {
                 Some(tier) => tier,
                 None => self.resolve_indexing_quality_embedder()?,
             }
         };
         control.checkpoint(cx, "index.quality_model_loaded", true)?;
-        if let Some(quality_embedder) = quality_embedder.as_ref() {
+        if !quality_already_admitted
+            && let Some(quality_embedder) = quality_embedder.as_ref()
+        {
             Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
         }
         // Each generation is stamped with its producer's identity; every
@@ -38677,6 +38689,12 @@ mod tests {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
             let mut resources = disagreeing_blend_resources(temp.path());
+            let unused_fast_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(unused_fast_path.parent().unwrap()).unwrap();
+            VectorIndex::create(&unused_fast_path, "fnv1a-256", 256)
+                .unwrap()
+                .finish()
+                .unwrap();
             let path = temp.path().join("nontrivial-quality.fsvi");
             let mut writer = VectorIndex::create_with_revision(
                 &path,
@@ -38785,8 +38803,12 @@ mod tests {
                         .is_some_and(|quality| quality.weight.to_bits() == 1.0_f32.to_bits())
             }));
             let assert_ranked_quality = |session: &super::ExplainSession| {
+                assert_eq!(session.vector_generation_id, payload.vector_generation_id);
+                assert!(!session.vector_generation_is_hash);
                 for (hit, fused) in session.hits.iter().zip(&phases[0].fused) {
                     assert_eq!(hit.path, fused.doc_id);
+                    assert_eq!(hit.semantic_rank, fused.semantic_rank);
+                    assert_eq!(hit.hash_rank, None);
                     let (explanation, warnings) = FsfsRuntime::explain_session_hit(
                         &cx,
                         session,
@@ -44825,7 +44847,7 @@ mod tests {
     fn indexing_probe_precedes_vector_and_cache_artifact_creation() {
         let source = include_str!("runtime.rs");
         let pipeline_start = source
-            .find("\n    async fn run_one_shot_index_with_quality<")
+            .find("\n    async fn run_one_shot_index_with_producers<")
             .expect("one-shot indexing pipeline");
         let pipeline_end = source[pipeline_start..]
             .find("\n    fn resolve_target_root")
