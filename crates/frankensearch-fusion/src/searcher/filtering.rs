@@ -195,6 +195,15 @@ impl<'a> RequestFilter<'a> {
         if !self.is_active() {
             return refill_lexical_candidates(cx, lexical, query, target, batch, include).await;
         }
+        // Wider searches replace the complete lexical prefix. Preserve known
+        // observations from earlier arms, including a rejection that caused
+        // revalidation, but replace this call's observations on every refill.
+        // Unknown values must remain eligible for a later metadata upgrade.
+        let retained_metadata: AHashSet<_> = self
+            .metadata
+            .iter()
+            .filter_map(|(id, value)| value.as_ref().map(|_| id.clone()))
+            .collect();
         let mut limit = target;
         loop {
             cancellation_checkpoint(cx, "filter_lexical_candidates")?;
@@ -208,6 +217,7 @@ impl<'a> RequestFilter<'a> {
                 )
                 .await?;
             }
+            self.metadata.retain(|id, _| retained_metadata.contains(id));
             self.observe(&results);
             let ids: Vec<_> = results.iter().map(|hit| hit.doc_id.as_str()).collect();
             self.hydrate(cx, Some(lexical), &ids).await?;

@@ -19197,6 +19197,199 @@ mod tests {
         }
     }
 
+    struct RefillMetadataLexical {
+        first: Vec<ScoredResult>,
+        replacement: Vec<ScoredResult>,
+        limits: Mutex<Vec<usize>>,
+    }
+
+    impl LexicalRead for RefillMetadataLexical {
+        fn search<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            Box::pin(async move {
+                let first = {
+                    let mut limits = self.limits.lock().unwrap();
+                    let first = limits.is_empty();
+                    limits.push(limit);
+                    first
+                };
+                let results = if first {
+                    &self.first
+                } else {
+                    &self.replacement
+                };
+                Ok(results.iter().take(limit).cloned().collect())
+            })
+        }
+
+        fn doc_count(&self) -> SearchResult<usize> {
+            Ok(self.first.len().max(self.replacement.len()))
+        }
+    }
+
+    fn refill_metadata_hit(id: &str, score: f32, allowed: Option<bool>) -> ScoredResult {
+        let mut result = test_scored_result(id, score);
+        result.source = ScoreSource::Lexical;
+        result.fast_score = None;
+        result.lexical_score = Some(score);
+        result.metadata =
+            allowed.map(|allowed| Arc::new(serde_json::json!({ "allowed": allowed })));
+        result
+    }
+
+    #[test]
+    fn async_filter_lexical_refill_replaces_superseded_metadata() {
+        for replacement in [Some(false), None] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                // The default pin_search returns None: each complete eager
+                // batch may belong to a different publication.
+                let lexical = Arc::new(RefillMetadataLexical {
+                    first: vec![
+                        refill_metadata_hit("doc-revoked", 4.0, Some(true)),
+                        refill_metadata_hit("doc-removed", 3.0, Some(false)),
+                        refill_metadata_hit("doc-promoted", 2.0, Some(false)),
+                    ],
+                    replacement: vec![
+                        refill_metadata_hit("doc-revoked", 4.0, replacement),
+                        refill_metadata_hit("doc-promoted", 3.0, Some(true)),
+                        refill_metadata_hit("doc-c", 2.0, Some(true)),
+                        refill_metadata_hit("doc-d", 1.0, Some(true)),
+                    ],
+                    limits: Mutex::new(Vec::new()),
+                });
+                let (_dir, index) = build_test_index(4);
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(StubEmbedder::new("fast", 4)),
+                    TwoTierConfig {
+                        candidate_multiplier: 1,
+                        fast_only: true,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_lexical(lexical.clone());
+                let filter = AsyncTestFilter(|_: &str, metadata: Option<&serde_json::Value>| {
+                    metadata.is_some_and(|value| value["allowed"] == true)
+                });
+                let (results, _) = searcher
+                    .search_collect_with_filter(&cx, "query", 3, Some(&filter))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    results
+                        .iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["doc-promoted", "doc-c", "doc-d"],
+                    "only the replacement batch determines this lexical arm's eligibility",
+                );
+                assert!(results.iter().all(|hit| {
+                    hit.source == ScoreSource::Lexical
+                        && hit.metadata.as_deref().unwrap()["allowed"] == true
+                }));
+                assert_eq!(*lexical.limits.lock().unwrap(), [3, 6]);
+            });
+        }
+    }
+
+    #[test]
+    fn async_filter_refill_preserves_cross_arm_observations_and_drops_old_prefix() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let filter = AsyncTestFilter(|_: &str, metadata: Option<&serde_json::Value>| {
+                metadata.is_none_or(|value| value["allowed"] == true)
+            });
+            let mut request = RequestFilter::new(Some(&filter));
+            let lookup = FilterLookupLexical::default();
+            let (blocked, _) = request
+                .refill_vectors(
+                    &cx,
+                    Some(&lookup),
+                    vec![vhit(0, 1.0, "doc-blocked")],
+                    1,
+                    1,
+                    None,
+                    &|_| None,
+                    "semantic_fast",
+                    |_| unreachable!("the physical bound is already exhausted"),
+                )
+                .await
+                .unwrap();
+            assert!(blocked.is_empty());
+
+            let lexical = RefillMetadataLexical {
+                first: vec![
+                    refill_metadata_hit("doc-blocked", 5.0, Some(true)),
+                    refill_metadata_hit("doc-upgraded", 4.0, Some(true)),
+                    refill_metadata_hit("doc-disappeared", 3.0, Some(false)),
+                ],
+                replacement: vec![
+                    refill_metadata_hit("doc-blocked", 5.0, Some(true)),
+                    refill_metadata_hit("doc-upgraded", 4.0, Some(false)),
+                    refill_metadata_hit("tail-a", 3.0, Some(true)),
+                    refill_metadata_hit("tail-b", 2.0, Some(true)),
+                    refill_metadata_hit("tail-c", 1.0, Some(true)),
+                ],
+                limits: Mutex::new(Vec::new()),
+            };
+            // Cache an actual unknown before lexical refill. Its first known
+            // value arrives inside this refill and must not freeze eligibility
+            // when the replacement batch revokes it.
+            let (unknown, _) = request
+                .refill_vectors(
+                    &cx,
+                    Some(&lexical),
+                    vec![vhit(1, 0.9, "doc-upgraded")],
+                    1,
+                    1,
+                    None,
+                    &|_| None,
+                    "semantic_fast",
+                    |_| unreachable!("the eligible target is already filled"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unknown.len(), 1);
+            let batch = lexical.search_candidates(&cx, "query", 3).await.unwrap();
+            let batch = request
+                .refill_lexical(&cx, &lexical, "query", 3, batch, |_| Ok(true))
+                .await
+                .unwrap();
+            assert_eq!(
+                batch
+                    .results()
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["tail-a", "tail-b", "tail-c"],
+                "another arm's known rejection survives a conflicting eager prefix",
+            );
+            assert_eq!(*lexical.limits.lock().unwrap(), [3, 6]);
+
+            let mut semantic = vec![
+                vhit(0, 1.0, "doc-blocked"),
+                vhit(1, 0.9, "doc-upgraded"),
+                vhit(2, 0.8, "doc-disappeared"),
+                vhit(3, 0.7, "tail-a"),
+            ];
+            request.retain_vectors(&cx, &mut semantic).unwrap();
+            assert_eq!(
+                semantic
+                    .iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["doc-disappeared", "tail-a"],
+                "the final prefix's rejection applies across arms; superseded IDs stay unknown",
+            );
+            let mut disappeared = vec![test_scored_result("doc-disappeared", 0.8)];
+            request.attach_metadata(&mut disappeared);
+            assert!(disappeared[0].metadata.is_none());
+        });
+    }
+
     #[test]
     fn async_filter_refills_both_semantic_tiers_and_quality_only() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
