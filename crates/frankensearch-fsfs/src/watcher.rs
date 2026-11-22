@@ -3708,6 +3708,28 @@ fn run_authoritative_reconciliation<'a>(
                     return Err(error);
                 }
             };
+            if prepared
+                .skipped_paths
+                .iter()
+                .any(|path| current.contains_key(path))
+            {
+                // The scan admitted this source, but policy or metadata changed
+                // before preparation. Committing that snapshot would claim an
+                // unapplied upsert and clear its deletion debt. Earlier chunks
+                // may have landed; the rejected chunk has no mutation evidence.
+                let mut state = lock_or_recover(reconciliation);
+                if attempted_prefix.is_empty() {
+                    state.require_full_scan()?;
+                } else {
+                    state.require_for_events(&attempted_prefix)?;
+                }
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs-watcher",
+                    source: Box::new(io::Error::other(
+                        "source eligibility changed after authoritative scan; rescanning",
+                    )),
+                });
+            }
             if prepared.ops.is_empty() {
                 staged_skipped = staged_skipped.saturating_add(prepared.skipped);
                 continue;
@@ -3898,6 +3920,18 @@ fn record_successful_events(
     if let Err(error) = state.ensure_lineage_available() {
         let _ = state.require_for_events(events);
         return Err(error);
+    }
+    if events.iter().any(|event| match event.kind {
+        WatchEventKind::Created | WatchEventKind::Modified => !current.contains_key(&event.path),
+        WatchEventKind::Deleted => current.contains_key(&event.path),
+    }) {
+        // A source can disappear or become excluded while its upsert is
+        // pending, or reappear while its deletion is pending. The scan then
+        // describes a different result from the mutation that reached the
+        // sink. Preserve the prior claims and exact applied paths until a
+        // full pass reconciles that difference through the retained roots.
+        state.require_for_events(events)?;
+        return Ok(RecordSuccessfulEventsOutcome::Recorded);
     }
     if !state.baseline_initialized {
         state.indexed_snapshot = current.clone();
@@ -4955,6 +4989,13 @@ fn collect_snapshot_for_root(
     let opened_identity = RootIdentity::of(&root_metadata);
     completeness.record_root_identity(root, opened_identity);
 
+    // The indexer and event adapter cannot represent non-UTF-8 source keys.
+    // Retain the selected root's identity, but never claim its unindexable
+    // path or descendants as applied sources in a reconciliation snapshot.
+    if root.to_str().is_none() {
+        return Ok(());
+    }
+
     let root_decision = discovery.evaluate_root(root, lookup_mount_category(mount_table, root));
     if matches!(root_decision.scope, DiscoveryScopeDecision::Exclude) {
         return Ok(());
@@ -5051,6 +5092,11 @@ fn collect_snapshot_for_root(
             };
 
             let path = entry.path();
+            // Match event preparation before stat or descent. Lossy conversion
+            // could otherwise alias a different, valid Unicode source.
+            if path.to_str().is_none() {
+                continue;
+            }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) if is_ignorable_walk_error(&error) => {
@@ -8056,6 +8102,134 @@ mod tests {
             ));
             assert!(!lock_or_recover(&watcher.reconciliation).required);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_reconciles_source_changes_during_apply() {
+        #[derive(Debug, Clone, Copy)]
+        enum SourceChange {
+            Exclude,
+            Remove,
+            Recreate,
+        }
+
+        struct ChangingPipeline {
+            recorded: RecordingPipeline,
+            source: PathBuf,
+            aside: PathBuf,
+            ignore_path: PathBuf,
+            change: SourceChange,
+            change_once: AtomicBool,
+        }
+
+        impl WatchIngestPipeline for ChangingPipeline {
+            fn apply_batch<'a>(
+                &'a self,
+                cx: &'a Cx,
+                batch: &'a [WatchIngestOp],
+            ) -> WatchIngestFuture<'a, usize> {
+                Box::pin(async move {
+                    let reindexed = self.recorded.apply_batch(cx, batch).await?;
+                    if self.change_once.swap(false, Ordering::AcqRel) {
+                        match self.change {
+                            SourceChange::Exclude => {
+                                fs::write(&self.ignore_path, "source.md\n")?;
+                            }
+                            SourceChange::Remove => {
+                                fs::rename(&self.source, &self.aside)?;
+                            }
+                            SourceChange::Recreate => {
+                                fs::write(&self.source, "recreated during deletion")?;
+                            }
+                        }
+                    }
+                    Ok(reindexed)
+                })
+            }
+        }
+
+        for change in [
+            SourceChange::Exclude,
+            SourceChange::Remove,
+            SourceChange::Recreate,
+        ] {
+            run_test_with_cx(move |cx| async move {
+                let temp = tempdir().unwrap();
+                let root = temp.path().join("watched");
+                fs::create_dir(&root).unwrap();
+                let source = root.join("source.md");
+                let aside = temp.path().join("source-aside.md");
+                if !matches!(change, SourceChange::Remove) {
+                    fs::write(&source, "previously indexed source").unwrap();
+                }
+                let pipeline = Arc::new(ChangingPipeline {
+                    recorded: RecordingPipeline::default(),
+                    source: source.clone(),
+                    aside: aside.clone(),
+                    ignore_path: root.join(".ignore"),
+                    change,
+                    change_once: AtomicBool::new(true),
+                });
+                let watcher =
+                    FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+                let (baseline, completeness) = watcher.collect_snapshot().unwrap();
+                lock_or_recover(&watcher.reconciliation)
+                    .seed_initial_authority(
+                        baseline.clone(),
+                        completeness.root_identities().clone(),
+                    )
+                    .unwrap();
+                let authority = lock_or_recover(&watcher.reconciliation).authority.clone();
+                let event = match change {
+                    SourceChange::Exclude => WatchEvent::modified(&source, now_millis(), None),
+                    SourceChange::Remove => {
+                        // No baseline claim exists for this source. Its applied
+                        // upsert must retain enough evidence to remove it later.
+                        fs::write(&source, "newly created source").unwrap();
+                        WatchEvent::created(&source, now_millis(), None)
+                    }
+                    SourceChange::Recreate => {
+                        fs::rename(&source, &aside).unwrap();
+                        WatchEvent::deleted(&source, now_millis())
+                    }
+                };
+                let outcome = watcher.process_events_now(&cx, &[event]).await.unwrap();
+                assert_eq!(outcome.accepted, 1);
+                {
+                    let state = lock_or_recover(&watcher.reconciliation);
+                    assert!(
+                        state.required,
+                        "post-apply change must retain debt: {change:?}"
+                    );
+                    assert_eq!(state.indexed_snapshot, baseline);
+                    assert_eq!(state.authority, authority);
+                    assert_eq!(state.affected_paths, BTreeSet::from([source.clone()]));
+                }
+                watcher.process_events_now(&cx, &[]).await.unwrap();
+                let ops = pipeline.recorded.all_ops();
+                assert_eq!(ops.len(), 2, "one mutation and one repair: {change:?}");
+                match change {
+                    SourceChange::Exclude | SourceChange::Remove => assert!(matches!(
+                        &ops[1],
+                        WatchIngestOp::Delete { file_key, .. }
+                            if file_key == &normalize_file_key(&source)
+                    )),
+                    SourceChange::Recreate => assert!(matches!(
+                        &ops[1],
+                        WatchIngestOp::Upsert { file_key, .. }
+                            if file_key == &normalize_file_key(&source)
+                    )),
+                }
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(!state.required);
+                assert!(state.affected_paths.is_empty());
+                assert_eq!(
+                    state.indexed_snapshot.contains_key(&source),
+                    matches!(change, SourceChange::Recreate)
+                );
+            });
+        }
     }
 
     #[cfg(unix)]
@@ -13066,6 +13240,264 @@ mod tests {
             let reconciliation_state = lock_or_recover(&reconciliation);
             assert!(!reconciliation_state.required);
             assert_eq!(reconciliation_state.epoch, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_retries_sources_excluded_after_snapshot() {
+        for use_ignore in [false, true] {
+            for batch_size in [1, 100] {
+                run_test_with_cx(move |cx| async move {
+                    let temp = tempdir().unwrap();
+                    let root = temp.path().join("source");
+                    fs::create_dir(&root).unwrap();
+                    let changing = root.join("z-changing.md");
+                    let accepted = root.join("a-accepted.md");
+                    fs::write(&changing, "previously indexed source").unwrap();
+                    let roots = [root.clone()];
+                    let discovery = DiscoveryConfig {
+                        max_file_size_mb: 1,
+                        ..DiscoveryConfig::default()
+                    };
+                    let (baseline, completeness) =
+                        collect_snapshot_from_roots(&roots, &discovery, &|| false).unwrap();
+                    let mut initial = ReconciliationState::default();
+                    initial
+                        .seed_initial_authority(
+                            baseline.clone(),
+                            completeness.root_identities().clone(),
+                        )
+                        .unwrap();
+                    initial.require_full_scan().unwrap();
+                    let authority = initial.authority.clone();
+                    let reconciliation = Arc::new(Mutex::new(initial));
+                    // This source has no baseline claim. Only a chunk that
+                    // reaches the sink may create debt for its later absence.
+                    fs::write(&accepted, "newly discovered source").unwrap();
+                    let changing_for_scan = changing.clone();
+                    let policy_path = root.join(".ignore");
+                    let collector =
+                        move |roots: &[PathBuf],
+                              discovery: &DiscoveryConfig,
+                              abort: &dyn Fn() -> bool| {
+                            let observed = collect_snapshot_from_roots(roots, discovery, abort)?;
+                            assert_eq!(observed.0.len(), 2);
+                            assert!(observed.0.contains_key(&changing_for_scan));
+                            // No notification advances the epoch: preparation
+                            // must detect the changed eligibility itself.
+                            if use_ignore {
+                                fs::write(&policy_path, "z-changing.md\n")?;
+                            } else {
+                                fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&changing_for_scan)?
+                                    .set_len(1024 * 1024 + 1)?;
+                            }
+                            Ok(observed)
+                        };
+                    let pipeline = RecordingPipeline::default();
+                    let queue = Arc::new(Mutex::new(VecDeque::new()));
+                    let stats = WatcherStatsInner::default();
+                    let error = run_authoritative_reconciliation(
+                        &cx,
+                        &roots,
+                        &discovery,
+                        &pipeline,
+                        &reconciliation,
+                        &queue,
+                        &stats,
+                        batch_size,
+                        &collector,
+                        &|| false,
+                    )
+                    .await
+                    .expect_err("a skipped snapshot source cannot commit reconciliation");
+                    assert!(is_retryable_error(&error));
+                    let expected_debt = if batch_size == 1 {
+                        BTreeSet::from([accepted.clone()])
+                    } else {
+                        BTreeSet::new()
+                    };
+                    {
+                        let state = lock_or_recover(&reconciliation);
+                        assert!(state.required);
+                        assert_eq!(state.indexed_snapshot, baseline);
+                        assert_eq!(state.authority, authority);
+                        assert_eq!(state.affected_paths, expected_debt);
+                    }
+                    let applied = pipeline.all_ops();
+                    if batch_size == 1 {
+                        assert!(matches!(
+                            applied.as_slice(),
+                            [WatchIngestOp::Upsert { file_key, .. }]
+                                if file_key == &normalize_file_key(&accepted)
+                        ));
+                    } else {
+                        assert!(applied.is_empty(), "reject the whole unstarted chunk");
+                        assert!(lock_or_recover(&pipeline.attempts).is_empty());
+                    }
+                    assert_eq!(stats.snapshot().files_reindexed, 0);
+                    assert_eq!(stats.snapshot().files_skipped, 0);
+
+                    // Retry through the real collector. Recover the old indexed
+                    // source and only the new source whose first chunk landed.
+                    fs::rename(&accepted, temp.path().join("accepted-aside.md")).unwrap();
+                    run_authoritative_reconciliation(
+                        &cx,
+                        &roots,
+                        &discovery,
+                        &pipeline,
+                        &reconciliation,
+                        &queue,
+                        &stats,
+                        batch_size,
+                        &collect_snapshot_from_roots,
+                        &|| false,
+                    )
+                    .await
+                    .unwrap();
+                    let deletes = pipeline
+                        .all_ops()
+                        .into_iter()
+                        .filter_map(|op| match op {
+                            WatchIngestOp::Delete { file_key, .. } => Some(file_key),
+                            WatchIngestOp::Upsert { .. } => None,
+                        })
+                        .collect::<BTreeSet<_>>();
+                    let mut expected_deletes = BTreeSet::from([normalize_file_key(&changing)]);
+                    if batch_size == 1 {
+                        expected_deletes.insert(normalize_file_key(&accepted));
+                    }
+                    assert_eq!(deletes, expected_deletes);
+                    let state = lock_or_recover(&reconciliation);
+                    assert!(!state.required);
+                    assert!(state.indexed_snapshot.is_empty());
+                    assert!(state.affected_paths.is_empty());
+                });
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_skips_non_utf8_sources_and_old_snapshot_keys() {
+        use std::os::unix::ffi::OsStrExt;
+
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("source");
+            fs::create_dir(&root).unwrap();
+            let valid = root.join("caf\u{fffd}.md");
+            let invalid = root.join(std::ffi::OsStr::from_bytes(b"caf\xff.md"));
+            let invalid_dir = root.join(std::ffi::OsStr::from_bytes(b"dir\xff"));
+            let invalid_child = invalid_dir.join("notes.md");
+            fs::write(&valid, "valid Unicode source").unwrap();
+            fs::write(&invalid, "distinct unrepresentable source").unwrap();
+            fs::create_dir(&invalid_dir).unwrap();
+            fs::write(&invalid_child, "unrepresentable descendant").unwrap();
+            assert_eq!(valid.to_string_lossy(), invalid.to_string_lossy());
+            let roots = [root];
+            let discovery = DiscoveryConfig::default();
+            let (snapshot, completeness) =
+                collect_snapshot_from_roots(&roots, &discovery, &|| false).unwrap();
+            assert_eq!(snapshot.keys().collect::<Vec<_>>(), [&valid]);
+            assert!(completeness.is_complete());
+            assert!(completeness.identity_is_trustworthy());
+
+            // Older watcher snapshots could contain names that event ingestion
+            // has always refused. Dropping those unsupported claims must neither
+            // delete their Unicode alias nor make reconciliation retry forever.
+            let mut old_snapshot = snapshot.clone();
+            old_snapshot.insert(invalid, 0);
+            old_snapshot.insert(invalid_child, 0);
+            let mut initial = ReconciliationState::default();
+            initial
+                .seed_initial_authority(old_snapshot, completeness.root_identities().clone())
+                .unwrap();
+            initial.require_full_scan().unwrap();
+            let reconciliation = Arc::new(Mutex::new(initial));
+            let pipeline = RecordingPipeline::default();
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            let stats = WatcherStatsInner::default();
+            run_authoritative_reconciliation(
+                &cx,
+                &roots,
+                &discovery,
+                &pipeline,
+                &reconciliation,
+                &queue,
+                &stats,
+                100,
+                &collect_snapshot_from_roots,
+                &|| false,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                pipeline.all_ops().as_slice(),
+                [WatchIngestOp::Upsert { file_key, .. }]
+                    if file_key == &normalize_file_key(&valid)
+            ));
+            let state = lock_or_recover(&reconciliation);
+            assert!(!state.required);
+            assert_eq!(state.indexed_snapshot, snapshot);
+            assert_eq!(state.authority.established().unwrap().snapshot, snapshot);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_skips_non_utf8_roots_without_losing_identity_coverage() {
+        use std::os::unix::ffi::OsStrExt;
+
+        for directory_root in [false, true] {
+            run_test_with_cx(move |cx| async move {
+                let temp = tempdir().unwrap();
+                let root = temp
+                    .path()
+                    .join(std::ffi::OsStr::from_bytes(b"source\xff.md"));
+                if directory_root {
+                    fs::create_dir(&root).unwrap();
+                    fs::write(root.join("notes.md"), "unrepresentable descendant").unwrap();
+                } else {
+                    fs::write(&root, "unrepresentable source").unwrap();
+                }
+                let roots = [root];
+                let discovery = DiscoveryConfig::default();
+                let (snapshot, completeness) =
+                    collect_snapshot_from_roots(&roots, &discovery, &|| false).unwrap();
+                assert!(snapshot.is_empty());
+                assert!(completeness.is_complete());
+                assert!(completeness.identity_is_trustworthy());
+                assert!(completeness.root_identities().contains_key(&roots[0]));
+                let reconciliation = Arc::new(Mutex::new(ReconciliationState::default()));
+                lock_or_recover(&reconciliation)
+                    .require_full_scan()
+                    .unwrap();
+                let pipeline = RecordingPipeline::default();
+                let queue = Arc::new(Mutex::new(VecDeque::new()));
+                let stats = WatcherStatsInner::default();
+                run_authoritative_reconciliation(
+                    &cx,
+                    &roots,
+                    &discovery,
+                    &pipeline,
+                    &reconciliation,
+                    &queue,
+                    &stats,
+                    100,
+                    &collect_snapshot_from_roots,
+                    &|| false,
+                )
+                .await
+                .unwrap();
+                assert!(pipeline.all_ops().is_empty());
+                let state = lock_or_recover(&reconciliation);
+                assert!(!state.required);
+                assert!(state.indexed_snapshot.is_empty());
+                assert!(state.authority.established().unwrap().covers(&roots));
+            });
         }
     }
 
