@@ -844,6 +844,7 @@ impl FsfsRuntime {
                 "inactive build receipts require an independent source recovery rebuild",
             ));
         }
+        self.admit_storage_write(cx, &canonical_root, "retained_build.start")?;
         if let RetainedRebuildStart::Resume(receipt) = &start {
             receipt.admit_scope(cx, self).await?;
         }
@@ -858,6 +859,9 @@ impl FsfsRuntime {
             } else {
                 RetainedBuildProducers::default()
             };
+        // Model admission can await for a long time. Recheck the whole store
+        // before creating or resuming candidate state, never just its new path.
+        self.admit_storage_write(cx, &canonical_root, "retained_build.allocate")?;
         let resumed = matches!(start, RetainedRebuildStart::Resume(_));
         let store = if resumed {
             CompleteGenerationStore::open(cx, store_root)?
@@ -896,6 +900,7 @@ impl FsfsRuntime {
                             .ok()
                             .flatten()
                             .is_some_and(|sentinel| sentinel.generation_complete);
+                    self.admit_storage_write(cx, root, "retained_build.allocate")?;
                     admission.allocate(cx, protect_legacy)?
                 }
                 RetainedBuildKind::Recovery => store.begin_recovery_rebuild(cx)?,
@@ -1100,8 +1105,8 @@ impl FsfsRuntime {
             ));
         }
         let store = CompleteGenerationStore::open(cx, store_root)?;
-        let build = store.begin(cx)?;
-        let predecessor = store.active(cx)?.ok_or_else(|| {
+        let admission = store.admit_build(cx)?;
+        let predecessor = admission.predecessor().cloned().ok_or_else(|| {
             complete_cli::complete_cli_error(
                 "selection",
                 "no complete generation has been published",
@@ -1144,6 +1149,8 @@ impl FsfsRuntime {
             return Ok((None, 0));
         }
         retained_search_checkpoint(cx)?;
+        self.admit_storage_write(cx, store_root, "retained_delete.start")?;
+        let build = admission.allocate(cx, false)?;
         let mut input = self.cli_input.clone();
         input.index_dir = Some(build.path().to_path_buf());
         input.daemon = false;
@@ -1309,6 +1316,7 @@ impl FsfsRuntime {
         if candidate_mode == SearchExecutionMode::LexicalOnly {
             return Ok((None, Self::lexical_only_compact_report().1));
         }
+        self.admit_storage_write(cx, store_root, "retained_compact.start")?;
         let build = store.begin(cx)?;
         let mut input = self.cli_input.clone();
         input.index_dir = Some(build.path().to_path_buf());
@@ -3623,6 +3631,56 @@ mod retained_delete_tests {
     }
 
     #[test]
+    fn storage_pressure_refuses_retained_compaction_before_copying_and_allows_retry() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root, predecessor) = fixture(&cx, directory.path(), true).await;
+            runtime.config.storage.disk_budget_bytes = Some(0);
+            let before = file_bytes(predecessor.path());
+            let allocations = fs::read_dir(root.join("generations")).unwrap().count();
+            let mut old = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let phases = old.search(&cx, "sharedtoken", 10).await.unwrap();
+            let old_hits = serde_json::to_value(&phases[0].hits).unwrap();
+            for emergency in [false, true] {
+                let mut blocked = runtime.clone();
+                blocked.config.storage.storage_pressure_emergency = emergency;
+                blocked.config.storage.disk_budget_bytes = Some(if emergency { 0 } else { 1 });
+                let error = blocked
+                    .compact_retained_generation(&cx, &root)
+                    .await
+                    .unwrap_err();
+                assert!(storage_admission::storage_admission_denial(&error).is_some());
+                cx.set_cancel_requested(true);
+                let cancelled = blocked.compact_retained_generation(&cx, &root).await;
+                cx.set_cancel_requested(false);
+                assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+                assert_eq!(
+                    fs::read_dir(root.join("generations")).unwrap().count(),
+                    allocations
+                );
+                assert_eq!(file_bytes(predecessor.path()), before);
+                assert_eq!(
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap(),
+                    Some(predecessor.clone())
+                );
+            }
+            let (publication, stats) = runtime
+                .compact_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert!(matches!(publication, Some(GenerationPublication::Durable(_))));
+            assert_eq!(stats["wal_records_merged"], 1);
+            assert_eq!(stats["quality"]["wal_records_merged"], 1);
+            assert_eq!(file_bytes(predecessor.path()), before);
+            let phases = old.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(serde_json::to_value(&phases[0].hits).unwrap(), old_hits);
+        });
+    }
+
+    #[test]
     fn retained_compact_merges_both_wals_while_retaining_readers_and_membership() {
         run_test_with_cx(|cx| async move {
             let parent = tempfile::tempdir().unwrap();
@@ -3773,6 +3831,226 @@ mod retained_search_tests {
                 .expect("rebuild"),
             GenerationPublication::Durable(_)
         ));
+    }
+
+    #[test]
+    fn storage_pressure_refuses_fresh_indexing_before_store_creation_and_allows_retry() {
+        run_test_with_cx(|cx| async move {
+            for retained in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut runtime, _, root) = fixture(directory.path());
+                runtime.lexical_only_indexing = true;
+                runtime.config.pressure.degradation_override =
+                    DegradationOverrideMode::ForceLexicalOnly;
+                runtime.config.storage.disk_budget_bytes = Some(0);
+                runtime.config.storage.storage_pressure_emergency = true;
+                let result = if retained {
+                    runtime
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .map(|_| ())
+                } else {
+                    runtime
+                        .run_one_shot_index_scaffold_internal(
+                            &cx,
+                            CliCommand::Index,
+                            |_| Ok(()),
+                            false,
+                            true,
+                        )
+                        .await
+                        .map(|_| ())
+                };
+                assert!(
+                    storage_admission::storage_admission_denial(&result.unwrap_err()).is_some(),
+                    "retained={retained}: emergency overrides an unlimited budget"
+                );
+                assert!(!root.exists(), "refusal must precede store creation");
+
+                cx.set_cancel_requested(true);
+                let cancelled = if retained {
+                    runtime
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .map(|_| ())
+                } else {
+                    runtime
+                        .run_one_shot_index_scaffold_internal(
+                            &cx,
+                            CliCommand::Index,
+                            |_| Ok(()),
+                            false,
+                            true,
+                        )
+                        .await
+                        .map(|_| ())
+                };
+                cx.set_cancel_requested(false);
+                assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+                assert!(!root.exists());
+
+                runtime.config.storage.storage_pressure_emergency = false;
+                if retained {
+                    publish(&runtime, &cx, &root).await;
+                    let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+                    let phases = reader.search(&cx, "sharedtoken", 10).await.unwrap();
+                    assert_eq!(phases[0].hits.len(), 1);
+                } else {
+                    runtime
+                        .run_one_shot_index_scaffold_internal(
+                            &cx,
+                            CliCommand::Index,
+                            |_| Ok(()),
+                            false,
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        FsfsRuntime::read_index_sentinel(&root)
+                            .unwrap()
+                            .is_some_and(|sentinel| sentinel.generation_complete)
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn storage_pressure_preserves_retained_mutations_and_real_noops() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.lexical_only_indexing = true;
+            runtime.config.pressure.degradation_override =
+                DegradationOverrideMode::ForceLexicalOnly;
+            runtime.config.storage.disk_budget_bytes = Some(0);
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let first = store.active(&cx).unwrap().unwrap();
+            let mut old = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let phases = old.search(&cx, "sharedtoken", 10).await.unwrap();
+            let before = serde_json::to_value(&phases[0].hits).unwrap();
+            let bundle = fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap();
+            let allocations = fs::read_dir(root.join("generations")).unwrap().count();
+            fs::write(source.join("beta.md"), "sharedtoken beta queued source").unwrap();
+            let mutations = [
+                retained_batch::RetainedMutation::Delete {
+                    id: "alpha.md".to_owned(),
+                },
+                retained_batch::RetainedMutation::Upsert {
+                    id: "gamma.md".to_owned(),
+                    text: "sharedtoken gamma supplied body".to_owned(),
+                },
+            ];
+            for emergency in [false, true] {
+                let mut blocked = runtime.clone();
+                blocked.config.storage.storage_pressure_emergency = emergency;
+                blocked.config.storage.disk_budget_bytes = Some(if emergency { 0 } else { 1 });
+                let mut input = blocked.cli_input.clone();
+                input.command = CliCommand::Delete;
+                input.delete_ids = vec!["alpha.md".to_owned()];
+                let deletion = blocked.clone().with_cli_input(input.clone());
+                let failures = [
+                    blocked
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap_err(),
+                    blocked
+                        .apply_retained_batch(&cx, &root, &first, &mutations)
+                        .await
+                        .unwrap_err(),
+                    deletion
+                        .delete_retained_generation(&cx, &root)
+                        .await
+                        .unwrap_err(),
+                ];
+                for error in failures {
+                    assert!(storage_admission::storage_admission_denial(&error).is_some());
+                }
+
+                // Resolve absent targets under the publication lease without
+                // allocating a candidate or treating a no-op as a blocked write.
+                input.delete_ids = vec!["absent.md".to_owned()];
+                let no_delete = blocked.clone().with_cli_input(input);
+                let (publication, deleted) = no_delete
+                    .delete_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                assert!(publication.is_none());
+                assert_eq!(deleted, 0);
+                for batch in [
+                    Vec::new(),
+                    vec![retained_batch::RetainedMutation::Delete {
+                        id: "absent.md".to_owned(),
+                    }],
+                ] {
+                    let result = blocked
+                        .apply_retained_batch(&cx, &root, &first, &batch)
+                        .await
+                        .unwrap();
+                    assert!(result.publication.is_none());
+                    assert_eq!((result.upserted, result.deleted), (0, 0));
+                }
+                assert!(
+                    blocked
+                        .compact_retained_generation(&cx, &root)
+                        .await
+                        .unwrap()
+                        .0
+                        .is_none(),
+                    "lexical-only compaction is a no-op"
+                );
+                cx.set_cancel_requested(true);
+                let cancelled = blocked
+                    .apply_retained_batch(&cx, &root, &first, &mutations)
+                    .await;
+                cx.set_cancel_requested(false);
+                assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+                assert_eq!(store.active(&cx).unwrap(), Some(first.clone()));
+                assert_eq!(
+                    fs::read_dir(root.join("generations")).unwrap().count(),
+                    allocations
+                );
+                assert_eq!(fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap(), bundle);
+                let phases = old.search(&cx, "sharedtoken", 10).await.unwrap();
+                assert_eq!(serde_json::to_value(&phases[0].hits).unwrap(), before);
+            }
+
+            // The source rebuild and original mixed batch both succeed after
+            // relief, while a previously retained reader keeps its exact result.
+            publish(&runtime, &cx, &root).await;
+            let rebuilt = store.active(&cx).unwrap().unwrap();
+            let result = runtime
+                .apply_retained_batch(&cx, &root, &rebuilt, &mutations)
+                .await
+                .unwrap();
+            assert_eq!((result.upserted, result.deleted), (1, 1));
+            assert!(matches!(
+                result.publication,
+                Some(GenerationPublication::Durable(_))
+            ));
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let phases = fresh.search(&cx, "sharedtoken", 10).await.unwrap();
+            let mut paths = phases[0].hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>();
+            paths.sort_unstable();
+            assert_eq!(paths, ["beta.md", "gamma.md"]);
+            let mut input = runtime.cli_input.clone();
+            input.command = CliCommand::Delete;
+            input.delete_ids = vec!["gamma.md".to_owned()];
+            let (publication, deleted) = runtime
+                .clone()
+                .with_cli_input(input)
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(deleted, 1);
+            assert!(matches!(publication, Some(GenerationPublication::Durable(_))));
+            let phases = old.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(serde_json::to_value(&phases[0].hits).unwrap(), before);
+            assert_eq!(fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap(), bundle);
+        });
     }
 
     /// Each successor starts as a copy of its predecessor. Merge inputs that

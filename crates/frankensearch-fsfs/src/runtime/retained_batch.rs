@@ -675,9 +675,10 @@ impl FsfsRuntime {
         let mut control = super::IndexRunControl::new(&self.config)?;
         control.admit_work(cx, "retained_batch.start").await?;
         let store = CompleteGenerationStore::open(cx, store_root)?;
-        let build = store.begin(cx)?;
-        let predecessor = store
-            .active(cx)?
+        let admission = store.admit_build(cx)?;
+        let predecessor = admission
+            .predecessor()
+            .cloned()
             .ok_or_else(|| invalid("no generation is selected"))?;
         if &predecessor != expected {
             return Err(invalid(
@@ -715,6 +716,8 @@ impl FsfsRuntime {
                 "source policy requires vectors absent from the selected generation",
             ));
         }
+        self.admit_storage_write(cx, store_root, "retained_batch.start")?;
+        let build = admission.allocate(cx, false)?;
         let mut input = self.cli_input.clone();
         input.index_dir = Some(build.path().to_path_buf());
         input.daemon = false;

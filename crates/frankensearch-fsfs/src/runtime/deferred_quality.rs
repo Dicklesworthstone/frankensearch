@@ -1085,6 +1085,7 @@ impl FsfsRuntime {
             .ok_or_else(|| invalid("quality completion requires a registered quality model"))?;
         let mut control = IndexRunControl::new(&self.config)?;
         control.admit_work(cx, "complete_quality.start").await?;
+        self.admit_storage_write(cx, store_root, "complete_quality.start")?;
         let store = CompleteGenerationStore::open(cx, store_root)?;
         let build = store.begin(cx)?;
         let predecessor = store
@@ -1773,6 +1774,76 @@ mod tests {
                 assert_eq!(files(selected.path()), before);
                 assert!(quality.inputs.lock().unwrap().is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn storage_pressure_preserves_deferred_quality_inputs_until_retry() {
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("deferred-fast"));
+            let quality = Arc::new(Producer::new("deferred-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let root = directory.path().join("store");
+            let deferred = runtime(directory.path(), true);
+            let first = durable(deferred.rebuild_retained_generation(&cx, &root).await.unwrap());
+            let before = files(first.path());
+            let allocations = fs::read_dir(root.join("generations")).unwrap().count();
+            let mut old = deferred.open_retained_search(&cx, &root).await.unwrap();
+            let phases = old.search(&cx, "sharedtoken", 10).await.unwrap();
+            let old_hits = serde_json::to_value(&phases[0].hits).unwrap();
+            fast.inputs.lock().unwrap().clear();
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            let mut resumed = runtime(directory.path(), false);
+            resumed.config.storage.disk_budget_bytes = Some(0);
+            for emergency in [false, true] {
+                let mut blocked = resumed.clone();
+                blocked.config.storage.storage_pressure_emergency = emergency;
+                blocked.config.storage.disk_budget_bytes = Some(if emergency { 0 } else { 1 });
+                let error = blocked
+                    .complete_retained_quality(&cx, &root, &first)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    super::super::storage_admission::storage_admission_denial(&error).is_some()
+                );
+                cx.set_cancel_requested(true);
+                let cancelled = blocked.complete_retained_quality(&cx, &root, &first).await;
+                cx.set_cancel_requested(false);
+                assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+                assert_eq!(
+                    fs::read_dir(root.join("generations")).unwrap().count(),
+                    allocations
+                );
+                assert_eq!(files(first.path()), before);
+                assert_eq!(
+                    CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap(),
+                    Some(first.clone())
+                );
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                assert!(quality.inputs.lock().unwrap().is_empty());
+            }
+            let completed = resumed
+                .complete_retained_quality(&cx, &root, &first)
+                .await
+                .unwrap();
+            assert_eq!(completed.completed_documents, expected.len());
+            let next = durable(completed.publication);
+            assert_ne!(next, first);
+            assert!(next.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).is_file());
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            let mut observed = quality.inputs.lock().unwrap().clone();
+            observed.sort();
+            let mut expected = expected.into_values().collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(observed, expected);
+            assert_eq!(files(first.path()), before);
+            let phases = old.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(serde_json::to_value(&phases[0].hits).unwrap(), old_hits);
         });
     }
 

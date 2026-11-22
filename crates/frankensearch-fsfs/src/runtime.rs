@@ -22281,6 +22281,10 @@ impl FsfsRuntime {
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        // A retained rebuild writes inside one candidate but owns the complete
+        // store's footprint, including the predecessor and inactive generations.
+        let storage_root = self.discovery_excluded_root.as_deref().unwrap_or(&index_root);
+        self.admit_storage_write(cx, storage_root, "index.start")?;
         // One-shot and watch-mode indexing mutate checkpoint + FSVI + sentinel
         // state; exclude every other mutating fsfs process for the duration.
         // The held lease is refenced immediately before every publication
