@@ -180,8 +180,9 @@ impl PipelineMetrics {
     }
 }
 
-/// An actual embedding response bound to the queue attempt and input revision
-/// that produced it. The sink must acquire its writer lock before calling
+/// An embedding response bound to its queue attempt and input revision.
+///
+/// The sink must acquire its writer lock before calling
 /// [`Self::persist_if_current`] and keep that lock through the supplied write.
 ///
 /// Checking only before acquiring the lock is insufficient: a newer worker
@@ -1952,6 +1953,7 @@ mod tests {
                     id: "fast-tier",
                     identity: EmbeddingIdentityBundleV1::explicit_test_model("fast-tier", 2),
                     inputs: Mutex::new(Vec::new()),
+                    values: Mutex::new(vec![0.6, 0.8]),
                     fail_next: AtomicBool::new(false),
                 });
                 let open_runner = || {
