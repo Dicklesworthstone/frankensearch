@@ -3146,6 +3146,13 @@ mod generation_tests {
                 let migrated = publish(&runtime, &cx, &root).await;
                 assert_eq!(fast.counts.probes.load(Ordering::SeqCst), 0);
                 assert_eq!(quality.counts.probes.load(Ordering::SeqCst), 0);
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let retention = store.plan_retention(&cx, 2).unwrap();
+                assert_eq!(retention.active.as_deref(), Some(migrated.id()));
+                assert!(retention.retained.is_empty());
+                assert_eq!(retention.reclaimable.len(), 1);
+                assert!(retention.reclaimable[0].sealed);
+                assert_eq!(fs::read(root.join(LEGACY_RECEIPT_FILE)).unwrap(), receipt);
                 let saved_pointer = parent.path().join("published-pointer");
                 fs::rename(&pointer, &saved_pointer).unwrap();
                 for corrupt in [false, true] {
@@ -3158,7 +3165,6 @@ mod generation_tests {
                 }
                 fs::rename(&pointer, parent.path().join("damaged-pointer")).unwrap();
                 fs::rename(saved_pointer, pointer).unwrap();
-                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
                 assert_eq!(store.active(&cx).unwrap(), Some(migrated));
             });
         }

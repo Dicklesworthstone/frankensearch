@@ -1945,6 +1945,8 @@ impl FsWatcher {
                 });
             }
 
+            let mut prepared = prepare_event_batch(&self.discovery, &self.roots, events)?;
+            prepared.require_reconciliation_for_skipped(&self.roots, &self.reconciliation)?;
             if lock_or_recover(&self.reconciliation).required {
                 let reconciliation_result = run_authoritative_reconciliation(
                     cx,
@@ -1964,25 +1966,33 @@ impl FsWatcher {
                     return Err(cancelled_ingest_error(cx));
                 }
                 reconciliation_result?;
+                // The awaited pass can outlive a source or policy change.
+                // Recheck the original events before replaying them, and retain
+                // another scan if a source the pass observed is now excluded.
+                prepared = prepare_event_batch(&self.discovery, &self.roots, events)?;
+                if prepared.require_reconciliation_for_skipped(&self.roots, &self.reconciliation)? {
+                    return Err(watcher_task_error(
+                        "source eligibility changed during reconciliation; rescan required",
+                    ));
+                }
             }
 
             // Runs on the caller's executor under the caller's `Cx`: this path
             // builds no runtime of its own and therefore cannot strand ingest work
             // on a private one that the caller cannot cancel.
-            let prepared = prepare_event_batch(&self.discovery, &self.roots, events)?;
             if prepared.ops.is_empty() {
                 let outcome = prepared.outcome(0);
                 self.stats.add_skipped(outcome.skipped);
                 return Ok(outcome);
             }
 
-            let mut guard = DirectApplyGuard::new(&self.reconciliation, events);
+            let mut guard = DirectApplyGuard::new(&self.reconciliation, &prepared.applied_events);
             let reindexed = self.ingest.apply_batch(cx, &prepared.ops).await?;
             match record_successful_events(
                 &self.roots,
                 &self.discovery,
                 &self.reconciliation,
-                events,
+                &prepared.applied_events,
                 &collect_snapshot_from_roots,
                 // This caller owns the `Cx`; it has no watcher generation whose
                 // stop signal it can observe.
@@ -2800,6 +2810,8 @@ impl Drop for DirectApplyGuard {
 
 struct PreparedWatchBatch {
     ops: Vec<WatchIngestOp>,
+    applied_events: Vec<WatchEvent>,
+    skipped_paths: Vec<PathBuf>,
     accepted: usize,
     skipped: usize,
 }
@@ -2811,6 +2823,58 @@ impl PreparedWatchBatch {
             reindexed,
             skipped: self.skipped,
         }
+    }
+
+    /// Excluding a new source requires no mutation, but excluding a source we
+    /// already indexed owes a deletion. A skipped directory can cover indexed
+    /// descendants too. Only a complete scan through the retained root identities
+    /// may derive those deletes; never turn an ignored upsert into one directly.
+    fn require_reconciliation_for_skipped(
+        &self,
+        roots: &[PathBuf],
+        reconciliation: &ReconciliationTracker,
+    ) -> SearchResult<bool> {
+        if self.skipped_paths.is_empty() {
+            return Ok(false);
+        }
+        let mut state = lock_or_recover(reconciliation);
+        let observed = match &state.authority {
+            DeletionAuthorityState::Established { authority, .. } => Some(&authority.snapshot),
+            DeletionAuthorityState::Probationary { candidate, .. } => Some(&candidate.snapshot),
+            DeletionAuthorityState::Absent | DeletionAuthorityState::UnverifiedLegacy { .. } => {
+                None
+            }
+        };
+        let needs_scan = self.skipped_paths.iter().any(|skipped| {
+            if skipped.as_os_str().is_empty()
+                || skipped.to_str().is_none()
+                || skipped
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+                || !roots.iter().any(|root| {
+                    !root.as_os_str().is_empty()
+                        && !root
+                            .components()
+                            .any(|component| component == Component::ParentDir)
+                        && skipped.starts_with(root)
+                })
+            {
+                return false;
+            }
+            let covers = |snapshot: &FileSnapshot| {
+                snapshot
+                    .range(skipped.clone()..)
+                    .next()
+                    .is_some_and(|(indexed, _)| indexed.starts_with(skipped))
+            };
+            covers(&state.indexed_snapshot) || observed.is_some_and(covers)
+        });
+        if needs_scan {
+            // This records an observation gap, not permission to adjudicate
+            // inherited legacy names or a replaced source root.
+            state.require_full_scan()?;
+        }
+        Ok(needs_scan)
     }
 }
 
@@ -3057,6 +3121,11 @@ fn run_ingest_loop<'a>(
                 prepare_event_batch(discovery, roots, lease.events()).inspect_err(|_| {
                     stats.add_error();
                 })?;
+            if prepared.require_reconciliation_for_skipped(roots, reconciliation)? {
+                stats.add_skipped(prepared.skipped);
+                lease.commit();
+                continue;
+            }
             if prepared.ops.is_empty() {
                 stats.add_skipped(prepared.skipped);
                 lease.commit();
@@ -3075,7 +3144,7 @@ fn run_ingest_loop<'a>(
             lease.begin_live_apply();
             match ingest.apply_batch(cx, &prepared.ops).await {
                 Ok(reindexed) => {
-                    let events = lease.events().to_vec();
+                    let events = prepared.applied_events.clone();
                     let outcome = prepared.outcome(reindexed);
                     // Freshness per applied batch: how old the oldest event in
                     // the batch was once the sink finished with it (debounce +
@@ -3228,12 +3297,18 @@ fn drain_final_batches<'a>(
                 prepare_event_batch(discovery, roots, lease.events()).inspect_err(|_| {
                     stats.add_error();
                 })?;
+            if prepared.require_reconciliation_for_skipped(roots, reconciliation)? {
+                stats.add_skipped(prepared.skipped);
+                lease.commit();
+                fold_queue_into_reconciliation(ready_batches, reconciliation)?;
+                return Ok(());
+            }
             if prepared.ops.is_empty() {
                 stats.add_skipped(prepared.skipped);
                 lease.commit();
                 continue;
             }
-            let events = lease.events().to_vec();
+            let events = prepared.applied_events.clone();
             lease.begin_live_apply();
             match ingest.apply_batch(cx, &prepared.ops).await {
                 Ok(reindexed) => {
@@ -3993,6 +4068,8 @@ fn prepare_event_batch(
     events: &[WatchEvent],
 ) -> SearchResult<PreparedWatchBatch> {
     let mut ops = Vec::new();
+    let mut applied_events = Vec::new();
+    let mut skipped_paths = Vec::new();
     let mut skipped = 0_usize;
     let mut ignore_rules = IgnoreRules::new()?;
     let mut delete_mounts = None;
@@ -4009,14 +4086,18 @@ fn prepare_event_batch(
             delete_mounts.as_ref(),
         )? {
             ops.push(op);
+            applied_events.push(event.clone());
         } else {
             skipped = skipped.saturating_add(1);
+            skipped_paths.push(event.path.clone());
         }
     }
 
     Ok(PreparedWatchBatch {
         accepted: ops.len(),
         ops,
+        applied_events,
+        skipped_paths,
         skipped,
     })
 }
@@ -7568,6 +7649,409 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_excluded_indexed_events_reconcile_single_and_mixed_batches() {
+        for mixed in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let temp = tempdir().unwrap();
+                let root = temp.path().canonicalize().unwrap();
+                let public = root.join("public.md");
+                let excluded = root.join("growing.md");
+                fs::write(&public, "public source").unwrap();
+                fs::write(&excluded, "previously indexed source").unwrap();
+                let pipeline = Arc::new(RecordingPipeline::default());
+                let watcher = FsWatcher::new(
+                    vec![root],
+                    DiscoveryConfig {
+                        max_file_size_mb: 1,
+                        ..DiscoveryConfig::default()
+                    },
+                    pipeline.clone(),
+                );
+                let (baseline, completeness) = watcher.collect_snapshot().unwrap();
+                assert_eq!(baseline.len(), 2);
+                lock_or_recover(&watcher.reconciliation)
+                    .seed_initial_authority(baseline, completeness.root_identities().clone())
+                    .unwrap();
+
+                // Only eligibility changes: the source still exists, so the
+                // backend emits a modification rather than a deletion.
+                let bytes = 1024 * 1024 + 1;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&excluded)
+                    .unwrap()
+                    .set_len(bytes)
+                    .unwrap();
+                let mut events = vec![WatchEvent::modified(&excluded, now_millis(), Some(bytes))];
+                if mixed {
+                    fs::write(&public, "updated public source").unwrap();
+                    events.push(WatchEvent::modified(&public, now_millis(), None));
+                }
+                watcher.process_events_now(&cx, &events).await.unwrap();
+
+                let excluded_ops = pipeline
+                    .all_ops()
+                    .into_iter()
+                    .filter(|op| match op {
+                        WatchIngestOp::Upsert { file_key, .. }
+                        | WatchIngestOp::Delete { file_key, .. } => {
+                            file_key == &normalize_file_key(&excluded)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    matches!(excluded_ops.as_slice(), [WatchIngestOp::Delete { .. }]),
+                    "an excluded indexed source must reach the sink as a deletion: mixed={mixed}"
+                );
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(!state.required);
+                assert_eq!(state.indexed_snapshot.keys().collect::<Vec<_>>(), [&public]);
+                assert!(
+                    !state
+                        .authority
+                        .established()
+                        .unwrap()
+                        .snapshot
+                        .contains_key(&excluded)
+                );
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_excluded_indexed_event_keeps_authority_until_reconciliation_succeeds() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("source");
+            fs::create_dir(&root).unwrap();
+            let excluded = root.join("growing.md");
+            fs::write(&excluded, "previously indexed source").unwrap();
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![root],
+                DiscoveryConfig {
+                    max_file_size_mb: 1,
+                    ..DiscoveryConfig::default()
+                },
+                pipeline.clone(),
+            );
+            let (baseline, completeness) = watcher.collect_snapshot().unwrap();
+            lock_or_recover(&watcher.reconciliation)
+                .seed_initial_authority(baseline.clone(), completeness.root_identities().clone())
+                .unwrap();
+            let authority = lock_or_recover(&watcher.reconciliation).authority.clone();
+            let bytes = 1024 * 1024 + 1;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&excluded)
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+            let event = WatchEvent::modified(&excluded, now_millis(), Some(bytes));
+            pipeline.fail_next.store(true, Ordering::Release);
+            assert!(
+                watcher
+                    .process_events_now(&cx, std::slice::from_ref(&event))
+                    .await
+                    .is_err()
+            );
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(state.required);
+                assert_eq!(state.indexed_snapshot, baseline);
+                assert_eq!(state.authority, authority);
+            }
+            assert!(pipeline.all_ops().is_empty());
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                watcher.process_events_now(&cx, &[]).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(pipeline.all_ops().is_empty());
+            cx.set_cancel_requested(false);
+            watcher.process_events_now(&cx, &[]).await.unwrap();
+            assert!(matches!(
+                pipeline.all_ops().as_slice(),
+                [WatchIngestOp::Delete { .. }]
+            ));
+            assert!(!lock_or_recover(&watcher.reconciliation).required);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_excluded_indexed_events_are_retained_by_live_and_shutdown_queues() {
+        for stopping in [false, true] {
+            run_on_local_runtime_task(move |cx| async move {
+                let temp = tempdir().unwrap();
+                let root = temp.path().canonicalize().unwrap();
+                let excluded = root.join("growing.md");
+                fs::write(&excluded, "previously indexed source").unwrap();
+                let roots = [root];
+                let discovery = DiscoveryConfig {
+                    max_file_size_mb: 1,
+                    ..DiscoveryConfig::default()
+                };
+                let (baseline, completeness) =
+                    collect_snapshot_from_roots(&roots, &discovery, &|| false).unwrap();
+                let reconciliation = Arc::new(Mutex::new(ReconciliationState::default()));
+                lock_or_recover(&reconciliation)
+                    .seed_initial_authority(
+                        baseline.clone(),
+                        completeness.root_identities().clone(),
+                    )
+                    .unwrap();
+                let bytes = 1024 * 1024 + 1;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&excluded)
+                    .unwrap()
+                    .set_len(bytes)
+                    .unwrap();
+                let event = WatchEvent::modified(&excluded, now_millis(), Some(bytes));
+                let queue = Arc::new(Mutex::new(VecDeque::from([vec![event]])));
+                let pipeline = RecordingPipeline::default();
+                let stats = WatcherStatsInner::default();
+                let stop = Arc::new(WatcherStop::default());
+                let producer_done = AtomicBool::new(true);
+                if stopping {
+                    stop.request();
+                } else {
+                    *lock_or_recover(&pipeline.stop_after_flush_barrier) =
+                        Some((Arc::clone(&stop), 2));
+                }
+                run_ingest_loop(
+                    &cx,
+                    &roots,
+                    &discovery,
+                    &pipeline,
+                    &queue,
+                    &stop,
+                    &stats,
+                    &reconciliation,
+                    100,
+                    &producer_done,
+                    &collect_snapshot_from_roots,
+                    &|| true,
+                )
+                .await
+                .unwrap();
+                if stopping {
+                    assert!(
+                        pipeline.all_ops().is_empty(),
+                        "shutdown must not start a rescan"
+                    );
+                    {
+                        let state = lock_or_recover(&reconciliation);
+                        assert!(state.required, "shutdown must retain the skipped source");
+                        assert_eq!(state.indexed_snapshot, baseline);
+                    }
+                    run_authoritative_reconciliation(
+                        &cx,
+                        &roots,
+                        &discovery,
+                        &pipeline,
+                        &reconciliation,
+                        &queue,
+                        &stats,
+                        100,
+                        &collect_snapshot_from_roots,
+                        &|| false,
+                    )
+                    .await
+                    .unwrap();
+                }
+                assert!(matches!(
+                    pipeline.all_ops().as_slice(),
+                    [WatchIngestOp::Delete { .. }]
+                ));
+                assert!(!lock_or_recover(&reconciliation).required);
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_excluded_directory_and_probationary_sources_keep_rescan_debt() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("nested");
+        fs::create_dir(&source).unwrap();
+        let file = source.join("notes.md");
+        fs::write(&file, "indexed source").unwrap();
+        let roots = [root];
+        let discovery = DiscoveryConfig::default();
+        let (snapshot, completeness) =
+            collect_snapshot_from_roots(&roots, &discovery, &|| false).unwrap();
+        let candidate = authority_over(snapshot.clone(), &roots);
+        let unselected_parent = roots[0].parent().unwrap().to_path_buf();
+
+        for probationary in [false, true] {
+            let authority = if probationary {
+                super::DeletionAuthorityState::Probationary {
+                    candidate: candidate.clone(),
+                    legacy: None,
+                }
+            } else {
+                super::DeletionAuthorityState::Established {
+                    authority: candidate.clone(),
+                    legacy: None,
+                }
+            };
+            let reconciliation = Arc::new(Mutex::new(ReconciliationState {
+                authority,
+                ..ReconciliationState::default()
+            }));
+            // A skipped directory can still own indexed descendants. The
+            // skipped observation itself cannot grant deletion authority.
+            let prepared = super::PreparedWatchBatch {
+                ops: Vec::new(),
+                applied_events: Vec::new(),
+                skipped_paths: vec![source.clone()],
+                accepted: 0,
+                skipped: 1,
+            };
+            assert!(
+                prepared
+                    .require_reconciliation_for_skipped(&roots, &reconciliation)
+                    .unwrap()
+            );
+            let state = lock_or_recover(&reconciliation);
+            assert!(state.required);
+            assert!(state.affected_paths.is_empty());
+            drop(state);
+
+            let unselected = super::PreparedWatchBatch {
+                skipped_paths: vec![unselected_parent.clone()],
+                ..prepared
+            };
+            let epoch = lock_or_recover(&reconciliation).epoch;
+            assert!(
+                !unselected
+                    .require_reconciliation_for_skipped(&roots, &reconciliation)
+                    .unwrap()
+            );
+            assert_eq!(lock_or_recover(&reconciliation).epoch, epoch);
+        }
+        let inherited = Arc::new(Mutex::new(ReconciliationState::default()));
+        lock_or_recover(&inherited)
+            .inherit_legacy(&snapshot)
+            .unwrap();
+        let prepared = super::PreparedWatchBatch {
+            ops: Vec::new(),
+            applied_events: Vec::new(),
+            skipped_paths: vec![file],
+            accepted: 0,
+            skipped: 1,
+        };
+        let epoch = lock_or_recover(&inherited).epoch;
+        assert!(
+            !prepared
+                .require_reconciliation_for_skipped(&roots, &inherited)
+                .unwrap()
+        );
+        let state = lock_or_recover(&inherited);
+        assert_eq!(state.epoch, epoch);
+        assert_eq!(state.authority.legacy(), Some(&snapshot));
+        assert!(completeness.identity_is_trustworthy());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_excluded_event_rechecks_eligibility_after_direct_reconciliation() {
+        struct ExcludingPipeline {
+            recorded: RecordingPipeline,
+            ignore_path: PathBuf,
+            exclude_once: AtomicBool,
+        }
+
+        impl WatchIngestPipeline for ExcludingPipeline {
+            fn apply_batch<'a>(
+                &'a self,
+                cx: &'a Cx,
+                batch: &'a [WatchIngestOp],
+            ) -> WatchIngestFuture<'a, usize> {
+                Box::pin(async move {
+                    let reindexed = self.recorded.apply_batch(cx, batch).await?;
+                    if self.exclude_once.swap(false, Ordering::AcqRel) {
+                        fs::write(&self.ignore_path, "public.md\n").unwrap();
+                    }
+                    Ok(reindexed)
+                })
+            }
+        }
+
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let public = root.join("public.md");
+            let excluded = root.join("growing.md");
+            fs::write(&public, "public source").unwrap();
+            fs::write(&excluded, "previously indexed source").unwrap();
+            let pipeline = Arc::new(ExcludingPipeline {
+                recorded: RecordingPipeline::default(),
+                ignore_path: root.join(".ignore"),
+                exclude_once: AtomicBool::new(true),
+            });
+            let watcher = FsWatcher::new(
+                vec![root],
+                DiscoveryConfig {
+                    max_file_size_mb: 1,
+                    ..DiscoveryConfig::default()
+                },
+                pipeline.clone(),
+            );
+            let (baseline, completeness) = watcher.collect_snapshot().unwrap();
+            lock_or_recover(&watcher.reconciliation)
+                .seed_initial_authority(baseline, completeness.root_identities().clone())
+                .unwrap();
+            let bytes = 1024 * 1024 + 1;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&excluded)
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+            let events = [
+                WatchEvent::modified(&excluded, now_millis(), Some(bytes)),
+                WatchEvent::modified(&public, now_millis(), None),
+            ];
+            let error = watcher.process_events_now(&cx, &events).await.unwrap_err();
+            assert!(super::is_retryable_error(&error));
+            assert_eq!(lock_or_recover(&pipeline.recorded.attempts).len(), 1);
+            assert_eq!(
+                pipeline
+                    .recorded
+                    .all_ops()
+                    .iter()
+                    .filter(|op| matches!(
+                        op,
+                        WatchIngestOp::Upsert { file_key, .. }
+                            if file_key == &normalize_file_key(&public)
+                    ))
+                    .count(),
+                1,
+                "a pre-scan upsert must not replay after its source is excluded"
+            );
+            {
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(state.required);
+                assert!(state.indexed_snapshot.contains_key(&public));
+                assert!(!state.indexed_snapshot.contains_key(&excluded));
+            }
+            watcher.process_events_now(&cx, &[]).await.unwrap();
+            assert!(matches!(
+                pipeline.recorded.all_ops().last(),
+                Some(WatchIngestOp::Delete { file_key, .. })
+                    if file_key == &normalize_file_key(&public)
+            ));
+            assert!(!lock_or_recover(&watcher.reconciliation).required);
+        });
     }
 
     #[cfg(unix)]
