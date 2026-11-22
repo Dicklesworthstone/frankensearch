@@ -13332,15 +13332,16 @@ impl FsfsRuntime {
     }
 
     fn load_complete_explain_session_at_root(root: &Path) -> SearchResult<Option<ExplainSession>> {
-        match Self::read_explain_session(root, FSFS_COMPLETE_EXPLAIN_SESSION_FILE)? {
-            Some(session) => Ok(Some(session)),
-            // Earlier versions saved complete sessions at the legacy path.
-            // The caller still compares the exact selected generation stamp.
-            None => Self::load_explain_session_at_root(root),
-        }
+        // Earlier versions saved complete sessions at the legacy path.
+        // The caller still compares the exact selected generation stamp.
+        Self::read_explain_session(root, FSFS_COMPLETE_EXPLAIN_SESSION_FILE)?
+            .map_or_else(|| Self::load_explain_session_at_root(root), |session| Ok(Some(session)))
     }
 
-    fn read_explain_session(index_root: &Path, session_file: &str) -> SearchResult<Option<ExplainSession>> {
+    fn read_explain_session(
+        index_root: &Path,
+        session_file: &str,
+    ) -> SearchResult<Option<ExplainSession>> {
         if !Self::admit_explain_directory(index_root, false)? {
             return Ok(None);
         }
@@ -45757,7 +45758,7 @@ mod tests {
                     lexical_expansion_stream_fixture(&cx, directory.path()).await;
                 // A directory at the file destination makes explanation writes
                 // fail deterministically, independent of filesystem permissions.
-                let session_path = FsfsRuntime::explain_session_path(directory.path());
+                let session_path = directory.path().join(super::FSFS_EXPLAIN_SESSION_FILE);
                 fs::create_dir_all(&session_path).unwrap();
                 runtime.cli_input.query = Some(QUERY.to_owned());
                 runtime.cli_input.stream = false;
@@ -60455,7 +60456,7 @@ mod tests {
                 session.complete_generation,
                 Some(super::CompleteExplainGeneration::from_generation(&first))
             );
-            assert!(!first.path().join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
+            assert!(FsfsRuntime::load_complete_explain_session_at_root(first.path()).unwrap().is_none());
             let session_path = root.join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE);
             let saved = fs::read(&session_path).unwrap();
             let hit = session.hits.first().expect("search found fixture");
@@ -60669,13 +60670,9 @@ mod tests {
                 Some(super::CompleteExplainGeneration::from_generation(&first))
             );
             assert_eq!(store.active(&cx).unwrap(), Some(second.clone()));
-            assert!(!first.path().join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
-            assert!(
-                !second
-                    .path()
-                    .join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
-                    .exists()
-            );
+            for generation in [first, second] {
+                assert!(FsfsRuntime::load_complete_explain_session_at_root(generation.path()).unwrap().is_none());
+            }
         });
     }
 
@@ -60725,7 +60722,7 @@ mod tests {
                     .persist_explain_session(store.root(), "wrong", SearchOutputPhase::Initial, &[])
                     .is_err()
             );
-            assert!(!store.root().join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
+            assert!(FsfsRuntime::load_complete_explain_session_at_root(store.root()).unwrap().is_none());
             runtime
                 .persist_explain_session(
                     generation.path(),
@@ -60818,6 +60815,7 @@ mod tests {
                     .contains("symlink")
             );
             assert!(output.is_empty());
+            assert!(!generation.path().join("last_search_session.json").exists());
             assert!(!generation.path().join("last_complete_search_session.json").exists());
             assert_eq!(store.active(&cx).unwrap(), Some(generation));
 

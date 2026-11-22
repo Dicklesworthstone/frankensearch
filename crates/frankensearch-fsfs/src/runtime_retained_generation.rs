@@ -4217,11 +4217,9 @@ mod retained_search_tests {
                 Some(reader.generation().clone())
             );
             assert!(
-                !reader
-                    .generation()
-                    .path()
-                    .join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
-                    .exists()
+                FsfsRuntime::load_complete_explain_session_at_root(reader.generation().path())
+                    .unwrap()
+                    .is_none()
             );
             reader
                 .search(&cx, "sharedtoken", 10)

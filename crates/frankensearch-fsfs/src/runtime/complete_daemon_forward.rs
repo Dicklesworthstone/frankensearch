@@ -2137,11 +2137,11 @@ mod generation_tests {
                 // CLI explanation session. A cached forwarded result must save
                 // that context, while --explain still computes its own detail.
                 assert_eq!(raw_search(&cx, &endpoint).await?, (2, false));
-                assert!(FsfsRuntime::load_explain_session_at_root(&root)?.is_none());
+                assert!(FsfsRuntime::load_complete_explain_session_at_root(&root)?.is_none());
                 let cached = client
                     .query_complete_generation_daemon(&cx, &root, "sharedtoken", 10)
                     .await?;
-                let context = FsfsRuntime::load_explain_session_at_root(&root)?.unwrap();
+                let context = FsfsRuntime::load_complete_explain_session_at_root(&root)?.unwrap();
                 assert_eq!(context.query, cached.query);
                 assert_eq!(context.hits.len(), 2);
                 assert!(context.complete_generation.is_some());
@@ -2208,7 +2208,7 @@ mod generation_tests {
                     .query_complete_generation_daemon(&cx, &root, "sharedtoken", 1)
                     .await?;
                 assert_eq!(limited.hits.len(), 1);
-                let context = FsfsRuntime::load_explain_session_at_root(&root)?.unwrap();
+                let context = FsfsRuntime::load_complete_explain_session_at_root(&root)?.unwrap();
                 assert_eq!(context.query, limited.query);
                 assert_eq!(context.hits.len(), 1);
                 assert_eq!(context.hits[0].path, limited.hits[0].path);

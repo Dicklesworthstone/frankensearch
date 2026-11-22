@@ -930,10 +930,9 @@ mod tests {
             assert_eq!(generation_count(&root), 2, "one new build, no retry");
             assert!(!directory.path().join("missing-models").exists());
             assert!(
-                !current
-                    .path()
-                    .join(crate::runtime::FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
-                    .exists()
+                FsfsRuntime::load_complete_explain_session_at_root(current.path())
+                    .unwrap()
+                    .is_none()
             );
         });
     }

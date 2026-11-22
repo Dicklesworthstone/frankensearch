@@ -2232,12 +2232,9 @@ mod generation_tests {
                 selected.as_ref().unwrap().id()
             );
             assert!(
-                !selected
-                    .as_ref()
+                FsfsRuntime::load_complete_explain_session_at_root(selected.as_ref().unwrap().path())
                     .unwrap()
-                    .path()
-                    .join(crate::runtime::FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
-                    .exists()
+                    .is_none()
             );
         });
     }

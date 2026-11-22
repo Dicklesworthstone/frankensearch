@@ -2893,7 +2893,7 @@ mod tests {
             assert_eq!(reader.generation(), &successor);
             assert_eq!(sealed_inventory(predecessor.path()), before);
             assert_eq!(sealed_inventory(successor.path()), successor_before);
-            assert!(!root.join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
+            assert!(FsfsRuntime::load_complete_explain_session_at_root(&root).unwrap().is_none());
         });
     }
 
@@ -2995,7 +2995,7 @@ mod tests {
             assert_eq!(sealed_inventory(predecessor.path()), before);
             assert_eq!(sealed_inventory(successor.path()), successor_before);
             assert_eq!(fs::read(&selection_path).unwrap(), valid_selection);
-            assert!(!root.join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
+            assert!(FsfsRuntime::load_complete_explain_session_at_root(&root).unwrap().is_none());
         });
     }
 
@@ -4040,10 +4040,9 @@ mod tests {
             );
             for generation in [reader.generation(), fresh.generation()] {
                 assert!(
-                    !generation
-                        .path()
-                        .join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
-                        .exists()
+                    FsfsRuntime::load_complete_explain_session_at_root(generation.path())
+                        .unwrap()
+                        .is_none()
                 );
                 assert!(!generation.path().join("query_cache").exists());
             }
@@ -5304,7 +5303,7 @@ mod tests {
                 current.id(),
                 second_receipt["data"]["generation_id"].as_str().unwrap()
             );
-            assert!(!current.path().join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
+            assert!(FsfsRuntime::load_complete_explain_session_at_root(current.path()).unwrap().is_none());
         });
     }
 

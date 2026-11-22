@@ -3088,7 +3088,7 @@ mod generation_tests {
 
         #[test]
         fn aborted_first_migration_keeps_foreground_legacy_search_and_explain() {
-            use crate::runtime::{SearchExecutionFlags, SearchExecutionMode};
+            use crate::runtime::{InterfaceMode, SearchExecutionFlags, SearchExecutionMode};
 
             run_test_with_cx(|cx| async move {
                 let parent = tempfile::tempdir().unwrap();
@@ -3165,22 +3165,43 @@ mod generation_tests {
 
                 let query = search.cli_input.query.as_deref().unwrap();
                 let limit = search.config.search.default_limit;
-                search.run_mode_with_complete_generations(
-                    &cx, super::super::super::InterfaceMode::Cli, None, false,
-                ).await.unwrap();
+                search
+                    .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                    .await
+                    .unwrap();
                 let mut retained = search.open_retained_search(&cx, &root).await.unwrap();
-                retained.runtime.enable_complete_generation_explanations(&root, &retained.generation).unwrap();
-                let key = search.search_cache_key(query, limit, SearchExecutionMode::LexicalOnly).unwrap();
+                retained
+                    .runtime
+                    .enable_complete_generation_explanations(&root, &retained.generation)
+                    .unwrap();
+                let key = search
+                    .search_cache_key(query, limit, SearchExecutionMode::LexicalOnly)
+                    .unwrap();
                 let fingerprint = &retained.resources.generation_fingerprint;
                 assert!(retained.runtime.try_load_search_payload_cache(&key, fingerprint).unwrap().is_some());
 
-                let late = search.execute_search_phase_artifacts_with_mode_using_resources(
-                    &cx, query, limit, SearchExecutionMode::LexicalOnly, &mut late_resources,
-                    SearchExecutionFlags { include_snippets: true, persist_explain_session: true },
-                    None,
-                ).await.unwrap();
+                let late = search
+                    .execute_search_phase_artifacts_with_mode_using_resources(
+                        &cx,
+                        query,
+                        limit,
+                        SearchExecutionMode::LexicalOnly,
+                        &mut late_resources,
+                        SearchExecutionFlags {
+                            include_snippets: true,
+                            persist_explain_session: true,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
                 let late: Vec<_> = late.into_iter().map(|artifact| artifact.payload).collect();
-                search.write_search_payload_cache(&key, &late, &late_resources.generation_fingerprint).unwrap();
+                let legacy_fingerprint = &late_resources.generation_fingerprint;
+                search.write_search_payload_cache(&key, &late, legacy_fingerprint).unwrap();
+                let legacy_context = FsfsRuntime::load_explain_session_at_root(&root).unwrap().unwrap();
+                assert_eq!(legacy_context.query, query);
+                assert!(legacy_context.complete_generation.is_none());
+                assert!(search.try_load_search_payload_cache(&key, legacy_fingerprint).unwrap().is_some());
 
                 let mut explanation = Vec::new();
                 let explained = explain.run_complete_generation_explain_with_writer(&cx, &root, &mut explanation).await;
