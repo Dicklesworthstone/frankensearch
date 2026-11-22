@@ -9554,9 +9554,13 @@ impl FsfsRuntime {
         }
 
         let payloads = if search_runtime.cli_input.expand {
-            search_runtime
-                .execute_expanded_search(cx, query, limit, Self::expand_search_query(cx, query))
-                .await?
+            Box::pin(search_runtime.execute_expanded_search(
+                cx,
+                query,
+                limit,
+                Self::expand_search_query(cx, query),
+            ))
+            .await?
         } else if search_runtime.cli_input.daemon {
             match search_runtime
                 .search_payloads_via_daemon(cx, query, limit)
