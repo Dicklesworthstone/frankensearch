@@ -3088,6 +3088,8 @@ mod generation_tests {
 
         #[test]
         fn aborted_first_migration_keeps_foreground_legacy_search_and_explain() {
+            use crate::runtime::{SearchExecutionFlags, SearchExecutionMode};
+
             run_test_with_cx(|cx| async move {
                 let parent = tempfile::tempdir().unwrap();
                 fixture(parent.path(), 2);
@@ -3141,6 +3143,13 @@ mod generation_tests {
                     assert_eq!(writer.complete_generation_command_root(false).unwrap(), Some(root.clone()));
                 }
 
+                // Capture resources on the legacy route before the successful retry.
+                // This request will finish after a request on the new route.
+                search.cli_input.query = Some("-absenttoken".to_owned());
+                let mut late_resources = search
+                    .prepare_search_execution_resources(&cx, SearchExecutionMode::LexicalOnly)
+                    .await
+                    .unwrap();
                 fast.counts.probes.store(0, Ordering::SeqCst);
                 quality.counts.probes.store(0, Ordering::SeqCst);
                 let migrated = publish(&runtime, &cx, &root).await;
@@ -3153,6 +3162,32 @@ mod generation_tests {
                 assert_eq!(retention.reclaimable.len(), 1);
                 assert!(retention.reclaimable[0].sealed);
                 assert_eq!(fs::read(root.join(LEGACY_RECEIPT_FILE)).unwrap(), receipt);
+
+                let query = search.cli_input.query.as_deref().unwrap();
+                let limit = search.config.search.default_limit;
+                search.run_mode_with_complete_generations(
+                    &cx, super::super::super::InterfaceMode::Cli, None, false,
+                ).await.unwrap();
+                let mut retained = search.open_retained_search(&cx, &root).await.unwrap();
+                retained.runtime.enable_complete_generation_explanations(&root, &retained.generation).unwrap();
+                let key = search.search_cache_key(query, limit, SearchExecutionMode::LexicalOnly).unwrap();
+                let fingerprint = &retained.resources.generation_fingerprint;
+                assert!(retained.runtime.try_load_search_payload_cache(&key, fingerprint).unwrap().is_some());
+
+                let late = search.execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx, query, limit, SearchExecutionMode::LexicalOnly, &mut late_resources,
+                    SearchExecutionFlags { include_snippets: true, persist_explain_session: true },
+                    None,
+                ).await.unwrap();
+                let late: Vec<_> = late.into_iter().map(|artifact| artifact.payload).collect();
+                search.write_search_payload_cache(&key, &late, &late_resources.generation_fingerprint).unwrap();
+
+                let mut explanation = Vec::new();
+                let explained = explain.run_complete_generation_explain_with_writer(&cx, &root, &mut explanation).await;
+                let warm = retained.runtime.try_load_search_payload_cache(&key, fingerprint).unwrap().is_some();
+                assert!(explained.is_ok() && warm,
+                    "late legacy writes must preserve the selected generation's explanation and cache: explain={explained:?}, warm={warm}");
+
                 let saved_pointer = parent.path().join("published-pointer");
                 fs::rename(&pointer, &saved_pointer).unwrap();
                 for corrupt in [false, true] {

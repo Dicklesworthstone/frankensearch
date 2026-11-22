@@ -2534,7 +2534,7 @@ mod tests {
         set_test_quality_embedder, test_fast_embedder_override, test_quality_embedder_override,
     };
     use super::super::{
-        FSFS_EXPLAIN_SESSION_FILE, INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexSentinel,
+        FSFS_COMPLETE_EXPLAIN_SESSION_FILE, INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexSentinel,
         IndexingCheckpoint, write_indexing_checkpoint,
     };
     use super::*;
@@ -2893,7 +2893,7 @@ mod tests {
             assert_eq!(reader.generation(), &successor);
             assert_eq!(sealed_inventory(predecessor.path()), before);
             assert_eq!(sealed_inventory(successor.path()), successor_before);
-            assert!(!root.join(FSFS_EXPLAIN_SESSION_FILE).exists());
+            assert!(!root.join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
         });
     }
 
@@ -2995,7 +2995,7 @@ mod tests {
             assert_eq!(sealed_inventory(predecessor.path()), before);
             assert_eq!(sealed_inventory(successor.path()), successor_before);
             assert_eq!(fs::read(&selection_path).unwrap(), valid_selection);
-            assert!(!root.join(FSFS_EXPLAIN_SESSION_FILE).exists());
+            assert!(!root.join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
         });
     }
 
@@ -4042,7 +4042,7 @@ mod tests {
                 assert!(
                     !generation
                         .path()
-                        .join(super::super::FSFS_EXPLAIN_SESSION_FILE)
+                        .join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
                         .exists()
                 );
                 assert!(!generation.path().join("query_cache").exists());
@@ -4203,7 +4203,7 @@ mod tests {
                     assert_eq!(store.active(&cx).unwrap(), Some(successor.clone()));
                     assert_eq!(sealed_inventory(predecessor.path()), before);
                     assert_eq!(sealed_inventory(successor.path()), successor_before);
-                    let session = FsfsRuntime::load_explain_session_at_root(&root).unwrap().unwrap();
+                    let session = FsfsRuntime::load_complete_explain_session_at_root(&root).unwrap().unwrap();
                     assert_eq!(session.complete_generation.as_ref().unwrap().id, predecessor.id());
                     assert_eq!(session.unavailable.is_some(), generate);
                 }
@@ -5304,7 +5304,7 @@ mod tests {
                 current.id(),
                 second_receipt["data"]["generation_id"].as_str().unwrap()
             );
-            assert!(!current.path().join(FSFS_EXPLAIN_SESSION_FILE).exists());
+            assert!(!current.path().join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
         });
     }
 
@@ -5374,6 +5374,13 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
+            let historical = path.with_file_name(format!(
+                "{}.json",
+                FsfsRuntime::search_cache_key_hash(&key),
+            ));
+            fs::rename(&path, &historical).unwrap();
+            assert!(reader.runtime.try_load_search_payload_cache(&key, &fingerprint).unwrap().is_some());
+            fs::rename(&historical, &path).unwrap();
             // Keep the key and index fingerprint exact so only the complete
             // bundle binding can reject a legacy, foreign or revised record.
             let stamp = record.complete_generation.as_ref().unwrap();
@@ -5634,7 +5641,7 @@ mod tests {
             publish(&runtime, &cx, &root).await;
             fs::create_dir(root.join("explain")).unwrap();
             fs::write(
-                root.join(FSFS_EXPLAIN_SESSION_FILE),
+                root.join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE),
                 "another query's partial context",
             )
             .unwrap();

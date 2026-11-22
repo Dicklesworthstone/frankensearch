@@ -577,6 +577,7 @@ impl IndexingQualityDeferral {
 /// nothing. No embedder reports this id, so no vector reuse can match it.
 const LEXICAL_ONLY_GENERATION_EMBEDDER_ID: &str = "fsfs-lexical-only";
 const FSFS_EXPLAIN_SESSION_FILE: &str = "explain/last_search_session.json";
+const FSFS_COMPLETE_EXPLAIN_SESSION_FILE: &str = "explain/last_complete_search_session.json";
 const FSFS_FLUSH_REQUEST_FILE: &str = ".fsfs-flush-request.json";
 const FSFS_FLUSH_ACK_FILE: &str = ".fsfs-flush-ack.json";
 const FSFS_FLUSH_POLL_MS: u64 = 25;
@@ -12666,7 +12667,7 @@ impl FsfsRuntime {
                 "no complete generation has been published",
             )
         })?;
-        let session = Self::load_explain_session_at_root(store.root())?;
+        let session = Self::load_complete_explain_session_at_root(store.root())?;
         if let Some(session) = &session
             && (session.schema_version != EXPLAIN_SESSION_SCHEMA_VERSION
                 || session.complete_generation.as_ref()
@@ -13017,10 +13018,6 @@ impl FsfsRuntime {
         (payload, warnings)
     }
 
-    fn explain_session_path(index_root: &Path) -> PathBuf {
-        index_root.join(FSFS_EXPLAIN_SESSION_FILE)
-    }
-
     fn admit_explain_directory(index_root: &Path, create: bool) -> SearchResult<bool> {
         let directory = index_root.join("explain");
         match fs::symlink_metadata(&directory) {
@@ -13267,7 +13264,7 @@ impl FsfsRuntime {
         index_root: &Path,
         mut session: ExplainSession,
     ) -> SearchResult<()> {
-        let destination = if let Some(target) = &self.complete_explain_target {
+        let (destination, session_file) = if let Some(target) = &self.complete_explain_target {
             if index_root != target.generation.path() {
                 return Err(complete_cli::complete_cli_error(
                     "explain_generation",
@@ -13277,9 +13274,11 @@ impl FsfsRuntime {
             session.complete_generation = Some(CompleteExplainGeneration::from_generation(
                 &target.generation,
             ));
-            target.store_root.as_path()
+            // A foreground legacy search can still be in flight during
+            // first publication, including on the previous executable.
+            (target.store_root.as_path(), FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
         } else {
-            index_root
+            (index_root, FSFS_EXPLAIN_SESSION_FILE)
         };
         crate::generation_store::reject_published_write(destination)?;
         if self.complete_explain_target.is_some() {
@@ -13287,7 +13286,7 @@ impl FsfsRuntime {
             // into a sealed generation despite a valid store-root binding.
             Self::admit_explain_directory(destination, true)?;
         }
-        let path = Self::explain_session_path(destination);
+        let path = destination.join(session_file);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -13329,10 +13328,23 @@ impl FsfsRuntime {
     }
 
     fn load_explain_session_at_root(index_root: &Path) -> SearchResult<Option<ExplainSession>> {
+        Self::read_explain_session(index_root, FSFS_EXPLAIN_SESSION_FILE)
+    }
+
+    fn load_complete_explain_session_at_root(root: &Path) -> SearchResult<Option<ExplainSession>> {
+        match Self::read_explain_session(root, FSFS_COMPLETE_EXPLAIN_SESSION_FILE)? {
+            Some(session) => Ok(Some(session)),
+            // Earlier versions saved complete sessions at the legacy path.
+            // The caller still compares the exact selected generation stamp.
+            None => Self::load_explain_session_at_root(root),
+        }
+    }
+
+    fn read_explain_session(index_root: &Path, session_file: &str) -> SearchResult<Option<ExplainSession>> {
         if !Self::admit_explain_directory(index_root, false)? {
             return Ok(None);
         }
-        let path = Self::explain_session_path(index_root);
+        let path = index_root.join(session_file);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_file() => {}
             Ok(_) => {
@@ -14705,18 +14717,18 @@ impl FsfsRuntime {
 
     fn search_cache_path(&self, key: &SearchCacheKey) -> SearchResult<PathBuf> {
         let index_root = self.resolve_status_index_root()?;
-        let cache_root = if let Some(target) = &self.complete_explain_target {
+        let (cache_root, prefix) = if let Some(target) = &self.complete_explain_target {
             if target.generation.path() != index_root {
                 return Err(complete_cli::complete_cli_error(
                     "cache_generation",
                     "answer cache destination does not own the searched complete generation",
                 ));
             }
-            &target.store_root
+            (&target.store_root, "complete-")
         } else {
-            &index_root
+            (&index_root, "")
         };
-        let file_name = format!("{}.json", Self::search_cache_key_hash(key));
+        let file_name = format!("{prefix}{}.json", Self::search_cache_key_hash(key));
         Ok(cache_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
     }
 
@@ -15375,7 +15387,18 @@ impl FsfsRuntime {
         if !self.admit_complete_search_cache_directory(false)? {
             return Ok(None);
         }
-        let raw = match fs::read_to_string(&cache_path) {
+        let raw = match fs::read_to_string(&cache_path).or_else(|error| {
+            if error.kind() == ErrorKind::NotFound && self.complete_explain_target.is_some() {
+                // Older complete entries used the shared filename. Accept
+                // them only through the complete-generation check below.
+                fs::read_to_string(cache_path.with_file_name(format!(
+                    "{}.json",
+                    Self::search_cache_key_hash(key),
+                )))
+            } else {
+                Err(error)
+            }
+        }) {
             Ok(raw) => raw,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(SearchError::Io(error)),
@@ -60422,7 +60445,7 @@ mod tests {
                 .await
                 .unwrap();
             let last = artifacts.last().unwrap();
-            let session = FsfsRuntime::load_explain_session_at_root(&root)
+            let session = FsfsRuntime::load_complete_explain_session_at_root(&root)
                 .unwrap()
                 .unwrap();
             assert_eq!(session.query, last.payload.query);
@@ -60432,8 +60455,9 @@ mod tests {
                 session.complete_generation,
                 Some(super::CompleteExplainGeneration::from_generation(&first))
             );
-            assert!(!first.path().join(super::FSFS_EXPLAIN_SESSION_FILE).exists());
-            let saved = fs::read(root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap();
+            assert!(!first.path().join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
+            let session_path = root.join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE);
+            let saved = fs::read(&session_path).unwrap();
             let hit = session.hits.first().expect("search found fixture");
             let candidate = &last.fused[0];
             assert_eq!(hit.path, candidate.doc_id);
@@ -60483,6 +60507,19 @@ mod tests {
                 );
             }
 
+            // An older executable's store-bound session can still explain
+            // this exact generation when the new session file is absent.
+            let historical_path = root.join(super::FSFS_EXPLAIN_SESSION_FILE);
+            fs::rename(&session_path, &historical_path).unwrap();
+            let mut historical = Vec::new();
+            explain
+                .run_complete_generation_explain_with_writer(&cx, &root, &mut historical)
+                .await
+                .unwrap();
+            let historical: serde_json::Value = serde_json::from_slice(&historical).unwrap();
+            assert_eq!(historical["data"]["query"], "sharedtoken");
+            fs::rename(&historical_path, &session_path).unwrap();
+
             // A sink that fails after seeing Initial cannot replace the last
             // completed query's context, even with persistence enabled.
             let mut reject_phase =
@@ -60506,7 +60543,7 @@ mod tests {
                     .is_err()
             );
             assert_eq!(
-                fs::read(root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap(),
+                fs::read(&session_path).unwrap(),
                 saved
             );
             for query in ["alpha", "   "] {
@@ -60532,7 +60569,7 @@ mod tests {
                 cx.set_cancel_requested(false);
                 assert!(matches!(result, Err(SearchError::Cancelled { .. })));
                 assert_eq!(
-                    fs::read(root.join(super::FSFS_EXPLAIN_SESSION_FILE)).unwrap(),
+                    fs::read(&session_path).unwrap(),
                     saved,
                     "cancelled phase must preserve prior explanation context"
                 );
@@ -60554,7 +60591,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let empty = FsfsRuntime::load_explain_session_at_root(&root)
+            let empty = FsfsRuntime::load_complete_explain_session_at_root(&root)
                 .unwrap()
                 .unwrap();
             assert!(empty.query.is_empty());
@@ -60625,18 +60662,18 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                FsfsRuntime::load_explain_session_at_root(&root)
+                FsfsRuntime::load_complete_explain_session_at_root(&root)
                     .unwrap()
                     .unwrap()
                     .complete_generation,
                 Some(super::CompleteExplainGeneration::from_generation(&first))
             );
             assert_eq!(store.active(&cx).unwrap(), Some(second.clone()));
-            assert!(!first.path().join(super::FSFS_EXPLAIN_SESSION_FILE).exists());
+            assert!(!first.path().join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
             assert!(
                 !second
                     .path()
-                    .join(super::FSFS_EXPLAIN_SESSION_FILE)
+                    .join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
                     .exists()
             );
         });
@@ -60688,7 +60725,7 @@ mod tests {
                     .persist_explain_session(store.root(), "wrong", SearchOutputPhase::Initial, &[])
                     .is_err()
             );
-            assert!(!store.root().join(super::FSFS_EXPLAIN_SESSION_FILE).exists());
+            assert!(!store.root().join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE).exists());
             runtime
                 .persist_explain_session(
                     generation.path(),
@@ -60697,7 +60734,7 @@ mod tests {
                     &[],
                 )
                 .unwrap();
-            let session_path = store.root().join(super::FSFS_EXPLAIN_SESSION_FILE);
+            let session_path = store.root().join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE);
             let original: serde_json::Value =
                 serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
             for mutation in ["unstamped", "wrong_id", "wrong_digest", "future_schema"] {
@@ -60781,7 +60818,7 @@ mod tests {
                     .contains("symlink")
             );
             assert!(output.is_empty());
-            assert!(!generation.path().join("last_search_session.json").exists());
+            assert!(!generation.path().join("last_complete_search_session.json").exists());
             assert_eq!(store.active(&cx).unwrap(), Some(generation));
 
             // The final context file is independently no-follow on read.
