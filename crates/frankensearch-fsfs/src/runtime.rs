@@ -43299,13 +43299,14 @@ mod tests {
         for disconnect in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let mut resources = disagreeing_blend_resources(temp.path());
+            let calls = Arc::new(AtomicUsize::new(0));
             let completed = Arc::new(AtomicUsize::new(0));
             // A 1 s deadline against a 3 s backend (as in bd-5tiyv): under load
             // a 50 ms deadline could fire before the blocking pool started the
             // backend, leaving no admitted inference to drain.
             resources.quality_embedder = Some(admitted(BlockingQualityFixture {
                 gate: Arc::new(asupersync::sync::Mutex::new(())),
-                calls: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::clone(&calls),
                 completed: Arc::clone(&completed),
                 hold: Duration::from_secs(3),
             }));
@@ -43324,7 +43325,9 @@ mod tests {
                     true,
                 );
             });
-            client.write_all(b"{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":1000,\"stream\":true}").unwrap();
+            let timeout_ms = if disconnect { 10_000 } else { 1000 };
+            let request = format!("{{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":{timeout_ms},\"stream\":true}}");
+            client.write_all(request.as_bytes()).unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
             let mut reader = std::io::BufReader::new(client);
             let mut header = String::new();
@@ -43334,6 +43337,13 @@ mod tests {
             assert!(initial.contains("\"phase\":\"initial\""));
             let mut remaining = String::new();
             if disconnect {
+                // INITIAL precedes quality admission. Wait for the blocking
+                // work this case expects the handler to drain on disconnect.
+                let start_deadline = Instant::now() + Duration::from_secs(3);
+                while calls.load(Ordering::SeqCst) == 0 && Instant::now() < start_deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "quality work was never admitted");
                 match reader.get_ref().shutdown(std::net::Shutdown::Both) {
                     Ok(()) => {}
                     // Darwin reports that the server already closed its end.

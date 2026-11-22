@@ -2874,6 +2874,7 @@ impl PreparedWatchBatch {
             // inherited legacy names or a replaced source root.
             state.require_full_scan()?;
         }
+        drop(state);
         Ok(needs_scan)
     }
 }
@@ -7677,9 +7678,9 @@ mod tests {
                     .seed_initial_authority(baseline, completeness.root_identities().clone())
                     .unwrap();
 
-                // Only eligibility changes: the source still exists, so the
-                // backend emits a modification rather than a deletion.
-                let bytes = 1024 * 1024 + 1;
+                // Sizes up to four times the threshold remain eligible for
+                // reduced ingestion. Grow past the exclusion boundary.
+                let bytes = 4 * 1024 * 1024 + 1;
                 fs::OpenOptions::new()
                     .write(true)
                     .open(&excluded)
@@ -7745,7 +7746,7 @@ mod tests {
                 .seed_initial_authority(baseline.clone(), completeness.root_identities().clone())
                 .unwrap();
             let authority = lock_or_recover(&watcher.reconciliation).authority.clone();
-            let bytes = 1024 * 1024 + 1;
+            let bytes = 4 * 1024 * 1024 + 1;
             fs::OpenOptions::new()
                 .write(true)
                 .open(&excluded)
@@ -7806,7 +7807,7 @@ mod tests {
                         completeness.root_identities().clone(),
                     )
                     .unwrap();
-                let bytes = 1024 * 1024 + 1;
+                let bytes = 4 * 1024 * 1024 + 1;
                 fs::OpenOptions::new()
                     .write(true)
                     .open(&excluded)
@@ -7847,9 +7848,12 @@ mod tests {
                         "shutdown must not start a rescan"
                     );
                     {
-                        let state = lock_or_recover(&reconciliation);
-                        assert!(state.required, "shutdown must retain the skipped source");
-                        assert_eq!(state.indexed_snapshot, baseline);
+                        let reconciliation_state = lock_or_recover(&reconciliation);
+                        assert!(
+                            reconciliation_state.required,
+                            "shutdown must retain the skipped source"
+                        );
+                        assert_eq!(reconciliation_state.indexed_snapshot, baseline);
                     }
                     run_authoritative_reconciliation(
                         &cx,
@@ -8010,7 +8014,7 @@ mod tests {
             lock_or_recover(&watcher.reconciliation)
                 .seed_initial_authority(baseline, completeness.root_identities().clone())
                 .unwrap();
-            let bytes = 1024 * 1024 + 1;
+            let bytes = 4 * 1024 * 1024 + 1;
             fs::OpenOptions::new()
                 .write(true)
                 .open(&excluded)
