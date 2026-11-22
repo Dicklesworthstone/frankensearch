@@ -5,6 +5,7 @@
 //! or cache is evicted to satisfy the policy.
 
 use std::fmt;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,32 @@ use super::{
 };
 
 const DISK_ADMISSION_SUBSYSTEM: &str = "fsfs.index.disk_pressure";
+const STORAGE_SAMPLE_ATTEMPTS: usize = 3;
+
+#[derive(Clone, Copy)]
+enum StorageSample {
+    Unbounded,
+    Measured(DiskBudgetSnapshot),
+    Unstable,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum StorageAdmissionPause {
+    Budget(DiskBudgetSnapshot),
+    Unstable,
+}
+
+impl StorageSample {
+    fn pause(self) -> Option<StorageAdmissionPause> {
+        match self {
+            Self::Measured(snapshot) if pauses_writes(snapshot) => {
+                Some(StorageAdmissionPause::Budget(snapshot))
+            }
+            Self::Unstable => Some(StorageAdmissionPause::Unstable),
+            Self::Measured(_) | Self::Unbounded => None,
+        }
+    }
+}
 
 /// The automatic budget is fixed for one monitor, as for the legacy lifecycle
 /// tracker. Explicit zero keeps that tracker's unbounded-budget convention.
@@ -29,7 +56,7 @@ pub(super) struct StorageAdmissionMonitor {
     budget_bytes: u64,
     emergency: Option<DiskBudgetSnapshot>,
     sample_interval: Duration,
-    sampled: Option<(Instant, Option<DiskBudgetSnapshot>)>,
+    sampled: Option<(Instant, StorageSample)>,
     last_stage: Option<DiskBudgetStage>,
 }
 
@@ -59,7 +86,7 @@ impl StorageAdmissionMonitor {
     }
 
     pub(super) fn paused(&mut self, cx: &Cx, now: Instant) -> SearchResult<bool> {
-        Ok(self.snapshot(cx, now)?.is_some_and(pauses_writes))
+        Ok(self.sample(cx, now)?.pause().is_some())
     }
 
     /// A publication changes storage occupancy even when visibility is durable
@@ -69,33 +96,49 @@ impl StorageAdmissionMonitor {
     }
 
     /// A fresh writer guard can observe growth after the watch's cached sample.
-    pub(super) fn record_denial(&mut self, snapshot: DiskBudgetSnapshot, now: Instant) {
-        self.observe(snapshot);
-        self.sampled = Some((now, Some(snapshot)));
+    pub(super) fn record_pause(&mut self, pause: StorageAdmissionPause, now: Instant) {
+        let sample = match pause {
+            StorageAdmissionPause::Budget(snapshot) => {
+                self.observe(snapshot);
+                StorageSample::Measured(snapshot)
+            }
+            StorageAdmissionPause::Unstable => {
+                tracing::debug!(
+                    "fsfs storage inventory changed during admission; retrying after the sample interval"
+                );
+                StorageSample::Unstable
+            }
+        };
+        self.sampled = Some((now, sample));
     }
 
-    fn snapshot(&mut self, cx: &Cx, now: Instant) -> SearchResult<Option<DiskBudgetSnapshot>> {
+    fn sample(&mut self, cx: &Cx, now: Instant) -> SearchResult<StorageSample> {
         retained_search_checkpoint(cx)?;
         // Emergency is configuration, not a sampled sensor: it must also win
         // with an unbounded budget or a nonexistent/inaccessible store.
         if let Some(snapshot) = self.emergency {
             self.observe(snapshot);
-            return Ok(Some(snapshot));
+            return Ok(StorageSample::Measured(snapshot));
         }
         if self.budget_bytes == 0 {
-            return Ok(None);
+            return Ok(StorageSample::Unbounded);
         }
         if let Some((sampled_at, snapshot)) = self.sampled
             && now.saturating_duration_since(sampled_at) < self.sample_interval
         {
             return Ok(snapshot);
         }
-        let used_bytes = storage_footprint_bytes(cx, &self.root)?;
+        let Some(used_bytes) = sample_footprint(cx, || storage_footprint_bytes(cx, &self.root))?
+        else {
+            self.record_pause(StorageAdmissionPause::Unstable, now.max(Instant::now()));
+            return Ok(StorageSample::Unstable);
+        };
         retained_search_checkpoint(cx)?;
         let snapshot = DiskBudgetPolicy::default().evaluate(used_bytes, self.budget_bytes);
         self.observe(snapshot);
-        self.sampled = Some((now, Some(snapshot)));
-        Ok(Some(snapshot))
+        let sample = StorageSample::Measured(snapshot);
+        self.sampled = Some((now, sample));
+        Ok(sample)
     }
 
     fn observe(&mut self, snapshot: DiskBudgetSnapshot) {
@@ -113,6 +156,23 @@ impl StorageAdmissionMonitor {
     }
 }
 
+fn sample_footprint(
+    cx: &Cx,
+    mut measure: impl FnMut() -> SearchResult<u64>,
+) -> SearchResult<Option<u64>> {
+    for _ in 0..STORAGE_SAMPLE_ATTEMPTS {
+        retained_search_checkpoint(cx)?;
+        // Atomic replacements can consume an enumerated temporary file. Take
+        // a fresh whole-tree sample instead of using the incomplete total.
+        match measure() {
+            Err(SearchError::Io(error)) if error.kind() == ErrorKind::NotFound => {}
+            result => return result.map(Some),
+        }
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(None)
+}
+
 fn pauses_writes(snapshot: DiskBudgetSnapshot) -> bool {
     matches!(
         FsfsRuntime::disk_budget_control_plan(snapshot).watcher_pressure_state,
@@ -122,21 +182,25 @@ fn pauses_writes(snapshot: DiskBudgetSnapshot) -> bool {
 
 #[derive(Debug)]
 struct StorageAdmissionDenied {
-    snapshot: DiskBudgetSnapshot,
+    pause: StorageAdmissionPause,
     phase: &'static str,
 }
 
 impl fmt::Display for StorageAdmissionDenied {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let StorageAdmissionPause::Budget(snapshot) = self.pause else {
+            return write!(
+                formatter,
+                "write admission paused at {} because storage entries changed during repeated footprint samples. Retry when the store is stable",
+                self.phase
+            );
+        };
         write!(
             formatter,
             "write admission paused at {}: {} ({} bytes used, {} byte budget); ",
-            self.phase,
-            self.snapshot.reason_code,
-            self.snapshot.used_bytes,
-            self.snapshot.budget_bytes,
+            self.phase, snapshot.reason_code, snapshot.used_bytes, snapshot.budget_bytes,
         )?;
-        if self.snapshot.reason_code == super::DISK_BUDGET_REASON_EMERGENCY_OVERRIDE {
+        if snapshot.reason_code == super::DISK_BUDGET_REASON_EMERGENCY_OVERRIDE {
             formatter.write_str("clear storage.storage_pressure_emergency before retrying")
         } else {
             formatter.write_str("free storage or raise storage.disk_budget_bytes before retrying")
@@ -146,18 +210,33 @@ impl fmt::Display for StorageAdmissionDenied {
 
 impl std::error::Error for StorageAdmissionDenied {}
 
-/// Only this structured denial is retryable as a disk pause. Traversal,
-/// integrity, and cancellation errors retain their original semantics.
-pub(super) fn storage_admission_denial(error: &SearchError) -> Option<DiskBudgetSnapshot> {
+/// Only this structured denial is retryable as a storage pause. Other
+/// traversal, integrity, and cancellation errors retain their semantics.
+fn storage_admission_cause(error: &SearchError) -> Option<&StorageAdmissionDenied> {
     match error {
         SearchError::SubsystemError { subsystem, source }
             if *subsystem == DISK_ADMISSION_SUBSYSTEM =>
         {
-            source
-                .downcast_ref::<StorageAdmissionDenied>()
-                .map(|denial| denial.snapshot)
+            source.downcast_ref::<StorageAdmissionDenied>()
         }
         _ => None,
+    }
+}
+
+pub(super) fn storage_admission_pause(error: &SearchError) -> Option<StorageAdmissionPause> {
+    storage_admission_cause(error).map(|denial| denial.pause)
+}
+
+/// Render only the typed cause whose fields contain no source paths or text.
+pub fn storage_admission_message(error: &SearchError) -> Option<String> {
+    storage_admission_cause(error).map(ToString::to_string)
+}
+
+#[cfg(test)]
+pub(super) fn storage_admission_denial(error: &SearchError) -> Option<DiskBudgetSnapshot> {
+    match storage_admission_pause(error)? {
+        StorageAdmissionPause::Budget(snapshot) => Some(snapshot),
+        StorageAdmissionPause::Unstable => None,
     }
 }
 
@@ -171,11 +250,11 @@ impl FsfsRuntime {
         phase: &'static str,
     ) -> SearchResult<()> {
         retained_search_checkpoint(cx)?;
-        let snapshot = StorageAdmissionMonitor::new(self, root)?.snapshot(cx, Instant::now())?;
-        if let Some(snapshot) = snapshot.filter(|snapshot| pauses_writes(*snapshot)) {
+        let sample = StorageAdmissionMonitor::new(self, root)?.sample(cx, Instant::now())?;
+        if let Some(pause) = sample.pause() {
             return Err(SearchError::SubsystemError {
                 subsystem: DISK_ADMISSION_SUBSYSTEM,
-                source: Box::new(StorageAdmissionDenied { snapshot, phase }),
+                source: Box::new(StorageAdmissionDenied { pause, phase }),
             });
         }
         Ok(())
@@ -214,6 +293,11 @@ mod tests {
             denial.reason_code,
             super::super::DISK_BUDGET_REASON_EMERGENCY_OVERRIDE
         );
+        assert!(
+            crate::output_schema::output_error_from(&error)
+                .message
+                .contains("clear storage.storage_pressure_emergency")
+        );
         assert!(!absent.exists());
         cx.cancel_with(asupersync::CancelKind::User, Some("cancel disk admission"));
         let error = runtime(0, true)
@@ -251,9 +335,15 @@ mod tests {
         );
         let io_error = SearchError::SubsystemError {
             subsystem: DISK_ADMISSION_SUBSYSTEM,
-            source: Box::new(std::io::Error::other("foreign error")),
+            source: Box::new(std::io::Error::other(
+                "private path for foreign storage error",
+            )),
         };
         assert!(storage_admission_denial(&io_error).is_none());
+        assert_eq!(
+            crate::output_schema::output_error_from(&io_error).message,
+            "A search subsystem failed."
+        );
     }
 
     #[test]
@@ -273,6 +363,7 @@ mod tests {
                 .unwrap()
         );
         assert!(!monitor.paused(&cx, now + Duration::from_secs(1)).unwrap());
+
         fs::write(&ballast, [0_u8; 110]).unwrap();
         assert!(
             !monitor
@@ -284,6 +375,92 @@ mod tests {
             monitor
                 .paused(&cx, now + Duration::from_millis(1_001))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn moving_an_enumerated_entry_restarts_the_full_storage_sample() {
+        let cx = Cx::for_testing();
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join(".answer.tmp");
+        let new = directory.path().join("answer.json");
+        fs::write(&old, [0_u8; 125]).unwrap();
+        let mut attempts = 0;
+        let measured = sample_footprint(&cx, || {
+            attempts += 1;
+            if attempts == 1 {
+                let listed = fs::read_dir(directory.path())?.next().unwrap()?;
+                assert_eq!(listed.path(), old);
+                fs::rename(&old, &new)?;
+                return fs::symlink_metadata(listed.path())
+                    .map(|metadata| metadata.len())
+                    .map_err(SearchError::Io);
+            }
+            storage_footprint_bytes(&cx, directory.path())
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(measured, Some(125), "count the renamed answer in full");
+    }
+
+    #[test]
+    fn churn_is_bounded_and_hard_errors_and_cancellation_propagate() {
+        let cx = Cx::for_testing();
+        let mut attempts = 0;
+        let measured = sample_footprint(&cx, || {
+            attempts += 1;
+            Err(std::io::Error::from(ErrorKind::NotFound).into())
+        })
+        .unwrap();
+        assert_eq!(measured, None);
+        assert_eq!(attempts, STORAGE_SAMPLE_ATTEMPTS);
+
+        let mut attempts = 0;
+        let error = sample_footprint(&cx, || {
+            attempts += 1;
+            Err(std::io::Error::from(ErrorKind::PermissionDenied).into())
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(matches!(error, SearchError::Io(io) if io.kind() == ErrorKind::PermissionDenied));
+
+        let error = sample_footprint(&cx, || {
+            cx.cancel_with(asupersync::CancelKind::User, Some("cancel storage retry"));
+            Err(std::io::Error::from(ErrorKind::NotFound).into())
+        })
+        .unwrap_err();
+        assert!(matches!(error, SearchError::Cancelled { .. }));
+    }
+
+    #[test]
+    fn unstable_sample_pauses_until_the_next_monitor_sample() {
+        let cx = Cx::for_testing();
+        let directory = tempfile::tempdir().unwrap();
+        let mut monitor =
+            StorageAdmissionMonitor::new(&runtime(100, false), directory.path()).unwrap();
+        let now = Instant::now();
+        monitor.record_pause(StorageAdmissionPause::Unstable, now);
+        assert!(monitor.paused(&cx, now).unwrap());
+        assert!(
+            monitor
+                .paused(&cx, now + Duration::from_millis(999))
+                .unwrap()
+        );
+        assert!(!monitor.paused(&cx, now + Duration::from_secs(1)).unwrap());
+
+        let error = SearchError::SubsystemError {
+            subsystem: DISK_ADMISSION_SUBSYSTEM,
+            source: Box::new(StorageAdmissionDenied {
+                pause: StorageAdmissionPause::Unstable,
+                phase: "retained_build.start",
+            }),
+        };
+        let public_error = crate::output_schema::output_error_from(&error);
+        assert!(public_error.message.contains("repeated footprint samples"));
+        assert!(
+            public_error
+                .message
+                .contains("Retry when the store is stable")
         );
     }
 

@@ -1012,8 +1012,9 @@ pub const fn exit_code_for(err: &frankensearch_core::SearchError) -> i32 {
 /// [`OutputError`] with actionable suggestion and context.
 ///
 /// Opaque provider, model-load, reranker, I/O and subsystem sources are never
-/// formatted for public output. Their original errors remain available to local
-/// callers through `SearchError`; only the outer failure class and bounded
+/// formatted for public output. The typed storage-admission cause carries its
+/// own bounded operator message. Original errors remain available to local
+/// callers through `SearchError`. The outer failure class and bounded
 /// model label/path are reported here. This is not a redactor for arbitrary
 /// caller-authored `OutputError` values or the other structured diagnostic fields.
 #[must_use]
@@ -1040,7 +1041,10 @@ pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
             bounded_public_model_id(model)
         ),
         SearchError::Io(error) => format!("I/O operation failed ({:?}).", error.kind()),
-        SearchError::SubsystemError { .. } => "A search subsystem failed.".to_owned(),
+        SearchError::SubsystemError { .. } => {
+            crate::runtime::storage_admission::storage_admission_message(err)
+                .unwrap_or_else(|| "A search subsystem failed.".to_owned())
+        }
         SearchError::UnverifiableRemoteSpace { producer, .. } => format!(
             "Embedding space from {} is unverifiable. Refuse semantic comparison; require a \
              producer-authenticated immutable identity, or use a verified local embedder or \

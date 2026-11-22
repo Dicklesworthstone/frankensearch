@@ -19,7 +19,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
 use super::deferred_quality::{DeferredQualityAttempt, retryable_quality_producer_error};
-use super::storage_admission::{StorageAdmissionMonitor, storage_admission_denial};
+use super::storage_admission::{StorageAdmissionMonitor, storage_admission_pause};
 use super::{
     FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsRuntime, IndexingQualityDeferral, STORE_OVERLAP_REASON,
     SourceStamp, canonical_store_root, index_discovery_walker, retained_search_checkpoint,
@@ -1099,9 +1099,9 @@ impl CompleteWatchSession {
                 Ok(None)
             }
             Err(error) => {
-                if let Some(snapshot) = storage_admission_denial(&error) {
+                if let Some(pause) = storage_admission_pause(&error) {
                     let observed = now.max(Instant::now());
-                    self.storage.record_denial(snapshot, observed);
+                    self.storage.record_pause(pause, observed);
                     self.last_reconcile = previous_reconcile;
                     self.restore_pending(observed, pending.as_ref())?;
                     return Ok(None);
