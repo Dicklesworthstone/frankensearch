@@ -53745,9 +53745,16 @@ mod tests {
                 ClaimOutcome::Applied(())
             );
             let wal_path = frankensearch_index::wal_path_for(&vector_path);
+            // The admitted append logs the replacement and tombstones the
+            // old base row. Observe both files before the stale request.
+            let published_index = fs::read(&vector_path).unwrap();
             let published_wal = fs::read(&wal_path).unwrap();
+            assert_ne!(
+                published_index, original_bytes,
+                "the admitted successor must tombstone the old base row"
+            );
             assert_eq!(sink.persist(&old_write).unwrap(), ClaimOutcome::LostClaim);
-            assert_eq!(fs::read(&vector_path).unwrap(), original_bytes);
+            assert_eq!(fs::read(&vector_path).unwrap(), published_index);
             assert_eq!(fs::read(&wal_path).unwrap(), published_wal);
             assert_eq!(queue.queue_depth().unwrap().completed, 1);
             drop(sink);
