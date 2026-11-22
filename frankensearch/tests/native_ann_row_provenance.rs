@@ -216,6 +216,10 @@ fn assert_owner(owner: &ValidatedFsviBytes, rows: &[Row], physical_order: &[usiz
         let expected = rows[source_row];
         assert_eq!(owner.doc_id_at(physical_row).unwrap(), expected.id);
         assert_eq!(owner.vector_at_f32(physical_row).unwrap(), expected.vector);
+        assert_eq!(
+            owner.row(physical_row).unwrap().flags().is_live(),
+            expected.live
+        );
     }
 }
 
@@ -328,15 +332,17 @@ fn reopened_or_exact(
     })
 }
 
-fn tiers(cx: &Cx, fast_ann: bool) -> Tiers {
+fn tiers(cx: &Cx, fast_ann: bool, fast_has_live_quality_winner: bool) -> Tiers {
     let directory = tempfile::tempdir().unwrap();
     let fast = Provider::new("row-provenance-fast", 2);
     let quality = Provider::new("row-provenance-quality", 3);
+    let mut fast_rows = FAST;
+    fast_rows[3].live = fast_has_live_quality_winner;
     let fast_owner = write_owner(
         &directory.path().join("fast.fsvi"),
         &fast,
         QuantizationFormat::F16,
-        &FAST,
+        &fast_rows,
         &[0, 1, 2, 3, 4],
     );
     let quality_owner = write_owner(
@@ -346,7 +352,7 @@ fn tiers(cx: &Cx, fast_ann: bool) -> Tiers {
         &QUALITY,
         &[0, 1, 2, 3],
     );
-    assert_owner(&fast_owner, &FAST, &FAST_PHYSICAL);
+    assert_owner(&fast_owner, &fast_rows, &FAST_PHYSICAL);
     assert_owner(&quality_owner, &QUALITY, &QUALITY_PHYSICAL);
     let fast_index = reopened_or_exact(
         cx,
@@ -375,7 +381,7 @@ fn tiers(cx: &Cx, fast_ann: bool) -> Tiers {
 fn quality_only_and_shared_winners_use_the_contributing_owners_physical_row_space() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         for fast_ann in [false, true] {
-            let fixture = tiers(&cx, fast_ann);
+            let fixture = tiers(&cx, fast_ann, false);
             let lexical = EmptyLexical;
             let fast_pool = fixture
                 .fast_index
@@ -414,6 +420,38 @@ fn quality_only_and_shared_winners_use_the_contributing_owners_physical_row_spac
             assert_result_row(winner, &fixture.quality_owner, 1, QUALITY[0].vector);
             assert!(stream.next_phase().await.unwrap().is_none());
 
+            let fixture = tiers(&cx, fast_ann, true);
+            // The live fast row for a-quality falls below the 3x cutoff. Its
+            // exact zero still gives it a 0.7 blend, below middle's fast-only
+            // 0.75. Treating the cutoff as absence would make a-quality win.
+            let fast_pool = fixture
+                .fast_index
+                .search_text(&cx, &fixture.fast, "query", 3, None)
+                .await
+                .unwrap();
+            assert_eq!(fast_pool.len(), 3);
+            assert!(fast_pool.iter().all(|hit| hit.doc_id != "a-quality"));
+            let cutoff_winners = fixture
+                .fast_index
+                .search_hybrid_refined_text(
+                    &cx,
+                    &fixture.fast,
+                    (fixture.quality_index.as_ref(), &fixture.quality),
+                    &lexical,
+                    "query",
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(cutoff_winners.len(), 1);
+            let winner = &cutoff_winners[0];
+            assert_eq!(winner.doc_id, "middle");
+            assert_eq!(
+                (winner.fast_score, winner.quality_score),
+                (Some(0.75), None)
+            );
+            assert_result_row(winner, &fixture.fast_owner, 1, FAST[1].vector);
+
             let shared = fixture
                 .fast_index
                 .search_hybrid_refined_text(
@@ -451,7 +489,7 @@ fn shard_set(cx: &Cx, shards: Vec<Arc<NativeAnnIndex>>) -> NativeShardSet {
 fn sharded_quality_only_and_shared_winners_keep_both_owner_coordinates() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         for fast_ann in [false, true] {
-            let fixture = tiers(&cx, fast_ann);
+            let fixture = tiers(&cx, fast_ann, false);
             let empty_owner = write_owner(
                 &fixture.directory.path().join("empty.fsvi"),
                 &fixture.quality,
@@ -461,7 +499,10 @@ fn sharded_quality_only_and_shared_winners_keep_both_owner_coordinates() {
             );
             let empty_index = Arc::new(NativeAnnIndex::exact(&cx, empty_owner).unwrap());
             let fast = shard_set(&cx, vec![Arc::clone(&fixture.fast_index)]);
-            let quality = shard_set(&cx, vec![empty_index, Arc::clone(&fixture.quality_index)]);
+            let quality = shard_set(
+                &cx,
+                vec![Arc::clone(&empty_index), Arc::clone(&fixture.quality_index)],
+            );
             let lexical = EmptyLexical;
             let mut stream = fast
                 .search_hybrid_progressive(
@@ -504,6 +545,37 @@ fn sharded_quality_only_and_shared_winners_keep_both_owner_coordinates() {
                 winner.result.doc_id.as_str()
             );
             assert!(stream.next_phase().await.unwrap().is_none());
+
+            let fixture = tiers(&cx, fast_ann, true);
+            let fast = shard_set(&cx, vec![Arc::clone(&fixture.fast_index)]);
+            let quality = shard_set(&cx, vec![empty_index, Arc::clone(&fixture.quality_index)]);
+            let cutoff_winners = fast
+                .search_hybrid_refined_text(
+                    &cx,
+                    &fixture.fast,
+                    (&quality, &fixture.quality),
+                    &lexical,
+                    "query",
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(cutoff_winners.len(), 1);
+            let winner = &cutoff_winners[0];
+            assert_eq!(winner.result.doc_id, "middle");
+            assert_eq!(
+                (winner.result.fast_score, winner.result.quality_score),
+                (Some(0.75), None)
+            );
+            assert!(winner.result.index.is_none());
+            assert_eq!(
+                winner.fast_row,
+                Some(NativeShardRow {
+                    shard: 0,
+                    physical_row: 1
+                })
+            );
+            assert!(winner.quality_row.is_none());
 
             let results = fast
                 .search_hybrid_refined_text(
