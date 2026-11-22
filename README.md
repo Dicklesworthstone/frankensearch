@@ -81,8 +81,10 @@ Installer goals:
 - auto-configured model cache path
 - sane defaults for interactive usage
 
-No Windows archive has been published yet: every release through v1.12.3
-ships Linux and macOS assets only. When the Windows x86-64 full archive
+The [fsfs 1.13.0 release](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.13.0)
+ships full archives for Linux x86-64 GNU and Apple Silicon, and lite archives
+for Linux x86-64/ARM64 MUSL and macOS Intel/Apple Silicon. There is no Windows
+archive. When the Windows x86-64 full archive
 ships, it will require the
 [Microsoft Visual C++ v14 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
 Install the current supported x64 package if the required `MSVCP140` or
@@ -1503,7 +1505,7 @@ Use this as a pragmatic hardening pass before rollout:
    - `cargo fmt --check`
    - `cargo check --workspace --all-targets`
    - `cargo clippy --workspace --all-targets -- -D warnings`
-   - `cargo test --workspace --lib --exclude frankensearch-quill-gauntlet` plus the fsfs test binaries
+   - `cargo test --locked --workspace --tests --exclude frankensearch-quill-gauntlet --exclude frankensearch-fsfs` and `cargo test --locked -p frankensearch-fsfs --tests`
    - downloader/hosted-API proxy tests and Clippy with `--features download,api`, plus installer contract checks
    - the Quill native witness against real Quill and pinned Tantivy, plus its oracle-validator negatives
    - the real-model quick-start lane and the executable quick-start gate against the built binary
@@ -1516,13 +1518,12 @@ Use this as a pragmatic hardening pass before rollout:
 
 Publication runs on a real host with configured Cargo registry credentials.
 GitHub Actions does not publish this repository. The two release lines are
-versioned independently: `v*` tags identify fsfs binary releases. Verified on
-2026-10-29, the latest downloadable binary is
-[**fsfs 1.12.3**](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.3)
-(October 5), while crates.io carries
-[**frankensearch 0.7.1**](https://crates.io/crates/frankensearch/0.7.1)
-(October 3) and [**frankensearch-fsfs 1.12.3**](https://crates.io/crates/frankensearch-fsfs/1.12.3)
-(October 5). The 0.7.1 library bundle is tagged `crates-v0.7.1`.
+versioned independently. The November 21, 2026 release published
+[**fsfs 1.13.0**](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.13.0)
+and the [**frankensearch 0.8.0**](https://crates.io/crates/frankensearch/0.8.0)
+crate family, including [**frankensearch-fsfs 1.13.0**](https://crates.io/crates/frankensearch-fsfs/1.13.0).
+The `v1.13.0` and `crates-v0.8.0` tags both point to `d1b9da15`.
+Later fixes on main require a source build until the next corresponding release.
 The [changelog](CHANGELOG.md) lists every member, source revision and semantic
 index rebuild requirement. A crate publication or git tag does not establish
 cross-platform binary qualification.
@@ -1725,20 +1726,21 @@ cargo build -p frankensearch --features full-fts5
 
 ## Config Recipes
 
+These recipes configure the `fsfs` CLI. Library callers configure their own
+`TwoTierConfig`, which reads its quality budget from
+`FRANKENSEARCH_QUALITY_TIMEOUT` when environment overrides are enabled.
+
 ### 1) Latency-First Profile
 
 Best for interactive UX where fast first answer matters most.
 
 ```bash
 export FRANKENSEARCH_FAST_ONLY=true
-export FRANKENSEARCH_QUALITY_WEIGHT=0.7
 export FRANKENSEARCH_RRF_K=60
-export FRANKENSEARCH_QUALITY_TIMEOUT=250
 ```
 
 Operational effect:
-- returns `Initial` quickly and skips/limits expensive refinement behavior
-- predictable low-latency tail for chat/assistant loops
+- Returns `Initial` and skips quality refinement.
 
 ### 2) Quality-First Profile
 
@@ -1749,12 +1751,13 @@ export FRANKENSEARCH_PRESSURE_PROFILE=performance
 export FRANKENSEARCH_FAST_ONLY=false
 export FRANKENSEARCH_QUALITY_WEIGHT=0.85
 export FRANKENSEARCH_RRF_K=40
-export FRANKENSEARCH_QUALITY_TIMEOUT=1200
+export FRANKENSEARCH_SEARCH_QUALITY_TIMEOUT_MS=1200
+fsfs config get search.quality_timeout_ms --format json
 ```
 
 Operational effect:
-- gives quality tier and rerank more room to improve ordering
-- increases median and tail latency
+- Gives quality inference and retrieval up to 1,200 ms. The separate optional
+  reranker uses `FRANKENSEARCH_RERANK_TIMEOUT_MS`.
 
 ### 3) Memory/CPU-Conservative Profile
 
@@ -1763,13 +1766,10 @@ Best for constrained laptops or multi-tenant CI hosts.
 ```bash
 export FRANKENSEARCH_PRESSURE_PROFILE=strict
 export FRANKENSEARCH_FAST_ONLY=true
-export FRANKENSEARCH_QUALITY_TIMEOUT=200
-export FRANKENSEARCH_HNSW_THRESHOLD=200000
 ```
 
 Operational effect:
-- reduces expensive quality-phase work
-- avoids ANN build/search overhead for smaller corpora
+- Disables quality refinement and enables the strict pressure profile.
 
 ### Optional: `TwoTierConfig::optimized()` TOML Recipe
 
@@ -1853,7 +1853,7 @@ host-specific env var drift.
 | `quality_weight` | `TwoTierConfig`, `FRANKENSEARCH_QUALITY_WEIGHT` | Blend balance | Favor quality-tier ranking signal | Favor fast-tier ranking signal |
 | `rrf_k` | `TwoTierConfig`, `FRANKENSEARCH_RRF_K` | RRF rank sensitivity | Flatten rank differences across sources | Emphasize top ranks more strongly |
 | `candidate_multiplier` | `TwoTierConfig` | Candidate pool size | Improve recall headroom, increase latency/work | Reduce latency/work, may reduce recall |
-| `quality_timeout_ms` | `TwoTierConfig`, `FRANKENSEARCH_QUALITY_TIMEOUT` | Phase 2 budget | More chances to finish refinement | More `RefinementFailed` timeouts |
+| `quality_timeout_ms` | CLI `FRANKENSEARCH_SEARCH_QUALITY_TIMEOUT_MS`, library `TwoTierConfig` and `FRANKENSEARCH_QUALITY_TIMEOUT` | Phase 2 budget | More chances to finish refinement | More `RefinementFailed` timeouts |
 | `fast_only` | `TwoTierConfig`, `FRANKENSEARCH_FAST_ONLY` | Phase behavior | Skip Phase 2 entirely (`true`) | Enable Phase 2 when quality embedder exists (`false`) |
 | `hnsw_threshold` | `TwoTierConfig`, `FRANKENSEARCH_HNSW_THRESHOLD` | ANN activation point | Use brute-force for more corpus sizes | Use ANN earlier for large corpora |
 | `hnsw_ef_search` | `TwoTierConfig` | ANN query beam width | Better ANN recall, more latency | Lower latency, potentially lower recall |
@@ -1910,7 +1910,8 @@ scripts/quality-gate.sh
 cargo fmt --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --lib --exclude frankensearch-quill-gauntlet
+cargo test --locked --workspace --tests --exclude frankensearch-quill-gauntlet --exclude frankensearch-fsfs
+cargo test --locked -p frankensearch-fsfs --tests
 ```
 
 The real-model CLI lane also checks explicit native quality selection. Provision

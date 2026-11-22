@@ -19,7 +19,7 @@ Define a deterministic packaging/release/install workflow for `fsfs` that covers
 
 ## Target and Capability Matrices (Required)
 
-### Ownership and current delivery boundary (2026-09-04)
+### Ownership and current delivery boundary (2026-11-22)
 
 This contract defines required capabilities and install failure behavior.
 `scripts/quality-gate.sh`, run on real hosts through
@@ -35,14 +35,14 @@ Crate publication is governed by
 topological publication requirements supersede the old hard-coded crate list
 and generic "already published" success rule in this document.
 
-The [v1.8.0 release](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.8.0)
-asset inventory checked on September 4 contains:
+The [v1.13.0 release](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.13.0)
+asset inventory checked on November 22 contains:
 
 | Profile | Targets with published archives | Evidence boundary |
 |---|---|---|
-| Full semantic | `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` | The Linux binary passed a cached-model index/Initial/Refined smoke test; this does not qualify a fresh install or the macOS binary. |
-| Explicit lite | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin` | Asset presence does not prove semantic capability; these binaries deliberately omit semantic loaders. |
-| Required delivery still absent | Full Windows; full Linux ARM | No corresponding full archive exists in that release. Delivery and actual platform qualification remain open under `bd-fsfs-cross-platform-semantic-installer-46z3u`. |
+| Full semantic | `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` | The signed Linux archive passed offline installation and executable quickstart with verified cached models. Signed Apple Silicon metadata records native version execution. |
+| Explicit lite | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin` | These builds deliberately omit semantic loaders. |
+| Open full-platform delivery | Windows and Linux ARM | Neither full archive appears in v1.13.0. Delivery and platform qualification remain under `bd-fsfs-cross-platform-semantic-installer-46z3u`. |
 
 The earlier exact-six matrix required full embedded Apple Silicon **and
 Windows**, plus the four lite targets below. Its Windows obligation is not
@@ -829,7 +829,7 @@ scripts/check_fsfs_packaging_release_install_contract.sh \
   --minisign /absolute/path/to/minisign
 ```
 
-The version above is an example, not an announced release. This path requires
+Substitute the exact version and source revision of the staged release. This path requires
 the six declared versioned variants, the two full installer aliases and their
 sidecars: exactly 50 files. `SHA256SUMS` covers the 16 archive/metadata payloads;
 their individual checksum sidecars must agree. The 16 payload signatures and

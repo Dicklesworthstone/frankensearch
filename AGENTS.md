@@ -273,13 +273,15 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ### What It Does
 
-Combines lexical (Tantivy BM25) and semantic (vector cosine similarity) search via Reciprocal Rank Fusion, with a two-tier progressive model: fast results in <15ms, quality-refined results in ~150ms.
+Combines Quill BM25 and semantic vector search via Reciprocal Rank Fusion.
+The fast tier returns Initial results and the quality tier refines them. See
+the README's measured performance envelope.
 
 ### Architecture
 
 ```
 Query → Canonicalize → Classify → ┬─ Fast Embed (potion, 0.57ms) → Vector Search ─┐
-                                   └─ Tantivy BM25 Lexical Search ─────────────────┤
+                                   └─ Quill BM25 Lexical Search ───────────────────┤
                                                                                     ▼
                                                                         RRF Fusion (K=60)
                                                                                     │
@@ -379,8 +381,9 @@ full-fts5 = ['full', 'fts5']                                     # Full stack + 
 ```
 
 **Packaging boundary (bd-8nqz-6-ft-registry-4hca, resolved 2026-08-24 by gh#416).** The
-workspace has **no git dependencies**: every crate resolves from crates.io, so every facade
-feature, `full`/`full-fts5` included, is publishable. Two closures are the ones that used to
+published crates have registry-resolvable dependencies, including the facade's
+`full` and `full-fts5` features. The unpublished `optimize-params` workspace
+tool uses the sibling `fast_cmaes` checkout. Two closures used to
 be git-sourced and are now registry renames — keep the rename form, never the bare name:
 
 | Feature | Registry closure | Why the rename matters |
@@ -389,13 +392,11 @@ be git-sourced and are now registry renames — keep the rename form, never the 
 | `ann` | `hnsw_rs = { package = "frankenhnsw", version = "=0.3.5" }` | The published fork carries the layer-invariant/search-correctness fixes; registry `hnsw_rs` 0.3.4 is upstream and would silently drop them. |
 
 `rerank` and `native` are exact aliases — there is no ONNX-only rerank lane, and
-`fastembed-reranker` also enables `native`. Published registry line as of
-2026-10-05: facade `frankensearch 0.7.1`, rerank `0.5.0`, ops `0.4.0`, the
-other eight library members `0.4.0`, all from source
-`d1cb86e1848309fe39fb7c8c4c4d7356ebd878aa` (tags `crates-v0.7.1`, `v1.12.1`);
-and fsfs `1.12.3` with TUI `0.4.0` from
-`cc528269c66ce89f640b860aff80992cc2333704` (tag `v1.12.3`, the latest GitHub
-binary release, signed with the key in `minisign.pub`). Never republish a version that exists on the registry;
+`fastembed-reranker` also enables `native`. The 2026-11-21 release publishes
+facade `frankensearch 0.8.0`, rerank `0.6.0`, fsfs `1.13.0` and the other
+ten library packages at `0.5.0`. Tags `crates-v0.8.0` and `v1.13.0` point
+to `d1b9da15b384f587a0acaca3173756417aa557b4`. The GitHub binary assets
+use the signing key in `minisign.pub`. Never republish a version that exists on the registry;
 bumps go forward only. Crate publication does not qualify a binary release.
 Verify later updates against the registry and GitHub release receipts. Embedder adapter and dependency-protocol updates
 change producer fingerprints; retain historical fixture checks and require
