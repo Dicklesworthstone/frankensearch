@@ -2459,13 +2459,13 @@ mod lifecycle_tests {
             ballast.set_len(BUDGET * 2).unwrap();
             drop(staged);
             let allocated = candidate_count(&root);
-            let changed = source.join("beta.md");
-            fs::write(&changed, "sharedtoken beta after disk pressure").unwrap();
+            let beta_path = source.join("beta.md");
+            fs::write(&beta_path, "sharedtoken beta after disk pressure").unwrap();
             let now = previous_reconcile.max(Instant::now()) + Duration::from_secs(1);
             {
                 let mut changes = lock_changes(&session.changes).unwrap();
                 changes.record(now, false);
-                changes.record_path(&changed);
+                changes.record_path(&beta_path);
             }
             let paused_at = now + MAX_DEBOUNCE;
             assert!(session.advance(&cx, paused_at).await.unwrap().is_none());
@@ -2480,7 +2480,7 @@ mod lifecycle_tests {
                     .as_ref()
                     .unwrap()
                     .paths,
-                BTreeSet::from([changed])
+                BTreeSet::from([beta_path])
             );
 
             // No new event accompanies relief. Early polls retain the sampled
@@ -2567,13 +2567,13 @@ mod lifecycle_tests {
             let ballast = File::create(root.join("pressure.bin")).unwrap();
             ballast.set_len(BUDGET * 2).unwrap();
             let allocated = candidate_count(&root);
-            let changed = source.join("beta.md");
-            fs::write(&changed, "sharedtoken beta after fresh admission").unwrap();
+            let beta_path = source.join("beta.md");
+            fs::write(&beta_path, "sharedtoken beta after fresh admission").unwrap();
             let event_at = sampled_at + Duration::from_secs(1);
             {
                 let mut changes = lock_changes(&session.changes).unwrap();
                 changes.record(event_at, false);
-                changes.record_path(&changed);
+                changes.record_path(&beta_path);
             }
             assert!(
                 session
@@ -2590,7 +2590,7 @@ mod lifecycle_tests {
                 let changes = lock_changes(&session.changes).unwrap();
                 let pending = changes.dirty.as_ref().unwrap();
                 assert_eq!(pending.first, event_at);
-                assert_eq!(pending.paths, BTreeSet::from([changed]));
+                assert_eq!(pending.paths, BTreeSet::from([beta_path]));
                 assert!(!pending.force_rebuild);
                 pending.last
             };
