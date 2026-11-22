@@ -10,6 +10,9 @@
   incorrect single-tier weight. Independent candidate discovery, true missing
   or tombstoned coverage, original bound query responses, and physical row
   provenance are preserved on direct and blocking-pool requests.
+  Streamed and sharded refinement use the same complete evidence, preserving
+  lazy quality inference, retrieved candidate counts, and per-tier shard/row
+  coordinates.
 
 ## [1.13.0] — 2026-11-21
 

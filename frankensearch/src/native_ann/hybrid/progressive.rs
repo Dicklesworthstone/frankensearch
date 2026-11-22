@@ -11,7 +11,9 @@ use frankensearch_core::traits::Reranker;
 use frankensearch_fusion::{RrfConfig, rrf_fuse_for_vector_lane};
 
 use super::query::ImmutableTextQuery;
-use super::refinement::{RefinementFusion, admit_pair, checked_lexical, refined_winners};
+use super::refinement::{
+    RefinementFusion, RetainedCandidates, admit_pair, checked_lexical, refined_winners,
+};
 use super::{NativeAnnIndex, checkpoint, hydrate_winners, invalid, join_sources};
 use crate::{Cx, Embedder, LexicalRead, ScoredResult, SearchError, SearchResult, VectorHit};
 
@@ -201,7 +203,7 @@ pub enum NativeSearchPhase {
 }
 
 struct PendingRefinement {
-    fast: Vec<VectorHit>,
+    fast: RetainedCandidates<VectorHit>,
     batch: LexicalCandidateBatch,
     initial_results: Vec<ScoredResult>,
 }
@@ -319,8 +321,9 @@ impl<'a> NativeProgressiveSearch<'a> {
     /// relabelling that lane. Every source weight must be strictly positive;
     /// zero is not a way to disable a required provider or its admission checks.
     ///
-    /// The quality weight applies to documents present in BOTH vector pools.
-    /// One-sided candidates keep their normalized score, including at 0 and 1,
+    /// The quality weight applies to candidates with evidence in BOTH owners.
+    /// A candidate below one tier's retrieval cutoff is scored there before
+    /// blending. Genuinely one-sided candidates keep their normalized score, including at 0 and 1,
     /// as in the existing union-preserving blend. Raw scores, physical rows and
     /// required-quality failure behavior do not change with weighting.
     ///
@@ -479,9 +482,12 @@ impl<'a> NativeProgressiveSearch<'a> {
         index: &NativeAnnIndex,
         embedder: &dyn Embedder,
         ef: Option<usize>,
-    ) -> SearchResult<Vec<VectorHit>> {
+    ) -> SearchResult<RetainedCandidates<VectorHit>> {
         if self.exclusion_only() {
-            return Ok(Vec::new());
+            return Ok(RetainedCandidates {
+                query: None,
+                hits: Vec::new(),
+            });
         }
         let allowed = self.allowed_documents.clone();
         let excluded = self
@@ -492,42 +498,21 @@ impl<'a> NativeProgressiveSearch<'a> {
         let budget = allowed
             .as_ref()
             .map_or(self.budget, |ids| self.budget.min(ids.len()));
-        if allowed.is_some() || excluded.is_some() {
-            let accept = move |id: &str| {
-                allowed.as_ref().is_none_or(|ids| ids.contains(id))
-                    && excluded.as_ref().is_none_or(|ids| !ids.contains(id))
-            };
-            if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
-                let query = owner
-                    .embed_query(self.cx, embedder, self.semantic_text())
-                    .await?;
-                owner
-                    .search_filtered_with_pool(self.cx, query, budget, ef, pool, accept)
-                    .await
-            } else {
-                index
-                    .search_text_filtered(
-                        self.cx,
-                        embedder,
-                        self.semantic_text(),
-                        budget,
-                        ef,
-                        accept,
-                    )
-                    .await
-            }
-        } else if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
-            let query = owner
-                .embed_query(self.cx, embedder, self.semantic_text())
-                .await?;
-            owner
-                .search_with_pool(self.cx, query, self.budget, ef, pool)
-                .await
-        } else {
-            index
-                .search_text(self.cx, embedder, self.semantic_text(), self.budget, ef)
-                .await
-        }
+        let accept = move |id: &str| {
+            allowed.as_ref().is_none_or(|ids| ids.contains(id))
+                && excluded.as_ref().is_none_or(|ids| !ids.contains(id))
+        };
+        index
+            .retrieve_candidates(
+                self.cx,
+                embedder,
+                self.semantic_text(),
+                budget,
+                ef,
+                self.owned_index(index).zip(self.pool.clone()),
+                accept,
+            )
+            .await
     }
 
     /// Add a lazy final cross-encoder stage before requesting the first phase.
@@ -747,13 +732,21 @@ impl<'a> NativeProgressiveSearch<'a> {
         )
         .await?;
         let candidates = NativePhaseCandidates {
-            fast: if self.primary_quality { 0 } else { fast.len() },
-            quality: if self.primary_quality { fast.len() } else { 0 },
+            fast: if self.primary_quality {
+                0
+            } else {
+                fast.hits.len()
+            },
+            quality: if self.primary_quality {
+                fast.hits.len()
+            } else {
+                0
+            },
             lexical: batch.results().len(),
         };
         let fused = rrf_fuse_for_vector_lane(
             batch.results(),
-            &fast,
+            &fast.hits,
             self.result_window(),
             0,
             &self.rrf,
@@ -800,7 +793,7 @@ impl<'a> NativeProgressiveSearch<'a> {
                     return Err(error);
                 }
                 let candidates = NativePhaseCandidates {
-                    fast: pending.fast.len(),
+                    fast: pending.fast.hits.len(),
                     quality: 0,
                     lexical: pending.batch.results().len(),
                 };
@@ -826,18 +819,39 @@ impl<'a> NativeProgressiveSearch<'a> {
                 "refinement requires its admitted arm",
             )
         })?;
-        let quality_hits = self.search_tier(quality, embedder, self.quality_ef).await?;
+        let mut quality_hits = self.search_tier(quality, embedder, self.quality_ef).await?;
         let candidates = NativePhaseCandidates {
-            fast: pending.fast.len(),
-            quality: quality_hits.len(),
+            fast: pending.fast.hits.len(),
+            quality: quality_hits.hits.len(),
             lexical: pending.batch.results().len(),
         };
+        let (fast_supplement, quality_supplement) = join_sources(
+            self.cx,
+            self.fast.supplement_candidates(
+                self.cx,
+                &pending.fast,
+                &quality_hits.hits,
+                self.owned_index(self.fast).zip(self.pool.clone()),
+            ),
+            quality.supplement_candidates(
+                self.cx,
+                &quality_hits,
+                &pending.fast.hits,
+                self.owned_index(quality).zip(self.pool.clone()),
+            ),
+        )
+        .await?;
+        // Keep the original Initial pool and its actual retrieval count intact
+        // if later hydration fails. Supplemental observations are score evidence.
+        let mut fast_hits = pending.fast.hits.clone();
+        fast_hits.extend(fast_supplement);
+        quality_hits.hits.extend(quality_supplement);
         let results = refined_winners(
             self.cx,
             self.lexical,
             &pending.batch,
-            &pending.fast,
-            &quality_hits,
+            &fast_hits,
+            &quality_hits.hits,
             self.result_window(),
             RefinementFusion {
                 quality_weight: self.quality_weight,
@@ -1388,9 +1402,9 @@ mod tests {
                         assert_eq!(results[0].metadata.as_deref().unwrap()["generation"], 1);
                     } else {
                         assert_eq!(results[0].quality_score, Some(1.0));
-                        assert!(results[0].fast_score.is_none());
+                        assert_eq!(results[0].fast_score, Some(0.0));
                         assert_eq!(
-                            qindex
+                            index
                                 .owner
                                 .doc_id_at(results[0].index.unwrap() as usize)
                                 .unwrap(),
@@ -1719,13 +1733,13 @@ mod tests {
     #[test]
     fn lazy_refinement_retrieves_a_winner_outside_the_fast_candidate_pool() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            for (padding, quality_row) in [("middle", 2_u32), ("quality-padding", 1)] {
+            for (padding, quality_row) in [("quality-padding", 2_u32), ("padding", 3)] {
                 let fast = Provider::new("fast", 2);
                 let quality = Provider::new("quality", 3);
                 let fast_index = fast_index(&cx, &fast);
-                // FSVI persists hash-sorted rows, not insertion positions. Use a
-                // different quality cohort so the winning document really has
-                // distinct physical positions in the two retained owners.
+                // FSVI persists hash-sorted rows, not insertion positions. Use
+                // an extra quality row to vary the winner's physical position
+                // without removing the quality evidence of any fast candidate.
                 let quality_index = native_index(
                     &cx,
                     &quality,
@@ -1733,7 +1747,8 @@ mod tests {
                     &[
                         ("a-quality", &[1.0, 0.0, 0.0]),
                         ("near", &[0.0, 1.0, 0.0]),
-                        (padding, &[0.0, 0.0, 1.0]),
+                        ("middle", &[0.0, 0.0, 1.0]),
+                        (padding, &[-0.5, 0.0, 0.0]),
                         ("z-fast", &[-1.0, 0.0, 0.0]),
                     ],
                 );
@@ -1774,7 +1789,13 @@ mod tests {
                 let State::Refine(pending) = &stream.state else {
                     panic!("missing retained pool")
                 };
-                assert!(pending.fast.iter().all(|hit| hit.doc_id != "a-quality"));
+                assert!(
+                    pending
+                        .fast
+                        .hits
+                        .iter()
+                        .all(|hit| hit.doc_id != "a-quality")
+                );
                 let NativeSearchPhase::Refined {
                     results,
                     candidates,
@@ -1784,18 +1805,12 @@ mod tests {
                 };
                 assert_eq!(results[0].doc_id, "a-quality");
                 assert_eq!(results[0].quality_score, Some(1.0));
-                assert!(results[0].fast_score.is_none());
+                assert_eq!(results[0].fast_score, Some(0.0));
                 assert_eq!(results[0].source, ScoreSource::SemanticQuality);
-                assert_eq!(results[0].index, Some(quality_row));
+                assert_eq!(results[0].index, Some(2));
                 let row = results[0].index.unwrap() as usize;
-                assert_eq!(
-                    quality_index.owner.doc_id_at(row).unwrap(),
-                    results[0].doc_id
-                );
-                assert_eq!(
-                    quality_index.owner.vector_at_f32(row).unwrap(),
-                    vec![1.0, 0.0, 0.0]
-                );
+                assert_eq!(fast_index.owner.doc_id_at(row).unwrap(), results[0].doc_id);
+                assert_eq!(fast_index.owner.vector_at_f32(row).unwrap(), vec![0.0, 1.0]);
                 assert_eq!(
                     candidates,
                     NativePhaseCandidates {
@@ -1811,6 +1826,120 @@ mod tests {
                 assert!(stream.next_phase().await.unwrap().is_none());
             }
         });
+    }
+
+    #[test]
+    fn progressive_refinement_retains_query_values_and_reports_retrieved_counts() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::runtime::blocking_pool::BlockingPool;
+        use std::time::Duration;
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let pool = BlockingPool::new(0, 2);
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for offload in [false, true] {
+                let fast = Provider::new("fast", 2);
+                let quality = Provider::new("quality", 3);
+                let mut index = native_index(
+                    &cx,
+                    &fast,
+                    generation(),
+                    &[
+                        ("a", &[1.0, 0.0]),
+                        ("b", &[0.875, 0.0]),
+                        ("c", &[0.75, 0.0]),
+                        ("d", &[0.625, 0.0]),
+                        ("e", &[0.5, 0.0]),
+                        ("f", &[0.375, 0.0]),
+                    ],
+                );
+                let mut qindex = native_index(
+                    &cx,
+                    &quality,
+                    generation(),
+                    &[
+                        ("a", &[0.0, 1.0, 0.0]),
+                        ("b", &[0.125, 0.0, 0.0]),
+                        ("c", &[0.25, 0.0, 0.0]),
+                        ("d", &[1.0, 0.0, 0.0]),
+                        ("e", &[0.875, 0.0, 0.0]),
+                        ("f", &[0.75, 0.0, 0.0]),
+                    ],
+                );
+                // Exercise graph traversal, not the full-width exact fallback.
+                index.default_ef_search = 3;
+                qindex.default_ef_search = 3;
+                let index = Arc::new(index);
+                let qindex = Arc::new(qindex);
+                let lexical = Lexical::new(&[]);
+                let mut stream = if offload {
+                    index.search_hybrid_progressive_with_pool(
+                        &cx,
+                        &fast,
+                        Some((&qindex, &quality)),
+                        &lexical,
+                        "query",
+                        1,
+                        pool.handle(),
+                    )
+                } else {
+                    index.search_hybrid_progressive(
+                        &cx,
+                        &fast,
+                        Some((&qindex, &quality)),
+                        &lexical,
+                        "query",
+                        1,
+                    )
+                }
+                .unwrap();
+                let NativeSearchPhase::Initial {
+                    results: initial,
+                    candidates,
+                } = stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("initial")
+                };
+                assert_eq!(initial[0].doc_id, "a");
+                assert!(initial[0].quality_score.is_none());
+                assert_eq!(
+                    candidates,
+                    NativePhaseCandidates {
+                        fast: 3,
+                        quality: 0,
+                        lexical: 0
+                    }
+                );
+                assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+
+                let NativeSearchPhase::Refined {
+                    results,
+                    candidates,
+                } = stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("refined")
+                };
+                assert_eq!(results[0].doc_id, "d");
+                assert_eq!(results[0].fast_score, Some(0.625));
+                assert_eq!(results[0].quality_score, Some(1.0));
+                // Six scored rows per owner do not become six retrieved hits.
+                assert_eq!(
+                    candidates,
+                    NativePhaseCandidates {
+                        fast: 3,
+                        quality: 3,
+                        lexical: 0
+                    }
+                );
+                assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+                assert!(stream.next_phase().await.unwrap().is_none());
+            }
+        });
+        assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
     }
 
     #[test]
