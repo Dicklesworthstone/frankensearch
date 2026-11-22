@@ -1472,8 +1472,10 @@ impl TwoTierSearcher {
     /// only exclusions retain the single-phase lexical-complement behavior.
     ///
     /// Quality identity and request topology are validated even for empty
-    /// queries or `k == 0`, before model, lexical or vector work. Quality
-    /// inference and retrieval use `quality_timeout_ms`; failure is returned
+    /// queries or `k == 0`, before model, lexical or vector work. Exclusion-only
+    /// browsing with a positive limit has no semantic tier to admit and does
+    /// not require a quality model, quality index or compatible vector identity.
+    /// Quality inference and retrieval use `quality_timeout_ms`; failure is returned
     /// rather than changing the requested semantic tier. MMR uses only quality
     /// vectors and skips diversity when a candidate lacks quality coverage.
     ///
@@ -1547,13 +1549,27 @@ impl TwoTierSearcher {
     ) -> SearchResult<TwoTierMetrics> {
         let mut metrics = TwoTierMetrics::default();
 
-        let quality_admission = if mode == SearchExecutionMode::QualityOnly {
-            let admission = self.admit_quality_only_query();
-            cancellation_checkpoint(cx, "quality_only_identity_admission")?;
-            Some(admission?)
-        } else {
-            None
-        };
+        // Determine whether a nonempty quality request is actually lexical
+        // browsing before admitting an unrelated semantic producer. Retain the
+        // canonicalized text and parse so a custom canonicalizer runs exactly
+        // once. Empty requests and k=0 keep their strict topology admission.
+        let preparsed_quality_query =
+            (mode == SearchExecutionMode::QualityOnly && k > 0 && !query.is_empty()).then(|| {
+                let canonical = self.canonicalizer.canonicalize_query(query);
+                let parsed = ParsedQuery::parse(&canonical);
+                (canonical, parsed)
+            });
+        let quality_lexical_complement = preparsed_quality_query
+            .as_ref()
+            .is_some_and(|(_, parsed)| parsed.is_positive_empty() && parsed.has_negations());
+        let quality_admission =
+            if mode == SearchExecutionMode::QualityOnly && !quality_lexical_complement {
+                let admission = self.admit_quality_only_query();
+                cancellation_checkpoint(cx, "quality_only_identity_admission")?;
+                Some(admission?)
+            } else {
+                None
+            };
 
         if k == 0 {
             metrics.zero_signal = Some(ZeroSignalReason::CallerRequestedZeroK);
@@ -1571,12 +1587,15 @@ impl TwoTierSearcher {
             });
         }
 
-        // Canonicalize query.
-        let canon_query = self.canonicalizer.canonicalize_query(query);
+        // Reuse quality-only preflight without running text transforms twice.
+        let (canon_query, parsed_query) = preparsed_quality_query.unwrap_or_else(|| {
+            let canonical = self.canonicalizer.canonicalize_query(query);
+            let parsed = ParsedQuery::parse(&canonical);
+            (canonical, parsed)
+        });
         if canon_query.trim().is_empty() {
             return Ok(metrics);
         }
-        let parsed_query = ParsedQuery::parse(&canon_query);
         let normalized_exclusions = if parsed_query.has_negations() {
             Some(NormalizedExclusions {
                 terms: parsed_query
@@ -7963,7 +7982,7 @@ mod tests {
     }
 
     #[test]
-    fn async_quality_only_admission_refuses_before_any_provider_work() {
+    fn async_quality_only_admission_refuses_semantics_but_not_lexical_complements() {
         for refusal in [
             "missing_embedder",
             "missing_index",
@@ -8014,12 +8033,24 @@ mod tests {
                 if refusal == "missing_embedder" {
                     searcher.quality_embedder = None;
                 }
-                for k in [0, 1] {
+                let unreachable_filter =
+                    AsyncTestFilter(|_: &str, _: Option<&serde_json::Value>| -> bool {
+                        panic!("refused request cannot invoke a document predicate")
+                    });
+                for (query, k) in [
+                    ("ordinary quality query", 0),
+                    ("ordinary quality query", 1),
+                    ("", 1),
+                    (" \t ", 1),
+                    ("ordinary quality query -blocked", 1),
+                    ("-blocked", 0),
+                ] {
                     let error = searcher
-                        .search_quality_only(
+                        .search_quality_only_with_filter(
                             &cx,
-                            "ordinary quality query",
+                            query,
                             k,
+                            Some(&unreachable_filter),
                             |_| panic!("refused request cannot inspect document text"),
                             |_| panic!("refused request cannot publish a phase"),
                         )
@@ -8033,6 +8064,57 @@ mod tests {
                 assert_eq!(quality.embed_count(), 0);
                 assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 0);
                 assert_eq!(lexical.searches.load(Ordering::Relaxed), 0);
+
+                // The same unavailable, foreign or policy-disabled semantic
+                // tier cannot block lexical browsing. Both public forms must
+                // reach the eligible tail without inspecting either producer.
+                let identity_calls = quality.identity_count();
+                lexical.epoch.store(11, Ordering::Relaxed);
+                let filter = AsyncTestFilter(|id: &str, metadata: Option<&serde_json::Value>| {
+                    id == "doc-quality-only" && metadata.is_some_and(|value| value["epoch"] == 11)
+                });
+                for filter in [None, Some(&filter as &dyn SearchFilter)] {
+                    let mut phases = Vec::new();
+                    let metrics = searcher
+                        .search_quality_only_with_filter(
+                            &cx,
+                            "-blocked",
+                            1,
+                            filter,
+                            |id| {
+                                Some(
+                                    if id == "doc-quality-only" {
+                                        "eligible"
+                                    } else {
+                                        "blocked"
+                                    }
+                                    .to_owned(),
+                                )
+                            },
+                            |phase| phases.push(phase),
+                        )
+                        .await
+                        .expect("a lexical complement does not request semantic retrieval");
+                    let [SearchPhase::Initial { results, .. }] = phases.as_slice() else {
+                        panic!("expected one lexical phase for {refusal}: {phases:?}");
+                    };
+                    assert_eq!(results.len(), 1);
+                    assert_eq!(results[0].doc_id, "doc-quality-only");
+                    assert_eq!(results[0].source, ScoreSource::Lexical);
+                    assert!(results[0].fast_score.is_none());
+                    assert!(results[0].quality_score.is_none());
+                    assert_eq!(results[0].metadata.as_ref().unwrap()["epoch"], 11);
+                    assert_eq!(metrics.skip_reason.as_deref(), Some("lexical_complement"));
+                    assert_eq!(metrics.semantic_candidates, 0);
+                    assert_eq!(metrics.phase1_vectors_searched, 0);
+                    assert_eq!(metrics.phase2_vectors_searched, 0);
+                    assert!(metrics.fast_embedder_id.is_none());
+                    assert!(metrics.quality_embedder_id.is_none());
+                    assert!(metrics.coverage.is_none());
+                }
+                assert_eq!(quality.identity_count(), identity_calls);
+                assert_eq!(quality.embed_count(), 0);
+                assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 0);
                 drop(extra_dir);
                 drop(legacy_dir);
             });
@@ -8261,6 +8343,11 @@ mod tests {
             }
             assert_eq!(quality.embed_count(), 0);
             assert_eq!(lexical.searches.load(Ordering::Relaxed), 0);
+            let identity_calls = quality.identity_count();
+            assert!(
+                identity_calls > 0,
+                "empty requests still admit their topology"
+            );
             let (complement, metrics) = searcher
                 .search_quality_only_collect_with_text(&cx, "-blocked", 2, |id| {
                     Some(
@@ -8282,9 +8369,10 @@ mod tests {
             );
             assert_eq!(metrics.skip_reason.as_deref(), Some("lexical_complement"));
             assert_eq!(quality.embed_count(), 0, "complement performs no inference");
-            assert!(
-                quality.identity_count() > 0,
-                "explicit topology is still admitted"
+            assert_eq!(
+                quality.identity_count(),
+                identity_calls,
+                "the lexical complement must not inspect an unrequested producer"
             );
             assert!(matches!(
                 searcher
@@ -15575,6 +15663,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn async_quality_only_complement_preserves_errors_and_cancellation_without_a_model() {
+        for fault in [
+            "backend",
+            "text",
+            "cancelled",
+            "filter",
+            "exclusion",
+            "initial",
+        ] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_directory, index) = build_test_index(4);
+                let lexical = Arc::new(RetainedMetadataLexical::default());
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(FailingEmbedder),
+                    TwoTierConfig::default(),
+                );
+                let searcher = if fault == "backend" {
+                    searcher
+                } else {
+                    searcher.with_lexical(lexical.clone())
+                };
+                let filter_calls = AtomicU64::new(0);
+                let filter = AsyncTestFilter(|_: &str, _: Option<&serde_json::Value>| {
+                    filter_calls.fetch_add(1, Ordering::Relaxed);
+                    if fault == "filter" {
+                        cx.set_cancel_requested(true);
+                    }
+                    true
+                });
+                if fault == "cancelled" {
+                    cx.set_cancel_requested(true);
+                }
+                let mut phases = 0;
+                let error = searcher
+                    .search_quality_only_with_filter(
+                        &cx,
+                        "-blocked",
+                        1,
+                        Some(&filter),
+                        |_| {
+                            if fault == "exclusion" {
+                                cx.set_cancel_requested(true);
+                            }
+                            (fault != "text").then(|| "eligible".to_owned())
+                        },
+                        |_| {
+                            phases += 1;
+                            if fault == "initial" {
+                                cx.set_cancel_requested(true);
+                            }
+                        },
+                    )
+                    .await
+                    .expect_err("lexical evidence failures are not semantic-model failures");
+                match fault {
+                    "backend" => assert!(matches!(
+                        error,
+                        SearchError::QueryParseError { detail, .. } if detail.contains("lexical backend")
+                    )),
+                    "text" => assert!(matches!(
+                        error,
+                        SearchError::QueryParseError { detail, .. } if detail.contains("document text")
+                    )),
+                    _ => assert!(matches!(error, SearchError::Cancelled { .. })),
+                }
+                assert_eq!(phases, usize::from(fault == "initial"));
+                if matches!(fault, "backend" | "cancelled") {
+                    assert_eq!(filter_calls.load(Ordering::Relaxed), 0);
+                    assert_eq!(lexical.searches.load(Ordering::Relaxed), 0);
+                }
+            });
+        }
+    }
+
     #[cfg(any(feature = "quill", feature = "tantivy-bench"))]
     fn complement_fixture_documents() -> Vec<frankensearch_core::IndexableDocument> {
         use frankensearch_core::IndexableDocument;
@@ -15648,6 +15812,25 @@ mod tests {
             all.iter().all(|hit| !hit.doc_id.starts_with("doc-")),
             "unrelated vector-only records must never enter the complement"
         );
+
+        // The actual retained backend must also support lexical browsing from
+        // the quality-only API despite an unavailable quality model. Metadata
+        // filtering and exclusions still run against that retained corpus.
+        let filter = AsyncTestFilter(|_: &str, metadata: Option<&serde_json::Value>| {
+            metadata.is_some_and(|value| value["path"] == "src/tail-b.rs")
+        });
+        let (quality_complement, metrics) = searcher
+            .search_quality_only_collect_with_text_and_filter(cx, query, 2, Some(&filter), text)
+            .await
+            .unwrap();
+        assert_eq!(quality_complement.len(), 1);
+        assert_eq!(quality_complement[0].doc_id, "tail-b");
+        assert_eq!(quality_complement[0].source, ScoreSource::Lexical);
+        assert!(quality_complement[0].fast_score.is_none());
+        assert!(quality_complement[0].quality_score.is_none());
+        assert_eq!(metrics.skip_reason.as_deref(), Some("lexical_complement"));
+        assert_eq!(metrics.semantic_candidates, 0);
+        assert!(metrics.coverage.is_none());
     }
 
     #[cfg(feature = "quill")]
