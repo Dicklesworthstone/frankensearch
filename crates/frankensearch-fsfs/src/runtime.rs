@@ -13309,22 +13309,16 @@ impl FsfsRuntime {
         index_root: &Path,
         payload: Option<&SearchPayload>,
     ) {
-        // The payload describes the lane actually searched. In quality-only
-        // mode the root can also contain a fast or hash artifact we never used.
-        if let Some(payload) = payload
-            && let Some(id) = &payload.vector_generation_id
-        {
-            session.vector_generation_id = Some(id.clone());
+        // The searched payload owns its provenance, including the absence of
+        // a vector generation when only the lexical index participated.
+        if let Some(payload) = payload {
+            session
+                .vector_generation_id
+                .clone_from(&payload.vector_generation_id);
             session.vector_generation_is_hash = payload.vector_generation_is_hash;
-            return;
-        }
-        if let Some(published) = Self::inspect_published_vector_generation(index_root) {
+        } else if let Some(published) = Self::inspect_published_vector_generation(index_root) {
             session.vector_generation_id = Some(published.id);
             session.vector_generation_is_hash = published.is_hash_control;
-            return;
-        }
-        if let Some(payload) = payload {
-            session.vector_generation_is_hash = payload.vector_generation_is_hash;
         }
     }
 
@@ -49875,10 +49869,16 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
     fn exclusion_only_daemon_cache_replays_lexical_attestation_without_models() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
             let mut resources = disagreeing_blend_resources(temp.path());
+            let hash_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(hash_path.parent().unwrap()).unwrap();
+            let mut hash = VectorIndex::create(&hash_path, "fnv1a-256", 256).unwrap();
+            hash.write_record("keep.rs", &[1.0; 256]).unwrap();
+            hash.finish().unwrap();
             let writer = create_test_quill(&cx, &temp.path().join("lexical")).await;
             for (path, text) in [("blocked.rs", "banned"), ("keep.rs", "ordinary document")] {
                 writer
@@ -49923,7 +49923,10 @@ mod tests {
             // may still request full, which the server must resolve identically.
             let mut wire_request = request();
             wire_request.mode = Some("lexical_only".to_owned());
+            let previous_session = temp.path().join(super::FSFS_EXPLAIN_SESSION_FILE);
+            fs::create_dir_all(previous_session.parent().unwrap()).unwrap();
             for cached in [false, true] {
+                fs::write(&previous_session, "previous session must be replaced").unwrap();
                 let mut state = super::SearchServeStreamState::default();
                 let mut delivered = Vec::new();
                 let mut sink = |frame| {
@@ -49945,7 +49948,7 @@ mod tests {
                         Arc::clone(&shared),
                         super::SearchServeOptions {
                             hot_cache_enabled: true,
-                            persist_explain_session: false,
+                            persist_explain_session: true,
                         },
                         Some(&mut sink),
                     )
@@ -49960,6 +49963,25 @@ mod tests {
                     Some("lexical_complement")
                 );
                 assert!(state.vector_generation_id.is_none());
+                let session = runtime.load_explain_session().unwrap().unwrap();
+                assert_eq!(
+                    session.vector_generation_id,
+                    delivered[0].vector_generation_id
+                );
+                assert!(!session.vector_generation_is_hash);
+                assert_eq!(session.hits[0].path, "keep.rs");
+                let shared = shared.lock(&cx).await.unwrap();
+                let (_, warnings) = FsfsRuntime::explain_session_hit(
+                    &cx,
+                    &session,
+                    &session.hits[0],
+                    Ok(shared.0.lexical_index.as_ref().unwrap()),
+                );
+                assert!(
+                    warnings
+                        .iter()
+                        .all(|warning| warning.code != OutputWarningCode::HASH_FALLBACK)
+                );
             }
             assert_eq!(producer.calls.load(Ordering::SeqCst), 0);
         });
