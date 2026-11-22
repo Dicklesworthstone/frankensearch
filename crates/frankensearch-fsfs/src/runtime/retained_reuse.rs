@@ -2982,6 +2982,72 @@ mod generation_tests {
         }
 
         #[test]
+        fn invalid_migration_discovery_leaves_the_legacy_index_searchable() {
+            run_test_with_cx(|cx| async move {
+                for relative_ignore in [".ignore", "nested/.ignore"] {
+                    let parent = tempfile::tempdir().unwrap();
+                    fixture(parent.path(), 2);
+                    assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
+                    let (runtime, source, root) = two_tier_fixture(parent.path(), 1);
+                    let runtime = runtime.with_contract_upgrade_reuse(true);
+                    let fast = Arc::new(CountingEmbedder::new("reuse-fast", 4, false));
+                    let quality = Arc::new(CountingEmbedder::new("reuse-quality", 6, false));
+                    let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
+                    let artifacts = [
+                        LEGACY_RECEIPT_FILE,
+                        super::super::super::FSFS_VECTOR_INDEX_FILE,
+                        super::super::super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                    ]
+                    .map(|name| (name, fs::read(root.join(name)).unwrap()));
+                    let mut search = runtime.clone();
+                    search.cli_input.command = CliCommand::Search;
+                    let before = search
+                        .execute_search_payload(&cx, "sharedtoken", 10)
+                        .await
+                        .unwrap();
+
+                    let ignore = source.join(relative_ignore);
+                    fs::create_dir_all(ignore.parent().unwrap()).unwrap();
+                    fs::write(&ignore, "private[9-0].md\n").unwrap();
+                    assert!(matches!(
+                        runtime.rebuild_retained_generation(&cx, &root).await,
+                        Err(SearchError::InvalidConfig { field, .. }) if field == "discovery.ignore_rules"
+                    ));
+                    assert!(
+                        search.complete_generation_command_root(false).unwrap().is_none(),
+                        "{relative_ignore} redirected a previously searchable legacy index"
+                    );
+                    assert!(!root.join("generations").exists());
+                    for (name, expected) in &artifacts {
+                        assert_eq!(&fs::read(root.join(name)).unwrap(), expected, "{name}");
+                    }
+                    let after = search
+                        .execute_search_payload(&cx, "sharedtoken", 10)
+                        .await
+                        .unwrap();
+                    let ranking = |payload: &super::super::super::SearchPayload| {
+                        payload
+                            .hits
+                            .iter()
+                            .map(|hit| (hit.path.clone(), hit.score.to_bits()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(before.hits.len(), 2);
+                    assert_eq!(ranking(&after), ranking(&before));
+
+                    fs::rename(ignore, parent.path().join("rejected-ignore")).unwrap();
+                    let migrated = publish(&runtime, &cx, &root).await;
+                    assert_eq!(search.complete_generation_command_root(false).unwrap(), Some(root));
+                    for (name, expected) in artifacts.iter().skip(1) {
+                        assert_eq!(&fs::read(migrated.path().join(name)).unwrap(), expected, "{name}");
+                    }
+                    assert_eq!(fast.counts.documents.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.counts.documents.load(Ordering::SeqCst), 0);
+                }
+            });
+        }
+
+        #[test]
         fn an_mtime_only_change_keeps_vectors_and_records_the_new_revision() {
             run_test_with_cx(|cx| async move {
                 let parent = tempfile::tempdir().unwrap();

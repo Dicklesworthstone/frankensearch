@@ -743,6 +743,30 @@ impl FsfsRuntime {
         })
     }
 
+    fn validate_first_migration_discovery(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        target_root: &Path,
+    ) -> SearchResult<()> {
+        let source_policy = IndexSourcePolicy::for_index_root(root)?;
+        if source_policy == IndexSourcePolicy::BestEffort
+            || complete_cli::complete_entry_exists(&root.join("generations"))?
+        {
+            return Ok(());
+        }
+        // Creating `generations` takes over routing from the legacy index. Run
+        // normal discovery under the root's writer lease before that boundary.
+        // The indexer takes a fresh observation after seeding; the lease does
+        // not make the source tree immutable.
+        let source = IndexSourceRoot::open(target_root)?;
+        let mut control = IndexRunControl::new(&self.config)?;
+        control.checkpoint(cx, "index.discovery", true)?;
+        self.discover_index_candidates(cx, &mut control, target_root, root, source_policy, drop)?;
+        source.check()?;
+        Ok(())
+    }
+
     #[allow(clippy::future_not_send)]
     async fn build_retained_generation_with_progress<F>(
         &self,
@@ -806,7 +830,11 @@ impl FsfsRuntime {
                             predecessor
                                 .map_or_else(|| store.root(), |generation| generation.path()),
                             &target_root,
-                        )
+                        )?;
+                        if predecessor.is_none() {
+                            self.validate_first_migration_discovery(cx, store.root(), &target_root)?;
+                        }
+                        Ok(())
                     })?
                 }
                 RetainedBuildKind::Recovery => store.begin_recovery_rebuild(cx)?,

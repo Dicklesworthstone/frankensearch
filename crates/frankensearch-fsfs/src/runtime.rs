@@ -22290,28 +22290,15 @@ impl FsfsRuntime {
             retained_reuse::prepare_legacy_reuse(cx).await?;
         }
 
-        self.refuse_foreign_target_root(&target_root)?;
-        let root_decision = self.config.discovery.evaluate_root(&target_root, None);
-        if !root_decision.include() {
-            return Err(SearchError::InvalidConfig {
-                field: "discovery.roots".to_owned(),
-                value: target_root.display().to_string(),
-                reason: format!(
-                    "target root excluded by discovery policy: {}",
-                    root_decision.reason_codes.join(",")
-                ),
-            });
-        }
-
         let mut candidates = Vec::new();
         let discovery_start = Instant::now();
-        let stats = self.collect_index_candidates(
+        let stats = self.discover_index_candidates(
             cx,
             &mut control,
             &target_root,
             &index_root,
             source_policy,
-            &mut candidates,
+            |candidate| candidates.push(candidate),
         )?;
         source_root.check()?;
         let discovery_elapsed_ms = discovery_start.elapsed().as_millis();
@@ -28229,15 +28216,27 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    fn collect_index_candidates(
+    fn discover_index_candidates(
         &self,
         cx: &Cx,
         control: &mut IndexRunControl,
         target_root: &Path,
         index_root: &Path,
         source_policy: IndexSourcePolicy,
-        output: &mut Vec<IndexCandidate>,
+        mut on_candidate: impl FnMut(IndexCandidate),
     ) -> SearchResult<IndexDiscoveryStats> {
+        self.refuse_foreign_target_root(target_root)?;
+        let root_decision = self.config.discovery.evaluate_root(target_root, None);
+        if !root_decision.include() {
+            return Err(SearchError::InvalidConfig {
+                field: "discovery.roots".to_owned(),
+                value: target_root.display().to_string(),
+                reason: format!(
+                    "target root excluded by discovery policy: {}",
+                    root_decision.reason_codes.join(",")
+                ),
+            });
+        }
         let mut discovered_files = 0_usize;
         let mut skipped_files = 0_usize;
         let mut reason_codes = BTreeSet::new();
@@ -28383,7 +28382,7 @@ impl FsfsRuntime {
             #[cfg(not(unix))]
             let stamp = None;
 
-            output.push(IndexCandidate {
+            on_candidate(IndexCandidate {
                 file_path: entry_path.clone(),
                 file_key: normalize_file_key_for_index(&entry_path, target_root),
                 byte_len: metadata.len(),
@@ -41604,13 +41603,13 @@ mod tests {
         let runtime = FsfsRuntime::new(config);
         let mut candidates = Vec::new();
         runtime
-            .collect_index_candidates(
+            .discover_index_candidates(
                 &Cx::for_testing(),
                 &mut control,
                 root,
                 &root.join(".frankensearch"),
                 super::IndexSourcePolicy::RequireReadable,
-                &mut candidates,
+                |candidate| candidates.push(candidate),
             )
             .unwrap();
         candidates
