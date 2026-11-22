@@ -1,16 +1,24 @@
 //! Independent native quality retrieval and two-tier candidate union.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
-use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
+use frankensearch_core::{BoundQueryEmbedding, DocId, LexicalCandidateBatch};
 use frankensearch_fusion::{RrfConfig, blend_two_tier, candidate_count, rrf_fuse_for_vector_lane};
 
 use super::{NativeAnnIndex, checkpoint, hydrate_winners, invalid, join_sources, validate_lexical};
+use crate::native_ann::NativeWorker;
 use crate::{Cx, Embedder, LexicalRead, ScoreSource, ScoredResult, SearchResult, VectorHit};
+
+/// The actual query response stays with its retrieved pool. Supplementary
+/// evidence must use these exact values, never a second inference of the text.
+pub(super) struct RetainedCandidates<T> {
+    pub query: Option<BoundQueryEmbedding>,
+    pub hits: Vec<T>,
+}
 
 impl NativeAnnIndex {
     /// Use this native owner as the primary quality retrieval arm.
@@ -90,6 +98,11 @@ impl NativeAnnIndex {
     /// combined by default RRF. Quality-only candidates are not restricted to
     /// the fast pool. Missing coverage is permitted, not counted as complete.
     ///
+    /// Each retained candidate is also scored in the other owner when it has a
+    /// live row there. Falling below a retrieval cutoff is not missing coverage;
+    /// only genuinely absent or tombstoned rows keep the single-tier blend.
+    /// Supplementation cannot add a document outside the retrieved union.
+    ///
     /// Raw per-tier scores are preserved. A row index belongs to the fast owner
     /// when `fast_score` is present, otherwise to the quality owner when
     /// `quality_score` is present. Two hash-control arms are supported, but their
@@ -126,22 +139,34 @@ impl NativeAnnIndex {
             return Ok(Vec::new());
         }
         let budget = candidate_count(k, 0, 3);
-        let (fast_hits, (quality_hits, batch)) = join_sources(
+        let (mut fast, (mut quality_hits, batch)) = join_sources(
             cx,
-            self.search_text(cx, fast_embedder, text, budget, None),
+            self.retrieve_candidates(cx, fast_embedder, text, budget, None, None, |_| true),
             join_sources(
                 cx,
-                quality.0.search_text(cx, quality.1, text, budget, None),
+                quality
+                    .0
+                    .retrieve_candidates(cx, quality.1, text, budget, None, None, |_| true),
                 checked_lexical(cx, lexical, text, budget),
             ),
         )
         .await?;
+        let (fast_supplement, quality_supplement) = join_sources(
+            cx,
+            self.supplement_candidates(cx, &fast, &quality_hits.hits, None),
+            quality
+                .0
+                .supplement_candidates(cx, &quality_hits, &fast.hits, None),
+        )
+        .await?;
+        fast.hits.extend(fast_supplement);
+        quality_hits.hits.extend(quality_supplement);
         refined_winners(
             cx,
             lexical,
             &batch,
-            &fast_hits,
-            &quality_hits,
+            &fast.hits,
+            &quality_hits.hits,
             k,
             RefinementFusion {
                 quality_weight: 0.7,
@@ -183,30 +208,56 @@ impl NativeAnnIndex {
             return Ok(Vec::new());
         }
         let budget = candidate_count(k, 0, 3);
-        let (fast_query, (quality_query, batch)) = join_sources(
+        let (mut fast, (mut quality_hits, batch)) = join_sources(
             cx,
-            self.embed_query(cx, fast_embedder, text),
+            self.retrieve_candidates(
+                cx,
+                fast_embedder,
+                text,
+                budget,
+                None,
+                Some((Arc::clone(self), pool.clone())),
+                |_| true,
+            ),
             join_sources(
                 cx,
-                quality.0.embed_query(cx, quality.1, text),
+                quality.0.retrieve_candidates(
+                    cx,
+                    quality.1,
+                    text,
+                    budget,
+                    None,
+                    Some((Arc::clone(quality.0), pool.clone())),
+                    |_| true,
+                ),
                 checked_lexical(cx, lexical, text, budget),
             ),
         )
         .await?;
-        let (fast_hits, quality_hits) = Box::pin(join_sources(
+        let (fast_supplement, quality_supplement) = join_sources(
             cx,
-            self.search_with_pool(cx, fast_query, budget, None, pool.clone()),
-            quality
-                .0
-                .search_with_pool(cx, quality_query, budget, None, pool),
-        ))
+            self.supplement_candidates(
+                cx,
+                &fast,
+                &quality_hits.hits,
+                Some((Arc::clone(self), pool.clone())),
+            ),
+            quality.0.supplement_candidates(
+                cx,
+                &quality_hits,
+                &fast.hits,
+                Some((Arc::clone(quality.0), pool)),
+            ),
+        )
         .await?;
+        fast.hits.extend(fast_supplement);
+        quality_hits.hits.extend(quality_supplement);
         refined_winners(
             cx,
             lexical,
             &batch,
-            &fast_hits,
-            &quality_hits,
+            &fast.hits,
+            &quality_hits.hits,
             k,
             RefinementFusion {
                 quality_weight: 0.7,
@@ -216,6 +267,156 @@ impl NativeAnnIndex {
         )
         .await
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn retrieve_candidates<F>(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        ef: Option<usize>,
+        worker: Option<(Arc<Self>, BlockingPoolHandle)>,
+        accept: F,
+    ) -> SearchResult<RetainedCandidates<VectorHit>>
+    where
+        F: Fn(&str) -> bool + Send + 'static,
+    {
+        checkpoint(cx, "native_ann.candidate_retrieval")?;
+        self.admit_identity(embedder.identity()?)?;
+        if let Some((_, pool)) = &worker {
+            NativeWorker::QUERY.require_pool(cx, pool)?;
+        }
+        if k == 0 || self.live_count() == 0 {
+            return Ok(RetainedCandidates {
+                query: None,
+                hits: Vec::new(),
+            });
+        }
+        let query = self.embed_query(cx, embedder, text).await?;
+        let hits = match worker {
+            Some((owner, pool)) => {
+                owner
+                    .search_filtered_with_pool(cx, query.clone(), k, ef, pool, accept)
+                    .await?
+            }
+            None => self.search_filtered(cx, &query, k, ef, accept)?,
+        };
+        Ok(RetainedCandidates {
+            query: Some(query),
+            hits,
+        })
+    }
+
+    pub(super) async fn supplement_candidates(
+        &self,
+        cx: &Cx,
+        observed: &RetainedCandidates<VectorHit>,
+        candidates: &[VectorHit],
+        worker: Option<(Arc<Self>, BlockingPoolHandle)>,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let Some(query) = observed.query.as_ref() else {
+            checkpoint(cx, "native_ann.candidate_evidence.empty")?;
+            return Ok(Vec::new());
+        };
+        let missing = missing_ids(
+            observed.hits.iter().map(|hit| &hit.doc_id),
+            candidates.iter().map(|hit| &hit.doc_id),
+        );
+        match worker {
+            Some((owner, pool)) => {
+                owner
+                    .score_documents_with_pool(cx, query.clone(), missing, pool)
+                    .await
+            }
+            None => self.score_documents(cx, query, &missing),
+        }
+    }
+
+    /// Exact evidence for a bounded set of already selected documents. The
+    /// bound query is admitted before any row lookup, including empty batches.
+    /// Lookup checks the complete ID (not only its hash) and excludes tombstones.
+    pub(super) fn score_documents(
+        &self,
+        cx: &Cx,
+        query: &BoundQueryEmbedding,
+        document_ids: &[DocId],
+    ) -> SearchResult<Vec<VectorHit>> {
+        checkpoint(cx, "native_ann.candidate_evidence.admission")?;
+        self.admit_identity(query.identity())?;
+        if query.vector().len() != self.owner.dimension() {
+            return Err(crate::SearchError::DimensionMismatch {
+                expected: self.owner.dimension(),
+                found: query.vector().len(),
+            });
+        }
+        if query.vector().iter().all(|value| *value == 0.0) {
+            return Ok(Vec::new());
+        }
+        let mut hits = Vec::with_capacity(document_ids.len());
+        for id in document_ids {
+            checkpoint(cx, "native_ann.candidate_evidence.row")?;
+            let Some(row) = self.owner.find_live_row_by_doc_id(id)? else {
+                continue;
+            };
+            let physical = row.physical_index();
+            let score = self.score_retained_row(physical, query.vector())?;
+            if !score.is_finite() {
+                return Err(invalid(
+                    "score",
+                    "non-finite",
+                    "retained-owner candidate evidence must be finite",
+                ));
+            }
+            hits.push(VectorHit {
+                index: u32::try_from(physical).map_err(|_| {
+                    invalid(
+                        "physical_row",
+                        "out-of-range",
+                        "source row does not fit u32",
+                    )
+                })?,
+                score,
+                doc_id: id.clone(),
+            });
+        }
+        checkpoint(cx, "native_ann.candidate_evidence.complete")?;
+        Ok(hits)
+    }
+
+    pub(super) async fn score_documents_with_pool(
+        self: &Arc<Self>,
+        cx: &Cx,
+        query: BoundQueryEmbedding,
+        document_ids: Vec<DocId>,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<VectorHit>> {
+        checkpoint(cx, "native_ann.candidate_evidence.worker")?;
+        self.admit_identity(query.identity())?;
+        NativeWorker::QUERY.require_pool(cx, &pool)?;
+        if document_ids.is_empty() {
+            return self.score_documents(cx, &query, &document_ids);
+        }
+        let index = Arc::clone(self);
+        NativeWorker::QUERY
+            .run(cx, pool, move |request| {
+                index.score_documents(request, &query, &document_ids)
+            })
+            .await
+    }
+}
+
+/// Complete only the retrieved union; an exact lookup is evidence, not another
+/// retrieval. Keep the existing pool order and clone only IDs missing a score.
+pub(super) fn missing_ids<'a>(
+    observed: impl Iterator<Item = &'a DocId>,
+    candidates: impl Iterator<Item = &'a DocId>,
+) -> Vec<DocId> {
+    let mut seen: BTreeSet<&str> = observed.map(DocId::as_str).collect();
+    candidates
+        .filter(|id| seen.insert(id.as_str()))
+        .cloned()
+        .collect()
 }
 
 pub(super) fn admit_pair(
@@ -479,6 +680,24 @@ mod tests {
         nonce: u8,
         format: QuantizationFormat,
     ) -> NativeAnnIndex {
+        index_states(
+            cx,
+            provider,
+            rows.iter().map(|&(id, vector)| (id, vector, true)),
+            generation,
+            nonce,
+            format,
+        )
+    }
+
+    fn index_states<'a>(
+        cx: &Cx,
+        provider: &Provider,
+        rows: impl IntoIterator<Item = (&'a str, &'a [f32], bool)>,
+        generation: u64,
+        nonce: u8,
+        format: QuantizationFormat,
+    ) -> NativeAnnIndex {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tier.fsvi");
         let mut identity = provider.identity.clone();
@@ -491,8 +710,12 @@ mod tests {
         )
         .unwrap();
         let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
-        for (id, vector) in rows {
-            writer.write_record(id, vector).unwrap();
+        for (id, vector, live) in rows {
+            if live {
+                writer.write_record(id, vector).unwrap();
+            } else {
+                writer.write_tombstone_record(id, vector).unwrap();
+            }
         }
         writer.finish().unwrap();
         let bytes: Arc<[u8]> = std::fs::read(path).unwrap().into();
@@ -545,13 +768,238 @@ mod tests {
                 assert_eq!(results.len(), 1);
                 assert_eq!(results[0].doc_id, "late");
                 assert_eq!(results[0].source, ScoreSource::Hybrid);
-                assert!(results[0].fast_score.is_none());
+                assert_eq!(results[0].fast_score, Some(0.0));
                 assert_eq!(results[0].quality_score, Some(quality_hit[0].score));
-                assert_eq!(results[0].index, Some(quality_hit[0].index));
+                assert_eq!(
+                    results[0].index,
+                    Some(
+                        u32::try_from(
+                            fast_index
+                                .owner
+                                .find_live_row_by_doc_id("late")
+                                .unwrap()
+                                .unwrap()
+                                .physical_index()
+                        )
+                        .unwrap()
+                    ),
+                );
                 assert_eq!(results[0].metadata.as_deref().unwrap()["snapshot"], 1);
                 assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
             }
         });
+    }
+
+    fn opposite_fast_rows() -> Vec<(&'static str, &'static [f32])> {
+        vec![
+            ("a", &[1.0, 0.0]),
+            ("b", &[0.875, 0.0]),
+            ("c", &[0.75, 0.0]),
+            ("d", &[0.625, 0.0]),
+            ("e", &[0.5, 0.0]),
+            ("f", &[0.375, 0.0]),
+        ]
+    }
+
+    fn opposite_quality_rows() -> Vec<(&'static str, &'static [f32])> {
+        vec![
+            ("a", &[1.0, 0.0, 0.0]),
+            ("b", &[0.0, 0.125, 0.0]),
+            ("c", &[0.0, 0.25, 0.0]),
+            ("d", &[0.0, 1.0, 0.0]),
+            ("e", &[0.0, 0.875, 0.0]),
+            ("f", &[0.0, 0.75, 0.0]),
+        ]
+    }
+
+    #[test]
+    fn refinement_scores_the_union_before_blending_on_exact_ann_and_worker_paths() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::runtime::blocking_pool::BlockingPool;
+        use std::time::Duration;
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let pool = BlockingPool::new(0, 2);
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for format in [QuantizationFormat::F16, QuantizationFormat::F32] {
+                for ann in [false, true] {
+                    for offload in [false, true] {
+                        let fast = Provider::new("fast", vec![1.0, 0.0], true);
+                        let quality = Provider::new("quality", vec![0.0, 1.0, 0.0], true);
+                        let mut fast_index = index(&cx, &fast, &opposite_fast_rows(), 1, 7, format);
+                        let mut quality_index =
+                            index(&cx, &quality, &opposite_quality_rows(), 1, 7, format);
+                        // A full-physical-row beam deliberately uses the exact
+                        // fallback. Keep the ANN arm below that threshold so
+                        // these variants actually traverse the dense graph.
+                        fast_index.default_ef_search = 3;
+                        quality_index.default_ef_search = 3;
+                        assert!(fast_index.default_ef_search < fast_index.len());
+                        assert!(quality_index.default_ef_search < quality_index.len());
+                        let fast_index = Arc::new(if ann {
+                            fast_index
+                        } else {
+                            NativeAnnIndex::exact(&cx, Arc::clone(&fast_index.owner)).unwrap()
+                        });
+                        let quality_index = Arc::new(if ann {
+                            quality_index
+                        } else {
+                            NativeAnnIndex::exact(&cx, Arc::clone(&quality_index.owner)).unwrap()
+                        });
+                        let fast_query =
+                            BoundQueryEmbedding::new(fast.values.clone(), fast.identity.clone())
+                                .unwrap();
+                        let quality_query = BoundQueryEmbedding::new(
+                            quality.values.clone(),
+                            quality.identity.clone(),
+                        )
+                        .unwrap();
+                        let fast_top = fast_index.search(&cx, &fast_query, 3, None).unwrap();
+                        let quality_top =
+                            quality_index.search(&cx, &quality_query, 3, None).unwrap();
+                        assert_eq!(
+                            fast_top
+                                .iter()
+                                .map(|hit| hit.doc_id.as_str())
+                                .collect::<Vec<_>>(),
+                            ["a", "b", "c"]
+                        );
+                        assert_eq!(
+                            quality_top
+                                .iter()
+                                .map(|hit| hit.doc_id.as_str())
+                                .collect::<Vec<_>>(),
+                            ["d", "e", "f"]
+                        );
+                        // The previous cutoff-as-absence behavior returns a,
+                        // despite a real quality score of zero and d's one.
+                        assert_eq!(blend_two_tier(&fast_top, &quality_top, 0.7)[0].doc_id, "a");
+                        let lexical = Lexical::default();
+                        let results = if offload {
+                            fast_index
+                                .search_hybrid_refined_text_with_pool(
+                                    &cx,
+                                    &fast,
+                                    (&quality_index, &quality),
+                                    &lexical,
+                                    "query",
+                                    1,
+                                    pool.handle(),
+                                )
+                                .await
+                                .unwrap()
+                        } else {
+                            fast_index
+                                .search_hybrid_refined_text(
+                                    &cx,
+                                    &fast,
+                                    (&quality_index, &quality),
+                                    &lexical,
+                                    "query",
+                                    1,
+                                )
+                                .await
+                                .unwrap()
+                        };
+                        assert_eq!(results.len(), 1);
+                        assert_eq!(
+                            results[0].doc_id, "d",
+                            "format={format:?} ann={ann} offload={offload}"
+                        );
+                        assert_eq!(results[0].fast_score, Some(0.625));
+                        assert_eq!(results[0].quality_score, Some(1.0));
+                        assert_eq!(
+                            results[0].index,
+                            Some(
+                                u32::try_from(
+                                    fast_index
+                                        .owner
+                                        .find_live_row_by_doc_id("d")
+                                        .unwrap()
+                                        .unwrap()
+                                        .physical_index()
+                                )
+                                .unwrap()
+                            )
+                        );
+                        assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+                    }
+                }
+            }
+        });
+        assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn refinement_keeps_absent_and_tombstoned_quality_evidence_missing() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tombstone in [false, true] {
+                let fast = Provider::new("fast", vec![1.0, 0.0], true);
+                let quality = Provider::new("quality", vec![0.0, 1.0, 0.0], true);
+                let fast_index = index(
+                    &cx,
+                    &fast,
+                    &opposite_fast_rows(),
+                    1,
+                    7,
+                    QuantizationFormat::F32,
+                );
+                let rows = opposite_quality_rows();
+                let quality_index = index_states(
+                    &cx,
+                    &quality,
+                    rows.iter()
+                        .filter(|(id, _)| tombstone || *id != "a")
+                        .map(|&(id, vector)| (id, vector, id != "a")),
+                    1,
+                    7,
+                    QuantizationFormat::F32,
+                );
+                let results = fast_index
+                    .search_hybrid_refined_text(
+                        &cx,
+                        &fast,
+                        (&quality_index, &quality),
+                        &Lexical::default(),
+                        "query",
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(results[0].doc_id, "a");
+                assert_eq!(results[0].fast_score, Some(1.0));
+                assert!(results[0].quality_score.is_none());
+                assert_eq!(results[0].source, ScoreSource::SemanticFast);
+            }
+        });
+    }
+
+    #[test]
+    fn candidate_evidence_requires_the_exact_tier_and_ignores_zero_signal() {
+        let cx = Cx::for_testing();
+        let fast = Provider::new("fast", vec![1.0, 0.0], true);
+        let quality = Provider::new("quality", vec![0.0, 1.0], true);
+        let owner = index(
+            &cx,
+            &fast,
+            &opposite_fast_rows(),
+            1,
+            7,
+            QuantizationFormat::F32,
+        );
+        let foreign = BoundQueryEmbedding::new(quality.values, quality.identity).unwrap();
+        assert!(owner.score_documents(&cx, &foreign, &[]).is_err());
+        assert!(owner.score_documents(&cx, &foreign, &["a".into()]).is_err());
+        let zero = BoundQueryEmbedding::new(vec![0.0, -0.0], fast.identity).unwrap();
+        assert!(
+            owner
+                .score_documents(&cx, &zero, &["a".into()])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

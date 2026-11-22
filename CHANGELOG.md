@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Native two-tier hybrid refinement now completes each retrieved candidate's
+  scores against both retained owners before blending. A document below one
+  tier's top-k cutoff receives its actual score, including zero, rather than an
+  incorrect single-tier weight. Independent candidate discovery, true missing
+  or tombstoned coverage, original bound query responses, and physical row
+  provenance are preserved on direct and blocking-pool requests.
+
 ## [1.13.0] — 2026-11-21
 
 Qualified multi-platform release of `fsfs 1.13.0` and the `frankensearch 0.8.0`
