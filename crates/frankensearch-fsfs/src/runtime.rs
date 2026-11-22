@@ -7608,6 +7608,8 @@ pub struct FsfsRuntime {
     /// sits beneath a hidden directory the walker skips, but a `.gitignore`
     /// whitelist can unhide that directory.
     discovery_excluded_root: Option<PathBuf>,
+    /// The configured path to a legacy index whose destination is bound for indexing.
+    legacy_index_alias: Option<PathBuf>,
 }
 
 /// Private CLI entry point used to extract embedded weights in a short-lived process.
@@ -7693,6 +7695,7 @@ impl FsfsRuntime {
             receipt_seed: None,
             source_policy: IndexSourcePolicy::BestEffort,
             discovery_excluded_root: None,
+            legacy_index_alias: None,
         }
     }
 
@@ -8554,7 +8557,7 @@ impl FsfsRuntime {
             CliCommand::Update => self.run_update_command(),
             CliCommand::Uninstall => self.run_uninstall_command(),
             CliCommand::Tui => self.run_tui(cx).await,
-            command => self.run_cli_scaffold(cx, command, shutdown).await,
+            command => Box::pin(self.run_cli_scaffold(cx, command, shutdown)).await,
         }
     }
 
@@ -22236,25 +22239,67 @@ impl FsfsRuntime {
             .map(|_| ())
     }
 
-    fn run_one_shot_index_scaffold_internal<F>(
+    async fn run_one_shot_index_scaffold_internal<F>(
         &self,
         cx: &Cx,
         command: CliCommand,
         on_progress: F,
         emit_user_output: bool,
         retain_legacy_reuse: bool,
-    ) -> impl Future<Output = SearchResult<FsfsIndexPayload>>
+    ) -> SearchResult<FsfsIndexPayload>
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
     {
-        self.run_one_shot_index_with_producers(
+        let alias_runtime = self.resolve_legacy_index_alias(command)?;
+        let runtime = alias_runtime.as_deref().unwrap_or(self);
+        Box::pin(runtime.run_one_shot_index_with_producers(
             cx,
             command,
             on_progress,
             emit_user_output,
             retain_legacy_reuse,
             RetainedBuildProducers::default(),
-        )
+        ))
+        .await
+    }
+
+    fn resolve_legacy_index_alias(&self, command: CliCommand) -> SearchResult<Option<Box<Self>>> {
+        let index_root = self.resolve_index_root(&self.resolve_target_root()?)?;
+        match fs::symlink_metadata(&index_root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+
+        let invalid_alias = |reason: &str| SearchError::InvalidConfig {
+            field: "cli.index_dir".to_owned(),
+            value: index_root.display().to_string(),
+            reason: reason.to_owned(),
+        };
+        let destination = match fs::canonicalize(&index_root) {
+            Ok(destination) => destination,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(invalid_alias("the index directory symlink has no existing destination"));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !fs::metadata(&destination)?.is_dir() {
+            return Err(invalid_alias("the index directory symlink must point to a directory"));
+        }
+
+        // Keep the footprint, lease, discovery exclusion and catalog on one
+        // destination even if the operator's alias moves during the build.
+        let mut runtime = Box::new(self.clone());
+        runtime.cli_input.command = command;
+        runtime.cli_input.index_dir = Some(destination);
+        runtime.legacy_index_alias = Some(index_root.clone());
+        if runtime.complete_generation_command_root(false)?.is_some() {
+            return Err(invalid_alias(
+                "the index directory symlink resolves to a complete-generation store; use its real path",
+            ));
+        }
+        Ok(Some(runtime))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -28025,16 +28070,20 @@ impl FsfsRuntime {
         }
 
         let index_root = self.resolve_index_root(&target_root)?;
+        let watcher = |ingest| {
+            let watcher = FsWatcher::new(vec![target_root], self.config.discovery.clone(), ingest);
+            if let Some(alias) = &self.legacy_index_alias {
+                watcher.with_excluded_roots([index_root.clone(), alias.clone()])
+            } else {
+                watcher
+            }
+        };
         if Self::is_lexical_only_generation(&index_root) {
             let ingest = self
                 .build_lexical_only_watch_ingest(cx, &index_root)
                 .await?;
             return Ok(LiveWatchSession {
-                watcher: FsWatcher::new(
-                    vec![target_root],
-                    self.config.discovery.clone(),
-                    Arc::new(ingest),
-                ),
+                watcher: watcher(Arc::new(ingest)),
                 vector_index: None,
                 quality_vector_index: None,
                 reuse: None,
@@ -28045,11 +28094,7 @@ impl FsfsRuntime {
         let quality_vector_index = pipeline.quality_vector_handle();
         let reuse = pipeline.reuse_ledger();
         Ok(LiveWatchSession {
-            watcher: FsWatcher::new(
-                vec![target_root],
-                self.config.discovery.clone(),
-                Arc::new(pipeline),
-            ),
+            watcher: watcher(Arc::new(pipeline)),
             vector_index: Some(vector_index),
             quality_vector_index,
             reuse,
@@ -28270,7 +28315,7 @@ impl FsfsRuntime {
         let mount_overrides = self.config.discovery.mount_override_map();
         let mount_table = MountTable::new(read_system_mounts(), &mount_overrides);
 
-        let walker = index_discovery_walker(
+        let walker = index_discovery_walker_with_alias(
             target_root,
             &self.config.discovery,
             Some(
@@ -28278,6 +28323,7 @@ impl FsfsRuntime {
                     .as_deref()
                     .unwrap_or(index_root),
             ),
+            self.legacy_index_alias.as_deref(),
         )?;
         // The ignore walker suppresses global-ignore read/parse errors. Share
         // the watcher's fallible policy admission so a partial global matcher
@@ -30051,12 +30097,21 @@ impl FsfsRuntime {
         cx: &Cx,
         shutdown: &ShutdownCoordinator,
     ) -> SearchResult<()> {
-        self.run_cli_inner(cx, Some(shutdown)).await?;
-
-        let watch_enabled_for_command = self.watch_requested(self.cli_input.command);
+        let command = self.cli_input.command;
+        let watch_enabled_for_command = self.watch_requested(command);
+        // Keep the initial index pass, watcher startup, pressure accounting
+        // and shutdown on the same destination even if the alias is retargeted.
+        let alias_runtime = if watch_enabled_for_command {
+            self.validate_command_inputs(command)?;
+            self.resolve_legacy_index_alias(command)?
+        } else {
+            None
+        };
+        let runtime = alias_runtime.as_deref().unwrap_or(self);
+        runtime.run_cli_inner(cx, Some(shutdown)).await?;
 
         if watch_enabled_for_command {
-            match self.build_live_watcher_shutdown(cx).await {
+            match runtime.build_live_watcher_shutdown(cx).await {
                 Ok(session) => {
                     let watcher = &session.watcher;
                     watcher.start(cx).await?;
@@ -30067,8 +30122,8 @@ impl FsfsRuntime {
                         }
                     });
                     let policy = watcher.execution_policy();
-                    let storage_paths = self.default_index_storage_paths();
-                    let lifecycle_tracker = self.new_runtime_lifecycle_tracker(&storage_paths);
+                    let storage_paths = runtime.default_index_storage_paths();
+                    let lifecycle_tracker = runtime.new_runtime_lifecycle_tracker(&storage_paths);
                     info!(
                         watch_roots = watcher.roots().len(),
                         debounce_ms = policy.debounce_ms,
@@ -30077,7 +30132,7 @@ impl FsfsRuntime {
                         "fsfs watch mode enabled; watcher started"
                     );
 
-                    let reason = self
+                    let reason = runtime
                         .await_shutdown(
                             cx,
                             shutdown,
@@ -30087,7 +30142,7 @@ impl FsfsRuntime {
                         .await;
                     Self::complete_watcher_shutdown(
                         watcher.stop_checked(cx),
-                        self.finalize_shutdown(
+                        runtime.finalize_shutdown(
                             cx,
                             reason,
                             session.vector_index.as_ref(),
@@ -30095,7 +30150,7 @@ impl FsfsRuntime {
                         ),
                     )
                     .await?;
-                    self.retain_watch_session_reuse(cx, session)?;
+                    runtime.retain_watch_session_reuse(cx, session)?;
                 }
                 Err(ref error)
                     if matches!(
@@ -35529,6 +35584,15 @@ pub(crate) fn index_discovery_walker(
     discovery: &crate::config::DiscoveryConfig,
     excluded_root: Option<&Path>,
 ) -> SearchResult<impl Iterator<Item = Result<ignore::DirEntry, IndexDiscoveryError>>> {
+    index_discovery_walker_with_alias(target_root, discovery, excluded_root, None)
+}
+
+fn index_discovery_walker_with_alias(
+    target_root: &Path,
+    discovery: &crate::config::DiscoveryConfig,
+    excluded_root: Option<&Path>,
+    index_alias: Option<&Path>,
+) -> SearchResult<impl Iterator<Item = Result<ignore::DirEntry, IndexDiscoveryError>>> {
     let rules = Mutex::new(crate::watcher::IgnoreRules::new()?);
     let policy_failure = Arc::new(Mutex::new(None));
     let filter_failure = Arc::clone(&policy_failure);
@@ -35539,12 +35603,10 @@ pub(crate) fn index_discovery_walker(
     walker.git_exclude(false);
     walker.hidden(false);
     let discovery = discovery.clone();
-    let excluded_root = excluded_root.map(Path::to_path_buf);
+    let excluded_roots = [excluded_root.map(Path::to_path_buf), index_alias.map(Path::to_path_buf)];
     let mounts = MountTable::new(read_system_mounts(), &discovery.mount_override_map());
     walker.filter_entry(move |entry| {
-        if excluded_root
-            .as_deref()
-            .is_some_and(|root| entry.path().starts_with(root))
+        if excluded_roots.iter().flatten().any(|root| entry.path().starts_with(root))
         {
             return false;
         }
@@ -58400,6 +58462,104 @@ mod tests {
             search.indexing_primary_tier,
             super::IndexingPrimaryTier::Fast
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_index_alias_updates_the_admitted_directory_and_excludes_it_from_discovery() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("alpha.md"), "sharedtoken source alpha").unwrap();
+            let store = source.join("index-data");
+            let mut config = FsfsConfig::default();
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            config.storage.disk_budget_bytes = Some(8 * 1024 * 1024);
+            config.discovery.follow_symlinks = true;
+            let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(source.clone()),
+                index_dir: Some(store.clone()),
+                ..CliInput::default()
+            });
+            runtime
+                .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false, true)
+                .await
+                .unwrap();
+
+            let alias = source.join("configured-index");
+            std::os::unix::fs::symlink(&store, &alias).unwrap();
+            runtime.cli_input.index_dir = Some(alias.clone());
+            fs::write(source.join("beta.md"), "sharedtoken source beta").unwrap();
+            fs::write(store.join("internal.md"), "sharedtoken index artifact").unwrap();
+            let low_budget = {
+                let mut limited = runtime.clone();
+                limited.config.storage.disk_budget_bytes = Some(1);
+                limited
+            };
+            let sentinel = store.join(super::FSFS_SENTINEL_FILE);
+            let before = fs::read(&sentinel).unwrap();
+            let error = low_budget
+                .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false, true)
+                .await
+                .unwrap_err();
+            assert!(super::storage_admission::storage_admission_denial(&error).is_some());
+            assert_eq!(fs::read(&sentinel).unwrap(), before);
+
+            runtime
+                .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false, true)
+                .await
+                .unwrap();
+            assert_eq!(fs::read_link(alias).unwrap(), store);
+            runtime.cli_input.command = CliCommand::Search;
+            let result = runtime.execute_search_payload(&cx, "sharedtoken", 10).await.unwrap();
+            let paths: super::BTreeSet<_> = result.hits.iter().map(|hit| hit.path.as_str()).collect();
+            assert_eq!(paths, super::BTreeSet::from(["alpha.md", "beta.md"]));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_index_alias_rejects_dangling_and_complete_store_destinations() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let missing = temp.path().join("missing");
+            let dangling = temp.path().join("dangling");
+            std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+            let mut runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(source),
+                index_dir: Some(dangling),
+                ..CliInput::default()
+            });
+            let error = runtime.resolve_legacy_index_alias(CliCommand::Index).unwrap_err();
+            assert!(error.to_string().contains("no existing destination"));
+            assert!(!missing.exists());
+
+            let file = temp.path().join("file");
+            fs::write(&file, b"ordinary file").unwrap();
+            let file_alias = temp.path().join("file-alias");
+            std::os::unix::fs::symlink(&file, &file_alias).unwrap();
+            runtime.cli_input.index_dir = Some(file_alias);
+            let error = runtime.resolve_legacy_index_alias(CliCommand::Index).unwrap_err();
+            assert!(error.to_string().contains("must point to a directory"));
+            assert_eq!(fs::read(file).unwrap(), b"ordinary file");
+
+            let store_root = temp.path().join("complete");
+            let store = crate::generation_store::CompleteGenerationStore::create(&cx, &store_root)
+                .unwrap();
+            fs::create_dir(store_root.join("generations")).unwrap();
+            let complete_alias = temp.path().join("complete-alias");
+            std::os::unix::fs::symlink(&store_root, &complete_alias).unwrap();
+            runtime.cli_input.index_dir = Some(complete_alias.clone());
+            let error = runtime.resolve_legacy_index_alias(CliCommand::Index).unwrap_err();
+            assert!(error.to_string().contains("complete-generation store"));
+            assert!(crate::generation_store::CompleteGenerationStore::create(&cx, &complete_alias).is_err());
+            assert!(store.active(&cx).unwrap().is_none());
+        });
     }
 
     #[cfg(feature = "semantic-support")]

@@ -1504,6 +1504,7 @@ impl WatcherControl {
 /// Filesystem watcher service for live incremental re-indexing.
 pub struct FsWatcher {
     roots: Vec<PathBuf>,
+    excluded_roots: Arc<[PathBuf]>,
     discovery: DiscoveryConfig,
     ingest: Arc<dyn WatchIngestPipeline>,
     base_debounce_ms: u64,
@@ -1532,6 +1533,7 @@ impl FsWatcher {
             .collect();
         Self {
             roots,
+            excluded_roots: Arc::default(),
             discovery,
             ingest,
             base_debounce_ms: DEFAULT_DEBOUNCE_MS,
@@ -1548,6 +1550,11 @@ impl FsWatcher {
     pub fn from_config(config: &FsfsConfig, ingest: Arc<dyn WatchIngestPipeline>) -> Self {
         let roots = config.discovery.roots.iter().map(PathBuf::from).collect();
         Self::new(roots, config.discovery.clone(), ingest)
+    }
+
+    pub(crate) fn with_excluded_roots(mut self, roots: [PathBuf; 2]) -> Self {
+        self.excluded_roots = Arc::from(roots);
+        self
     }
 
     #[must_use]
@@ -1708,6 +1715,7 @@ impl FsWatcher {
         let ingest_stop = Arc::clone(&stop);
         let ingest_reconciliation = Arc::clone(&self.reconciliation);
         let ingest_roots = self.roots.clone();
+        let ingest_excluded_roots = Arc::clone(&self.excluded_roots);
         let ingest_batch_size = self.base_batch_size;
         let ingest_pressure = Arc::clone(&self.pressure_state);
         let ingest_task = match cx.spawn_local(move |child_cx| async move {
@@ -1726,7 +1734,9 @@ impl FsWatcher {
                 &ingest_reconciliation,
                 ingest_batch_size,
                 &producer_done_for_task,
-                &collect_snapshot_from_roots,
+                &|roots, discovery, abort| {
+                    collect_scoped_snapshot(roots, &ingest_excluded_roots, discovery, abort)
+                },
                 &|| {
                     WatcherExecutionPolicy::for_pressure(
                         pressure_state_from_code(ingest_pressure.load(Ordering::Acquire)),
@@ -1801,6 +1811,7 @@ impl FsWatcher {
 
         let producer_context = ProducerContext {
             roots: self.roots.clone(),
+            excluded_roots: Arc::clone(&self.excluded_roots),
             discovery: self.discovery.clone(),
             stats: Arc::clone(&self.stats),
             pressure_state: Arc::clone(&self.pressure_state),
@@ -1921,6 +1932,20 @@ impl FsWatcher {
         events: &'a [WatchEvent],
     ) -> WatchIngestFuture<'a, WatchBatchOutcome> {
         Box::pin(async move {
+            let scoped_events;
+            let events = if self.excluded_roots.is_empty() {
+                events
+            } else {
+                scoped_events = events
+                    .iter()
+                    .filter(|event| !path_is_excluded(&event.path, &self.excluded_roots))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                &scoped_events
+            };
+            let scan = |roots: &[PathBuf], discovery: &DiscoveryConfig, abort: &dyn Fn() -> bool| {
+                collect_scoped_snapshot(roots, &self.excluded_roots, discovery, abort)
+            };
             for event in events {
                 self.stats.mark_event(event.observed_at_ms);
             }
@@ -1957,7 +1982,7 @@ impl FsWatcher {
                     &self.ready_batches,
                     &self.stats,
                     self.base_batch_size,
-                    &collect_snapshot_from_roots,
+                    &scan,
                     // Caller-driven path: its `Cx` is the cancellation channel.
                     &|| cx.is_cancel_requested(),
                 )
@@ -1993,7 +2018,7 @@ impl FsWatcher {
                 &self.discovery,
                 &self.reconciliation,
                 &prepared.applied_events,
-                &collect_snapshot_from_roots,
+                &scan,
                 // This caller owns the `Cx`; it has no watcher generation whose
                 // stop signal it can observe.
                 &|| cx.is_cancel_requested(),
@@ -2024,7 +2049,7 @@ impl FsWatcher {
     ///
     /// Returns errors from filesystem traversal that are not safe to ignore.
     pub fn collect_snapshot(&self) -> SearchResult<(FileSnapshot, ScanCompleteness)> {
-        collect_snapshot_from_roots(&self.roots, &self.discovery, &|| false)
+        collect_scoped_snapshot(&self.roots, &self.excluded_roots, &self.discovery, &|| false)
     }
 
     /// Grant one-shot authority to rebuild deletion authority over names the
@@ -2265,6 +2290,7 @@ impl Drop for FsWatcher {
 
 struct ProducerContext {
     roots: Vec<PathBuf>,
+    excluded_roots: Arc<[PathBuf]>,
     discovery: DiscoveryConfig,
     stats: Arc<WatcherStatsInner>,
     pressure_state: Arc<AtomicU8>,
@@ -2490,9 +2516,12 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
 
     // The startup scan is a full walk too, so it observes the stop flag on the
     // same bounded interval as every other scan.
-    let startup_scan = collect_snapshot_from_roots(&context.roots, &context.discovery, &|| {
-        context.stop.is_requested()
-    });
+    let startup_scan = collect_scoped_snapshot(
+        &context.roots,
+        &context.excluded_roots,
+        &context.discovery,
+        &|| context.stop.is_requested(),
+    );
     let (baseline, baseline_completeness) = match startup_scan {
         Ok(scan) => scan,
         // A stop during startup is an ordinary shutdown, not a watcher fault.
@@ -2538,7 +2567,10 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         ));
     }
 
-    let mut pending = PendingEvents::default();
+    let mut pending = PendingEvents {
+        excluded_roots: Arc::clone(&context.excluded_roots),
+        ..PendingEvents::default()
+    };
     let mut pressure_was_disabled = false;
     let mut disconnected = false;
     let mut producer_failure = None;
@@ -4068,11 +4100,17 @@ fn process_notify_result(
                 && event
                     .paths
                     .iter()
-                    .any(|path| is_ignore_policy_path(path, roots));
+                    .any(|path| {
+                        !path_is_excluded(path, &pending.excluded_roots)
+                            && is_ignore_policy_path(path, roots)
+                    });
             if event.need_rescan() || policy_changed {
                 lock_or_recover(reconciliation).require_full_scan()?;
             }
             for watch_event in map_notify_event_with_mount_table(event, mount_table) {
+                if path_is_excluded(&watch_event.path, &pending.excluded_roots) {
+                    continue;
+                }
                 stats.mark_event(watch_event.observed_at_ms);
                 if !policy.watching_enabled {
                     stats.add_skipped(1);
@@ -4545,8 +4583,22 @@ fn watcher_error(error: &notify::Error) -> SearchError {
 /// entire directory. Abandoning returns a typed interruption instead of a
 /// short snapshot, so a stop can never be mistaken for a complete scan of a
 /// smaller tree.
+fn path_is_excluded(path: &Path, excluded_roots: &[PathBuf]) -> bool {
+    excluded_roots.iter().any(|root| path.starts_with(root))
+}
+
+#[cfg(test)]
 fn collect_snapshot_from_roots(
     roots: &[PathBuf],
+    discovery: &DiscoveryConfig,
+    should_abort: &dyn Fn() -> bool,
+) -> SearchResult<(FileSnapshot, ScanCompleteness)> {
+    collect_scoped_snapshot(roots, &[], discovery, should_abort)
+}
+
+fn collect_scoped_snapshot(
+    roots: &[PathBuf],
+    excluded_roots: &[PathBuf],
     discovery: &DiscoveryConfig,
     should_abort: &dyn Fn() -> bool,
 ) -> SearchResult<(FileSnapshot, ScanCompleteness)> {
@@ -4562,6 +4614,7 @@ fn collect_snapshot_from_roots(
         }
         collect_snapshot_for_root(
             root,
+            excluded_roots,
             discovery,
             Some(&mount_table),
             &mut snapshot,
@@ -4949,6 +5002,7 @@ impl IgnoreRules {
 
 fn collect_snapshot_for_root(
     root: &Path,
+    excluded_roots: &[PathBuf],
     discovery: &DiscoveryConfig,
     mount_table: Option<&MountTable>,
     snapshot: &mut FileSnapshot,
@@ -4993,7 +5047,7 @@ fn collect_snapshot_for_root(
     // The indexer and event adapter cannot represent non-UTF-8 source keys.
     // Retain the selected root's identity, but never claim its unindexable
     // path or descendants as applied sources in a reconciliation snapshot.
-    if root.to_str().is_none() {
+    if root.to_str().is_none() || path_is_excluded(root, excluded_roots) {
         return Ok(());
     }
 
@@ -5095,7 +5149,7 @@ fn collect_snapshot_for_root(
             let path = entry.path();
             // Match event preparation before stat or descent. Lossy conversion
             // could otherwise alias a different, valid Unicode source.
-            if path.to_str().is_none() {
+            if path.to_str().is_none() || path_is_excluded(&path, excluded_roots) {
                 continue;
             }
             let file_type = match entry.file_type() {
@@ -5257,6 +5311,7 @@ const fn pressure_state_from_code(code: u8) -> PressureState {
 
 #[derive(Default)]
 struct PendingEvents {
+    excluded_roots: Arc<[PathBuf]>,
     by_path: HashMap<PathBuf, WatchEvent>,
     by_time: BTreeMap<u64, BTreeSet<PathBuf>>,
 }
