@@ -4,16 +4,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
-use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::traits::Reranker;
+use frankensearch_core::{BoundQueryEmbedding, DocId, LexicalCandidateBatch};
 use frankensearch_fusion::{blend_two_tier, rrf_fuse_for_vector_lane};
 
 use super::progressive::rerank::{RerankRequest, RerankTextSource};
 use super::query::ImmutableTextQuery;
-use super::refinement::{admit_pair, checked_lexical};
+use super::refinement::{RetainedCandidates, admit_pair, checked_lexical, missing_ids};
 use super::{NativePhaseCandidates, checkpoint, hydrate_winners, invalid, join_sources};
-use crate::native_ann::{NativeShardHit, NativeShardRow, NativeShardSet};
+use crate::native_ann::{NativeShardHit, NativeShardRow, NativeShardSet, NativeWorker};
 use crate::{
     Cx, Embedder, LexicalRead, ScoreSource, ScoredResult, SearchError, SearchResult, VectorHit,
 };
@@ -237,7 +237,9 @@ impl NativeShardSet {
     /// dimensions and partial membership. Their complete artifact generation
     /// and canonical document-ID contracts must agree. A quality winner may be
     /// absent from every fast candidate shard. Each tier embeds only once.
-    /// The existing 0.7/0.3 normalized union blend precedes lexical RRF.
+    /// Candidates below the other tier's retrieval cutoff receive exact evidence
+    /// from its retained shards before the 0.7/0.3 normalized union blend and
+    /// lexical RRF. Missing or tombstoned rows keep truthful partial coverage.
     ///
     /// # Errors
     ///
@@ -260,22 +262,34 @@ impl NativeShardSet {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let (fast, (quality, batch)) = join_sources(
+        let (mut fast, (mut quality_hits, batch)) = join_sources(
             cx,
-            self.search_text(cx, fast_embedder, text, budget, None),
+            self.retrieve_candidates(cx, fast_embedder, text, budget, None, None, |_| true),
             join_sources(
                 cx,
-                quality.0.search_text(cx, quality.1, text, budget, None),
+                quality
+                    .0
+                    .retrieve_candidates(cx, quality.1, text, budget, None, None, |_| true),
                 checked_lexical(cx, lexical, text, budget),
             ),
         )
         .await?;
+        let (fast_supplement, quality_supplement) = join_sources(
+            cx,
+            self.supplement_candidates(cx, &fast, &quality_hits.hits, None),
+            quality
+                .0
+                .supplement_candidates(cx, &quality_hits, &fast.hits, None),
+        )
+        .await?;
+        fast.hits.extend(fast_supplement);
+        quality_hits.hits.extend(quality_supplement);
         finish(
             cx,
             lexical,
             &batch,
-            &fast,
-            &quality,
+            &fast.hits,
+            &quality_hits.hits,
             QueryPolicy::default().fusion(k, is_hash, true),
         )
         .await
@@ -308,47 +322,180 @@ impl NativeShardSet {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let fast_owner = self.shard(0).ok_or_else(|| {
-            invalid(
-                "shards.inventory",
-                "empty",
-                "missing admitted fast identity",
-            )
-        })?;
-        let quality_owner = quality.0.shard(0).ok_or_else(|| {
-            invalid(
-                "shards.inventory",
-                "empty",
-                "missing admitted quality identity",
-            )
-        })?;
-        let (fast_query, (quality_query, batch)) = join_sources(
+        let (mut fast, (mut quality_hits, batch)) = join_sources(
             cx,
-            fast_owner.embed_query(cx, fast_embedder, text),
+            self.retrieve_candidates(
+                cx,
+                fast_embedder,
+                text,
+                budget,
+                None,
+                Some((self.clone(), pool.clone())),
+                |_| true,
+            ),
             join_sources(
                 cx,
-                quality_owner.embed_query(cx, quality.1, text),
+                quality.0.retrieve_candidates(
+                    cx,
+                    quality.1,
+                    text,
+                    budget,
+                    None,
+                    Some((quality.0.clone(), pool.clone())),
+                    |_| true,
+                ),
                 checked_lexical(cx, lexical, text, budget),
             ),
         )
         .await?;
-        let (fast, quality_hits) = Box::pin(join_sources(
+        let (fast_supplement, quality_supplement) = join_sources(
             cx,
-            self.search_with_pool(cx, fast_query, budget, None, pool.clone()),
-            quality
-                .0
-                .search_with_pool(cx, quality_query, budget, None, pool),
-        ))
+            self.supplement_candidates(
+                cx,
+                &fast,
+                &quality_hits.hits,
+                Some((self.clone(), pool.clone())),
+            ),
+            quality.0.supplement_candidates(
+                cx,
+                &quality_hits,
+                &fast.hits,
+                Some((quality.0.clone(), pool)),
+            ),
+        )
         .await?;
+        fast.hits.extend(fast_supplement);
+        quality_hits.hits.extend(quality_supplement);
         finish(
             cx,
             lexical,
             &batch,
-            &fast,
-            &quality_hits,
+            &fast.hits,
+            &quality_hits.hits,
             QueryPolicy::default().fusion(k, is_hash, true),
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retrieve_candidates<F>(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        ef: Option<usize>,
+        worker: Option<(Self, BlockingPoolHandle)>,
+        accept: F,
+    ) -> SearchResult<RetainedCandidates<NativeShardHit>>
+    where
+        F: Fn(&str) -> bool + Send + 'static,
+    {
+        checkpoint(cx, "native_ann.shards.candidate_retrieval")?;
+        let first = self.shard(0).ok_or_else(|| {
+            invalid(
+                "shards.inventory",
+                "empty",
+                "missing admitted shard identity",
+            )
+        })?;
+        first.admit_identity(embedder.identity()?)?;
+        if let Some((_, pool)) = &worker {
+            NativeWorker::QUERY.require_pool(cx, pool)?;
+        }
+        if k == 0 || self.live_count() == 0 {
+            return Ok(RetainedCandidates {
+                query: None,
+                hits: Vec::new(),
+            });
+        }
+        let query = first.embed_query(cx, embedder, text).await?;
+        let hits = match worker {
+            Some((owner, pool)) => {
+                owner
+                    .search_filtered_with_pool(cx, query.clone(), k, ef, pool, accept)
+                    .await?
+            }
+            None => self.search_filtered(cx, &query, k, ef, accept)?,
+        };
+        Ok(RetainedCandidates {
+            query: Some(query),
+            hits,
+        })
+    }
+
+    async fn supplement_candidates(
+        &self,
+        cx: &Cx,
+        observed: &RetainedCandidates<NativeShardHit>,
+        candidates: &[NativeShardHit],
+        worker: Option<(Self, BlockingPoolHandle)>,
+    ) -> SearchResult<Vec<NativeShardHit>> {
+        let Some(query) = observed.query.as_ref() else {
+            checkpoint(cx, "native_ann.shards.candidate_evidence.empty")?;
+            return Ok(Vec::new());
+        };
+        let missing = missing_ids(
+            observed.hits.iter().map(|hit| &hit.doc_id),
+            candidates.iter().map(|hit| &hit.doc_id),
+        );
+        match worker {
+            Some((owner, pool)) => {
+                NativeWorker::QUERY.require_pool(cx, &pool)?;
+                if missing.is_empty() {
+                    return owner.score_documents(cx, query, &missing);
+                }
+                let query = query.clone();
+                NativeWorker::QUERY
+                    .run(cx, pool, move |request| {
+                        owner.score_documents(request, &query, &missing)
+                    })
+                    .await
+            }
+            None => self.score_documents(cx, query, &missing),
+        }
+    }
+
+    fn score_documents(
+        &self,
+        cx: &Cx,
+        query: &BoundQueryEmbedding,
+        document_ids: &[DocId],
+    ) -> SearchResult<Vec<NativeShardHit>> {
+        checkpoint(cx, "native_ann.shards.candidate_evidence.admission")?;
+        self.shard(0)
+            .ok_or_else(|| {
+                invalid(
+                    "shards.inventory",
+                    "empty",
+                    "missing admitted shard identity",
+                )
+            })?
+            .admit_identity(query.identity())?;
+        // The admitted set has disjoint physical IDs, including tombstones.
+        // Each owner's indexed lookup is exact and keeps its own row coordinate.
+        let mut hits = Vec::with_capacity(document_ids.len());
+        for shard in 0..self.shard_count() {
+            checkpoint(cx, "native_ann.shards.candidate_evidence")?;
+            let owner = self.shard(shard).ok_or_else(|| {
+                invalid("shards.inventory", "missing", "retained shard disappeared")
+            })?;
+            hits.extend(
+                owner
+                    .score_documents(cx, query, document_ids)?
+                    .into_iter()
+                    .map(|hit| NativeShardHit {
+                        doc_id: hit.doc_id,
+                        score: hit.score,
+                        row: NativeShardRow {
+                            shard,
+                            physical_row: hit.index,
+                        },
+                    }),
+            );
+        }
+        checkpoint(cx, "native_ann.shards.candidate_evidence.complete")?;
+        Ok(hits)
     }
 
     /// Prepare lazy fast-then-quality retrieval without starting provider work.
@@ -438,7 +585,7 @@ impl NativeShardSet {
 }
 
 struct Pending {
-    fast: Vec<NativeShardHit>,
+    fast: RetainedCandidates<NativeShardHit>,
     batch: LexicalCandidateBatch,
     initial: Vec<NativeShardedResult>,
 }
@@ -584,9 +731,12 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         shards: &NativeShardSet,
         embedder: &dyn Embedder,
         ef: Option<usize>,
-    ) -> SearchResult<Vec<NativeShardHit>> {
+    ) -> SearchResult<RetainedCandidates<NativeShardHit>> {
         if self.exclusion_only() {
-            return Ok(Vec::new());
+            return Ok(RetainedCandidates {
+                query: None,
+                hits: Vec::new(),
+            });
         }
         let allowed = self.allowed_documents.clone();
         let excluded = self
@@ -597,41 +747,20 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         let budget = allowed
             .as_ref()
             .map_or(self.budget, |ids| self.budget.min(ids.len()));
-        if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_shards(shards)) {
-            let first = owner.shard(0).ok_or_else(|| {
-                invalid(
-                    "shards.inventory",
-                    "empty",
-                    "missing admitted progressive shard identity",
-                )
-            })?;
-            let query = first
-                .embed_query(self.cx, embedder, self.semantic_text())
-                .await?;
-            if allowed.is_some() || excluded.is_some() {
-                owner
-                    .search_filtered_with_pool(self.cx, query, budget, ef, pool, move |id| {
-                        allowed.as_ref().is_none_or(|ids| ids.contains(id))
-                            && excluded.as_ref().is_none_or(|ids| !ids.contains(id))
-                    })
-                    .await
-            } else {
-                owner
-                    .search_with_pool(self.cx, query, budget, ef, pool)
-                    .await
-            }
-        } else if allowed.is_some() || excluded.is_some() {
-            shards
-                .search_text_filtered(self.cx, embedder, self.semantic_text(), budget, ef, |id| {
+        shards
+            .retrieve_candidates(
+                self.cx,
+                embedder,
+                self.semantic_text(),
+                budget,
+                ef,
+                self.owned_shards(shards).zip(self.pool.clone()),
+                move |id| {
                     allowed.as_ref().is_none_or(|ids| ids.contains(id))
                         && excluded.as_ref().is_none_or(|ids| !ids.contains(id))
-                })
-                .await
-        } else {
-            shards
-                .search_text(self.cx, embedder, self.semantic_text(), budget, ef)
-                .await
-        }
+                },
+            )
+            .await
     }
 
     /// Add one lazy cross-encoder stage over the globally fused candidate window.
@@ -715,7 +844,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
                         return Err(error);
                     }
                     let candidates = NativePhaseCandidates {
-                        fast: pending.fast.len(),
+                        fast: pending.fast.hits.len(),
                         quality: 0,
                         lexical: pending.batch.results().len(),
                     };
@@ -777,15 +906,23 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
             }
         }
         let candidates = NativePhaseCandidates {
-            fast: if self.primary_quality { 0 } else { fast.len() },
-            quality: if self.primary_quality { fast.len() } else { 0 },
+            fast: if self.primary_quality {
+                0
+            } else {
+                fast.hits.len()
+            },
+            quality: if self.primary_quality {
+                fast.hits.len()
+            } else {
+                0
+            },
             lexical: batch.results().len(),
         };
         let mut results = finish(
             self.cx,
             self.lexical,
             &batch,
-            &fast,
+            &fast.hits,
             &[],
             self.policy.fusion(self.result_window(), is_hash, false),
         )
@@ -829,20 +966,39 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
                 "refinement requires its admitted quality tier",
             )
         })?;
-        let quality = self
+        let mut quality_hits = self
             .vector_candidates(quality, embedder, self.policy.quality_ef)
             .await?;
         let candidates = NativePhaseCandidates {
-            fast: pending.fast.len(),
-            quality: quality.len(),
+            fast: pending.fast.hits.len(),
+            quality: quality_hits.hits.len(),
             lexical: pending.batch.results().len(),
         };
+        let (fast_supplement, quality_supplement) = join_sources(
+            self.cx,
+            self.fast.supplement_candidates(
+                self.cx,
+                &pending.fast,
+                &quality_hits.hits,
+                self.owned_shards(self.fast).zip(self.pool.clone()),
+            ),
+            quality.supplement_candidates(
+                self.cx,
+                &quality_hits,
+                &pending.fast.hits,
+                self.owned_shards(quality).zip(self.pool.clone()),
+            ),
+        )
+        .await?;
+        let mut fast_hits = pending.fast.hits.clone();
+        fast_hits.extend(fast_supplement);
+        quality_hits.hits.extend(quality_supplement);
         let results = finish(
             self.cx,
             self.lexical,
             &pending.batch,
-            &pending.fast,
-            &quality,
+            &fast_hits,
+            &quality_hits.hits,
             self.policy.fusion(self.result_window(), is_hash, true),
         )
         .await?;
@@ -1272,6 +1428,22 @@ mod tests {
         generation: u64,
         ann: bool,
     ) -> Arc<NativeAnnIndex> {
+        partition_states(
+            cx,
+            provider,
+            rows.iter().map(|&(id, values)| (id, values, true)),
+            generation,
+            ann,
+        )
+    }
+
+    fn partition_states<'a>(
+        cx: &Cx,
+        provider: &Provider,
+        rows: impl IntoIterator<Item = (&'a str, &'a [f32], bool)>,
+        generation: u64,
+        ann: bool,
+    ) -> Arc<NativeAnnIndex> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("part.fsvi");
         let mut bundle = provider.identity.clone();
@@ -1284,8 +1456,12 @@ mod tests {
         )
         .unwrap();
         let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
-        for &(id, values) in rows {
-            writer.write_record(id, values).unwrap();
+        for (id, values, live) in rows {
+            if live {
+                writer.write_record(id, values).unwrap();
+            } else {
+                writer.write_tombstone_record(id, values).unwrap();
+            }
         }
         writer.finish().unwrap();
         let bytes: Arc<[u8]> = std::fs::read(path).unwrap().into();
@@ -1346,7 +1522,27 @@ mod tests {
             let fast = Provider::new("fast", 2, true);
             let quality = Provider::new("quality", 3, true);
             let a = fast_set(&cx, &fast);
-            let b = quality_set(&cx, &quality);
+            // Keep every fast candidate covered by quality. The discovered
+            // winner is below the fast cutoff, not a genuinely one-sided row
+            // whose unpenalized blend would obscure this retrieval assertion.
+            let b = set(
+                &cx,
+                vec![
+                    partition(
+                        &cx,
+                        &quality,
+                        &[
+                            ("q-other", &[-0.5, 0.0, 0.0]),
+                            ("z-fast", &[-1.0, 0.0, 0.0]),
+                            ("mid-fast", &[0.0, 1.0, 0.0]),
+                            ("near-fast", &[0.125, 0.0, 0.0]),
+                        ],
+                        1,
+                        false,
+                    ),
+                    partition(&cx, &quality, &[("a-late", &[1.0, 0.0, 0.0])], 1, true),
+                ],
+            );
             let lexical = Lexical::new(&[]);
             let mut stream = a
                 .search_hybrid_progressive(&cx, &fast, Some((&b, &quality)), &lexical, "query", 1)
@@ -1364,7 +1560,7 @@ mod tests {
             let State::Refine(pending) = &stream.state else {
                 panic!("retained candidates");
             };
-            assert!(pending.fast.iter().all(|hit| hit.doc_id != "a-late"));
+            assert!(pending.fast.hits.iter().all(|hit| hit.doc_id != "a-late"));
             let NativeShardedSearchPhase::Refined {
                 results,
                 candidates,
@@ -1381,13 +1577,290 @@ mod tests {
                     physical_row: 0
                 })
             );
-            assert!(results[0].fast_row.is_none() && results[0].result.index.is_none());
+            let fast_row = results[0].fast_row.unwrap();
+            assert_eq!(fast_row.shard, 1);
+            assert_eq!(
+                a.shard(1)
+                    .unwrap()
+                    .owner
+                    .doc_id_at(fast_row.physical_row as usize)
+                    .unwrap(),
+                "a-late"
+            );
+            assert!(results[0].result.index.is_none());
+            assert_eq!(results[0].result.fast_score, Some(0.0));
             assert_eq!(results[0].result.quality_score, Some(1.0));
             assert_eq!(candidates.quality, 3);
             assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
             assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
             assert!(stream.is_finished() && stream.next_phase().await.unwrap().is_none());
+        });
+    }
+
+    fn opposing_sets(
+        cx: &Cx,
+        fast: &Provider,
+        quality: &Provider,
+    ) -> (NativeShardSet, NativeShardSet) {
+        let fast = set(
+            cx,
+            vec![
+                partition(
+                    cx,
+                    fast,
+                    &[("a", &[1.0, 0.0]), ("c", &[0.75, 0.0]), ("e", &[0.5, 0.0])],
+                    1,
+                    false,
+                ),
+                partition(
+                    cx,
+                    fast,
+                    &[
+                        ("b", &[0.875, 0.0]),
+                        ("d", &[0.625, 0.0]),
+                        ("f", &[0.375, 0.0]),
+                    ],
+                    1,
+                    false,
+                ),
+            ],
+        );
+        let quality = set(
+            cx,
+            vec![
+                partition(
+                    cx,
+                    quality,
+                    &[("a", &[0.0, 1.0, 0.0]), ("f", &[0.75, 0.0, 0.0])],
+                    1,
+                    false,
+                ),
+                partition(
+                    cx,
+                    quality,
+                    &[("b", &[0.125, 0.0, 0.0]), ("e", &[0.875, 0.0, 0.0])],
+                    1,
+                    false,
+                ),
+                partition(
+                    cx,
+                    quality,
+                    &[("c", &[0.25, 0.0, 0.0]), ("d", &[1.0, 0.0, 0.0])],
+                    1,
+                    false,
+                ),
+            ],
+        );
+        (fast, quality)
+    }
+
+    #[test]
+    fn sharded_refinement_completes_union_evidence_with_exact_per_tier_locations() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::runtime::blocking_pool::BlockingPool;
+        use std::time::Duration;
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let pool = BlockingPool::new(0, 2);
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for offload in [false, true] {
+                for progressive in [false, true] {
+                    let fast = Provider::new("fast", 2, true);
+                    let quality = Provider::new("quality", 3, true);
+                    let (a, b) = opposing_sets(&cx, &fast, &quality);
+                    let lexical = Lexical::new(&[]);
+                    let results = if progressive {
+                        let mut stream = if offload {
+                            a.search_hybrid_progressive_with_pool(
+                                &cx,
+                                &fast,
+                                Some((&b, &quality)),
+                                &lexical,
+                                "query",
+                                1,
+                                pool.handle(),
+                            )
+                        } else {
+                            a.search_hybrid_progressive(
+                                &cx,
+                                &fast,
+                                Some((&b, &quality)),
+                                &lexical,
+                                "query",
+                                1,
+                            )
+                        }
+                        .unwrap();
+                        let NativeShardedSearchPhase::Initial {
+                            results,
+                            candidates,
+                        } = stream.next_phase().await.unwrap().unwrap()
+                        else {
+                            panic!("initial")
+                        };
+                        assert_eq!(results[0].result.doc_id, "a");
+                        assert_eq!(
+                            candidates,
+                            NativePhaseCandidates {
+                                fast: 3,
+                                quality: 0,
+                                lexical: 0
+                            }
+                        );
+                        assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+                        let NativeShardedSearchPhase::Refined {
+                            results,
+                            candidates,
+                        } = stream.next_phase().await.unwrap().unwrap()
+                        else {
+                            panic!("refined")
+                        };
+                        assert_eq!(
+                            candidates,
+                            NativePhaseCandidates {
+                                fast: 3,
+                                quality: 3,
+                                lexical: 0
+                            }
+                        );
+                        assert!(stream.next_phase().await.unwrap().is_none());
+                        results
+                    } else if offload {
+                        a.search_hybrid_refined_text_with_pool(
+                            &cx,
+                            &fast,
+                            (&b, &quality),
+                            &lexical,
+                            "query",
+                            1,
+                            pool.handle(),
+                        )
+                        .await
+                        .unwrap()
+                    } else {
+                        a.search_hybrid_refined_text(
+                            &cx,
+                            &fast,
+                            (&b, &quality),
+                            &lexical,
+                            "query",
+                            1,
+                        )
+                        .await
+                        .unwrap()
+                    };
+                    assert_eq!(results.len(), 1);
+                    let winner = &results[0];
+                    assert_eq!(
+                        winner.result.doc_id, "d",
+                        "offload={offload} progressive={progressive}"
+                    );
+                    assert_eq!(winner.result.fast_score, Some(0.625));
+                    assert_eq!(winner.result.quality_score, Some(1.0));
+                    assert!(winner.result.index.is_none());
+                    let fast_row = winner.fast_row.unwrap();
+                    let quality_row = winner.quality_row.unwrap();
+                    assert_eq!(fast_row.shard, 1);
+                    assert_eq!(quality_row.shard, 2);
+                    assert_eq!(
+                        a.shard(fast_row.shard)
+                            .unwrap()
+                            .owner
+                            .doc_id_at(fast_row.physical_row as usize)
+                            .unwrap(),
+                        "d"
+                    );
+                    assert_eq!(
+                        b.shard(quality_row.shard)
+                            .unwrap()
+                            .owner
+                            .doc_id_at(quality_row.physical_row as usize)
+                            .unwrap(),
+                        "d"
+                    );
+                    assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+                }
+            }
+        });
+        assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn sharded_refinement_keeps_true_missing_and_tombstoned_rows_one_sided() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tombstone in [false, true] {
+                let fast = Provider::new("fast", 2, true);
+                let quality = Provider::new("quality", 3, true);
+                let (a, _) = opposing_sets(&cx, &fast, &quality);
+                let rows: &[(&str, &[f32], bool)] = if tombstone {
+                    &[
+                        ("a", &[0.0, 1.0, 0.0], false),
+                        ("f", &[0.75, 0.0, 0.0], true),
+                    ]
+                } else {
+                    &[("f", &[0.75, 0.0, 0.0], true)]
+                };
+                let b = set(
+                    &cx,
+                    vec![
+                        partition_states(&cx, &quality, rows.iter().copied(), 1, false),
+                        partition(
+                            &cx,
+                            &quality,
+                            &[("b", &[0.125, 0.0, 0.0]), ("e", &[0.875, 0.0, 0.0])],
+                            1,
+                            false,
+                        ),
+                        partition(
+                            &cx,
+                            &quality,
+                            &[("c", &[0.25, 0.0, 0.0]), ("d", &[1.0, 0.0, 0.0])],
+                            1,
+                            false,
+                        ),
+                    ],
+                );
+                let lexical = Lexical::new(&[]);
+                let mut stream = a
+                    .search_hybrid_progressive(
+                        &cx,
+                        &fast,
+                        Some((&b, &quality)),
+                        &lexical,
+                        "query",
+                        1,
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    stream.next_phase().await.unwrap(),
+                    Some(NativeShardedSearchPhase::Initial { .. })
+                ));
+                let NativeShardedSearchPhase::Refined {
+                    results,
+                    candidates,
+                } = stream.next_phase().await.unwrap().unwrap()
+                else {
+                    panic!("refined")
+                };
+                assert_eq!(results[0].result.doc_id, "a");
+                assert_eq!(results[0].result.fast_score, Some(1.0));
+                assert_eq!(results[0].result.source, ScoreSource::SemanticFast);
+                assert!(results[0].result.quality_score.is_none());
+                assert!(results[0].quality_row.is_none());
+                assert_eq!(results[0].fast_row.unwrap().shard, 0);
+                assert_eq!(
+                    candidates,
+                    NativePhaseCandidates {
+                        fast: 3,
+                        quality: 3,
+                        lexical: 0
+                    }
+                );
+            }
         });
     }
 
@@ -1657,7 +2130,26 @@ mod tests {
             let fast = Provider::new("hash-fast", 2, false);
             let quality = Provider::new("hash-quality", 3, false);
             let a = fast_set(&cx, &fast);
-            let b = quality_set(&cx, &quality);
+            // Isolate hash provenance from genuinely missing quality coverage:
+            // every retrieved fast candidate has a live quality row here.
+            let b = set(
+                &cx,
+                vec![
+                    partition(
+                        &cx,
+                        &quality,
+                        &[
+                            ("q-other", &[-0.5, 0.0, 0.0]),
+                            ("z-fast", &[-1.0, 0.0, 0.0]),
+                            ("mid-fast", &[0.0, 1.0, 0.0]),
+                            ("near-fast", &[0.125, 0.0, 0.0]),
+                        ],
+                        1,
+                        false,
+                    ),
+                    partition(&cx, &quality, &[("a-late", &[1.0, 0.0, 0.0])], 1, true),
+                ],
+            );
             let hits = a
                 .search_hybrid_refined_text(
                     &cx,
