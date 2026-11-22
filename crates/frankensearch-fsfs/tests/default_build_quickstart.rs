@@ -5117,6 +5117,159 @@ mod loader_only {
         }
     }
 
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[test]
+    #[ignore = "requires the pinned real fast and quality models"]
+    fn cold_complete_daemons_preserve_explicit_network_policy() {
+        struct DaemonSocket(PathBuf);
+
+        impl Drop for DaemonSocket {
+            fn drop(&mut self) {
+                request_daemon_stop(&self.0, true);
+                let deadline = Instant::now() + FAILURE_TIMEOUT;
+                while self.0.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                if !thread::panicking() {
+                    assert!(!self.0.exists(), "daemon still owns {}", self.0.display());
+                }
+            }
+        }
+
+        log_binary_profile("complete-daemon-network-policy");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let models = configured_model_root();
+        verify_pinned_model_cache(&models).expect("verified pinned real producers");
+        let fsfs = IsolatedFsfs::new(root, models);
+        let corpus = root.join("corpus");
+        let index = root.join("index");
+        let config = root.join("config.toml");
+        write_quickstart_corpus(&corpus);
+        fs::write(&config, "[search]\nquality_timeout_ms = 5000\n").unwrap();
+        let indexed = fsfs.run_with_env(
+            root,
+            "daemon-network-policy-index",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--offline",
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FSFS_COMPLETE_GENERATIONS", "1")],
+        );
+        assert_eq!(
+            parse_success_envelope("index complete daemon fixture", &indexed)["data"]["generation_complete"],
+            true
+        );
+        assert!(is_complete_store(&index));
+
+        for (label, socket_name, policy, inherited, opposite) in [
+            ("default-offline", None, "--offline", "0", "--online"),
+            (
+                "named-offline",
+                Some("off.sock"),
+                "--offline",
+                "0",
+                "--online",
+            ),
+            (
+                "named-online",
+                Some("on.sock"),
+                "--online",
+                "1",
+                "--offline",
+            ),
+        ] {
+            let socket = DaemonSocket(index.join(socket_name.unwrap_or("fsfs-query.sock")));
+            assert!(!socket.0.exists(), "cold daemon fixture: {label}");
+            let mut args = vec![
+                "search",
+                "bounded retries with exponential backoff",
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--limit",
+                SEARCH_LIMIT,
+                "--daemon",
+            ];
+            if let Some(name) = socket_name {
+                args.extend(["--daemon-socket", name]);
+            }
+            let env = [("FRANKENSEARCH_OFFLINE", inherited)];
+            let cold = fsfs.run_with_env(
+                root,
+                &format!("{label}-cold"),
+                args.iter().copied().chain([policy, "--format", "json"]),
+                QUICKSTART_TIMEOUT,
+                &env,
+            );
+            let result = parse_success_envelope(label, &cold);
+            assert_eq!(result["data"]["phase"], "refined", "{result}");
+            assert_eq!(result["data"]["hits"][0]["path"], "retry.md", "{result}");
+            assert!(socket.0.exists(), "managed daemon must survive: {label}");
+
+            let warm = fsfs.run_with_env(
+                root,
+                &format!("{label}-warm"),
+                args.iter()
+                    .copied()
+                    .chain([policy, "--stream", "--format", "jsonl"]),
+                QUICKSTART_TIMEOUT,
+                &env,
+            );
+            assert_finished_successfully(label, &warm);
+            let frames = warm
+                .stdout
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| { frame["payload"]["reason_code"] == "daemon_cache_hit" }),
+                "{warm:?}"
+            );
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame["event"] == "terminal")
+                    .count(),
+                1,
+                "{warm:?}"
+            );
+            let terminal = frames.last().unwrap();
+            assert_eq!(terminal["event"], "terminal", "{warm:?}");
+            assert_eq!(terminal["payload"]["status"], "completed", "{warm:?}");
+            assert!(
+                frames.iter().any(|frame| {
+                    frame["event"] == "result" && frame["payload"]["item"]["path"] == "retry.md"
+                }),
+                "{warm:?}"
+            );
+
+            if socket_name.is_some() {
+                let refused = fsfs.run_with_env(
+                    root,
+                    &format!("{label}-opposite-policy"),
+                    args.iter().copied().chain([opposite, "--format", "json"]),
+                    QUICKSTART_TIMEOUT,
+                    &env,
+                );
+                assert!(!refused.timed_out, "{refused:?}");
+                assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+                let error: Value = serde_json::from_str(&refused.stdout).unwrap();
+                assert_eq!(error["error"]["field"], "complete_generation.daemon_config");
+                assert!(error["data"].is_null(), "{error}");
+            }
+        }
+    }
+
     #[cfg(feature = "semantic-loaders")]
     #[test]
     #[ignore = "requires two source-bound executables and pinned real models; explicit upgrade lifecycle"]

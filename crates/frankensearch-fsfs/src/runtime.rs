@@ -11951,8 +11951,8 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    /// Build the child command with the resolved pressure profile. A profile
-    /// selected on the search CLI is not inherited through the config file.
+    /// Build the child command with the caller's config, resolved pressure
+    /// profile, and explicit network override.
     #[cfg(unix)]
     fn detached_fsfs_command(
         &self,
@@ -11968,6 +11968,9 @@ impl FsfsRuntime {
             .stderr(Stdio::null());
         if let Some(config_path) = self.cli_input.overrides.config_path.as_deref() {
             command.arg("--config").arg(config_path);
+        }
+        if let Some(offline) = self.cli_input.overrides.offline {
+            command.arg(if offline { "--offline" } else { "--online" });
         }
         command
             .arg("--profile")
@@ -11988,8 +11991,8 @@ impl FsfsRuntime {
         Ok(command)
     }
 
-    /// Start this executable with the caller's configuration and profile,
-    /// detached from the calling command and with no stdio.
+    /// Start this executable with the caller's configuration, detached from
+    /// the calling command and with no stdio.
     #[cfg(unix)]
     fn spawn_detached_fsfs(
         &self,
@@ -51554,6 +51557,23 @@ mod tests {
                     cli_selected.then_some(profile)
                 );
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_daemon_command_preserves_explicit_network_policy() {
+        for offline in [None, Some(true), Some(false)] {
+            let mut input = CliInput::default();
+            input.overrides.offline = offline;
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(input);
+            let command = runtime.detached_fsfs_command(["daemon".into()]).unwrap();
+            let child = crate::adapters::cli::parse_cli_args(
+                command.get_args().map(|arg| arg.to_str().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(child.command, CliCommand::Daemon);
+            assert_eq!(child.overrides.offline, offline);
         }
     }
 
