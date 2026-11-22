@@ -1695,6 +1695,16 @@ fn history_has_objects(root: &Path) -> SearchResult<bool> {
 /// Absence of CURRENT alone cannot prove an empty history. Only a new build may
 /// exclude its own fresh directory, never an already retained restore target.
 fn first_build_origin(cx: &Cx, root: &Path, candidate: &str) -> SearchResult<bool> {
+    checkpoint(cx)?;
+    // A pending legacy conversion proves no complete generation was selected:
+    // the marker predates staging, and every publisher creates the persistent
+    // pin namespace before activation. Sealed attempts and staged history from
+    // an aborted precommit are therefore not unknown selected predecessors.
+    // A lost CURRENT or even an unselected preview leaves pins and cannot take
+    // this path. Keep the same conservative witness used by foreground reads.
+    if CompleteGenerationStore::legacy_migration_pending(root)? {
+        return Ok(true);
+    }
     if history_has_objects(root)? {
         return Ok(false);
     }
@@ -2634,6 +2644,121 @@ mod tests {
                 .begin_with_predecessor_check(&cx, |_| Ok(true))
                 .unwrap();
             assert!(entry_is_absent(&root.join(LEGACY_MIGRATION)).unwrap());
+        });
+    }
+
+    #[test]
+    fn aborted_legacy_migrations_preserve_first_activation_retention() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let mut abandoned = Vec::new();
+            for cancel in [false, true] {
+                let build = store
+                    .begin_with_predecessor_check(&cx, |_| Ok(true))
+                    .unwrap();
+                abandoned.push(build.id.clone());
+                write_bundle(build.path(), "abandoned legacy conversion");
+                let mut reached_precommit = false;
+                let error = build
+                    .publish_with_precommit(
+                        &cx,
+                        |_, _| Ok(()),
+                        |cx| {
+                            reached_precommit = true;
+                            if cancel {
+                                cx.set_cancel_requested(true);
+                                Ok(())
+                            } else {
+                                Err(std::io::Error::other("injected precommit failure").into())
+                            }
+                        },
+                    )
+                    .unwrap_err();
+                cx.set_cancel_requested(false);
+                assert!(reached_precommit);
+                if cancel {
+                    assert!(matches!(error, SearchError::Cancelled { .. }));
+                } else {
+                    assert!(matches!(
+                        error,
+                        SearchError::Io(error) if error.kind() == ErrorKind::Other
+                    ));
+                }
+                assert!(store.active(&cx).unwrap().is_none());
+                assert!(history_has_objects(root.path()).unwrap());
+                assert!(CompleteGenerationStore::legacy_migration_pending(root.path()).unwrap());
+            }
+            abandoned.sort_unstable();
+            let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
+            let first = publish(&reopened, &cx, "first selected generation");
+            for keep in [0, 1, 3] {
+                let plan = reopened.plan_retention(&cx, keep).unwrap();
+                assert_eq!(plan.active.as_deref(), Some(first.id()));
+                assert!(plan.retained.is_empty());
+                assert!(plan.reclaimable.iter().all(|candidate| candidate.sealed));
+                assert_eq!(
+                    plan.reclaimable
+                        .iter()
+                        .map(|candidate| candidate.id.clone())
+                        .collect::<Vec<_>>(),
+                    abandoned
+                );
+            }
+            let successor = publish(&reopened, &cx, "successor");
+            let plan = reopened.plan_retention(&cx, 2).unwrap();
+            assert_eq!(plan.active.as_deref(), Some(successor.id()));
+            assert_eq!(plan.retained, [first.id().to_owned()]);
+            for id in abandoned {
+                assert!(
+                    root.path().join(GENERATIONS).join(id).is_dir(),
+                    "planning deletes nothing"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn legacy_marker_cannot_erase_published_or_preview_ancestry() {
+        run_test_with_cx(|cx| async move {
+            for activated in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+                let build = store
+                    .begin_with_predecessor_check(&cx, |_| Ok(true))
+                    .unwrap();
+                write_bundle(build.path(), "prior bundle");
+                if activated {
+                    drop(build.publish(&cx, |_, _| Ok(())).unwrap());
+                    fs::rename(
+                        root.path().join(COMPLETE_GENERATION_POINTER),
+                        root.path().join("saved-selection"),
+                    )
+                    .unwrap();
+                    // An older publisher can leave this marker behind. Its
+                    // persistent pin namespace still proves activation risk.
+                    write_new_synced(
+                        &root.path().join(LEGACY_MIGRATION),
+                        LEGACY_MIGRATION_PENDING,
+                    )
+                    .unwrap();
+                } else {
+                    drop(build.prepare(&cx, |_, _| Ok(())).unwrap());
+                }
+                assert!(!CompleteGenerationStore::legacy_migration_pending(root.path()).unwrap());
+                let rebuilt = publish(&store, &cx, "independently rebuilt generation");
+                assert_eq!(store.active(&cx).unwrap(), Some(rebuilt));
+                for keep in [0, 2] {
+                    assert!(
+                        matches!(
+                            store.plan_retention(&cx, keep),
+                            Err(SearchError::InvalidConfig { field, .. })
+                                if field == "generation_retention_history"
+                        ),
+                        "activated={activated}"
+                    );
+                }
+            }
         });
     }
 

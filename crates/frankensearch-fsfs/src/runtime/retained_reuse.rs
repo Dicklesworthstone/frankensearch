@@ -3101,6 +3101,13 @@ mod generation_tests {
                 }
 
                 let migrated = publish(&runtime, &cx, &root).await;
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let retention = store.plan_retention(&cx, 2).unwrap();
+                assert_eq!(retention.active.as_deref(), Some(migrated.id()));
+                assert!(retention.retained.is_empty());
+                assert_eq!(retention.reclaimable.len(), 1);
+                assert!(retention.reclaimable[0].sealed);
+                assert_eq!(fs::read(root.join(LEGACY_RECEIPT_FILE)).unwrap(), receipt);
                 let saved_pointer = parent.path().join("published-pointer");
                 fs::rename(&pointer, &saved_pointer).unwrap();
                 for corrupt in [false, true] {
