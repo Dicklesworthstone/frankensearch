@@ -92,6 +92,9 @@ impl Fixture {
         }
         settings.search.fast_only = !quality;
         settings.search.rerank = false;
+        // The watch fixtures compare actual cold-reader results and may
+        // switch from fast-only to quality during an upgrade.
+        settings.search.quality_timeout_ms = 5_000;
         if let Some(models) = models {
             settings.indexing.model_dir = models.display().to_string();
         }
@@ -1152,17 +1155,12 @@ print(json.dumps({'exit_code': status, 'prompts': answers,
                 "watch upgrade prior={prior_sha} current={current_sha} quality={quality} legacy_seed={legacy_seed} policy={policy} drift={drift}"
             );
             let mut fixture = Fixture::new(Some(&models), quality);
-            if quality || drift == "tier" {
+            if drift == "tier" && !quality {
+                // Keep the selected producer fixed across A and B. Only the
+                // effective tier coverage changes after the A build.
                 let mut settings: FsfsConfig =
                     toml::from_str(&fs::read_to_string(&fixture.config).unwrap()).unwrap();
-                // This matrix checks ranking and retained tier coverage on
-                // cold CLI readers while a watcher is running.
-                settings.search.quality_timeout_ms = 5_000;
-                if !quality {
-                    // Keep the selected producer fixed across A and B. Only
-                    // effective tier coverage changes after the A build.
-                    settings.indexing.quality_model = FsfsConfig::default().indexing.quality_model;
-                }
+                settings.indexing.quality_model = FsfsConfig::default().indexing.quality_model;
                 fs::write(&fixture.config, settings.to_toml().unwrap()).unwrap();
             }
             fixture.executable.clone_from(&prior);
