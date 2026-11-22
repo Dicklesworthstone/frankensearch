@@ -9538,6 +9538,14 @@ impl FsfsRuntime {
                 .await;
         }
 
+        let explanation_fingerprint = if self.config.search.explain {
+            search_runtime
+                .resolve_status_index_root()
+                .and_then(|root| Self::search_index_fingerprint_at_root(&root))
+                .ok()
+        } else {
+            None
+        };
         let started = Instant::now();
         if search_runtime.cli_input.expand && search_runtime.cli_input.daemon {
             warn!(
@@ -9547,7 +9555,7 @@ impl FsfsRuntime {
 
         let payloads = if search_runtime.cli_input.expand {
             search_runtime
-                .execute_expanded_search(cx, query, limit)
+                .execute_expanded_search(cx, query, limit, Self::expand_search_query(cx, query))
                 .await?
         } else if search_runtime.cli_input.daemon {
             match search_runtime
@@ -9598,10 +9606,10 @@ impl FsfsRuntime {
             elapsed_ms,
             "fsfs search command completed"
         );
-        // `--explain` (bd-7l7si): what `fsfs explain R<n>` prints, for every
-        // returned hit, from the explanation context this search just saved.
         let (explained, explain_warnings) = if self.config.search.explain {
-            search_runtime.explain_returned_hits(cx, &payload).await
+            search_runtime
+                .explain_returned_hits(cx, &payload, explanation_fingerprint.as_deref())
+                .await
         } else {
             (Vec::new(), Vec::new())
         };
@@ -12757,15 +12765,14 @@ impl FsfsRuntime {
         writer.flush().map_err(SearchError::Io)
     }
 
-    /// `search --explain`: what `fsfs explain R<n>` prints for every returned
-    /// hit, built from the explanation context this search just saved, plus
-    /// the warnings that qualify them (each code once). The search's answer
-    /// stands when that context is missing; a warning then says why.
+    /// Build inline explanations from this request's returned ranking. The
+    /// shared last-search session is for a separate follow-up command.
     #[allow(clippy::future_not_send)]
     async fn explain_returned_hits(
         &self,
         cx: &Cx,
         payload: &SearchPayload,
+        expected_fingerprint: Option<&str>,
     ) -> (Vec<ExplainedSearchHit>, Vec<OutputWarning>) {
         let unavailable = |reason: String| {
             (
@@ -12780,34 +12787,39 @@ impl FsfsRuntime {
             Ok(root) => root,
             Err(error) => return unavailable(error.to_string()),
         };
-        let session = match Self::load_explain_session_at_root(&index_root) {
-            Ok(Some(session))
-                if Self::normalize_search_query(&session.query)
-                    == Self::normalize_search_query(&payload.query) =>
-            {
-                session
-            }
-            Ok(Some(_)) => {
-                return unavailable(
-                    "the saved explanation context belongs to another search".to_owned(),
-                );
-            }
-            Ok(None) => return unavailable("this search saved no explanation context".to_owned()),
+        if payload
+            .explanation_warnings
+            .iter()
+            .any(|warning| warning.code == OutputWarningCode::EXPLANATION_UNAVAILABLE)
+        {
+            return (Vec::new(), payload.explanation_warnings.clone());
+        }
+        let candidates = Self::search_payload_explanation_candidates(payload);
+        let session = match self.explain_session_with_payload(
+            &index_root,
+            &payload.query,
+            payload.phase,
+            &candidates,
+            Some(payload),
+        ) {
+            Ok(session) => session,
             Err(error) => return unavailable(error.to_string()),
         };
-        if session.unavailable == Some(ExplainUnavailableReason::ExpandedQueryFusion) {
-            return unavailable(
-                "a search fused from expanded queries has no per-query explanation evidence"
-                    .to_owned(),
-            );
-        }
-        let lexical = Self::open_explain_lexical_index(cx, &index_root).await;
-        let mut warnings: Vec<OutputWarning> = Vec::new();
-        let mut explained = Vec::new();
-        for hit in &payload.hits {
-            let Some(session_hit) = session.resolve(&hit.path) else {
-                continue;
-            };
+        let lexical = if let Some(expected) = expected_fingerprint
+            && Self::search_index_fingerprint_at_root(&index_root).ok().as_deref() == Some(expected)
+        {
+            let opened = Self::open_explain_lexical_index(cx, &index_root).await;
+            if Self::search_index_fingerprint_at_root(&index_root).ok().as_deref() == Some(expected) {
+                opened
+            } else {
+                Err("the search index changed while opening lexical evidence".to_owned())
+            }
+        } else {
+            Err("the searched index fingerprint is unavailable or changed".to_owned())
+        };
+        let mut warnings = payload.explanation_warnings.clone();
+        let mut explained = Vec::with_capacity(session.hits.len());
+        for session_hit in &session.hits {
             let (explanation, hit_warnings) =
                 Self::explain_session_hit(cx, &session, session_hit, lexical.as_ref());
             for warning in hit_warnings {
@@ -12824,20 +12836,10 @@ impl FsfsRuntime {
                 session.vector_generation_id.as_deref(),
             );
             explained.push(ExplainedSearchHit {
-                path: hit.path.clone(),
+                path: session_hit.path.clone(),
                 ranking: explanation.ranking,
                 table,
             });
-        }
-        if explained.len() < payload.hits.len() {
-            warnings.push(OutputWarning::new(
-                OutputWarningCode::EXPLANATION_UNAVAILABLE,
-                format!(
-                    "{} of {} hits have no saved explanation context",
-                    payload.hits.len() - explained.len(),
-                    payload.hits.len()
-                ),
-            ));
         }
         (explained, warnings)
     }
@@ -13846,9 +13848,10 @@ impl FsfsRuntime {
         cx: &Cx,
         query: &str,
         limit: usize,
+        expansion: impl Future<Output = SearchResult<query_expansion::ExpansionResult>> + Send,
     ) -> SearchResult<Vec<SearchPayload>> {
         let mode = self.search_mode_for_query(query, self.requested_search_mode())?;
-        let expansion = Self::expand_search_query(cx, query).await?;
+        let expansion = expansion.await?;
 
         // If we only have the original query (no expansions), fast-path to normal search.
         if expansion.queries.len() <= 1 {
@@ -13872,7 +13875,7 @@ impl FsfsRuntime {
                 &expansion_fingerprint,
                 SearchExecutionFlags {
                     include_snippets: true,
-                    persist_explain_session: true,
+                    persist_explain_session: false,
                 },
             )
             .await?;
@@ -13888,6 +13891,20 @@ impl FsfsRuntime {
             &expansion_fingerprint,
             mode,
         )?;
+        if self.config.search.explain {
+            fused_payload.explanation_warnings.push(OutputWarning::new(
+                OutputWarningCode::EXPLANATION_UNAVAILABLE,
+                "expanded-query fusion has no complete per-query explanation evidence; run the search without --expand for ranking explanations",
+            ));
+        }
+        if let Err(error) =
+            self.invalidate_expanded_query_explanation(&resources.index_root, query)
+        {
+            warn!(
+                error_code = error_code_for(&error),
+                "failed to mark follow-up explanation unavailable after expanded search"
+            );
+        }
 
         Ok(vec![fused_payload])
     }
@@ -15446,11 +15463,22 @@ impl FsfsRuntime {
         let Some(last) = payloads.last() else {
             return Ok(());
         };
-        let fused = last
-            .hits
+        let fused = Self::search_payload_explanation_candidates(last);
+        let index_root = self.resolve_status_index_root()?;
+        self.persist_explain_session_with_payload(
+            &index_root,
+            query,
+            last.phase,
+            &fused,
+            Some(last),
+        )
+    }
+
+    fn search_payload_explanation_candidates(payload: &SearchPayload) -> Vec<FusedCandidate> {
+        payload.hits
             .iter()
             .map(|hit| {
-                let evidence = last
+                let evidence = payload
                     .score_evidence
                     .get(&hit.path)
                     .copied()
@@ -15468,15 +15496,7 @@ impl FsfsRuntime {
                     in_both_sources: hit.in_both_sources,
                 }
             })
-            .collect::<Vec<_>>();
-        let index_root = self.resolve_status_index_root()?;
-        self.persist_explain_session_with_payload(
-            &index_root,
-            query,
-            last.phase,
-            &fused,
-            Some(last),
-        )
+            .collect()
     }
 
     fn apply_search_filter(
@@ -50735,6 +50755,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_buffered_expansion_refuses_explanations_for_fused_variant_ranks() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runtime, _lexical) = lexical_expansion_stream_fixture(&cx, temp.path()).await;
+            runtime.config.search.explain = true;
+            runtime.cli_input.stream = false;
+            let query = "alpha -secret";
+            let fingerprint = FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let payloads = runtime
+                .execute_expanded_search(&cx, query, 2, async {
+                    Ok(stream_expansion_fixture(query, Some("beta")))
+                })
+                .await
+                .unwrap();
+            let payload = payloads.last().unwrap();
+            assert_eq!(
+                payload.hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+                ["expanded.md", "original.md"]
+            );
+            let (explained, warnings) = runtime
+                .explain_returned_hits(&cx, payload, Some(&fingerprint))
+                .await;
+            assert!(explained.is_empty());
+            assert_eq!(warnings[0].code, OutputWarningCode::EXPLANATION_UNAVAILABLE);
+            let session = runtime.load_explain_session().unwrap().unwrap();
+            assert_eq!(session.query, query);
+            assert!(session.hits.is_empty());
+            assert!(session.unavailable.is_some());
+        });
+    }
+
+    #[test]
     fn expanded_stream_flushes_initial_then_finds_generated_hits_and_preserves_exclusions() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
@@ -60275,7 +60327,11 @@ mod tests {
                 .expect("search payload");
             assert!(!payload.hits.is_empty());
 
-            let (explained, warnings) = search.explain_returned_hits(&cx, &payload).await;
+            let root = project.join(".frankensearch");
+            let fingerprint = FsfsRuntime::search_index_fingerprint_at_root(&root).unwrap();
+            let (explained, warnings) = search
+                .explain_returned_hits(&cx, &payload, Some(&fingerprint))
+                .await;
             assert!(
                 warnings
                     .iter()
@@ -60306,15 +60362,32 @@ mod tests {
                 assert_eq!(attached, printed["data"]["ranking"], "hit {index}");
             }
 
-            // Another search's context is not this search's explanation.
-            let mut other = payload.clone();
-            other.query = "some other query".to_owned();
-            let (none, warnings) = search.explain_returned_hits(&cx, &other).await;
-            assert!(none.is_empty());
+            // A competing request with the same query replaces the shared
+            // context with a ranking of its own. Inline evidence stays tied
+            // to the returned payload even when that file cannot be read.
+            let path = root.join(super::FSFS_EXPLAIN_SESSION_FILE);
+            let mut competing = search.load_explain_session().unwrap().unwrap();
+            competing.hits[0].final_score = -1.0;
+            search.persist_explain_session_value(&root, competing).unwrap();
+            let (after_competitor, _) = search
+                .explain_returned_hits(&cx, &payload, Some(&fingerprint))
+                .await;
+            assert_eq!(after_competitor[0].ranking, explained[0].ranking);
+            fs::rename(&path, temp.path().join("competing-session")).unwrap();
+            fs::create_dir(&path).unwrap();
+            let (without_file, _) = search
+                .explain_returned_hits(&cx, &payload, Some(&fingerprint))
+                .await;
+            assert_eq!(without_file[0].ranking, explained[0].ranking);
+
+            let (without_terms, warnings) = search
+                .explain_returned_hits(&cx, &payload, Some("different index"))
+                .await;
+            assert_eq!(without_terms[0].ranking.fusion, explained[0].ranking.fusion);
             assert!(
                 warnings
                     .iter()
-                    .any(|warning| warning.code == OutputWarningCode::EXPLANATION_UNAVAILABLE)
+                    .any(|warning| warning.code == OutputWarningCode::BM25_STATS_UNAVAILABLE)
             );
         });
     }
