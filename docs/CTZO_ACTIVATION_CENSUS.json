@@ -79,14 +79,20 @@
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": "activate_owner_backed_search",
-      "count": 5,
-      "note": "run_phase1 admits the actual fast response, then retains one activation for native or tuned exact retrieval, exclusion refill, and fast coverage replay. run_phase2 admits the actual quality response before PRF, then admits the final quality query for retrieval and coverage. Direct quality-only async search (925002e8) adds the fifth owner-backed activation site. Both coverage replay calls remain."
+      "count": 6,
+      "note": "run_phase1 admits the fast response and activates its retained retrieval. run_phase2 admits the quality response before PRF and activates the final quality query for retrieval. Direct quality-only retrieval and filtered quality coverage replay each have their own activation. The filtered replay was added by 41eb3626."
     },
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": ".coverage(",
-      "count": 2,
-      "note": "run_phase1 fast coverage and run_phase2 quality coverage."
+      "count": 1,
+      "note": "run_phase1 fast coverage."
+    },
+    {
+      "file": "crates/frankensearch-fusion/src/searcher.rs",
+      "callee": ".coverage_with_params(",
+      "count": 3,
+      "note": "Direct quality-only coverage and both ordinary and filtered quality coverage in run_phase2 use the same search parameters as retrieval."
     }
   ]
 }
