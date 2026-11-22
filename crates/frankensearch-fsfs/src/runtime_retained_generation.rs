@@ -3644,7 +3644,7 @@ mod retained_delete_tests {
             for emergency in [false, true] {
                 let mut blocked = runtime.clone();
                 blocked.config.storage.storage_pressure_emergency = emergency;
-                blocked.config.storage.disk_budget_bytes = Some(if emergency { 0 } else { 1 });
+                blocked.config.storage.disk_budget_bytes = Some(u64::from(!emergency));
                 let error = blocked
                     .compact_retained_generation(&cx, &root)
                     .await
@@ -3947,7 +3947,7 @@ mod retained_search_tests {
             for emergency in [false, true] {
                 let mut blocked = runtime.clone();
                 blocked.config.storage.storage_pressure_emergency = emergency;
-                blocked.config.storage.disk_budget_bytes = Some(if emergency { 0 } else { 1 });
+                blocked.config.storage.disk_budget_bytes = Some(u64::from(!emergency));
                 let mut input = blocked.cli_input.clone();
                 input.command = CliCommand::Delete;
                 input.delete_ids = vec!["alpha.md".to_owned()];

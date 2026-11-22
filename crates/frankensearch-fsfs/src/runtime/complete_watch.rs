@@ -2486,7 +2486,9 @@ mod lifecycle_tests {
             // No new event accompanies relief. Early polls retain the sampled
             // pause; the configured deadline admits the original owed edit.
             ballast.set_len(0).unwrap();
-            let early = paused_at + SAMPLE_INTERVAL - Duration::from_millis(1);
+            let early = (paused_at + SAMPLE_INTERVAL)
+                .checked_sub(Duration::from_millis(1))
+                .unwrap();
             assert!(session.advance(&cx, early).await.unwrap().is_none());
             assert_eq!(candidate_count(&root), allocated);
             assert_eq!(session.last_reconcile, previous_reconcile);
@@ -2592,14 +2594,18 @@ mod lifecycle_tests {
                 assert_eq!(pending.first, event_at);
                 assert_eq!(pending.paths, BTreeSet::from([beta_path]));
                 assert!(!pending.force_rebuild);
-                pending.last
+                let restored_at = pending.last;
+                drop(changes);
+                restored_at
             };
 
             // The typed rejection itself refreshes the pause cache and retains
             // the consumed path; retrying does not need a source-race counter
             // or another notification after storage becomes available.
             ballast.set_len(0).unwrap();
-            let early = paused_at + SAMPLE_INTERVAL - Duration::from_millis(1);
+            let early = (paused_at + SAMPLE_INTERVAL)
+                .checked_sub(Duration::from_millis(1))
+                .unwrap();
             assert!(session.advance(&cx, early).await.unwrap().is_none());
             assert_eq!(candidate_count(&root), allocated);
             let after = require_durable_publication(

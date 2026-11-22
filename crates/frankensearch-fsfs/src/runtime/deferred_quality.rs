@@ -1805,7 +1805,7 @@ mod tests {
             for emergency in [false, true] {
                 let mut blocked = resumed.clone();
                 blocked.config.storage.storage_pressure_emergency = emergency;
-                blocked.config.storage.disk_budget_bytes = Some(if emergency { 0 } else { 1 });
+                blocked.config.storage.disk_budget_bytes = Some(u64::from(!emergency));
                 let error = blocked
                     .complete_retained_quality(&cx, &root, &first)
                     .await
