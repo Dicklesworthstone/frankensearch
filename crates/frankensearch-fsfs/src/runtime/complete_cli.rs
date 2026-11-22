@@ -5443,6 +5443,53 @@ mod tests {
             assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
             assert_eq!(sealed_inventory(reader.generation.path()), sealed);
             assert!(!reader.generation.path().join("query_cache").exists());
+
+            // Both filenames can contain valid bytes reached through an
+            // invalid entry. Only actual regular files may supply answers.
+            let saved = directory.path().join("saved-answer.json");
+            fs::rename(&path, &saved).unwrap();
+            std::os::unix::fs::symlink(&saved, &historical).unwrap();
+            assert!(
+                reader
+                    .runtime
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-symlink regular file")
+            );
+            fs::rename(&historical, directory.path().join("historical-link")).unwrap();
+
+            // A bad canonical entry is a read failure even when the older
+            // filename holds a valid record for the selected generation.
+            fs::copy(&saved, &historical).unwrap();
+            std::os::unix::fs::symlink(&saved, &path).unwrap();
+            assert!(
+                reader
+                    .runtime
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-symlink regular file")
+            );
+            fs::rename(&path, directory.path().join("canonical-link")).unwrap();
+            #[cfg(target_os = "linux")]
+            rustix::fs::mkfifoat(rustix::fs::CWD, &path, rustix::fs::Mode::RUSR).unwrap();
+            #[cfg(not(target_os = "linux"))]
+            fs::write(&path, b"{not json").unwrap();
+
+            recorded.lock().unwrap().clear();
+            search.cli_input.stream = false;
+            search.cli_input.format = OutputFormat::Json;
+            let mut recovered = Vec::new();
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut recovered))
+                .await
+                .unwrap();
+            let recovered: serde_json::Value = serde_json::from_slice(&recovered).unwrap();
+            assert_eq!(recovered["data"]["hits"], cold["data"]["hits"]);
+            assert!(!recorded.lock().unwrap().is_empty(), "live retrieval must rebuild the answer");
+            assert!(fs::symlink_metadata(&path).unwrap().is_file());
+            assert_eq!(fs::read(&historical).unwrap(), bytes);
+            assert_eq!(sealed_inventory(reader.generation.path()), sealed);
         });
     }
 

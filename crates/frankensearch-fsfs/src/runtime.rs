@@ -13345,47 +13345,14 @@ impl FsfsRuntime {
         if !Self::admit_explain_directory(index_root, false)? {
             return Ok(None);
         }
-        let path = index_root.join(session_file);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => {
-                return Err(SearchError::SubsystemError {
-                    subsystem: "fsfs.explain.session",
-                    source: Box::new(std::io::Error::other(
-                        "explanation context must be a regular file, not a symlink or other entry",
-                    )),
-                });
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let mut file = match options.open(&path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(SearchError::SubsystemError {
-                    subsystem: "fsfs.explain.session",
-                    source: Box::new(source),
-                });
-            }
-        };
-        if !file.metadata()?.is_file() {
-            return Err(SearchError::SubsystemError {
+        let Some(raw) = read_regular_search_record(&index_root.join(session_file))
+            .map_err(|source| SearchError::SubsystemError {
                 subsystem: "fsfs.explain.session",
-                source: Box::new(std::io::Error::other(
-                    "explanation context is not a regular file",
-                )),
-            });
-        }
-        let mut raw = String::new();
-        file.read_to_string(&mut raw)?;
+                source: Box::new(source),
+            })?
+        else {
+            return Ok(None);
+        };
         let mut session = serde_json::from_str::<ExplainSession>(&raw).map_err(|source| {
             SearchError::SubsystemError {
                 subsystem: "fsfs.explain.session",
@@ -15388,21 +15355,18 @@ impl FsfsRuntime {
         if !self.admit_complete_search_cache_directory(false)? {
             return Ok(None);
         }
-        let raw = match fs::read_to_string(&cache_path).or_else(|error| {
-            if error.kind() == ErrorKind::NotFound && self.complete_explain_target.is_some() {
+        let raw = match read_regular_search_record(&cache_path)? {
+            None if self.complete_explain_target.is_some() => {
                 // Older complete entries used the shared filename. Accept
                 // them only through the complete-generation check below.
-                fs::read_to_string(cache_path.with_file_name(format!(
-                    "{}.json",
-                    Self::search_cache_key_hash(key),
-                )))
-            } else {
-                Err(error)
+                let historical = cache_path
+                    .with_file_name(format!("{}.json", Self::search_cache_key_hash(key)));
+                read_regular_search_record(&historical)?
             }
-        }) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(SearchError::Io(error)),
+            current => current,
+        };
+        let Some(raw) = raw else {
+            return Ok(None);
         };
 
         let record = serde_json::from_str::<SearchCacheRecord>(&raw).map_err(|source| {
@@ -35652,6 +35616,42 @@ fn write_durable(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Res
 /// cheap to recreate and read defensively.
 fn write_replace(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {
     write_through_temporary(path.as_ref(), data.as_ref(), false)
+}
+
+/// Read an atomically replaced convenience record. Only absence permits a
+/// fallback to an older filename. A substituted FIFO must not block the open
+/// before we can check the descriptor.
+fn read_regular_search_record(path: &Path) -> std::io::Result<Option<String>> {
+    let invalid_entry = || {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "saved search record must be a non-symlink regular file",
+        )
+    };
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(invalid_entry()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(invalid_entry());
+    }
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    Ok(Some(raw))
 }
 
 fn write_through_temporary(path: &Path, data: &[u8], durable: bool) -> std::io::Result<()> {
