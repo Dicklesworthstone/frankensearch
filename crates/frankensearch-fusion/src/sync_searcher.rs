@@ -733,7 +733,9 @@ impl SyncTwoTierSearcher {
     /// Returns [`SearchError::InvalidConfig`] when the requested tier is absent
     /// or unauthorized, or when a query fails its retained space and producer
     /// admission; plus dimension/filter errors from vector search and
-    /// cancellation from an optional lexical backend.
+    /// cancellation from an optional lexical backend, including metadata
+    /// hydration during quality refinement. Cancellation never returns the
+    /// initial ranking as a successful collected search.
     pub fn search_collect(
         &self,
         query: &TieredQueryEmbeddings,
@@ -764,6 +766,7 @@ impl SyncTwoTierSearcher {
         let prepared = self.search_initial(query, k, filter, false)?;
         let outcome = if let Some(refinement) = prepared.refinement {
             self.search_refined(prepared.initial, refinement, filter, false)
+                .map_err(|failure| failure.error)?
         } else {
             prepared.initial
         };
@@ -1296,7 +1299,7 @@ impl SyncTwoTierSearcher {
         refinement: SyncRefinement<'_>,
         filter: Option<&dyn SearchFilter>,
         want_phase: bool,
-    ) -> SyncSearchOutcome {
+    ) -> Result<SyncSearchOutcome, Box<SyncRefinementFailure>> {
         let SyncSearchOutcome {
             final_results: initial_results,
             mut metrics,
@@ -1384,12 +1387,17 @@ impl SyncTwoTierSearcher {
         let (quality_pool, refined_fast_hits) = match quality_pool {
             Ok(pool) => pool,
             Err(error) => {
-                let final_ranking = if matches!(&error, SearchError::Cancelled { .. }) {
-                    None
-                } else {
-                    final_ranking
-                };
                 let latency = phase2_started.elapsed();
+                if matches!(&error, SearchError::Cancelled { .. }) {
+                    // Collection must retain the typed refusal even when phase
+                    // payloads are disabled. The iterator can still return the
+                    // previously published Initial with this terminal failure.
+                    return Err(Box::new(SyncRefinementFailure {
+                        initial_results,
+                        error,
+                        latency,
+                    }));
+                }
                 metrics.phase2_total_ms = ms(latency);
                 metrics.skip_reason = Some(error.diagnostic_code().to_owned());
                 let phase = want_phase.then(|| SearchPhase::RefinementFailed {
@@ -1397,12 +1405,12 @@ impl SyncTwoTierSearcher {
                     error,
                     latency,
                 });
-                return SyncSearchOutcome {
+                return Ok(SyncSearchOutcome {
                     phase,
                     final_results: initial_results,
                     metrics,
                     final_ranking,
-                };
+                });
             }
         };
         metrics.lexical_search_ms += ms(lexical_refill_time);
@@ -1608,12 +1616,12 @@ impl SyncTwoTierSearcher {
             rank_changes,
         });
 
-        SyncSearchOutcome {
+        Ok(SyncSearchOutcome {
             phase,
             final_results: refined_results,
             metrics,
             final_ranking,
-        }
+        })
     }
 
     fn mmr_embeddings(
@@ -1794,6 +1802,15 @@ struct SyncSearchOutcome {
     final_results: Vec<ScoredResult>,
     metrics: TwoTierMetrics,
     final_ranking: Option<SyncFinalRanking>,
+}
+
+/// A cancelled refinement retains its published Initial for iterator callers,
+/// while collected searches propagate the cancellation as an error. This is
+/// boxed only on failure; successful searches allocate no error payload.
+struct SyncRefinementFailure {
+    initial_results: Vec<ScoredResult>,
+    error: SearchError,
+    latency: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2018,17 +2035,25 @@ impl Iterator for SyncSearchIterator<'_> {
                 }
             }
             SyncIteratorState::Refine(pending) => {
-                let mut outcome = self.searcher.search_refined(
+                match self.searcher.search_refined(
                     pending.initial,
                     pending.refinement,
                     self.filter,
                     true,
-                );
-                let phase = outcome.phase.take();
-                if outcome.final_ranking.is_some() {
-                    self.state = SyncIteratorState::Rank(Box::new(outcome));
+                ) {
+                    Ok(mut outcome) => {
+                        let phase = outcome.phase.take();
+                        if outcome.final_ranking.is_some() {
+                            self.state = SyncIteratorState::Rank(Box::new(outcome));
+                        }
+                        phase
+                    }
+                    Err(failure) => Some(SearchPhase::RefinementFailed {
+                        initial_results: failure.initial_results,
+                        error: failure.error,
+                        latency: failure.latency,
+                    }),
                 }
-                phase
             }
             SyncIteratorState::Rank(pending) => self.searcher.search_final(*pending, true).phase,
             SyncIteratorState::Done => None,
@@ -6064,6 +6089,120 @@ mod tests {
     }
 
     #[test]
+    fn quality_metadata_cancellation_is_terminal_in_collect_and_stream() {
+        use frankensearch_core::filter::DocTypeFilter;
+        use frankensearch_index::TwoTierIndex;
+
+        struct CancellingQualityMetadata {
+            cancellations: AtomicUsize,
+        }
+        impl SyncLexicalSearch for CancellingQualityMetadata {
+            fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+                Ok(Vec::new())
+            }
+
+            fn metadata_for_documents(
+                &self,
+                ids: &[&str],
+            ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+                if ids.contains(&"quality-only") {
+                    self.cancellations.fetch_add(1, Ordering::SeqCst);
+                    return Err(SearchError::Cancelled {
+                        phase: "quality-metadata".to_owned(),
+                        reason: "request cancelled during quality hydration".to_owned(),
+                    });
+                }
+                Ok(vec![
+                    Some(Arc::new(serde_json::json!({"doc_type": "keep"})));
+                    ids.len()
+                ])
+            }
+        }
+
+        let directory = temp_dir("quality-metadata-cancellation");
+        let fast = semantic_identity("persisted-fast", 2);
+        let quality = semantic_identity("persisted-quality", 3);
+        let mut writer = TwoTierIndex::create(directory.path(), TwoTierConfig::default()).unwrap();
+        writer.set_fast_embedder_id("persisted-fast");
+        writer.set_quality_embedder_id("persisted-quality");
+        writer.set_fast_identity(&fast).unwrap();
+        writer.set_quality_identity(&quality).unwrap();
+        writer.add_fast_record("a", &[1.0, 0.0]).unwrap();
+        writer.add_fast_record("c", &[0.8, 0.6]).unwrap();
+        writer.add_quality_record("a", &[0.0, 0.0, 1.0]).unwrap();
+        writer
+            .add_quality_record("quality-only", &[1.0, 0.0, 0.0])
+            .unwrap();
+        writer.add_quality_record("c", &[0.8, 0.6, 0.0]).unwrap();
+        drop(writer.finish().unwrap());
+
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(directory.path()).unwrap());
+        let fast_query = BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap();
+        let query = TieredQueryEmbeddings::progressive(
+            fast_query.clone(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let filter = DocTypeFilter::new(["keep"]);
+        for enabled in [false, true] {
+            let lexical = Arc::new(CancellingQualityMetadata {
+                cancellations: AtomicUsize::new(0),
+            });
+            let searcher = SyncTwoTierSearcher::new(
+                Arc::clone(&index),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_lexical(lexical.clone())
+            .with_mmr_config(MmrConfig {
+                enabled,
+                candidate_pool: 2,
+                ..sync_mmr_config()
+            });
+            assert!(matches!(
+                searcher.search_collect_with_filter(&query, 1, Some(&filter)),
+                Err(SearchError::Cancelled { ref phase, .. }) if phase == "quality-metadata"
+            ));
+            assert_eq!(lexical.cancellations.load(Ordering::SeqCst), 1);
+
+            let mut phases = searcher.search_iter_with_filter(&query, 1, Some(&filter));
+            let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+                panic!("fast results must precede quality metadata cancellation");
+            };
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].doc_id, "a");
+            let Some(SearchPhase::RefinementFailed {
+                initial_results,
+                error: SearchError::Cancelled { phase, .. },
+                ..
+            }) = phases.next()
+            else {
+                panic!("quality cancellation must remain a terminal typed failure");
+            };
+            assert_eq!(phase, "quality-metadata");
+            assert_eq!(
+                serde_json::to_value(initial_results).unwrap(),
+                serde_json::to_value(results).unwrap(),
+                "the failure preserves the exact previously published ranking"
+            );
+            assert!(phases.next().is_none(), "cancelled searches must not run MMR");
+            assert!(phases.next().is_none(), "terminal iteration cannot retry");
+            assert_eq!(lexical.cancellations.load(Ordering::SeqCst), 2);
+
+            let (fast_results, _) = searcher
+                .search_collect_with_filter(
+                    &TieredQueryEmbeddings::fast_only(fast_query.clone()),
+                    1,
+                    Some(&filter),
+                )
+                .expect("a separate fast-only request never reaches quality metadata");
+            assert!(!fast_results.is_empty());
+            assert_eq!(lexical.cancellations.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
     fn metadata_filter_hydration_errors_never_become_unknown_observations() {
         use frankensearch_core::filter::DocTypeFilter;
 
@@ -6130,6 +6269,12 @@ mod tests {
             assert_eq!(initial_results[0].doc_id, "a");
             assert!(matches!(error, SearchError::InvalidConfig { .. }));
             assert!(phases.next().is_none());
+            let (fallback, metrics) = searcher
+                .search_collect_with_filter(&query, 1, Some(&filter))
+                .expect("ordinary refinement failures preserve the verified initial ranking");
+            assert_eq!(fallback.len(), 1);
+            assert_eq!(fallback[0].doc_id, "a");
+            assert!(metrics.skip_reason.is_some());
             assert!(matches!(
                 searcher.search_collect_with_filter(&quality_only, 1, Some(&filter)),
                 Err(SearchError::InvalidConfig { .. }),
