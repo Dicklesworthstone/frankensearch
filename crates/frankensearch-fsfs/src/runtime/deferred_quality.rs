@@ -1787,7 +1787,12 @@ mod tests {
             let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
             let root = directory.path().join("store");
             let deferred = runtime(directory.path(), true);
-            let first = durable(deferred.rebuild_retained_generation(&cx, &root).await.unwrap());
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
             let before = files(first.path());
             let allocations = fs::read_dir(root.join("generations")).unwrap().count();
             let mut old = deferred.open_retained_search(&cx, &root).await.unwrap();

@@ -50,7 +50,9 @@ impl StorageAdmissionMonitor {
             root,
             budget_bytes,
             emergency: runtime.apply_storage_emergency_override(None, None, budget_bytes),
-            sample_interval: Duration::from_millis(runtime.config.pressure.sample_interval_ms.max(1)),
+            sample_interval: Duration::from_millis(
+                runtime.config.pressure.sample_interval_ms.max(1),
+            ),
             sampled: None,
             last_stage: None,
         })
