@@ -3922,6 +3922,18 @@ fn record_successful_events(
         let _ = state.require_for_events(events);
         return Err(error);
     }
+    if events.iter().any(|event| match event.kind {
+        WatchEventKind::Created | WatchEventKind::Modified => !current.contains_key(&event.path),
+        WatchEventKind::Deleted => current.contains_key(&event.path),
+    }) {
+        // A source can disappear or become excluded while its upsert is
+        // pending, or reappear while its deletion is pending. The scan then
+        // describes a different result from the mutation that reached the
+        // sink. Preserve the prior claims and exact applied paths until a
+        // full pass reconciles that difference through the retained roots.
+        state.require_for_events(events)?;
+        return Ok(RecordSuccessfulEventsOutcome::Recorded);
+    }
     if !state.baseline_initialized {
         state.indexed_snapshot = current.clone();
         state.baseline_initialized = true;
@@ -8083,6 +8095,131 @@ mod tests {
             ));
             assert!(!lock_or_recover(&watcher.reconciliation).required);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_reconciles_source_changes_during_apply() {
+        #[derive(Debug, Clone, Copy)]
+        enum SourceChange {
+            Exclude,
+            Remove,
+            Recreate,
+        }
+
+        struct ChangingPipeline {
+            recorded: RecordingPipeline,
+            source: PathBuf,
+            aside: PathBuf,
+            ignore_path: PathBuf,
+            change: SourceChange,
+            change_once: AtomicBool,
+        }
+
+        impl WatchIngestPipeline for ChangingPipeline {
+            fn apply_batch<'a>(
+                &'a self,
+                cx: &'a Cx,
+                batch: &'a [WatchIngestOp],
+            ) -> WatchIngestFuture<'a, usize> {
+                Box::pin(async move {
+                    let reindexed = self.recorded.apply_batch(cx, batch).await?;
+                    if self.change_once.swap(false, Ordering::AcqRel) {
+                        match self.change {
+                            SourceChange::Exclude => {
+                                fs::write(&self.ignore_path, "source.md\n")?;
+                            }
+                            SourceChange::Remove => {
+                                fs::rename(&self.source, &self.aside)?;
+                            }
+                            SourceChange::Recreate => {
+                                fs::write(&self.source, "recreated during deletion")?;
+                            }
+                        }
+                    }
+                    Ok(reindexed)
+                })
+            }
+        }
+
+        for change in [
+            SourceChange::Exclude,
+            SourceChange::Remove,
+            SourceChange::Recreate,
+        ] {
+            run_test_with_cx(move |cx| async move {
+                let temp = tempdir().unwrap();
+                let root = temp.path().join("watched");
+                fs::create_dir(&root).unwrap();
+                let source = root.join("source.md");
+                let aside = temp.path().join("source-aside.md");
+                if !matches!(change, SourceChange::Remove) {
+                    fs::write(&source, "previously indexed source").unwrap();
+                }
+                let pipeline = Arc::new(ChangingPipeline {
+                    recorded: RecordingPipeline::default(),
+                    source: source.clone(),
+                    aside: aside.clone(),
+                    ignore_path: root.join(".ignore"),
+                    change,
+                    change_once: AtomicBool::new(true),
+                });
+                let watcher =
+                    FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+                let (baseline, completeness) = watcher.collect_snapshot().unwrap();
+                lock_or_recover(&watcher.reconciliation)
+                    .seed_initial_authority(
+                        baseline.clone(),
+                        completeness.root_identities().clone(),
+                    )
+                    .unwrap();
+                let authority = lock_or_recover(&watcher.reconciliation).authority.clone();
+                let event = match change {
+                    SourceChange::Exclude => WatchEvent::modified(&source, now_millis(), None),
+                    SourceChange::Remove => {
+                        // No baseline claim exists for this source. Its applied
+                        // upsert must retain enough evidence to remove it later.
+                        fs::write(&source, "newly created source").unwrap();
+                        WatchEvent::created(&source, now_millis(), None)
+                    }
+                    SourceChange::Recreate => {
+                        fs::rename(&source, &aside).unwrap();
+                        WatchEvent::deleted(&source, now_millis())
+                    }
+                };
+                let outcome = watcher.process_events_now(&cx, &[event]).await.unwrap();
+                assert_eq!(outcome.accepted, 1);
+                {
+                    let state = lock_or_recover(&watcher.reconciliation);
+                    assert!(state.required, "post-apply change must retain debt: {change:?}");
+                    assert_eq!(state.indexed_snapshot, baseline);
+                    assert_eq!(state.authority, authority);
+                    assert_eq!(state.affected_paths, BTreeSet::from([source.clone()]));
+                }
+                watcher.process_events_now(&cx, &[]).await.unwrap();
+                let ops = pipeline.recorded.all_ops();
+                assert_eq!(ops.len(), 2, "one mutation and one repair: {change:?}");
+                match change {
+                    SourceChange::Exclude | SourceChange::Remove => assert!(matches!(
+                        &ops[1],
+                        WatchIngestOp::Delete { file_key, .. }
+                            if file_key == &normalize_file_key(&source)
+                    )),
+                    SourceChange::Recreate => assert!(matches!(
+                        &ops[1],
+                        WatchIngestOp::Upsert { file_key, .. }
+                            if file_key == &normalize_file_key(&source)
+                    )),
+                }
+                let state = lock_or_recover(&watcher.reconciliation);
+                assert!(!state.required);
+                assert!(state.affected_paths.is_empty());
+                assert_eq!(
+                    state.indexed_snapshot.contains_key(&source),
+                    matches!(change, SourceChange::Recreate)
+                );
+            });
+        }
     }
 
     #[cfg(unix)]
