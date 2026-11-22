@@ -1327,6 +1327,18 @@ fn exclusive_pin(root: &Path, id: &str) -> SearchResult<Option<CollectorPin>> {
     }
 }
 
+/// Read-only footprint of the whole store, including retained and inactive
+/// generations. Missing roots have no footprint; this does not create them.
+pub(crate) fn storage_footprint_bytes(cx: &Cx, directory: &Path) -> SearchResult<u64> {
+    checkpoint(cx)?;
+    match fs::symlink_metadata(directory) {
+        Ok(_) => require_directory(directory)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    }
+    tree_bytes(cx, directory, 0, &mut HashSet::new())
+}
+
 /// Bytes held by regular files under `directory`, without following symlinks.
 /// A file with several links counts only if `counted` lacks its inode, which
 /// it then records.
@@ -1342,6 +1354,7 @@ fn tree_bytes(
     }
     let mut total = 0_u64;
     for entry in fs::read_dir(directory)? {
+        checkpoint(cx)?;
         let entry = entry?;
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.is_dir() {

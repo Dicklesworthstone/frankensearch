@@ -19,6 +19,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
 use super::deferred_quality::{DeferredQualityAttempt, retryable_quality_producer_error};
+use super::storage_admission::{StorageAdmissionMonitor, storage_admission_denial};
 use super::{
     FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsRuntime, IndexingQualityDeferral, STORE_OVERLAP_REASON,
     SourceStamp, canonical_store_root, index_discovery_walker, retained_search_checkpoint,
@@ -563,6 +564,7 @@ enum WatchAttempt {
 struct CompleteWatchSession {
     runtime: FsfsRuntime,
     pressure: IndexPressureMonitor,
+    storage: StorageAdmissionMonitor,
     store_root: PathBuf,
     source: SourceRoot,
     changes: Arc<Mutex<Changes>>,
@@ -608,6 +610,7 @@ impl CompleteWatchSession {
                 "symlinked store roots are unsupported",
             ));
         }
+        let storage = StorageAdmissionMonitor::new(runtime, &store_root)?;
         let changes = Arc::new(Mutex::new(Changes::default()));
         let callback_changes = Arc::clone(&changes);
         let callback_store = store_root.clone();
@@ -636,6 +639,7 @@ impl CompleteWatchSession {
         Ok(Self {
             runtime,
             pressure,
+            storage,
             store_root,
             source,
             changes,
@@ -647,6 +651,27 @@ impl CompleteWatchSession {
             last_reconcile: Instant::now(),
             unstable_builds: 0,
         })
+    }
+
+    /// Restore work consumed by an attempt without erasing newer notifications.
+    /// An empty window also retains a retry driven only by periodic or quality
+    /// work, which must not depend on another filesystem event.
+    fn restore_pending(&self, now: Instant, pending: Option<&DirtyWindow>) -> SearchResult<()> {
+        let mut changes = lock_changes(&self.changes)?;
+        let last = changes
+            .dirty
+            .as_ref()
+            .map_or(now, |window| window.last.max(now));
+        changes.record(last, pending.is_some_and(|window| window.force_rebuild));
+        for path in pending.into_iter().flat_map(|window| &window.paths) {
+            changes.record_path(path);
+        }
+        if let Some(window) = &mut changes.dirty {
+            window.first = window
+                .first
+                .min(pending.map_or(now, |pending| pending.first));
+        }
+        Ok(())
     }
 
     /// `consumed` is the hint window the failed attempt took before observing.
@@ -976,7 +1001,7 @@ impl CompleteWatchSession {
         check_backend(&self.changes)?;
         self.source.check()?;
         check_watch_publication(cx, &self.store_root, self.publication.as_ref())?;
-        if self.pressure.paused() {
+        if self.storage.paused(cx, now)? || self.pressure.paused() {
             // Keep notifications and the reconciliation deadline owed. A quiet
             // pressure sample resumes the same source/producer-fenced builder.
             return Ok(None);
@@ -1022,9 +1047,20 @@ impl CompleteWatchSession {
         if !initial && !periodic && !quality_ready && pending.is_none() {
             return Ok(None);
         }
+        let previous_reconcile = self.last_reconcile;
         self.last_reconcile = now;
         let force_rebuild = initial || pending.as_ref().is_some_and(|window| window.force_rebuild);
-        match self.attempt(cx, force_rebuild, pending.as_ref()).await {
+        let attempted = match self
+            .runtime
+            .admit_storage_write(cx, &self.store_root, "complete_watch")
+        {
+            Ok(()) => self.attempt(cx, force_rebuild, pending.as_ref()).await,
+            Err(error) => Err(error),
+        };
+        // Even an unsuccessful attempt can leave an unselected candidate. The
+        // next admission must observe its storage before allocating again.
+        self.storage.invalidate();
+        match attempted {
             Ok(WatchAttempt::Published {
                 observation,
                 publication,
@@ -1047,15 +1083,8 @@ impl CompleteWatchSession {
                 // Bind the waiting session to the same selected generation.
                 // A different publisher must not retarget this pending work.
                 self.publication = Some(generation);
-                if let Some(pending) = pending {
-                    let mut changes = lock_changes(&self.changes)?;
-                    changes.record(now.max(Instant::now()), pending.force_rebuild);
-                    for path in &pending.paths {
-                        changes.record_path(path);
-                    }
-                    if let Some(window) = &mut changes.dirty {
-                        window.first = window.first.min(pending.first);
-                    }
+                if pending.is_some() {
+                    self.restore_pending(now.max(Instant::now()), pending.as_ref())?;
                 }
                 self.postpone_quality_retry(now, &error);
                 Ok(None)
@@ -1068,7 +1097,16 @@ impl CompleteWatchSession {
                 self.record_unstable_source(Instant::now(), pending.as_ref())?;
                 Ok(None)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                if let Some(snapshot) = storage_admission_denial(&error) {
+                    let observed = now.max(Instant::now());
+                    self.storage.record_denial(snapshot, observed);
+                    self.last_reconcile = previous_reconcile;
+                    self.restore_pending(observed, pending.as_ref())?;
+                    return Ok(None);
+                }
+                Err(error)
+            }
         }
     }
 }
@@ -1084,6 +1122,9 @@ impl FsfsRuntime {
     /// source requires a hidden path component and is excluded from discovery.
     /// The store must not contain the source. Incomplete scans never authorize
     /// deletion.
+    /// Host and storage pressure pause before consuming source hints or quality
+    /// retries. Storage accounting includes retained and incomplete generations;
+    /// pressure relief resumes the owed work without another notification.
     ///
     /// On restart, an eligible selected quality backlog is completed from its
     /// retained inputs before rebuilding sources, once pressure permits work.
@@ -2323,6 +2364,264 @@ mod lifecycle_tests {
             assert_eq!(
                 fs::read(before.path().join("FSFS-BUNDLE.json")).unwrap(),
                 before_bytes
+            );
+        });
+    }
+
+    #[test]
+    fn complete_watch_storage_emergency_preserves_initial_work_and_cancellation() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.storage.disk_budget_bytes = Some(0);
+            runtime.config.storage.storage_pressure_emergency = true;
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let now = Instant::now();
+            let previous_reconcile = session.last_reconcile;
+            let alpha = source.join("alpha.md");
+            {
+                let mut changes = lock_changes(&session.changes).unwrap();
+                changes.record(now, false);
+                changes.record_path(&alpha);
+            }
+
+            assert!(
+                session
+                    .advance(&cx, now + MAX_DEBOUNCE)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !root.exists(),
+                "emergency admission must not create a store"
+            );
+            assert!(session.baseline.is_none());
+            assert!(session.publication.is_none());
+            assert_eq!(session.last_reconcile, previous_reconcile);
+            assert_eq!(
+                lock_changes(&session.changes)
+                    .unwrap()
+                    .dirty
+                    .as_ref()
+                    .unwrap()
+                    .paths,
+                BTreeSet::from([alpha])
+            );
+
+            cx.set_cancel_requested(true);
+            let cancelled = session.advance(&cx, now + RECONCILE_INTERVAL).await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_some());
+            assert!(!root.exists());
+        });
+    }
+
+    #[test]
+    fn complete_watch_storage_pressure_counts_unselected_generations_and_resumes() {
+        use crate::pressure_sensing::PressureSample;
+
+        run_test_with_cx(|cx| async move {
+            const BUDGET: u64 = 64 * 1024 * 1024;
+            const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.storage.disk_budget_bytes = Some(BUDGET);
+            runtime.config.pressure.ewma_alpha_per_mille = 1_000;
+            runtime.config.pressure.anti_flap_readings = 1;
+            runtime.config.pressure.sample_interval_ms = 60_000;
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            session.pressure.observe(
+                &PressureSample {
+                    cpu_pct: 0.0,
+                    rss_bytes: 0,
+                    io_read_bytes: 0,
+                    io_write_bytes: 0,
+                    io_counters_available: true,
+                    load_avg_1m: Some(0.0),
+                },
+                Instant::now(),
+            );
+            let before = publish_tick(&mut session, &cx).await;
+            let before_bytes = fs::read(before.path().join("FSFS-BUNDLE.json")).unwrap();
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let previous_reconcile = session.last_reconcile;
+
+            // An abandoned candidate consumes the store budget even though the
+            // selected bundle is small. Sparse length keeps this test bounded.
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let staged = store.begin(&cx).unwrap();
+            let ballast = File::create(staged.path().join("pressure.bin")).unwrap();
+            ballast.set_len(BUDGET * 2).unwrap();
+            drop(staged);
+            let allocated = candidate_count(&root);
+            let changed = source.join("beta.md");
+            fs::write(&changed, "sharedtoken beta after disk pressure").unwrap();
+            let now = previous_reconcile.max(Instant::now()) + Duration::from_secs(1);
+            {
+                let mut changes = lock_changes(&session.changes).unwrap();
+                changes.record(now, false);
+                changes.record_path(&changed);
+            }
+            let paused_at = now + MAX_DEBOUNCE;
+            assert!(session.advance(&cx, paused_at).await.unwrap().is_none());
+            assert_eq!(candidate_count(&root), allocated);
+            assert_eq!(session.last_reconcile, previous_reconcile);
+            assert_eq!(session.unstable_builds, 0);
+            assert_eq!(store.active(&cx).unwrap(), Some(before.clone()));
+            assert_eq!(
+                lock_changes(&session.changes)
+                    .unwrap()
+                    .dirty
+                    .as_ref()
+                    .unwrap()
+                    .paths,
+                BTreeSet::from([changed])
+            );
+
+            // No new event accompanies relief. Early polls retain the sampled
+            // pause; the configured deadline admits the original owed edit.
+            ballast.set_len(0).unwrap();
+            let early = paused_at + SAMPLE_INTERVAL - Duration::from_millis(1);
+            assert!(session.advance(&cx, early).await.unwrap().is_none());
+            assert_eq!(candidate_count(&root), allocated);
+            assert_eq!(session.last_reconcile, previous_reconcile);
+            let after = require_durable_publication(
+                session
+                    .advance(&cx, paused_at + SAMPLE_INTERVAL)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(before, after);
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_none());
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(
+                fresh
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
+            assert_eq!(
+                pinned
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(pinned.generation(), &before);
+            assert_eq!(
+                fs::read(before.path().join("FSFS-BUNDLE.json")).unwrap(),
+                before_bytes
+            );
+        });
+    }
+
+    #[test]
+    fn complete_watch_storage_growth_after_cached_admission_restores_pending_work() {
+        use crate::pressure_sensing::PressureSample;
+
+        run_test_with_cx(|cx| async move {
+            const BUDGET: u64 = 64 * 1024 * 1024;
+            const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.storage.disk_budget_bytes = Some(BUDGET);
+            runtime.config.pressure.ewma_alpha_per_mille = 1_000;
+            runtime.config.pressure.anti_flap_readings = 1;
+            runtime.config.pressure.sample_interval_ms = 60_000;
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            session.pressure.observe(
+                &PressureSample {
+                    cpu_pct: 0.0,
+                    rss_bytes: 0,
+                    io_read_bytes: 0,
+                    io_write_bytes: 0,
+                    io_counters_available: true,
+                    load_avg_1m: Some(0.0),
+                },
+                Instant::now(),
+            );
+            let before = publish_tick(&mut session, &cx).await;
+            let previous_reconcile = session.last_reconcile;
+            let sampled_at = previous_reconcile.max(Instant::now()) + Duration::from_secs(1);
+            // Seed a valid low-usage cache on an idle tick. The later hint is
+            // due before that sample expires, so only fresh write admission
+            // can detect the intervening growth.
+            assert!(session.advance(&cx, sampled_at).await.unwrap().is_none());
+            let ballast = File::create(root.join("pressure.bin")).unwrap();
+            ballast.set_len(BUDGET * 2).unwrap();
+            let allocated = candidate_count(&root);
+            let changed = source.join("beta.md");
+            fs::write(&changed, "sharedtoken beta after fresh admission").unwrap();
+            let event_at = sampled_at + Duration::from_secs(1);
+            {
+                let mut changes = lock_changes(&session.changes).unwrap();
+                changes.record(event_at, false);
+                changes.record_path(&changed);
+            }
+            assert!(
+                session
+                    .advance(&cx, event_at + DEBOUNCE)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(candidate_count(&root), allocated);
+            assert_eq!(session.last_reconcile, previous_reconcile);
+            assert_eq!(session.unstable_builds, 0);
+            assert_eq!(session.publication.as_ref(), Some(&before));
+            let paused_at = {
+                let changes = lock_changes(&session.changes).unwrap();
+                let pending = changes.dirty.as_ref().unwrap();
+                assert_eq!(pending.first, event_at);
+                assert_eq!(pending.paths, BTreeSet::from([changed]));
+                assert!(!pending.force_rebuild);
+                pending.last
+            };
+
+            // The typed rejection itself refreshes the pause cache and retains
+            // the consumed path; retrying does not need a source-race counter
+            // or another notification after storage becomes available.
+            ballast.set_len(0).unwrap();
+            let early = paused_at + SAMPLE_INTERVAL - Duration::from_millis(1);
+            assert!(session.advance(&cx, early).await.unwrap().is_none());
+            assert_eq!(candidate_count(&root), allocated);
+            let after = require_durable_publication(
+                session
+                    .advance(&cx, paused_at + SAMPLE_INTERVAL)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(before, after);
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_none());
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(
+                fresh
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
             );
         });
     }
