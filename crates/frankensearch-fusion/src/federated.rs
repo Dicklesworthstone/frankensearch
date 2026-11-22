@@ -23,6 +23,12 @@ use crate::searcher::TwoTierSearcher;
 
 const DEFAULT_FEDERATED_RRF_K: f64 = 60.0;
 
+#[derive(Debug, Clone, Copy)]
+enum FederatedSearchMode {
+    Progressive,
+    QualityOnly,
+}
+
 /// Fusion methods supported by [`FederatedSearcher`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FederatedFusion {
@@ -62,9 +68,11 @@ pub struct FederatedConfig {
     pub fusion_method: FederatedFusion,
     /// Per-index timeout budget in milliseconds.
     pub per_index_timeout_ms: u64,
-    /// Minimum number of indices that must return a valid result phase — a
-    /// FLOOR enforced after the gather completes. This includes a shard whose
-    /// optional refinement exceeded its deadline after publishing results.
+    /// Minimum number of indices that must answer successfully — a floor
+    /// enforced after the gather completes. Empty answers count, including
+    /// quality-only requests that pass admission without requesting results.
+    /// A shard whose optional refinement exceeded its deadline after publishing
+    /// results also counts.
     /// Fewer responses fail with [`SearchError::FederatedInsufficientResponses`].
     /// This knob never stops the gather early; that is `wait_for_indices`.
     pub min_indices: usize,
@@ -177,7 +185,8 @@ pub struct FederatedCoverage {
     /// Shards dispatched for this query (bounded by `max_indices`), in
     /// registration order.
     pub queried: Vec<String>,
-    /// Shards whose results are included in the fused output.
+    /// Shards whose successful answers are included in fusion, including empty
+    /// answers and quality-only requests that pass admission without inference.
     pub answered: Vec<String>,
     /// Shards that returned an error.
     pub failed: Vec<FederatedShardError>,
@@ -195,8 +204,8 @@ pub struct FederatedCoverage {
 impl FederatedCoverage {
     /// True when every dispatched shard completed within its deadline.
     ///
-    /// A shard with valid fast results but unfinished refinement contributes
-    /// to the answer while keeping this completeness signal false.
+    /// A shard with published results but unfinished refinement or reranking
+    /// contributes to the answer while keeping this completeness signal false.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.answered.len() == self.queried.len() && self.refinement_timed_out.is_empty()
@@ -419,7 +428,154 @@ impl FederatedSearcher {
         F: Fn(&str, &str) -> Option<String> + Send + Sync,
         P: Fn(&str) -> Option<&'filter dyn SearchFilter> + Send + Sync,
     {
-        if query.is_empty() || limit == 0 || self.indices.is_empty() {
+        self.search_with_mode(
+            cx,
+            query,
+            limit,
+            FederatedSearchMode::Progressive,
+            filter_fn,
+            text_fn,
+        )
+        .await
+    }
+
+    /// Search every dispatched index directly through its quality tier.
+    ///
+    /// Dispatch follows [`TwoTierSearcher::search_quality_only_with_filter`],
+    /// including its quality readiness checks and lexical query complements.
+    /// Quality is the only semantic tier; attached lexical retrieval still
+    /// participates under the child's query rules.
+    /// Retrieval does not request fast embeddings. Shard failures follow the
+    /// ordinary minimum-response and coverage policy.
+    ///
+    /// Empty queries and zero limits still dispatch to validate each selected
+    /// shard's quality identity and topology, without running inference. Their
+    /// coverage reports the shards that passed admission. An empty federation
+    /// remains a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search_with_index_text`], including shard failures when
+    /// a required quality producer or index is unavailable.
+    pub async fn search_quality_only<F>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        text_fn: F,
+    ) -> SearchResult<FederatedResponse>
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync,
+    {
+        self.search_quality_only_with_filter(cx, query, limit, None, text_fn)
+            .await
+    }
+
+    /// Search quality tiers with one borrowed request-scoped filter.
+    ///
+    /// Filtering and text resolution follow [`Self::search_with_filter`],
+    /// while retrieval goes directly to each shard's quality tier.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search_quality_only`].
+    pub async fn search_quality_only_with_filter<F>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        text_fn: F,
+    ) -> SearchResult<FederatedResponse>
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync,
+    {
+        self.search_quality_only_with_index_filter(
+            cx,
+            query,
+            limit,
+            |_index| filter,
+            |_index, doc_id| text_fn(doc_id),
+        )
+        .await
+    }
+
+    /// Search quality tiers with text resolved from the originating index.
+    ///
+    /// The text and global document identity contracts are the same as
+    /// [`Self::search_with_index_text`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search_quality_only`].
+    pub async fn search_quality_only_with_index_text<F>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        text_fn: F,
+    ) -> SearchResult<FederatedResponse>
+    where
+        F: Fn(&str, &str) -> Option<String> + Send + Sync,
+    {
+        self.search_quality_only_with_index_filter(cx, query, limit, |_index| None, text_fn)
+            .await
+    }
+
+    /// Search quality tiers with filters and text bound to each index.
+    ///
+    /// Filters and text obey the source-binding and borrowing contracts of
+    /// [`Self::search_with_index_filter`]. Filter providers run once per selected
+    /// shard, including empty and zero-limit requests that still require quality
+    /// admission; these requests do not hydrate text or run inference.
+    /// Each shard retrieves quality candidates independently of its fast tier.
+    /// A timeout before quality results produces no fallback fast answer.
+    /// Already published quality results may survive an optional rerank timeout,
+    /// which remains visible in the response's refinement-timeout coverage.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search_quality_only`].
+    pub async fn search_quality_only_with_index_filter<'filter, F, P>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        filter_fn: P,
+        text_fn: F,
+    ) -> SearchResult<FederatedResponse>
+    where
+        F: Fn(&str, &str) -> Option<String> + Send + Sync,
+        P: Fn(&str) -> Option<&'filter dyn SearchFilter> + Send + Sync,
+    {
+        self.search_with_mode(
+            cx,
+            query,
+            limit,
+            FederatedSearchMode::QualityOnly,
+            filter_fn,
+            text_fn,
+        )
+        .await
+    }
+
+    async fn search_with_mode<'filter, F, P>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mode: FederatedSearchMode,
+        filter_fn: P,
+        text_fn: F,
+    ) -> SearchResult<FederatedResponse>
+    where
+        F: Fn(&str, &str) -> Option<String> + Send + Sync,
+        P: Fn(&str) -> Option<&'filter dyn SearchFilter> + Send + Sync,
+    {
+        if self.indices.is_empty()
+            || (matches!(mode, FederatedSearchMode::Progressive)
+                && (query.is_empty() || limit == 0))
+        {
             return Ok(FederatedResponse {
                 hits: Vec::new(),
                 coverage: FederatedCoverage::default(),
@@ -436,6 +592,7 @@ impl FederatedSearcher {
                 query,
                 per_index_limit,
                 timeout_budget,
+                mode,
                 &filter_fn,
                 &text_fn,
             )
@@ -462,13 +619,14 @@ impl FederatedSearcher {
         Ok(FederatedResponse { hits, coverage })
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn collect_shard_results<'filter, F, P>(
         &self,
         cx: &Cx,
         query: &str,
         per_index_limit: usize,
         timeout_budget: Duration,
+        mode: FederatedSearchMode,
         filter_fn: &P,
         text_fn: &F,
     ) -> SearchResult<(Vec<ShardResult>, FederatedCoverage)>
@@ -501,21 +659,42 @@ impl FederatedSearcher {
                         // Bind before the shard starts: exclusion and rerank
                         // lookups must never hydrate from another index's store.
                         let shard_text = |doc_id: &str| text_fn(index_name.as_str(), doc_id);
-                        let future = Box::pin(searcher.search_with_filter(
-                            cx,
-                            query,
-                            per_index_limit,
-                            filter,
-                            shard_text,
-                            |phase| match phase {
-                                SearchPhase::Initial { results, .. }
-                                | SearchPhase::Refined { results, .. }
-                                | SearchPhase::Reranked { results, .. } => {
-                                    last_results = Some(results);
+                        let on_phase = |phase| match phase {
+                            SearchPhase::Initial { results, .. }
+                            | SearchPhase::Refined { results, .. }
+                            | SearchPhase::Reranked { results, .. } => {
+                                last_results = Some(results);
+                            }
+                            SearchPhase::RefinementFailed { .. } => {}
+                        };
+                        let future = Box::pin(async move {
+                            match mode {
+                                FederatedSearchMode::Progressive => {
+                                    searcher
+                                        .search_with_filter(
+                                            cx,
+                                            query,
+                                            per_index_limit,
+                                            filter,
+                                            shard_text,
+                                            on_phase,
+                                        )
+                                        .await
                                 }
-                                SearchPhase::RefinementFailed { .. } => {}
-                            },
-                        ));
+                                FederatedSearchMode::QualityOnly => {
+                                    searcher
+                                        .search_quality_only_with_filter(
+                                            cx,
+                                            query,
+                                            per_index_limit,
+                                            filter,
+                                            shard_text,
+                                            on_phase,
+                                        )
+                                        .await
+                                }
+                            }
+                        });
                         timeout(timeout_start, timeout_budget, future).await
                     };
                     // The timeout has dropped the unfinished future. A provider
@@ -893,8 +1072,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    use frankensearch_core::generation::{
+        EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1,
+        QuantizationFormat,
+    };
     use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
-    use frankensearch_core::{SearchError, TwoTierConfig};
+    use frankensearch_core::{ScoreSource, SearchError, SearchResult, TwoTierConfig};
     use frankensearch_index::TwoTierIndex;
 
     use super::{FederatedConfig, FederatedFusion, FederatedSearcher};
@@ -1253,6 +1436,119 @@ mod tests {
         )
         .with_quality_embedder(quality);
         (dir, Arc::new(searcher))
+    }
+
+    fn federated_query_identity(model: &str, dimension: usize) -> EmbeddingIdentityBundleV1 {
+        let dimension = u32::try_from(dimension).expect("fixture dimension fits u32");
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model, dimension);
+        "in-memory-f32".clone_into(&mut identity.storage.format);
+        identity.storage.quantization = QuantizationFormat::F32;
+        "native-f32-values".clone_into(&mut identity.storage.endianness);
+        identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+        identity.space.hash_control = None;
+        identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+        identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+            role: "weights".to_owned(),
+            sha256: "b".repeat(64),
+            size: 1,
+        }];
+        identity.producer.space_fingerprint = identity.space.fingerprint();
+        identity.validate().expect("semantic federation identity");
+        identity
+    }
+
+    struct CountingEmbedder {
+        inner: Arc<dyn Embedder>,
+        identity: EmbeddingIdentityBundleV1,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl Embedder for CountingEmbedder {
+        fn embed<'a>(
+            &'a self,
+            cx: &'a asupersync::Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.embed(cx, text)
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn is_semantic(&self) -> bool {
+            self.inner.is_semantic()
+        }
+
+        fn category(&self) -> ModelCategory {
+            self.inner.category()
+        }
+    }
+
+    fn build_counted_quality_searcher(
+        records: &[(&str, &[f32], &[f32])],
+        quality: Option<Arc<dyn Embedder>>,
+        fast_calls: Arc<AtomicU64>,
+        quality_calls: Arc<AtomicU64>,
+    ) -> SearcherFixture {
+        let dimension = records
+            .iter()
+            .find_map(|(_, fast, _)| (!fast.is_empty()).then_some(fast.len()))
+            .unwrap_or(1);
+        let quality_dimension = quality
+            .as_ref()
+            .map_or(dimension, |provider| provider.dimension());
+        let fast_identity = federated_query_identity("federated-fast", dimension);
+        let quality_identity = federated_query_identity("federated-quality", quality_dimension);
+        let directory = reserve_index_fixture_dir();
+        let mut builder = TwoTierIndex::create(directory.path(), TwoTierConfig::default()).unwrap();
+        builder.set_fast_identity(&fast_identity).unwrap();
+        builder.set_quality_identity(&quality_identity).unwrap();
+        for (doc_id, fast, refined) in records {
+            if !fast.is_empty() {
+                builder.add_fast_record(*doc_id, fast).unwrap();
+            }
+            if !refined.is_empty() {
+                builder.add_quality_record(*doc_id, refined).unwrap();
+            }
+        }
+        drop(builder.finish().unwrap());
+        let index =
+            Arc::new(TwoTierIndex::open(directory.path(), TwoTierConfig::default()).unwrap());
+        let mut searcher = TwoTierSearcher::new(
+            index,
+            Arc::new(CountingEmbedder {
+                inner: Arc::new(StubEmbedder::new("stub-fast", dimension)),
+                identity: fast_identity,
+                calls: fast_calls,
+            }),
+            TwoTierConfig {
+                quality_timeout_ms: 60_000,
+                quality_weight: 1.0,
+                ..TwoTierConfig::default()
+            },
+        );
+        if let Some(provider) = quality {
+            searcher = searcher.with_quality_embedder(Arc::new(CountingEmbedder {
+                inner: provider,
+                identity: quality_identity,
+                calls: quality_calls,
+            }));
+        }
+        (directory, Arc::new(searcher))
     }
 
     /// bd-3zh67 red proof: an out-of-the-box `FederatedSearcher` must return
@@ -2730,6 +3026,273 @@ mod tests {
             assert!(empty.hits.is_empty());
             assert!(empty.coverage.queried.is_empty());
         });
+    }
+
+    #[test]
+    fn federated_quality_only_uses_independent_candidates_without_fast_inference() {
+        use frankensearch_core::filter::IncludeDocIdsFilter;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast_calls = Arc::new(AtomicU64::new(0));
+            let quality_calls = Arc::new(AtomicU64::new(0));
+            let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("stub-quality", 3));
+            let (_directory, searcher) = build_counted_quality_searcher(
+                &[
+                    ("fast-winner", &[1.0, 0.0], &[0.1, 0.9, 0.0]),
+                    ("quality-winner", &[], &[1.0, 0.0, 0.0]),
+                    ("filtered-quality-winner", &[0.1, 0.9], &[0.9, 0.1, 0.0]),
+                ],
+                Some(quality),
+                Arc::clone(&fast_calls),
+                Arc::clone(&quality_calls),
+            );
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    candidate_pool_factor: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("primary", searcher, 1.0);
+            let query = "find related retry behavior";
+            let shared = federated
+                .search_quality_only(&cx, query, 1, |_| None)
+                .await
+                .unwrap();
+            let indexed = federated
+                .search_quality_only_with_index_text(&cx, query, 1, |name, _| {
+                    assert_eq!(name, "primary");
+                    None
+                })
+                .await
+                .unwrap();
+            assert!(shared.coverage.is_complete());
+            assert_eq!(shared.hits.len(), 1);
+            assert_eq!(shared.hits[0].result.doc_id, "quality-winner");
+            assert_eq!(shared.hits[0].result.source, ScoreSource::SemanticQuality);
+            assert!(shared.hits[0].result.fast_score.is_none());
+            assert!(shared.hits[0].result.quality_score.is_some());
+            assert_same_federated_hits(&indexed.hits, &shared.hits);
+
+            let filter = IncludeDocIdsFilter::new(["filtered-quality-winner"]);
+            let filtered = federated
+                .search_quality_only_with_filter(&cx, query, 1, Some(&filter), |doc_id| {
+                    assert_eq!(doc_id, "filtered-quality-winner");
+                    None
+                })
+                .await
+                .unwrap();
+            let filter_calls = AtomicU64::new(0);
+            let indexed_filtered = federated
+                .search_quality_only_with_index_filter(
+                    &cx,
+                    query,
+                    1,
+                    |name| {
+                        assert_eq!(name, "primary");
+                        filter_calls.fetch_add(1, Ordering::Relaxed);
+                        Some(&filter as &dyn frankensearch_core::filter::SearchFilter)
+                    },
+                    |name, doc_id| {
+                        assert_eq!(name, "primary");
+                        assert_eq!(doc_id, "filtered-quality-winner");
+                        None
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(filtered.coverage.is_complete());
+            assert_eq!(filtered.hits.len(), 1);
+            assert_eq!(filtered.hits[0].result.doc_id, "filtered-quality-winner");
+            assert_same_federated_hits(&indexed_filtered.hits, &filtered.hits);
+            assert_eq!(filter_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(fast_calls.load(Ordering::SeqCst), 0);
+            assert!(quality_calls.load(Ordering::SeqCst) > 0);
+        });
+    }
+
+    #[test]
+    fn federated_quality_only_admits_empty_requests_without_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast_calls = Arc::new(AtomicU64::new(0));
+            let quality_calls = Arc::new(AtomicU64::new(0));
+            let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("stub-quality", 2));
+            let (_healthy_directory, healthy) = build_counted_quality_searcher(
+                &[("quality-hit", &[0.1, 0.9], &[1.0, 0.0])],
+                Some(quality),
+                Arc::clone(&fast_calls),
+                Arc::clone(&quality_calls),
+            );
+            let healthy_federation = FederatedSearcher::new().add_index("primary", healthy, 1.0);
+            let filter_calls = AtomicU64::new(0);
+            for (query, limit) in [("", 1), ("find related retry behavior", 0)] {
+                let response = healthy_federation
+                    .search_quality_only_with_index_filter(
+                        &cx,
+                        query,
+                        limit,
+                        |name| {
+                            assert_eq!(name, "primary");
+                            filter_calls.fetch_add(1, Ordering::Relaxed);
+                            None
+                        },
+                        |_, _| panic!("empty admitted requests cannot hydrate documents"),
+                    )
+                    .await
+                    .unwrap();
+                assert!(response.hits.is_empty());
+                assert_eq!(response.coverage.queried, vec!["primary"]);
+                assert_eq!(response.coverage.answered, vec!["primary"]);
+                assert!(response.coverage.is_complete());
+            }
+            assert_eq!(filter_calls.load(Ordering::Relaxed), 2);
+
+            let (_unconfigured_directory, unconfigured) = build_counted_quality_searcher(
+                &[("fast-leak", &[1.0, 0.0], &[1.0, 0.0])],
+                None,
+                Arc::clone(&fast_calls),
+                Arc::clone(&quality_calls),
+            );
+            let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("stub-quality", 2));
+            let (_missing_directory, missing) = build_counted_quality_searcher(
+                &[("fast-leak", &[1.0, 0.0], &[])],
+                Some(quality),
+                Arc::clone(&fast_calls),
+                Arc::clone(&quality_calls),
+            );
+            for (name, unavailable) in [
+                ("missing-provider", unconfigured),
+                ("missing-index", missing),
+            ] {
+                let federated = FederatedSearcher::new().add_index(name, unavailable, 1.0);
+                for (query, limit) in [
+                    ("", 1),
+                    ("find related retry behavior", 0),
+                    ("find related retry behavior", 1),
+                ] {
+                    let error = federated
+                        .search_quality_only(&cx, query, limit, |_| {
+                            panic!("unavailable quality cannot read document text")
+                        })
+                        .await
+                        .unwrap_err();
+                    if name == "missing-provider" {
+                        assert!(matches!(error, SearchError::EmbedderUnavailable { .. }));
+                    } else {
+                        assert!(matches!(
+                            error,
+                            SearchError::InvalidConfig { field, value, .. }
+                                if field == "search_activation.quality" && value == "absent"
+                        ));
+                    }
+                }
+            }
+            assert_eq!(fast_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn federated_quality_only_reports_missing_quality_without_fast_fallback() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast_calls = Arc::new(AtomicU64::new(0));
+            let quality_calls = Arc::new(AtomicU64::new(0));
+            let (_unconfigured_directory, unconfigured) = build_counted_quality_searcher(
+                &[("fast-leak", &[1.0, 0.0], &[1.0, 0.0])],
+                None,
+                Arc::clone(&fast_calls),
+                Arc::clone(&quality_calls),
+            );
+            let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("stub-quality", 2));
+            let (_healthy_directory, healthy) = build_counted_quality_searcher(
+                &[("quality-hit", &[0.1, 0.9], &[1.0, 0.0])],
+                Some(quality),
+                Arc::clone(&fast_calls),
+                Arc::clone(&quality_calls),
+            );
+            for required in [1, 2] {
+                let result = FederatedSearcher::new()
+                    .with_config(FederatedConfig {
+                        min_indices: required,
+                        ..FederatedConfig::default()
+                    })
+                    .add_index("healthy", Arc::clone(&healthy), 1.0)
+                    .add_index("unavailable", Arc::clone(&unconfigured), 1.0)
+                    .search_quality_only(&cx, "find related retry behavior", 10, |_| None)
+                    .await;
+                if required == 1 {
+                    let response = result.unwrap();
+                    assert_eq!(response.hits.len(), 1);
+                    assert_eq!(response.hits[0].result.doc_id, "quality-hit");
+                    assert_eq!(response.hits[0].result.source, ScoreSource::SemanticQuality);
+                    assert!(response.hits[0].result.fast_score.is_none());
+                    assert!(response.hits[0].result.quality_score.is_some());
+                    assert_eq!(response.coverage.answered, vec!["healthy"]);
+                    assert_eq!(response.coverage.failed.len(), 1);
+                    assert_eq!(response.coverage.failed[0].index, "unavailable");
+                    assert!(!response.coverage.is_complete());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::FederatedInsufficientResponses {
+                            required: 2,
+                            received: 1,
+                        })
+                    ));
+                }
+            }
+            assert_eq!(fast_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn federated_quality_timeout_never_falls_back_to_fast_results() {
+        for cancel_on_drop in [false, true] {
+            asupersync::test_utils::run_test_with_cx(move |cx| async move {
+                let fast_calls = Arc::new(AtomicU64::new(0));
+                let quality_calls = Arc::new(AtomicU64::new(0));
+                let pending_quality = Arc::new(PendingEmbedder {
+                    cancel_on_drop,
+                    ..PendingEmbedder::new("pending-quality", 2)
+                });
+                let quality: Arc<dyn Embedder> = pending_quality.clone();
+                let (_pending_directory, pending) = build_counted_quality_searcher(
+                    &[("fast-leak", &[1.0, 0.0], &[1.0, 0.0])],
+                    Some(quality),
+                    Arc::clone(&fast_calls),
+                    Arc::clone(&quality_calls),
+                );
+                let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("stub-quality", 2));
+                let (_healthy_directory, healthy) = build_counted_quality_searcher(
+                    &[("quality-hit", &[0.1, 0.9], &[1.0, 0.0])],
+                    Some(quality),
+                    Arc::clone(&fast_calls),
+                    Arc::clone(&quality_calls),
+                );
+                let result = FederatedSearcher::new()
+                    .with_config(FederatedConfig {
+                        per_index_timeout_ms: 1_000,
+                        ..FederatedConfig::default()
+                    })
+                    .add_index("pending", pending, 1.0)
+                    .add_index("healthy", healthy, 1.0)
+                    .search_quality_only(&cx, "find related retry behavior", 10, |_| None)
+                    .await;
+                assert_eq!(pending_quality.started.load(Ordering::SeqCst), 1);
+                assert_eq!(pending_quality.dropped.load(Ordering::SeqCst), 1);
+                assert_eq!(fast_calls.load(Ordering::SeqCst), 0);
+                if cancel_on_drop {
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                } else {
+                    let response = result.unwrap();
+                    assert_eq!(response.hits.len(), 1);
+                    assert_eq!(response.hits[0].result.doc_id, "quality-hit");
+                    assert_eq!(response.hits[0].result.source, ScoreSource::SemanticQuality);
+                    assert_eq!(response.coverage.answered, vec!["healthy"]);
+                    assert_eq!(response.coverage.timed_out, vec!["pending"]);
+                    assert!(response.coverage.refinement_timed_out.is_empty());
+                    assert!(!response.coverage.is_complete());
+                }
+            });
+        }
     }
 
     #[test]
