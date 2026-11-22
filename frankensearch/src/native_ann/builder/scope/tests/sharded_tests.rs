@@ -282,7 +282,9 @@ fn independent_scoped_quality_keeps_its_own_partition_coordinates() {
             panic!("refined");
         };
         assert_eq!(results[0].result.doc_id, "d-quality");
-        assert!(results[0].fast_row.is_none());
+        let fast_row = results[0].fast_row.unwrap();
+        assert_eq!((fast_row.shard, fast_row.physical_row), (3, 0));
+        assert_eq!(results[0].result.fast_score, Some(0.0));
         assert_eq!(results[0].quality_row.unwrap().shard, 3);
         assert_eq!(results[0].result.quality_score, Some(1.0));
         assert_eq!(candidates.quality, 3);

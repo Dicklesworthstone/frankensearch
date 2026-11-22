@@ -324,7 +324,14 @@ fn independent_quality_finds_a_document_outside_the_global_fast_candidate_pool()
             .iter()
             .find(|hit| hit.result.doc_id == "zz-target")
             .unwrap();
-        assert!(winner.fast_row.is_none());
+        let fast_row = winner.fast_row.expect("live retained fast row");
+        let fast_owner = &built.vectors().fast().shard(fast_row.shard).unwrap().owner;
+        assert_eq!(
+            fast_owner
+                .doc_id_at(usize::try_from(fast_row.physical_row).unwrap())
+                .unwrap(),
+            "zz-target"
+        );
         assert!(winner.quality_row.is_some());
         assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
         assert_eq!(quality.calls.load(Ordering::SeqCst), 1);

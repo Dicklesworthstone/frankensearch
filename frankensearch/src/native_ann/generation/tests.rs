@@ -126,7 +126,7 @@ impl Embedder for ProgressiveProvider {
                 if special || text == "unmatched" {
                     vec![1.0, 0.0, 0.0]
                 } else if text == "fast-quality-ordinary cohort" {
-                    vec![0.6, 0.8, 0.0]
+                    vec![0.5, 0.866_025_4, 0.0]
                 } else {
                     vec![0.0, 1.0, 0.0]
                 }
@@ -266,9 +266,9 @@ async fn progressive_fixture_with_retrieval(
         progressive_policy(quality_ann, true),
     )
     .unwrap()
-    // Distinct fast scores keep the lowest fast-only candidate from tying
-    // the quality-only winner under the union-preserving blend policy.
-    // The quality-only document still lies outside the three-result fast pool.
+    // The fast leader's combined score is 0.3 + 0.7 * 0.5 = 0.65.
+    // The quality leader scores 0.7 after its live fast row adds a zero,
+    // and still lies outside the three-result fast pool.
     .add_documents(["a", "b", "c", "d", "e"].into_iter().map(|id| {
         let content = match id {
             "d" => "fast-tail-ordinary cohort",
@@ -540,6 +540,8 @@ fn progressive_authority_retrieves_quality_beyond_fast_window_and_defers_quality
             .await
             .unwrap();
         assert_eq!(refined[0].doc_id, "quality-only");
+        assert_eq!(refined[0].fast_score, Some(0.0));
+        assert_eq!(refined[0].quality_score, Some(1.0));
         assert!(refined[0].lexical_score.is_none());
         assert_eq!(refined[0].metadata.as_ref().unwrap()["version"], "old");
         let fast_before = fixture.fast.calls.load(Ordering::SeqCst);
@@ -1113,7 +1115,7 @@ fn pooled_retained_preview_yields_and_abandons_queued_work_without_starting_qual
                 ..
             })
         ));
-        assert!(
+        assert!(matches!(
             scope
                 .search_refined_text_with_pool(
                     &cx,
@@ -1123,10 +1125,14 @@ fn pooled_retained_preview_yields_and_abandons_queued_work_without_starting_qual
                     1,
                     handle
                 )
-                .await
-                .is_err()
-        );
-        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 1);
+                .await,
+            Err(SearchError::SubsystemError {
+                subsystem: "native_ann.query_worker",
+                ..
+            })
+        ));
+        // A shutdown pool must reject the quality request before inference.
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
     });
 }
 

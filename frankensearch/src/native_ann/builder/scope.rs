@@ -1866,7 +1866,7 @@ mod tests {
             };
             assert_eq!(results[0].doc_id, "d-quality");
             assert_eq!(results[0].quality_score, Some(1.0));
-            assert!(results[0].fast_score.is_none());
+            assert_eq!(results[0].fast_score, Some(0.0));
             assert_eq!(candidates.quality, 3);
             assert_eq!(candidates.lexical, 0);
             assert_row(&index, &results[0], false);
