@@ -15,8 +15,8 @@ use crate::{Cx, Embedder, LexicalRead, ScoreSource, ScoredResult, SearchResult, 
 
 /// The actual query response stays with its retrieved pool. Supplementary
 /// evidence must use these exact values, never a second inference of the text.
+/// Keep the complete identity bundle out of progressive state and join futures.
 pub(super) struct RetainedCandidates<T> {
-    // Keep the identity bundle out of line while this pool is held across phases.
     pub query: Option<Box<BoundQueryEmbedding>>,
     pub hits: Vec<T>,
 }
@@ -298,10 +298,10 @@ impl NativeAnnIndex {
         let hits = match worker {
             Some((owner, pool)) => {
                 owner
-                    .search_filtered_with_pool(cx, (*query).clone(), k, ef, pool, accept)
+                    .search_filtered_with_pool(cx, query.as_ref().clone(), k, ef, pool, accept)
                     .await?
             }
-            None => self.search_filtered(cx, &query, k, ef, accept)?,
+            None => self.search_filtered(cx, query.as_ref(), k, ef, accept)?,
         };
         Ok(RetainedCandidates {
             query: Some(query),

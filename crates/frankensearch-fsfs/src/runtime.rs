@@ -53620,13 +53620,20 @@ mod tests {
                 queue
                     .enqueue("doc.md", "sink-fast", &document.content_hash, 0)
                     .unwrap();
-            } else {
-                storage
-                    .connection()
-                    .execute_sync("UPDATE embedding_jobs SET started_at = 0;")
-                    .unwrap();
-                assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
+                assert!(
+                    queue
+                        .claim_batch("blocked-successor", 1)
+                        .unwrap()
+                        .is_empty()
+                );
             }
+            // Pending successors cannot pass a still-processing lease. Expire
+            // and reclaim it before the newer attempt publishes its vector.
+            storage
+                .connection()
+                .execute_sync("UPDATE embedding_jobs SET started_at = 0;")
+                .unwrap();
+            assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
             let new_claim = queue.claim_batch("sink-worker", 1).unwrap().pop().unwrap();
             let new_hash = new_claim.content_hash.as_ref().unwrap();
             let new_response = IdentityBoundEmbedding {
@@ -53650,14 +53657,7 @@ mod tests {
             );
             let wal_path = frankensearch_index::wal_path_for(&vector_path);
             let published_wal = fs::read(&wal_path).unwrap();
-            assert_eq!(
-                sink.persist(&old_write).unwrap(),
-                if replace_document {
-                    ClaimOutcome::Superseded
-                } else {
-                    ClaimOutcome::LostClaim
-                }
-            );
+            assert_eq!(sink.persist(&old_write).unwrap(), ClaimOutcome::LostClaim);
             assert_eq!(fs::read(&vector_path).unwrap(), original_bytes);
             assert_eq!(fs::read(&wal_path).unwrap(), published_wal);
             assert_eq!(queue.queue_depth().unwrap().completed, 1);
@@ -53672,6 +53672,74 @@ mod tests {
                 "old attempt changed the durable successor"
             );
         }
+    }
+
+    #[test]
+    fn live_vector_sink_rejects_changed_content_before_any_wal_write() {
+        use frankensearch_core::{EmbeddingIdentityBundleV1, IdentityBoundEmbedding};
+
+        let cx = Cx::for_testing();
+        let (storage, queue, old_claim) = live_sink_claim_fixture("sink-fast");
+        let old_hash = old_claim.content_hash.as_ref().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let vector_path = temp.path().join("fast.fsvi");
+        let identity = EmbeddingIdentityBundleV1::explicit_test_model("sink-fast", 2);
+        let mut writer = VectorIndex::create_with_revision(
+            &vector_path,
+            "sink-fast",
+            &identity.fingerprint(),
+            2,
+            frankensearch_index::Quantization::F16,
+        )
+        .unwrap();
+        writer.write_record("doc.md", &[1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+        let original_bytes = fs::read(&vector_path).unwrap();
+        let sink = LiveVectorSink {
+            vector_index: Arc::new(Mutex::new(VectorIndex::open(&vector_path).unwrap())),
+        };
+        let old_response = IdentityBoundEmbedding {
+            values: vec![0.0, 1.0],
+            identity,
+        };
+        let old_write =
+            ClaimedEmbeddingWrite::new(&cx, &queue, &old_claim, old_hash, &old_response);
+        assert!(matches!(
+            queue.check_claim(&old_claim, Some(old_hash)).unwrap(),
+            ClaimOutcome::Applied(_)
+        ));
+
+        let mut document = storage.get_document("doc.md").unwrap().unwrap();
+        document.content_preview = "replacement input".to_owned();
+        document.content_length = document.content_preview.len();
+        document.content_hash = ContentHasher::hash(&document.content_preview);
+        storage.upsert_document(&document).unwrap();
+        queue
+            .enqueue("doc.md", "sink-fast", &document.content_hash, 0)
+            .unwrap();
+        // Do not reclaim here: the original epoch remains processing and
+        // explicitly blocks its pending successor until sink admission retires it.
+        assert!(queue.claim_batch("new-worker", 1).unwrap().is_empty());
+        let depth = queue.queue_depth().unwrap();
+        assert_eq!(depth.processing, 1);
+        assert_eq!(depth.pending, 1);
+        assert_eq!(sink.persist(&old_write).unwrap(), ClaimOutcome::Superseded);
+        assert_eq!(fs::read(&vector_path).unwrap(), original_bytes);
+        assert!(!frankensearch_index::wal_path_for(&vector_path).exists());
+        let depth = queue.queue_depth().unwrap();
+        assert_eq!(depth.processing, 0);
+        assert_eq!(depth.pending, 1);
+        assert_eq!(depth.completed + depth.failed + depth.skipped, 0);
+        let successor = queue.claim_batch("new-worker", 1).unwrap().pop().unwrap();
+        assert_ne!(successor.job_id, old_claim.job_id);
+        assert_eq!(successor.content_hash, Some(document.content_hash));
+        drop(sink);
+
+        let durable = VectorIndex::open_read_only(&vector_path).unwrap();
+        let hits = durable.search_top_k(&[1.0, 0.0], 2, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc.md");
+        assert!(hits[0].score > 0.99);
     }
 
     #[test]

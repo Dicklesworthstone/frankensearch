@@ -413,10 +413,10 @@ impl NativeShardSet {
         let hits = match worker {
             Some((owner, pool)) => {
                 owner
-                    .search_filtered_with_pool(cx, (*query).clone(), k, ef, pool, accept)
+                    .search_filtered_with_pool(cx, query.as_ref().clone(), k, ef, pool, accept)
                     .await?
             }
-            None => self.search_filtered(cx, &query, k, ef, accept)?,
+            None => self.search_filtered(cx, query.as_ref(), k, ef, accept)?,
         };
         Ok(RetainedCandidates {
             query: Some(query),
