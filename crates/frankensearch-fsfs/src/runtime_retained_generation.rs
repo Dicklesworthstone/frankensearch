@@ -4220,7 +4220,7 @@ mod retained_search_tests {
                 !reader
                     .generation()
                     .path()
-                    .join(FSFS_EXPLAIN_SESSION_FILE)
+                    .join(FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
                     .exists()
             );
             reader

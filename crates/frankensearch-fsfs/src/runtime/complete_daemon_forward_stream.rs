@@ -2093,7 +2093,7 @@ mod generation_tests {
                     }
                     assert!(cache.is_empty());
                     assert!(
-                        FsfsRuntime::load_explain_session_at_root(&root)
+                        FsfsRuntime::load_complete_explain_session_at_root(&root)
                             .unwrap()
                             .is_none()
                     );
@@ -2222,7 +2222,7 @@ mod generation_tests {
                 if terminal.status == StreamTerminalStatus::Completed)
             );
             assert_eq!(store.active(&cx).unwrap(), selected);
-            let context = FsfsRuntime::load_explain_session_at_root(&root)
+            let context = FsfsRuntime::load_complete_explain_session_at_root(&root)
                 .unwrap()
                 .unwrap();
             assert_eq!(context.query, "sharedtoken");
@@ -2236,7 +2236,7 @@ mod generation_tests {
                     .as_ref()
                     .unwrap()
                     .path()
-                    .join("explain/last_search_session.json")
+                    .join(crate::runtime::FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
                     .exists()
             );
         });

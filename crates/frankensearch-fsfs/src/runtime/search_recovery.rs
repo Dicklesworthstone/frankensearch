@@ -932,7 +932,7 @@ mod tests {
             assert!(
                 !current
                     .path()
-                    .join(crate::runtime::FSFS_EXPLAIN_SESSION_FILE)
+                    .join(crate::runtime::FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
                     .exists()
             );
         });
