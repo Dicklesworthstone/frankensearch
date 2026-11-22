@@ -836,7 +836,7 @@ impl FsfsRuntime {
             // checkpoint; that checkpoint grants no completed-receipt carry.
             candidate.cli_input.full_reindex = !resumed;
             candidate.unchanged_sources = None;
-            candidate.seeded_from_receipt = false;
+            candidate.receipt_seed = None;
         }
         candidate.discovery_excluded_root = Some(store.root().to_path_buf());
         if let RetainedRebuildStart::Save(save) = start {

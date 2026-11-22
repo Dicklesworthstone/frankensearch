@@ -7598,7 +7598,7 @@ pub struct FsfsRuntime {
     /// to this executable and configuration. A file whose settled stamp or
     /// digest still matches is then carried forward like an observed-unchanged
     /// one; a legacy root proves the same through its own receipt.
-    seeded_from_receipt: bool,
+    receipt_seed: Option<retained_reuse::ReceiptSeed>,
     /// Successor and recovery builds need a readable source observation before
     /// absence can remove indexed membership, including cold/forced rebuilds.
     source_policy: IndexSourcePolicy,
@@ -7689,7 +7689,7 @@ impl FsfsRuntime {
             indexing_primary_tier: IndexingPrimaryTier::Fast,
             indexing_quality_deferral: None,
             unchanged_sources: None,
-            seeded_from_receipt: false,
+            receipt_seed: None,
             source_policy: IndexSourcePolicy::BestEffort,
             discovery_excluded_root: None,
         }
@@ -22453,6 +22453,14 @@ impl FsfsRuntime {
         // prompt to provision missing registered models; every other lane
         // (offline, non-TTY, machine formats, declined) falls through to the
         // existing typed readiness error with its `fsfs download-models` argv.
+        let can_reuse_without_inference = self.receipt_seed
+            == Some(retained_reuse::ReceiptSeed::CompleteGeneration)
+            && self.contract_upgrade_reuse_enabled()
+            && !quality_only
+            && !lexical_only
+            && !self.cli_input.full_reindex
+            && admitted_producers.fast.is_none()
+            && admitted_producers.quality.is_none();
         let embedder = if lexical_only {
             None
         } else if quality_only {
@@ -22488,7 +22496,9 @@ impl FsfsRuntime {
             let embedder = self.resolve_fast_embedder()?;
             control.checkpoint(cx, "index.fast_model_loaded", true)?;
             Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
-            Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+            if !can_reuse_without_inference {
+                Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+            }
             Some(embedder)
         };
         let (embedder_id, embedder_dimension) = embedder.as_ref().map_or_else(
@@ -22515,7 +22525,8 @@ impl FsfsRuntime {
             }
         };
         control.checkpoint(cx, "index.quality_model_loaded", true)?;
-        if !quality_already_admitted
+        if !can_reuse_without_inference
+            && !quality_already_admitted
             && let Some(quality_embedder) = quality_embedder.as_ref()
         {
             Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
@@ -22536,6 +22547,86 @@ impl FsfsRuntime {
             })
             .transpose()?;
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+
+        // 2. Validate the last durable checkpoint before opening index writers.
+        let vector_path = index_root.join(if quality_only {
+            FSFS_VECTOR_QUALITY_INDEX_FILE
+        } else {
+            FSFS_VECTOR_INDEX_FILE
+        });
+        let mut existing_checkpoint = match read_indexing_checkpoint(&index_root) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                warn!(error = %error, "ignoring malformed indexing checkpoint");
+                push_warning(
+                    &mut recent_warnings,
+                    IndexingWarningSeverity::Warn,
+                    format!("Ignoring malformed indexing checkpoint: {error}"),
+                );
+                None
+            }
+        };
+        // An interruption checkpoint proves its rows only to the build that
+        // wrote them; a completion receipt binds them to this executable and
+        // configuration.
+        let checkpoint_from_receipt =
+            if !self.cli_input.full_reindex && retain_legacy_reuse && existing_checkpoint.is_none()
+            {
+                existing_checkpoint = retained_reuse::legacy_checkpoint(cx, self, &index_root)?;
+                existing_checkpoint.is_some()
+            } else {
+                existing_checkpoint.is_some() && self.receipt_seed.is_some()
+            };
+        let target_root_label = target_root.display().to_string();
+        let index_root_label = index_root.display().to_string();
+        let checkpoint_metadata_valid = existing_checkpoint.as_ref().is_some_and(|checkpoint| {
+            !self.cli_input.full_reindex
+                && checkpoint.schema_version == INDEXING_CHECKPOINT_SCHEMA_VERSION
+                && checkpoint.artifacts_durable
+                && checkpoint.target_root == target_root_label
+                && checkpoint.index_root == index_root_label
+                && checkpoint.fast_window_max_per_file == fast_window_max_per_file
+        });
+        let checkpoint_manifests = if checkpoint_metadata_valid {
+            match Self::read_checkpoint_manifest_generation(
+                &index_root,
+                existing_checkpoint
+                    .as_ref()
+                    .expect("checkpoint checked above"),
+            ) {
+                Ok(manifests) => manifests,
+                Err(error) => {
+                    warn!(error = %error, "ignoring inconsistent checkpoint manifests");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let probe_free_digests = if can_reuse_without_inference
+            && let Some(producers) = primary_admission.as_ref().zip(quality_admission.as_ref())
+            && let Some(checkpoint) = existing_checkpoint.as_ref().zip(checkpoint_manifests.as_ref())
+        {
+            Box::pin(retained_reuse::prove_two_tier_reuse_without_inference(
+                cx,
+                &index_root,
+                &candidates,
+                source_policy,
+                checkpoint,
+                producers,
+            ))
+            .await?
+        } else {
+            None
+        };
+        if can_reuse_without_inference && probe_free_digests.is_none() {
+            if let Some(embedder) = embedder.as_ref() {
+                Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+            }
+            if let Some(quality_embedder) = quality_embedder.as_ref() {
+                Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
+            }
+        }
 
         control.checkpoint(cx, "index.artifact_directories", true)?;
         publication_lease.fence("one-shot index artifact directories")?;
@@ -22566,61 +22657,6 @@ impl FsfsRuntime {
             &recent_warnings,
         ))?;
 
-        // 2. Prepare indexes and validate the last durable checkpoint generation.
-        let vector_path = index_root.join(if quality_only {
-            FSFS_VECTOR_QUALITY_INDEX_FILE
-        } else {
-            FSFS_VECTOR_INDEX_FILE
-        });
-        let mut existing_checkpoint = match read_indexing_checkpoint(&index_root) {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => {
-                warn!(error = %error, "ignoring malformed indexing checkpoint");
-                push_warning(
-                    &mut recent_warnings,
-                    IndexingWarningSeverity::Warn,
-                    format!("Ignoring malformed indexing checkpoint: {error}"),
-                );
-                None
-            }
-        };
-        // An interruption checkpoint proves its rows only to the build that
-        // wrote them; a completion receipt binds them to this executable and
-        // configuration.
-        let checkpoint_from_receipt =
-            if !self.cli_input.full_reindex && retain_legacy_reuse && existing_checkpoint.is_none()
-            {
-                existing_checkpoint = retained_reuse::legacy_checkpoint(cx, self, &index_root)?;
-                existing_checkpoint.is_some()
-            } else {
-                existing_checkpoint.is_some() && self.seeded_from_receipt
-            };
-        let target_root_label = target_root.display().to_string();
-        let index_root_label = index_root.display().to_string();
-        let checkpoint_metadata_valid = existing_checkpoint.as_ref().is_some_and(|checkpoint| {
-            !self.cli_input.full_reindex
-                && checkpoint.schema_version == INDEXING_CHECKPOINT_SCHEMA_VERSION
-                && checkpoint.artifacts_durable
-                && checkpoint.target_root == target_root_label
-                && checkpoint.index_root == index_root_label
-                && checkpoint.fast_window_max_per_file == fast_window_max_per_file
-        });
-        let checkpoint_manifests = if checkpoint_metadata_valid {
-            match Self::read_checkpoint_manifest_generation(
-                &index_root,
-                existing_checkpoint
-                    .as_ref()
-                    .expect("checkpoint checked above"),
-            ) {
-                Ok(manifests) => manifests,
-                Err(error) => {
-                    warn!(error = %error, "ignoring inconsistent checkpoint manifests");
-                    None
-                }
-            }
-        } else {
-            None
-        };
         // Source discovery is the membership authority on a cold rebuild.
         // Without a proven checkpoint, old Quill rows may include an aborted
         // batch or an out-of-protocol mutation absent from both manifests.
@@ -22924,14 +22960,18 @@ impl FsfsRuntime {
                 // carried, so its rows and manifest take the new revision
                 // (bd-rhpnx).
                 let revision_changed = entry.revision != revision || manifest.revision != revision;
+                let digest_already_proven = probe_free_digests
+                    .as_ref()
+                    .is_some_and(|keys| keys.contains(&candidate.file_key));
                 let unchanged = !revision_changed
                     && entry.canonical_lines.is_some()
                     && (observed_unchanged(&candidate.file_path)
-                        || same_stamp(candidate, entry.stamp.as_ref()));
+                        || same_stamp(candidate, entry.stamp.as_ref())
+                        || digest_already_proven);
                 let content_hash_hex = if unchanged {
                     // The seeded generation recorded this digest for the same
-                    // bytes, unchanged since by the watch's observation or by
-                    // the settled stamp they were read under.
+                    // bytes, confirmed by a watcher, a settled stamp, or the
+                    // source digest read before opening the index writers.
                     entry.content_hash_hex.clone()
                 } else {
                     let Some(bytes) = read_source_for_reuse(cx, candidate, source_policy).await?
@@ -22964,7 +23004,7 @@ impl FsfsRuntime {
                         candidate.file_key.clone(),
                         candidate.ingestion_class == IngestionClass::FullSemanticLexical,
                     );
-                    if !unchanged {
+                    if !unchanged || digest_already_proven {
                         digest_proven.insert(candidate.file_key.clone());
                     }
                 }
@@ -23175,6 +23215,19 @@ impl FsfsRuntime {
             } else {
                 reading.push(candidate);
             }
+        }
+
+        if probe_free_digests.is_some()
+            && (!reading.is_empty()
+                || !lexical_reconciliation_ids.is_empty()
+                || reusable_quality_ids.len() != reusable_semantic_ids.len())
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "index.generation".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "the seeded generation changed after its reuse check; retry indexing"
+                    .to_owned(),
+            });
         }
 
         // Only a durable checkpoint admits work to a later run; an undurable one

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::super::super::set_test_fast_embedder;
 use super::super::{
     CompleteGenerationStore, FsfsRuntime, LEGACY_RECEIPT_FILE, LegacyReuseReceipt, RECEIPT_FILE,
-    ReuseReceipt, proven, read_json, seed_candidate, session_id,
+    ReceiptSeed, ReuseReceipt, proven, read_json, seed_candidate, session_id,
 };
 use crate::config::load_from_str;
 use crate::generation_store::{GenerationPublication, PublishedGeneration};
@@ -242,7 +242,11 @@ fn restart_child() {
             let mut input = runtime.cli_input.clone();
             input.index_dir = Some(build.path().to_path_buf());
             let candidate = runtime.clone().with_cli_input(input);
-            seeded = seed_candidate(&cx, &candidate, &store, build.path()).unwrap();
+            seeded = match seed_candidate(&cx, &candidate, &store, build.path()).unwrap() {
+                Some((ReceiptSeed::CompleteGeneration, files)) => Some(files),
+                Some((ReceiptSeed::Legacy, _)) => panic!("a complete predecessor was selected"),
+                None => None,
+            };
             if seeded.is_none() {
                 assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
             }

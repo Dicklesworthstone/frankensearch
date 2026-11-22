@@ -117,14 +117,16 @@ the file; the CLI flag overrides either environment variable. The canonical
 accept hyphens or underscores. Unknown policies fail configuration loading.
 Use `--upgrade-reuse same-executable` to restore the conservative policy for a run.
 
-This opt-in only removes the requirement for identical executable fingerprints
+This opt-in removes the requirement for identical executable fingerprints
 when a completion receipt contains the matching versioned indexing contract.
 It preserves configuration, target-root, checkpoint, artifact-integrity,
 source-content and producer-identity checks. Changed source files still require
 indexing, and a changed model or indexing contract cannot reuse incompatible
 work. Complete-generation rebuilds seed an independently verified staging copy,
 leaving the selected predecessor intact until publication. Legacy-layout
-indexing uses the same receipt admission policy.
+indexing uses the same receipt admission policy. An unchanged, already selected
+two-tier generation can skip startup inference after the source, both producer
+identities, and both tiers' complete row coverage have been verified.
 
 `--full` and `--force` still bypass completed-work reuse. The upgrade policy is
 excluded from the indexing configuration fingerprint because it changes

@@ -13,7 +13,7 @@
 //! binding the evidence to their actual serving artifacts under the publication
 //! lease. They still pass through ordinary indexing and publication admission.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,13 +22,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_index::VectorIndex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CheckpointFileEntry, CliCommand, FSFS_CHECKPOINT_FILE, FsfsIndexPayload, FsfsRuntime,
-    INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexingCheckpoint, SearchExecutionMode,
-    content_sha256_hex, retained_search_checkpoint, write_indexing_checkpoint,
+    AdmittedEmbedder, BlueGreenEngine, CheckpointFileEntry, CheckpointReuse, CliCommand,
+    FSFS_CHECKPOINT_FILE, FSFS_VECTOR_INDEX_FILE, FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsIndexPayload,
+    FsfsRuntime, INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexCandidate, IndexSourcePolicy,
+    IndexManifestEntry, IndexingCheckpoint, IngestionClass, SearchExecutionMode,
+    checkpoint_entry_reuse, content_sha256_hex, file_matches_digest, retained_search_checkpoint,
+    vector_checkpoint_reusable, vector_live_doc_ids, write_indexing_checkpoint,
 };
 use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore, GenerationBuild, PublishedGeneration,
@@ -54,6 +58,12 @@ const MAX_COPY_DEPTH: usize = 64;
 const MAX_COPY_ENTRIES: usize = 200_000;
 const MAX_LEGACY_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 static SESSION: OnceLock<String> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReceiptSeed {
+    CompleteGeneration,
+    Legacy,
+}
 
 /// Caller-owned handoff for one interrupted, inactive source recovery build.
 ///
@@ -444,15 +454,17 @@ impl FsfsRuntime {
         F: FnMut(&super::IndexingProgressSnapshot) -> SearchResult<()>,
     {
         execution::prepare(cx).await?;
-        let seeded;
-        let runtime = if !resumed && seed_candidate(cx, self, store, candidate_root)?.is_some() {
-            let mut runtime = self.clone();
-            runtime.seeded_from_receipt = true;
-            seeded = runtime;
-            &seeded
+        let seed = if resumed {
+            None
         } else {
-            self
+            seed_candidate(cx, self, store, candidate_root)?
         };
+        let seeded = seed.map(|(seed, _)| {
+            let mut runtime = self.clone();
+            runtime.receipt_seed = Some(seed);
+            runtime
+        });
+        let runtime = seeded.as_ref().unwrap_or(self);
         let payload = Box::pin(runtime.run_one_shot_index_with_producers(
             cx,
             CliCommand::Index,
@@ -467,6 +479,112 @@ impl FsfsRuntime {
         write_receipt(cx, candidate_root, &receipt)?;
         Ok(payload)
     }
+}
+
+/// Given the validated checkpoint of a seeded complete generation, prove that
+/// every row can be carried without invoking either producer. Return the files
+/// whose bytes were read so ordinary checkpoint validation can reuse the digests.
+pub(super) async fn prove_two_tier_reuse_without_inference(
+    cx: &Cx,
+    index_root: &Path,
+    candidates: &[IndexCandidate],
+    source_policy: IndexSourcePolicy,
+    checkpoint_and_manifests: (&IndexingCheckpoint, &BTreeMap<String, IndexManifestEntry>),
+    producers: (&AdmittedEmbedder, &AdmittedEmbedder),
+) -> SearchResult<Option<HashSet<String>>> {
+    let (primary, quality) = producers;
+    let (checkpoint, manifests) = checkpoint_and_manifests;
+    if !checkpoint.content_skipped.is_empty() || checkpoint.files.len() != candidates.len() {
+        return Ok(None);
+    }
+    let Ok(layout) = FsfsRuntime::resolve_lexical_engine(index_root) else {
+        return Ok(None);
+    };
+    if layout.engine() != Some(BlueGreenEngine::Quill)
+        || !layout.engine_dir().is_some_and(|dir| {
+            matches!(FsfsRuntime::quill_engine_schema_is_stale(&dir), Ok(false))
+        })
+    {
+        return Ok(None);
+    }
+
+    let read_ids = |path, admission: &AdmittedEmbedder| {
+        let index = VectorIndex::open_read_only(&index_root.join(path)).ok()?;
+        let embedder = admission.embedder();
+        if !vector_checkpoint_reusable(
+            &index,
+            embedder.id(),
+            &admission.identity.fingerprint(),
+            embedder.dimension(),
+        ) {
+            return None;
+        }
+        vector_live_doc_ids(&index).ok()
+    };
+    let (Some(fast_ids), Some(quality_ids)) = (
+        read_ids(FSFS_VECTOR_INDEX_FILE, primary),
+        read_ids(FSFS_VECTOR_QUALITY_INDEX_FILE, quality),
+    ) else {
+        return Ok(None);
+    };
+    let mut expected_fast = HashSet::new();
+    let mut expected_quality = HashSet::new();
+    for candidate in candidates {
+        retained_search_checkpoint(cx)?;
+        let (Some(entry), Some(manifest)) = (
+            checkpoint.files.get(&candidate.file_key),
+            manifests.get(&candidate.file_key),
+        ) else {
+            return Ok(None);
+        };
+        let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
+        if !matches!(
+            candidate.ingestion_class,
+            IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
+        ) || entry.revision != revision
+            || manifest.revision != revision
+            || entry.canonical_lines.is_none()
+            || !hex_digest(&entry.content_hash_hex)
+            || checkpoint_entry_reuse(
+                checkpoint,
+                entry,
+                manifest,
+                candidate,
+                &entry.content_hash_hex,
+                primary.embedder().id(),
+                primary.embedder().dimension(),
+                false,
+                &fast_ids,
+            ) != CheckpointReuse::Complete
+        {
+            return Ok(None);
+        }
+        if candidate.ingestion_class == IngestionClass::FullSemanticLexical {
+            expected_quality.insert(candidate.file_key.clone());
+            if let Some(plan) = entry.fast_windows.as_ref() {
+                expected_fast.extend(plan.row_ids(&candidate.file_key));
+            } else {
+                expected_fast.insert(candidate.file_key.clone());
+            }
+        }
+    }
+    if expected_quality.is_empty() || expected_quality != quality_ids || expected_fast != fast_ids {
+        return Ok(None);
+    }
+
+    let mut digest_proven = HashSet::new();
+    for candidate in candidates {
+        retained_search_checkpoint(cx)?;
+        let entry = &checkpoint.files[&candidate.file_key];
+        if candidate.stamp.is_some() && candidate.stamp == entry.stamp {
+            continue;
+        }
+        if !file_matches_digest(cx, candidate, Some(&entry.content_hash_hex), source_policy).await? {
+            return Ok(None);
+        }
+        digest_proven.insert(candidate.file_key.clone());
+    }
+    Ok(Some(digest_proven))
 }
 
 fn completed_receipt(
@@ -1151,13 +1269,13 @@ pub(super) fn copy_selected_generation(
 /// Must be called while the caller owns `store.begin()` and before opening any
 /// candidate resources. Missing/incompatible evidence starts cold; malformed
 /// evidence or damaged selection is an error, not permission to reuse data.
-/// Returns `None` for a cold start, else the seeded semantic files.
+/// Reports the kind of receipt and the number of covered semantic files.
 fn seed_candidate(
     cx: &Cx,
     runtime: &FsfsRuntime,
     store: &CompleteGenerationStore,
     destination: &Path,
-) -> SearchResult<Option<usize>> {
+) -> SearchResult<Option<(ReceiptSeed, usize)>> {
     retained_search_checkpoint(cx)?;
     if runtime.cli_input.full_reindex {
         return Ok(None);
@@ -1251,7 +1369,7 @@ fn seed_candidate(
         linked_segments = stats.linked,
         "seeded isolated generation; ordinary source-hash and producer checks decide actual reuse"
     );
-    Ok(Some(eligible))
+    Ok(Some((ReceiptSeed::CompleteGeneration, eligible)))
 }
 
 /// The first complete build in a directory that still holds a legacy index
@@ -1266,7 +1384,7 @@ fn seed_candidate_from_legacy(
     runtime: &FsfsRuntime,
     root: &Path,
     destination: &Path,
-) -> SearchResult<Option<usize>> {
+) -> SearchResult<Option<(ReceiptSeed, usize)>> {
     let Some(evidence) = admitted_legacy_evidence(cx, runtime, root)? else {
         return Ok(None);
     };
@@ -1338,7 +1456,7 @@ fn seed_candidate_from_legacy(
         linked_segments = stats.linked,
         "seeded the first complete generation from the legacy index it converts"
     );
-    Ok(Some(eligible))
+    Ok(Some((ReceiptSeed::Legacy, eligible)))
 }
 
 /// Charge entries while enumerating, including siblings awaiting recursion.
@@ -3080,6 +3198,11 @@ mod generation_tests {
         /// controls exercise both tiers and the final, previously omitted batch.
         async fn run_counted(cx: &Cx, parent: &Path, operation: &str) -> serde_json::Value {
             let (mut runtime, source, root) = fixture(parent, 0);
+            let compatible_operation = operation.strip_prefix("compatible-");
+            if compatible_operation.is_some() {
+                runtime = runtime.with_contract_upgrade_reuse(true);
+            }
+            let operation = compatible_operation.unwrap_or(operation);
             runtime.config.search.fast_only = false;
             runtime.config.search.quality_timeout_ms = 5_000;
             "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
@@ -3302,6 +3425,38 @@ mod generation_tests {
                 assert_index_calls(&changed, 1, 1);
                 let warm = run_counted(&cx, parent.path(), "index").await;
                 assert_index_calls(&warm, 0, 0);
+            });
+        }
+
+        #[test]
+        fn compatible_two_tier_build_skips_all_inference_only_for_unchanged_inputs() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, _) = fixture(parent.path(), 2);
+                let run = |operation| run_counted(&cx, parent.path(), operation);
+                let cold = run("compatible-index").await;
+                assert_index_calls(&cold, 2, 2);
+                let warm = run("compatible-index").await;
+                assert_eq!(warm["fast_documents"], 0);
+                assert_eq!(warm["quality_documents"], 0);
+                assert_eq!(warm["fast_probes"], 0);
+                assert_eq!(warm["quality_probes"], 0);
+                assert_ne!(cold["generation"], warm["generation"]);
+                assert_index_calls(&run("index").await, 0, 0);
+
+                let changed = source.join("doc-0.md");
+                let modified = fs::metadata(&changed).unwrap().modified().unwrap();
+                fs::write(&changed, "sharedtoken revision 0").unwrap();
+                File::options()
+                    .write(true)
+                    .open(&changed)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+                assert_index_calls(&run("compatible-index").await, 1, 1);
+                assert_index_calls(&run("compatible-force").await, 2, 2);
+                let drift = run("compatible-quality_drift").await;
+                assert_index_calls(&drift, 0, 2);
             });
         }
 
@@ -3617,7 +3772,7 @@ mod generation_tests {
             let next = candidate(&runtime, build.path());
             assert_eq!(
                 seed_candidate(&cx, &next, &store, build.path()).unwrap(),
-                Some(4)
+                Some((ReceiptSeed::CompleteGeneration, 4))
             );
             let checkpoint: IndexingCheckpoint =
                 read_json(&cx, &build.path().join(FSFS_CHECKPOINT_FILE)).unwrap();

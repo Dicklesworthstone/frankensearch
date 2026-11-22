@@ -5146,9 +5146,13 @@ mod loader_only {
         old.binary = previous;
         let current = IsolatedFsfs::new(temp.path(), models);
         let observe = [
-            ("RUST_LOG", "frankensearch_fsfs::indexing=debug"),
+            (
+                "RUST_LOG",
+                "frankensearch_fsfs=info,frankensearch_fsfs::indexing=debug",
+            ),
             ("FSFS_COMPLETE_GENERATIONS", "1"),
         ];
+        let probe_succeeded = "event=\"fsfs.semantic_probe_succeeded\"";
         // A separate incumbent per control prevents an earlier B run from
         // replacing the A receipt and accidentally turning upgrade into same-ELF reuse.
         for (control, flags, expected_carried) in [
@@ -5198,6 +5202,12 @@ mod loader_only {
                 &observe,
             );
             assert_finished_successfully("previous executable", &first);
+            assert_eq!(
+                first.stderr.matches(probe_succeeded).count(),
+                2,
+                "the real two-tier cold build must exercise the probe observation: {}",
+                first.stderr
+            );
             let prior_root = active_generation_root(&index);
             let prior_fast = fs::read(prior_root.join("vector/index.fsvi")).unwrap();
             let prior_quality = fs::read(prior_root.join("vector/quality.fsvi")).unwrap();
@@ -5297,10 +5307,16 @@ mod loader_only {
                 .stderr
                 .matches("fsfs admitted indexing embedding batch")
                 .count();
+            let probes = result.stderr.matches(probe_succeeded).count();
             if control == "compatible" {
+                let probe_events = result
+                    .stderr
+                    .matches("event=\"fsfs.semantic_probe_")
+                    .count();
                 assert_eq!(
-                    calls, 0,
-                    "no new indexing embedding admission: {}",
+                    (calls, probe_events),
+                    (0, 0),
+                    "unchanged inputs must require zero indexing inference: {}",
                     result.stderr
                 );
                 let next_root = active_generation_root(&index);
@@ -5318,6 +5334,7 @@ mod loader_only {
                     "cold control must exercise the observation point: {}",
                     result.stderr
                 );
+                assert_eq!(probes, 2, "{}", result.stderr);
             }
             assert_eq!(
                 fs::read(prior_root.join("FSFS-REUSE.json")).unwrap(),
@@ -5352,7 +5369,7 @@ mod loader_only {
                 );
             }
             eprintln!(
-                "[upgrade-reuse] control={control} source_documents={QUICKSTART_DOCUMENT_COUNT} carried={expected_carried} indexing_embedding_admissions={calls} previous_sha={previous_sha:?} current_sha={current_sha:?} functional_only=true"
+                "[upgrade-reuse] control={control} source_documents={QUICKSTART_DOCUMENT_COUNT} carried={expected_carried} indexing_embedding_admissions={calls} startup_probes={probes} previous_sha={previous_sha:?} current_sha={current_sha:?} functional_only=true"
             );
         }
     }
