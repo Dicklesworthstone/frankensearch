@@ -10936,14 +10936,14 @@ mod tests {
     }
 
     #[test]
-    fn native_refresh_rebuilds_edited_deleted_and_tombstoned_rows() {
+    fn native_refresh_rebuilds_edited_and_physically_removed_rows() {
         let mut original = [
             ("alpha", [1.0, 0.0, 0.0, 0.0].as_slice()),
             ("bravo", [0.0, 1.0, 0.0, 0.0].as_slice()),
             ("charlie", [0.0, 0.0, 1.0, 0.0].as_slice()),
         ];
         original.sort_by_key(|(doc_id, _)| crate::fnv1a_hash(doc_id.as_bytes()));
-        for change in ["edit", "delete", "tombstone"] {
+        for change in ["edit", "delete"] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
             let cx = Cx::for_testing();
@@ -10978,18 +10978,6 @@ mod tests {
             }
             let (next_paths, next_fast, next_quality) =
                 native_refresh_generation(root, 3, &changed, &original);
-            if change == "tombstone" {
-                let mut writer =
-                    VectorIndex::create_v2(next_paths.fast_index(), next_fast.clone()).unwrap();
-                for (doc_id, vector) in &changed {
-                    if *doc_id == "bravo" {
-                        writer.write_tombstone_record(doc_id, vector).unwrap();
-                    } else {
-                        writer.write_record(doc_id, vector).unwrap();
-                    }
-                }
-                writer.finish().unwrap();
-            }
             let mut rebuilt = TwoTierIndex::open_admitted_v2_with_paths(
                 &next_paths,
                 TwoTierConfig::default(),
@@ -11022,6 +11010,147 @@ mod tests {
             }
             assert!(index.has_native_quality_hnsw());
             assert_eq!(index.quality_admitted_owner().unwrap().live_count(), 3);
+        }
+    }
+
+    #[test]
+    fn native_refresh_reuses_tombstones_and_restorations_in_each_tier() {
+        let mut rows = [
+            ("alpha", [1.0, 0.0, 0.0, 0.0].as_slice()),
+            ("bravo", [0.0, 1.0, 0.0, 0.0].as_slice()),
+            ("charlie", [0.0, 0.0, 1.0, 0.0].as_slice()),
+        ];
+        rows.sort_by_key(|(doc_id, _)| crate::fnv1a_hash(doc_id.as_bytes()));
+        let (_, fast_identity) = fsvi_v2_binding("incremental-refresh-fast", 4, 1);
+        let (_, quality_identity) = fsvi_v2_binding("incremental-refresh-quality", 4, 1);
+        let embeddings = TieredQueryEmbeddings::progressive(
+            bound_query(&fast_identity, &[0.0, 1.0, 0.0, 0.0]),
+            bound_query(&quality_identity, &[0.0, 0.0, 1.0, 0.0]),
+        );
+        for (delete_fast, delete_quality) in [(true, false), (false, true), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let cx = Cx::for_testing();
+            let (paths, fast, quality) = native_refresh_generation(root, 1, &rows[1..], &rows[1..]);
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &fast,
+                Some(&quality),
+            )
+            .unwrap();
+            let params = HnswParams::default();
+            index.enable_native_fast_hnsw(&cx, params, 3).unwrap();
+            index.enable_native_quality_hnsw(&cx, params, 7).unwrap();
+            let (paths, fast, quality) = native_refresh_generation(root, 2, &rows, &rows);
+            index
+                .try_replace_admitted_v2(&cx, &paths, &fast, Some(&quality))
+                .unwrap();
+            // These graphs preserve an append's nonidentity row permutation.
+            // Rebuilding after a liveness change cannot produce the same bytes.
+            let previous_fast = index
+                .save_native_fast_hnsw(&root.join("previous-fast.fshnsw"))
+                .unwrap();
+            let previous_quality = index
+                .save_native_quality_hnsw(&root.join("previous-quality.fshnsw"))
+                .unwrap();
+
+            for (sequence, restore) in [(3, false), (4, true)] {
+                let (paths, fast, quality) =
+                    native_refresh_generation(root, sequence, &rows, &rows);
+                if !restore {
+                    for (delete, path, binding, removed) in [
+                        (delete_fast, paths.fast_index(), &fast, "bravo"),
+                        (
+                            delete_quality,
+                            paths.quality_index().unwrap(),
+                            &quality,
+                            "charlie",
+                        ),
+                    ] {
+                        if delete {
+                            let mut writer = VectorIndex::create_v2(path, binding.clone()).unwrap();
+                            for (doc_id, vector) in &rows {
+                                if *doc_id == removed {
+                                    writer.write_tombstone_record(doc_id, vector).unwrap();
+                                } else {
+                                    writer.write_record(doc_id, vector).unwrap();
+                                }
+                            }
+                            writer.finish().unwrap();
+                        }
+                    }
+                }
+                index
+                    .try_replace_admitted_v2(&cx, &paths, &fast, Some(&quality))
+                    .unwrap();
+                let mut reopened = TwoTierIndex::open_admitted_v2_with_paths(
+                    &paths,
+                    TwoTierConfig::default(),
+                    &fast,
+                    Some(&quality),
+                )
+                .unwrap();
+                for (tier, deleted, previous, seed) in [
+                    ("fast", delete_fast, &previous_fast, 3),
+                    ("quality", delete_quality, &previous_quality, 7),
+                ] {
+                    let graph_path = root.join(format!("state-{sequence}-{tier}.fshnsw"));
+                    let receipt = if tier == "fast" {
+                        let receipt = index.save_native_fast_hnsw(&graph_path).unwrap();
+                        reopened
+                            .load_native_fast_hnsw(&graph_path, params, seed)
+                            .unwrap();
+                        receipt
+                    } else {
+                        let receipt = index.save_native_quality_hnsw(&graph_path).unwrap();
+                        reopened
+                            .load_native_quality_hnsw(&graph_path, params, seed)
+                            .unwrap();
+                        receipt
+                    };
+                    assert_eq!(receipt.graph_sha256, previous.graph_sha256, "{tier}");
+                    assert_eq!(receipt.topology_sha256, previous.topology_sha256, "{tier}");
+                    assert_ne!(receipt.receipt_sha256, previous.receipt_sha256);
+                    assert_eq!(receipt.artifact_generation.sequence, sequence);
+                    assert_eq!(
+                        receipt.ordered_live_docset_digest == previous.ordered_live_docset_digest,
+                        !deleted || restore,
+                        "{tier} must attest its own current liveness"
+                    );
+                }
+                for candidate in [&index, &reopened] {
+                    let activated = candidate
+                        .activate_owner_backed_search(&cx, &embeddings)
+                        .unwrap();
+                    let fast_hits = activated.search_fast(3).unwrap();
+                    let quality_hits = activated.search_quality(3).unwrap();
+                    assert_eq!(
+                        fast_hits.len(),
+                        rows.len() - usize::from(delete_fast && !restore)
+                    );
+                    assert_eq!(
+                        quality_hits.len(),
+                        rows.len() - usize::from(delete_quality && !restore)
+                    );
+                    assert_eq!(
+                        fast_hits,
+                        activated.fast().unwrap().search_top_k(3).unwrap()
+                    );
+                    assert_eq!(
+                        quality_hits,
+                        activated.quality().unwrap().search_top_k(3).unwrap()
+                    );
+                    assert_eq!(
+                        fast_hits.iter().any(|hit| hit.doc_id == "bravo"),
+                        !delete_fast || restore
+                    );
+                    assert_eq!(
+                        quality_hits.iter().any(|hit| hit.doc_id == "charlie"),
+                        !delete_quality || restore
+                    );
+                }
+            }
         }
     }
 

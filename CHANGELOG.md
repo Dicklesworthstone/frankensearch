@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Native HNSW refresh now reuses graph topology across logical deletion and
+  restoration when retained document identities and persisted vectors match.
+  Fast and quality tiers bind reused graphs to fresh owner receipts, including
+  the new live document set, while retained readers keep their previous view.
+  Vector edits and physically removed rows still require rebuilding.
 - Federated search now reports a shard's quality-refinement failure even when
   the shard retains valid Initial results or later completes reranking. Those
   hits still count toward the minimum-response requirement, while coverage

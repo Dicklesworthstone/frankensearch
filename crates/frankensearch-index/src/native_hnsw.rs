@@ -1145,21 +1145,24 @@ impl ValidatedNativeHnsw {
         Ok(bound)
     }
 
-    /// Reuse this graph for an unchanged or append-only successor owner.
+    /// Reuse this graph for a successor with retained vectors and optional appends.
     ///
     /// The successor must have a strictly newer generation and the same full
     /// embedding, producer, input and storage identities. Every old document
-    /// must still occur exactly once with the same persisted vector bytes and
-    /// LIVE/TOMBSTONE state. Physical rows may move: graph node IDs stay stable
-    /// and a validated permutation binds them to the successor's exact rows.
+    /// must still occur exactly once with the same persisted vector bytes.
+    /// LIVE/TOMBSTONE transitions are allowed: both states were already indexed
+    /// as routing nodes, and search filters hits through the successor owner.
+    /// Physical rows may move: graph node IDs stay stable and a validated
+    /// permutation binds them to the successor's exact rows.
     /// Only new documents run graph insertion; unchanged membership copies the
     /// existing topology without rebuilding its neighborhoods.
     ///
-    /// `Ok(None)` means changed identities, edited/deleted rows or smaller
-    /// membership require an explicit full rebuild. It does not mean a failed
-    /// or cancelled attempt may silently fall back. No files are touched, the
+    /// `Ok(None)` means changed identities, edited vectors or physically removed
+    /// rows require an explicit full rebuild. It does not mean a failed or
+    /// cancelled attempt may silently fall back. No files are touched, the
     /// predecessor stays unchanged, and the returned handle owns the successor.
-    /// A later save produces a new graph/receipt bound to that generation.
+    /// A later save produces a new receipt bound to that generation's exact
+    /// live document set and whole FSVI image, even when graph bytes are unchanged.
     ///
     /// # Errors
     ///
@@ -1221,7 +1224,12 @@ impl ValidatedNativeHnsw {
                 return Ok(None);
             };
             let next = owner.row(next_physical as usize)?;
-            if previous.flags() != next.flags() || previous.vector_bytes() != next.vector_bytes() {
+            // Every physical row, including a tombstone, already participates
+            // in the routing graph. Changing only liveness preserves all graph
+            // distances and adjacency; the successor owner's validated flags
+            // determine which routed nodes may be returned as hits. Its fresh
+            // binding above seals both the live docset and complete row layout.
+            if previous.vector_bytes() != next.vector_bytes() {
                 native_reuse_checkpoint(cx)?;
                 return Ok(None);
             }
@@ -5211,6 +5219,165 @@ mod tests {
     }
 
     #[test]
+    fn liveness_only_successors_preserve_routing_and_bind_each_owner() {
+        let rows: Vec<_> = TestStore::synthetic(32, 8)
+            .vectors
+            .into_iter()
+            .enumerate()
+            .map(|(row, vector)| (format!("liveness-{row:04}"), vector))
+            .collect();
+        let cx = Cx::for_testing();
+        for quantization in [QuantizationFormat::F16, QuantizationFormat::F32] {
+            let directory = tempfile::tempdir().expect("temporary liveness directory");
+            let initial_binding =
+                fsvi_v2_binding_with_quantization(107, 0x17, "liveness-successor", 8, quantization);
+            let initial_owner =
+                admitted_fsvi_owner(directory.path(), "initial.fsvi", &initial_binding, &rows);
+            let initial = ValidatedNativeHnsw::build(&cx, Arc::clone(&initial_owner), params(), 42)
+                .expect("build the live predecessor");
+            let entry = initial.graph.entry_point().expect("nonempty graph");
+            let entry_id = initial_owner
+                .doc_id_at(entry as usize)
+                .expect("entry document");
+            let survivor = rows
+                .iter()
+                .find(|row| row.0 != entry_id)
+                .expect("a live document other than the entry");
+            let query = initial_owner
+                .vector_at_f32(entry as usize)
+                .expect("query equal to the graph entry");
+            let original_hits = initial
+                .search(&cx, &query, rows.len(), Some(rows.len()))
+                .expect("search all predecessor rows");
+            assert_eq!(original_hits.len(), rows.len());
+            let initial_path = directory.path().join("initial.fshnsw");
+            let initial_receipt = initial.save(&initial_path).expect("save predecessor");
+            let mut previous = ValidatedNativeHnsw::load(Arc::clone(&initial_owner), &initial_path)
+                .expect("reload predecessor")
+                .0;
+
+            // Delete almost every row, then every row, then restore every row.
+            // Each row was always in the routing graph. No distance or edge
+            // changes, even while the entry itself is not a searchable hit.
+            for (step, live_count) in [(1_u64, 1), (2, 0), (3, rows.len())] {
+                let binding = fsvi_v2_binding_with_quantization(
+                    107 + step,
+                    0x18,
+                    "liveness-successor",
+                    8,
+                    quantization,
+                );
+                let flagged: Vec<_> = rows
+                    .iter()
+                    .map(|(doc_id, vector)| {
+                        let live =
+                            live_count == rows.len() || (live_count == 1 && *doc_id == survivor.0);
+                        (
+                            doc_id.clone(),
+                            vector.clone(),
+                            if live {
+                                FsviRecordFlags::LIVE
+                            } else {
+                                FsviRecordFlags::TOMBSTONE
+                            },
+                        )
+                    })
+                    .collect();
+                let owner = admitted_fsvi_owner_with_flags(
+                    directory.path(),
+                    &format!("state-{step}.fsvi"),
+                    &binding,
+                    &flagged,
+                );
+                if live_count == rows.len() {
+                    let mut edited = flagged.clone();
+                    edited.iter_mut().find(|row| row.0 == entry_id).unwrap().1 = vec![0.25; 8];
+                    let edited_owner = admitted_fsvi_owner_with_flags(
+                        directory.path(),
+                        "edited-restoration.fsvi",
+                        &binding,
+                        &edited,
+                    );
+                    assert!(
+                        previous
+                            .try_reuse_for_owner(&cx, edited_owner)
+                            .unwrap()
+                            .is_none(),
+                        "restoring a tombstone with changed vector bytes requires a full rebuild"
+                    );
+                }
+                let successor = previous
+                    .try_reuse_for_owner(&cx, Arc::clone(&owner))
+                    .expect("admit liveness-only successor")
+                    .expect("identical physical vectors preserve the routing topology");
+                assert_eq!(successor.owner_witness(), owner.witness());
+                assert_eq!(successor.len(), rows.len());
+                assert_eq!(owner.live_count(), live_count);
+                assert_eq!(
+                    topology_snapshot(&successor.graph),
+                    topology_snapshot(&initial.graph)
+                );
+                assert_eq!(successor.graph.source_rows, initial.graph.source_rows);
+                let hits = successor
+                    .search(&cx, &query, rows.len(), Some(1))
+                    .expect("route through retained tombstones or restore their hits");
+                assert_eq!(hits.len(), live_count);
+                assert!(hits.iter().all(|hit| hit.flags().is_live()));
+                let exact = owner
+                    .search_top_k(&query, rows.len(), None)
+                    .expect("exact live-only reference");
+                assert_eq!(
+                    hits.iter()
+                        .map(ValidatedNativeHnswHit::doc_id)
+                        .collect::<Vec<_>>(),
+                    exact
+                        .iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>()
+                );
+                if live_count == 1 {
+                    assert_eq!(hits[0].doc_id(), survivor.0);
+                    assert!(owner.row(entry as usize).unwrap().flags().is_tombstone());
+                }
+
+                let graph_path = directory.path().join(format!("state-{step}.fshnsw"));
+                let receipt = successor.save(&graph_path).expect("save successor");
+                assert_eq!(receipt.graph_sha256, initial_receipt.graph_sha256);
+                assert_eq!(receipt.topology_sha256, initial_receipt.topology_sha256);
+                assert_ne!(receipt.receipt_sha256, initial_receipt.receipt_sha256);
+                assert_ne!(
+                    receipt.fsvi_whole_image_sha256,
+                    initial_receipt.fsvi_whole_image_sha256
+                );
+                assert_eq!(receipt.artifact_generation, binding.generation);
+                assert_eq!(
+                    receipt.ordered_live_docset_digest,
+                    encode_lower_hex(owner.witness().ordered_live_docset_digest)
+                );
+                assert!(
+                    ValidatedNativeHnsw::load(Arc::clone(&previous.owner), &graph_path).is_err(),
+                    "unchanged graph bytes do not admit the previous generation's liveness"
+                );
+                let (reopened, observed) = ValidatedNativeHnsw::load(owner, &graph_path)
+                    .expect("reopen the exact successor owner and graph");
+                assert_eq!(observed, receipt);
+                assert_eq!(
+                    reopened.search(&cx, &query, rows.len(), Some(1)).unwrap(),
+                    hits
+                );
+                assert_eq!(
+                    initial
+                        .search(&cx, &query, rows.len(), Some(rows.len()))
+                        .unwrap(),
+                    original_hits,
+                    "publishing liveness changes cannot retarget the retained predecessor"
+                );
+                previous = reopened;
+            }
+        }
+    }
+
+    #[test]
     fn append_successors_preserve_node_identity_across_row_reordering_and_restart() {
         let directory = tempfile::tempdir().expect("temporary append directory");
         let rows: Vec<_> = TestStore::synthetic(96, 8)
@@ -5323,9 +5490,9 @@ mod tests {
     }
 
     #[test]
-    fn append_successor_keeps_tombstones_as_routes_without_returning_them() {
+    fn append_successor_reuses_liveness_changes_and_keeps_tombstones_as_routes() {
         let directory = tempfile::tempdir().expect("temporary tombstone append directory");
-        let rows: Vec<_> = fsvi_rows(48, 8)
+        let mut rows: Vec<_> = fsvi_rows(48, 8)
             .into_iter()
             .enumerate()
             .map(|(row, (doc_id, vector))| {
@@ -5350,13 +5517,23 @@ mod tests {
         let seed = seed_with_tombstoned_entry(&owner);
         let previous = ValidatedNativeHnsw::build(&Cx::for_testing(), owner, params(), seed)
             .expect("build predecessor");
+        rows[0].2 = FsviRecordFlags::TOMBSTONE;
+        rows[1].2 = FsviRecordFlags::LIVE;
         let next_binding = fsvi_v2_binding(121, 0x21, "tombstone-successor", 8);
         let next_owner =
             admitted_fsvi_owner_with_flags(directory.path(), "next.fsvi", &next_binding, &rows);
         let next = previous
             .try_reuse_for_owner(&Cx::for_testing(), Arc::clone(&next_owner))
             .expect("append tombstone successor")
-            .expect("eligible unchanged tombstone layout");
+            .expect("retained vectors remain eligible across liveness changes and append");
+        assert!(
+            next.graph
+                .source_rows
+                .iter()
+                .enumerate()
+                .any(|(node, &row)| node != row as usize),
+            "the appended rows must exercise a nonidentity graph-to-owner permutation"
+        );
         let hits = next
             .search(
                 &Cx::for_testing(),
@@ -5416,7 +5593,7 @@ mod tests {
             Err(SearchError::InvalidConfig { field, .. })
                 if field == "doc_id"
         ));
-        let flagged: Vec<_> = rows
+        let mut flagged: Vec<_> = rows
             .iter()
             .enumerate()
             .map(|(row, (doc_id, vector))| {
@@ -5431,12 +5608,13 @@ mod tests {
                 )
             })
             .collect();
+        flagged[2].1 = vec![0.5; 4];
         let owner =
             admitted_fsvi_owner_with_flags(directory.path(), "flags.fsvi", &binding, &flagged);
         assert!(
             previous
                 .try_reuse_for_owner(&Cx::for_testing(), owner)
-                .expect("changed LIVE state requires rebuilding")
+                .expect("changed vector bytes require rebuilding even for a tombstone")
                 .is_none()
         );
 
