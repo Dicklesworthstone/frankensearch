@@ -423,6 +423,45 @@ Quill conformance and performance program.
   buffered and streaming search. See `published-candidate-gate.log`,
   `tmp/fsfs-quickstart.bl8zC0QG/receipt.json`, and
   `peer-close-installed.log` in the same evidence root.
+- At `438495c8`, `fsfs daemon --stop --daemon-socket` stopped the complete
+  store's selected listener but returned `cli.flag` on a populated legacy
+  store. The legacy listener kept serving the same ranked hit as a fresh
+  direct search. `aa6a50cf` sends the existing legacy shutdown command to
+  the named query socket without checking the compactor's PID file.
+- The executable regression passed both layouts with two live listeners
+  each. The selected listener exited cleanly and lost its socket, its
+  repeated stop returned a typed absence, and the other listener kept
+  serving the direct hit. A fresh real-model replay also proved a running
+  legacy compactor and its PID receipt survived the named stop. The usual
+  index-wide stop then shut down that compactor. See `regression.log`,
+  `baseline.log`, `baseline-reaping.log` and `candidate-focused.log` under
+  `/data/tmp/fsfs-named-stop.ovOns3jI`. The first index-wide stop control
+  timed out on the unreaped child. A bounded reaping control captured the
+  exited child's zero status and then observed the usual stop succeed.
+- The signed Linux 1.13.0 executable reproduced the legacy refusal on a
+  fresh store. With it still owning the listeners and compactor, the
+  repaired client stopped only the requested listener on either layout.
+  The signed client kept returning exact direct hits from the other listener
+  after the stop. See `signed-baseline.log` and
+  `signed-live-candidate-stop.log` in the same evidence root.
+- The first stock run passed 15 stages and retained three failures. The Core
+  diagnostics test missed its runtime shedding event. The fsfs suite caught
+  an old unit assertion that expected an invalid flag for a missing named
+  stop target. The real-model upgrade test lost its predecessor's temporary
+  install path before launch. The consolidated `169a1b85` differs from
+  `aa6a50cf` only in the unit assertion. It preserves the original startup
+  guard and checks the new typed absence on Unix. The replay uses a pinned
+  copy of the previously qualified predecessor and the original stages.
+  See `stock-gate.log` and `replay-gate.log` in the same evidence root.
+- All nine replay stages passed on clean `169a1b85`, including the full
+  workspace and fsfs suites and all 36 real-model end-to-end cases. The two
+  runs cover all 18 stock stages. Both quickstart installs produced the
+  same default debug executable, SHA-256
+  `fe7a4e9b792b44ae07b005b544b5be7268eff10c1f2d0599496339b0eafe28ee`.
+  The final install passed 12 commands and 22 negative controls with zero
+  owned processes remaining. The exact installed binary then repeated the
+  live named shutdown and compactor controls on their respective layouts.
+  See `verified-quickstart-receipt.json` and `candidate-installed.log`.
 - The previous optimized `fsfs update` tried to contact GitHub when offline
   was selected by CLI, environment or config. Both `--check` and apply
   reached the refusing loopback control. The repair checks resolved offline
@@ -806,6 +845,18 @@ Quill conformance and performance program.
 - [x] Repeat the early-close checks on the retained source quickstart install.
 - [x] Run complete stock quality checks, record exact scoped Bead evidence,
   and publish the named-endpoint repair.
+- [x] Reproduce explicit shutdown against two live query listeners on each
+  store layout. Verify the rejected legacy listener still serves.
+- [x] Route a named legacy stop to its query socket and keep the index-wide
+  command on the existing compactor and default-socket path.
+- [x] Verify both listener layouts, missing endpoints, exact ranked hits and
+  clean exit in the checked-in test.
+- [x] Verify the named stop preserves a live legacy compactor and its PID
+  receipt, then stop it through the normal index-wide command.
+- [x] Verify the signed 1.13.0 reproduction and shut down its still-running
+  listeners with the repaired client.
+- [x] Repeat the listener and compactor controls on the installed quickstart
+  executable, finish the stock gate, and publish with scoped Bead evidence.
 - [x] Reproduce the updater's offline leak with the optimized executable
   and a refusing loopback proxy.
 - [x] Apply the resolved offline policy before remote release checks or
