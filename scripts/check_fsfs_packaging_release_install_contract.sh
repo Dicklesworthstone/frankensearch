@@ -676,7 +676,7 @@ case "\${1:-}" in
       done
     fi
     if [ -n "\${FSFS_STUB_MODEL_CALLS:-}" ]; then
-      printf '%s %s %s\n' "\$1" "\${2:-}" "\${3:-}" >>"\$FSFS_STUB_MODEL_CALLS"
+      printf '%s\n' "\$*" >>"\$FSFS_STUB_MODEL_CALLS"
     fi
     case "\${2:-}" in
       potion-multilingual-128m|all-minilm-l6-v2) ;;
@@ -908,10 +908,10 @@ SH
       NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock"
       "FSFS_STUB_PROXY_ENV=$proxy_case" "FSFS_STUB_MODEL_CALLS=$proxy_calls"
     )
-    expected_calls=$'download-models potion-multilingual-128m \ndownload-models potion-multilingual-128m --verify\ndownload-models all-minilm-l6-v2 \ndownload-models all-minilm-l6-v2 --verify'
+    expected_calls=$'download-models potion-multilingual-128m\ndownload-models potion-multilingual-128m --verify\ndownload-models all-minilm-l6-v2\ndownload-models all-minilm-l6-v2 --verify'
     if [[ "$proxy_case" == offline ]]; then
       proxy_env+=(FSFS_STUB_DOWNLOAD_STATUS=73)
-      expected_calls=$'download-models potion-multilingual-128m --verify\ndownload-models all-minilm-l6-v2 --verify'
+      expected_calls=$'download-models potion-multilingual-128m --verify --offline\ndownload-models all-minilm-l6-v2 --verify --offline'
     fi
     if [[ "$proxy_case" != unset ]]; then
       for proxy_name in http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; do

@@ -568,8 +568,10 @@ install_binary() (
 
 provision_default_semantic_models() {
   local staged_binary="$1" model_id
+  local -a verify_flags=(--verify)
 
   if [ "$OFFLINE" -eq 1 ]; then
+    verify_flags+=(--offline)
     info "Offline install: verifying the default search model artifacts..."
   else
     info "Provisioning the default search model artifacts..."
@@ -584,7 +586,7 @@ provision_default_semantic_models() {
         return 1
       fi
     fi
-    if ! "$staged_binary" download-models "$model_id" --verify; then
+    if ! "$staged_binary" download-models "$model_id" "${verify_flags[@]}"; then
       err "Semantic model verification failed for $model_id. The existing fsfs installation was not replaced."
       return 1
     fi
