@@ -27,13 +27,11 @@
 //! 4. The same through the request's `rerank` flag (20 timed queries) so the
 //!    cross-encoder's cost has a receipt too; skipped with the reason when the
 //!    ms-marco model is not installed.
-//! 5. Watch-mode freshness: `fsfs index --watch` on the same corpus, 20 files
-//!    written one at a time, the watcher's own per-batch `oldest_event_age_ms`
-//!    (event observed to batch applied) and the client-side write-to-visible
-//!    wall, a graceful stop, and a fresh-process search proving the new files
-//!    are searchable once the watcher has exited. Host-pressure sampling is
-//!    pinned to one sample per hour for this section (a saturated host would
-//!    otherwise pause the watcher by design); the receipt records the pin.
+//! 5. Watch-mode freshness: `fsfs watch` on the same corpus, 20 files written
+//!    one at a time. Each file must become searchable through the already-live
+//!    daemon after a complete generation is selected, then through a separate
+//!    direct process. The watcher must exit cleanly and leave its last change
+//!    searchable. The receipt records the polling interval and pressure policy.
 //!
 //! `FRANKENSEARCH_PERF_RECEIPT_MAX_DAEMON_P95_MS=<ms>` turns the lane into a
 //! threshold check (the planted-regression control).
@@ -47,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-const RECEIPT_SCHEMA: &str = "frankensearch-fsfs-latency-receipt-v1";
+const RECEIPT_SCHEMA: &str = "frankensearch-fsfs-latency-receipt-v2";
 const DEFAULT_DOCS: usize = 1_000;
 const COLD_RUNS: usize = 3;
 const WARMUP_QUERIES: usize = 5;
@@ -55,6 +53,8 @@ const TIMED_QUERIES: usize = 50;
 const RERANK_QUERIES: usize = 20;
 const TOP_K: usize = 10;
 const DAEMON_IDLE_TIMEOUT_MS: u64 = 120_000;
+const WATCH_FILES: usize = 20;
+const WATCH_POLL: Duration = Duration::from_millis(25);
 
 const TOPICS: &[&[&str]] = &[
     &[
@@ -322,31 +322,12 @@ impl Harness {
             .env("FRANKENSEARCH_OFFLINE", "1")
             .env("FRANKENSEARCH_ALLOW_DOWNLOAD", "0")
             .env("FRANKENSEARCH_CHECK_UPDATES", "0")
+            .env("FSFS_COMPLETE_GENERATIONS", "1")
             .env("NO_COLOR", "1")
             .env_remove("FRANKENSEARCH_INDEX_DIR")
             .env_remove("FSFS_INDEX_DIR")
             .env_remove("RUST_LOG");
         command
-    }
-
-    fn run_text(&self, label: &str, args: &[&str]) -> (String, Duration) {
-        let started = Instant::now();
-        let output = self
-            .command(args)
-            .output()
-            .unwrap_or_else(|error| panic!("{label}: spawn fsfs: {error}"));
-        let elapsed = started.elapsed();
-        assert!(
-            output.status.success(),
-            "{label} failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        (
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            elapsed,
-        )
     }
 
     fn run_json(&self, label: &str, args: &[&str]) -> (Value, Duration) {
@@ -423,8 +404,15 @@ fn daemon_query(socket: &Path, query: &str, rerank: bool) -> (Value, Duration) {
         "filter": null,
         "rerank": rerank,
     });
+    daemon_request(socket, &request)
+}
+
+fn daemon_request(socket: &Path, request: &Value) -> (Value, Duration) {
     let started = Instant::now();
     let mut stream = UnixStream::connect(socket).expect("connect to the query daemon");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("bound daemon read time");
     stream
         .write_all(request.to_string().as_bytes())
         .expect("write request");
@@ -452,59 +440,149 @@ fn final_phase(response: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// `(files, reported_ms, index_size_bytes)` from the `fsfs index` summary
-/// line: `Indexed N file(s) (discovered N, skipped 0) into <dir> in M ms
-/// (index size B bytes)`.
-fn parse_index_summary(stdout: &str) -> Option<(u64, u64, u64)> {
-    let line = stdout.lines().find(|line| line.starts_with("Indexed "))?;
-    let tokens = line.split_whitespace().collect::<Vec<_>>();
-    let files = tokens.get(1)?.parse().ok()?;
-    let after = |marker: &str| -> Option<u64> {
-        tokens
-            .iter()
-            .position(|token| *token == marker)
-            .and_then(|at| tokens.get(at + 1))
-            .and_then(|token| token.parse().ok())
-    };
-    Some((files, after("in")?, after("size")?))
+fn has_hit(payload: &Value, path: &str) -> bool {
+    payload["hits"]
+        .as_array()
+        .is_some_and(|hits| hits.iter().any(|hit| hit["path"].as_str() == Some(path)))
 }
 
-/// Lines of the watcher's stderr that carry the per-batch freshness record.
-fn watch_batch_lines(log: &Path) -> Vec<String> {
-    std::fs::read_to_string(log)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| line.contains("fsfs watch batch applied"))
-        .map(str::to_owned)
-        .collect()
-}
+struct WatchGuard(Child);
 
-/// `key=<digits>` out of a tracing line.
-fn tracing_field_u64(line: &str, key: &str) -> Option<u64> {
-    let start = line.find(key)? + key.len();
-    let digits: String = line[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
-}
-
-fn wait_for_log_line(log: &Path, needle: &str, budget: Duration) {
-    let started = Instant::now();
-    while started.elapsed() < budget {
-        if std::fs::read_to_string(log)
-            .unwrap_or_default()
-            .contains(needle)
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
-    panic!(
-        "{needle:?} not seen in {} within {budget:?}:\n{}",
-        log.display(),
-        std::fs::read_to_string(log).unwrap_or_default()
+}
+
+fn measure_watch(harness: &Harness, corpus: &Path, index: &Path, socket: &Path) -> Value {
+    let corpus_arg = corpus.to_str().expect("UTF-8 corpus path");
+    let index_arg = index.to_str().expect("UTF-8 index path");
+    let log_path = harness.home.join("watch.stderr");
+    let log = std::fs::File::create(&log_path).expect("create watcher log");
+    let mut watcher = WatchGuard(
+        harness
+            .command(&[
+                "watch",
+                corpus_arg,
+                "--index-dir",
+                index_arg,
+                "--format",
+                "jsonl",
+            ])
+            .env("RUST_LOG", "info")
+            // A pressure pause is outside this steady-load freshness sample.
+            .env("FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS", "3600000")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .expect("spawn the watcher"),
     );
+    let selection = index.join("FSFS-CURRENT");
+    let mut daemon_visible_ms = Vec::with_capacity(WATCH_FILES);
+    let mut direct_confirmed_ms = Vec::with_capacity(WATCH_FILES);
+    for edit in 0..=WATCH_FILES {
+        let name = format!("watch-{edit:04}.md");
+        let token = format!("zorblax{edit:04}");
+        let filter = format!("path:{name}");
+        let request = serde_json::json!({
+            "query": token, "limit": 1, "mode": "lexical", "filter": filter,
+        });
+        let search = || {
+            let response = daemon_request(socket, &request).0;
+            assert_eq!(response["ok"].as_bool(), Some(true), "{response}");
+            has_hit(&response["payloads"][0], &name)
+        };
+        assert!(!search(), "daemon returned {name} before it was written");
+        let previous = std::fs::read(&selection).expect("read the prior selection");
+        let before_write = Instant::now();
+        std::fs::write(
+            corpus.join(&name),
+            format!("Watch marker {token} calibrates temporal flux with quorum heartbeat.\n"),
+        )
+        .expect("write the watch file");
+        loop {
+            assert!(watcher.0.try_wait().expect("poll watcher").is_none());
+            let selected = std::fs::read(&selection).expect("read the selection");
+            if selected != previous && search() {
+                break;
+            }
+            assert!(
+                before_write.elapsed() < Duration::from_secs(60),
+                "daemon did not see the watch edit {name}:\n{}",
+                std::fs::read_to_string(&log_path).unwrap_or_default(),
+            );
+            std::thread::sleep(WATCH_POLL);
+        }
+        let daemon_ms = ms(before_write.elapsed());
+        let direct = harness
+            .run_json(
+                "independent search while the watcher is live",
+                &[
+                    "search",
+                    &token,
+                    "--index-dir",
+                    index_arg,
+                    "--no-daemon",
+                    "--lexical-only",
+                    "--filter",
+                    &filter,
+                    "--format",
+                    "json",
+                ],
+            )
+            .0;
+        assert!(has_hit(&direct["data"], &name), "{name}: {direct}");
+        // The first edit proves the watch is active and is a warm-up sample.
+        if edit != 0 {
+            daemon_visible_ms.push(daemon_ms);
+            direct_confirmed_ms.push(ms(before_write.elapsed()));
+        }
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &watcher.0.id().to_string()])
+            .status()
+            .expect("signal watcher")
+            .success()
+    );
+    let stop_started = Instant::now();
+    loop {
+        if let Some(status) = watcher.0.try_wait().expect("poll watcher shutdown") {
+            assert!(status.success(), "watcher did not exit cleanly: {status}");
+            break;
+        }
+        assert!(stop_started.elapsed() < Duration::from_secs(60));
+        std::thread::sleep(WATCH_POLL);
+    }
+    let last_query = format!("zorblax{WATCH_FILES:04}");
+    let last_path = format!("watch-{WATCH_FILES:04}.md");
+    let after = harness
+        .run_json(
+            "search after the watcher exits",
+            &[
+                "search",
+                &last_query,
+                "--index-dir",
+                index_arg,
+                "--no-daemon",
+                "--lexical-only",
+                "--format",
+                "json",
+            ],
+        )
+        .0;
+    assert!(has_hit(&after["data"], &last_path), "{after}");
+    serde_json::json!({
+        "warmup_edits": 1,
+        "measured_edits": WATCH_FILES,
+        "selection_poll_interval_ms": WATCH_POLL.as_millis(),
+        "pressure_sampling_interval_ms": 3_600_000,
+        "write_to_daemon_visible_ms": distribution(&daemon_visible_ms),
+        "write_to_direct_confirmed_after_daemon_ms": distribution(&direct_confirmed_ms),
+        "searchable_after_exit": true,
+    })
 }
 
 fn host_fingerprint() -> Value {
@@ -597,28 +675,39 @@ fn fsfs_latency_receipt() {
     let corpus_arg = corpus.display().to_string();
     let index_arg = index_dir.display().to_string();
 
-    // 1. Index cost, end to end through the binary. `fsfs index` reports a
-    //    human summary line ("Indexed N file(s) ... in M ms (index size B
-    //    bytes)") rather than an envelope; the wall clock here is the
-    //    number that matters, the reported values are cross-checks.
-    let (index_text, index_wall) = harness.run_text(
-        "fsfs index",
-        &[
-            "index",
-            &corpus_arg,
-            "--index-dir",
-            &index_arg,
-            "--no-watch-mode",
-            "--format",
-            "json",
-        ],
-    );
-    let (indexed_files, index_reported_ms, index_size_bytes) = parse_index_summary(&index_text)
-        .unwrap_or_else(|| panic!("fsfs index summary line missing:\n{index_text}"));
+    // 1. Index cost through the complete-generation CLI, then an unchanged rerun.
+    let index_args = [
+        "index",
+        &corpus_arg,
+        "--index-dir",
+        &index_arg,
+        "--no-watch-mode",
+        "--format",
+        "json",
+    ];
+    let (index, index_wall) = harness.run_json("fsfs index", &index_args);
+    let indexed = &index["data"];
     assert_eq!(
-        indexed_files,
-        u64::try_from(docs).unwrap_or(u64::MAX),
-        "every corpus file must be indexed:\n{index_text}"
+        indexed["indexed_files"].as_u64(),
+        Some(u64::try_from(docs).expect("corpus size fits u64")),
+        "every corpus file must be indexed: {index}"
+    );
+    assert_eq!(
+        indexed["generation_complete"].as_bool(),
+        Some(true),
+        "{index}"
+    );
+    let selected = Path::new(indexed["index_root"].as_str().expect("selected index root"));
+    assert!(index_dir.join("FSFS-CURRENT").is_file(), "{index}");
+    assert!(
+        selected.join("vector/quality.fsvi").is_file()
+            && indexed["quality_generation"]["is_hash_control"].as_bool() == Some(false),
+        "the registered models must produce a quality tier: {index}"
+    );
+    let (repeat, repeat_wall) = harness.run_json("unchanged fsfs index", &index_args);
+    assert_eq!(
+        repeat["data"]["unchanged_files"], indexed["indexed_files"],
+        "{repeat}"
     );
     let status_json = harness
         .run_json(
@@ -626,11 +715,6 @@ fn fsfs_latency_receipt() {
             &["status", "--index-dir", &index_arg, "--format", "json"],
         )
         .0;
-    let quality_tier_present = index_dir.join("vector").join("quality.fsvi").is_file();
-    assert!(
-        quality_tier_present,
-        "the registered models must produce a quality tier: {status_json}"
-    );
 
     // 2. Cold start: whole-process wall for a no-daemon search.
     let queries = synthetic_queries(COLD_RUNS + WARMUP_QUERIES + TIMED_QUERIES + RERANK_QUERIES);
@@ -664,6 +748,7 @@ fn fsfs_latency_receipt() {
     let child = harness
         .command(&[
             "serve",
+            "--daemon",
             "--daemon-socket",
             &socket.display().to_string(),
             "--idle-timeout-ms",
@@ -763,140 +848,8 @@ fn fsfs_latency_receipt() {
             .entry(format!("{status}:{reason}"))
             .or_insert(0) += 1;
     }
+    let watch_mode = measure_watch(&harness, &corpus, &index_dir, &daemon.socket);
     drop(daemon);
-
-    // 5. Watch-mode freshness. The daemon is gone (it held a reader lock on
-    //    the vector generations; the watcher needs the writer). Start the
-    //    watcher, write files one at a time, and read the per-batch
-    //    `fsfs watch batch applied` lines it logs: `oldest_event_age_ms` is
-    //    the age of the oldest event in the batch when the sink finished
-    //    (debounce + queueing + ingest). The client-side wall from the write
-    //    to the line becoming visible is kept as an upper bound (it includes
-    //    this test's 10 ms poll). Then stop the watcher and prove a new file
-    //    is searchable from a fresh process.
-    const WATCH_FILES: usize = 20;
-    let watch_log_path = temp.path().join("watch.stderr");
-    let watch_log = std::fs::File::create(&watch_log_path).expect("create watcher log");
-    let watch_started = Instant::now();
-    let mut watcher = harness
-        .command(&[
-            "index",
-            &corpus_arg,
-            "--index-dir",
-            &index_arg,
-            "--watch",
-            "--format",
-            "json",
-        ])
-        .env("RUST_LOG", "info")
-        // Host pressure is not the subject: on a saturated host the pressure
-        // controller moves the watcher to Degraded/Emergency, where watching
-        // is switched off by design (observed mid-measurement on a loaded
-        // 64-core box). One sample per hour keeps the measurement about the
-        // watcher; the receipt says so.
-        .env("FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS", "3600000")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(watch_log)
-        .spawn()
-        .expect("spawn the watcher");
-    wait_for_log_line(&watch_log_path, "watcher started", Duration::from_secs(120));
-    let watcher_startup_ms = ms(watch_started.elapsed());
-
-    let mut write_to_visible_ms = Vec::with_capacity(WATCH_FILES);
-    let mut event_to_applied_ms = Vec::new();
-    let mut batch_apply_ms = Vec::new();
-    let mut seen_batches = 0_usize;
-    for index in 0..WATCH_FILES {
-        let path = corpus.join(format!("watch-{index:04}.md"));
-        std::fs::write(
-            &path,
-            format!(
-                "watch freshness probe {index}: zorblax calibrates temporal flux with quorum heartbeat.\n"
-            ),
-        )
-        .expect("write watch file");
-        let written = Instant::now();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let lines = watch_batch_lines(&watch_log_path);
-            if lines.len() > seen_batches {
-                for line in &lines[seen_batches..] {
-                    if let Some(age) = tracing_field_u64(line, "oldest_event_age_ms=") {
-                        #[allow(clippy::cast_precision_loss)]
-                        event_to_applied_ms.push(age as f64);
-                    }
-                    if let Some(apply) = tracing_field_u64(line, "apply_ms=") {
-                        #[allow(clippy::cast_precision_loss)]
-                        batch_apply_ms.push(apply as f64);
-                    }
-                }
-                seen_batches = lines.len();
-                write_to_visible_ms.push(ms(written.elapsed()));
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "watcher did not apply a batch for {} within 30 s; log:\n{}",
-                path.display(),
-                std::fs::read_to_string(&watch_log_path).unwrap_or_default()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    let _ = Command::new("kill")
-        .args(["-TERM", &watcher.id().to_string()])
-        .status();
-    let stop_deadline = Instant::now() + Duration::from_secs(60);
-    let watcher_exit = loop {
-        if let Some(status) = watcher.try_wait().expect("poll watcher") {
-            break status.code();
-        }
-        if Instant::now() >= stop_deadline {
-            let _ = watcher.kill();
-            let _ = watcher.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    let (after_watch, _) = harness.run_json(
-        "search after the watcher exits",
-        &[
-            "search",
-            "zorblax calibrates temporal flux",
-            "--index-dir",
-            &index_arg,
-            "--no-daemon",
-            "--no-watch-mode",
-            "--format",
-            "json",
-        ],
-    );
-    let searchable_after_exit = after_watch
-        .pointer("/data/hits")
-        .and_then(Value::as_array)
-        .is_some_and(|hits| {
-            hits.iter().any(|hit| {
-                hit.get("path")
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| path.starts_with("watch-"))
-            })
-        });
-    assert!(
-        searchable_after_exit,
-        "a file ingested by the watcher must be searchable once it exits: {after_watch}"
-    );
-    let watch_mode = serde_json::json!({
-        "files_written": WATCH_FILES,
-        "host_pressure_sampling": "pinned to one sample per hour for this measurement (FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS=3600000); in production a saturated host moves the watcher to Degraded/Emergency, where watching pauses",
-        "batches_applied": seen_batches,
-        "watcher_startup_ms": watcher_startup_ms,
-        "event_to_applied_ms": distribution(&event_to_applied_ms),
-        "batch_apply_ms": distribution(&batch_apply_ms),
-        "write_to_line_visible_ms": distribution(&write_to_visible_ms),
-        "watcher_exit_code": watcher_exit,
-        "searchable_after_exit": searchable_after_exit,
-    });
 
     let receipt = serde_json::json!({
         "schema": RECEIPT_SCHEMA,
@@ -911,10 +864,11 @@ fn fsfs_latency_receipt() {
         "corpus": { "files": docs, "total_chars": total_chars, "generator": "deterministic LCG prose over 6 topic vocabularies, one file per document" },
         "index": {
             "wall_ms": ms(index_wall),
-            "indexed_files": indexed_files,
-            "reported_ms": index_reported_ms,
-            "index_size_bytes": index_size_bytes,
-            "quality_tier": quality_tier_present,
+            "indexed_files": indexed["indexed_files"],
+            "index_size_bytes": indexed["index_size_bytes"],
+            "generation_id": indexed["generation_id"],
+            "quality_generation": indexed["quality_generation"],
+            "unchanged_rerun_ms": ms(repeat_wall),
             "status": status_json.get("data").cloned().unwrap_or(Value::Null),
         },
         "cold_start_search_ms": { "runs": COLD_RUNS, "summary": distribution(&cold), "samples": cold, "phases": cold_phases },
