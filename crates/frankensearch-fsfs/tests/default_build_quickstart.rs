@@ -5188,25 +5188,40 @@ mod loader_only {
                 )
             })
         };
-        for (label, args, offline) in [
+        let apply_error = if cfg!(all(
+            feature = "semantic-native",
+            not(feature = "semantic-loaders")
+        )) {
+            "update.profile"
+        } else {
+            "update.offline"
+        };
+        for (label, args, offline, expected_field) in [
             (
                 "offline-check-cli",
                 &["update", "--check", "--offline", "--format", "json"][..],
                 "0",
+                "update.offline",
             ),
             (
                 "offline-check-env",
                 &["update", "--check", "--format", "json"],
                 "1",
+                "update.offline",
             ),
-            ("offline-apply-env", &["update", "--format", "json"], "1"),
+            (
+                "offline-apply-env",
+                &["update", "--format", "json"],
+                "1",
+                apply_error,
+            ),
         ] {
             let (outcome, connects) = run(label, args, offline);
             assert!(!outcome.timed_out, "{outcome:?}");
             assert!(connects.is_empty(), "{label}: contacted {connects:?}");
             assert_eq!(outcome.status.code(), Some(2), "{outcome:?}");
             let envelope: Value = serde_json::from_str(&outcome.stdout).unwrap();
-            assert_eq!(envelope["error"]["field"], "update.offline", "{envelope}");
+            assert_eq!(envelope["error"]["field"], expected_field, "{envelope}");
         }
         let (online, connects) = run(
             "online-check",
