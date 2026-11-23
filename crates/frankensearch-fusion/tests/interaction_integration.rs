@@ -449,15 +449,18 @@ async fn run_template_driven_test_with_tiebreak(
         let _query_seed = derive_query_seed(lane.seed, qi);
 
         let mut collector = PhaseCollector::default();
-        let search_result = searcher
-            .search(
+        let search_result = {
+            // Keep the concrete search future out of the outer test futures
+            // while still requiring it to be Send.
+            let search: SearchFuture<'_, _> = Box::pin(searcher.search(
                 cx,
                 query_text,
                 k,
                 fixture_document_text,
                 collector.callback(),
-            )
-            .await;
+            ));
+            search.await
+        };
 
         match search_result {
             Ok(_metrics) => {
