@@ -17,6 +17,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use asupersync::runtime::reactor::Interest;
 use frankensearch_core::{SearchError, SearchResult};
 use serde::Serialize;
 
@@ -1246,12 +1247,24 @@ fn encode_response<T: Serialize>(response: &T) -> SearchResult<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn read_request(cx: &Cx, peer: &mut impl Read, timeout: Duration) -> SearchResult<Vec<u8>> {
+async fn read_request(cx: &Cx, peer: &UnixStream, timeout: Duration) -> SearchResult<Vec<u8>> {
+    let mut input = peer;
+    read_request_from(cx, &mut input, Some(peer), timeout, IO_POLL_INTERVAL).await
+}
+
+async fn read_request_from(
+    cx: &Cx,
+    peer: &mut impl Read,
+    source: Option<&UnixStream>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> SearchResult<Vec<u8>> {
     let started = Instant::now();
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
     let mut turn_bytes = 0;
     let mut turn_calls = 0;
+    let mut registration = None;
     loop {
         retained_search_checkpoint(cx)?;
         if started.elapsed() >= timeout {
@@ -1271,35 +1284,71 @@ async fn read_request(cx: &Cx, peer: &mut impl Read, timeout: Duration) -> Searc
             .min(chunk.len())
             .min(64 * 1024 - turn_bytes);
         turn_calls += 1;
-        match peer.read(&mut chunk[..remaining]) {
-            Ok(0) if bytes.is_empty() => {
+        let count = match peer.read(&mut chunk[..remaining]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                turn_bytes = 0;
+                turn_calls = 0;
+                let wait = poll_interval.min(timeout.saturating_sub(started.elapsed()));
+                let mut fallback = pin!(asupersync::time::sleep(cx.now(), wait));
+                let Some(count) = poll_fn(|task| {
+                    retained_search_checkpoint(cx)?;
+                    if started.elapsed() >= timeout || fallback.as_mut().poll(task).is_ready() {
+                        return Poll::Ready(Ok(None));
+                    }
+                    let Some(source) = source else {
+                        return Poll::Pending;
+                    };
+                    if !admission::arm_io(
+                        cx,
+                        source,
+                        &mut registration,
+                        Interest::READABLE,
+                        task.waker(),
+                    ) {
+                        return Poll::Pending;
+                    }
+                    // Check again after arming to close the registration race.
+                    // The timer still covers deadlines and runtimes without I/O.
+                    match peer.read(&mut chunk[..remaining]) {
+                        Ok(count) => Poll::Ready(Ok(Some(count))),
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => Poll::Pending,
+                        Err(error) if error.kind() == ErrorKind::Interrupted => {
+                            Poll::Ready(Ok(None))
+                        }
+                        Err(error) => Poll::Ready(Err(SearchError::Io(error))),
+                    }
+                })
+                .await?
+                else {
+                    continue;
+                };
+                turn_calls = 1;
+                count
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if count == 0 {
+            if bytes.is_empty() {
                 return Err(
                     io::Error::new(ErrorKind::UnexpectedEof, "empty daemon request").into(),
                 );
             }
-            Ok(0) => return Ok(bytes),
-            Ok(count) => {
-                turn_bytes += count;
-                let newline = chunk[..count].iter().position(|byte| *byte == b'\n');
-                let end = newline.map_or(count, |offset| offset + 1);
-                bytes.extend_from_slice(&chunk[..end]);
-                if bytes.len() > FSFS_DAEMON_REQUEST_MAX_BYTES {
-                    return Err(complete_cli_error(
-                        "daemon_request",
-                        "request exceeds 1 MiB limit",
-                    ));
-                }
-                if newline.is_some() {
-                    return Ok(bytes);
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL).await;
-                turn_bytes = 0;
-                turn_calls = 0;
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error.into()),
+            return Ok(bytes);
+        }
+        turn_bytes += count;
+        let newline = chunk[..count].iter().position(|byte| *byte == b'\n');
+        let end = newline.map_or(count, |offset| offset + 1);
+        bytes.extend_from_slice(&chunk[..end]);
+        if bytes.len() > FSFS_DAEMON_REQUEST_MAX_BYTES {
+            return Err(complete_cli_error(
+                "daemon_request",
+                "request exceeds 1 MiB limit",
+            ));
+        }
+        if newline.is_some() {
+            return Ok(bytes);
         }
     }
 }
@@ -1341,6 +1390,73 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct MarkReleased(Arc<AtomicBool>);
+
+    fn finish_parked_frame(io_driver: bool, prefix: &[u8], suffix: Option<&[u8]>) -> Vec<u8> {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .enable_platform_reactor(io_driver)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller-owned runtime");
+            let (mut client, server) = UnixStream::pair().unwrap();
+            server.set_nonblocking(true).unwrap();
+            client.write_all(prefix).unwrap();
+            let mut input = &server;
+            let fallback = if io_driver {
+                Duration::from_secs(5)
+            } else {
+                IO_POLL_INTERVAL
+            };
+            let mut frame = pin!(read_request_from(
+                &cx,
+                &mut input,
+                Some(&server),
+                Duration::from_secs(10),
+                fallback,
+            ));
+            let mut guard = pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(2)));
+            let mut sent = false;
+            let bytes = poll_fn(|task| {
+                if guard.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(None);
+                }
+                if let Poll::Ready(result) = frame.as_mut().poll(task) {
+                    return Poll::Ready(Some(result.unwrap()));
+                }
+                if !sent {
+                    // Complete the frame only after the reader is parked.
+                    if let Some(suffix) = suffix {
+                        client.write_all(suffix).unwrap();
+                    } else {
+                        client.shutdown(Shutdown::Write).unwrap();
+                    }
+                    sent = true;
+                }
+                Poll::Pending
+            })
+            .await
+            .expect("the split frame must wake the reader before its guard deadline");
+            assert!(sent);
+            bytes
+        })
+    }
+
+    #[test]
+    fn split_socket_frame_wakes_before_the_fallback_tick() {
+        assert_eq!(
+            finish_parked_frame(true, b":re", Some(b"ady\n")),
+            b":ready\n"
+        );
+        assert_eq!(finish_parked_frame(true, b":ready", None), b":ready");
+    }
+
+    #[test]
+    fn split_socket_frame_uses_the_timer_without_a_reactor() {
+        assert_eq!(
+            finish_parked_frame(false, b":re", Some(b"ady\n")),
+            b":ready\n"
+        );
+    }
 
     impl Drop for MarkReleased {
         fn drop(&mut self) {
@@ -1488,9 +1604,7 @@ mod tests {
             let runtime = FsfsRuntime::new(crate::FsfsConfig::default());
             let transport_timeout = Duration::from_millis(100);
             let (client, mut server) = pair(b"{\"query\":\"slow search\"}\n");
-            let bytes = read_request(&cx, &mut server, transport_timeout)
-                .await
-                .unwrap();
+            let bytes = read_request(&cx, &server, transport_timeout).await.unwrap();
             serve_peer_bytes(
                 &cx,
                 &runtime,
@@ -1997,7 +2111,7 @@ mod tests {
             client.set_nonblocking(true).unwrap();
             cx.set_cancel_requested(true);
             assert!(matches!(
-                read_request(&cx, &mut server, Duration::from_secs(60)).await,
+                read_request(&cx, &server, Duration::from_secs(60)).await,
                 Err(SearchError::Cancelled { .. })
             ));
             assert!(matches!(
@@ -2051,9 +2165,7 @@ mod tests {
             let (_client, mut server) = UnixStream::pair().unwrap();
             server.set_nonblocking(true).unwrap();
             for result in [
-                read_request(&cx, &mut server, Duration::ZERO)
-                    .await
-                    .map(|_| ()),
+                read_request(&cx, &server, Duration::ZERO).await.map(|_| ()),
                 write_response(&cx, &mut server, b"response", Duration::ZERO).await,
             ] {
                 assert!(

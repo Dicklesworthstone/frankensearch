@@ -12,7 +12,10 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use asupersync::runtime::{IoRegistration, reactor::Interest};
+use asupersync::runtime::{
+    IoRegistration,
+    reactor::{Interest, Source},
+};
 use frankensearch_core::SearchResult;
 
 use super::streaming::check_peer;
@@ -22,6 +25,28 @@ use super::{IO_POLL_INTERVAL, control, read_request, retained_search_checkpoint}
 // The existing 1 MiB request limit therefore also bounds queued payloads.
 pub(super) const MAX_PEERS: usize = 8;
 const ACCEPTS_PER_TURN: usize = 4;
+
+/// Arm a caller-owned reactor registration. The caller must retry the I/O
+/// operation after arming in case its readiness changed during registration.
+pub(super) fn arm_io(
+    cx: &Cx,
+    source: &impl Source,
+    registration: &mut Option<IoRegistration>,
+    interest: Interest,
+    waker: &Waker,
+) -> bool {
+    if let Some(existing) = registration
+        && existing.rearm(interest, waker).unwrap_or(false)
+    {
+        return true;
+    }
+    *registration = None;
+    *registration = cx
+        .register_io(source, interest)
+        .ok()
+        .filter(|registered| registered.update_waker(waker.clone()));
+    registration.is_some()
+}
 
 pub(super) type Request<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -88,22 +113,6 @@ impl Intake {
         self.reading.len() + self.ready.len()
     }
 
-    fn arm_listener(&mut self, cx: &Cx, listener: &UnixListener, waker: &Waker) -> bool {
-        if let Some(registration) = &mut self.listener_io
-            && registration
-                .rearm(Interest::READABLE, waker)
-                .unwrap_or(false)
-        {
-            return true;
-        }
-        self.listener_io = None;
-        self.listener_io = cx
-            .register_io(listener, Interest::READABLE)
-            .ok()
-            .filter(|registration| registration.update_waker(waker.clone()));
-        self.listener_io.is_some()
-    }
-
     /// A completed frame is not a live response consumer. Reclaim abandoned
     /// slots before accepting more peers, and recheck newly completed frames
     /// before dispatch or control preemption. Share the active driver's probe:
@@ -157,7 +166,13 @@ impl Intake {
             retained_search_checkpoint(cx)?;
             let connection = listener.accept().or_else(|error| {
                 if error.kind() == std::io::ErrorKind::WouldBlock
-                    && self.arm_listener(cx, listener, task.waker())
+                    && arm_io(
+                        cx,
+                        listener,
+                        &mut self.listener_io,
+                        Interest::READABLE,
+                        task.waker(),
+                    )
                 {
                     // Close the race between observing WouldBlock and arming
                     // the reactor. The periodic tick still covers deadlines
@@ -167,7 +182,7 @@ impl Intake {
                     Err(error)
                 }
             });
-            let (mut peer, _) = match connection {
+            let (peer, _) = match connection {
                 Ok(peer) => peer,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -183,7 +198,7 @@ impl Intake {
             self.reading.push_back(ReadingPeer {
                 accepted: now,
                 future: Box::pin(async move {
-                    let bytes = read_request(&task_cx, &mut peer, timeout).await?;
+                    let bytes = read_request(&task_cx, &peer, timeout).await?;
                     // Malformed controls remain ordinary refused requests. Do
                     // not turn a decoder error, discriminator alone, duplicate
                     // field or unknown command into shutdown authorization.
@@ -861,7 +876,13 @@ mod tests {
                 input: std::io::Cursor::new(bytes.clone()),
                 consumed: &consumed,
             };
-            let mut reading = Box::pin(read_request(&cx, &mut input, Duration::from_secs(60)));
+            let mut reading = Box::pin(super::super::read_request_from(
+                &cx,
+                &mut input,
+                None,
+                Duration::from_secs(60),
+                IO_POLL_INTERVAL,
+            ));
             let mut task = Context::from_waker(Waker::noop());
             assert!(reading.as_mut().poll(&mut task).is_pending());
             assert_eq!(consumed.get(), 64 * 1024);
@@ -885,7 +906,13 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let calls = Cell::new(0);
             let mut input = Interrupted(&calls);
-            let mut reading = Box::pin(read_request(&cx, &mut input, Duration::from_secs(60)));
+            let mut reading = Box::pin(super::super::read_request_from(
+                &cx,
+                &mut input,
+                None,
+                Duration::from_secs(60),
+                IO_POLL_INTERVAL,
+            ));
             let mut task = Context::from_waker(Waker::noop());
             assert!(reading.as_mut().poll(&mut task).is_pending());
             assert_eq!(calls.get(), 32);
