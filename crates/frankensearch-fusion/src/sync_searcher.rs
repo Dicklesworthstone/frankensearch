@@ -736,7 +736,9 @@ impl SyncTwoTierSearcher {
     /// admission; plus dimension/filter errors from vector search and
     /// cancellation from an optional lexical backend, including metadata
     /// hydration during quality refinement. Cancellation never returns the
-    /// initial ranking as a successful collected search.
+    /// initial ranking as a successful collected search. Other refinement errors
+    /// also propagate when newly available metadata rejects a retained initial
+    /// candidate, including candidates reserved for final diversity ranking.
     pub fn search_collect(
         &self,
         query: &TieredQueryEmbeddings,
@@ -807,8 +809,10 @@ impl SyncTwoTierSearcher {
     /// Execute a synchronous filtered search and stream progressive phases.
     ///
     /// Metadata upgrades and stable predicate requirements match
-    /// [`Self::search_collect_with_filter`]. A terminal failure during refinement
-    /// retains the previously emitted Initial results in its failure payload.
+    /// [`Self::search_collect_with_filter`]. A terminal refinement failure retains
+    /// the previously emitted Initial only while its candidate pool stays
+    /// eligible. If new metadata rejects any retained candidate, the failure
+    /// payload is empty and no final diversity ranking runs.
     #[must_use]
     pub const fn search_iter_with_filter<'a>(
         &'a self,
@@ -950,24 +954,25 @@ impl SyncTwoTierSearcher {
         let mut lexical_hits =
             Self::search_optional_lexical(&mut lexical_context, query_vec, fetch, filter)?;
         metrics.lexical_search_ms = ms(lexical_started.elapsed());
-        let (mut classified, phase1_vectors_searched) = if query_vec.iter().all(|&value| value == 0.0) {
-            // Zero signal belongs to this semantic lane (bd-tqhc), not the
-            // whole query. Lexical matches and an independently admitted
-            // quality query can still answer it without any fast-vector work.
-            (ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery), 0)
-        } else {
-            // Count the vectors evaluated, not the bounded candidate pool.
-            (
-                search_filtered_vectors(
-                    &mut lexical_context,
-                    fetch,
-                    self.index.fast_index().record_count(),
-                    filter,
-                    |limit, candidates| self.search_fast_hits(query_vec, limit, candidates),
-                )?,
-                self.index.doc_count(),
-            )
-        };
+        let (mut classified, phase1_vectors_searched) =
+            if query_vec.iter().all(|&value| value == 0.0) {
+                // Zero signal belongs to this semantic lane (bd-tqhc), not the
+                // whole query. Lexical matches and an independently admitted
+                // quality query can still answer it without any fast-vector work.
+                (ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery), 0)
+            } else {
+                // Count the vectors evaluated, not the bounded candidate pool.
+                (
+                    search_filtered_vectors(
+                        &mut lexical_context,
+                        fetch,
+                        self.index.fast_index().record_count(),
+                        filter,
+                        |limit, candidates| self.search_fast_hits(query_vec, limit, candidates),
+                    )?,
+                    self.index.doc_count(),
+                )
+            };
         let (lexical_refill_time, _) = reconcile_filtered_vectors(
             &mut lexical_context,
             query_vec,
@@ -1203,8 +1208,9 @@ impl SyncTwoTierSearcher {
                 )
             },
         )?;
-        metrics.quality_search_ms =
-            ms(quality_started.elapsed().saturating_sub(lexical_refill_time));
+        metrics.quality_search_ms = ms(quality_started
+            .elapsed()
+            .saturating_sub(lexical_refill_time));
         metrics.lexical_search_ms += ms(lexical_refill_time);
         let ClassifiedHits { hits, zero_signal } = classified;
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
@@ -1441,8 +1447,7 @@ impl SyncTwoTierSearcher {
                 {
                     // Initial may have had signal that metadata subsequently
                     // revoked. Keep the reason from the exhausted refill.
-                    reconciled_zero_signal =
-                        fast_classified.zero_signal.or(classified.zero_signal);
+                    reconciled_zero_signal = fast_classified.zero_signal.or(classified.zero_signal);
                 }
                 fast_hits = fast_classified.hits;
                 let mut hits = classified.hits;
@@ -1480,12 +1485,38 @@ impl SyncTwoTierSearcher {
             Ok(pool) => pool,
             Err(error) => {
                 let latency = phase2_started.elapsed();
-                if matches!(&error, SearchError::Cancelled { .. }) {
-                    // Collection must retain the typed refusal even when phase
-                    // payloads are disabled. The iterator can still return the
-                    // previously published Initial with this terminal failure.
+                // A later metadata observation can revoke the already-published
+                // Initial or an undisplayed candidate retained for MMR. Neither
+                // pool is a valid fallback after that observation, even if the
+                // quality failure itself normally permits graceful degradation.
+                let fallback_is_eligible = filter.is_none_or(|filter| {
+                    final_ranking
+                        .as_ref()
+                        .map_or(initial_results.as_slice(), |ranking| {
+                            ranking.candidates.as_slice()
+                        })
+                        .iter()
+                        .all(|hit| {
+                            filter.matches(
+                                &hit.doc_id,
+                                lexical_context
+                                    .metadata
+                                    .get(&hit.doc_id)
+                                    .and_then(Option::as_deref)
+                                    .or(hit.metadata.as_deref()),
+                            )
+                        })
+                });
+                if !fallback_is_eligible || matches!(&error, SearchError::Cancelled { .. }) {
+                    // Collection retains the original typed failure. Iterators
+                    // keep an eligible Initial for cancellation, but never
+                    // republish an invalidated fallback or schedule final MMR.
                     return Err(Box::new(SyncRefinementFailure {
-                        initial_results,
+                        initial_results: if fallback_is_eligible {
+                            initial_results
+                        } else {
+                            Vec::new()
+                        },
                         error,
                         latency,
                     }));
@@ -1899,9 +1930,10 @@ struct SyncSearchOutcome {
     final_ranking: Option<SyncFinalRanking>,
 }
 
-/// A cancelled refinement retains its published Initial for iterator callers,
-/// while collected searches propagate the cancellation as an error. This is
-/// boxed only on failure; successful searches allocate no error payload.
+/// Terminal refinement failures propagate to collected searches. Iterators keep
+/// an eligible published Initial for cancellation, but an invalidated fallback
+/// has an empty payload and cannot schedule final ranking. This is boxed only on
+/// failure; successful searches allocate no error payload.
 struct SyncRefinementFailure {
     initial_results: Vec<ScoredResult>,
     error: SearchError,
@@ -2319,9 +2351,8 @@ fn search_lexical_candidates(
                 .iter()
                 .filter(|hit| {
                     metadata.get(&hit.doc_id).is_some_and(Option::is_none)
-                        && retained_metadata.is_none_or(|prior| {
-                            prior.get(&hit.doc_id).is_none_or(Option::is_none)
-                        })
+                        && retained_metadata
+                            .is_none_or(|prior| prior.get(&hit.doc_id).is_none_or(Option::is_none))
                 })
                 .map(|hit| hit.doc_id.as_str())
                 .collect();
@@ -5953,13 +5984,12 @@ mod tests {
             let mut limits = self.limits.lock().unwrap();
             limits.push(limit);
             if limits.len() == 1 {
-                return Ok(vec![
-                    lexical_result("doc-a", 10.0),
-                    lexical_result("doc-b", 9.0),
-                ]
-                .into_iter()
-                .take(limit)
-                .collect());
+                return Ok(
+                    vec![lexical_result("doc-a", 10.0), lexical_result("doc-b", 9.0)]
+                        .into_iter()
+                        .take(limit)
+                        .collect(),
+                );
             }
             let mut hits = vec![
                 lexical_result("doc-c", 8.0),
@@ -6029,10 +6059,8 @@ mod tests {
             ("tail-a", &[0.6, 0.8]),
             ("tail-b", &[0.5, 0.866_025_4]),
         ];
-        let progressive_fast_rows: &[(&str, &[f32])] = &[
-            ("fast-only-a", &[0.8, 0.6]),
-            ("fast-only-b", &[0.6, 0.8]),
-        ];
+        let progressive_fast_rows: &[(&str, &[f32])] =
+            &[("fast-only-a", &[0.8, 0.6]), ("fast-only-b", &[0.6, 0.8])];
         let quality_rows: &[(&str, &[f32])] = &[
             ("doc-a", &[1.0, 0.0, 0.0]),
             ("doc-b", &[0.9, 0.435_889_9, 0.0]),
@@ -6058,13 +6086,8 @@ mod tests {
             &quality_rows[..4]
         };
         let index = if attested {
-            let fast_index = attested_tier_with_identity(
-                directory.path(),
-                "fast.fsvi",
-                1,
-                fast_rows,
-                &fast,
-            );
+            let fast_index =
+                attested_tier_with_identity(directory.path(), "fast.fsvi", 1, fast_rows, &fast);
             let quality_index = attested_tier_with_identity(
                 directory.path(),
                 "quality.fsvi",
@@ -6235,11 +6258,9 @@ mod tests {
             }
         }
 
-        let mut context = SyncLexicalContext::new(
-            Some(Arc::new(StaticLexical { hits: Vec::new() })),
-            true,
-        )
-        .unwrap();
+        let mut context =
+            SyncLexicalContext::new(Some(Arc::new(StaticLexical { hits: Vec::new() })), true)
+                .unwrap();
         context.metadata.insert(
             "candidate".into(),
             Some(Arc::new(serde_json::json!({"doc_type": "keep"}))),
@@ -6290,20 +6311,14 @@ mod tests {
             let directory = temp_dir("late-fast-window");
             let fast = semantic_identity("late-fast-window-fast", 2);
             let quality = semantic_identity("late-fast-window-quality", 3);
-            let fast_rows: &[(&str, &[f32])] =
-                &[("a", &[1.0, 0.0]), ("fast-tail", &[0.8, 0.6])];
+            let fast_rows: &[(&str, &[f32])] = &[("a", &[1.0, 0.0]), ("fast-tail", &[0.8, 0.6])];
             let fast_rows = if include_tail {
                 fast_rows
             } else {
                 &fast_rows[..1]
             };
-            let fast_index = attested_tier_with_identity(
-                directory.path(),
-                "fast.fsvi",
-                1,
-                fast_rows,
-                &fast,
-            );
+            let fast_index =
+                attested_tier_with_identity(directory.path(), "fast.fsvi", 1, fast_rows, &fast);
             let quality_index = attested_tier_with_identity(
                 directory.path(),
                 "quality.fsvi",
@@ -6311,7 +6326,8 @@ mod tests {
                 &[("a", &[1.0, 0.0, 0.0])],
                 &quality,
             );
-            let index = Arc::new(InMemoryTwoTierIndex::new(fast_index, Some(quality_index)).unwrap());
+            let index =
+                Arc::new(InMemoryTwoTierIndex::new(fast_index, Some(quality_index)).unwrap());
             let lexical = Arc::new(LateBlockingLexical {
                 blocked_id: "a",
                 unknown_reads: AtomicUsize::new(usize::MAX),
@@ -6543,6 +6559,189 @@ mod tests {
         assert_eq!(hits[0].metadata.as_deref().unwrap()["doc_type"], "keep");
         assert_eq!(metrics.lexical_candidates, 1);
         assert_eq!(metrics.semantic_candidates, 0);
+    }
+
+    /// The initial fast pool is admitted while metadata is unknown. Quality
+    /// retrieval then resolves a rejection before a wider prefix's lookup fails.
+    struct RefinementMetadataFailure {
+        revoked: Option<&'static str>,
+        cancelled: bool,
+        lookups: AtomicUsize,
+    }
+
+    impl RefinementMetadataFailure {
+        fn error(&self) -> SearchError {
+            if self.cancelled {
+                SearchError::Cancelled {
+                    phase: "quality-refill-metadata".to_owned(),
+                    reason: "fixture cancellation after metadata resolution".to_owned(),
+                }
+            } else {
+                SearchError::InvalidConfig {
+                    field: "quality-refill.metadata".to_owned(),
+                    value: "unavailable".to_owned(),
+                    reason: "fixture failure after metadata resolution".to_owned(),
+                }
+            }
+        }
+    }
+
+    impl SyncLexicalSearch for RefinementMetadataFailure {
+        fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+            Ok(Vec::new())
+        }
+
+        fn metadata_for_documents(
+            &self,
+            ids: &[&str],
+        ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+            let first = self.lookups.fetch_add(1, Ordering::Relaxed) == 0;
+            if ids.contains(&"replacement") {
+                return Err(self.error());
+            }
+            Ok(ids
+                .iter()
+                .map(|id| {
+                    if first {
+                        return None;
+                    }
+                    let doc_type = if *id == "quality-blocked" || self.revoked == Some(*id) {
+                        "blocked"
+                    } else {
+                        "keep"
+                    };
+                    Some(Arc::new(serde_json::json!({ "doc_type": doc_type })))
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn refinement_failure_revalidates_displayed_and_hidden_initial_candidates() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        for revoked in [None, Some("shown"), Some("hidden")] {
+            let dir = temp_dir("sync-refinement-fallback");
+            let fast = semantic_identity("fallback-fast", 2);
+            let quality = semantic_identity("fallback-quality", 3);
+            let mut writer =
+                frankensearch_index::TwoTierIndex::create(dir.path(), TwoTierConfig::default())
+                    .unwrap();
+            writer.set_fast_embedder_id("fallback-fast");
+            writer.set_quality_embedder_id("fallback-quality");
+            writer.set_fast_identity(&fast).unwrap();
+            writer.set_quality_identity(&quality).unwrap();
+            writer.add_fast_record("shown", &[1.0, 0.0]).unwrap();
+            writer.add_fast_record("hidden", &[0.8, 0.6]).unwrap();
+            // The target's rejection is stored in the first quality prefix.
+            // The replacement fails only in the subsequent wider prefix.
+            let target = revoked.unwrap_or("shown");
+            let other = if target == "shown" { "hidden" } else { "shown" };
+            for (id, score) in [
+                ("quality-blocked", 1.0_f32),
+                (target, 0.99),
+                (other, 0.8),
+                ("replacement", 0.6),
+            ] {
+                writer
+                    .add_quality_record(id, &[score, (1.0 - score * score).sqrt(), 0.0])
+                    .unwrap();
+            }
+            drop(writer.finish().unwrap());
+            let index = Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap());
+            let query = TieredQueryEmbeddings::progressive(
+                BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+                BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+            );
+            let filter = DocTypeFilter::new(["keep"]);
+
+            for mmr in [false, true] {
+                for cancelled in [false, true] {
+                    // With MMR, "hidden" belongs to the retained ranking pool
+                    // but is absent from the already-published Initial.
+                    let k = if mmr { 1 } else { 2 };
+                    let searcher = || {
+                        let lexical = Arc::new(RefinementMetadataFailure {
+                            revoked,
+                            cancelled,
+                            lookups: AtomicUsize::new(0),
+                        });
+                        let searcher = SyncTwoTierSearcher::new(
+                            Arc::clone(&index),
+                            TwoTierConfig {
+                                candidate_multiplier: 1,
+                                ..TwoTierConfig::default()
+                            },
+                        )
+                        .with_nqc_dense_downweight_disabled()
+                        .with_mmr_config(MmrConfig {
+                            enabled: mmr,
+                            lambda: 0.3,
+                            candidate_pool: 2,
+                        })
+                        .with_lexical(lexical.clone());
+                        (searcher, lexical)
+                    };
+                    let (collect_searcher, lexical) = searcher();
+                    let collected =
+                        collect_searcher.search_collect_with_filter(&query, k, Some(&filter));
+                    assert_eq!(lexical.lookups.load(Ordering::Relaxed), 3);
+                    if revoked.is_some() || cancelled {
+                        let error = collected.expect_err(
+                            "a refinement failure cannot return an invalidated Initial as success",
+                        );
+                        assert_eq!(format!("{error:?}"), format!("{:?}", lexical.error()));
+                    } else {
+                        let (results, metrics) = collected.unwrap();
+                        assert_eq!(results.len(), k);
+                        assert_eq!(results[0].doc_id, "shown");
+                        assert_eq!(
+                            metrics.skip_reason.as_deref(),
+                            Some(lexical.error().diagnostic_code()),
+                        );
+                    }
+
+                    let (iter_searcher, lexical) = searcher();
+                    let mut phases =
+                        iter_searcher.search_iter_with_filter(&query, k, Some(&filter));
+                    let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+                        panic!("Initial must be emitted before quality metadata is resolved");
+                    };
+                    assert_eq!(results.len(), k);
+                    assert_eq!(results[0].doc_id, "shown");
+                    assert_eq!(lexical.lookups.load(Ordering::Relaxed), 1);
+                    let Some(SearchPhase::RefinementFailed {
+                        initial_results,
+                        error,
+                        ..
+                    }) = phases.next()
+                    else {
+                        panic!("the later metadata lookup must retain its original failure");
+                    };
+                    assert_eq!(format!("{error:?}"), format!("{:?}", lexical.error()));
+                    assert_eq!(lexical.lookups.load(Ordering::Relaxed), 3);
+                    if revoked.is_some() {
+                        assert!(
+                            initial_results.is_empty(),
+                            "terminal failure must not republish known rejected candidates",
+                        );
+                    } else {
+                        assert_eq!(
+                            serde_json::to_value(initial_results).unwrap(),
+                            serde_json::to_value(results).unwrap(),
+                        );
+                        if mmr && !cancelled {
+                            assert!(matches!(phases.next(), Some(SearchPhase::Reranked { .. })));
+                        }
+                    }
+                    assert!(
+                        phases.next().is_none(),
+                        "rejected candidates and cancelled searches must not reach final ranking",
+                    );
+                    assert!(phases.next().is_none());
+                }
+            }
+        }
     }
 
     #[cfg(feature = "quill")]
