@@ -178,8 +178,13 @@ impl FsfsRuntime {
         } else {
             self.cli_input.command
         };
-        self.validate_command_inputs(effective_command)?;
-        let Some(root) = self.complete_generation_command_root(initialize_store)? else {
+        let root = {
+            let _cancellation_scope =
+                Self::bind_foreground_cli_cancellation(cx, effective_command, shutdown)?;
+            self.validate_command_inputs(effective_command)?;
+            self.complete_generation_command_root(initialize_store)?
+        };
+        let Some(root) = root else {
             return match shutdown {
                 Some(shutdown) => Box::pin(self.run_mode_with_shutdown(cx, mode, shutdown)).await,
                 None => Box::pin(self.run_mode(cx, mode)).await,

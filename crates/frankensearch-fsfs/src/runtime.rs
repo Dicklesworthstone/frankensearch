@@ -9307,19 +9307,12 @@ impl FsfsRuntime {
         entry
     }
 
-    #[allow(clippy::future_not_send)]
-    async fn run_cli_scaffold(
-        &self,
+    fn bind_foreground_cli_cancellation(
         cx: &Cx,
         command: CliCommand,
         shutdown: Option<&ShutdownCoordinator>,
-    ) -> SearchResult<()> {
-        self.validate_command_inputs(command)?;
-        // Bind the supplied signal coordinator before foreground query/model
-        // waits. Keep this scope inside the initial watch pass so watcher
-        // finalization still uses its graceful-shutdown lifecycle. Serve and
-        // daemon retain their own stop/drain protocol.
-        let cancellation_scope = shutdown
+    ) -> SearchResult<Option<Arc<Cx>>> {
+        let scope = shutdown
             .filter(|_| {
                 matches!(
                     command,
@@ -9335,9 +9328,23 @@ impl FsfsRuntime {
                 )
             })
             .map(|shutdown| shutdown.cancellation_scope(cx));
-        if cancellation_scope.is_some() {
+        if scope.is_some() {
             Self::semantic_retry_checkpoint(cx, "fsfs.cli")?;
         }
+        Ok(scope)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn run_cli_scaffold(
+        &self,
+        cx: &Cx,
+        command: CliCommand,
+        shutdown: Option<&ShutdownCoordinator>,
+    ) -> SearchResult<()> {
+        // This scope covers foreground work, including the initial watch pass.
+        // Watcher finalization and server drain use their own shutdown paths.
+        let _cancellation_scope = Self::bind_foreground_cli_cancellation(cx, command, shutdown)?;
+        self.validate_command_inputs(command)?;
         // A paused stage halts writes (pressure.rs contract); stopping the
         // compaction daemon sheds work and stays allowed.
         let writes = matches!(
@@ -30105,6 +30112,8 @@ impl FsfsRuntime {
         // Keep the initial index pass, watcher startup, pressure accounting
         // and shutdown on the same destination even if the alias is retargeted.
         let alias_runtime = if watch_enabled_for_command {
+            let _cancellation_scope =
+                Self::bind_foreground_cli_cancellation(cx, command, Some(shutdown))?;
             self.validate_command_inputs(command)?;
             self.resolve_legacy_index_alias(command)?
         } else {
@@ -43742,7 +43751,7 @@ mod tests {
 
     #[test]
     fn foreground_cli_dispatch_binds_an_already_requested_shutdown_before_work() {
-        for command in [
+        for (command, complete_dispatch) in [
             CliCommand::Index,
             CliCommand::Watch,
             CliCommand::Search,
@@ -43752,7 +43761,10 @@ mod tests {
             CliCommand::Compact,
             CliCommand::Flush,
             CliCommand::Download,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|command| [(command, false), (command, true)])
+        {
             run_test_with_cx(|cx| async move {
                 let temp = tempfile::tempdir().unwrap();
                 let mut config = FsfsConfig::default();
@@ -43769,12 +43781,21 @@ mod tests {
                 let shutdown = ShutdownCoordinator::new();
                 shutdown.request_shutdown(ShutdownReason::UserRequest);
                 assert!(!cx.is_cancel_requested());
-                let result =
+                let result = if complete_dispatch {
+                    Box::pin(runtime.run_mode_with_complete_generations(
+                        &cx,
+                        InterfaceMode::Cli,
+                        Some(&shutdown),
+                        true,
+                    ))
+                    .await
+                } else {
                     Box::pin(runtime.run_mode_with_shutdown(&cx, InterfaceMode::Cli, &shutdown))
-                        .await;
+                        .await
+                };
                 assert!(
                     matches!(result, Err(SearchError::Cancelled { .. })),
-                    "{command:?}: {result:?}"
+                    "{command:?}, complete dispatch {complete_dispatch}: {result:?}"
                 );
                 assert!(temp.path().read_dir().unwrap().next().is_none());
                 cx.set_cancel_requested(false);

@@ -19682,7 +19682,7 @@ mod tests {
                             .zip(&fast_vectors)
                             .map(|(id, vector)| (*id, vector.as_slice()))
                             .collect();
-                        let quality_rows: Vec<_> = ids
+                        let mut quality_rows: Vec<_> = ids
                             .iter()
                             .zip(&quality_vectors)
                             .map(|(id, vector)| (*id, vector.as_slice()))
@@ -19691,6 +19691,14 @@ mod tests {
                             ("fast-only-a", &[0.0, 0.0, 1.0, 0.0]),
                             ("fast-only-b", &[0.0, 0.0, 0.0, 1.0]),
                         ];
+                        if mode == "progressive" {
+                            // Give the initial fast hits low quality evidence so
+                            // a real quality winner outranks their normalized ties.
+                            quality_rows.extend([
+                                ("fast-only-a", [0.0, 0.0, 1.0, 0.0, 0.0, 0.0].as_slice()),
+                                ("fast-only-b", [0.0, 0.0, 0.0, 1.0, 0.0, 0.0].as_slice()),
+                            ]);
+                        }
                         let (_dir, index) = query_admission_index_with_rows(
                             layout,
                             if mode == "progressive" {
@@ -19712,6 +19720,9 @@ mod tests {
                             TwoTierConfig {
                                 candidate_multiplier: 1,
                                 fast_only: mode == "fast",
+                                // Exercise both retrieval pools even though this short
+                                // query fills its initial lexical budget.
+                                graph_ranking_enabled: true,
                                 ..TwoTierConfig::default()
                             },
                         )
@@ -19794,7 +19805,7 @@ mod tests {
                                 metrics.coverage.unwrap().quality,
                                 frankensearch_core::TierQueryCoverageV1::Witnessed {
                                     generation_sequence: 79,
-                                    live_count: 6,
+                                    live_count: u64::try_from(quality_rows.len()).unwrap(),
                                     contributed_candidates: 2,
                                 },
                                 "coverage must use the final eligible retrieval window",

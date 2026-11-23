@@ -1,6 +1,239 @@
 # Bridge Plan: frankensearch
 
-## Current assessment — November 20, 2026
+## Current assessment — November 22, 2026
+
+The core local search product ships and works. The signed Linux release
+executable indexed and ranked documents with both registered model tiers,
+served current results from separate processes while a watcher published a
+successor, and preserved document removal through compaction and reopen. The
+largest gaps are consistent behavior across CLI and daemon entry points,
+identity-safe publication and upgrades across platforms, and the unfinished
+Quill conformance and performance program.
+
+### Evidence
+
+- Read the complete repository [AGENTS.md](../../AGENTS.md) and
+  [README.md](../../README.md), and the suite-wide instructions. Reviewed the
+  previous bridge, Quill design and governing language, release, configuration,
+  streaming, performance and generation contracts. Traced the documented paths
+  through their production implementations and tests.
+- Froze committed main at `1c553f5dd3e4baed804697a7815111bbacce12f4` on
+  thinkstation1, with lockfile SHA-256
+  `b91fd96a2b985f360576dd59a05e11373de15aa72f099560ee9c466212e56b76`,
+  nightly-2026-08-31 and the workspace optimizer's clean `fast_cmaes` sibling
+  at `18b3910246862468893ca1d0cd345a379e4f7082`. The shared checkout moved
+  during validation. For instance, `172ed241` landed the legacy alias work
+  after the freeze.
+- GitHub published [fsfs 1.13.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.13.0)
+  on November 21. The binary and crate-family tags point to `d1b9da15`,
+  80 commits behind the audited snapshot. The registry serves
+  [frankensearch 0.8.0](https://crates.io/crates/frankensearch/0.8.0) and
+  [frankensearch-fsfs 1.13.0](https://crates.io/crates/frankensearch-fsfs/1.13.0).
+  Verified the Linux GNU and Apple Silicon release metadata with
+  `minisign.pub`. The tested Linux executable matched the signed digest
+  `9f8ca93592270fd24f4526c934635ad3307a625c14e18da0d2f8ef7823a5b225`.
+  The tested Apple Silicon executable matched the signed digest
+  `ba974337d3ce7065c9a69c6a29e315607d1f012e8c618af7778a29c300ca8186`.
+  On Darwin arm64 the signed archive installed offline, verified Potion and
+  MiniLM, indexed two files and returned the planted hit in both search
+  phases with a successful terminal frame. See `mac-release-smoke.log`.
+- The Linux release archive matched GitHub's SHA-256 and passed Minisign.
+  `install.sh --offline --verify` verified both cached model tiers and
+  installed an executable with the signed digest into a private destination.
+  The release executable quickstart passed all 12 commands and 22 negative
+  controls with no owned processes left. It exercised both vector generations,
+  Initial and Refined frames and warmed daemon queries.
+  Local evidence is under `/data/tmp/fs-reality-20261122.gR4zaX`, including
+  the release quickstart, source gate, manual lifecycle and policy controls.
+- The pinned `1c553f5d` gate passed formatting, workspace check, all three
+  Clippy lanes, Windows MSVC index compilation, workspace tests, proxy,
+  installer, bounded Quill, fsfs tests, the real-model facade and doctests,
+  executable quickstart and lite. See `quality-retry.log`. This invocation
+  omitted the separate four-model CLI e2e stage. The first invocation failed
+  because the isolated workspace lacked its optimizer's sibling manifest.
+  RCH refused the initial location before launching Cargo. The successful
+  run had the sibling and executed locally with debug info disabled.
+- The repair rerun passed formatting, workspace check, all three Clippy
+  lanes, Windows MSVC index compilation, proxy and all three installer
+  suites. The workspace test lane failed in Fusion. The same executable
+  reproduced the failure five times. A full eligible lexical prefix and
+  the short query caused the regression to take the lexical shortcut before
+  reaching semantic refill. A separate run of the storage batch tests found
+  that the reclaim fixture had a zero retry budget, so it could never claim
+  the successor it expected. See `integrated-quality.log`,
+  `receipt-test.nt8zih/fusion-focus.log` and `storage-batch-verified.log`.
+- The patched storage suite passed all 587 tests and warnings-denied package
+  Clippy. The Fusion test now enters the hybrid path and gives the initial
+  fast hits low quality scores. An eligible quality winner can outrank them
+  without depending on a document-ID tie. The Fusion suite passed 1,257 tests
+  with four ignored, including the populated 36-case refill matrix. The
+  earlier fsfs gate separately exposed a path lookup ahead of foreground
+  cancellation. The repaired source passed the 18-case shutdown regression,
+  3,335 fsfs library tests with 16 ignored, and four populated executable
+  cases, including both watch routes and a cold managed daemon. `bd-eogl0`
+  is closed. The binary SHA-256 was
+  `2f5abf02febebb501e79e4791185c18c9cc26a147da889574657eabea12f54de`.
+- That earlier integrated run passed all 25 cases in the four-model executable
+  lane. Its source-build quickstart correctly refused the dirty checkout.
+  The next full run uses a clean checkout of the repair commit.
+- The paired Linux diagnostic used the signed executable and a stock
+  release-profile build of `aaa1e06e`, SHA-256
+  `754be33869454e7b981ed5a834f51bc5411046784dbbf83af1925ac13bd6ef79`.
+  Each arm reached Refined in all 50 warm queries in both execution orders.
+  Warm p50 ranges were 12.7–13.1 ms Initial and 20.0–21.3 ms Refined.
+  The ordering of watch medians reversed in the second run as host load
+  shifted. Fresh indexing and unchanged reruns varied with load as well.
+  The raw diagnostic samples are under `product-pair*`.
+- The same binaries indexed the frozen `be75d713` Rust corpus, each producing
+  11,878 fast windows over 581 indexed files with one exclusion. Both unchanged
+  reruns preserved all 581 files. Both arms reached Refined on all 253 frozen
+  code queries. The paired nDCG@10 and Recall@100 differences were zero for
+  both phases. See `code-workload/paired-quality.log` and the index receipts.
+
+### Vision checklist
+
+| Goal | Current reality and evidence | Remaining work and tracker |
+|---|---|---|
+| 1. Standard semantic install and explicit lite | Full Linux x86-64 GNU and Apple Silicon archives and four lite variants are published. The installer has checksum, signature and model provisioning paths. Intel macOS has a documented lite-only exception. | Finish exact installer/updater matrix and Linux ARM source route. Windows authority has separate scope. `bd-fsfs-cross-platform-semantic-installer-46z3u`, `bd-windows-generation-root-authority-f77gj`, `bd-macos-x86-generation-root-qualification-bb39t`, `bd-dsbym`. |
+| 2. Verified model acquisition and local search | Five registered models verified offline in a private cache. The published executable returned separate Initial and Refined results with Potion and MiniLM. Hosted embeddings are a library opt-in. Explicit expansion has its own remote policy. | Ordinary model-change recovery across entry points. `bd-p6z6`, `bd-p6z6.3`, `bd-p6z6.4`, `bd-3fy9`. |
+| 3. Durable indexing and efficient reruns | Signed Linux artifact durably indexed three files and reported three unchanged on repeat. Complete publication, retained inputs and source-root admission have real implementations. | Current cancellation, storage and sustained-pressure acceptance. `bd-pz8va`. |
+| 4. Progressive hybrid and independent quality-only retrieval | Linux quickstart delivered both phases. Independent corpus returned `retry.md` first in hybrid Refined and quality-only Initial. Sync, async and federated implementations exist. | Request-scoped filter and scan-policy acceptance, and retained real facade restart and candidate union. `bd-async-filter-2c68s`, `bd-quality-policy-1x3k7`, `bd-q4rg`, `bd-2g2l`. |
+| 5. Degradation, filters and exclusion semantics | Fusion's failure and fallback paths are implemented. Stock CLI gates fast-provider admission and supports exclusion-only queries without model work. Release quickstart had missing-model and invalid-producer controls. | Unified degraded recovery and typed embedding-space enforcement. `bd-3fy9`, `bd-jbfg`, `bd-a6zt`. |
+| 6. Equivalent direct, daemon, streaming and replay behavior | Release smoke passed normal direct and socket paths. Fresh named `search --daemon --offline` spawned its own daemon and returned exit 2, `complete_generation.daemon_config`, and no hits. Matching explicit offline server and direct offline search returned the planted result. A default-socket offline request recovered in process after retiring its own mismatched child. `719d58bc` forwards explicit network policy. The populated regression failed with the signed release and passed with the repair, including the opposite-policy refusal control. The Bead is closed. | Carry the fix into the next executable release through `bd-dsbym`. |
+| 7. Search while watch publishes updates | Linux artifact published a successor after rename and addition. Independent direct and warm daemon searches saw both new IDs and omitted the old ID while watch stayed live. `bd-z2nfa` records the eight native Mac lifecycle combinations passing at `0e4d5725`. The earlier November 20 failure is historical. | Legacy flat locking has a documented boundary. Verify current-source pressure/reconciliation and restart. `bd-pz8va`, `bd-fsfs-identity-bound-watch-staging-t9m9m`, `bd-fsfs-cli-upgrade-reuse-rsqq7`. |
+| 8. Atomic maintenance, flush and recovery | Actual append, ID deletion, compact and reopen behaved as expected. Flush confirmed selected-generation durability. A read-only preparation preserved the selection hash. Applying it restored the exact older receipt, confirmation returned `durability_confirmed`, and a fresh query found the restored document. | Exact-source recovery fault controls across platforms and migration to composite authority. `bd-xomn.2`, `bd-rgcvv`, `bd-3fy9`. |
+| 9. Explanations, snapshot provenance and interactive dashboard | Inline and standalone explanations served on the Linux lifecycle. A full-screen session on a controlling PTY displayed the planted result, then displayed a new matching document after a separate append process published it and the idle dashboard refreshed. It quit cleanly. A separate ANSI fallback showed the Refined result. | Current policy parity and corruption/cancellation breadth through existing TUI runtime tests and `bd-retained-composite-generation-snapshot-cdny8`. |
+| 10. Safe cross-executable upgrades | Linux opt-in contract v5 is wired and has genuine two-executable evidence for earlier source. It binds producer, format, configuration, file policy and artifact identity. | Native Mac still scopes evidence to the process. Qualify a stronger launch-time identity with real predecessor and successor binaries. `bd-fsfs-cli-upgrade-reuse-rsqq7`. |
+| 11. Reusable Rust facade and caller-owned runtime | `IndexBuilder`, `open_hybrid` and `TwoTierSearcher` are real. Quill backs the lexical feature; hash is a control. The lock contains none of the prohibited runtime packages. | Real-model and optional-package matrices, an external consumer and persisted restart. `bd-2g2l`, `bd-q4rg`, `bd-8nqz`. |
+| 12. Quill conformance across lifecycle states | Quill ships with native parsing and BM25, encoded postings, deltas, compaction and concat-merge. Tantivy 0.26.2 is the pinned live oracle. The bounded witness, full gauntlet and scaled campaigns each cover a distinct scope. | R1, UNION_HORIZON, full result contract, scale, all named full gates and divergence census. `bd-r1-exact-repair-or-residual-1i4j4`, `bd-quill-union-horizon-exactness-salej`, `bd-qwkq`, `bd-y7vz`, `bd-quill-e6-gauntlet-scale-rm3q`, `bd-quill-flip-conformance-release-gate-0r2p`. |
+| 13. CASS interop and durable library storage | Tantivy-backed `cass-compat` and native Quill CASS analyzer implement scoped contracts. Catalog, queue and attempt-fenced embedding writes use FrankenSQLite. | External CASS persisted semantic generation and recovery plus total lexical result contract. `bd-cass-semantic-cross-repo-receipt-91k2`, `bd-cass-total-lexical-contract-jxyq`, `bd-q4rg`. |
+| 14. Immutable composite authority and embedding-space identity | Cooperative `FSFS-CURRENT` and low-level FSVI v2 owner-bound APIs exist, while native and ordinary CLI modes still have different selection entry points. | Fixed-slot authority, authenticated anti-rollback, retained pinning and migration of ordinary writers, readers and caches. `bd-xomn.1`–`.4`, `bd-generation-antirollback-floor-ynwdi`, `bd-fixed-generation-root-publisher-ycng6`, `bd-retained-composite-generation-snapshot-cdny8`, `bd-generation-retention-roots-xnmxi`, `bd-jbfg`. |
+| 15. Quantized exact search and opt-in ANN | SIMD f16 exact path and admitted native HNSW with independent graphs, receipts and exact rescoring exist. Optional `ann` still pulls renamed `frankenhnsw`. | Representative recall and tail costs, native cutover and controlled retirement of raw-vector admission. `bd-kcek`, `bd-exact-residual-vector-scan-iusa0`, `bd-raw-vector-api-retirement-8sc8a`. |
+| 16. Alternate models and optional rerank | The release indexed and searched with the explicit native MiniLM quality-only profile. A separate ONNX-default hybrid request applied the real ms-marco cross-encoder to three hits and ranked `retry.md` first. These probes used raised functional deadlines. Prior rerank receipts show both wins and losses by corpus. | Native ARM64 numerical and performance qualification, and paired quality ablation. `bd-2ba5`, `bd-6kafg`, `bd-quill-e6-gauntlet-scale-rm3q.7`. |
+| 17. Representative relevance and product cost | README supports Refined gains and mixed Initial performance on the measured corpora. September timing receipts apply to their workloads and source. Newer watch, semantic-window and daemon policy can change cost. | Held-out relevance and fresh executable latency/index/watch receipts. `bd-quill-e6-gauntlet-scale-rm3q.6`, `bd-quill-e6-gauntlet-scale-rm3q.7`, `bd-fsfs-current-product-envelope-lz056`. |
+| 18. Competitive lexical performance | All ten QG rows remain provisional. The ledger includes losses and unscored cells. | Paired live incumbent, matched lifecycle and A/A validity by machine class. Execute through `bd-h6eh` and E8/E8-H. |
+| 19. Reproducible releases and accurate instructions | The prior timeout recipe returned 500 ms from defaults when given 1,200 ms. The supported CLI variable returned 1,200 ms from env. `6d5d669b` records the tested recipe and current release boundary. | `bd-dsbym` tracks the next release chain. |
+| 20. Fleet ops and distributed search | Ops is experimental by `bd-p6k61`. Distributed architecture is a draft. | Future owner decision. |
+
+### Order of work
+
+1. Pass explicit offline/online intent to managed daemon children. Keep exact
+   admission and opposite-policy refusal. Test fresh default and named sockets,
+   direct and matching explicit-server controls, and one stream terminal. A
+   direct fallback cannot satisfy the daemon test.
+2. Bind release decisions to source and executable hashes. Run the stock
+   quality gate with a genuine compatible predecessor and all four models.
+   Qualify native Mac and changed platform/profile artifacts through installer,
+   updater, runtime and external-consumer gates. Keep the named full Quill
+   gate required when that surface changes.
+3. Carry the same retained generation and producer identity through query,
+   cache, explanation and recovery. Prove pinned predecessor and successor
+   reads during interruption and restart before retiring mutable legacy
+   paths. Exercise the same fault classes across ordinary CLI, native CLI,
+   facade and CASS adapters as they migrate.
+4. Resolve real Quill correctness residuals before generalizing equivalence.
+   Use minimized R1 and union-horizon witnesses across fresh, delta,
+   compacted and reopened stores. Run meaningful QG losses through
+   full-path profiling and a live, matched incumbent.
+5. Refresh current user timings on the production path and correct public
+   recipes. Separate cold startup, warm cache misses, cache hits and
+   edit-to-visible watch, with phase counts, timeouts and retained bytes.
+   Retain older measurements. The release and recipe corrections can land
+   independently of the performance result.
+
+### Implementation checklist
+
+- [x] Reproduce cold named and store-default offline startup on the signed
+  Linux executable and compare with direct and explicit-server controls.
+- [x] Reproduce the named failure with the retained `8ea447e3` candidate.
+  Its production source and lockfile match `1c553f5d`.
+- [x] Route explicit CLI network selection through the shared child launcher
+  and add child-argument and executable regressions.
+- [x] Reproduce the newer watcher alias compile failure at `172ed241`.
+  Bind the scan callback object to its caller's lifetime and keep its borrowed
+  exclusions. Tracked in `bd-fsfs-watch-alias-compile-i98tu`.
+- [x] Verify alias admission and scoped watch exclusions with a store symlink
+  inside the corpus, an excluded canary and a new source file ingested by
+  the running watcher.
+- [x] Run the populated daemon test against the signed release and fixed
+  executable. Verify warm replay, one terminal frame and typed refusal of
+  an opposite-policy named daemon. Trace the warm offline client and confirm
+  AF_UNIX traffic and zero AF_INET/AF_INET6 calls.
+- [x] Fix three watcher fixtures that lacked the new exclusions argument
+  and two storage fixtures that held the probe guard past its last use.
+- [x] Verify the watcher snapshot tests, both storage batch regressions and
+  the daemon argument test on the integrated source.
+- [x] Reproduce both newly exposed regression-fixture failures. Allow the
+  expired storage attempt to return to pending. Exercise the Fusion refill
+  test with the shortcut disabled while preserving its candidate budgets
+  and cancellation checks.
+- [x] Run the populated Fusion matrix and storage batch cases with those
+  fixture corrections.
+- [x] Route an already requested shutdown ahead of alias and layout admission.
+  Extend the missing-source regression to the complete-aware executable route.
+  `bd-eogl0`.
+- [x] Verify the expanded cancellation regression, adjacent watch and daemon
+  tests and a populated index and search with the final source.
+- [x] Confirm the 13 registry versions and signed release artifacts. Exercise
+  the corrected CLI timeout and pressure recipes against the published binary.
+- [x] Update README, AGENTS and the existing packaging contract with the
+  tested recipes and release boundary.
+- [ ] Verify the integrated workspace and real-model CLI gate with a genuine
+  predecessor. Keep terminal evidence tied to the exact tested source.
+- [x] Verify the signed Apple Silicon installer, registered model pair and
+  two-phase search on a native host.
+- [x] Establish complete-store timing controls on the signed Linux release
+  with six cold queries, 50 streamed warm misses, six buffered cache hits
+  and five edits observed through a live daemon and a separate CLI process.
+- [x] Build the selected current executable in the stock release profile and
+  run the same complete-store workload against both binaries.
+- [x] Fix the opt-in product receipt to read the complete-store index JSON
+  and resolve its quality artifact. Confirm each edit through the live daemon
+  and a separate reader, with an absence check before each write and a final
+  restart read. On signed 1.13.0 the old observer failed after indexing, and
+  the v2 smoke served 50 refined queries and verified 20 edits. The repaired
+  executable likewise passed. The same observer rejected a planted zero p95
+  bound after completing the workload.
+- [x] Materialize the 582-file versioned code corpus used by the existing
+  product evaluator and retain its 253 frozen relevance judgments.
+- [x] Run both optimized executables on the same code corpus and judgments.
+- [ ] Recheck latency on a booked native host, isolate model-load cost and
+  qualify the code workload's peak memory, retained bytes and live watch cuts.
+- [ ] Qualify cross-executable macOS reuse and the remaining documented
+  installer and updater paths.
+- [ ] Advance retained FSVI v2 authority and recovery, then exercise CASS,
+  native and ordinary CLI and facade restart cases.
+- [ ] Resolve Quill R1 and union-horizon witnesses. Run full and scaled
+  differential suites, then the competitive workloads with live Tantivy.
+
+### Graph coverage and plan refinement
+
+The incoming graph contained 1,478 issues, including 1,335 closed, 87 open,
+46 in progress, six blocked and four deferred. Finishing that queue would
+have covered most architectural and qualification gaps. Three concrete
+obligations lacked active acceptance: the offline self-spawn bug, the current
+release and executable recipes, and a current complete-store product
+envelope. The three new beads link to existing streaming, release and
+product-evidence work without blocking one another.
+After export there were 90 open issues and 39 actionable issues. A record-wise
+comparison preserved all 1,478 original issues. `br dep cycles` returned zero
+active cycles and two archived closed-only cycles, and the `bv` robot triage
+and plan parsed successfully.
+
+The three ambition passes sharpened the proposal around retained identity
+across the entire result, equivalence at actual CLI and daemon process
+boundaries, and relevance and cost measured on the same operational paths.
+Five refinement passes checked the vision rows, duplicate and related beads,
+positive/negative controls, dependency and platform boundaries, and exact
+source and release evidence. The probe required two observer corrections:
+hybrid retrieval may return other documents after deletion, so the assertion
+checks for the deleted ID, and a named daemon has to be stopped at its
+named socket. The terminal probe uses a controlling PTY so that the actual
+full-screen renderer takes over. The new daemon bead includes both unit and populated regression
+acceptance. Existing release and whole-product proof lanes provide terminal
+checks.
+
+## November 20, 2026
 
 The library and the stock CLI can deliver an initial hybrid result and a
 quality-refined result from local models. Retained generations also let

@@ -763,10 +763,7 @@ fn fsfs_latency_receipt() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the query daemon");
-    let daemon = DaemonGuard {
-        child,
-        socket: socket.clone(),
-    };
+    let daemon = DaemonGuard { child, socket };
     wait_for_socket(&daemon.socket, Duration::from_secs(60));
 
     // The daemon's overhead floor: a `:ready` round trip does no search, so
