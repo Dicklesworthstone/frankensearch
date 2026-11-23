@@ -398,6 +398,31 @@ Quill conformance and performance program.
   `transport-quickstart-receipt.json` in the same evidence root.
 - Landed as `ffbec5e5`. The only tracked difference from the gated revision
   at that commit was an intervening update to this plan.
+- At `e7c09806`, a populated legacy store returned successful direct hits
+  when the requested daemon socket was too long. The complete-store control
+  returned a socket error. A private Unix peer that read the request and
+  closed without replying triggered the same legacy fallback. `4eea170f`
+  propagates early socket failures for explicitly named endpoints. Buffered
+  JSON and JSONL stream tests reproduce the baseline failure and pass on
+  both layouts after the change. The signed Linux 1.13.0 executable also
+  performed the silent fallback in both output modes on a fresh legacy store.
+- The traced development binary returned no hits for each of four overlong
+  socket requests. The early-close replay used the same socket pathname for
+  default and explicit requests. Default queries kept exact direct hit
+  records, and explicit queries returned the typed error with no hits.
+  Healthy named daemons on both layouts returned exact direct hit records
+  and shut down normally. See `checked-in-{red,green}.log`,
+  `peer-close-{baseline,candidate}.log`, and `healthy-daemons.log` under
+  `/data/tmp/fsfs-named-socket.aa6bfZAM`.
+- Clean `4eea170f` passed all 18 stock quality stages, including all 36
+  real-model end-to-end tests. The default debug quickstart installation
+  passed 12 commands and 22 negative controls with zero owned processes
+  remaining. Its SHA-256 is
+  `7fd8a59abaa5d1fdc4a3396a9702b931c77e453b98d8bea1fda195db5860b122`.
+  That exact installed executable repeated the early-close outcomes for
+  buffered and streaming search. See `published-candidate-gate.log`,
+  `tmp/fsfs-quickstart.bl8zC0QG/receipt.json`, and
+  `peer-close-installed.log` in the same evidence root.
 - The previous optimized `fsfs update` tried to contact GitHub when offline
   was selected by CLI, environment or config. Both `--check` and apply
   reached the refusing loopback control. The repair checks resolved offline
@@ -770,6 +795,17 @@ Quill conformance and performance program.
   optimized binary.
 - [x] Run the stock quality stages on the exact revision and publish the
   CLI transport fix.
+- [x] Reproduce named-socket startup failure in both output modes on real
+  legacy and complete indexes and compare the direct controls.
+- [x] Preserve an executable regression that fails on the legacy baseline.
+- [x] Propagate an unavailable named daemon's error in both legacy output
+  paths while preserving fallback for an implicit default endpoint.
+- [x] Confirm healthy named transports and compare their entire ranked hit
+  records with direct execution. Exercise default fallback after a peer
+  closes before sending its first frame.
+- [x] Repeat the early-close checks on the retained source quickstart install.
+- [x] Run complete stock quality checks, record exact scoped Bead evidence,
+  and publish the named-endpoint repair.
 - [x] Reproduce the updater's offline leak with the optimized executable
   and a refusing loopback proxy.
 - [x] Apply the resolved offline policy before remote release checks or
