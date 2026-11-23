@@ -371,10 +371,44 @@ struct DriftingCachedQueryProvider {
     inner: Arc<Provider>,
     changed: EmbeddingIdentityBundleV1,
     drift: std::sync::atomic::AtomicBool,
+    unavailable: std::sync::atomic::AtomicBool,
+    identity_calls: AtomicUsize,
+}
+
+impl DriftingCachedQueryProvider {
+    fn new(inner: Arc<Provider>) -> Arc<Self> {
+        let mut changed = inner.identity.clone();
+        changed
+            .producer
+            .implementation_revision
+            .push_str("-foreign-producer");
+        changed.validate().unwrap();
+        Arc::new(Self {
+            inner,
+            changed,
+            drift: std::sync::atomic::AtomicBool::new(false),
+            unavailable: std::sync::atomic::AtomicBool::new(false),
+            identity_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> (usize, usize) {
+        (
+            self.identity_calls.load(Ordering::Relaxed),
+            self.inner.calls.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl Embedder for DriftingCachedQueryProvider {
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        self.identity_calls.fetch_add(1, Ordering::Relaxed);
+        if self.unavailable.load(Ordering::Relaxed) {
+            return Err(SearchError::EmbedderUnavailable {
+                model: self.id().to_owned(),
+                reason: "query identity is unavailable".to_owned(),
+            });
+        }
         Ok(if self.drift.load(Ordering::Relaxed) {
             &self.changed
         } else {
@@ -401,6 +435,237 @@ impl Embedder for DriftingCachedQueryProvider {
     }
 }
 
+fn full_drifting_session(
+    cx: &Cx,
+    fixture: &QualityActivationFixture,
+    cached: bool,
+) -> (
+    AuthoritySession,
+    Arc<DriftingCachedQueryProvider>,
+    Arc<DriftingCachedQueryProvider>,
+) {
+    let fast = DriftingCachedQueryProvider::new(Arc::clone(&fixture.fast));
+    let quality = DriftingCachedQueryProvider::new(Arc::clone(&fixture.quality));
+    let receipt = fixture.completed.clone();
+    let root = admit_root(&receipt.root).unwrap();
+    let snapshot = receipt
+        .open_on_root(cx, &root, DEFAULT_IMAGE_BYTES)
+        .unwrap();
+    let session = AuthoritySession::new(
+        cx,
+        root,
+        receipt,
+        snapshot,
+        Models {
+            fast: fast.clone(),
+            quality: Some(quality.clone()),
+        },
+        (1, DEFAULT_IMAGE_BYTES),
+        false,
+    )
+    .unwrap()
+    .with_query_cache(cx, cache_config(if cached { "4" } else { "0" }))
+    .unwrap();
+    (session, fast, quality)
+}
+
+#[test]
+fn authority_query_mode_isolates_single_tier_producers_with_and_without_cache() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = QualityActivationFixture::new(&cx, "query-mode-isolation", false, true).await;
+        for cached in [false, true] {
+            let (session, fast, quality) = full_drifting_session(&cx, &fixture, cached);
+            for (mode, phase, selected, unused) in [
+                ("fast", "initial", &fast, &quality),
+                ("quality", "quality", &quality, &fast),
+            ] {
+                let request: AuthoritySearchRequest = serde_json::from_value(
+                    serde_json::json!({"query":CACHED_QUERY, "mode":mode, "stream":true}),
+                )
+                .unwrap();
+                let mut baseline = Vec::new();
+                session
+                    .query(&cx, &request, 1, &mut baseline)
+                    .await
+                    .unwrap();
+                let baseline = frames(&baseline);
+                assert_eq!(baseline.len(), 1);
+                assert_eq!(baseline[0]["results"][0]["doc_id"], "retry-first");
+                for (drift, unavailable) in [(true, false), (false, true)] {
+                    unused.drift.store(drift, Ordering::Relaxed);
+                    unused.unavailable.store(unavailable, Ordering::Relaxed);
+                    let before_selected = selected.calls();
+                    let before_unused = unused.calls();
+                    let mut output = Vec::new();
+                    session.query(&cx, &request, 2, &mut output).await.unwrap();
+                    let output = frames(&output);
+                    assert_eq!(output.len(), 1);
+                    assert_eq!(output[0]["results"], baseline[0]["results"]);
+                    assert_eq!(output[0]["authority"], baseline[0]["authority"]);
+                    assert_eq!(output[0]["mode"], mode);
+                    assert_eq!(output[0]["phase"], phase);
+                    assert!(selected.calls().0 > before_selected.0);
+                    assert_eq!(selected.calls().1 - before_selected.1, usize::from(!cached));
+                    assert_eq!(unused.calls(), before_unused);
+                    unused.drift.store(false, Ordering::Relaxed);
+                    unused.unavailable.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn authority_query_mode_admits_requested_producers_before_cache_hits_and_empty_scopes() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = QualityActivationFixture::new(&cx, "query-mode-admission", true, false).await;
+        for cached in [false, true] {
+            let (session, fast, quality) = full_drifting_session(&cx, &fixture, cached);
+            for (mode, selected, unused) in
+                [("fast", &fast, &quality), ("quality", &quality, &fast)]
+            {
+                let request: AuthoritySearchRequest =
+                    serde_json::from_value(serde_json::json!({"query":CACHED_QUERY, "mode":mode}))
+                        .unwrap();
+                session
+                    .query(&cx, &request, 1, &mut Vec::new())
+                    .await
+                    .unwrap();
+                for empty_scope in [false, true] {
+                    let mut request: AuthoritySearchRequest = serde_json::from_value(
+                        serde_json::json!({"query":CACHED_QUERY, "mode":mode}),
+                    )
+                    .unwrap();
+                    if empty_scope {
+                        request.filter =
+                            Some(Filter::parse(r#"{"id_prefix":"missing-"}"#).unwrap());
+                    }
+                    for (drift, unavailable, code) in [
+                        (true, false, "producer_identity_mismatch"),
+                        (false, true, "producer_identity_unavailable"),
+                    ] {
+                        selected.drift.store(drift, Ordering::Relaxed);
+                        selected.unavailable.store(unavailable, Ordering::Relaxed);
+                        let before_selected = selected.calls();
+                        let before_unused = unused.calls();
+                        let mut output = Vec::new();
+                        let error = session
+                            .query(&cx, &request, 2, &mut output)
+                            .await
+                            .unwrap_err();
+                        assert!(error.to_string().contains(code), "{error}");
+                        assert!(output.is_empty());
+                        assert!(selected.calls().0 > before_selected.0);
+                        assert_eq!(selected.calls().1, before_selected.1);
+                        assert_eq!(unused.calls(), before_unused);
+                        selected.drift.store(false, Ordering::Relaxed);
+                        selected.unavailable.store(false, Ordering::Relaxed);
+                    }
+                    let before_selected = selected.calls();
+                    let before_unused = unused.calls();
+                    let mut recovered = Vec::new();
+                    session
+                        .query(&cx, &request, 3, &mut recovered)
+                        .await
+                        .unwrap();
+                    let recovered = frames(&recovered);
+                    assert_eq!(recovered.len(), 1);
+                    assert_eq!(
+                        recovered[0]["authority"],
+                        serde_json::json!(fixture.completed.authority)
+                    );
+                    if empty_scope {
+                        assert!(recovered[0]["results"].as_array().unwrap().is_empty());
+                        assert_eq!(selected.calls().1, before_selected.1);
+                    } else {
+                        assert_eq!(recovered[0]["results"][0]["doc_id"], "retry-first");
+                        assert_eq!(selected.calls().1 - before_selected.1, usize::from(!cached));
+                    }
+                    assert!(selected.calls().0 > before_selected.0);
+                    assert_eq!(unused.calls(), before_unused);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn authority_query_mode_preserves_full_startup_lexical_and_protocol_boundaries() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture =
+            QualityActivationFixture::new(&cx, "query-mode-boundaries", false, false).await;
+        for cached in [false, true] {
+            let (session, fast, quality) = full_drifting_session(&cx, &fixture, cached);
+            let request: AuthoritySearchRequest = serde_json::from_value(
+                serde_json::json!({"query":CACHED_QUERY, "mode":"full", "stream":true}),
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            session.query(&cx, &request, 1, &mut output).await.unwrap();
+            assert_eq!(frames(&output).len(), 2);
+            for selected in [&fast, &quality] {
+                selected.drift.store(true, Ordering::Relaxed);
+                let before_fast = fast.calls().1;
+                let before_quality = quality.calls().1;
+                let mut output = Vec::new();
+                let error = session
+                    .query(&cx, &request, 2, &mut output)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("producer_identity_mismatch"));
+                assert!(output.is_empty());
+                let error = AuthoritySession::new(
+                    &cx,
+                    admit_root(&session.receipt.root).unwrap(),
+                    session.receipt.clone(),
+                    Arc::clone(&session.snapshot),
+                    session.models.models().unwrap().clone(),
+                    (1, DEFAULT_IMAGE_BYTES),
+                    false,
+                )
+                .err()
+                .expect("startup must admit both producers");
+                assert!(error.to_string().contains("producer_identity_mismatch"));
+                assert_eq!(fast.calls().1, before_fast);
+                assert_eq!(quality.calls().1, before_quality);
+                selected.drift.store(false, Ordering::Relaxed);
+            }
+            fast.unavailable.store(true, Ordering::Relaxed);
+            quality.unavailable.store(true, Ordering::Relaxed);
+            let before_fast = fast.calls();
+            let before_quality = quality.calls();
+            let lexical: AuthoritySearchRequest =
+                serde_json::from_value(serde_json::json!({"query":CACHED_QUERY, "mode":"lexical"}))
+                    .unwrap();
+            let mut output = Vec::new();
+            session.query(&cx, &lexical, 3, &mut output).await.unwrap();
+            let output = frames(&output);
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0]["phase"], "lexical");
+            assert_eq!(output[0]["results"][0]["doc_id"], "retry-first");
+            for (query, limit, code) in [
+                (" ", 1, "invalid_query"),
+                (CACHED_QUERY, 0, "invalid_limit"),
+                (CACHED_QUERY, 1_001, "invalid_limit"),
+            ] {
+                let invalid: AuthoritySearchRequest = serde_json::from_value(
+                    serde_json::json!({"query":query, "limit":limit, "mode":"fast"}),
+                )
+                .unwrap();
+                let mut output = Vec::new();
+                let error = session
+                    .query(&cx, &invalid, 4, &mut output)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains(code), "{error}");
+                assert!(output.is_empty());
+            }
+            assert_eq!(fast.calls(), before_fast);
+            assert_eq!(quality.calls(), before_quality);
+        }
+    });
+}
+
 #[test]
 fn cached_authority_query_still_refuses_identity_drift_and_cancellation_before_a_hit() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -416,17 +681,7 @@ fn cached_authority_query_still_refuses_identity_drift_and_cancellation_before_a
             false,
         )
         .await;
-        let mut changed = model.identity.clone();
-        changed
-            .producer
-            .implementation_revision
-            .push_str("-foreign-producer");
-        changed.validate().unwrap();
-        let drifting = Arc::new(DriftingCachedQueryProvider {
-            inner: model.clone(),
-            changed,
-            drift: std::sync::atomic::AtomicBool::new(false),
-        });
+        let drifting = DriftingCachedQueryProvider::new(Arc::clone(&model));
         let root = admit_root(&first.root).unwrap();
         let snapshot = first.open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES).unwrap();
         let mut session = AuthoritySession::new(

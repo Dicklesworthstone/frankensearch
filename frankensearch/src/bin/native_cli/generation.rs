@@ -3210,6 +3210,28 @@ impl AuthorityModels {
         }
     }
 
+    /// Revalidate only the producers used by this admitted query mode. The
+    /// session's startup and publication paths still admit the whole selection.
+    fn admit_query(&self, receipt: &Receipt, mode: QueryMode) -> Result<()> {
+        match mode {
+            QueryMode::Lexical => Ok(()),
+            QueryMode::Full => admit_serving_models(receipt, self.models()?),
+            QueryMode::Fast => admit_serving_model(&receipt.identity, self.models()?.fast.as_ref()),
+            QueryMode::Quality => {
+                let models = self.models()?;
+                match (&receipt.quality_identity, &models.quality) {
+                    (Some(identity), Some(model)) => admit_serving_model(identity, model.as_ref()),
+                    // A quality-only generation stores its sole producer in
+                    // the primary slot; full generations require both slots.
+                    (None, None) if receipt.tier == EmbedderTierTag::Quality => {
+                        admit_serving_model(&receipt.identity, models.fast.as_ref())
+                    }
+                    _ => Err(serve_refused("session_provider_topology_mismatch")),
+                }
+            }
+        }
+    }
+
     fn query_mode(&self, receipt: &Receipt, requested: Option<QueryMode>) -> Result<QueryMode> {
         let mode = if self.is_lexical() {
             requested.unwrap_or(QueryMode::Lexical)
@@ -3680,7 +3702,7 @@ impl AuthoritySession {
             // Preserve the protocol's typed admission refusal before expiry;
             // the outer boundary still rejects late synchronous admission.
             query::within(cx, deadline.as_ref(), async {
-                Ok(self.models.admit(&self.receipt))
+                Ok(self.models.admit_query(&self.receipt, mode))
             })
             .await??;
         }
