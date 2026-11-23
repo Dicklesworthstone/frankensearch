@@ -488,6 +488,57 @@ Quill conformance and performance program.
   SHA-256 is `7268d9f75cd67f3098b0d2a236bf0c4977e029c89e376253c60c0f69911e44c4`.
   See `stock-gate.log`, `verified-quickstart-receipt.json`, and
   `candidate-installed.log` in the same evidence root.
+- At `f5a400b1`, a legacy stop could signal a live compactor for a different
+  store. The two-store probe built real indexes, observed each live kernel
+  publication lock, and crashed store A's fixture owner. It then modeled
+  numeric PID reuse in A's retained receipt by selecting B's live PID.
+  Stopping A returned success and caused B to exit. See `baseline.log`
+  under `/data/tmp/fsfs-compactor-identity.zL5cdUFs`.
+- `2e67728b` checks the Linux kernel's exclusive publication lock for the
+  selected device and inode. When available, one process descriptor carries
+  that target through the signal and exit wait. The live candidate retained
+  both receipts and left B running when A's lock was free and when a separate
+  owner held A's lock. A correct stop used `pidfd_send_signal` on the same
+  descriptor opened for B. The same cross-version control passed with the
+  signed Linux 1.13.0 daemons. Unreaped exit, paused timeout, foreign and
+  invalid receipts, and the denied-descriptor fallback passed again. See
+  `candidate-focused.log`, `signed-owner.log`, `fallback-replay.log`, and
+  the corresponding syscall traces.
+- The initial compile exposed the inner lease type's separate module
+  boundary. The first stock run then caught the crate-private lookup in the
+  nested kernel module. The final source places the same lookup in the
+  existing lifecycle admission module, with its visibility still limited
+  to the crate. See `focused-tests.log`, `focused-replay.log`,
+  `stock-gate.log`, and `initial-gate-stop.log`.
+- The next stock run found a quiesce fixture failure before any shutdown
+  request. The current and older-protocol sockets bound in a short fallback
+  directory. The legacy socket still fit its original directory, whose
+  parent the fixture had omitted. The raw `socket-fixture-red.trace`
+  records both successful binds and the legacy `ENOENT`. The follow-up
+  revision `371e2fc4` creates each fixture socket's parent and retains all
+  three positive checks, the unrelated listener control, and the oversized
+  legacy refusal. The delta from `0d875b62` is confined to test setup.
+  Fresh temporary paths of the same lengths retained both routing cases.
+  `socket-fixture-green.trace` records successful binds for the two fallback
+  sockets, the legacy socket in the original directory, and the unrelated
+  socket. The exact regression passed.
+- `0d875b62` passed 17 of 18 stock stages, including all 36 real-model
+  end-to-end tests. Its original failure remains in `final-stock-gate.log`.
+  `371e2fc4` passed the seven-stage replay, including workspace check,
+  all three strict Clippy profiles, and 3,917 fsfs tests with 41 ignored.
+  The two runs cover all 18 stock stages. Both quickstart installations have
+  SHA-256 `1881f7668d7d297f94821dfa0f93d396e11c6cca8bf141c685a23e695b2a1e95`.
+  The receipt for `371e2fc4` records 12 commands, 22 controls, and zero owned
+  processes remaining. See `replay-gate.log` and
+  `verified-quickstart-receipt.json` in the same evidence root.
+- The pinned quickstart executable repeated both wrong-owner refusals and
+  the exact-owner shutdown with current and signed 1.13.0 compactors. Both
+  refusals preserved both receipts and made no signal call. Each positive
+  stop used one descriptor through `pidfd_send_signal`. Unreaped exit,
+  successor startup, live timeout, foreign and zero receipts, and the
+  forced `pidfd_open` failure also passed on this install. See
+  `candidate-installed.log`, `installed-signed-owner.log`, and
+  `installed-fallback.log`.
 - The previous optimized `fsfs update` tried to contact GitHub when offline
   was selected by CLI, environment or config. Both `--check` and apply
   reached the refusing loopback control. The repair checks resolved offline
@@ -892,6 +943,17 @@ Quill conformance and performance program.
   through the CLI. Check receipt bytes on every refusal.
 - [x] Run the stock gates, pin the installed executable, repeat the process
   controls, and publish with scoped Bead evidence.
+- [x] Reproduce the wrong-target stop with real stores and kernel lock owners
+  on the prior installed CLI.
+- [x] Check selected-store lock ownership on Linux and retain an available
+  descriptor from liveness through shutdown.
+- [x] Run the new wrong-owner test and the existing lifecycle tests through
+  the lease-holding child path.
+- [x] Verify the free and busy selected-lock refusals, correct shutdown,
+  signed predecessor interoperability and signal fallback.
+- [x] Cover all stock stages across the production revision and the test
+  fixture correction. Verify the exact installed executable and keep the
+  failed and passing receipts with the scoped Bead evidence.
 - [x] Reproduce the updater's offline leak with the optimized executable
   and a refusing loopback proxy.
 - [x] Apply the resolved offline policy before remote release checks or
