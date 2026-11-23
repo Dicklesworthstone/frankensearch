@@ -8,10 +8,11 @@ use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::pin::{Pin, pin};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use asupersync::runtime::{IoRegistration, reactor::Interest};
 use frankensearch_core::SearchResult;
 
 use super::streaming::check_peer;
@@ -63,6 +64,7 @@ pub(super) enum DriveOutcome<T> {
 pub(super) struct Intake {
     reading: VecDeque<ReadingPeer>,
     ready: VecDeque<ReadyPeer>,
+    listener_io: Option<IoRegistration>,
     timeout: Duration,
     last_activity: Instant,
 }
@@ -72,6 +74,7 @@ impl Intake {
         Self {
             reading: VecDeque::new(),
             ready: VecDeque::new(),
+            listener_io: None,
             timeout,
             last_activity: Instant::now(),
         }
@@ -83,6 +86,22 @@ impl Intake {
 
     fn len(&self) -> usize {
         self.reading.len() + self.ready.len()
+    }
+
+    fn arm_listener(&mut self, cx: &Cx, listener: &UnixListener, waker: &Waker) -> bool {
+        if let Some(registration) = &mut self.listener_io
+            && registration
+                .rearm(Interest::READABLE, waker)
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        self.listener_io = None;
+        self.listener_io = cx
+            .register_io(listener, Interest::READABLE)
+            .ok()
+            .filter(|registration| registration.update_waker(waker.clone()));
+        self.listener_io.is_some()
     }
 
     /// A completed frame is not a live response consumer. Reclaim abandoned
@@ -136,7 +155,19 @@ impl Intake {
                 break;
             }
             retained_search_checkpoint(cx)?;
-            let (mut peer, _) = match listener.accept() {
+            let connection = listener.accept().or_else(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && self.arm_listener(cx, listener, task.waker())
+                {
+                    // Close the race between observing WouldBlock and arming
+                    // the reactor. The periodic tick still covers deadlines
+                    // and callers whose runtime has no I/O driver.
+                    listener.accept()
+                } else {
+                    Err(error)
+                }
+            });
+            let (mut peer, _) = match connection {
                 Ok(peer) => peer,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -381,7 +412,6 @@ mod tests {
     use std::net::Shutdown;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::Waker;
 
     fn listener() -> (tempfile::TempDir, UnixListener) {
         // These intake probes must bind before testing admission and shutdown.
@@ -409,6 +439,76 @@ mod tests {
                 MAX_PEERS,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn listener_wakes_parked_intake_without_a_polling_tick() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller-owned runtime");
+            let (_directory, listener) = listener();
+            let mut intake = Intake::new(Duration::from_secs(5));
+            let mut deadline = pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(2)));
+            let mut client = None;
+
+            let peer = poll_fn(|task| {
+                if deadline.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(None);
+                }
+                intake
+                    .pump(&cx, &listener, task, Instant::now(), MAX_PEERS)
+                    .unwrap();
+                if let Some(peer) = intake.ready.pop_front() {
+                    return Poll::Ready(Some(peer));
+                }
+                // Connect only after the listener has observed an empty backlog.
+                // A blocking std client cannot schedule this task's next poll.
+                if client.is_none() {
+                    client = Some(connect(&listener, b":ready\n"));
+                }
+                Poll::Pending
+            })
+            .await
+            .expect("socket readiness must wake the parked intake before its guard deadline");
+            assert_eq!(peer.into_parts().1, b":ready\n");
+        });
+    }
+
+    #[test]
+    fn listener_retains_timer_fallback_without_an_io_driver() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .enable_platform_reactor(false)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller-owned runtime");
+            let (_directory, listener) = listener();
+            let mut intake = Intake::new(Duration::from_secs(5));
+            let mut work: Vec<Request<'_, ()>> = Vec::new();
+            let mut waiting = pin!(intake.next_concurrent(&cx, &listener, None, &mut work));
+            let mut deadline = pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(2)));
+            let mut client = None;
+
+            let event = poll_fn(|task| {
+                if deadline.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(None);
+                }
+                if let Poll::Ready(result) = waiting.as_mut().poll(task) {
+                    return Poll::Ready(Some(result.unwrap()));
+                }
+                if client.is_none() {
+                    client = Some(connect(&listener, b":ready\n"));
+                }
+                Poll::Pending
+            })
+            .await;
+            let Some(Event::Peer(peer)) = event else {
+                panic!("the timer must admit the listener without reactor support");
+            };
+            assert_eq!(peer.into_parts().1, b":ready\n");
+        });
     }
 
     #[test]
