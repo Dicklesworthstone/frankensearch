@@ -498,26 +498,46 @@ impl<'a> RequestFilter<'a> {
         exclusions: Option<&NormalizedExclusions>,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     ) -> SearchResult<Option<Vec<ScoredResult>>> {
-        let mut limit = target;
+        cancellation_checkpoint(cx, "filter_graph_retrieval")?;
+        if target == 0 {
+            return Ok(None);
+        }
+        // PageRank already scores and sorts every reachable node before it
+        // truncates. Retain one ranking for this seed set while widening the
+        // metadata/exclusion prefix; recomputing it for every refill repeats
+        // the full graph walk and can change tie scores between prefixes.
+        let Some(mut ranked) =
+            super::GraphRanker::new().rank_phase1(cx, query, graph, seeds, graph.node_count())?
+        else {
+            return Ok(None);
+        };
+        let available = ranked.len();
+        let mut limit = target.min(available);
         loop {
             cancellation_checkpoint(cx, "filter_graph_retrieval")?;
-            let Some(results) =
-                super::GraphRanker::new().rank_phase1(cx, query, graph, seeds, limit)?
-            else {
-                return Ok(None);
+            // The final prefix is also the exhaustion boundary, so it can
+            // consume the ranking without cloning the complete graph pool.
+            let prefix = if limit == available {
+                std::mem::take(&mut ranked)
+            } else {
+                ranked[..limit].to_vec()
             };
-            let mut results = self.filter_scored(cx, lexical, results).await?;
+            let mut results = self.filter_scored(cx, lexical, prefix).await?;
             if let Some(exclusions) = exclusions {
                 results = super::filter_scored_results_by_negations(
-                    cx, results, exclusions, text_fn, "graph",
+                    cx, results, target, exclusions, text_fn, "graph",
                 )?;
             }
             let next = limit
                 .saturating_mul(2)
                 .max(limit.saturating_add(1))
-                .min(graph.node_count());
-            if !self.is_active() || results.len() >= target || next <= limit {
+                .min(available);
+            if (!self.is_active() && exclusions.is_none())
+                || results.len() >= target
+                || next <= limit
+            {
                 results.truncate(target);
+                cancellation_checkpoint(cx, "filter_graph_to_fusion")?;
                 return Ok(Some(results));
             }
             limit = next;

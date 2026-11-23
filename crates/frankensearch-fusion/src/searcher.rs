@@ -5601,12 +5601,16 @@ async fn refill_lexical_candidates(
 fn filter_scored_results_by_negations(
     cx: &Cx,
     mut results: Vec<ScoredResult>,
+    target: usize,
     exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
 ) -> SearchResult<Vec<ScoredResult>> {
     let mut retained = 0;
     for rank in 0..results.len() {
+        if retained == target {
+            break;
+        }
         cancellation_checkpoint(cx, "graph_candidates_to_exclusions")?;
         let excluded = should_exclude_document(&results[rank].doc_id, exclusions, text_fn, source);
         cancellation_checkpoint(cx, "graph_exclusions_to_search")?;
@@ -14658,6 +14662,181 @@ mod tests {
 
     #[cfg(feature = "graph")]
     #[test]
+    fn graph_exclusions_refill_eligible_tail_without_a_request_filter() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = build_test_index(4);
+            let mut graph = DocumentGraph::new();
+            for rank in 0..16 {
+                graph.add_edge(
+                    "doc-0",
+                    format!("graph-only-{rank:02}"),
+                    frankensearch_core::EdgeType::Reference,
+                    1.0,
+                );
+            }
+            let full_ranking = GraphRanker::new()
+                .rank_phase1(
+                    &cx,
+                    "graph",
+                    &graph,
+                    &[VectorHit {
+                        index: 0,
+                        score: 1.0,
+                        doc_id: "doc-0".into(),
+                    }],
+                    graph.node_count(),
+                )
+                .unwrap()
+                .unwrap();
+            let tail = full_ranking.last().unwrap().doc_id.clone();
+            assert_ne!(tail, "doc-0");
+            assert!(full_ranking[..8].iter().all(|hit| hit.doc_id != tail));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    graph_ranking_enabled: true,
+                    graph_ranking_weight: 1.0,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_document_graph(Arc::new(graph));
+            let permissive = AsyncTestFilter(|_: &str, _: Option<&serde_json::Value>| true);
+
+            for (query, blocked_text) in [
+                ("graph -unsafe", "unsafe content"),
+                ("graph -\"private draft\"", "private draft"),
+            ] {
+                for filter in [None, Some(&permissive as &dyn SearchFilter)] {
+                    let mut phases = Vec::new();
+                    searcher
+                        .search_with_filter(
+                            &cx,
+                            query,
+                            2,
+                            filter,
+                            |id| {
+                                Some(
+                                    if id == "doc-0" || id == tail.as_str() {
+                                        "public content"
+                                    } else {
+                                        blocked_text
+                                    }
+                                    .to_owned(),
+                                )
+                            },
+                            |phase| phases.push(phase),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(phases.len(), 1);
+                    let SearchPhase::Initial { results, .. } = &phases[0] else {
+                        panic!("graph exclusions must publish an Initial phase");
+                    };
+                    assert_eq!(
+                        results.len(),
+                        2,
+                        "query exclusions must refill the graph budget without an unrelated filter: {query}, filter={}",
+                        filter.is_some(),
+                    );
+                    assert!(results.iter().any(|hit| hit.doc_id == "doc-0"));
+                    assert!(results.iter().any(|hit| hit.doc_id == tail));
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_exclusions_stop_at_the_eligible_budget_and_observe_cancellation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut graph = DocumentGraph::new();
+            for id in ["neighbor-a", "neighbor-b", "neighbor-c"] {
+                graph.add_edge("seed", id, frankensearch_core::EdgeType::Reference, 1.0);
+            }
+            let seeds = [VectorHit {
+                index: 0,
+                score: 1.0,
+                doc_id: "seed".into(),
+            }];
+            let ranked = GraphRanker::new()
+                .rank_phase1(&cx, "graph", &graph, &seeds, graph.node_count())
+                .unwrap()
+                .unwrap();
+            assert_eq!(ranked.len(), 4);
+            assert_eq!(ranked[0].doc_id, "seed");
+            let allowed = &ranked[2].doc_id;
+            let unnecessary = &ranked[3].doc_id;
+            let exclusions = to_exclusions(&ParsedQuery::parse("graph -unsafe"));
+            let permissive = AsyncTestFilter(|_: &str, _: Option<&serde_json::Value>| true);
+
+            for filter in [None, Some(&permissive as &dyn SearchFilter)] {
+                for cancel_after_last in [false, true] {
+                    let mut request_filter = RequestFilter::new(filter);
+                    let outcome = request_filter
+                        .graph_candidates(
+                            &cx,
+                            None,
+                            &graph,
+                            "graph",
+                            &seeds,
+                            2,
+                            Some(&exclusions),
+                            &|id| {
+                                assert_ne!(
+                                    id,
+                                    unnecessary.as_str(),
+                                    "a complete page must not read unnecessary text"
+                                );
+                                if id == allowed.as_str() && cancel_after_last {
+                                    cx.set_cancel_requested(true);
+                                }
+                                Some(
+                                    if id == "seed" || id == allowed.as_str() {
+                                        "public content"
+                                    } else {
+                                        "unsafe content"
+                                    }
+                                    .to_owned(),
+                                )
+                            },
+                        )
+                        .await;
+                    if cancel_after_last {
+                        assert!(matches!(outcome, Err(SearchError::Cancelled { .. })));
+                        cx.set_cancel_requested(false);
+                    } else {
+                        let results = outcome.unwrap().unwrap();
+                        let ids: Vec<_> = results.iter().map(|hit| hit.doc_id.as_str()).collect();
+                        assert_eq!(ids, ["seed", allowed.as_str()]);
+                    }
+                }
+            }
+
+            // Missing text remains a hard error when the candidate is needed
+            // to decide membership; stopping at the budget must not fail open.
+            let error = RequestFilter::new(None)
+                .graph_candidates(
+                    &cx,
+                    None,
+                    &graph,
+                    "graph",
+                    &seeds,
+                    2,
+                    Some(&exclusions),
+                    &|_| None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "search.exclusion_text")
+            );
+        });
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
     fn async_filter_graph_metadata_rejection_refills_and_reseeds_fast_pool() {
         #[derive(Default)]
         struct GraphMetadataLexical {
@@ -16543,6 +16722,7 @@ mod tests {
             let error = filter_scored_results_by_negations(
                 &cx,
                 results,
+                3,
                 &exclusions,
                 &|_| {
                     cx.set_cancel_requested(true);
@@ -19145,7 +19325,7 @@ mod tests {
             let parsed = ParsedQuery::parse("query -foo");
             let exclusions = to_exclusions(&parsed);
             let results =
-                filter_scored_results_by_negations(&cx, vec![], &exclusions, &|_| None, "test")
+                filter_scored_results_by_negations(&cx, vec![], 1, &exclusions, &|_| None, "test")
                     .unwrap();
             assert!(results.is_empty());
         });
