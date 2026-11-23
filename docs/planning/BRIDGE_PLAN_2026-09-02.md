@@ -347,6 +347,30 @@ Quill conformance and performance program.
   overlapping Cargo target failure. See `offline-integrated-gate.log`,
   `offline-integrated-e2e-replay.log`, and
   `integrated-quickstart-receipt.json` under the same root.
+- Auto-started complete and legacy query daemons previously kept both
+  expansion provider keys from the launching client. A live socket-owner
+  probe confirmed both synthetic values on the prior optimized build.
+  The repaired development build removed both keys while preserving an
+  unrelated environment canary and all cold and warm ranked records.
+  Both child processes exited after shutdown. Both online expansion
+  controls still reached the refusing loopback proxy from the client.
+  The command builder and provider precedence tests passed. See
+  `credentials-baseline.log`, `credentials-dev-probe.log`,
+  `credentials-dev-parity.log`, and `credentials-{spawn,expansion}-tests.log`
+  under `/data/tmp/fs-cred.6tOZqU`.
+- The stock optimized binary from clean `d5c3eb0e` repeated both daemon
+  lifecycles. Both credentials were absent, the unrelated environment
+  marker was present, and all four cold and warm hit records matched the
+  prior optimized binary. The client still reached both loopback provider
+  controls. The candidate SHA-256 is
+  `5e55019c18d12b245870a7838fe8b3160354cce447ed5a52dad3ec2fa03d215e`.
+  See `credentials-release-{probe,parity}.log` in the same evidence root.
+- Clean `d5c3eb0e` passed all 18 stock quality stages in one run,
+  including all 25 real-model executable cases with the frozen
+  predecessor. The source quickstart verified the same revision, passed
+  12 commands and 22 negative controls, and left zero owned processes.
+  See `credentials-gate.log` and `credentials-quickstart-receipt.json`
+  in the same evidence root.
 
 ### Vision checklist
 
@@ -554,6 +578,18 @@ Quill conformance and performance program.
 - [x] Pass every stock quality stage on the combined revision with a short
   disk-backed fixture directory. Keep the predecessor executable in the
   current evidence root and run retries serially before publication.
+- [x] Confirm that both auto-started query daemon layouts inherit synthetic
+  expansion keys. Check the actual socket owner's executable and process,
+  a noncredential environment canary, ranked search, and clean shutdown.
+- [x] Filter the shared provider key list at daemon spawn. Verify the
+  environment filter and provider lookup precedence with focused tests.
+- [x] Repeat both daemon layouts on the repaired development executable. Require
+  both keys absent, the unrelated environment canary present, stable ranks
+  and client-side online calls for each provider through the loopback proxy.
+- [x] Repeat the same process and provider controls on the stock optimized
+  executable and compare full cold and warm hit records.
+- [x] Finish the stock quality stages on the exact revision with a frozen
+  predecessor, then publish the managed daemon privacy repair.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
   independent fast and quality load times, peak RSS, per-generation disk
