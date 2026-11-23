@@ -371,6 +371,25 @@ Quill conformance and performance program.
   12 commands and 22 negative controls, and left zero owned processes.
   See `credentials-gate.log` and `credentials-quickstart-receipt.json`
   in the same evidence root.
+- A command with a final `--no-daemon` could still connect to the named
+  socket on a complete-generation search. The prior optimized binary
+  connected in all four buffered or streamed complete-store cases and
+  opened the named listener from `serve` on both layouts. The parser now
+  rejects the conflict before runtime setup. The new parser regression
+  failed on the baseline and all 111 CLI parser tests passed on the repair.
+  The development executable refused all eight conflicting searches and
+  both conflicting serve commands before socket activity. Valid direct,
+  named, and stdio routes retained all ten ranked-hit records. The named
+  controls covered explicit final `--daemon` and implied socket mode.
+  See `transport-baseline.log`, `transport-parser-{red,green}.log`, and
+  `transport-dev-{probe,parity}.log` under
+  `/data/tmp/fs-route.35ZIKs`.
+- The stock optimized build from clean `d53c2ff6` repeated all eight
+  search refusals and both serve refusals without accessing the named
+  sockets. Full hit records and scores matched the prior optimized
+  binary in all ten valid-route controls. Its SHA-256 is
+  `708b415df84f7260e4ea611b6aa252ae3a6d7da1aa0d7b497160abdba83c3194`.
+  See `transport-release-{probe,parity}.log` in the same evidence root.
 
 ### Vision checklist
 
@@ -590,6 +609,18 @@ Quill conformance and performance program.
   executable and compare full cold and warm hit records.
 - [x] Finish the stock quality stages on the exact revision with a frozen
   predecessor, then publish the managed daemon privacy repair.
+- [x] Reproduce conflicting direct and named-socket flags on the prior
+  optimized binary. Trace buffered and streamed searches and verify
+  listener creation by both serve layouts.
+- [x] Reject the conflicting final daemon preference at CLI parsing.
+  Preserve valid direct, named, implied socket and source-recovery forms.
+- [x] Verify both store layouts and flag orders on the development executable.
+  Require a typed error before socket activity and exact ranks for the
+  valid direct, named and stdio controls.
+- [x] Repeat both layouts and the ranked-hit comparison on the stock
+  optimized binary.
+- [ ] Run the stock quality stages on the exact revision and publish the
+  CLI transport fix.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
   independent fast and quality load times, peak RSS, per-generation disk
