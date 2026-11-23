@@ -1796,13 +1796,19 @@ mod tests {
             assert_eq!(response.hits.len(), 1);
             assert_eq!(response.hits[0].result.doc_id, "doc");
             assert_eq!(response.hits[0].result.quality_score, None);
-            assert_eq!(response.coverage.answered, vec!["quality-timeout".to_owned()]);
+            assert_eq!(
+                response.coverage.answered,
+                vec!["quality-timeout".to_owned()]
+            );
             assert_eq!(response.coverage.refinement_failed.len(), 1);
             assert_eq!(
                 response.coverage.refinement_failed[0].index,
                 "quality-timeout"
             );
-            assert_eq!(response.coverage.refinement_failed[0].error, "search_timeout");
+            assert_eq!(
+                response.coverage.refinement_failed[0].error,
+                "search_timeout"
+            );
             assert!(response.coverage.refinement_timed_out.is_empty());
             assert!(response.coverage.timed_out.is_empty());
             assert!(!response.coverage.is_complete());

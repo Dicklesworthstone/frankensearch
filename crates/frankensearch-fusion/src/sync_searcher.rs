@@ -5981,9 +5981,12 @@ mod tests {
 
     impl SyncLexicalSearch for LateRefillLexical {
         fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
-            let mut limits = self.limits.lock().unwrap();
-            limits.push(limit);
-            if limits.len() == 1 {
+            let first_request = {
+                let mut limits = self.limits.lock().unwrap();
+                limits.push(limit);
+                limits.len() == 1
+            };
+            if first_request {
                 return Ok(
                     vec![lexical_result("doc-a", 10.0), lexical_result("doc-b", 9.0)]
                         .into_iter()
@@ -6169,7 +6172,9 @@ mod tests {
                                     SearchPhase::Initial { results, .. }
                                     | SearchPhase::Refined { results, .. } => Ok(results),
                                     SearchPhase::RefinementFailed { error, .. } => Err(error),
-                                    other => panic!("unexpected final phase: {other:?}"),
+                                    other @ SearchPhase::Reranked { .. } => {
+                                        panic!("unexpected final phase: {other:?}")
+                                    }
                                 }
                             } else {
                                 searcher
