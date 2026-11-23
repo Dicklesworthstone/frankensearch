@@ -398,6 +398,91 @@ Quill conformance and performance program.
   `transport-quickstart-receipt.json` in the same evidence root.
 - Landed as `ffbec5e5`. The only tracked difference from the gated revision
   at that commit was an intervening update to this plan.
+- The previous optimized `fsfs update` tried to contact GitHub when offline
+  was selected by CLI, environment or config. Both `--check` and apply
+  reached the refusing loopback control. The repair checks resolved offline
+  policy before the release fetch, with local rollback dispatched separately.
+  The source-built candidate at `30401002` returned `update.offline` and
+  made zero IP connects in all four cases. The explicit online override
+  reached the loopback control and completed a live read-only GitHub check.
+  Offline rollback listing exited zero with no IP connects. See
+  `updater-offline-baseline.log`, `updater-executable-controls.log` and
+  `updater-online-live.log` under `/data/tmp/fs-mac-reuse.04OfAWrO`.
+  The checked-in executable regression failed against the preceding binary
+  at the observed GitHub tunnel. It passed on the default and native-only
+  builds of `163e6b55`, including the existing native-only apply refusal.
+  The frozen default binary repeated the four zero-connect cases, the
+  online override, and local rollback. Its SHA-256 is
+  `cc953b880cf6ab35ad262464456a195e29d7e5a4b20bf9ea36efef182f232505`.
+  See `updater-default-regression-{red,green}.log`,
+  `updater-final-executable-controls.log`, and `updater-native-only.log`.
+- All 18 stock quality stages passed on clean `163e6b55`, including 26
+  real-model CLI tests. The source quickstart verified that exact revision,
+  passed 12 commands and 22 negative controls, and left zero owned processes.
+  See `updater-final-gate.log` and
+  `tmp/fsfs-quickstart.yrZa5iFr/receipt.json` in the evidence root.
+- The first upstream integration at `b4206472` passed workspace compilation,
+  Windows index compilation, and the fsfs and real-model CLI suites. The
+  workspace formatter and strict Clippy found defects in newly landed Fusion
+  tests. On the next upstream tip, `7a8a2f06` scoped the fixture lock to its
+  recording step, named the unexpected phase explicitly, and formatted the
+  federated assertions. See `updater-integrated-gate.log` and
+  `fusion-lint-ubs.log` in the same root.
+- Clean `7a8a2f06` passed the ten selected integration stages, including
+  workspace compilation, all three Clippy lanes, Windows index compilation,
+  fsfs tests, the 26-case real-model CLI suite, source quickstart, and lite.
+  The quickstart executable repeated all four offline checks with zero IP
+  connects and passed the online and local rollback controls. Its SHA-256 is
+  `055c4067cd5f059ac991ea50b7dffeabd35324af0910c8fee019e458980edadc`.
+  See `updater-landing-gate.log` and `updater-landing-executable-controls.log`.
+- The Fusion library suite failed in five staging cases on both `7a8a2f06`
+  and `1ccb938c`. Refresh assigned distinct full v2 identities to the fast
+  and quality files, so exact re-admission refused the staged output.
+  `0ac24c88` stamps one full successor identity across both tiers while
+  retaining independent producer bindings. It also rejects a canonical
+  pair with different full identities even when the short markers agree.
+  The test checks the quality-only predecessor's sequence and refusal before
+  staging. See `landing-fusion-tests.log` and `publication-fusion-tests.log`.
+- The later integration at `1ccb938c` passed workspace compilation and the
+  26-case real-model executable suite. Strict Clippy reported a Send
+  recursion-depth error in the interaction test after the upstream async
+  search update. `2a5bb819` uses the existing boxed `SearchFuture` in that
+  test. See `updater-publication-gate.log`.
+- Clean `2a5bb819` passed 1,282 Fusion library tests with 4 standard ignores
+  and all 31 interaction tests. All five previously failing writer cases
+  passed, including two model-call bounds and preservation of the prior
+  staged artifact bytes. The split-input control refused both short-marker
+  disagreement and a full-generation mismatch with matching short markers.
+  See `refresh-and-interaction-final.log` in the evidence root.
+- The first combined workspace test stage missed the expected runtime-shed
+  event in Core's diagnostic capture. Core source is unchanged from the
+  earlier passing gate. The same test binary passed 20 isolated replays and
+  a complete Core run with 1,239 passes and one standard ignore. Both the
+  original failure and replay logs are retained.
+- The unchanged workspace replay passed Core and reached the stale activation
+  census. `eea0715d` added a typed native fast refill using the original bound
+  query after late metadata rejection. The runtime refill regression passed.
+  `4a0e2dcd` records the sixth activation, and the same census test binary
+  then passed all four assertions. Source and gate code are identical to
+  `2a5bb819`. See `combined-workspace-replay.log` and `census-exact-green.log`.
+- The combined source passed 17 stock stages on `2a5bb819`. The unchanged
+  workspace test lane then passed on `4a0e2dcd`, whose only tracked difference
+  is the census entry. See `combined-final-stock-gate.log` and
+  `final-workspace-gate.log`. The final source quickstart ran 12 commands and
+  22 controls with no owned processes left. Its exact installed binary also
+  repeated the updater probes. See `combined-updater-executable-controls.log`
+  and `tmp/fsfs-quickstart.hI36rcW9/receipt.json`.
+- On Apple Silicon, the signed 1.13.0 executable and a clean stock release
+  build of `5ac9c5e7` used the verified Potion and MiniLM models. The existing
+  two-executable test reached the reuse assertion and carried zero of ten
+  files. The compatible-contract flag resolved, and the CLI emitted the
+  process-scope warning. On a separate six-file store, the current binary
+  re-embedded both tiers and selected a successor. Both vector artifacts and
+  all refined ranked records matched the predecessor. The predecessor's two
+  vector artifacts and receipt retained their hashes. The signed executable
+  also reopened the successor and returned the same refined records. See
+  `mac-native-existing-gate.log`, `mac-current-fixture.log`,
+  `mac-predecessor-artifacts.log`, and `mac-signed-reopen.json` in that root.
 
 ### Vision checklist
 
@@ -629,12 +714,41 @@ Quill conformance and performance program.
   optimized binary.
 - [x] Run the stock quality stages on the exact revision and publish the
   CLI transport fix.
+- [x] Reproduce the updater's offline leak with the optimized executable
+  and a refusing loopback proxy.
+- [x] Apply the resolved offline policy before remote release checks or
+  downloads. Keep local rollback available.
+- [x] Run the updater regression against the baseline and the repaired
+  executable. Verify the online override and offline rollback listing.
+- [x] Run all stock quality stages on the updater repair before integration.
+- [x] Reproduce the upstream Fusion test formatting and lint failures.
+- [x] Correct the fixture lock and match arm. Keep the test assertions.
+- [x] Reproduce all five refresh failures and trace them to the emitted
+  FSVI v2 generation identities.
+- [x] Stamp the shared successor identity and add assertions for quality-only
+  lineage and mismatched input with matching short markers.
+- [x] Address the interaction test's Send recursion-depth diagnostic with
+  the existing `SearchFuture` type.
+- [x] Run the combined Fusion library and interaction suites, including the
+  five writer regressions and both split-input controls.
+- [x] Verify the native fast-refill activation and update its census entry.
+  Run the same exact-count test against the updated census.
+- [x] Complete the stock lanes on the combined source and replay the original
+  workspace test lane after the Core diagnostics failure.
+- [x] Qualify the updater and staging repairs on the newer upstream tip and
+  publish them with the scoped Beads evidence.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
   independent fast and quality load times, peak RSS, per-generation disk
   usage, retained bytes, and every missed terminal phase for both workloads.
 - [ ] Qualify cross-executable macOS reuse and the remaining documented
   installer and updater paths.
+  - [x] Find a native Apple Silicon runner, verify the signed predecessor,
+    and pin the candidate source, lockfile and toolchain.
+  - [x] Verify what the current product does with both binaries and real
+    models, including whether it retains work or re-embeds.
+  - [ ] Establish executing-image identity on macOS before claiming
+    cross-process reuse there.
 - [ ] Advance retained FSVI v2 authority and recovery, then exercise CASS,
   native and ordinary CLI and facade restart cases.
 - [ ] Resolve Quill R1 and union-horizon witnesses. Run full and scaled
