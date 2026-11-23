@@ -770,6 +770,7 @@ the CLI generates the variants and the daemon owns the retained reader. Legacy
 stores run expanded searches directly. Streams deliver Initial before
 waiting for optional expansion. Online expansion sends query text to
 Anthropic or OpenAI when the matching API key is set (see the FAQ).
+Auto-started query daemons exclude both provider keys from their environment.
 Under the offline policy or without a key, the original query keeps its
 normal search phases.
 Ordinary direct and forwarded searches save explanation context beside the

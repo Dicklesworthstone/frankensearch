@@ -11973,6 +11973,10 @@ impl FsfsRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Expansion belongs to the requesting client. A daemon can outlive it.
+        for (name, _) in query_expansion::PROVIDER_KEYS {
+            command.env_remove(name);
+        }
         if let Some(config_path) = self.cli_input.overrides.config_path.as_deref() {
             command.arg("--config").arg(config_path);
         }
@@ -51603,6 +51607,21 @@ mod tests {
             .unwrap();
             assert_eq!(child.command, CliCommand::Daemon);
             assert_eq!(child.overrides.offline, offline);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_daemon_command_excludes_query_expansion_credentials() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        for command in ["daemon", "serve"] {
+            let child = runtime.detached_fsfs_command([command.into()]).unwrap();
+            for name in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+                assert!(
+                    child.get_envs().any(|(key, value)| key == name && value.is_none()),
+                    "{command} must unset {name}"
+                );
+            }
         }
     }
 

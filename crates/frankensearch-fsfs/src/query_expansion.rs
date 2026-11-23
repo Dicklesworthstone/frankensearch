@@ -36,6 +36,12 @@ pub enum LlmBackend {
     OpenAi,
 }
 
+/// Provider lookup order and the credential names excluded from managed daemons.
+pub(crate) const PROVIDER_KEYS: [(&str, LlmBackend); 2] = [
+    ("ANTHROPIC_API_KEY", LlmBackend::Anthropic),
+    ("OPENAI_API_KEY", LlmBackend::OpenAi),
+];
+
 /// Only fixed classifications cross the diagnostic boundary. Transport errors
 /// and malformed JSON can contain credentials, prompts or provider responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,17 +108,12 @@ pub struct ExpansionResult {
 /// Detect available LLM backend from environment variables.
 #[must_use]
 fn detect_backend(env_map: &HashMap<String, String>) -> Option<(LlmBackend, String)> {
-    if let Some(key) = env_map.get("ANTHROPIC_API_KEY") {
-        if !key.trim().is_empty() {
-            return Some((LlmBackend::Anthropic, key.clone()));
-        }
-    }
-    if let Some(key) = env_map.get("OPENAI_API_KEY") {
-        if !key.trim().is_empty() {
-            return Some((LlmBackend::OpenAi, key.clone()));
-        }
-    }
-    None
+    PROVIDER_KEYS.into_iter().find_map(|(name, backend)| {
+        env_map
+            .get(name)
+            .filter(|key| !key.trim().is_empty())
+            .map(|key| (backend, key.clone()))
+    })
 }
 
 /// Expand a search query using an LLM backend.
