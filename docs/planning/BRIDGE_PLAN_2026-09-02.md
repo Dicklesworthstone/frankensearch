@@ -500,6 +500,22 @@ Quill conformance and performance program.
   See `recovery-workspace-gate.log` in the same directory. This qualifies
   cooperative generation recovery. The fixed-authority, CASS, retention,
   and fault-matrix milestones remain open.
+- The installer at `109b3d58` made two loopback connections per case for
+  alternate-scheme and uppercase HTTPS artifact URLs supplied with
+  `--offline`. Lowercase HTTPS already refused before connecting. Commit
+  `6dc2e4d5` limits offline artifacts to plain local paths and local `file://`
+  URLs. The complete installer stage, DSR and proxy controls passed on that
+  revision. The two new installer cases failed on the baseline. The real
+  loopback replay returned the typed error with zero connections for all
+  three controls, and the incumbent's executable hash matched throughout.
+- The exact repaired script verified and installed the signed 1.13.0 archive
+  from a plain path on Linux x86-64 and a `file://` URL on native Apple
+  Silicon. Both installs verified the model pair, indexed two documents and
+  ranked `retry.md` first in both search phases with one completed terminal.
+  The Linux install, index and search trace recorded zero IP `connect`
+  calls. See `baseline.log`, `candidate.log`, `installer-red.log`,
+  `installer-gate.log`, `linux-signed.log`, `linux-connect.log`, and
+  `mac-signed.log` under `/data/tmp/fsfs-offline-installer.qh4vs5h5`.
 
 ### Vision checklist
 
@@ -766,6 +782,14 @@ Quill conformance and performance program.
     models, including whether it retains work or re-embeds.
   - [ ] Establish executing-image identity on macOS before claiming
     cross-process reuse there.
+  - [x] Reproduce offline installer network access with a loopback listener
+    and confirm the installed executable keeps its hash.
+  - [x] Make offline archive admission match the downloader's local routes.
+  - [x] Run the installer stage with both network refusals and the local
+    archive, signature, model-verification, and incumbent controls.
+  - [x] Install the signed Apple Silicon archive from a local file URL and
+    run indexing and progressive search from the installed binary.
+  - [x] Record scoped installer evidence and publish the repair.
 - [ ] Advance retained FSVI v2 authority and recovery, then exercise CASS,
   native and ordinary CLI and facade restart cases.
   - [x] Check the installed CLI's quality-only prepare, resume, and fresh search
