@@ -1678,7 +1678,7 @@ fn prepare_publication_with_intent(
 ) -> Result<PreparedPublication> {
     if intent == PublicationIntent::CompleteQuality && predecessor.is_none() {
         return Err(bad(
-            "quality completion requires a selected fast-only predecessor",
+            "quality completion requires a selected fast-only or partial-quality predecessor",
         ));
     }
     let (root_id, expected, previous) = match predecessor {
@@ -1702,7 +1702,18 @@ fn prepare_publication_with_intent(
                     NativeGenerationTopology::PartialQuality { .. } => false,
                 },
                 PublicationIntent::CompleteQuality => {
-                    snapshot.topology() == NativeGenerationTopology::FastOnly
+                    let quality_identity_matches = match snapshot.topology() {
+                        NativeGenerationTopology::FastOnly => true,
+                        NativeGenerationTopology::PartialQuality { .. } => {
+                            built.quality_binding().is_some_and(|binding| {
+                                snapshot.metadata().embedders.get("quality")
+                                    == Some(binding.frozen_identity())
+                            })
+                        }
+                        NativeGenerationTopology::QualityOnly
+                        | NativeGenerationTopology::FullProgressive => false,
+                    };
+                    quality_identity_matches
                         && built.quality_binding().is_some()
                         && built.coverage() == VectorCohortCoverage::Complete
                         && built.binding().frozen_identity()

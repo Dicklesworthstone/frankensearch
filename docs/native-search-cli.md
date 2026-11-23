@@ -283,9 +283,10 @@ Full-query tuning remains restricted to complete full generations.
 its default remains fast. Source fetch, lexical search, publication-attempt
 recovery, and retained rollback use the complete admitted source. Partial sources
 currently refuse update, rebuild, repair, and model activation; these operations
-need an explicit policy for preserving or changing the subset. Quality completion
-continues to require a fast-only source. Sharded authority generations remain
-unsupported.
+need an explicit policy for preserving or changing the subset.
+`authority-complete-quality` explicitly fills the missing quality coverage and
+publishes a full generation before those ordinary maintenance operations resume.
+Sharded authority generations remain unsupported.
 
 Library callers use `build_partial_quality_generation(&cx, source, quality_ids,
 max_image_bytes)`, `NativeGenerationSnapshot::admit_partial_quality`, and
@@ -330,13 +331,15 @@ queries skip a warm server's reranker; a lexical-only startup rejects its model
 options. Ordinary and sharded receipt-based `search`/`serve` commands also support
 selected-tier reranking, with the retained source policy described below.
 
-### Complete quality for an existing fast-only generation
+### Complete quality for an existing fast-only or partial generation
 
-`authority-complete-quality` adds a complete, independently bound quality tier
-to the selected fast-only generation. It reads the authenticated retained source,
-reuses the fast vectors and exact lexical image, and publishes a full successor
-at the same source checkpoint. Original JSONL files are unnecessary, and the
-fast model performs no document inference.
+`authority-complete-quality` completes the independently bound quality tier of
+the selected fast-only or partial-quality generation. It reads the authenticated
+retained source, reuses the fast vectors and exact lexical image, and publishes a
+full successor at the same source checkpoint. For partial quality, it also reuses
+every already covered quality row and embeds only the missing documents.
+Original JSONL files are unnecessary, and the fast model performs no document
+inference.
 
 ```sh
 ./target/release/frankensearch-native authority-complete-quality \
@@ -349,14 +352,19 @@ fast model performs no document inference.
 
 The configured fast provider must still match its retained identity. Choose the
 quality provider with the usual local model-directory and quality-backend flags.
-`--retrieval` applies to the new quality tier; the existing fast precision and
-retrieval configuration stay bound to their retained artifacts. The command
+For a partial predecessor, that quality provider must match its independently
+retained identity too; completion cannot change the model. Existing quality
+precision and retrieval policy are inherited, including F16 storage.
+`--retrieval` can explicitly change the quality retrieval policy without changing
+its vectors' precision. A newly added quality tier defaults to F32 and exact
+retrieval. The existing fast precision and retrieval configuration stay bound to
+their retained artifacts. The command
 accepts the ordinary batch, source-byte and image-byte limits, but refuses
 replacement source input, source-cut overrides and model-migration flags.
 
 Publication requires the entire quality tier to be built and admitted, with the
-same document set, source checkpoint, fast identity and lexical receipt. A
-cancelled or failed build leaves the incumbent selected. A competing publication
+same document set, source checkpoint, fast identity, existing quality identity
+and lexical receipt. A cancelled or failed build leaves the incumbent selected. A competing publication
 refuses the original expected-authority pair instead of rebasing. Work files
 remain available after failure. This route produces a complete two-tier
 generation; partial quality coverage is not exposed as complete.

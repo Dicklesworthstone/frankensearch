@@ -218,13 +218,15 @@ impl NativeIndexQualityCompletion {
     }
 }
 
-/// Complete a fast-only authority generation's missing quality tier.
+/// Complete an authority generation's absent or partial quality tier.
 ///
-/// This owns the selected source and fast-vector pins. It cannot edit documents,
-/// change fast precision or replace the fast producer. Only the new quality tier
-/// performs document inference; the successor preserves the source checkpoint
-/// and reuses the exact Quill image. No authority changes until the caller
-/// publishes the fully admitted result with the predecessor's expected pair.
+/// This owns the selected source and independent vector pins. It cannot edit
+/// documents, change fast precision or replace either retained producer. Existing
+/// quality vectors keep their precision and retrieval policy by default; only
+/// missing quality rows require document inference. An explicit quality precision
+/// change re-embeds that entire tier. The successor preserves the source checkpoint
+/// and exact Quill image. No authority changes until the caller publishes the fully
+/// admitted result with the predecessor's expected pair.
 #[cfg(feature = "quill")]
 pub struct NativeQualityCompletion {
     update: NativeIndexUpdate,
@@ -243,18 +245,23 @@ impl NativeQualityCompletion {
         snapshot: &NativeGenerationSnapshot,
         max_source_bytes: usize,
         index: Arc<NativeAnnIndex>,
+        quality_index: Option<Arc<NativeAnnIndex>>,
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.quality_completion.prepare")?;
-        if snapshot.topology() != crate::native_ann::NativeGenerationTopology::FastOnly {
+        if !matches!(
+            snapshot.topology(),
+            crate::native_ann::NativeGenerationTopology::FastOnly
+                | crate::native_ann::NativeGenerationTopology::PartialQuality { .. }
+        ) {
             return Err(invalid(
                 "quality_completion.topology",
-                "fast-only-required",
-                "quality completion requires one complete retained fast tier",
+                "incomplete-quality-required",
+                "quality completion requires a retained fast tier with absent or partial quality",
             ));
         }
         // Retained source is already prepared input. A newly selected model
         // cannot reinterpret its content selection or canonicalization contract.
-        let quality = TierPlan::new(quality_provider)?;
+        let quality = TierPlan::new(Arc::clone(&quality_provider))?;
         let fast_identity = snapshot.metadata().embedders.get("fast").ok_or_else(|| {
             invalid(
                 "quality_completion.identity",
@@ -271,7 +278,7 @@ impl NativeQualityCompletion {
                 "quality completion must preserve the retained prepared-input contract",
             ));
         }
-        let mut update = NativeIndexUpdate::from_authority(
+        let mut update = NativeIndexUpdate::from_authority_with_intent(
             cx,
             directory,
             generation,
@@ -279,10 +286,13 @@ impl NativeQualityCompletion {
             snapshot,
             max_source_bytes,
             index,
-            None,
+            quality_index.map(|index| (quality_provider, index)),
+            AuthorityUpdateIntent::CompleteQuality,
         )?;
-        quality.binding(&generation)?;
-        update.builder.quality = Some(quality);
+        if update.builder.quality.is_none() {
+            quality.binding(&generation)?;
+            update.builder.quality = Some(quality);
+        }
         let source = update
             .builder
             .reuse
@@ -296,9 +306,11 @@ impl NativeQualityCompletion {
                     "quality completion requires its newly retained authority source",
                 )
             })?;
-        // Missing quality is an explicit build intent, never a failed lookup
-        // silently converted into re-embedding during an ordinary update.
-        source.completing_quality = true;
+        // Only an absent tier bypasses reuse entirely. Partial completion keeps
+        // its admitted quality owner and the explicitly sparse source/row join;
+        // ordinary updates can never turn a failed row lookup into inference.
+        source.completing_quality =
+            snapshot.topology() == crate::native_ann::NativeGenerationTopology::FastOnly;
         checkpoint(cx, "native_ann.quality_completion.prepared")?;
         Ok(Self {
             update,
@@ -324,7 +336,9 @@ impl NativeQualityCompletion {
         Ok(self)
     }
 
-    /// Select the new quality tier's precision and exact/native ANN retrieval.
+    /// Select the quality tier's precision and exact/native ANN retrieval.
+    /// Existing quality policy is inherited by default. Changing its precision
+    /// re-embeds every quality row rather than promoting already rounded values.
     /// The inherited fast encoding and graph policy cannot be changed here.
     ///
     /// # Errors
@@ -351,7 +365,9 @@ impl NativeQualityCompletion {
     /// Build a full fast/quality successor at the unchanged retained source cut.
     ///
     /// The fast provider is admitted but receives no document inference request.
-    /// Every quality row must succeed before a publishable candidate exists.
+    /// Existing quality rows are reused only under their complete retained
+    /// producer identity and unchanged precision. Every missing or deliberately
+    /// re-embedded quality row must succeed before a publishable candidate exists.
     /// Failure, cancellation, or dropping this future leaves the incumbent usable.
     ///
     /// # Errors
@@ -386,6 +402,7 @@ impl NativeQualityCompletion {
 enum AuthorityUpdateIntent {
     RetainProducers,
     MigrateModels,
+    CompleteQuality,
 }
 
 impl NativeBuiltIndex {
@@ -644,10 +661,11 @@ impl NativeIndexUpdate {
         intent: AuthorityUpdateIntent,
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.update.authority")?;
-        if matches!(
+        let partial_quality = matches!(
             snapshot.topology(),
             crate::native_ann::NativeGenerationTopology::PartialQuality { .. }
-        ) {
+        );
+        if partial_quality && !matches!(intent, AuthorityUpdateIntent::CompleteQuality) {
             return Err(invalid(
                 "update.inventory",
                 "partial-quality-unsupported",
@@ -674,7 +692,9 @@ impl NativeIndexUpdate {
             ));
         }
         if quality.is_some()
-            != (snapshot.topology() == crate::native_ann::NativeGenerationTopology::FullProgressive)
+            != (partial_quality
+                || snapshot.topology()
+                    == crate::native_ann::NativeGenerationTopology::FullProgressive)
         {
             return Err(invalid(
                 "update.inventory",
@@ -749,10 +769,28 @@ impl NativeIndexUpdate {
         };
         let mut documents = snapshot.source_documents(cx, max_source_bytes)?;
         documents.sort_by(|left, right| left.id.cmp(&right.id));
-        let fast = ReuseTier::from_owner(cx, index, &documents, fast_fingerprint, precision)?;
+        let fast = ReuseTier::from_owner(
+            cx,
+            index,
+            &documents,
+            fast_fingerprint,
+            precision,
+            ReuseCoverage::Complete,
+        )?;
         let quality = quality
             .map(|(index, fingerprint, precision)| {
-                ReuseTier::from_owner(cx, index, &documents, fingerprint, precision)
+                ReuseTier::from_owner(
+                    cx,
+                    index,
+                    &documents,
+                    fingerprint,
+                    precision,
+                    if partial_quality {
+                        ReuseCoverage::PartialQualityCompletion
+                    } else {
+                        ReuseCoverage::Complete
+                    },
+                )
             })
             .transpose()?;
         let progressive = quality.is_some();
@@ -1161,8 +1199,9 @@ pub(super) struct ReuseSource {
     // or physical-row-map copies when repartitioning the predecessor.
     partitions: Vec<ReusePartition>,
     // Only explicit completion constructors may set this after proving every
-    // predecessor partition is fast-only. Ordinary updates require their
-    // retained quality owner and must never treat an absent owner as a fallback.
+    // predecessor partition is fast-only. Partial completion retains its quality
+    // owner and sparse row map instead; ordinary updates require a complete
+    // quality owner and must never treat a failed lookup as a fallback.
     completing_quality: bool,
     #[cfg(feature = "quill")]
     authority: Option<AuthorityReuse>,
@@ -1290,11 +1329,21 @@ impl ReuseSource {
 struct ReuseTier {
     index: Arc<NativeAnnIndex>,
     owner: Arc<ValidatedFsviBytes>,
+    // usize::MAX denotes a missing row only for explicit partial completion.
+    // Keeping one word per source preserves the complete-update join's cost.
     physical_rows: Vec<usize>,
+    coverage: ReuseCoverage,
     // None explicitly forbids vector AND graph reuse for a migrated producer.
     // Source equality or coincidentally equal output values cannot admit it.
     producer_fingerprint: Option<String>,
     precision: NativeBuildPrecision,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReuseCoverage {
+    Complete,
+    #[cfg(feature = "quill")]
+    PartialQualityCompletion,
 }
 
 impl ReuseTier {
@@ -1305,6 +1354,7 @@ impl ReuseTier {
             documents,
             Some(tier.producer_identity.fingerprint()),
             tier.precision,
+            ReuseCoverage::Complete,
         )
     }
 
@@ -1314,13 +1364,20 @@ impl ReuseTier {
         documents: &[IndexableDocument],
         producer_fingerprint: Option<String>,
         precision: NativeBuildPrecision,
+        coverage: ReuseCoverage,
     ) -> SearchResult<Self> {
         let owner = Arc::clone(&index.owner);
-        if owner.live_count() != documents.len() {
+        let complete = coverage == ReuseCoverage::Complete;
+        let invalid_cardinality = if complete {
+            owner.live_count() != documents.len()
+        } else {
+            owner.live_count() == 0 || owner.live_count() >= documents.len()
+        };
+        if invalid_cardinality {
             return Err(invalid(
                 "update.source_join",
                 "cardinality",
-                "source/tier membership differs",
+                "source/tier membership differs from the explicit reuse coverage",
             ));
         }
         for (position, document) in documents.iter().enumerate() {
@@ -1358,7 +1415,7 @@ impl ReuseTier {
                 ));
             }
         }
-        if physical_rows.contains(&usize::MAX) {
+        if complete && physical_rows.contains(&usize::MAX) {
             return Err(invalid(
                 "update.source_join",
                 "missing",
@@ -1369,6 +1426,7 @@ impl ReuseTier {
             index,
             owner,
             physical_rows,
+            coverage,
             producer_fingerprint,
             precision,
         })
@@ -1414,10 +1472,21 @@ impl TierPlan {
                         "reused vectors require the original complete producer identity",
                     ));
                 }
+                let physical = tier.physical_rows[position];
+                if physical == usize::MAX {
+                    if tier.coverage == ReuseCoverage::Complete {
+                        return Err(invalid(
+                            "update.source_join",
+                            "missing",
+                            "ordinary retained reuse requires a live physical row",
+                        ));
+                    }
+                    changed.push(document.clone());
+                    continue;
+                }
                 if self.precision == tier.precision
                     && partition.documents[position].content == document.content
                 {
-                    let physical = tier.physical_rows[position];
                     let vector = tier.owner.vector_at_f32(physical)?;
                     // F16 -> F32 -> the SAME F16 storage is exact. Changed
                     // precision re-embeds instead of promoting rounded values.
@@ -1456,7 +1525,7 @@ fn authority_reuse_fingerprint(
         index.admit_identity(&plan.identity)?;
         return Ok(Some(plan.identity.fingerprint()));
     }
-    if matches!(intent, AuthorityUpdateIntent::RetainProducers) {
+    if !matches!(intent, AuthorityUpdateIntent::MigrateModels) {
         return Err(invalid(
             "update.producer",
             "changed",
@@ -3077,6 +3146,7 @@ mod tests {
                     old.documents(),
                     fingerprint,
                     retained.precision,
+                    ReuseCoverage::Complete,
                 )
             };
             builder.reuse = Some(Arc::new(ReuseSource {
