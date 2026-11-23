@@ -8,10 +8,13 @@
 use std::future::{Future, poll_fn};
 use std::io::{self, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
+use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::Poll;
+use std::task::{Poll, Waker};
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use asupersync::runtime::IoRegistration;
 use frankensearch_core::{SearchError, SearchResult};
 
 use super::super::super::{FSFS_DAEMON_RESPONSE_MAX_BYTES, parse_search_execution_mode};
@@ -19,7 +22,7 @@ use super::{IO_POLL_INTERVAL, complete_cli_error, retained_search_checkpoint};
 
 #[path = "complete_daemon_stream/drain.rs"]
 mod drain;
-use drain::{DrainState, drain_pending};
+use drain::{DrainState, drain_pending, drain_writable};
 
 /// Observe a disconnected response consumer without reading request bytes or
 /// writing a probe into the response. EOF on the input half alone is NOT a
@@ -39,27 +42,45 @@ struct Output {
 }
 
 impl Output {
-    fn drain(&mut self) -> io::Result<DrainState> {
+    fn drain(
+        &mut self,
+        readiness: Option<(&Cx, &mut Option<IoRegistration>, &Waker)>,
+    ) -> io::Result<DrainState> {
         if self.failed {
             return Err(io::Error::other("daemon output previously failed"));
         }
-        let result = self.drain_inner();
+        let result = self.drain_inner(readiness);
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    fn drain_inner(&mut self) -> io::Result<DrainState> {
+    fn drain_inner(
+        &mut self,
+        readiness: Option<(&Cx, &mut Option<IoRegistration>, &Waker)>,
+    ) -> io::Result<DrainState> {
         // Check even with an empty queue: quality inference or generation
         // admission can suspend long after Initial was completely delivered.
         check_peer(&self.peer)?;
-        let state = drain_pending(
-            &mut self.peer,
-            &self.pending,
-            &mut self.offset,
-            &mut self.emitted,
-        )?;
+        let state = if let Some((cx, registration, waker)) = readiness {
+            drain_writable(
+                cx,
+                &mut self.peer,
+                &self.pending,
+                &mut self.offset,
+                &mut self.emitted,
+                registration,
+                waker,
+            )?
+        } else {
+            drain_pending(
+                &mut self.peer,
+                &self.pending,
+                &mut self.offset,
+                &mut self.emitted,
+            )?
+        };
         if state == DrainState::Drained {
             self.pending.clear();
             self.offset = 0;
@@ -153,7 +174,7 @@ impl Write for PhaseWriter {
             pending.append(staged);
         }
         // The owning driver finishes a blocked or cooperatively yielded flush.
-        output.drain().map(|_| ())
+        output.drain(None).map(|_| ())
     }
 }
 
@@ -167,15 +188,28 @@ pub(super) async fn drive<T>(
     output: &PhaseWriter,
     producer: impl Future<Output = SearchResult<T>>,
 ) -> SearchResult<T> {
+    drive_with_tick(cx, output, producer, IO_POLL_INTERVAL).await
+}
+
+async fn drive_with_tick<T>(
+    cx: &Cx,
+    output: &PhaseWriter,
+    producer: impl Future<Output = SearchResult<T>>,
+    io_tick: Duration,
+) -> SearchResult<T> {
     let mut producer = Some(Box::pin(producer));
     let mut finished = None;
+    let mut registration = None;
     loop {
-        let mut tick = Box::pin(asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL));
+        let mut tick = Box::pin(asupersync::time::sleep(cx.now(), io_tick));
         let result = poll_fn(|task| {
             if let Err(error) = retained_search_checkpoint(cx) {
                 return Poll::Ready(Err(error));
             }
-            match output.lock().and_then(|mut state| state.drain()) {
+            match output
+                .lock()
+                .and_then(|mut state| state.drain(Some((cx, &mut registration, task.waker()))))
+            {
                 Ok(DrainState::Yielded) => {
                     // Give the parent deadline and other tasks a turn without
                     // adding an I/O-timer delay to a normally writable stream.
@@ -206,7 +240,7 @@ pub(super) async fn drive<T>(
                 // follow any exposed stream bytes.
                 state.staged.clear();
             }
-            let drain_state = match state.drain() {
+            let drain_state = match state.drain(Some((cx, &mut registration, task.waker()))) {
                 Ok(state) => state,
                 Err(error) => return Poll::Ready(Err(error.into())),
             };
@@ -237,6 +271,60 @@ pub(super) async fn drive<T>(
             return Ok(result);
         }
     }
+}
+
+pub(super) async fn write_response(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    bytes: &[u8],
+    timeout: Duration,
+) -> SearchResult<()> {
+    write_response_with_tick(cx, peer, bytes, timeout, IO_POLL_INTERVAL).await
+}
+
+async fn write_response_with_tick(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    bytes: &[u8],
+    timeout: Duration,
+    io_tick: Duration,
+) -> SearchResult<()> {
+    let started = Instant::now();
+    let mut offset = 0;
+    let mut emitted = false;
+    let mut registration = None;
+    while offset < bytes.len() {
+        let wait = io_tick.min(timeout.saturating_sub(started.elapsed()));
+        let mut tick = pin!(asupersync::time::sleep(cx.now(), wait));
+        poll_fn(|task| -> Poll<SearchResult<()>> {
+            retained_search_checkpoint(cx)?;
+            if started.elapsed() >= timeout {
+                return Poll::Ready(Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "daemon response deadline exceeded",
+                )
+                .into()));
+            }
+            match drain_writable(
+                cx,
+                peer,
+                bytes,
+                &mut offset,
+                &mut emitted,
+                &mut registration,
+                task.waker(),
+            )? {
+                DrainState::Drained => Poll::Ready(Ok(())),
+                DrainState::Yielded => {
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                DrainState::Blocked => tick.as_mut().poll(task).map(Ok),
+            }
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 /// Raw streaming accepts the buffered request's retrieval modes and search
@@ -287,6 +375,110 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Waker};
     use std::time::Duration;
+
+    fn resume_parked_response(streamed: bool, reactor: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .enable_platform_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller-owned runtime");
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            server.set_nonblocking(true).unwrap();
+            let mut filled = 0;
+            loop {
+                match server.write(&[b'x'; 8192]) {
+                    Ok(count) => {
+                        assert!(count > 0);
+                        filled += count;
+                        assert!(filled < 16 * 1024 * 1024, "socket did not park");
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("could not fill socket: {error}"),
+                }
+            }
+            assert!(filled > 0);
+            let io_tick = if reactor {
+                Duration::from_secs(5)
+            } else {
+                IO_POLL_INTERVAL
+            };
+            let tail = b"{\"event\":\"terminal\"}\n";
+            let mut response = std::pin::pin!(async {
+                if streamed {
+                    let output = PhaseWriter::new(&server)?;
+                    let mut writer = output.clone();
+                    drive_with_tick(
+                        &cx,
+                        &output,
+                        async move {
+                            writer.write_all(tail)?;
+                            writer.flush()?;
+                            Ok(())
+                        },
+                        io_tick,
+                    )
+                    .await
+                } else {
+                    write_response_with_tick(
+                        &cx,
+                        &mut server,
+                        tail,
+                        Duration::from_secs(10),
+                        io_tick,
+                    )
+                    .await
+                }
+            });
+            let mut guard =
+                std::pin::pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(2)));
+            let mut drained = false;
+            poll_fn(|task| {
+                assert!(
+                    guard.as_mut().poll(task).is_pending(),
+                    "writer missed guard"
+                );
+                if let Poll::Ready(result) = response.as_mut().poll(task) {
+                    return Poll::Ready(result);
+                }
+                if !drained {
+                    let mut prefix = vec![0; filled];
+                    client.read_exact(&mut prefix).unwrap();
+                    assert!(prefix.into_iter().all(|byte| byte == b'x'));
+                    drained = true;
+                }
+                Poll::Pending
+            })
+            .await
+            .unwrap();
+            assert!(drained);
+            let mut actual = [0; 21];
+            client.read_exact(&mut actual).unwrap();
+            assert_eq!(&actual, tail);
+            assert_eq!(
+                client.read(&mut [0]).unwrap_err().kind(),
+                ErrorKind::WouldBlock
+            );
+        });
+    }
+
+    #[test]
+    fn backpressured_buffered_response_wakes_on_writable_socket() {
+        resume_parked_response(false, true);
+    }
+
+    #[test]
+    fn backpressured_stream_response_wakes_on_writable_socket() {
+        resume_parked_response(true, true);
+    }
+
+    #[test]
+    fn backpressured_responses_keep_timer_fallback() {
+        resume_parked_response(false, false);
+        resume_parked_response(true, false);
+    }
 
     #[test]
     fn stream_flush_delivers_before_producer_completion() {

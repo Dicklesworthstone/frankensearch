@@ -2,6 +2,13 @@
 //! both consume a bounded turn; a blocked peer does not request a busy retry.
 
 use std::io::{self, ErrorKind, Write};
+use std::os::unix::net::UnixStream;
+use std::task::Waker;
+
+use asupersync::Cx;
+use asupersync::runtime::{IoRegistration, reactor::Interest};
+
+use super::super::admission::arm_io;
 
 const MAX_DRAIN_BYTES: usize = 64 * 1024;
 const MAX_DRAIN_WRITES: usize = 32;
@@ -16,9 +23,50 @@ pub(super) enum DrainState {
 /// Send a bounded prefix, retaining the exact offset for the next owned poll.
 /// `Yielded` requires a scheduler wake rather than waiting for the I/O timer:
 /// a writable peer should not pay one timer interval per 64 KiB. In contrast,
-/// `Blocked` must use the existing I/O tick to avoid spinning on backpressure.
+/// `Blocked` waits for readiness or the I/O tick instead of spinning.
 pub(super) fn drain_pending(
     writer: &mut impl Write,
+    pending: &[u8],
+    offset: &mut usize,
+    emitted: &mut bool,
+) -> io::Result<DrainState> {
+    drain_with(|bytes| writer.write(bytes), pending, offset, emitted)
+}
+
+/// Arm only after a real blocked write. Retry that write after arming to
+/// cover a reader making space during registration. Both attempts share the
+/// same byte budget, and an idle driver holds no writable registration.
+pub(super) fn drain_writable(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    pending: &[u8],
+    offset: &mut usize,
+    emitted: &mut bool,
+    registration: &mut Option<IoRegistration>,
+    waker: &Waker,
+) -> io::Result<DrainState> {
+    let result = drain_with(
+        |bytes| match peer.write(bytes) {
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock
+                    && arm_io(cx, peer, registration, Interest::WRITABLE, waker) =>
+            {
+                peer.write(bytes)
+            }
+            result => result,
+        },
+        pending,
+        offset,
+        emitted,
+    );
+    if !matches!(result, Ok(DrainState::Blocked)) {
+        *registration = None;
+    }
+    result
+}
+
+fn drain_with(
+    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
     pending: &[u8],
     offset: &mut usize,
     emitted: &mut bool,
@@ -33,7 +81,7 @@ pub(super) fn drain_pending(
             return Ok(DrainState::Yielded);
         }
         let remaining = &pending[*offset..];
-        match writer.write(&remaining[..remaining.len().min(budget)]) {
+        match write(&remaining[..remaining.len().min(budget)]) {
             Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "stream peer closed")),
             Ok(count) => {
                 *emitted = true;

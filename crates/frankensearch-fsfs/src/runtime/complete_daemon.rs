@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::future::{Future, poll_fn};
-use std::io::{self, ErrorKind, Read, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{self, ErrorKind, Read};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -43,6 +45,7 @@ mod control;
 
 #[path = "complete_daemon_stream.rs"]
 mod streaming;
+use streaming::write_response;
 
 #[path = "complete_daemon_forward.rs"]
 mod forwarding;
@@ -1351,33 +1354,6 @@ async fn read_request_from(
             return Ok(bytes);
         }
     }
-}
-
-async fn write_response(
-    cx: &Cx,
-    peer: &mut UnixStream,
-    mut bytes: &[u8],
-    timeout: Duration,
-) -> SearchResult<()> {
-    let started = Instant::now();
-    while !bytes.is_empty() {
-        retained_search_checkpoint(cx)?;
-        if started.elapsed() >= timeout {
-            return Err(
-                io::Error::new(ErrorKind::TimedOut, "daemon response deadline exceeded").into(),
-            );
-        }
-        match peer.write(bytes) {
-            Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "daemon peer closed").into()),
-            Ok(count) => bytes = &bytes[count..],
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL).await;
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
