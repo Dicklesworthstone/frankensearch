@@ -75,13 +75,20 @@ Quill conformance and performance program.
   `2f5abf02febebb501e79e4791185c18c9cc26a147da889574657eabea12f54de`.
 - That earlier integrated run passed all 25 cases in the four-model executable
   lane. Its source-build quickstart correctly refused the dirty checkout.
-  The next full run uses a clean checkout of `9054d288`. Its workspace lane
-  reached a stale activation census. `5ba13f72` retains the original quality
+  The clean run at `9054d288` passed 17 stages. Its workspace lane reached
+  a stale activation census. `5ba13f72` retains the original quality
   activation through filtered refill and coverage, eliminating one redundant
   activation and one coverage replay. The census records the retained five
   activation and two parameterized coverage calls. Its four unchanged checks
-  passed alongside the query-admission and eligibility tests. `bd-k6b1y`
-  tracks the subsequent workspace rerun.
+  passed alongside 18 query-admission and eligibility tests. The workspace
+  lane passed on clean `6d61dc6c`, which changed the census and this plan.
+  `bd-k6b1y` is closed. Together the receipts cover the default gate. See
+  `clean-quality.log` and `census-workspace-gate.log`.
+- The clean gate's CLI suite passed all 25 cases with four registered
+  models and a genuine predecessor. The clean source-build quickstart
+  attested build and install bytes at `9054d288`, ran 12 commands and 22
+  negative controls, and retained no live owned processes. The lite lane
+  passed. See `tmp/fsfs-quickstart.NWvq7f5a/receipt.json`.
 - A standalone Cargo app resolved published `frankensearch 0.8.0` with
   `hybrid` from crates.io. It built a three-document index with Potion and
   MiniLM in one process. A second process reopened the disk index and found
@@ -190,7 +197,7 @@ Quill conformance and performance program.
   the corrected CLI timeout and pressure recipes against the published binary.
 - [x] Update README, AGENTS and the existing packaging contract with the
   tested recipes and release boundary.
-- [ ] Verify the integrated workspace and real-model CLI gate with a genuine
+- [x] Verify the integrated workspace and real-model CLI gate with a genuine
   predecessor. Keep terminal evidence tied to the exact tested source.
 - [x] Check the stale census failure against the retained quality path and
   correct the recorded source census. Rerun the exact census and owner controls.
