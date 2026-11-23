@@ -8619,6 +8619,13 @@ impl FsfsRuntime {
                 reason: NATIVE_PROFILE_UPDATE_GUIDANCE.to_owned(),
             });
         }
+        if self.config.indexing.offline {
+            return Err(SearchError::InvalidConfig {
+                field: "update.offline".to_owned(),
+                value: "true".to_owned(),
+                reason: "checking or downloading releases requires network access; rerun with --online to allow it".to_owned(),
+            });
+        }
 
         let current = SemVer::parse(current_str).ok_or_else(|| SearchError::InvalidConfig {
             field: "update.current_version".into(),

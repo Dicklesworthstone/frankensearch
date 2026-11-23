@@ -5117,8 +5117,8 @@ mod loader_only {
         }
     }
 
-    #[cfg(all(unix, feature = "semantic-loaders"))]
-    fn observe_expansion_proxy(
+    #[cfg(unix)]
+    fn observe_http_proxy(
         run: impl FnOnce(&str) -> CommandOutcome,
     ) -> (CommandOutcome, Vec<String>) {
         use std::io::{BufRead, BufReader, ErrorKind, Write};
@@ -5163,6 +5163,74 @@ mod loader_only {
             output,
             observer.join().unwrap().expect("observe loopback proxy"),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_honors_offline_policy_and_keeps_local_rollback_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("models"));
+        let run = |label, args: &[&str], offline| {
+            observe_http_proxy(|proxy| {
+                fsfs.run_with_env(
+                    temp.path(),
+                    label,
+                    args.iter().copied(),
+                    FAILURE_TIMEOUT,
+                    &[
+                        ("FRANKENSEARCH_OFFLINE", offline),
+                        ("FRANKENSEARCH_CHECK_UPDATES", "0"),
+                        ("HTTPS_PROXY", proxy),
+                        ("https_proxy", proxy),
+                        ("NO_PROXY", ""),
+                        ("no_proxy", ""),
+                    ],
+                )
+            })
+        };
+        for (label, args, offline) in [
+            (
+                "offline-check-cli",
+                &["update", "--check", "--offline", "--format", "json"][..],
+                "0",
+            ),
+            (
+                "offline-check-env",
+                &["update", "--check", "--format", "json"],
+                "1",
+            ),
+            ("offline-apply-env", &["update", "--format", "json"], "1"),
+        ] {
+            let (outcome, connects) = run(label, args, offline);
+            assert!(!outcome.timed_out, "{outcome:?}");
+            assert!(connects.is_empty(), "{label}: contacted {connects:?}");
+            assert_eq!(outcome.status.code(), Some(2), "{outcome:?}");
+            let envelope: Value = serde_json::from_str(&outcome.stdout).unwrap();
+            assert_eq!(envelope["error"]["field"], "update.offline", "{envelope}");
+        }
+        let (online, connects) = run(
+            "online-check",
+            &["update", "--check", "--online", "--format", "json"],
+            "1",
+        );
+        assert!(!online.timed_out, "{online:?}");
+        assert_eq!(connects, ["CONNECT api.github.com:443 HTTP/1.1"]);
+        assert_eq!(online.status.code(), Some(2), "{online:?}");
+        let refusal: Value = serde_json::from_str(&online.stdout).unwrap();
+        assert_eq!(refusal["error"]["field"], "update.github_api", "{refusal}");
+
+        let (rollback, connects) = run(
+            "offline-rollback-list",
+            &["update", "--rollback", "--check", "--offline"],
+            "1",
+        );
+        assert!(connects.is_empty(), "rollback contacted {connects:?}");
+        assert_finished_successfully("offline rollback listing", &rollback);
+        assert!(
+            rollback
+                .stdout
+                .contains("No backups available for rollback")
+        );
     }
 
     #[cfg(all(unix, feature = "semantic-loaders"))]
@@ -5302,7 +5370,7 @@ mod loader_only {
             );
 
             if socket_name.is_some() {
-                let (expanded, connects) = observe_expansion_proxy(|proxy| {
+                let (expanded, connects) = observe_http_proxy(|proxy| {
                     fsfs.run_with_env(
                         root,
                         &format!("{label}-expand"),

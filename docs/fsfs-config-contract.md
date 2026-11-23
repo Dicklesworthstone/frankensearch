@@ -85,8 +85,10 @@ as ignored even though Git itself does not apply the outer rules to them.
 - `fast_model: string`
 - `quality_model: string`
 - `model_dir: string`
-- `offline: bool` (default `false`; `--offline` forbids model acquisition,
-  including a forced refresh. `--online` explicitly permits acquisition.)
+- `offline: bool` (default `false`). Offline mode forbids model acquisition,
+  including a forced refresh, and remote release checks or downloads from
+  `fsfs update`. `--online` permits network access for those commands.
+  Local `fsfs update --rollback` operations remain available offline.
 - `embedding_batch_size: int` (`1..4096`, default `64`; bounds document batches in
   one-shot indexing and the watch vector pipeline. Smaller batches reduce working
   memory and the time between batch checkpoints; they do not reduce model size.)
