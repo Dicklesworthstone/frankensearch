@@ -75,7 +75,19 @@ Quill conformance and performance program.
   `2f5abf02febebb501e79e4791185c18c9cc26a147da889574657eabea12f54de`.
 - That earlier integrated run passed all 25 cases in the four-model executable
   lane. Its source-build quickstart correctly refused the dirty checkout.
-  The next full run uses a clean checkout of the repair commit.
+  The next full run uses a clean checkout of `9054d288`. Its workspace lane
+  reached a stale activation census. `5ba13f72` retains the original quality
+  activation through filtered refill and coverage, eliminating one redundant
+  activation and one coverage replay. The census records the retained five
+  activation and two parameterized coverage calls. Its four unchanged checks
+  passed alongside the query-admission and eligibility tests. `bd-k6b1y`
+  tracks the subsequent workspace rerun.
+- A standalone Cargo app resolved published `frankensearch 0.8.0` with
+  `hybrid` from crates.io. It built a three-document index with Potion and
+  MiniLM in one process. A second process reopened the disk index and found
+  the planted document through Quill, both progressive phases and direct
+  quality-only retrieval. The second process's network trace had no IP socket
+  calls. See `registry-consumer/{build-index.log,reopen.log,read-network.log}`.
 - The paired Linux diagnostic used the signed executable and a stock
   release-profile build of `aaa1e06e`, SHA-256
   `754be33869454e7b981ed5a834f51bc5411046784dbbf83af1925ac13bd6ef79`.
@@ -104,7 +116,7 @@ Quill conformance and performance program.
 | 8. Atomic maintenance, flush and recovery | Actual append, ID deletion, compact and reopen behaved as expected. Flush confirmed selected-generation durability. A read-only preparation preserved the selection hash. Applying it restored the exact older receipt, confirmation returned `durability_confirmed`, and a fresh query found the restored document. | Exact-source recovery fault controls across platforms and migration to composite authority. `bd-xomn.2`, `bd-rgcvv`, `bd-3fy9`. |
 | 9. Explanations, snapshot provenance and interactive dashboard | Inline and standalone explanations served on the Linux lifecycle. A full-screen session on a controlling PTY displayed the planted result, then displayed a new matching document after a separate append process published it and the idle dashboard refreshed. It quit cleanly. A separate ANSI fallback showed the Refined result. | Current policy parity and corruption/cancellation breadth through existing TUI runtime tests and `bd-retained-composite-generation-snapshot-cdny8`. |
 | 10. Safe cross-executable upgrades | Linux opt-in contract v5 is wired and has genuine two-executable evidence for earlier source. It binds producer, format, configuration, file policy and artifact identity. | Native Mac still scopes evidence to the process. Qualify a stronger launch-time identity with real predecessor and successor binaries. `bd-fsfs-cli-upgrade-reuse-rsqq7`. |
-| 11. Reusable Rust facade and caller-owned runtime | `IndexBuilder`, `open_hybrid` and `TwoTierSearcher` are real. Quill backs the lexical feature; hash is a control. The lock contains none of the prohibited runtime packages. | Real-model and optional-package matrices, an external consumer and persisted restart. `bd-2g2l`, `bd-q4rg`, `bd-8nqz`. |
+| 11. Reusable Rust facade and caller-owned runtime | `IndexBuilder`, `open_hybrid` and `TwoTierSearcher` ran with verified models in a standalone crates.io consumer. An independent process reopened its Quill and vector artifacts and served Initial, Refined and quality-only results. The workspace lock contains none of the prohibited runtime packages. | Retained composite generations, the frozen Treasure Island restart and negative controls, and optional-package matrices. `bd-2g2l`, `bd-q4rg`, `bd-8nqz`. |
 | 12. Quill conformance across lifecycle states | Quill ships with native parsing and BM25, encoded postings, deltas, compaction and concat-merge. Tantivy 0.26.2 is the pinned live oracle. The bounded witness, full gauntlet and scaled campaigns each cover a distinct scope. | R1, UNION_HORIZON, full result contract, scale, all named full gates and divergence census. `bd-r1-exact-repair-or-residual-1i4j4`, `bd-quill-union-horizon-exactness-salej`, `bd-qwkq`, `bd-y7vz`, `bd-quill-e6-gauntlet-scale-rm3q`, `bd-quill-flip-conformance-release-gate-0r2p`. |
 | 13. CASS interop and durable library storage | Tantivy-backed `cass-compat` and native Quill CASS analyzer implement scoped contracts. Catalog, queue and attempt-fenced embedding writes use FrankenSQLite. | External CASS persisted semantic generation and recovery plus total lexical result contract. `bd-cass-semantic-cross-repo-receipt-91k2`, `bd-cass-total-lexical-contract-jxyq`, `bd-q4rg`. |
 | 14. Immutable composite authority and embedding-space identity | Cooperative `FSFS-CURRENT` and low-level FSVI v2 owner-bound APIs exist, while native and ordinary CLI modes still have different selection entry points. | Fixed-slot authority, authenticated anti-rollback, retained pinning and migration of ordinary writers, readers and caches. `bd-xomn.1`–`.4`, `bd-generation-antirollback-floor-ynwdi`, `bd-fixed-generation-root-publisher-ycng6`, `bd-retained-composite-generation-snapshot-cdny8`, `bd-generation-retention-roots-xnmxi`, `bd-jbfg`. |
@@ -180,6 +192,10 @@ Quill conformance and performance program.
   tested recipes and release boundary.
 - [ ] Verify the integrated workspace and real-model CLI gate with a genuine
   predecessor. Keep terminal evidence tied to the exact tested source.
+- [x] Check the stale census failure against the retained quality path and
+  correct the recorded source census. Rerun the exact census and owner controls.
+- [x] Compile and run the published hybrid facade in an external consumer.
+  Build and reopen in separate processes and trace the reopen's network calls.
 - [x] Verify the signed Apple Silicon installer, registered model pair and
   two-phase search on a native host.
 - [x] Establish complete-store timing controls on the signed Linux release
