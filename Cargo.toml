@@ -307,6 +307,13 @@ debug = "line-tables-only"
 [profile.dev.package.sha2]
 opt-level = 3
 
+# Code-corpus watch publications can spend minutes solving the repair matrix
+# for a new FSVI in an unoptimized RaptorQ build. Use the same optimization
+# level as the test dependency profile without changing repair symbols or
+# the publication path.
+[profile.dev.package.raptorq]
+opt-level = 2
+
 # The native encoder owns fused attention and GELU kernels in this workspace
 # crate, so the dependency-only test override above does not optimize them.
 # Optimize the same inference implementation in development and inherited
