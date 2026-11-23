@@ -517,12 +517,12 @@ fn reconstruct_admission_binding(
 /// [`std::collections::hash_map::RandomState`] draws (fresh keys per
 /// process from OS randomness, distinct per instantiation), domain-mixed
 /// with the deterministic build context.
-fn generation_nonce(index_dir: &Path, tier: &str, sequence: u64) -> [u8; 16] {
+fn generation_nonce(index_dir: &Path, purpose: &str, sequence: u64) -> [u8; 16] {
     use std::hash::BuildHasher as _;
 
     let mut hasher = Sha256::new();
     hasher.update(index_dir.as_os_str().as_encoded_bytes());
-    hasher.update(tier.as_bytes());
+    hasher.update(purpose.as_bytes());
     hasher.update(sequence.to_le_bytes());
     for draw in 0_u64..4 {
         let os_seeded = std::collections::hash_map::RandomState::new();
@@ -1486,8 +1486,8 @@ impl RefreshWorker {
         // A canonical pair whose tiers came from DIFFERENT publications must
         // never be admitted for a merge: carrying both forward would stamp
         // the staged generation with one fresh shared nonce and erase the
-        // split origin that `assemble_opened` degrades on (bd-miio8).
-        // Legacy pre-nonce pairs read 0 == 0 and remain admissible.
+        // split origin. Pre-nonce pairs read 0 == 0, so verify the full v2
+        // generation even when the publication markers match.
         if let (Some(fast_tier), Some(quality_tier)) = (&fast, &quality) {
             let fast_nonce = fast_tier.owner.metadata().publication_nonce;
             let quality_nonce = quality_tier.owner.metadata().publication_nonce;
@@ -1500,6 +1500,13 @@ impl RefreshWorker {
                              installs); refusing to launder the pair into one staged \
                              generation — rebuild from source instead"
                         .to_owned(),
+                });
+            }
+            if fast_tier.owner.witness().generation != quality_tier.owner.witness().generation {
+                return Err(SearchError::InvalidConfig {
+                    field: "refresh.canonical_pair_generation".to_owned(),
+                    value: "mismatch".to_owned(),
+                    reason: "canonical fast and quality tiers have different v2 generations; rebuild from source before staging a replacement".to_owned(),
                 });
             }
         }
@@ -1921,27 +1928,23 @@ impl RefreshWorker {
         let staged_fast = staged_dir.join(VECTOR_INDEX_FAST_FILENAME);
         let staged_quality = staged_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
 
-        // Both staged tiers carry ONE publication nonce, the successor of
-        // the admitted destination pair's (mirroring the v1 publish_tier
-        // route, bd-miio8): the staged pair re-admits as a same-publication
-        // pair instead of a legacy 0 == 0 exemption, and a crash between the
-        // two eventual per-tier installs stays detectable at open time.
+        // Both tiers belong to one replacement. Derive its full generation
+        // and short publication marker from the admitted predecessor. A
+        // quality-only predecessor owns the lineage when fast is absent.
+        let predecessor = fast_admitted
+            .as_ref()
+            .or(quality_admitted.as_ref())
+            .map(|tier| &tier.owner);
         let publication_nonce = next_publication_nonce(
-            fast_admitted
-                .as_ref()
-                .or(quality_admitted.as_ref())
-                .map_or(0, |tier| tier.owner.metadata().publication_nonce),
+            predecessor.map_or(0, |owner| owner.metadata().publication_nonce),
         );
-
-        let fast_sequence =
-            next_generation_sequence(fast_admitted.as_ref().map(|tier| &tier.owner))?;
+        let generation_sequence = next_generation_sequence(predecessor)?;
         let fast_artifact_bundle = artifact_identity_for(self.fast_embedder.as_ref())?;
-        let fast_generation = ArtifactGenerationIdentityV1::new(
-            fast_sequence,
-            generation_nonce(&self.config.index_dir, "fast", fast_sequence),
+        let generation = ArtifactGenerationIdentityV1::new(
+            generation_sequence,
+            generation_nonce(&staged_dir, "publication", generation_sequence),
         )?;
-        let fast_binding =
-            FsviV2IdentityBinding::new(fast_generation, fast_artifact_bundle.freeze()?)?;
+        let fast_binding = FsviV2IdentityBinding::new(generation, fast_artifact_bundle.freeze()?)?;
         let mut fast_writer = VectorIndex::create_v2(&staged_fast, fast_binding.clone())?
             .with_publication_nonce(publication_nonce);
         for (doc_id, (fast_vector, _)) in &merged {
@@ -1967,14 +1970,8 @@ impl RefreshWorker {
                     reason: "quality rows were merged without a quality embedder".to_owned(),
                 });
             };
-            let quality_sequence =
-                next_generation_sequence(quality_admitted.as_ref().map(|tier| &tier.owner))?;
             let quality_bundle = artifact_identity_for(quality_embedder.as_ref())?;
-            let quality_generation = ArtifactGenerationIdentityV1::new(
-                quality_sequence,
-                generation_nonce(&self.config.index_dir, "quality", quality_sequence),
-            )?;
-            let binding = FsviV2IdentityBinding::new(quality_generation, quality_bundle.freeze()?)?;
+            let binding = FsviV2IdentityBinding::new(generation, quality_bundle.freeze()?)?;
             let mut quality_writer = VectorIndex::create_v2(&staged_quality, binding.clone())?
                 .with_publication_nonce(publication_nonce);
             for (doc_id, vector) in quality_rows {
@@ -2007,7 +2004,7 @@ impl RefreshWorker {
             staged_fast = %staged_fast.display(),
             staged_quality = quality_binding.is_some(),
             rows = merged.len(),
-            generation_sequence = fast_sequence,
+            generation_sequence,
             "identity-bound replacement generation staged and admitted (non-canonical)"
         );
 
@@ -4205,6 +4202,15 @@ mod tests {
                 staged.quality_binding.as_ref().expect("quality binding"),
             )
             .expect("staged quality admits");
+            assert_eq!(
+                fast_owner.witness().generation,
+                quality_owner.witness().generation
+            );
+            assert_eq!(fast_owner.witness().generation.sequence, 3);
+            assert_ne!(
+                fast_owner.witness().generation.nonce,
+                fast_binding.generation().nonce
+            );
             let fast_nonce = fast_owner.metadata().publication_nonce;
             let quality_nonce = quality_owner.metadata().publication_nonce;
             assert_ne!(
@@ -4222,52 +4228,56 @@ mod tests {
         });
     }
 
-    /// A canonical pair whose tiers carry DISAGREEING publication nonces is a
-    /// mixed-generation pair (crash between tier installs); admission must
-    /// refuse it rather than launder both tiers into one freshly-stamped
-    /// staged generation (round-2 hardening of bd-miio8).
+    /// A canonical pair may be split even when its short publication markers
+    /// match. Keep the typed refusal for both forms before stage admission.
     #[test]
-    fn staging_refuses_a_mixed_nonce_canonical_pair() {
+    fn staging_refuses_split_canonical_pairs() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let fast = Arc::new(StubEmbedder::new("v2-fast", V2_DIM));
-            let quality = Arc::new(StubEmbedder::new("v2-quality", 16));
-            let (dir, cache, fast_binding, fast_path) = v2_canonical_fixture(
-                "v2-pair-nonce-mismatch",
-                fast.identity_bundle(),
-                &[("old-1", normalized(V2_DIM, 0.25))],
-                2,
-            );
-            let quality_binding = v2_binding(quality.identity_bundle(), 2);
-            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-            write_v2_tier_with_nonce(
-                &fast_path,
-                &fast_binding,
-                &[("old-1", normalized(V2_DIM, 0.25))],
-                7,
-            );
-            write_v2_tier_with_nonce(
-                &quality_path,
-                &quality_binding,
-                &[("old-1", normalized(16, 0.5))],
-                3,
-            );
+            for (sequence, nonce, field, value) in [
+                (
+                    2,
+                    3,
+                    "refresh.canonical_pair_publication_nonce",
+                    "fast=7 quality=3",
+                ),
+                (3, 7, "refresh.canonical_pair_generation", "mismatch"),
+            ] {
+                let fast = Arc::new(StubEmbedder::new("v2-fast", V2_DIM));
+                let quality = Arc::new(StubEmbedder::new("v2-quality", 16));
+                let (dir, cache, fast_binding, fast_path) = v2_canonical_fixture(
+                    "v2-split-pair",
+                    fast.identity_bundle(),
+                    &[("old-1", normalized(V2_DIM, 0.25))],
+                    2,
+                );
+                let quality_binding = v2_binding(quality.identity_bundle(), sequence);
+                let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+                write_v2_tier_with_nonce(
+                    &fast_path,
+                    &fast_binding,
+                    &[("old-1", normalized(V2_DIM, 0.25))],
+                    7,
+                );
+                write_v2_tier_with_nonce(
+                    &quality_path,
+                    &quality_binding,
+                    &[("old-1", normalized(16, 0.5))],
+                    nonce,
+                );
 
-            let queue = make_queue(100);
-            submit(&queue, "doc-2", "a second document");
-            let jobs = queue.drain_batch();
-            let worker =
-                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), fast, cache)
-                    .with_quality_embedder(quality.clone());
+                let queue = make_queue(100);
+                submit(&queue, "doc-2", "a second document");
+                let jobs = queue.drain_batch();
+                let worker = RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue, fast, cache)
+                    .with_quality_embedder(quality);
 
-            let error = worker
-                .stage_identity_bound_generation(&cx, &jobs)
-                .await
-                .expect_err("a mixed-nonce canonical pair must refuse admission");
-            assert_invalid_config(
-                &error,
-                "refresh.canonical_pair_publication_nonce",
-                "fast=7 quality=3",
-            );
+                let error = worker
+                    .stage_identity_bound_generation(&cx, &jobs)
+                    .await
+                    .expect_err("a split canonical pair must refuse admission");
+                assert_invalid_config(&error, field, value);
+                assert!(!dir.join(STAGED_V2_DIR_NAME).exists());
+            }
         });
     }
 
@@ -4332,6 +4342,10 @@ mod tests {
             // The quality-only carried row must not fabricate a fast row.
             let fast_owner = VectorIndex::open_admitted_v2(&staged.fast_path, &staged.fast_binding)
                 .expect("staged fast admits");
+            assert_eq!(
+                fast_owner.witness().generation,
+                quality_owner.witness().generation
+            );
             let fast_vectors = admitted_vectors_by_doc(&fast_owner);
             assert!(
                 !fast_vectors.contains_key("old-q"),
