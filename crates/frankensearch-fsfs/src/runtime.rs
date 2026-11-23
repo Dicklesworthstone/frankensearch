@@ -17648,7 +17648,11 @@ impl FsfsRuntime {
                 Self::ensure_quality_backend(quality)?;
                 selected.push(quality.download_manifest());
             }
-            if self.reranking_enabled_by_policy() {
+            // First-run consent must not acquire a cross-encoder that the
+            // effective fast-only search policy can never execute. Keep this
+            // aligned with search_can_rerank, including callers that construct
+            // the runtime directly instead of resolving CLI configuration.
+            if self.reranking_enabled_by_policy() && !self.quality_disabled_by_policy() {
                 if !cfg!(feature = "rerank") {
                     return Err(SearchError::EmbedderUnavailable {
                         model: FSFS_RERANKER_MODEL_ID.to_owned(),
@@ -36510,6 +36514,84 @@ mod tests {
             matches!(selected, Err(SearchError::EmbedderUnavailable { model, .. }) if model == super::FSFS_RERANKER_MODEL_ID)
         );
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn fast_only_provisioning_never_requires_an_unusable_reranker() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_root = directory.path().join("missing-models");
+        for command in [CliCommand::Index, CliCommand::Watch] {
+            let mut config = FsfsConfig::default();
+            config.indexing.fast_model = "potion-base-32m".to_owned();
+            config.indexing.quality_model = "unused-invalid-quality-producer".to_owned();
+            config.search.fast_only = true;
+            config.search.rerank = true;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command,
+                ..CliInput::default()
+            });
+
+            assert_eq!(
+                runtime.configured_model_manifests().unwrap(),
+                vec![ModelManifest::potion_base_32m()],
+                "fast-only must not depend on the cross-encoder feature or disabled quality selection"
+            );
+            assert_eq!(
+                runtime
+                    .missing_interactive_model_downloads(&model_root)
+                    .unwrap(),
+                vec![(
+                    ModelManifest::potion_base_32m(),
+                    model_root.join("potion-base-32M"),
+                )],
+                "first-run consent must offer only the producer fast-only search uses"
+            );
+            assert!(!model_root.exists(), "selection must not install anything");
+
+            let mut invalid_primary = runtime.clone();
+            invalid_primary.config.indexing.fast_model = "invalid-fast-producer".to_owned();
+            assert!(matches!(
+                invalid_primary.configured_model_manifests(),
+                Err(SearchError::InvalidConfig { field, .. }) if field == "indexing.fast_model"
+            ));
+
+            // Enabling the quality stage restores the cross-encoder
+            // dependency, including the existing missing-feature refusal.
+            // An empty quality producer isolates reranker admission here.
+            let mut full = runtime;
+            full.config.search.fast_only = false;
+            full.config.indexing.quality_model.clear();
+            let selected = full.configured_model_manifests();
+            #[cfg(feature = "rerank")]
+            {
+                assert_eq!(
+                    selected.unwrap(),
+                    vec![
+                        ModelManifest::potion_base_32m(),
+                        ModelManifest::ms_marco_reranker(),
+                    ]
+                );
+                assert_eq!(
+                    full.missing_interactive_model_downloads(&model_root)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(manifest, _)| manifest)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        ModelManifest::potion_base_32m(),
+                        ModelManifest::ms_marco_reranker(),
+                    ]
+                );
+            }
+            #[cfg(not(feature = "rerank"))]
+            assert!(matches!(
+                selected,
+                Err(SearchError::EmbedderUnavailable { model, .. })
+                    if model == super::FSFS_RERANKER_MODEL_ID
+            ));
+            assert!(!model_root.exists(), "selection must remain read-only");
+        }
     }
 
     #[cfg(not(feature = "semantic-support"))]
