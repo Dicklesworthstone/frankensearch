@@ -781,8 +781,8 @@ impl SyncTwoTierSearcher {
     /// a different embedding space than the index was built in, or a dimension
     /// mismatch), this returns an iterator yielding a single
     /// `RefinementFailed` phase carrying an empty `initial_results` payload.
-    /// No retrieval runs until the first `next()`. That call admits both query
-    /// identities and returns Initial; quality retrieval runs only when the
+    /// No retrieval runs until the first `next()`. That call admits every enabled
+    /// query tier and returns Initial; quality retrieval runs only when the
     /// caller requests the next phase. Dropping the iterator discards pending
     /// refinement without starting it. Each call uses the caller's thread.
     /// A quality-only request instead returns an Initial containing
@@ -870,16 +870,23 @@ impl SyncTwoTierSearcher {
         };
         admit_tier_query(self.index.fast_index(), fast, "fast")?;
 
-        let quality = match (query.quality(), self.index.quality_index()) {
-            (Some(bound), Some(quality_index)) => {
-                admit_tier_query(quality_index, bound, "quality")?;
-                Some(bound)
+        let quality = if self.config.fast_only {
+            // Disabled quality is outside this request's admission contract.
+            // A stale precomputed quality embedding must not block valid fast
+            // retrieval, just as an absent quality embedding does not.
+            None
+        } else {
+            match (query.quality(), self.index.quality_index()) {
+                (Some(bound), Some(quality_index)) => {
+                    admit_tier_query(quality_index, bound, "quality")?;
+                    Some(bound)
+                }
+                // A quality-bound query against an index with no quality tier is
+                // not an error — it is the ordinary fast-only index — and a
+                // quality tier the caller bound no embedding for is simply never
+                // consulted. Neither case licenses reusing the fast embedding.
+                _ => None,
             }
-            // A quality-bound query against an index with no quality tier is
-            // not an error — it is the ordinary fast-only index — and a
-            // quality tier the caller bound no embedding for is simply never
-            // consulted. Neither case licenses reusing the fast embedding.
-            _ => None,
         };
         Ok(AdmittedSyncQuery::Progressive { fast, quality })
     }
@@ -7269,6 +7276,150 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(phases.len(), 1);
         assert!(matches!(phases[0], SearchPhase::Initial { .. }));
+    }
+
+    #[test]
+    fn fast_only_policy_ignores_disabled_quality_identity() {
+        for attested in [false, true] {
+            let directory = temp_dir("fast-only-quality-admission");
+            let (index, fast, quality) = sync_mmr_fixture(directory.path(), attested, true);
+            let fast_only = SyncTwoTierSearcher::new(
+                Arc::clone(&index),
+                TwoTierConfig {
+                    fast_only: true,
+                    ..TwoTierConfig::default()
+                },
+            );
+            let progressive =
+                SyncTwoTierSearcher::new(Arc::clone(&index), TwoTierConfig::default());
+            for change_space in [false, true] {
+                let foreign = |identity: &EmbeddingIdentityBundleV1| {
+                    let mut changed = identity.clone();
+                    if change_space {
+                        "new-weights-same-model".clone_into(&mut changed.space.immutable_revision);
+                        changed.producer.space_fingerprint = changed.space.fingerprint();
+                    } else {
+                        "foreign-backend".clone_into(&mut changed.producer.backend);
+                        changed.producer.golden_vectors.vectors_sha256 = "c".repeat(64);
+                    }
+                    changed.validate().expect("coherent foreign identity");
+                    changed
+                };
+                let expected_field = |tier: &str| {
+                    if !attested {
+                        format!("search_activation.{tier}.producer_revision")
+                    } else if change_space {
+                        format!("query_embedding.{tier}.space_identity")
+                    } else {
+                        format!("query_embedding.{tier}.producer_conformance")
+                    }
+                };
+                for zero in [false, true] {
+                    for k in [0, 2] {
+                        let vector = vec![if zero { 0.0 } else { 1.0 }, 0.0];
+                        let query = TieredQueryEmbeddings::progressive(
+                            BoundQueryEmbedding::new(vector.clone(), fast.clone()).unwrap(),
+                            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], foreign(&quality))
+                                .unwrap(),
+                        );
+                        let (results, metrics) = fast_only
+                            .search_collect_with_filter(&query, k, Some(&ExcludeB))
+                            .expect("disabled quality cannot block admitted fast retrieval");
+                        assert_eq!(metrics.phase2_vectors_searched, 0);
+                        assert!(results.iter().all(|hit| hit.quality_score.is_none()));
+                        if k == 0 || zero {
+                            assert!(results.is_empty());
+                        } else {
+                            assert_eq!(
+                                results
+                                    .iter()
+                                    .map(|hit| hit.doc_id.as_str())
+                                    .collect::<Vec<_>>(),
+                                ["a", "c"]
+                            );
+                            assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only"));
+                            let phases = fast_only
+                                .search_iter_with_filter(&query, k, Some(&ExcludeB))
+                                .collect::<Vec<_>>();
+                            let [
+                                SearchPhase::Initial {
+                                    results: streamed, ..
+                                },
+                            ] = phases.as_slice()
+                            else {
+                                panic!("fast-only must return one successful phase: {phases:?}");
+                            };
+                            assert_eq!(
+                                serde_json::to_value(streamed).unwrap(),
+                                serde_json::to_value(&results).unwrap()
+                            );
+                        }
+                        assert_admission_refusal(
+                            &progressive,
+                            &query,
+                            k,
+                            &expected_field("quality"),
+                        );
+                        let wrong_fast = TieredQueryEmbeddings::progressive(
+                            BoundQueryEmbedding::new(vector, foreign(&fast)).unwrap(),
+                            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality.clone()).unwrap(),
+                        );
+                        assert_admission_refusal(
+                            &fast_only,
+                            &wrong_fast,
+                            k,
+                            &expected_field("fast"),
+                        );
+                    }
+                }
+            }
+            let quality_only = TieredQueryEmbeddings::quality_only(
+                BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+            );
+            assert_admission_refusal(&fast_only, &quality_only, 1, "sync_search.topology");
+        }
+    }
+
+    #[test]
+    fn fast_only_policy_ignores_disabled_quality_shape_on_legacy_indexes() {
+        let index = make_index();
+        let fast_only = SyncTwoTierSearcher::new(
+            Arc::clone(&index),
+            TwoTierConfig {
+                fast_only: true,
+                ..TwoTierConfig::default()
+            },
+        );
+        let progressive = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+        for k in [0, 2] {
+            let query = TieredQueryEmbeddings::progressive(
+                bound("sync-fixture", vec![1.0, 0.0]),
+                bound("sync-fixture", vec![1.0, 0.0, 0.0]),
+            );
+            let (results, metrics) = fast_only
+                .search_collect(&query, k)
+                .expect("disabled quality shape is irrelevant to fast retrieval");
+            assert_eq!(results.len(), k);
+            assert_eq!(metrics.phase2_vectors_searched, 0);
+            assert!(matches!(
+                progressive.search_collect(&query, k),
+                Err(SearchError::DimensionMismatch {
+                    expected: 2,
+                    found: 3
+                })
+            ));
+            let wrong_fast = TieredQueryEmbeddings::progressive(
+                bound("sync-fixture", vec![1.0, 0.0, 0.0]),
+                bound("sync-fixture", vec![1.0, 0.0]),
+            );
+            assert!(matches!(
+                fast_only.search_collect(&wrong_fast, k),
+                Err(SearchError::DimensionMismatch {
+                    expected: 2,
+                    found: 3
+                })
+            ));
+        }
     }
 
     #[test]
