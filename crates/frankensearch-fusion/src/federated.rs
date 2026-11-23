@@ -71,8 +71,8 @@ pub struct FederatedConfig {
     /// Minimum number of indices that must answer successfully — a floor
     /// enforced after the gather completes. Empty answers count, including
     /// quality-only requests that pass admission without requesting results.
-    /// A shard whose optional refinement exceeded its deadline after publishing
-    /// results also counts.
+    /// A shard whose optional refinement failed or exceeded its deadline after
+    /// publishing results also counts; coverage reports the degradation.
     /// Fewer responses fail with [`SearchError::FederatedInsufficientResponses`].
     /// This knob never stops the gather early; that is `wait_for_indices`.
     pub min_indices: usize,
@@ -120,6 +120,7 @@ enum ShardCompletion {
     Completed {
         shard: ShardResult,
         refinement_timed_out: bool,
+        refinement_error: Option<&'static str>,
     },
     Failed {
         index: String,
@@ -165,12 +166,14 @@ pub struct FederatedHit {
     pub appeared_in: Vec<String>,
 }
 
-/// A shard that returned an error during a federated query.
+/// A shard that reported a failure during a federated query.
 #[derive(Debug, Clone)]
 pub struct FederatedShardError {
     /// Index name as registered via `add_index`.
     pub index: String,
-    /// Rendered shard error (the underlying `SearchError` display).
+    /// Stable, bounded [`SearchError::diagnostic_code`] for the failure.
+    /// Provider bodies, queries, credentials and filesystem paths are never
+    /// formatted into the coverage report.
     pub error: String,
 }
 
@@ -193,22 +196,31 @@ pub struct FederatedCoverage {
     /// Shards that exceeded `per_index_timeout_ms` before publishing any results.
     pub timed_out: Vec<String>,
     /// Answered shards whose optional quality refinement or final ranking
-    /// exceeded the deadline. Their last published result phase is included
-    /// in fusion and counts toward `min_indices`; no unfinished phase is used.
+    /// exceeded `per_index_timeout_ms`. Their last published result phase is
+    /// included in fusion and counts toward `min_indices`; no unfinished phase
+    /// is used. A quality stage's own timeout is in `refinement_failed`.
     pub refinement_timed_out: Vec<String>,
+    /// Answered shards that published a `RefinementFailed` phase, including a
+    /// quality stage's own timeout. Their last successful phase is retained
+    /// and counts toward `min_indices`. Later successful reranking does not
+    /// erase the failed refinement.
+    pub refinement_failed: Vec<FederatedShardError>,
     /// Shards still in flight when the gather stopped early because
     /// `wait_for_indices` was satisfied.
     pub cancelled_in_flight: Vec<String>,
 }
 
 impl FederatedCoverage {
-    /// True when every dispatched shard completed within its deadline.
+    /// True when every dispatched shard completed without failed or timed-out
+    /// refinement.
     ///
-    /// A shard with published results but unfinished refinement or reranking
+    /// A shard with published results but failed or unfinished refinement
     /// contributes to the answer while keeping this completeness signal false.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.answered.len() == self.queried.len() && self.refinement_timed_out.is_empty()
+        self.answered.len() == self.queried.len()
+            && self.refinement_timed_out.is_empty()
+            && self.refinement_failed.is_empty()
     }
 }
 
@@ -369,8 +381,11 @@ impl FederatedSearcher {
     /// stop. `min_indices` is a floor validated after the gather. When a shard
     /// publishes results before its deadline, those results survive a timeout
     /// of its optional quality or final ranking stage; coverage identifies
-    /// that incomplete refinement. A timeout before any phase has no results
-    /// to retain. Cancellation and returned errors never take this fallback.
+    /// that incomplete refinement. A reported quality-refinement failure also
+    /// preserves the last successful phase while keeping coverage incomplete,
+    /// even if a later rerank succeeds. A timeout before any phase has no
+    /// results to retain. Cancellation and returned errors never take this
+    /// fallback.
     /// Contributions are accumulated in index-name order, making scores and
     /// cutoff membership independent of completion order for the same shard
     /// replies. Explicit early stopping can still change which shards reply.
@@ -655,6 +670,7 @@ impl FederatedSearcher {
                 Box::pin(async move {
                     let timeout_start = cx.now();
                     let mut last_results = None;
+                    let mut refinement_error = None;
                     let response = {
                         // Bind before the shard starts: exclusion and rerank
                         // lookups must never hydrate from another index's store.
@@ -665,7 +681,9 @@ impl FederatedSearcher {
                             | SearchPhase::Reranked { results, .. } => {
                                 last_results = Some(results);
                             }
-                            SearchPhase::RefinementFailed { .. } => {}
+                            SearchPhase::RefinementFailed { error, .. } => {
+                                refinement_error = Some(error.diagnostic_code());
+                            }
                         };
                         let future = Box::pin(async move {
                             match mode {
@@ -716,6 +734,7 @@ impl FederatedSearcher {
                                 hits: last_results.unwrap_or_default(),
                             },
                             refinement_timed_out: false,
+                            refinement_error,
                         },
                         Ok(Err(SearchError::Cancelled { phase, reason })) => {
                             ShardCompletion::Cancelled { phase, reason }
@@ -732,6 +751,7 @@ impl FederatedSearcher {
                                     hits,
                                 },
                                 refinement_timed_out: true,
+                                refinement_error,
                             },
                             None => ShardCompletion::TimedOut { index: index_name },
                         },
@@ -768,6 +788,7 @@ impl FederatedSearcher {
                     ShardCompletion::Completed {
                         shard,
                         refinement_timed_out,
+                        refinement_error,
                     } => {
                         debug!(
                             index = %shard.name,
@@ -778,6 +799,12 @@ impl FederatedSearcher {
                         if refinement_timed_out {
                             coverage.refinement_timed_out.push(shard.name.clone());
                         }
+                        if let Some(error) = refinement_error {
+                            coverage.refinement_failed.push(FederatedShardError {
+                                index: shard.name.clone(),
+                                error: error.to_owned(),
+                            });
+                        }
                         coverage.answered.push(shard.name.clone());
                         shard_results.push(shard);
                     }
@@ -787,12 +814,12 @@ impl FederatedSearcher {
                     ShardCompletion::Failed { index, error } => {
                         warn!(
                             index = %index,
-                            error = %error,
+                            error_code = error.diagnostic_code(),
                             "federated shard search failed; continuing with remaining indices"
                         );
                         coverage.failed.push(FederatedShardError {
                             index,
-                            error: error.to_string(),
+                            error: error.diagnostic_code().to_owned(),
                         });
                         if first_shard_error.is_none() {
                             first_shard_error = Some(error);
@@ -1292,6 +1319,9 @@ mod tests {
         }
     }
 
+    const PRIVATE_PROVIDER_FAILURE: &str =
+        "private provider body\nhttps://user:secret@provider/private/path\u{1b}[31m";
+
     struct FailingEmbedder {
         id: &'static str,
         dimension: usize,
@@ -1312,7 +1342,7 @@ mod tests {
             Box::pin(async move {
                 Err(SearchError::EmbeddingFailed {
                     model: self.id.to_owned(),
-                    source: Box::new(io::Error::other("simulated embed failure")),
+                    source: Box::new(io::Error::other(PRIVATE_PROVIDER_FAILURE)),
                 })
             })
         }
@@ -1409,6 +1439,24 @@ mod tests {
         records: &[(&str, &[f32], &[f32])],
         quality: Arc<dyn Embedder>,
     ) -> SearcherFixture {
+        build_refining_searcher_with_config(
+            records,
+            quality,
+            TwoTierConfig {
+                // The federation deadline, not the optional quality stage's
+                // own timeout, owns the degradation exercised below.
+                quality_timeout_ms: 60_000,
+                quality_weight: 1.0,
+                ..TwoTierConfig::default()
+            },
+        )
+    }
+
+    fn build_refining_searcher_with_config(
+        records: &[(&str, &[f32], &[f32])],
+        quality: Arc<dyn Embedder>,
+        config: TwoTierConfig,
+    ) -> SearcherFixture {
         let dimension = records.first().map_or(1, |(_, fast, _)| fast.len());
         let dir = reserve_index_fixture_dir();
         let mut builder =
@@ -1426,13 +1474,7 @@ mod tests {
         let searcher = TwoTierSearcher::new(
             Arc::new(builder.finish().expect("finish index")),
             Arc::new(StubEmbedder::new("stub-fast", dimension)),
-            TwoTierConfig {
-                // The federation deadline, not the optional quality stage's
-                // own timeout, owns the degradation exercised below.
-                quality_timeout_ms: 60_000,
-                quality_weight: 1.0,
-                ..TwoTierConfig::default()
-            },
+            config,
         )
         .with_quality_embedder(quality);
         (dir, Arc::new(searcher))
@@ -1585,6 +1627,7 @@ mod tests {
     /// the first shard error must not be silently discarded just because some
     /// other shard answered.
     #[test]
+    #[tracing_test::traced_test]
     fn coverage_reports_failed_and_timed_out_shards() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_healthy_dir, healthy) = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
@@ -1617,10 +1660,12 @@ mod tests {
             assert_eq!(coverage.answered, vec!["healthy".to_owned()]);
             assert_eq!(coverage.failed.len(), 1, "failed shard must be recorded");
             assert_eq!(coverage.failed[0].index, "failing");
-            assert!(
-                !coverage.failed[0].error.is_empty(),
-                "shard error text must be preserved for the caller"
-            );
+            assert_eq!(coverage.failed[0].error, "embedding_failed");
+            assert!(!format!("{coverage:?}").contains("private provider body"));
+            assert!(!format!("{coverage:?}").contains("user:secret"));
+            assert!(logs_contain("federated shard search failed"));
+            assert!(!logs_contain("private provider body"));
+            assert!(!logs_contain("user:secret"));
             assert_eq!(coverage.timed_out, vec!["pending".to_owned()]);
             assert!(coverage.cancelled_in_flight.is_empty());
             assert!(!coverage.is_complete());
@@ -1672,6 +1717,145 @@ mod tests {
             assert_eq!(retained.source_index, "slow-quality");
             assert_eq!(retained.result.fast_score, Some(1.0));
             assert_eq!(retained.result.quality_score, None);
+        });
+    }
+
+    #[test]
+    fn quality_failure_retains_hits_without_claiming_complete_coverage() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_healthy_dir, healthy) = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
+            let (_degraded_dir, degraded) = build_refining_searcher(
+                &[("doc-degraded", &[1.0, 0.0], &[1.0, 0.0])],
+                Arc::new(FailingEmbedder::new("failed-quality", 2)),
+            );
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    min_indices: 2,
+                    ..FederatedConfig::default()
+                })
+                .add_index("healthy", healthy, 1.0)
+                .add_index("degraded-quality", degraded, 1.0);
+
+            let response = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let ids: std::collections::BTreeSet<_> = response
+                .hits
+                .iter()
+                .map(|hit| hit.result.doc_id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                std::collections::BTreeSet::from(["doc-healthy", "doc-degraded"])
+            );
+            assert_eq!(response.coverage.answered.len(), 2);
+            assert_eq!(response.coverage.refinement_failed.len(), 1);
+            assert_eq!(
+                response.coverage.refinement_failed[0].index,
+                "degraded-quality"
+            );
+            assert_eq!(
+                response.coverage.refinement_failed[0].error,
+                "embedding_failed"
+            );
+            assert!(response.coverage.failed.is_empty());
+            assert!(response.coverage.timed_out.is_empty());
+            assert!(response.coverage.refinement_timed_out.is_empty());
+            assert!(response.coverage.cancelled_in_flight.is_empty());
+            assert!(!response.coverage.is_complete());
+            let retained = response
+                .hits
+                .iter()
+                .find(|hit| hit.result.doc_id == "doc-degraded")
+                .unwrap();
+            assert_eq!(retained.result.fast_score, Some(1.0));
+            assert_eq!(retained.result.quality_score, None);
+            assert!(!format!("{:?}", response.coverage).contains("user:secret"));
+        });
+    }
+
+    #[test]
+    fn quality_stage_timeout_is_distinct_from_federated_deadline() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let quality = Arc::new(PendingEmbedder::new("pending-quality", 2));
+            let (_dir, searcher) = build_refining_searcher_with_config(
+                &[("doc", &[1.0, 0.0], &[1.0, 0.0])],
+                quality.clone(),
+                TwoTierConfig {
+                    quality_timeout_ms: 20,
+                    quality_weight: 1.0,
+                    ..TwoTierConfig::default()
+                },
+            );
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    per_index_timeout_ms: 60_000,
+                    ..FederatedConfig::default()
+                })
+                .add_index("quality-timeout", searcher, 1.0);
+
+            let response = federated.search(&cx, "query", 1, |_| None).await.unwrap();
+            assert_eq!(response.hits.len(), 1);
+            assert_eq!(response.hits[0].result.doc_id, "doc");
+            assert_eq!(response.hits[0].result.quality_score, None);
+            assert_eq!(response.coverage.answered, vec!["quality-timeout".to_owned()]);
+            assert_eq!(response.coverage.refinement_failed.len(), 1);
+            assert_eq!(
+                response.coverage.refinement_failed[0].index,
+                "quality-timeout"
+            );
+            assert_eq!(response.coverage.refinement_failed[0].error, "search_timeout");
+            assert!(response.coverage.refinement_timed_out.is_empty());
+            assert!(response.coverage.timed_out.is_empty());
+            assert!(!response.coverage.is_complete());
+            assert_eq!(quality.started.load(Ordering::SeqCst), 1);
+            assert_eq!(quality.dropped.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn later_successful_reranking_does_not_erase_quality_failure() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, searcher) = build_refining_searcher(
+                &[
+                    ("best", &[0.8, 0.6], &[1.0, 0.0]),
+                    ("similar", &[0.75, 0.661_437_8], &[1.0, 0.0]),
+                    ("diverse", &[0.6, -0.8], &[1.0, 0.0]),
+                ],
+                Arc::new(FailingEmbedder::new("failed-quality", 2)),
+            );
+            let searcher = Arc::new(
+                Arc::try_unwrap(searcher)
+                    .expect("fixture has a single searcher owner")
+                    .with_mmr_config(crate::mmr::MmrConfig {
+                        enabled: true,
+                        lambda: 0.3,
+                        candidate_pool: 3,
+                    }),
+            );
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    candidate_pool_factor: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("reranked", searcher, 1.0);
+
+            let response = federated.search(&cx, "query", 2, |_| None).await.unwrap();
+            assert_eq!(
+                response
+                    .hits
+                    .iter()
+                    .map(|hit| hit.result.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["best", "diverse"],
+                "the final MMR phase must actually replace the Initial page"
+            );
+            assert_eq!(response.coverage.refinement_failed.len(), 1);
+            assert_eq!(response.coverage.refinement_failed[0].index, "reranked");
+            assert_eq!(
+                response.coverage.refinement_failed[0].error,
+                "embedding_failed"
+            );
+            assert!(response.coverage.refinement_timed_out.is_empty());
+            assert!(!response.coverage.is_complete());
         });
     }
 

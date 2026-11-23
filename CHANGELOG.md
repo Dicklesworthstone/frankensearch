@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Federated search now reports a shard's quality-refinement failure even when
+  the shard retains valid Initial results or later completes reranking. Those
+  hits still count toward the minimum-response requirement, while coverage
+  remains incomplete. Quality-stage timeouts and federation deadlines retain
+  distinct diagnostics. Coverage and failure logs expose stable error codes
+  instead of formatting provider bodies, queries, credentials or paths.
 - Native two-tier hybrid refinement now completes each retrieved candidate's
   scores against both retained owners before blending. A document below one
   tier's top-k cutoff receives its actual score, including zero, rather than an
