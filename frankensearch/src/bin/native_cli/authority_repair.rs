@@ -116,6 +116,7 @@ where
             .as_deref()
             .ok_or_else(|| bad("missing repair source receipt"))?,
     )?;
+    selected.require_complete_for_mutation()?;
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;

@@ -45,6 +45,7 @@ use frankensearch_index::generation_root::{
     QualifiedGenerationRoot,
 };
 use frankensearch_index::native_hnsw::HnswParams;
+use frankensearch_index::vector_cohort::VectorCohortCoverage;
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -74,14 +75,16 @@ mod repair;
 mod query_controls;
 
 const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v3";
+const PARTIAL_QUALITY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v4";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_AUTHORITY_MUTATIONS: usize = 1_000;
 const MAX_HISTORY_HOPS: u64 = 1_024;
 const PROFILE: GenerationRootSecurityProfileV1 = GenerationRootSecurityProfileV1::CooperativeLocal;
-const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topology)\n\n\
+const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or partial topology)\n\n\
   authority-index --root NEW_ROOT --work-dir NEW_DIR --receipt NEW_JSON\n\
-      --tier fast|quality|full --source-low N --source-high N --cooperative-local\n\
+      --tier fast|quality|full|partial --source-low N --source-high N --cooperative-local\n\
+      [--quality-ids '[\"document-a\",\"document-b\"]' (required for partial)]\n\
       [--input JSONL] [--model-dir DIR] [--batch-size N]\n\
       [--quality-backend onnx|native-int8|native-f32|native-multilingual]\n\
       [--quality-model-dir DIR] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
@@ -109,7 +112,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
   authority-search --receipt JSON --query TEXT [--limit N] [--lexical-only]\n\
       [--current-receipt CURRENT_JSON]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--mode fast|quality|full|lexical] [--stream] [--filter JSON] [--timeout-ms N]\n\
+      [--mode fast|quality|full|partial|lexical] [--stream] [--filter JSON] [--timeout-ms N]\n\
       [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]\n\
       [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-fetch --receipt JSON --doc-id ID [--offset-bytes N] [--max-bytes N]\n\
@@ -151,7 +154,19 @@ Lexical requests skip reranking. Request tuning requires request_overrides:true\
 in the server --full-query and an envelope {\"op\":\"search\",\"request\":{...},\n\
 \"full_query\":{...}}. Overrides cannot increase server candidate, beam or rerank\n\
 limits, change models/source scope, or extend its timeout ceiling.\n\
---retrieval selects both full tiers; partial/sharded cohorts remain unsupported.\n\
+--retrieval selects both configured tiers; sharded authority cohorts remain unsupported.\n\
+--tier partial requires --quality-ids with a nonempty proper subset of source IDs.\n\
+Fast vectors and stored source cover every document; quality vectors cover exactly\n\
+the selected IDs. Failed inference aborts the build without dropping requested IDs.\n\
+Partial receipts use a distinct schema and authenticate actual quality coverage.\n\
+They default to fast search; --mode partial explicitly enables quality refinement,\n\
+including streaming, filters, deadlines and optional reranking. Full and direct\n\
+quality modes require complete coverage and refuse partial generations. Results\n\
+report quality document counts and coverage. Full-query tuning remains full-only.\n\
+Partial generations support search, fetch, read-only serve, attempt recovery and\n\
+retained rollback. Update, rebuild, repair and model activation refuse partial\n\
+sources until subset-preserving mutation is available. Quality completion still\n\
+requires a fast-only source. A warm partial session accepts mode=partial explicitly.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
 missing or invalid graphs fail admission without substituting exact retrieval.\n\
@@ -340,6 +355,7 @@ enum QueryMode {
     Fast,
     Quality,
     Full,
+    Partial,
     Lexical,
 }
 
@@ -349,6 +365,7 @@ impl QueryMode {
             Self::Fast => "fast",
             Self::Quality => "quality",
             Self::Full => "full",
+            Self::Partial => "partial",
             Self::Lexical => "lexical",
         }
     }
@@ -372,6 +389,8 @@ struct Options {
     quality: models::QualityOptions,
     tier: Option<EmbedderTierTag>,
     progressive: bool,
+    partial_quality: bool,
+    quality_ids: Option<Vec<String>>,
     mode: Option<QueryMode>,
     stream: bool,
     timeout_ms: Option<u64>,
@@ -449,6 +468,8 @@ impl Options {
             quality: models::QualityOptions::default(),
             tier: None,
             progressive: false,
+            partial_quality: false,
+            quality_ids: None,
             mode: None,
             stream: false,
             timeout_ms: None,
@@ -607,8 +628,37 @@ impl Options {
                             options.progressive = true;
                             EmbedderTierTag::Fast
                         }
-                        _ => return Err(bad("authority tier must be fast, quality, or full")),
+                        "partial" => {
+                            options.partial_quality = true;
+                            EmbedderTierTag::Fast
+                        }
+                        _ => {
+                            return Err(bad(
+                                "authority tier must be fast, quality, full, or partial",
+                            ));
+                        }
                     });
+                }
+                "--quality-ids" if command == Command::Index => {
+                    let encoded = value(&mut args)?;
+                    if encoded.len() > MAX_RECORD_BYTES {
+                        return Err(bad("quality ID selection exceeds the encoded-record limit"));
+                    }
+                    let ids: Vec<String> = serde_json::from_str(&encoded)
+                        .map_err(|_| bad("--quality-ids requires a JSON array of document IDs"))?;
+                    let unique: BTreeSet<_> = ids.iter().collect();
+                    if ids.is_empty()
+                        || ids.len() > MAX_DOCUMENTS
+                        || unique.len() != ids.len()
+                        || ids
+                            .iter()
+                            .any(|id| id.trim().is_empty() || id.contains('\0'))
+                    {
+                        return Err(bad(
+                            "quality IDs must be nonempty, unique, NUL-free document IDs",
+                        ));
+                    }
+                    options.quality_ids = Some(ids);
                 }
                 "--source-low"
                     if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
@@ -724,10 +774,11 @@ impl Options {
                         "fast" => QueryMode::Fast,
                         "quality" => QueryMode::Quality,
                         "full" => QueryMode::Full,
+                        "partial" => QueryMode::Partial,
                         "lexical" => QueryMode::Lexical,
                         _ => {
                             return Err(bad(
-                                "authority search mode must be fast, quality, full, or lexical",
+                                "authority search mode must be fast, quality, full, partial, or lexical",
                             ));
                         }
                     });
@@ -786,9 +837,14 @@ impl Options {
                 let tier = options
                     .tier
                     .ok_or_else(|| bad("authority-index requires --tier"))?;
-                options
-                    .quality
-                    .validate_usage(tier == EmbedderTierTag::Quality || options.progressive)?;
+                if options.partial_quality != options.quality_ids.is_some() {
+                    return Err(bad("--tier partial and --quality-ids require each other"));
+                }
+                options.quality.validate_usage(
+                    tier == EmbedderTierTag::Quality
+                        || options.progressive
+                        || options.partial_quality,
+                )?;
                 options.source_cut()?;
             }
             Command::Search => validate_query(
@@ -952,7 +1008,7 @@ fn annotate_retrieval(
         Some(QueryMode::Lexical) => "lexical",
         Some(QueryMode::Fast) => primary,
         Some(QueryMode::Quality) => quality.unwrap_or(primary),
-        Some(QueryMode::Full) | None => {
+        Some(QueryMode::Full | QueryMode::Partial) | None => {
             if quality.is_some_and(|quality| quality != primary) {
                 "mixed"
             } else {
@@ -988,6 +1044,17 @@ fn annotate_snapshot_retrieval(
         snapshot.quality_retrieval_configuration(),
         query_mode,
     );
+    if let NativeGenerationTopology::PartialQuality {
+        quality_documents,
+        total_documents,
+        coverage_ppm,
+    } = snapshot.topology()
+    {
+        response["quality_coverage"] = serde_json::json!({
+            "kind": "partial_quality", "quality_documents": quality_documents,
+            "total_documents": total_documents, "parts_per_million": coverage_ppm,
+        });
+    }
 }
 
 /// Inputs recorded before publication, never an assertion about its outcome.
@@ -1060,6 +1127,8 @@ struct Receipt {
     tier: EmbedderTierTag,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quality_identity: Option<FrozenEmbeddingIdentityBundleV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality_documents: Option<u64>,
     documents: u64,
     image_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1102,7 +1171,11 @@ impl Receipt {
             self.quality_identity.as_ref(),
         ) {
             (RECEIPT_SCHEMA, Some(attempt), None)
-            | (PROGRESSIVE_RECEIPT_SCHEMA, Some(attempt), Some(_)) => {
+            | (
+                PROGRESSIVE_RECEIPT_SCHEMA | PARTIAL_QUALITY_RECEIPT_SCHEMA,
+                Some(attempt),
+                Some(_),
+            ) => {
                 // This CLI never supplies an external floor. A saved attempt
                 // requiring one cannot be downgraded during a process restart.
                 if attempt.requires_floor {
@@ -1118,6 +1191,16 @@ impl Receipt {
                     "authority receipt schema and prepared attempt disagree",
                 ));
             }
+        }
+        match (self.schema.as_str(), self.quality_documents) {
+            (PARTIAL_QUALITY_RECEIPT_SCHEMA, Some(count))
+                if count > 0 && count < self.documents => {}
+            (PARTIAL_QUALITY_RECEIPT_SCHEMA, _) | (_, Some(_)) => {
+                return Err(bad(
+                    "partial quality receipt requires a nonempty proper quality subset",
+                ));
+            }
+            _ => {}
         }
         if self.quality_identity.is_some() && self.tier != EmbedderTierTag::Fast {
             return Err(bad(
@@ -1158,7 +1241,16 @@ impl Receipt {
     }
 
     fn topology(&self) -> NativeGenerationTopology {
-        if self.quality_identity.is_some() {
+        if let Some(quality_documents) = self.quality_documents {
+            NativeGenerationTopology::PartialQuality {
+                quality_documents,
+                total_documents: self.documents,
+                coverage_ppm: u32::try_from(
+                    quality_documents.saturating_mul(1_000_000) / self.documents.max(1),
+                )
+                .unwrap_or(u32::MAX),
+            }
+        } else if self.quality_identity.is_some() {
             NativeGenerationTopology::FullProgressive
         } else if self.tier == EmbedderTierTag::Quality {
             NativeGenerationTopology::QualityOnly
@@ -1172,7 +1264,17 @@ impl Receipt {
             NativeGenerationTopology::FastOnly => "fast_only",
             NativeGenerationTopology::QualityOnly => "quality_only",
             NativeGenerationTopology::FullProgressive => "full_progressive",
+            NativeGenerationTopology::PartialQuality { .. } => "partial_quality",
         }
+    }
+
+    // Coverage counts belong to an individual admitted generation. Selection
+    // transitions preserve the tier shape while allowing an authenticated
+    // predecessor/successor to have a different number of live documents.
+    fn same_topology(&self, other: &Self) -> bool {
+        self.tier == other.tier
+            && self.quality_identity.is_some() == other.quality_identity.is_some()
+            && self.quality_documents.is_some() == other.quality_documents.is_some()
     }
 
     fn query_mode(&self, requested: Option<QueryMode>) -> Result<QueryMode> {
@@ -1180,13 +1282,32 @@ impl Receipt {
             NativeGenerationTopology::FastOnly => QueryMode::Fast,
             NativeGenerationTopology::QualityOnly => QueryMode::Quality,
             NativeGenerationTopology::FullProgressive => QueryMode::Full,
+            NativeGenerationTopology::PartialQuality { .. } => QueryMode::Fast,
         };
         let mode = requested.unwrap_or(default);
+        if self.quality_documents.is_some() {
+            return match mode {
+                QueryMode::Fast | QueryMode::Lexical | QueryMode::Partial => Ok(mode),
+                QueryMode::Full | QueryMode::Quality => {
+                    Err(serve_refused("complete_quality_coverage_required"))
+                }
+            };
+        }
+        if mode == QueryMode::Partial {
+            return Err(serve_refused("partial_quality_topology_required"));
+        }
         if mode == QueryMode::Lexical || mode == default || self.quality_identity.is_some() {
             Ok(mode)
         } else {
             Err(serve_refused("query_tier_unavailable"))
         }
+    }
+
+    fn require_complete_for_mutation(&self) -> Result<()> {
+        if self.quality_documents.is_some() {
+            return Err(serve_refused("partial_quality_mutation_unsupported"));
+        }
+        Ok(())
     }
 
     fn open(&self, cx: &Cx, max_image_bytes: usize) -> Result<NativeGenerationSnapshot> {
@@ -1243,7 +1364,12 @@ impl Receipt {
             ));
         }
         let snapshot = if let Some(quality) = self.quality_binding()? {
-            NativeGenerationSnapshot::admit_progressive(
+            let admit = if self.quality_documents.is_some() {
+                NativeGenerationSnapshot::admit_partial_quality
+            } else {
+                NativeGenerationSnapshot::admit_progressive
+            };
+            admit(
                 cx,
                 opened,
                 &self.binding()?,
@@ -1565,13 +1691,20 @@ fn prepare_publication_with_intent(
                 &built.metadata().commit_range,
             )?;
             let topology_matches = match intent {
-                PublicationIntent::PreserveTopology => {
-                    built.quality_binding().is_some()
-                        == (snapshot.topology() == NativeGenerationTopology::FullProgressive)
-                }
+                PublicationIntent::PreserveTopology => match snapshot.topology() {
+                    NativeGenerationTopology::FullProgressive => {
+                        built.quality_binding().is_some()
+                            && built.coverage() == VectorCohortCoverage::Complete
+                    }
+                    NativeGenerationTopology::FastOnly | NativeGenerationTopology::QualityOnly => {
+                        built.quality_binding().is_none()
+                    }
+                    NativeGenerationTopology::PartialQuality { .. } => false,
+                },
                 PublicationIntent::CompleteQuality => {
                     snapshot.topology() == NativeGenerationTopology::FastOnly
                         && built.quality_binding().is_some()
+                        && built.coverage() == VectorCohortCoverage::Complete
                         && built.binding().frozen_identity()
                             == snapshot.metadata().embedders.get("fast").ok_or_else(|| {
                                 bad("quality completion requires the retained fast identity")
@@ -1676,7 +1809,9 @@ fn stage_prepared_and_publish(
         new_generation(1)?.nonce,
     )?;
     let receipt = Receipt {
-        schema: if built.quality_binding().is_some() {
+        schema: if built.coverage() == VectorCohortCoverage::PartialQuality {
+            PARTIAL_QUALITY_RECEIPT_SCHEMA
+        } else if built.quality_binding().is_some() {
             PROGRESSIVE_RECEIPT_SCHEMA
         } else {
             RECEIPT_SCHEMA
@@ -1692,6 +1827,19 @@ fn stage_prepared_and_publish(
         quality_identity: built
             .quality_binding()
             .map(|binding| binding.frozen_identity().clone()),
+        quality_documents: if built.coverage() == VectorCohortCoverage::PartialQuality {
+            Some(
+                built
+                    .metadata()
+                    .vector_artifacts
+                    .iter()
+                    .find(|artifact| artifact.embedder_tier == EmbedderTierTag::Quality)
+                    .ok_or_else(|| bad("partial generation is missing its quality artifact"))?
+                    .vector_count,
+            )
+        } else {
+            None
+        },
         documents: built.metadata().total_documents,
         image_bytes: candidate.owned_image_bytes(),
         attempt: Some(SavedAttempt::from_permit(&attempt, false)),
@@ -1927,7 +2075,7 @@ where
         None => read_documents(&mut io::stdin().lock())?,
     };
     let tier = options.tier.ok_or_else(|| bad("missing tier"))?;
-    let mode = if options.progressive {
+    let mode = if options.progressive || options.partial_quality {
         QueryMode::Full
     } else if tier == EmbedderTierTag::Quality {
         QueryMode::Quality
@@ -1945,7 +2093,19 @@ where
             .with_quality_embedder(quality)?
             .with_quality_storage(NativeBuildPrecision::F32, options.build_retrieval(None))?;
     }
-    let built = if options.progressive {
+    let built = if options.partial_quality {
+        builder
+            .build_partial_quality_generation(
+                cx,
+                options.source_cut()?,
+                options
+                    .quality_ids
+                    .clone()
+                    .ok_or_else(|| bad("partial generation requires quality IDs"))?,
+                options.max_image_bytes,
+            )
+            .await?
+    } else if options.progressive {
         builder
             .build_progressive_generation(cx, options.source_cut()?, options.max_image_bytes)
             .await?
@@ -2127,6 +2287,7 @@ where
             .as_deref()
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
+    selected.require_complete_for_mutation()?;
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;
@@ -2390,6 +2551,7 @@ where
     F: FnOnce() -> Result<mutations::Edits>,
 {
     checkpoint(cx)?;
+    selected.require_complete_for_mutation()?;
     if snapshot.retained_snapshot().selected_history_of().is_some()
         || snapshot.authority() != selected.authority()?
     {
@@ -2616,7 +2778,7 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     if selected.root != target.root
         || selected.root_id != target.root_id
         || selected.profile != target.profile
-        || selected.topology() != target.topology()
+        || !selected.same_topology(&target)
     {
         return Err(bad(
             "rollback receipts must select the same root, security profile, and tier",
@@ -2690,7 +2852,9 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         new_generation(1)?.nonce,
     )?;
     let receipt = Receipt {
-        schema: if target.quality_identity.is_some() {
+        schema: if target.quality_documents.is_some() {
+            PARTIAL_QUALITY_RECEIPT_SCHEMA
+        } else if target.quality_identity.is_some() {
             PROGRESSIVE_RECEIPT_SCHEMA
         } else {
             RECEIPT_SCHEMA
@@ -2704,6 +2868,7 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         identity: target.identity.clone(),
         tier: target.tier,
         quality_identity: target.quality_identity.clone(),
+        quality_documents: target.quality_documents,
         documents: target.documents,
         // The new activation manifest can be larger than the target's old
         // genesis manifest even though every component image is unchanged.
@@ -2761,7 +2926,7 @@ fn load_authority_models(
     if mode == QueryMode::Lexical {
         return Err(serve_refused("lexical_requires_model_free_execution"));
     }
-    if mode == QueryMode::Full {
+    if matches!(mode, QueryMode::Full | QueryMode::Partial) {
         models::load(cx, options.models.as_deref(), true, &options.quality, pool)
     } else {
         let tier = if mode == QueryMode::Quality {
@@ -2803,22 +2968,35 @@ where
         return Err(serve_refused("lexical_requires_model_free_execution"));
     }
     let selection = query_controls::RetainedQuery::new(snapshot, scope, plan.policy);
-    if plan.mode == QueryMode::Full {
+    if matches!(plan.mode, QueryMode::Full | QueryMode::Partial) {
         let quality = loaded
             .quality
             .as_deref()
             .ok_or_else(|| serve_refused("quality_provider_missing"))?;
-        if plan.stream || plan.policy.is_some_and(query_controls::configured) {
+        if plan.mode == QueryMode::Partial
+            || plan.stream
+            || plan.policy.is_some_and(query_controls::configured)
+        {
             let mut empty_initial_without_refinement = false;
             let mut buffered = None;
             let mut query = query::within(cx, plan.deadline, async {
-                let search = selection.progressive(
-                    cx,
-                    loaded.fast.as_ref(),
-                    quality,
-                    plan.text,
-                    plan.limit,
-                )?;
+                let search = if plan.mode == QueryMode::Partial {
+                    selection.partial_progressive(
+                        cx,
+                        loaded.fast.as_ref(),
+                        quality,
+                        plan.text,
+                        plan.limit,
+                    )?
+                } else {
+                    selection.progressive(
+                        cx,
+                        loaded.fast.as_ref(),
+                        quality,
+                        plan.text,
+                        plan.limit,
+                    )?
+                };
                 match plan.policy {
                     Some(policy) => {
                         query_controls::configure(search, policy, plan.max_source_bytes)
@@ -3017,9 +3195,10 @@ where
         options.mode
     })?;
     query_controls::validate_startup(options, mode)?;
-    options
-        .quality
-        .validate_usage(matches!(mode, QueryMode::Quality | QueryMode::Full))?;
+    options.quality.validate_usage(matches!(
+        mode,
+        QueryMode::Quality | QueryMode::Full | QueryMode::Partial
+    ))?;
     let (_, snapshot) = open_read_selection(
         cx,
         &receipt,
@@ -3043,7 +3222,7 @@ where
             } else {
                 EmbedderTierTag::Fast
             })?,
-            quality: if mode == QueryMode::Full {
+            quality: if matches!(mode, QueryMode::Full | QueryMode::Partial) {
                 Some(load_model(EmbedderTierTag::Quality)?)
             } else {
                 None
@@ -3215,7 +3394,7 @@ impl AuthorityModels {
     fn admit_query(&self, receipt: &Receipt, mode: QueryMode) -> Result<()> {
         match mode {
             QueryMode::Lexical => Ok(()),
-            QueryMode::Full => admit_serving_models(receipt, self.models()?),
+            QueryMode::Full | QueryMode::Partial => admit_serving_models(receipt, self.models()?),
             QueryMode::Fast => admit_serving_model(&receipt.identity, self.models()?.fast.as_ref()),
             QueryMode::Quality => {
                 let models = self.models()?;
@@ -3541,6 +3720,7 @@ impl AuthoritySession {
     }
 
     fn with_updates(mut self, batch_size: usize, max_source_bytes: usize) -> Result<Self> {
+        self.receipt.require_complete_for_mutation()?;
         self.require_current_selection()?;
         self.models.models()?;
         if batch_size == 0 || batch_size > MAX_DOCUMENTS || max_source_bytes == 0 {
@@ -3964,7 +4144,7 @@ impl AuthoritySession {
         if candidate.root != self.receipt.root
             || candidate.root_id != self.receipt.root_id
             || candidate.profile != self.receipt.profile
-            || candidate.topology() != self.receipt.topology()
+            || !candidate.same_topology(&self.receipt)
         {
             return Err(serve_refused("activation_root_or_tier_mismatch"));
         }
@@ -4048,6 +4228,8 @@ async fn serve_session(
     ready["fetch_enabled"] = serde_json::json!(true);
     ready["query_modes"] = if session.models.is_lexical() {
         serde_json::json!(["lexical"])
+    } else if session.receipt.quality_documents.is_some() {
+        serde_json::json!(["fast", "partial", "lexical"])
     } else if session.receipt.quality_identity.is_some() {
         serde_json::json!(["fast", "quality", "full", "lexical"])
     } else {
@@ -4071,7 +4253,7 @@ async fn serve_session(
             .query_policy
             .rerank
             .as_ref()
-            .filter(|_| session.receipt.quality_identity.is_some())
+            .filter(|_| session.receipt.topology() == NativeGenerationTopology::FullProgressive)
             .map(|rerank| rerank.model.id())
     );
     ready["rerank_modes"] = if session.query_policy.rerank.is_some() {
@@ -4318,7 +4500,12 @@ async fn serve(
     let loaded = if options.lexical_only {
         AuthorityModels::Lexical
     } else {
-        load_authority_models(cx, options, receipt.query_mode(None)?, pool)?.into()
+        let model_mode = if receipt.quality_documents.is_some() {
+            QueryMode::Partial
+        } else {
+            receipt.query_mode(None)?
+        };
+        load_authority_models(cx, options, model_mode, pool)?.into()
     };
     let mut session = AuthoritySession::new(
         cx,
@@ -4334,6 +4521,7 @@ async fn serve(
         session = session.with_updates(options.batch_size, options.max_source_bytes)?;
     }
     if options.allow_model_activation {
+        session.receipt.require_complete_for_mutation()?;
         session.require_current_selection()?;
         session.models.models()?;
         session.allow_model_activation = true;

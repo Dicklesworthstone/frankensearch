@@ -29,7 +29,7 @@ use frankensearch_index::generation_root::generation_reader::{
 use frankensearch_index::native_hnsw::{
     HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
 };
-use frankensearch_index::vector_cohort::ExactVectorCohortV1;
+use frankensearch_index::vector_cohort::{ExactVectorCohortV1, VectorCohortCoverage};
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{
     DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillIndexError, QuillSnapshotIndex,
@@ -58,6 +58,10 @@ pub use source_recovery::{NativeGenerationSource, NativeGenerationVectorSource};
 // generations pack the independently receipted graphs into one ANN component.
 pub(super) const NATIVE_ANN_RECEIPT_KEY: &str = "native_hnsw_receipt_v2";
 pub(super) const NATIVE_QUALITY_ANN_RECEIPT_KEY: &str = "native_quality_hnsw_receipt_v2";
+// Persist the coverage contract in authenticated metadata as well as vector
+// framing. Source-only recovery must not mistake a partial owner for a full tier
+// when its vector image is unavailable.
+pub(super) const NATIVE_QUALITY_COVERAGE_KEY: &str = "native_quality_coverage_v1";
 
 /// Independently admitted vector owners stored in a complete authority generation.
 /// This describes stored shape, not semantic readiness or a request's chosen mode.
@@ -69,6 +73,16 @@ pub enum NativeGenerationTopology {
     QualityOnly,
     /// Complete independently identified fast and quality tiers.
     FullProgressive,
+    /// A complete fast corpus and an explicitly admitted, nonempty quality subset.
+    /// Counts describe the retained owners, not the query's result window.
+    PartialQuality {
+        /// Live documents represented by the quality owner.
+        quality_documents: u64,
+        /// Live documents represented by the complete fast and lexical owners.
+        total_documents: u64,
+        /// Quality coverage in whole parts per million, rounded down.
+        coverage_ppm: u32,
+    },
 }
 
 pub(in crate::native_ann) fn require_query_tier(
@@ -100,7 +114,8 @@ pub(in crate::native_ann) fn require_query_tier(
 /// exact search. Complete fast-plus-quality generations use two independently
 /// admitted owners in one packed Vector component. Each tier independently uses
 /// exact retrieval or an owner-bound graph in the packed ANN component.
-/// Partial/sharded descriptors remain unsupported. Metadata
+/// Partial quality requires the separate [`Self::admit_partial_quality`] contract
+/// and an explicit partial-quality query. Sharded descriptors remain unsupported. Metadata
 /// paths are descriptive names, never paths to open. Vector artifact
 /// counts describe physical rows, including tombstones; the common document set
 /// and metadata total count describe live documents. Empty generations retain
@@ -362,6 +377,47 @@ impl NativeGenerationPreview {
             .search_progressive_with_quality_and_pool(cx, fast, quality, text, k, pool)
     }
 
+    /// Explicitly preview refinement over this candidate's admitted quality subset.
+    ///
+    /// Initial searches the complete fast/lexical corpus; refinement retains
+    /// uncovered fast candidates and adds independently retrieved quality rows.
+    /// Coverage remains the exact stored topology returned by [`Self::topology`].
+    ///
+    /// # Errors
+    /// Refuses no-op previews, a non-partial topology, producer disagreement,
+    /// invalid query policy and cancellation. Quality work remains lazy.
+    pub fn search_progressive_with_partial_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_progressive_with_partial_quality(cx, fast, quality, text, k, None)
+    }
+
+    /// Preview explicit partial refinement with traversal on the caller's pool.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_progressive_with_partial_quality`],
+    /// plus pool errors without inline fallback.
+    pub fn search_progressive_with_partial_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_progressive_with_partial_quality(cx, fast, quality, text, k, Some(pool))
+    }
+
     pub(in crate::native_ann) fn require_query(
         cx: &Cx,
         text: &str,
@@ -418,6 +474,33 @@ impl NativeGenerationPreview {
             pool,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn scoped_partial_quality_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        Self::require_query(cx, text, k, allowed.len())?;
+        self.readers.scoped_progressive_with_coverage(
+            cx,
+            fast,
+            Some(quality),
+            false,
+            lexical,
+            text,
+            k,
+            allowed,
+            pool,
+            VectorCohortCoverage::PartialQuality,
+        )
+    }
 }
 
 pub(super) struct CompositeReaders {
@@ -429,6 +512,7 @@ pub(super) struct CompositeReaders {
     retrieval: NativeBuildRetrieval,
     quality_retrieval: Option<NativeBuildRetrieval>,
     components: ExactGenerationComponentsV1,
+    topology: NativeGenerationTopology,
 }
 
 impl NativeGenerationSnapshot {
@@ -507,6 +591,64 @@ impl NativeGenerationSnapshot {
         config: QuillConfig,
         max_image_bytes: usize,
     ) -> SearchResult<Self> {
+        Self::admit_with_quality_coverage(
+            cx,
+            authority,
+            expected_fast,
+            expected_quality,
+            schema,
+            config,
+            VectorCohortCoverage::Complete,
+            max_image_bytes,
+        )
+    }
+
+    /// Admit a complete fast/lexical corpus and an explicitly selected quality subset.
+    ///
+    /// The partial wire contract must be selected by the caller; this method
+    /// never downgrades a complete generation or infers permission from row
+    /// counts. Every quality document must be live in the retained fast owner,
+    /// and both producers, source checkpoint and artifact generation are joined
+    /// before serving. [`Self::topology`] reports the actual retained coverage.
+    /// Full-progressive search remains unavailable; use the explicit partial
+    /// query surface, or search the complete fast/lexical corpus directly.
+    ///
+    /// # Errors
+    /// Refuses complete or empty quality coverage, foreign quality IDs, changed
+    /// bindings, malformed components, budget exhaustion and cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_partial_quality(
+        cx: &Cx,
+        authority: Arc<OpenedGenerationSnapshotV1>,
+        expected_fast: &FsviV2IdentityBinding,
+        expected_quality: &FsviV2IdentityBinding,
+        schema: SchemaDescriptor,
+        config: QuillConfig,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
+        Self::admit_with_quality_coverage(
+            cx,
+            authority,
+            expected_fast,
+            expected_quality,
+            schema,
+            config,
+            VectorCohortCoverage::PartialQuality,
+            max_image_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_with_quality_coverage(
+        cx: &Cx,
+        authority: Arc<OpenedGenerationSnapshotV1>,
+        expected_fast: &FsviV2IdentityBinding,
+        expected_quality: &FsviV2IdentityBinding,
+        schema: SchemaDescriptor,
+        config: QuillConfig,
+        coverage: VectorCohortCoverage,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.generation.progressive_admit")?;
         let component = |role| {
             authority
@@ -514,11 +656,11 @@ impl NativeGenerationSnapshot {
                 .bytes(role)
                 .ok_or_else(|| refused("component", "missing"))
         };
-        let readers = admit_progressive_components(
+        let readers = admit_components_with_coverage(
             cx,
             authority.manifest(),
             expected_fast,
-            expected_quality,
+            Some(expected_quality),
             schema,
             config,
             [
@@ -527,6 +669,7 @@ impl NativeGenerationSnapshot {
                 component(GenerationComponentRole::Metadata)?,
             ],
             authority.closure().bytes(GenerationComponentRole::Ann),
+            coverage,
             max_image_bytes,
         )?;
         checkpoint(cx, "native_ann.generation.admitted")?;
@@ -708,6 +851,7 @@ impl NativeGenerationSnapshot {
         provider: Arc<dyn Embedder>,
         max_source_bytes: usize,
     ) -> SearchResult<NativeIndexUpdate> {
+        self.readers.require_mutable_topology()?;
         if self.readers.quality.is_some() {
             return Err(refused("update", "both-providers-required"));
         }
@@ -832,6 +976,7 @@ impl NativeGenerationSnapshot {
         max_source_bytes: usize,
     ) -> SearchResult<NativeIndexUpdate> {
         checkpoint(cx, "native_ann.generation.model_migration")?;
+        self.readers.require_mutable_topology()?;
         let quality = match (&self.readers.quality, quality_provider) {
             (Some(quality), Some(provider)) => Some((provider, Arc::clone(quality))),
             (None, None) => None,
@@ -1231,6 +1376,49 @@ impl NativeGenerationSnapshot {
             .search_progressive_with_quality_and_pool(cx, fast, quality, text, k, pool)
     }
 
+    /// Explicitly refine the complete fast corpus with its admitted quality subset.
+    ///
+    /// This is an opt-in partial-quality request. Existing full-progressive
+    /// methods continue to require complete quality coverage. Both independent
+    /// producers are admitted before inference, uncovered fast candidates remain
+    /// eligible, and quality can contribute rows absent from the fast window.
+    /// The returned query supports ordinary tuning and retained-source reranking.
+    /// [`Self::topology`] reports exact stored counts and quality coverage.
+    ///
+    /// # Errors
+    /// Refuses a non-partial topology, producer disagreement, invalid budgets
+    /// and cancellation, including empty and zero-result queries.
+    pub fn search_progressive_with_partial_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.readers
+            .search_progressive_with_partial_quality(cx, fast, quality, text, k, None)
+    }
+
+    /// Run explicit partial refinement with vector traversal on the caller's pool.
+    /// Both owners remain retained while a worker runs; quality stays lazy.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_progressive_with_partial_quality`],
+    /// plus pool errors without inline or full-coverage fallback.
+    pub fn search_progressive_with_partial_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.readers
+            .search_progressive_with_partial_quality(cx, fast, quality, text, k, Some(pool))
+    }
+
     /// Search the retained Quill image without loading or invoking a model.
     ///
     /// This is an explicit keyword request over the already fully admitted
@@ -1358,6 +1546,32 @@ impl NativeGenerationSnapshot {
             Some(pool),
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn scoped_partial_quality_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.readers.scoped_progressive_with_coverage(
+            cx,
+            fast,
+            Some(quality),
+            false,
+            lexical,
+            text,
+            k,
+            allowed,
+            pool,
+            VectorCohortCoverage::PartialQuality,
+        )
+    }
 }
 
 // Directory contents and control bytes legitimately change on publication.
@@ -1387,19 +1601,38 @@ fn same_anchor_security_identity(
 
 impl CompositeReaders {
     const fn topology(&self) -> NativeGenerationTopology {
-        if self.quality.is_some() {
-            NativeGenerationTopology::FullProgressive
-        } else if matches!(self.tier, EmbedderTierTag::Quality) {
-            NativeGenerationTopology::QualityOnly
-        } else {
-            NativeGenerationTopology::FastOnly
+        self.topology
+    }
+
+    fn require_mutable_topology(&self) -> SearchResult<()> {
+        if matches!(
+            self.topology(),
+            NativeGenerationTopology::PartialQuality { .. }
+        ) {
+            return Err(refused("update", "partial-quality-mutation-unsupported"));
         }
+        Ok(())
     }
 
     fn full_quality(&self) -> SearchResult<&Arc<NativeAnnIndex>> {
+        if !matches!(self.topology(), NativeGenerationTopology::FullProgressive) {
+            return Err(refused("topology", "complete-quality-required"));
+        }
         self.quality
             .as_ref()
             .ok_or_else(|| refused("topology", "complete-quality-required"))
+    }
+
+    fn partial_quality(&self) -> SearchResult<&Arc<NativeAnnIndex>> {
+        if !matches!(
+            self.topology(),
+            NativeGenerationTopology::PartialQuality { .. }
+        ) {
+            return Err(refused("topology", "explicit-partial-quality-required"));
+        }
+        self.quality
+            .as_ref()
+            .ok_or_else(|| refused("topology", "explicit-partial-quality-required"))
     }
 
     fn bounded_limit(&self, requested: usize) -> usize {
@@ -1460,15 +1693,50 @@ impl CompositeReaders {
         allowed: Arc<BTreeSet<String>>,
         pool: Option<BlockingPoolHandle>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.scoped_progressive_with_coverage(
+            cx,
+            primary,
+            quality,
+            quality_only,
+            lexical,
+            text,
+            k,
+            allowed,
+            pool,
+            VectorCohortCoverage::Complete,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scoped_progressive_with_coverage<'a>(
+        &'a self,
+        cx: &'a Cx,
+        primary: &'a dyn Embedder,
+        quality: Option<&'a dyn Embedder>,
+        quality_only: bool,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+        pool: Option<BlockingPoolHandle>,
+        coverage: VectorCohortCoverage,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
         checkpoint(cx, "native_ann.generation.scoped_search")?;
         let index = if quality_only && self.tier != EmbedderTierTag::Quality {
             self.full_quality()?
         } else {
             &self.vector
         };
-        let refinement = quality
-            .map(|provider| self.full_quality().map(|index| (index, provider)))
-            .transpose()?;
+        let quality_index = match coverage {
+            VectorCohortCoverage::Complete => quality.map(|_| self.full_quality()).transpose()?,
+            VectorCohortCoverage::PartialQuality => {
+                if quality.is_none() || quality_only {
+                    return Err(refused("topology", "explicit-partial-quality-required"));
+                }
+                Some(self.partial_quality()?)
+            }
+        };
+        let refinement = quality_index.zip(quality);
         let k = self.bounded_limit(k).min(allowed.len());
         let search = match pool {
             Some(pool) => index.search_hybrid_progressive_with_pool(
@@ -2070,6 +2338,39 @@ impl CompositeReaders {
             )?
             .with_retained_metadata(self))
     }
+
+    fn search_progressive_with_partial_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation.partial_quality_search")?;
+        let quality_index = self.partial_quality()?;
+        let search = match pool {
+            Some(pool) => self.vector.search_hybrid_progressive_with_pool(
+                cx,
+                fast,
+                Some((quality_index, quality)),
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+                pool,
+            )?,
+            None => self.vector.search_hybrid_progressive(
+                cx,
+                fast,
+                Some((quality_index.as_ref(), quality)),
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+            )?,
+        };
+        Ok(search.with_retained_metadata(self))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2083,7 +2384,7 @@ pub(super) fn admit_components(
     ann_image: Option<Arc<[u8]>>,
     max_image_bytes: usize,
 ) -> SearchResult<CompositeReaders> {
-    admit_components_impl(
+    admit_components_with_coverage(
         cx,
         activation,
         expected_vector,
@@ -2092,10 +2393,12 @@ pub(super) fn admit_components(
         config,
         images,
         ann_image,
+        VectorCohortCoverage::Complete,
         max_image_bytes,
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_progressive_components(
     cx: &Cx,
@@ -2108,7 +2411,7 @@ pub(super) fn admit_progressive_components(
     ann_image: Option<Arc<[u8]>>,
     max_image_bytes: usize,
 ) -> SearchResult<CompositeReaders> {
-    admit_components_impl(
+    admit_components_with_coverage(
         cx,
         activation,
         expected_fast,
@@ -2117,12 +2420,13 @@ pub(super) fn admit_progressive_components(
         config,
         images,
         ann_image,
+        VectorCohortCoverage::Complete,
         max_image_bytes,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn admit_components_impl(
+pub(super) fn admit_components_with_coverage(
     cx: &Cx,
     activation: &ActivationManifest,
     expected_vector: &FsviV2IdentityBinding,
@@ -2131,9 +2435,16 @@ fn admit_components_impl(
     config: QuillConfig,
     images: [Arc<[u8]>; 3],
     ann_image: Option<Arc<[u8]>>,
+    coverage: VectorCohortCoverage,
     max_image_bytes: usize,
 ) -> SearchResult<CompositeReaders> {
     checkpoint(cx, "native_ann.generation.components")?;
+    if coverage == VectorCohortCoverage::PartialQuality && expected_quality.is_none() {
+        return Err(refused(
+            "topology",
+            "partial-quality-requires-both-producers",
+        ));
+    }
     let declared = activation.components();
     if declared.ann.is_some() != ann_image.is_some() {
         return Err(refused("ann", "component-presence-mismatch"));
@@ -2186,6 +2497,20 @@ fn admit_components_impl(
     if !validate_manifest(&metadata).is_valid() {
         return Err(refused("metadata", "invalid-manifest"));
     }
+    let declared_coverage = metadata
+        .metadata
+        .get(NATIVE_QUALITY_COVERAGE_KEY)
+        .map(String::as_str);
+    if !matches!(
+        (coverage, declared_coverage),
+        (VectorCohortCoverage::Complete, None)
+            | (
+                VectorCohortCoverage::PartialQuality,
+                Some("partial_quality")
+            )
+    ) {
+        return Err(refused("metadata", "quality-coverage-contract-mismatch"));
+    }
     let decode_receipt = |key: &str| {
         metadata
             .metadata
@@ -2210,12 +2535,13 @@ fn admit_components_impl(
     checkpoint(cx, "native_ann.generation.vector")?;
     let cohort = expected_quality
         .map(|quality| {
-            ExactVectorCohortV1::admit(
+            ExactVectorCohortV1::admit_with_coverage(
                 cx,
                 Arc::clone(&vector_bytes),
                 expected_vector,
                 quality,
                 checkpoint_value,
+                coverage,
                 max_image_bytes,
             )
         })
@@ -2344,6 +2670,27 @@ fn admit_components_impl(
         (graph, None)
     };
     let (vector, retrieval) = retained_tier(cx, owner, fast_graph, native_receipt.as_ref())?;
+    let tier = metadata.vector_artifacts[0].embedder_tier;
+    let topology = match (cohort.as_ref(), coverage, tier) {
+        (Some(cohort), VectorCohortCoverage::PartialQuality, _) => {
+            let quality_documents = cohort.quality_receipt().live_document_count;
+            let total_documents = cohort.fast_receipt().live_document_count;
+            // The admitted subset is strict and nonempty. Keep exact counts
+            // alongside the quantized metric, including a sub-one-ppm subset.
+            let coverage_ppm = u32::try_from(
+                u128::from(quality_documents) * 1_000_000 / u128::from(total_documents),
+            )
+            .map_err(|_| refused("topology", "quality-coverage-overflow"))?;
+            NativeGenerationTopology::PartialQuality {
+                quality_documents,
+                total_documents,
+                coverage_ppm,
+            }
+        }
+        (Some(_), VectorCohortCoverage::Complete, _) => NativeGenerationTopology::FullProgressive,
+        (None, _, EmbedderTierTag::Quality) => NativeGenerationTopology::QualityOnly,
+        (None, _, EmbedderTierTag::Fast) => NativeGenerationTopology::FastOnly,
+    };
     let (quality, quality_retrieval) = if let Some(cohort) = cohort {
         let (index, policy) = retained_tier(
             cx,
@@ -2358,7 +2705,6 @@ fn admit_components_impl(
     let lexical_result = QuillSnapshotIndex::new(cx, lexical, config);
     checkpoint(cx, "native_ann.generation.ready")?;
     let lexical = lexical_result.map_err(|_| refused("lexical", "invalid-search-configuration"))?;
-    let tier = metadata.vector_artifacts[0].embedder_tier;
     Ok(CompositeReaders {
         vector: Arc::new(vector),
         quality,
@@ -2368,6 +2714,7 @@ fn admit_components_impl(
         retrieval,
         quality_retrieval,
         components,
+        topology,
     })
 }
 

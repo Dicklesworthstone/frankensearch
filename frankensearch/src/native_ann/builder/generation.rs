@@ -1,6 +1,6 @@
 //! Source-owned native components for the fixed generation-authority publisher.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
@@ -23,11 +23,15 @@ use frankensearch_index::exact_component_adapters::{
 };
 use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
 use frankensearch_index::native_hnsw::{NativeHnswGenerationReceiptV2, ValidatedNativeHnsw};
-use frankensearch_index::vector_cohort::{ExactVectorCohortV1, VECTOR_COHORT_HEADER_BYTES_V1};
+use frankensearch_index::vector_cohort::{
+    ExactVectorCohortV1, VECTOR_COHORT_HEADER_BYTES_V1, VectorCohortCoverage,
+};
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
 
-use super::super::generation::{NATIVE_ANN_RECEIPT_KEY, NATIVE_QUALITY_ANN_RECEIPT_KEY};
+use super::super::generation::{
+    NATIVE_ANN_RECEIPT_KEY, NATIVE_QUALITY_ANN_RECEIPT_KEY, NATIVE_QUALITY_COVERAGE_KEY,
+};
 use super::super::{NativeRetrievalMode, checkpoint, invalid, lower_hex};
 use super::scope::PreparedNativeGenerationScope;
 use super::{NativeBuildRetrieval, NativeBuiltTier, NativeIndexBuilder, hybrid};
@@ -54,6 +58,7 @@ pub struct NativeBuiltExactGeneration {
     metadata_bytes: Arc<[u8]>,
     retrieval: NativeBuildRetrieval,
     quality_retrieval: Option<NativeBuildRetrieval>,
+    coverage: VectorCohortCoverage,
     max_image_bytes: usize,
 }
 
@@ -100,7 +105,7 @@ impl NativeIndexBuilder {
                 "authority generations require exactly one vector provider",
             ));
         }
-        Box::pin(self.build_composite_generation(cx, tier, source, max_image_bytes)).await
+        Box::pin(self.build_composite_generation(cx, tier, source, None, max_image_bytes)).await
     }
 
     /// Build independently identified fast and quality tiers over one complete cohort.
@@ -137,16 +142,80 @@ impl NativeIndexBuilder {
             cx,
             EmbedderTierTag::Fast,
             source,
+            None,
+            max_image_bytes,
+        ))
+        .await
+    }
+
+    /// Build a complete fast corpus with an explicitly selected quality subset.
+    ///
+    /// Every selected ID must occur exactly once in the supplied source. The
+    /// quality selection must be nonempty and strictly smaller than that source;
+    /// use [`Self::build_progressive_generation`] for full quality coverage.
+    /// Selection is validated before work files or inference. Both configured
+    /// providers remain required: a failed embedding aborts this build and never
+    /// silently changes the requested subset. Quill retains every source document.
+    ///
+    /// Each tier is built and admitted independently. The resulting versioned
+    /// cohort records partial coverage explicitly and is admitted only through
+    /// the partial-quality reader. Full-coverage admission remains strict. Graphs
+    /// retain their own actual vector owners; no placeholder vectors are added.
+    /// This constructs a fresh generation, not an incremental update.
+    ///
+    /// # Errors
+    /// Rejects missing quality, empty/full/duplicate/unknown selections, reuse
+    /// plans, and the source, image-budget and cancellation errors documented by
+    /// [`Self::build_exact_generation`]. A failure may leave unselected work files.
+    pub async fn build_partial_quality_generation(
+        self,
+        cx: &Cx,
+        source: CommitRange,
+        quality_document_ids: impl IntoIterator<Item = String>,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.builder.partial_quality_start")?;
+        if self.quality.is_none() || self.reuse.is_some() {
+            return Err(invalid(
+                "builder.generation.partial_quality",
+                "unsupported-plan",
+                "partial quality requires two explicit providers and a fresh source build",
+            ));
+        }
+        let mut selected = BTreeSet::new();
+        for id in quality_document_ids {
+            checkpoint(cx, "native_ann.builder.partial_quality_selection")?;
+            if !selected.insert(id) {
+                return Err(invalid(
+                    "builder.generation.partial_quality",
+                    "duplicate-id",
+                    "quality document IDs must be unique",
+                ));
+            }
+            if selected.len() >= self.documents.len() {
+                return Err(invalid(
+                    "builder.generation.partial_quality",
+                    "invalid-subset",
+                    "quality IDs must select fewer documents than the complete source",
+                ));
+            }
+        }
+        Box::pin(self.build_composite_generation(
+            cx,
+            EmbedderTierTag::Fast,
+            source,
+            Some(selected),
             max_image_bytes,
         ))
         .await
     }
 
     async fn build_composite_generation(
-        self,
+        mut self,
         cx: &Cx,
         tier: EmbedderTierTag,
         source: CommitRange,
+        quality_document_ids: Option<BTreeSet<String>>,
         max_image_bytes: usize,
     ) -> SearchResult<NativeBuiltExactGeneration> {
         if source
@@ -166,6 +235,67 @@ impl NativeIndexBuilder {
         let started = timestamp_millis()?;
         let retrieval = self.fast.retrieval;
         let quality_retrieval = self.quality.as_ref().map(|quality| quality.retrieval);
+        let coverage = if quality_document_ids.is_some() {
+            VectorCohortCoverage::PartialQuality
+        } else {
+            VectorCohortCoverage::Complete
+        };
+        let partial_builder = if let Some(selected) = quality_document_ids {
+            self.validate_documents(cx)?;
+            if selected.is_empty() || selected.len() >= self.documents.len() {
+                return Err(invalid(
+                    "builder.generation.partial_quality",
+                    "invalid-subset",
+                    "quality IDs must select a nonempty proper subset of the complete source",
+                ));
+            }
+            for id in &selected {
+                checkpoint(cx, "native_ann.builder.partial_quality_membership")?;
+                if self
+                    .documents
+                    .binary_search_by(|document| document.id.cmp(id))
+                    .is_err()
+                {
+                    return Err(invalid(
+                        "builder.generation.partial_quality",
+                        "unknown-document",
+                        "every quality ID must occur in the complete source",
+                    ));
+                }
+            }
+            let quality = self.quality.take().ok_or_else(|| {
+                invalid(
+                    "builder.generation.partial_quality",
+                    "missing",
+                    "quality provider is required",
+                )
+            })?;
+            quality.binding(&self.generation)?;
+            if let NativeBuildRetrieval::Hnsw { params, .. } = quality.retrieval {
+                params.validate()?;
+            }
+            let mut documents = Vec::with_capacity(selected.len());
+            for document in &self.documents {
+                checkpoint(cx, "native_ann.builder.partial_quality_source")?;
+                if selected.contains(&document.id) {
+                    documents.push(document.clone());
+                }
+            }
+            Some(Self {
+                directory: self.directory.join("partial-quality"),
+                generation: self.generation,
+                fast: quality,
+                quality: None,
+                batch_size: self.batch_size,
+                max_batch_input_bytes: self.max_batch_input_bytes,
+                split_failed_batches: self.split_failed_batches,
+                documents,
+                reuse: None,
+                blocking_pool: self.blocking_pool.clone(),
+            })
+        } else {
+            None
+        };
         let retained_lexical = self
             .reuse
             .as_ref()
@@ -173,19 +303,27 @@ impl NativeIndexBuilder {
             .transpose()?
             .flatten();
         let vectors = Box::pin(self.build(cx)).await?;
+        let partial_quality = match partial_builder {
+            Some(builder) => Some(Box::pin(builder.build(cx)).await?),
+            None => None,
+        };
+        let quality_tier = vectors
+            .quality()
+            .or_else(|| partial_quality.as_ref().map(super::NativeBuiltIndex::fast));
         let (vector, owner) = capture_vector(cx, vectors.fast(), component_budget)?;
         let source_checkpoint = SourceCheckpointV1::derive(&source);
-        let cohort = if let Some(quality) = vectors.quality() {
+        let cohort = if let Some(quality) = quality_tier {
             let remaining = remaining_budget(
                 remaining_budget(component_budget, vector.len())?,
                 VECTOR_COHORT_HEADER_BYTES_V1,
             )?;
             let (quality_bytes, _quality_owner) = capture_vector(cx, quality, remaining)?;
-            Some(ExactVectorCohortV1::build(
+            Some(ExactVectorCohortV1::build_with_coverage(
                 cx,
                 (vectors.fast().binding(), Arc::clone(&vector)),
                 (quality.binding(), quality_bytes),
                 source_checkpoint,
+                coverage,
                 component_budget,
             )?)
         } else {
@@ -202,7 +340,7 @@ impl NativeIndexBuilder {
             after_vector
         };
         let native_ann = capture_ann(cx, vectors.fast(), Arc::clone(&owner), graph_budget)?;
-        let quality_ann = match (vectors.quality(), cohort.as_ref()) {
+        let quality_ann = match (quality_tier, cohort.as_ref()) {
             (Some(quality), Some(cohort)) => capture_ann(
                 cx,
                 quality,
@@ -317,7 +455,7 @@ impl NativeIndexBuilder {
             (image.bytes(), image.receipt().clone())
         };
         let binding = vectors.fast().binding().clone();
-        let quality_binding = vectors.quality().map(|quality| quality.binding().clone());
+        let quality_binding = quality_tier.map(|quality| quality.binding().clone());
         let mut metadata = build_metadata(
             &binding,
             tier,
@@ -357,8 +495,12 @@ impl NativeIndexBuilder {
                     &mut invariant.kind
                 {
                     *expected_total = physical_rows;
-                    "Every source document has a stored vector in each independently admitted tier"
-                        .clone_into(&mut invariant.description);
+                    invariant.description = match coverage {
+                        VectorCohortCoverage::Complete =>
+                            "Every source document has a stored vector in each independently admitted tier".to_owned(),
+                        VectorCohortCoverage::PartialQuality =>
+                            "Complete fast corpus and explicit quality subset match their independently admitted physical row counts".to_owned(),
+                    };
                 }
             }
             if let Some((_, receipt)) = &quality_ann {
@@ -372,6 +514,12 @@ impl NativeIndexBuilder {
                 metadata
                     .metadata
                     .insert(NATIVE_QUALITY_ANN_RECEIPT_KEY.to_owned(), encoded);
+            }
+            if coverage == VectorCohortCoverage::PartialQuality {
+                metadata.metadata.insert(
+                    NATIVE_QUALITY_COVERAGE_KEY.to_owned(),
+                    "partial_quality".to_owned(),
+                );
             }
             metadata.manifest_hash = compute_manifest_hash(&metadata)?;
             require_valid(&validate_manifest(&metadata))?;
@@ -415,12 +563,20 @@ impl NativeIndexBuilder {
             metadata_bytes,
             retrieval,
             quality_retrieval,
+            coverage,
             max_image_bytes,
         })
     }
 }
 
 impl NativeBuiltExactGeneration {
+    /// Explicit quality coverage contract of the retained vector component.
+    /// Single-tier generations use `Complete` for their one admitted corpus.
+    #[must_use]
+    pub const fn coverage(&self) -> VectorCohortCoverage {
+        self.coverage
+    }
+
     /// Actual generation and frozen embedding/storage identity of the vector image.
     #[must_use]
     pub const fn binding(&self) -> &FsviV2IdentityBinding {
@@ -592,11 +748,11 @@ impl NativeBuiltExactGeneration {
         candidate: &GenerationCandidateV1,
     ) -> SearchResult<super::super::generation::CompositeReaders> {
         if let Some(quality_binding) = &self.quality_binding {
-            return super::super::generation::admit_progressive_components(
+            return super::super::generation::admit_components_with_coverage(
                 cx,
                 candidate.manifest(),
                 &self.binding,
-                quality_binding,
+                Some(quality_binding),
                 DEFAULT_SCHEMA,
                 QuillConfig::default(),
                 [
@@ -605,6 +761,7 @@ impl NativeBuiltExactGeneration {
                     Arc::clone(&self.metadata_bytes),
                 ],
                 self.ann.as_ref().map(Arc::clone),
+                self.coverage,
                 self.max_image_bytes,
             );
         }

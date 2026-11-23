@@ -644,6 +644,16 @@ impl NativeIndexUpdate {
         intent: AuthorityUpdateIntent,
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.update.authority")?;
+        if matches!(
+            snapshot.topology(),
+            crate::native_ann::NativeGenerationTopology::PartialQuality { .. }
+        ) {
+            return Err(invalid(
+                "update.inventory",
+                "partial-quality-unsupported",
+                "partial quality updates require an explicit subset preservation contract",
+            ));
+        }
         // An explicitly reopened predecessor carries the newer selection's
         // physical slot pair. That pair cannot authorize incremental edits to
         // its historical source. A previously current retained snapshot keeps

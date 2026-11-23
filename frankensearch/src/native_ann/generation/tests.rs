@@ -186,6 +186,21 @@ impl ProgressiveFixture {
         )
     }
 
+    fn admit_partial(&self, cx: &Cx) -> SearchResult<CompositeReaders> {
+        admit_components_with_coverage(
+            cx,
+            &self.activation,
+            &self.fast_binding,
+            Some(&self.quality_binding),
+            DEFAULT_SCHEMA,
+            config(),
+            self.images.clone(),
+            self.ann.as_ref().map(Arc::clone),
+            VectorCohortCoverage::PartialQuality,
+            BUDGET,
+        )
+    }
+
     fn admit_resealed(&self, cx: &Cx, images: [Arc<[u8]>; 3]) -> SearchResult<CompositeReaders> {
         let activation = activation(
             &self.fast_binding,
@@ -246,10 +261,20 @@ async fn progressive_fixture_with_retrieval(
     fast_ann: bool,
     quality_ann: bool,
 ) -> ProgressiveFixture {
+    progressive_fixture_with_coverage(cx, fast_ann, quality_ann, VectorCohortCoverage::Complete)
+        .await
+}
+
+async fn progressive_fixture_with_coverage(
+    cx: &Cx,
+    fast_ann: bool,
+    quality_ann: bool,
+    coverage: VectorCohortCoverage,
+) -> ProgressiveFixture {
     let directory = tempfile::tempdir().unwrap();
     let fast = Arc::new(ProgressiveProvider::new(false));
     let quality = Arc::new(ProgressiveProvider::new(true));
-    let built = crate::native_ann::builder::NativeIndexBuilder::new(
+    let builder = crate::native_ann::builder::NativeIndexBuilder::new(
         directory.path().join("source"),
         ArtifactGenerationIdentityV1::new(7, [0x37; 16]).unwrap(),
         fast.clone(),
@@ -279,9 +304,24 @@ async fn progressive_fixture_with_retrieval(
     }))
     .add_document(
         IndexableDocument::new("quality-only", "quality-special").with_metadata("version", "old"),
-    )
-    .build_progressive_generation(cx, CommitRange { low: 1, high: 4 }, BUDGET)
-    .await
+    );
+    let built = match coverage {
+        VectorCohortCoverage::Complete => {
+            builder
+                .build_progressive_generation(cx, CommitRange { low: 1, high: 4 }, BUDGET)
+                .await
+        }
+        VectorCohortCoverage::PartialQuality => {
+            builder
+                .build_partial_quality_generation(
+                    cx,
+                    CommitRange { low: 1, high: 4 },
+                    ["a", "b", "c", "e", "quality-only"].map(str::to_owned),
+                    BUDGET,
+                )
+                .await
+        }
+    }
     .unwrap();
     let candidate = built
         .candidate(
@@ -315,6 +355,259 @@ async fn progressive_fixture_with_retrieval(
         ],
         ann: built.component_bytes(GenerationComponentRole::Ann),
     }
+}
+
+#[test]
+fn partial_quality_invalid_membership_is_refused_before_inference_and_files() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        for (case, selected) in [
+            Vec::<String>::new(),
+            vec!["absent".to_owned()],
+            vec!["a".to_owned(), "a".to_owned()],
+            vec!["a".to_owned(), "b".to_owned()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fast = Arc::new(ProgressiveProvider::new(false));
+            let quality = Arc::new(ProgressiveProvider::new(true));
+            let path = directory.path().join(format!("invalid-{case}"));
+            let result = crate::native_ann::builder::NativeIndexBuilder::new(
+                &path,
+                ArtifactGenerationIdentityV1::new(7, [0x37; 16]).unwrap(),
+                fast.clone(),
+            )
+            .unwrap()
+            .with_quality_embedder(quality.clone())
+            .unwrap()
+            .add_documents([
+                IndexableDocument::new("a", "first"),
+                IndexableDocument::new("b", "second"),
+            ])
+            .build_partial_quality_generation(
+                &cx,
+                CommitRange { low: 1, high: 4 },
+                selected,
+                BUDGET,
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(!path.exists());
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
+#[test]
+fn partial_quality_retains_full_source_and_requires_explicit_refinement() {
+    use crate::native_ann::NativeSearchPhase;
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for (fast_ann, quality_ann) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let fixture = progressive_fixture_with_coverage(
+                &cx,
+                fast_ann,
+                quality_ann,
+                VectorCohortCoverage::PartialQuality,
+            )
+            .await;
+            assert!(
+                fixture.admit(&cx).is_err(),
+                "complete admission stays strict"
+            );
+            let readers = fixture.admit_partial(&cx).unwrap();
+            assert_eq!(
+                readers.topology(),
+                NativeGenerationTopology::PartialQuality {
+                    quality_documents: 5,
+                    total_documents: 6,
+                    coverage_ppm: 833_333,
+                }
+            );
+            assert_eq!(readers.metadata.total_documents, 6);
+            assert_eq!(readers.source_documents(&cx, BUDGET).unwrap().len(), 6);
+            assert!(
+                readers
+                    .source_documents_by_ids(&cx, &["d"], BUDGET)
+                    .unwrap()[0]
+                    .is_some()
+            );
+            assert!(readers.full_quality().is_err());
+            assert!(
+                readers
+                    .search_refined_text(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        fixture.quality.as_ref(),
+                        "unmatched",
+                        1,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                readers
+                    .search_quality_text(&cx, fixture.quality.as_ref(), "unmatched", 1)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+            let candidate = GenerationCandidateV1::new(
+                [0x75; 16],
+                None,
+                GenerationAuthorityActionV1::Activate,
+                fixture.fast_binding.generation(),
+                [0x76; 32],
+                &readers.components,
+            )
+            .unwrap();
+            let preview = Arc::new(NativeGenerationPreview::new(candidate.authority(), readers));
+            std::fs::rename(
+                fixture.directory.path().join("source"),
+                fixture.directory.path().join("relocated"),
+            )
+            .unwrap();
+            let mut stream = preview
+                .search_progressive_with_partial_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                )
+                .unwrap();
+            let Some(NativeSearchPhase::Initial { results, .. }) =
+                stream.next_phase().await.unwrap()
+            else {
+                panic!("partial refinement must first deliver the complete fast phase")
+            };
+            assert_ne!(results[0].doc_id, "quality-only");
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+            let Some(NativeSearchPhase::Refined { results, .. }) =
+                stream.next_phase().await.unwrap()
+            else {
+                panic!("partial refinement must retrieve the independent quality subset")
+            };
+            assert_eq!(results[0].doc_id, "quality-only");
+            assert_eq!(results[0].quality_score, Some(1.0));
+            assert_eq!(results[0].metadata.as_ref().unwrap()["version"], "old");
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 1);
+            drop(stream);
+
+            let all = preview
+                .search_progressive_with_partial_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    6,
+                )
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(all.len(), 6);
+            let uncovered = all.iter().find(|hit| hit.doc_id == "d").unwrap();
+            assert!(uncovered.fast_score.is_some());
+            assert!(uncovered.quality_score.is_none());
+
+            let scope = preview
+                .scope(&cx, BUDGET, |document| Ok(document.id == "d"))
+                .unwrap();
+            assert!(
+                scope
+                    .search_progressive_with_quality(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        fixture.quality.as_ref(),
+                        "unmatched",
+                        1,
+                    )
+                    .is_err()
+            );
+            let only_uncovered = scope
+                .search_progressive_with_partial_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                )
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(only_uncovered.len(), 1);
+            assert_eq!(only_uncovered[0].doc_id, "d");
+            assert!(only_uncovered[0].fast_score.is_some());
+            assert!(only_uncovered[0].quality_score.is_none());
+        }
+    });
+}
+
+#[test]
+fn partial_quality_metadata_and_complete_contracts_cannot_be_interchanged() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for coverage in [
+            VectorCohortCoverage::Complete,
+            VectorCohortCoverage::PartialQuality,
+        ] {
+            let fixture = progressive_fixture_with_coverage(&cx, false, false, coverage).await;
+            let mismatched = match coverage {
+                VectorCohortCoverage::Complete => fixture.admit_partial(&cx),
+                VectorCohortCoverage::PartialQuality => fixture.admit(&cx),
+            };
+            assert!(mismatched.is_err());
+            for marker in [None, Some("partial_quality"), Some("unknown")] {
+                if matches!(
+                    (coverage, marker),
+                    (VectorCohortCoverage::Complete, None)
+                        | (
+                            VectorCohortCoverage::PartialQuality,
+                            Some("partial_quality")
+                        )
+                ) {
+                    continue;
+                }
+                let mut metadata = fixture.metadata.clone();
+                metadata.metadata.remove(NATIVE_QUALITY_COVERAGE_KEY);
+                if let Some(marker) = marker {
+                    metadata
+                        .metadata
+                        .insert(NATIVE_QUALITY_COVERAGE_KEY.to_owned(), marker.to_owned());
+                }
+                metadata.manifest_hash = compute_manifest_hash(&metadata).unwrap();
+                let mut images = fixture.images.clone();
+                images[2] = serde_json::to_vec(&metadata).unwrap().into();
+                let resealed = activation(
+                    &fixture.fast_binding,
+                    &images,
+                    fixture.activation.document_set_sha256(),
+                    None,
+                );
+                let error = admit_components_with_coverage(
+                    &cx,
+                    &resealed,
+                    &fixture.fast_binding,
+                    Some(&fixture.quality_binding),
+                    DEFAULT_SCHEMA,
+                    config(),
+                    images,
+                    None,
+                    coverage,
+                    BUDGET,
+                )
+                .err()
+                .expect("authenticated wrong coverage must still refuse");
+                assert!(matches!(error, SearchError::InvalidConfig { value, .. }
+                    if value == "quality-coverage-contract-mismatch"));
+            }
+        }
+    });
 }
 
 #[test]

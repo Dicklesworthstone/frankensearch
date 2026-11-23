@@ -188,6 +188,32 @@ impl<'a> RetainedQuery<'a> {
         })
     }
 
+    pub(super) fn partial_progressive(
+        &self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        limit: usize,
+    ) -> Result<NativeProgressiveSearch<'a>> {
+        Ok(match (self.scope, self.pool.clone()) {
+            (Some(scope), Some(pool)) => scope.search_progressive_with_partial_quality_and_pool(
+                cx, fast, quality, text, limit, pool,
+            )?,
+            (None, Some(pool)) => self
+                .snapshot
+                .search_progressive_with_partial_quality_and_pool(
+                    cx, fast, quality, text, limit, pool,
+                )?,
+            (Some(scope), None) => {
+                scope.search_progressive_with_partial_quality(cx, fast, quality, text, limit)?
+            }
+            (None, None) => self
+                .snapshot
+                .search_progressive_with_partial_quality(cx, fast, quality, text, limit)?,
+        })
+    }
+
     pub(super) fn progressive(
         &self,
         cx: &'a Cx,

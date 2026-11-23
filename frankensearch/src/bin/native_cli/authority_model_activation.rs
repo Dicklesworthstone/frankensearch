@@ -135,6 +135,7 @@ impl AuthoritySession {
         if !self.allow_model_activation {
             return Err(serve_refused("model_activation_disabled"));
         }
+        self.receipt.require_complete_for_mutation()?;
         if !matches!(self.models, AuthorityModels::Semantic(_)) {
             return Err(serve_refused("model_activation_requires_hybrid"));
         }

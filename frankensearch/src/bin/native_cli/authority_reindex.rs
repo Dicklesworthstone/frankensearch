@@ -324,6 +324,9 @@ pub(super) async fn execute_with_policy(
                 NativeGenerationTopology::FastOnly => RetrievalTopology::FastOnly,
                 NativeGenerationTopology::QualityOnly => RetrievalTopology::QualityOnly,
                 NativeGenerationTopology::FullProgressive => RetrievalTopology::FullProgressive,
+                NativeGenerationTopology::PartialQuality { .. } => {
+                    return Err(bad("partial quality model recovery is not supported"));
+                }
             },
         },
         &recovery_policy,
@@ -807,6 +810,7 @@ impl Inputs<'_> {
             identity: self.selected.identity.clone(),
             tier: self.selected.tier,
             quality_identity: self.selected.quality_identity.clone(),
+            quality_documents: self.selected.quality_documents,
             documents: self.selected.documents,
             image_bytes: candidate.owned_image_bytes(),
             attempt: Some(SavedAttempt::from_permit(&attempt, false)),
@@ -888,6 +892,7 @@ fn validate_phases(mode: QueryMode, rerank: bool, phases: &Phases) -> Result<()>
         QueryMode::Full if rerank => &["initial", "refined", "reranked"],
         QueryMode::Full => &["initial", "refined"],
         QueryMode::Lexical => return Err(bad("lexical queries cannot prove semantic recovery")),
+        QueryMode::Partial => return Err(bad("partial quality model recovery is not supported")),
     };
     if phases
         .iter()

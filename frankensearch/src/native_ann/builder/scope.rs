@@ -527,6 +527,58 @@ impl NativeScopedGenerationPreview {
             Some(pool),
         )
     }
+
+    /// Explicitly preview partial-quality refinement inside this frozen scope.
+    /// Membership applies to both semantic owners and the retained lexical view.
+    ///
+    /// # Errors
+    /// Refuses a non-partial topology, no-op preview, changed producer, invalid
+    /// query policy or cancellation. Full-progressive preview remains strict.
+    pub fn search_progressive_with_partial_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.preview.scoped_partial_quality_progressive(
+            cx,
+            fast,
+            quality,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            None,
+        )
+    }
+
+    /// Preview scoped partial refinement with traversal on the caller's pool.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_progressive_with_partial_quality`],
+    /// plus pool errors without inline fallback.
+    pub fn search_progressive_with_partial_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.preview.scoped_partial_quality_progressive(
+            cx,
+            fast,
+            quality,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            Some(pool),
+        )
+    }
 }
 
 pub(in crate::native_ann) fn quality_provenance(
@@ -908,6 +960,61 @@ impl NativeScopedGenerationSnapshot {
             k,
             Arc::clone(&self.lexical.allowed),
             pool,
+        )
+    }
+
+    /// Explicitly refine this scope using the admitted quality subset.
+    ///
+    /// The complete fast/lexical scope remains eligible even where quality has
+    /// no row. Quality retrieval independently adds eligible covered documents.
+    /// The same source membership applies before retrieval limits and fusion.
+    ///
+    /// # Errors
+    /// Refuses non-partial topology, changed producer, invalid query policy or
+    /// cancellation. Construction starts no inference, including quality work.
+    pub fn search_progressive_with_partial_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.snapshot.scoped_partial_quality_progressive(
+            cx,
+            fast,
+            quality,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            None,
+        )
+    }
+
+    /// Query scoped partial refinement with traversal on the caller's pool.
+    ///
+    /// # Errors
+    /// Has the refusals of [`Self::search_progressive_with_partial_quality`],
+    /// plus pool errors. Both owner and scope remain pinned through delivery.
+    pub fn search_progressive_with_partial_quality_and_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.snapshot.scoped_partial_quality_progressive(
+            cx,
+            fast,
+            quality,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+            Some(pool),
         )
     }
 

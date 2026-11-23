@@ -1399,6 +1399,7 @@ fn receipt() -> Receipt {
         identity: identity(),
         tier: EmbedderTierTag::Fast,
         quality_identity: None,
+        quality_documents: None,
         documents: 2,
         image_bytes: 4096,
         attempt: Some(SavedAttempt::from_permit(&permit, false)),
@@ -1412,6 +1413,145 @@ fn progressive_receipt() -> Receipt {
     quality.producer.implementation_revision = "independent-quality-producer".to_owned();
     selected.quality_identity = Some(quality.freeze().unwrap());
     selected
+}
+
+fn partial_quality_receipt() -> Receipt {
+    let mut selected = progressive_receipt();
+    selected.schema = PARTIAL_QUALITY_RECEIPT_SCHEMA.to_owned();
+    selected.quality_documents = Some(1);
+    selected
+}
+
+#[test]
+fn partial_quality_options_require_explicit_subset_and_mode() {
+    let mut arguments = index_arguments();
+    let tier = arguments.iter().position(|value| *value == "fast").unwrap();
+    arguments[tier] = "partial";
+    assert!(parse(&arguments).is_err());
+    arguments.extend(["--quality-ids", r#"["zeta"]"#]);
+    let options = parse(&arguments).unwrap().unwrap();
+    assert!(options.partial_quality);
+    assert!(!options.progressive);
+    assert_eq!(options.tier, Some(EmbedderTierTag::Fast));
+    assert_eq!(options.quality_ids, Some(vec!["zeta".to_owned()]));
+    let mut duplicate = arguments.clone();
+    duplicate.extend(["--quality-ids", r#"["alpha"]"#]);
+    assert!(parse(&duplicate).is_err());
+    for selection in [
+        "[]",
+        r#"[""]"#,
+        r#"["zeta","zeta"]"#,
+        "null",
+        r#"{"id":"zeta"}"#,
+    ] {
+        let mut invalid = arguments.clone();
+        *invalid.last_mut().unwrap() = selection;
+        assert!(parse(&invalid).is_err(), "{selection}");
+    }
+    for tier_name in ["fast", "quality", "full"] {
+        let mut invalid = arguments.clone();
+        invalid[tier] = tier_name;
+        assert!(parse(&invalid).is_err(), "{tier_name}");
+    }
+    let options = parse(&[
+        "authority-search",
+        "--receipt",
+        "selected.json",
+        "--query",
+        "retry",
+        "--mode",
+        "partial",
+        "--stream",
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(options.mode, Some(QueryMode::Partial));
+    let request: AuthoritySearchRequest =
+        serde_json::from_str(r#"{"query":"retry","mode":"partial","stream":true}"#).unwrap();
+    assert_eq!(request.mode, Some(QueryMode::Partial));
+}
+
+#[test]
+fn partial_quality_receipt_requires_truthful_nonempty_strict_coverage() {
+    let selected = partial_quality_receipt();
+    selected.validate().unwrap();
+    let decoded: Receipt = serde_json::from_slice(&serde_json::to_vec(&selected).unwrap()).unwrap();
+    decoded.validate().unwrap();
+    assert_eq!(decoded.binding().unwrap(), selected.binding().unwrap());
+    assert_eq!(
+        decoded.quality_binding().unwrap(),
+        selected.quality_binding().unwrap()
+    );
+    assert_eq!(
+        decoded.topology(),
+        NativeGenerationTopology::PartialQuality {
+            quality_documents: 1,
+            total_documents: 2,
+            coverage_ppm: 500_000,
+        }
+    );
+    assert_eq!(decoded.query_mode(None).unwrap(), QueryMode::Fast);
+    for mode in [QueryMode::Fast, QueryMode::Partial, QueryMode::Lexical] {
+        assert_eq!(decoded.query_mode(Some(mode)).unwrap(), mode);
+    }
+    for mode in [QueryMode::Full, QueryMode::Quality] {
+        assert!(decoded.query_mode(Some(mode)).is_err());
+    }
+    for count in [None, Some(0), Some(2), Some(3), Some(u64::MAX)] {
+        let mut changed = selected.clone();
+        changed.quality_documents = count;
+        assert!(changed.validate().is_err(), "{count:?}");
+    }
+    for schema in [
+        RECEIPT_SCHEMA,
+        SELECTION_ONLY_RECEIPT_SCHEMA,
+        PROGRESSIVE_RECEIPT_SCHEMA,
+    ] {
+        let mut changed = selected.clone();
+        changed.schema = schema.to_owned();
+        assert!(changed.validate().is_err(), "{schema}");
+    }
+    let mut changed = selected.clone();
+    changed.quality_identity = None;
+    assert!(changed.validate().is_err());
+    changed = selected.clone();
+    changed.tier = EmbedderTierTag::Quality;
+    assert!(changed.validate().is_err());
+    changed = selected;
+    changed.documents = 0;
+    assert!(changed.validate().is_err());
+}
+
+#[test]
+fn receipt_topology_shape_preserves_partial_policy_without_freezing_coverage_counts() {
+    let partial = partial_quality_receipt();
+    let mut successor = partial.clone();
+    successor.documents = 3;
+    successor.quality_documents = Some(2);
+    partial.validate().unwrap();
+    successor.validate().unwrap();
+    assert_ne!(partial.topology(), successor.topology());
+    assert!(partial.same_topology(&successor));
+    assert!(successor.same_topology(&partial));
+
+    let fast = receipt();
+    let mut quality = receipt();
+    quality.tier = EmbedderTierTag::Quality;
+    let full = progressive_receipt();
+    for selected in [&fast, &quality, &full] {
+        selected.validate().unwrap();
+        assert!(!partial.same_topology(selected));
+        assert!(!selected.same_topology(&partial));
+        let mut more_documents = selected.clone();
+        more_documents.documents = 7;
+        more_documents.validate().unwrap();
+        assert!(selected.same_topology(&more_documents));
+    }
+    assert!(!fast.same_topology(&quality));
+    assert!(!fast.same_topology(&full));
+    assert!(!quality.same_topology(&full));
+    // This shape comparison does not authorize a reader: admit_opened still
+    // compares actual retained counts and the full topology to its receipt.
 }
 
 #[test]
@@ -1564,7 +1704,12 @@ fn query_modes_cannot_invent_a_missing_authority_tier() {
     ] {
         selected.validate().unwrap();
         assert_eq!(selected.query_mode(None).unwrap(), default);
-        for mode in [QueryMode::Fast, QueryMode::Quality, QueryMode::Full] {
+        for mode in [
+            QueryMode::Fast,
+            QueryMode::Quality,
+            QueryMode::Full,
+            QueryMode::Partial,
+        ] {
             assert_eq!(
                 selected.query_mode(Some(mode)).is_ok(),
                 allowed.contains(&mode)
@@ -7666,6 +7811,395 @@ mod progressive_authority {
         }
     }
 
+    fn partial_index_options(parent: &Path, ann: bool) -> Options {
+        let input = parent.join("partial-input.jsonl");
+        fs::write(
+            &input,
+            concat!(
+                "{\"id\":\"fast-only\",\"content\":\"retry fallback remains searchable\"}\n",
+                "{\"id\":\"quality\",\"content\":\"retry network with quality coverage\"}\n",
+                "{\"id\":\"garden\",\"content\":\"garden flowers\"}\n",
+            ),
+        )
+        .unwrap();
+        let mut arguments = index_arguments();
+        let tier = arguments.iter().position(|value| *value == "fast").unwrap();
+        arguments[tier] = "partial";
+        arguments.extend(["--quality-ids", r#"["quality"]"#]);
+        if ann {
+            arguments.extend(["--retrieval", "hnsw"]);
+        }
+        let mut options = parse(&arguments).unwrap().unwrap();
+        options.root = Some(parent.join("root"));
+        options.work = Some(parent.join("partial-work"));
+        options.receipt = parent.join("partial.json");
+        options.input = Some(input);
+        options
+    }
+
+    async fn publish_partial_cli(
+        cx: &Cx,
+        parent: &Path,
+        fast: &Arc<Provider>,
+        quality: &Arc<Provider>,
+        ann: bool,
+    ) -> (Options, Receipt) {
+        let options = partial_index_options(parent, ann);
+        let mut output = Vec::new();
+        index_with_loader(cx, &options, &mut output, |mode| {
+            assert_eq!(
+                mode,
+                QueryMode::Full,
+                "both providers are independently loaded"
+            );
+            Ok(models(fast, quality))
+        })
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["event"], "indexed");
+        assert_eq!(report["publication"], "committed");
+        let receipt = Receipt::read(&options.receipt).unwrap();
+        assert_eq!(receipt.schema, PARTIAL_QUALITY_RECEIPT_SCHEMA);
+        assert_eq!(receipt.documents, 3);
+        assert_eq!(receipt.quality_documents, Some(1));
+        assert_eq!(calls(fast, quality), (3, 1));
+        (options, receipt)
+    }
+
+    fn partial_search_options(receipt: &Path, mode: Option<QueryMode>) -> Options {
+        let mut options = parse(&[
+            "authority-search",
+            "--receipt",
+            "selected.json",
+            "--query",
+            "retry",
+            "--limit",
+            "3",
+            "--stream",
+        ])
+        .unwrap()
+        .unwrap();
+        options.receipt = receipt.to_path_buf();
+        options.mode = mode;
+        options.lexical_only = mode == Some(QueryMode::Lexical);
+        options
+    }
+
+    #[test]
+    fn partial_quality_cli_rejects_unknown_or_complete_selection_before_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ids in [
+                vec!["unknown"],
+                vec!["fast-only", "quality", "garden"],
+                vec!["quality", "quality"],
+                vec![],
+            ] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let mut options = partial_index_options(&parent, false);
+                options.quality_ids = Some(ids.into_iter().map(str::to_owned).collect());
+                let mut output = Vec::new();
+                assert!(
+                    index_with_loader(&cx, &options, &mut output, |_| {
+                        Ok(models(&fast, &quality))
+                    })
+                    .await
+                    .is_err()
+                );
+                assert_eq!(calls(&fast, &quality), (0, 0));
+                assert!(!options.work.as_ref().unwrap().exists());
+                assert!(!options.receipt.exists());
+                assert!(output.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn partial_quality_cli_indexes_reopens_and_searches_exact_and_ann_owners() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ann in [false, true] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let (options, selected) =
+                    publish_partial_cli(&cx, &parent, &fast, &quality, ann).await;
+                fs::rename(options.work.as_ref().unwrap(), parent.join("archived-work")).unwrap();
+                fs::rename(
+                    options.input.as_ref().unwrap(),
+                    parent.join("archived-input"),
+                )
+                .unwrap();
+                let snapshot = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    snapshot.topology(),
+                    NativeGenerationTopology::PartialQuality {
+                        quality_documents: 1,
+                        total_documents: 3,
+                        coverage_ppm: 333_333,
+                    }
+                );
+                assert_eq!(
+                    snapshot
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap()
+                        .len(),
+                    3
+                );
+                assert_eq!(
+                    snapshot.retrieval_configuration(),
+                    options.build_retrieval(None)
+                );
+                assert_eq!(
+                    snapshot.quality_retrieval_configuration(),
+                    Some(options.build_retrieval(None))
+                );
+                drop(snapshot);
+
+                for mode in [
+                    None,
+                    Some(QueryMode::Fast),
+                    Some(QueryMode::Partial),
+                    Some(QueryMode::Lexical),
+                ] {
+                    let query = partial_search_options(&options.receipt, mode);
+                    let mut requested = Vec::new();
+                    let mut output = Vec::new();
+                    search_with_loader(&cx, &query, &mut output, |tier| {
+                        requested.push(tier);
+                        Ok(match tier {
+                            EmbedderTierTag::Fast => fast.clone(),
+                            EmbedderTierTag::Quality => quality.clone(),
+                        })
+                    })
+                    .await
+                    .unwrap();
+                    let expected = match mode {
+                        Some(QueryMode::Partial) => {
+                            vec![EmbedderTierTag::Fast, EmbedderTierTag::Quality]
+                        }
+                        Some(QueryMode::Lexical) => vec![],
+                        _ => vec![EmbedderTierTag::Fast],
+                    };
+                    assert_eq!(requested, expected);
+                    let response = frames(&output);
+                    assert_eq!(
+                        response.len(),
+                        if mode == Some(QueryMode::Partial) {
+                            2
+                        } else {
+                            1
+                        }
+                    );
+                    for frame in &response {
+                        assert_eq!(frame["event"], "results");
+                        assert_eq!(frame["topology"], "partial_quality");
+                        assert_eq!(frame["authority"], serde_json::json!(selected.authority));
+                        assert_eq!(frame["quality_coverage"]["quality_documents"], 1);
+                        assert_eq!(frame["quality_coverage"]["total_documents"], 3);
+                        assert_eq!(frame["quality_coverage"]["parts_per_million"], 333_333);
+                        assert!(
+                            frame["results"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|result| result["doc_id"] == "fast-only")
+                        );
+                    }
+                    if mode == Some(QueryMode::Partial) {
+                        assert_eq!(response[0]["phase"], "initial");
+                        assert_eq!(response[1]["phase"], "refined");
+                    }
+                }
+                for mode in [QueryMode::Full, QueryMode::Quality] {
+                    let query = partial_search_options(&options.receipt, Some(mode));
+                    let before = calls(&fast, &quality);
+                    let mut output = Vec::new();
+                    assert!(
+                        search_with_loader(&cx, &query, &mut output, |_| {
+                            panic!("incompatible coverage must refuse before model loading")
+                        })
+                        .await
+                        .is_err()
+                    );
+                    assert!(output.is_empty());
+                    assert_eq!(calls(&fast, &quality), before);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn partial_quality_warm_session_advertises_modes_and_keeps_filters_pinned() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (_, selected) = publish_partial_cli(&cx, &parent, &fast, &quality, false).await;
+            let root = admit_root(&selected.root).unwrap();
+            let snapshot = selected
+                .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                .unwrap();
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                selected.clone(),
+                snapshot,
+                models(&fast, &quality),
+                (3, DEFAULT_IMAGE_BYTES),
+                false,
+            )
+            .unwrap()
+            .with_filter(
+                &cx,
+                Some(Filter::parse(r#"{"ids":["fast-only","quality"]}"#).unwrap()),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap();
+            let response = exchange(&cx, &mut session, &[
+                serde_json::json!({"id":"default", "query":"retry", "stream":true}),
+                serde_json::json!({"id":"covered", "query":"retry", "mode":"partial", "stream":true,
+                    "filter":{"ids":["quality","garden"]}}),
+                serde_json::json!({"id":"uncovered", "query":"retry", "mode":"partial", "stream":true,
+                    "filter":{"ids":["fast-only","garden"]}}),
+            ]).await;
+            assert_eq!(response.len(), 6);
+            let ready = &response[0];
+            assert_eq!(ready["event"], "ready");
+            assert_eq!(ready["topology"], "partial_quality");
+            assert_eq!(ready["default_mode"], "fast");
+            assert_eq!(
+                ready["query_modes"],
+                serde_json::json!(["fast", "partial", "lexical"])
+            );
+            assert_eq!(ready["progressive_available"], true);
+            assert_eq!(ready["scope"]["eligible_documents"], 2);
+            assert_eq!(response[1]["id"], "default");
+            assert_eq!(response[1]["mode"], "fast");
+            assert_eq!(response[1]["phase"], "initial");
+            assert_eq!(response[1]["results"].as_array().unwrap().len(), 2);
+            for (frames, request_id, expected_id) in [
+                (&response[2..4], "covered", "quality"),
+                (&response[4..6], "uncovered", "fast-only"),
+            ] {
+                assert_eq!(frames[0]["phase"], "initial");
+                assert_eq!(frames[1]["phase"], "refined");
+                for frame in frames {
+                    assert_eq!(frame["event"], "results");
+                    assert_eq!(frame["id"], request_id);
+                    assert_eq!(frame["mode"], "partial");
+                    assert_eq!(frame["scope"]["eligible_documents"], 1);
+                    let results = frame["results"].as_array().unwrap();
+                    assert_eq!(results.len(), 1);
+                    assert_eq!(results[0]["doc_id"], expected_id);
+                }
+            }
+            for frame in &response {
+                assert_eq!(frame["authority"], serde_json::json!(selected.authority));
+                assert_eq!(frame["quality_coverage"]["quality_documents"], 1);
+                assert_eq!(frame["quality_coverage"]["total_documents"], 3);
+                assert_eq!(frame["quality_coverage"]["parts_per_million"], 333_333);
+            }
+            let before = calls(&fast, &quality);
+            let refused = exchange(
+                &cx,
+                &mut session,
+                &[
+                    serde_json::json!({"id":"full", "query":"retry", "mode":"full"}),
+                    serde_json::json!({"id":"quality", "query":"retry", "mode":"quality"}),
+                ],
+            )
+            .await;
+            assert_eq!(refused.len(), 3);
+            for frame in &refused[1..] {
+                assert_eq!(frame["event"], "failed");
+                assert_eq!(frame["code"], "complete_quality_coverage_required");
+            }
+            assert_eq!(calls(&fast, &quality), before);
+            assert_eq!(session.receipt.authority, selected.authority);
+            assert_eq!(session.scope.as_ref().unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn partial_quality_cli_rejects_forged_coverage_and_unsupported_mutation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (options, selected) =
+                publish_partial_cli(&cx, &parent, &fast, &quality, false).await;
+            let authority_before = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            for count in [0, 2, 3] {
+                let mut forged = selected.clone();
+                forged.quality_documents = Some(count);
+                assert!(forged.open(&cx, DEFAULT_IMAGE_BYTES).is_err(), "{count}");
+            }
+            let changes = parent.join("edits.jsonl");
+            fs::write(&changes, b"{\"op\":\"delete\",\"id\":\"quality\"}\n").unwrap();
+            let update = update_options(&parent, &options.receipt, "forbidden-update", &changes, 8);
+            let before = calls(&fast, &quality);
+            let mut output = Vec::new();
+            assert!(
+                update_generation_with_loader(&cx, &update, &mut output, |_| {
+                    panic!("unsupported partial mutation must refuse before model loading")
+                })
+                .await
+                .is_err()
+            );
+            assert!(output.is_empty());
+            assert!(!update.work.as_ref().unwrap().exists());
+            assert!(!update.receipt.exists());
+            let mut rebuild = parse(&retained_rebuild_arguments()).unwrap().unwrap();
+            rebuild.from_receipt = Some(options.receipt.clone());
+            rebuild.work = Some(parent.join("forbidden-rebuild-work"));
+            rebuild.receipt = parent.join("forbidden-rebuild.json");
+            assert!(
+                rebuild_with_loader(&cx, &rebuild, &mut output, |_| {
+                    panic!("unsupported partial rebuild must refuse before model loading")
+                })
+                .await
+                .is_err()
+            );
+            assert!(!rebuild.work.as_ref().unwrap().exists());
+            assert!(!rebuild.receipt.exists());
+            let mut repair_options = parse(&[
+                "authority-repair",
+                "--from-receipt",
+                "selected.json",
+                "--work-dir",
+                "repair-work",
+                "--receipt",
+                "repaired.json",
+                "--retrieval",
+                "exact",
+            ])
+            .unwrap()
+            .unwrap();
+            repair_options.from_receipt = Some(options.receipt.clone());
+            repair_options.work = Some(parent.join("forbidden-repair-work"));
+            repair_options.receipt = parent.join("forbidden-repair.json");
+            let repair_error = repair::run(&cx, &repair_options, &mut output, None)
+                .await
+                .expect_err("unsupported partial repair must refuse");
+            assert!(
+                repair_error
+                    .to_string()
+                    .contains("partial_quality_mutation_unsupported")
+            );
+            assert!(!repair_options.work.as_ref().unwrap().exists());
+            assert!(!repair_options.receipt.exists());
+            assert!(output.is_empty());
+            assert_eq!(calls(&fast, &quality), before);
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority_before
+            );
+            selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+        });
+    }
+
     #[test]
     fn retained_rebuild_preserves_independent_tier_precision_and_retrieval_without_migration() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -8084,7 +8618,7 @@ mod progressive_authority {
                         match requested_mode {
                             QueryMode::Fast => vec![EmbedderTierTag::Fast],
                             QueryMode::Quality => vec![EmbedderTierTag::Quality],
-                            QueryMode::Full =>
+                            QueryMode::Full | QueryMode::Partial =>
                                 vec![EmbedderTierTag::Fast, EmbedderTierTag::Quality],
                             QueryMode::Lexical => vec![],
                         }
@@ -9054,7 +9588,7 @@ mod progressive_authority {
                         match query_mode {
                             QueryMode::Fast => vec![EmbedderTierTag::Fast],
                             QueryMode::Quality => vec![EmbedderTierTag::Quality],
-                            QueryMode::Full =>
+                            QueryMode::Full | QueryMode::Partial =>
                                 vec![EmbedderTierTag::Fast, EmbedderTierTag::Quality],
                             QueryMode::Lexical => vec![],
                         }
@@ -9227,6 +9761,7 @@ mod progressive_authority {
                     QueryMode::Fast => (2, 0),
                     QueryMode::Quality => (0, 2),
                     QueryMode::Full => (2, 2),
+                    QueryMode::Partial => unreachable!("this fixture selects complete coverage"),
                     QueryMode::Lexical => unreachable!("index construction requires a producer"),
                 };
                 assert_eq!(calls(&fast, &quality), initial_calls);
@@ -9566,6 +10101,8 @@ mod progressive_authority {
                         QueryMode::Fast => (before.0 + 3, before.1),
                         QueryMode::Quality => (before.0, before.1 + 3),
                         QueryMode::Full => (before.0 + 3, before.1 + 3),
+                        QueryMode::Partial =>
+                            unreachable!("this fixture selects complete coverage"),
                         QueryMode::Lexical =>
                             unreachable!("index construction requires a producer"),
                     },

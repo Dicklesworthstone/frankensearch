@@ -651,6 +651,9 @@ fn authority_primary_reranking_uses_only_selected_owners_and_retained_source_sco
                     NativeGenerationTopology::FastOnly => &["fast"],
                     NativeGenerationTopology::QualityOnly => &["quality"],
                     NativeGenerationTopology::FullProgressive => &["fast", "quality"],
+                    NativeGenerationTopology::PartialQuality { .. } => {
+                        unreachable!("this fixture selects complete coverage")
+                    }
                 };
                 for &mode in modes {
                     let mut buffered_results = None;

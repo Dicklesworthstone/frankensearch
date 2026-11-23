@@ -341,6 +341,7 @@ impl NativeGenerationVectorSource {
             metadata_bytes,
             retrieval: primary_policy,
             quality_retrieval: quality_policy,
+            coverage: frankensearch_index::vector_cohort::VectorCohortCoverage::Complete,
             max_image_bytes,
         })
     }

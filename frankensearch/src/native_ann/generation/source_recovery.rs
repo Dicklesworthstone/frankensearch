@@ -24,7 +24,10 @@ use frankensearch_quill::{
 };
 use sha2::{Digest as _, Sha256};
 
-use super::{NativeGenerationTopology, checkpoint, lower_hex, refused, validate_artifact_metadata};
+use super::{
+    NATIVE_QUALITY_COVERAGE_KEY, NativeGenerationTopology, checkpoint, lower_hex, refused,
+    validate_artifact_metadata,
+};
 use crate::{Cx, IndexableDocument, SearchResult};
 
 /// Authenticated source from an explicitly selected, possibly damaged generation.
@@ -366,6 +369,15 @@ fn admit_source_components(
     checkpoint(cx, "native_ann.generation.recovery_metadata")?;
     let metadata: GenerationManifest = serde_json::from_slice(metadata_bytes)
         .map_err(|_| refused("source-recovery", "invalid-metadata-json"))?;
+    if metadata.metadata.contains_key(NATIVE_QUALITY_COVERAGE_KEY) {
+        // This recovery builder always re-embeds every source in every tier.
+        // It has no explicit quality-subset membership/reuse contract, and must
+        // not silently turn a partial generation into a complete one.
+        return Err(refused(
+            "source-recovery",
+            "partial-quality-repair-unsupported",
+        ));
+    }
     let tier_count = if quality.is_some() { 2 } else { 1 };
     if metadata.vector_artifacts.len() != tier_count
         || metadata.lexical_artifacts.len() != 1
@@ -776,6 +788,46 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn partial_quality_source_cannot_be_repaired_as_complete_coverage() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture(&cx, EmbedderTierTag::Fast, true).await;
+            let mut metadata = fixture.built.metadata().clone();
+            metadata.metadata.insert(
+                NATIVE_QUALITY_COVERAGE_KEY.to_owned(),
+                "partial_quality".to_owned(),
+            );
+            metadata.manifest_hash =
+                frankensearch_core::generation::compute_manifest_hash(&metadata).unwrap();
+            let metadata = serde_json::to_vec(&metadata).unwrap();
+            let manifest = reseal(
+                &fixture,
+                &metadata,
+                fixture.candidate.manifest().source_checkpoint_sha256(),
+                fixture.candidate.manifest().document_set_sha256(),
+            );
+            let error = fixture
+                .admit_images(
+                    &cx,
+                    &manifest,
+                    fixture
+                        .built
+                        .component_bytes(GenerationComponentRole::Lexical)
+                        .unwrap(),
+                    &metadata,
+                    BUDGET,
+                )
+                .err()
+                .expect("source-only repair cannot invent full quality membership");
+            assert!(
+                matches!(error, crate::SearchError::InvalidConfig { value, .. }
+                if value == "partial-quality-repair-unsupported")
+            );
+            assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]

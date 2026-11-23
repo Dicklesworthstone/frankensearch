@@ -119,8 +119,10 @@ metadata, and optional native HNSW graphs. `authority-search`
 reopens the exact authority named by the saved receipt and searches the retained
 vector and lexical images together, including deferred result metadata.
 
-Choose `--tier fast`, `--tier quality`, or `--tier full`. Full generations contain
-both complete tiers. `--retrieval exact|hnsw` selects the vector search policy for
+Choose `--tier fast`, `--tier quality`, `--tier full`, or explicit `--tier partial`
+with `--quality-ids`. Full generations contain both complete tiers; partial
+generations retain the complete fast corpus and the selected quality subset.
+`--retrieval exact|hnsw` selects the vector search policy for
 every stored tier; new indexes default to `exact`. HNSW uses the native engine's
 default parameters and deterministic seed 42. Graphs are published through the
 optional ANN component. For a full generation, a versioned image contains each
@@ -233,6 +235,62 @@ are counted once. No new authority pointer or publication protocol is introduced
 The optional full ANN image similarly retains each tier's original native graph
 with an independent metadata receipt. A graph for one tier cannot be reinterpreted
 as the other tier's graph, even when the dimensions agree.
+
+### Publish and search an explicit quality subset
+
+A quality tier can cover a selected subset while the fast and lexical tiers
+retain the complete source. This is useful when only part of a corpus has been
+selected for the more expensive quality model. The subset is an explicit build
+input; inference errors still fail the build instead of silently dropping IDs.
+
+```sh
+./target/release/frankensearch-native authority-index \
+  --root /absolute/private/search/partial-root \
+  --work-dir /absolute/private/search/partial-work \
+  --receipt /absolute/private/search/partial.json \
+  --tier partial --quality-ids '["document-a","document-b"]' \
+  --source-low 1 --source-high 42 --cooperative-local \
+  --input ./documents.jsonl --model-dir /absolute/path/to/installed/models
+./target/release/frankensearch-native authority-search \
+  --receipt /absolute/private/search/partial.json \
+  --model-dir /absolute/path/to/installed/models \
+  --mode partial --query 'retry network requests' --stream
+```
+
+`--quality-ids` must contain unique, existing document IDs and select a nonempty
+proper subset of the input. Empty quality belongs to `--tier fast`; full quality
+belongs to `--tier full`. Invalid selections fail before document inference or
+creation of the work directory. Both providers retain complete independent
+identities and can have different dimensions. `--retrieval hnsw` builds each graph
+against its actual vector owner, including the smaller quality document set.
+
+The selection receipt uses `frankensearch.native.authority-selection.v4` and
+records `quality_documents` separately from total `documents`. Admission derives
+both live counts from the retained images and rejects a forged receipt count.
+FSVC v2 and FSAC v2 distinguish partial coverage from the strict full-coverage v1
+formats. The full fast document set still anchors the lexical and metadata join;
+no source documents or placeholder vectors are invented to claim full quality.
+
+Partial receipts default to fast search. `--mode partial` explicitly retrieves
+and fuses quality candidates, with `initial` and `refined` streaming phases over
+one retained generation. Full and direct quality modes refuse this topology.
+Filters, total query deadlines, optional reranking, and warm query caching retain
+their existing contracts. Responses identify `topology: "partial_quality"` and
+report actual quality and total document counts plus coverage in parts per million.
+Full-query tuning remains restricted to complete full generations.
+
+`authority-serve` retains both producers and accepts `"mode":"partial"` explicitly;
+its default remains fast. Source fetch, lexical search, publication-attempt
+recovery, and retained rollback use the complete admitted source. Partial sources
+currently refuse update, rebuild, repair, and model activation; these operations
+need an explicit policy for preserving or changing the subset. Quality completion
+continues to require a fast-only source. Sharded authority generations remain
+unsupported.
+
+Library callers use `build_partial_quality_generation(&cx, source, quality_ids,
+max_image_bytes)`, `NativeGenerationSnapshot::admit_partial_quality`, and
+`search_progressive_with_partial_quality` (including pool and scoped variants).
+The existing full-coverage methods continue to require complete quality coverage.
 
 ### Rerank an individual authority tier
 
@@ -1392,7 +1450,8 @@ expose the independent quality policy through `quality_retrieval_configuration()
 this returns `Some(NativeBuildRetrieval::Exact)` for an exact quality tier and
 `None` for a single-tier generation. This route admits a single exact or HNSW
 tier, or a complete fast/quality pair with either policy chosen independently.
-Partial or sharded authority descriptors remain unsupported.
+Explicit partial-quality authority generations use the separate APIs and
+contracts described above. Sharded authority descriptors remain unsupported.
 
 ## Native quality without the ONNX feature bundle
 
