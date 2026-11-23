@@ -843,6 +843,30 @@ PY
     FAILURES=$((FAILURES + 1))
   fi
 
+  # Artifact URLs must be rejected before even calling the network downloader.
+  local scheme curl_marker
+  mkdir "$work/no-network"
+  cat >"$work/no-network/curl" <<'SH'
+#!/bin/sh
+printf 'curl called\n' >>"$FSFS_TEST_CURL_MARKER"
+exit 97
+SH
+  chmod +x "$work/no-network/curl"
+  for scheme in gopher HTTPS; do
+    curl_marker="$work/curl-$scheme.log"
+    status=0
+    output=$(env "PATH=$work/no-network:$PATH" "FSFS_TEST_CURL_MARKER=$curl_marker" \
+      "${base_cmd[@]:1}" --artifact-url "$scheme://127.0.0.1:9/archive.tar.gz" 2>&1) || status=$?
+    after_digest=$(installer_file_digest "$dest/fsfs")
+    if [[ "$status" -ne 0 && "$output" == *"install.preflight.offline_artifact_required"* \
+      && ! -e "$curl_marker" && "$before_digest" == "$after_digest" ]]; then
+      echo "[installer][OK]   offline $scheme artifact refused before curl or replacement"
+    else
+      echo "[installer][FAIL] offline $scheme artifact status=$status output=${output:-<empty>}"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
+
   # 8. The regular path still provisions both selected models before replacing
   # the incumbent. Local archive and model-command fixtures keep this offline.
   status=0

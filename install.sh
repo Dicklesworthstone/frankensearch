@@ -491,8 +491,10 @@ check_offline_preconditions() {
       err "install.preflight.offline_artifact_required: --offline needs --artifact-url pointing at a locally available archive"
       return 1
       ;;
-    http://*|https://*|ftp://*)
-      err "install.preflight.offline_artifact_required: --artifact-url $artifact_url is a network URL; --offline needs a local path or file:// URL"
+    file://*) ;;
+    *://*)
+      # Match the downloader: every other URL scheme is passed to curl.
+      err "install.preflight.offline_artifact_required: --offline needs --artifact-url to be a local path or file:// URL"
       return 1
       ;;
   esac
