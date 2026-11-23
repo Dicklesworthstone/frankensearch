@@ -163,6 +163,12 @@ Quill conformance and performance program.
   A fresh build of the unchanged canary corpus produced byte-identical fast
   and quality FSVI files and both matching trailers across the development
   builds. See `codec-equivalence/index.stdout` in the new evidence root.
+- All 18 stock quality stages passed locally on clean `850f03f8`. The
+  four-model CLI suite passed 25 cases. The source quickstart used the same
+  optimized development executable as the watch probe, passed 12 commands
+  and 22 controls, and left no owned processes. The repair landed on top of
+  a bridge-plan-only commit with identical build inputs. See `dev-gate.log`
+  and `tmp/fsfs-quickstart.zBNxUxFy/receipt.json` in the new evidence root.
 - Tested the upstream single-block plan cache in isolation with two real
   1,720-symbol vector payloads. Both packet streams matched the current codec
   for all eight comparisons, including edits that changed packet bytes. The
@@ -346,7 +352,7 @@ Quill conformance and performance program.
   directly with those from the old executable for the same source payload.
 - [x] Reject persisted-result timings as loader samples. Time entry and
   return across five fresh development CLI processes with separate caches.
-- [ ] Finish the stock quality gate on `850f03f8` and publish the development
+- [x] Finish the stock quality gate on `850f03f8` and publish the development
   repair with its scoped diagnostic evidence.
 - [x] Repeat live code-corpus watch with the exact current release-profile
   build in both orders. Check fresh index, unchanged rerun, publication,
