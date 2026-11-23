@@ -150,6 +150,55 @@ Quill conformance and performance program.
   The incomplete successor had written the 7,041,536-byte fast FSVI without
   its repair sidecar. This identifies where to instrument a release-profile
   watch and cancellation test. See `watch-profile/{hotspots,time}.log`.
+- `850f03f8` aligns the development RaptorQ optimization level with the
+  existing test dependency profile. On the same 582-file workload, it
+  published the first edit in 40.1 s and three warm edits in 20.2–20.4 s under
+  the original 90 s guard. The daemon and direct reader saw the new tokens,
+  the old tokens disappeared, and both owned processes exited cleanly. A
+  separate CLI repaired a deliberately damaged copy of the old 7,041,536-byte
+  FSVI from its old trailer. The repaired bytes matched the original SHA-256
+  and a fresh reader found the canary. Corrupting the trailer itself refused
+  repair and preserved selection. See `cw-dev2/receipt.json` in the earlier
+  evidence root and `recovery.log` under `/data/tmp/fs-watch-20261123.6JJWHe`.
+  A fresh build of the unchanged canary corpus produced byte-identical fast
+  and quality FSVI files and both matching trailers across the development
+  builds. See `codec-equivalence/index.stdout` in the new evidence root.
+- Tested the upstream single-block plan cache in isolation with two real
+  1,720-symbol vector payloads. Both packet streams matched the current codec
+  for all eight comparisons, including edits that changed packet bytes. The
+  observed release-profile encoding time was already tens of milliseconds.
+  Those timings do not justify adding a production cache for the measured
+  watch workload. See `codec-parity.log` in the new evidence root.
+- Timed the actual Potion loader at its entry and return under GDB. Five
+  fresh development CLI processes used separate store and client-cache
+  copies and each returned the planted semantic hit. The loader span ranged
+  from 1,083 to 1,104 ms, with a 1,096 ms median. An earlier repeated-query
+  run yielded only one loader sample because the other processes reused the
+  persisted result. Both traces are retained under `fast-loader*` in the
+  new evidence root. The booked-host release loader measurements remain due.
+- A stock release-profile build of `b943ae4d`, executable SHA-256
+  `d91dc3f5b3ad711e6367ff963ec215a4e449b5ed61f4e59ee058176d19254afb`,
+  and signed 1.13.0 both passed the 582-file watch probe in both execution
+  orders. All 16 edits advanced selection, crossed the live daemon and
+  direct-reader checks, and preserved the latest hit after watch stopped.
+  Current warm edits reached the daemon in 2.06–2.98 s. The signed arm's
+  warm edits took 2.21–4.75 s, with substantial host-load variation. Across
+  the watched 7 MB fast vector files, protection spans ranged from 48 to
+  156 ms. GNU time's peak child RSS was 995,232–995,684 KiB for signed and
+  999,180–999,676 KiB for current. Both retained about 75.1 MB of logical
+  store bytes. See `release-product{,-ba}.log`, `watch-*.time`, and
+  `cw-{rel,sign}-r{2,3}/receipt.json`. The dedicated benchmark host was busy
+  at preflight. These runs used the shared Linux build host.
+- With the same two release binaries on the 1,000-file fixture, each arm in
+  each execution order completed six cold queries, 50 distinct warm queries
+  and six buffered cache hits. All cold and warm queries reached Refined.
+  Median Initial results were 2.39–2.50 ms current and 12.73–13.05 ms signed.
+  Median Refined results were 9.24–10.30 ms current and 20.04–20.66 ms signed.
+  Cached replies were 2.51–3.20 ms current and 12.85–13.14 ms signed. Watch
+  ordering reversed between the two runs. Median edit visibility was
+  2.70 s current and 1.95 s signed in the first order, then 2.07 s current
+  and 2.40 s signed in the reverse order. Keep these comparisons scoped to
+  shared-host diagnostics. See `pair-r{2,3}/*/receipt.json`.
 
 ### Vision checklist
 
@@ -285,8 +334,26 @@ Quill conformance and performance program.
 - [x] Retain the debug watch timeout and verify both owned processes stopped.
 - [x] Sample the stalled startup on a scratch copy and locate the RaptorQ
   activity for the release-profile investigation.
-- [ ] Repeat the code-corpus watcher on the qualified current release-profile
-  build. Profile initial reconciliation and cancellation if it repeats the miss.
+- [x] Check that the stalled edit changed the FSVI digest. Preserve recovery
+  by encoding a fresh trailer and keep the dependency's development checks.
+- [x] Re-run the development watcher with the package optimization enabled.
+  Keep the startup and shutdown guards and compare four live generations.
+- [x] Restore the original FSVI from its previous development-profile
+  trailer, then use a damaged trailer to check refusal and selection stability.
+- [x] Check packet equality and cold and warm cost of upstream plan reuse on
+  two real same-size FSVI payloads before considering a production cache.
+- [x] Compare both development-generated FSVI files and repair trailers
+  directly with those from the old executable for the same source payload.
+- [x] Reject persisted-result timings as loader samples. Time entry and
+  return across five fresh development CLI processes with separate caches.
+- [ ] Finish the stock quality gate on `850f03f8` and publish the development
+  repair with its scoped diagnostic evidence.
+- [x] Repeat live code-corpus watch with the exact current release-profile
+  build in both orders. Check fresh index, unchanged rerun, publication,
+  reader parity, shutdown, protector span and retained bytes.
+- [x] Repeat the 1,000-file release comparison in both orders. Verify cold
+  and warm terminal phases, buffered cache hits, planted ranking and five
+  watcher edits per executable. Preserve the reversal in watch timing.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
   independent fast and quality load times, peak RSS, per-generation disk
