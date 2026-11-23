@@ -483,6 +483,23 @@ Quill conformance and performance program.
   also reopened the successor and returned the same refined records. See
   `mac-native-existing-gate.log`, `mac-current-fixture.log`,
   `mac-predecessor-artifacts.log`, and `mac-signed-reopen.json` in that root.
+- Both real-model recovery cases passed on `e01c6517`, outside the previous
+  stock gate. `64d970bb` adds them to the stock `e2e` stage and exercises both
+  recovery entry points. Trusted-receipt hybrid restore returned the refined
+  `alpha.md` result through a fresh direct process after the source moved.
+  With all four registered models verified offline, the Linux stage passed
+  26 quickstart and nine recovery cases with zero ignores. A separate check
+  used the installed `2a5bb819` binary with an invalid fast producer. It
+  prepared and resumed a quality-only generation, returned `alpha.md` with a
+  semantic rank after the source moved, and preserved all 13 SHA-256 hashes.
+  Tracing recorded zero IP connections across the three CLI processes. See
+  `recovery-baseline.log`, `recovery-gate.log`, and `installed-quality.log`
+  under `/data/tmp/fsfs-recovery-lane.VfQeeXyb`. The same clean revision
+  passed formatting, workspace all-targets compilation, all three strict
+  lint stages and the default fsfs suite (3,911 passes, 40 standard ignores).
+  See `recovery-workspace-gate.log` in the same directory. This qualifies
+  cooperative generation recovery. The fixed-authority, CASS, retention,
+  and fault-matrix milestones remain open.
 
 ### Vision checklist
 
@@ -751,6 +768,16 @@ Quill conformance and performance program.
     cross-process reuse there.
 - [ ] Advance retained FSVI v2 authority and recovery, then exercise CASS,
   native and ordinary CLI and facade restart cases.
+  - [x] Check the installed CLI's quality-only prepare, resume, and fresh search
+    with the source unavailable and the fast producer deliberately invalid.
+  - [x] Run both existing real-model recovery cases on the published baseline.
+  - [x] Exercise both executable recovery entry points and verify the restored
+    hybrid ranking through a fresh direct search.
+  - [x] Include the two real-model recovery cases in the stock CLI gate and
+    run the complete affected stage against verified models.
+  - [x] Check workspace compilation, strict lint, formatting, and the default
+    fsfs suite on the candidate source.
+  - [x] Record the scoped result on `bd-p6z6.4` and publish the qualification.
 - [ ] Resolve Quill R1 and union-horizon witnesses. Run full and scaled
   differential suites, then the competitive workloads with live Tantivy.
 
