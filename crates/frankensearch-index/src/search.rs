@@ -32,7 +32,7 @@ const INT8_PARALLEL_CHUNK_SIZE: usize = PARALLEL_CHUNK_SIZE * 4;
 /// the measured 5% regression.
 const GATHER_SELECTIVITY_DIVISOR: usize = 50;
 /// Bound work between cooperative checks independently of Rayon chunk tuning.
-const SCAN_CHECKPOINT_INTERVAL: usize = 256;
+pub(crate) const SCAN_CHECKPOINT_INTERVAL: usize = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -43,7 +43,7 @@ thread_local! {
 /// The raw numeric API keeps its existing noncancellable kernel. Retained-tier
 /// callers instantiate the same traversal with their context, so cancellation
 /// cannot accidentally select a different scorer or visibility policy.
-trait ScanCancellation: Copy + Send + Sync {
+pub(crate) trait ScanCancellation: Copy + Send + Sync {
     fn checkpoint(self) -> SearchResult<()>;
 
     #[inline]
@@ -56,7 +56,7 @@ trait ScanCancellation: Copy + Send + Sync {
 }
 
 #[derive(Clone, Copy)]
-struct UncancelledScan;
+pub(crate) struct UncancelledScan;
 
 impl ScanCancellation for UncancelledScan {
     #[inline]
@@ -1785,7 +1785,7 @@ impl VectorIndex {
         Ok(positions)
     }
 
-    fn hash_range(&self, hash: u64) -> SearchResult<Option<(usize, usize)>> {
+    pub(crate) fn hash_range(&self, hash: u64) -> SearchResult<Option<(usize, usize)>> {
         let count = self.record_count();
         let start = self.lower_bound_hash(hash, 0, count)?;
         if start == count || self.record_at(start)?.doc_id_hash != hash {

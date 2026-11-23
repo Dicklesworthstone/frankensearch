@@ -3742,7 +3742,8 @@ impl TwoTierSearcher {
             // has no identity. An empty pool validates width without scoring
             // any vector. Identity and cancellation above still take priority
             // over this no-signal outcome, including a foreign zero response.
-            self.index.quality_scores_for_hits(&quality_vec, &[])?;
+            self.index
+                .quality_scores_for_hits_cancellable(cx, &quality_vec, &[])?;
             cancellation_checkpoint(cx, "quality_zero_signal_to_skip")?;
             return Ok(Phase2Outcome::SkippedZeroSignal);
         }
@@ -3989,7 +3990,7 @@ impl TwoTierSearcher {
             SemanticAdmission::OwnerBacked { quality: false }
             | SemanticAdmission::LegacyUnidentified => QualityPool::RescoredFastPool(
                 self.index
-                    .quality_scores_for_hits(&quality_vec, &fast_hits)?,
+                    .quality_scores_for_hits_cancellable(cx, &quality_vec, &fast_hits)?,
             ),
         };
         if request_filter.is_active() && matches!(quality_pool, QualityPool::RescoredFastPool(_)) {
@@ -4017,7 +4018,8 @@ impl TwoTierSearcher {
             // these score-only observations must not inflate its contribution.
             complete_quality_evidence(&fast_hits, hits, |missing| {
                 cancellation_checkpoint(cx, "quality_search_to_candidate_evidence")?;
-                self.index.quality_scores_for_hits(&quality_vec, missing)
+                self.index
+                    .quality_scores_for_hits_cancellable(cx, &quality_vec, missing)
             })?;
         }
         if let Some(coverage) = quality_coverage.as_ref() {

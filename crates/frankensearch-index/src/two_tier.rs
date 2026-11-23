@@ -33,7 +33,10 @@ use crate::native_hnsw::{
     HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
     native_hnsw_generation_receipt_path,
 };
-use crate::search::{classified_candidates, deduplicate_ranked_hits, query_zero_signal};
+use crate::search::{
+    ScanCancellation, UncancelledScan, classified_candidates, deduplicate_ranked_hits,
+    query_zero_signal,
+};
 use crate::{
     ClassifiedHits, FsviAdmissionError, FsviUpgradeRequired, FsviV2IdentityBinding, Quantization,
     SearchParams, ValidatedFsviBytes, VectorIndex, VectorMetadata, dot_product_f32_f32,
@@ -2085,8 +2088,38 @@ impl TwoTierIndex {
         query_vec: &[f32],
         hits: &[VectorHit],
     ) -> SearchResult<Vec<Option<f32>>> {
+        self.quality_scores_for_hits_controlled(query_vec, hits, UncancelledScan)
+    }
+
+    /// Compute the same quality evidence with cooperative cancellation.
+    ///
+    /// WAL resolution, duplicate recovery and scoring observe the caller's
+    /// context. Cancellation returns an error instead of a partial score batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::quality_scores_for_hits`], plus
+    /// [`SearchError::Cancelled`] when the caller cancels during completion.
+    pub fn quality_scores_for_hits_cancellable(
+        &self,
+        cx: &Cx,
+        query_vec: &[f32],
+        hits: &[VectorHit],
+    ) -> SearchResult<Vec<Option<f32>>> {
+        self.quality_scores_for_hits_controlled(query_vec, hits, cx)
+    }
+
+    fn quality_scores_for_hits_controlled(
+        &self,
+        query_vec: &[f32],
+        hits: &[VectorHit],
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<Vec<Option<f32>>> {
+        cancel.checkpoint()?;
         let Some(quality_index) = self.quality_tier() else {
-            return Ok(vec![None; hits.len()]);
+            let scores = vec![None; hits.len()];
+            cancel.checkpoint()?;
+            return Ok(scores);
         };
 
         if query_vec.len() != quality_index.dimension() {
@@ -2097,6 +2130,7 @@ impl TwoTierIndex {
         }
 
         if hits.is_empty() {
+            cancel.checkpoint()?;
             return Ok(Vec::new());
         }
 
@@ -2109,13 +2143,16 @@ impl TwoTierIndex {
         let wal_latest: HashMap<&str, usize> = {
             let mut m = HashMap::with_capacity(quality_index.wal_entries.len());
             for (i, entry) in quality_index.wal_entries.iter().enumerate() {
+                cancel.checkpoint_at(i)?;
                 m.insert(entry.doc_id.as_str(), i);
             }
             m
         };
 
+        cancel.checkpoint()?;
         let mut scores = Vec::with_capacity(hits.len());
-        for hit in hits {
+        for (offset, hit) in hits.iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
             if let Some(&i) = wal_latest.get(hit.doc_id.as_str()) {
                 let embedding = &quality_index.wal_entries[i].embedding;
                 let score = if crate::vector_signal_usable(embedding) {
@@ -2137,7 +2174,8 @@ impl TwoTierIndex {
             } else {
                 None
             };
-            let quality_row = usable_main_row_for_doc_id(quality_index, &hit.doc_id, mapped)?;
+            let quality_row =
+                usable_main_row_for_doc_id_controlled(quality_index, &hit.doc_id, mapped, cancel)?;
             let score = match quality_row {
                 Some(row) => {
                     let score = quality_index.dot_query_at(row, query_vec)?;
@@ -2147,6 +2185,7 @@ impl TwoTierIndex {
             };
             scores.push(score);
         }
+        cancel.checkpoint()?;
         Ok(scores)
     }
 
@@ -2572,38 +2611,42 @@ fn usable_main_row_for_doc_id(
     doc_id: &str,
     preferred: Option<usize>,
 ) -> SearchResult<Option<usize>> {
-    let row = match preferred {
-        Some(row) => Some(row),
-        None => index.find_index_by_doc_id(doc_id)?,
-    };
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    if index.vector_has_signal(row)? {
+    usable_main_row_for_doc_id_controlled(index, doc_id, preferred, UncancelledScan)
+}
+
+fn usable_main_row_for_doc_id_controlled(
+    index: &VectorIndex,
+    doc_id: &str,
+    preferred: Option<usize>,
+    cancel: impl ScanCancellation,
+) -> SearchResult<Option<usize>> {
+    cancel.checkpoint()?;
+    if let Some(row) = preferred
+        && index.vector_has_signal(row)?
+    {
         return Ok(Some(row));
     }
 
-    // A damaged physical row does not invalidate its healthy siblings. Only
-    // inspect this hash run, including rows before an unusable aligned row;
-    // ordinary unique-document lookups never scan the rest of the index.
+    // Preserve a usable aligned row above; otherwise select the first live,
+    // usable copy with this exact ID. Binary hash bounds avoid an unchecked
+    // backward walk through an arbitrarily long duplicate or collision run.
     let hash = crate::fnv1a_hash(doc_id.as_bytes());
-    let mut first = row;
-    while first > 0 && index.record_at(first - 1)?.doc_id_hash == hash {
-        first -= 1;
-    }
-    for candidate in first..index.record_count() {
+    let Some((first, end)) = index.hash_range(hash)? else {
+        return Ok(None);
+    };
+    for candidate in first..end {
+        cancel.checkpoint_at(candidate - first)?;
         let entry = index.record_at(candidate)?;
-        if entry.doc_id_hash != hash {
-            break;
-        }
-        if candidate != row
+        if Some(candidate) != preferred
             && !crate::is_tombstoned_flags(entry.flags)
             && index.doc_id_at(candidate)? == doc_id
             && index.vector_has_signal(candidate)?
         {
+            cancel.checkpoint()?;
             return Ok(Some(candidate));
         }
     }
+    cancel.checkpoint()?;
     Ok(None)
 }
 
@@ -4400,6 +4443,168 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cancellable_quality_scores_stop_wal_hit_and_duplicate_work() {
+        use std::sync::Mutex;
+
+        use crate::search::SCAN_CHECKPOINT_INTERVAL;
+        use crate::wal::{WalEntry, append_wal_batch, wal_path_for};
+
+        const ROWS: usize = 4096;
+        const CANCEL_AFTER: usize = 17;
+
+        // Use the exact scan's existing cancellation adapter contract. The
+        // trigger records real traversal work; interval checks stay unchanged.
+        #[derive(Clone, Copy)]
+        struct CancelDuringQualityWork<'a> {
+            cx: &'a Cx,
+            visits: &'a Mutex<usize>,
+        }
+
+        impl ScanCancellation for CancelDuringQualityWork<'_> {
+            fn checkpoint(self) -> SearchResult<()> {
+                ScanCancellation::checkpoint(self.cx)
+            }
+
+            fn checkpoint_at(self, offset: usize) -> SearchResult<()> {
+                {
+                    let mut visits = self.visits.lock().unwrap();
+                    *visits += 1;
+                    if *visits == CANCEL_AFTER {
+                        self.cx.set_cancel_requested(true);
+                    }
+                }
+                ScanCancellation::checkpoint_at(self.cx, offset)
+            }
+        }
+
+        for scenario in ["wal", "hits", "duplicates", "tail"] {
+            let dir = temp_index_dir(&format!("cancel-quality-{scenario}"));
+            fs::create_dir_all(&dir).unwrap();
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            write_index_file(&fast_path, &[("target", &[0.5, 0.5])]).unwrap();
+            if scenario == "duplicates" {
+                let mut writer = VectorIndex::create_with_revision(
+                    &quality_path,
+                    "hash",
+                    "test",
+                    2,
+                    Quantization::F16,
+                )
+                .unwrap();
+                for _ in 0..ROWS {
+                    writer.write_legacy_f16_zero_fixture("target");
+                }
+                writer.finish().unwrap();
+            } else {
+                write_index_file(&quality_path, &[("target", &[0.5, 0.5])]).unwrap();
+            }
+
+            if matches!(scenario, "wal" | "tail") {
+                let count = if scenario == "wal" { ROWS } else { 1 };
+                let entries: Vec<_> = (0..count)
+                    .map(|row| {
+                        let doc_id = if scenario == "tail" {
+                            "target".to_owned()
+                        } else {
+                            format!("wal-{row}")
+                        };
+                        WalEntry {
+                            doc_id_hash: crate::fnv1a_hash(doc_id.as_bytes()),
+                            doc_id,
+                            embedding: vec![0.75, 0.25],
+                        }
+                    })
+                    .collect();
+                append_wal_batch(
+                    &wal_path_for(&quality_path),
+                    &entries,
+                    2,
+                    Quantization::F16,
+                    crate::next_generation(
+                        VectorIndex::peek_compaction_gen(&quality_path).unwrap(),
+                    ),
+                    true,
+                )
+                .unwrap();
+            }
+
+            let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+            let count = match scenario {
+                "hits" => ROWS,
+                // Cancellation lands inside the final short hit batch. All
+                // hits resolve from WAL, so only the final checkpoint can stop
+                // publication of the completed but cancelled score vector.
+                "tail" => CANCEL_AFTER,
+                _ => 1,
+            };
+            let hits = vec![
+                VectorHit {
+                    index: 0,
+                    doc_id: "target".into(),
+                    score: 0.0,
+                };
+                count
+            ];
+            let expected = index.quality_scores_for_hits(&[1.0, 0.0], &hits).unwrap();
+            let score = match scenario {
+                "duplicates" => None,
+                "tail" => Some(0.75),
+                _ => Some(0.5),
+            };
+            assert_eq!(expected, vec![score; count]);
+
+            let cx = Cx::for_testing();
+            let visits = Mutex::new(0);
+            let result = index.quality_scores_for_hits_controlled(
+                &[1.0, 0.0],
+                &hits,
+                CancelDuringQualityWork {
+                    cx: &cx,
+                    visits: &visits,
+                },
+            );
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "{scenario} must return cancellation, never a partial score batch"
+            );
+            let visited = *visits.lock().unwrap();
+            assert!(
+                (CANCEL_AFTER..=CANCEL_AFTER + SCAN_CHECKPOINT_INTERVAL).contains(&visited),
+                "{scenario} continued too much work after cancellation: {visited}"
+            );
+
+            cx.set_cancel_requested(false);
+            let before = cx.checkpoint_state().checkpoint_count;
+            let retried = index
+                .quality_scores_for_hits_cancellable(&cx, &[1.0, 0.0], &hits)
+                .unwrap();
+            assert_eq!(
+                retried, expected,
+                "{scenario} retry must preserve exact scores"
+            );
+            assert!(
+                cx.checkpoint_state().checkpoint_count > before + 2,
+                "{scenario} must traverse with the caller's real context"
+            );
+            assert!(
+                index
+                    .quality_scores_for_hits_cancellable(&cx, &[1.0, 0.0], &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            cx.set_cancel_requested(true);
+            for batch in [&hits[..], &[]] {
+                assert!(matches!(
+                    index.quality_scores_for_hits_cancellable(&cx, &[1.0, 0.0], batch),
+                    Err(SearchError::Cancelled { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn quality_scores_are_none_without_quality_index() {
         let dir = temp_index_dir("no-quality");
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -4432,6 +4637,20 @@ mod tests {
             .quality_scores_for_hits(&[1.0, 0.0], &hits)
             .expect("scores");
         assert_eq!(scores, vec![None, None, None]);
+        let cx = Cx::for_testing();
+        assert_eq!(
+            index
+                .quality_scores_for_hits_cancellable(&cx, &[1.0, 0.0], &hits)
+                .unwrap(),
+            scores
+        );
+        cx.set_cancel_requested(true);
+        for batch in [&hits[..], &[]] {
+            assert!(matches!(
+                index.quality_scores_for_hits_cancellable(&cx, &[1.0, 0.0], batch),
+                Err(SearchError::Cancelled { .. })
+            ));
+        }
     }
 
     /// A crash between the two per-tier installs leaves a mixed-generation
@@ -6834,22 +7053,33 @@ mod tests {
                         doc_id: id.into(),
                     })
                     .collect();
-                assert_eq!(
-                    index.quality_scores_for_hits(&[1.0, 0.0], &hits).unwrap(),
-                    [Some(ranked.hits[0].score), None, None]
-                );
+                for scores in [
+                    index.quality_scores_for_hits(&[1.0, 0.0], &hits),
+                    index.quality_scores_for_hits_cancellable(
+                        &Cx::for_testing(),
+                        &[1.0, 0.0],
+                        &hits,
+                    ),
+                ] {
+                    assert_eq!(scores.unwrap(), [Some(ranked.hits[0].score), None, None]);
+                }
                 // Force the ID lookup fallback as well as the precomputed
                 // cross-tier alignment used by ordinary fast hits.
                 let unaligned = VectorHit {
                     index: u32::MAX,
                     ..hits[0].clone()
                 };
-                assert_eq!(
-                    index
-                        .quality_scores_for_hits(&[1.0, 0.0], &[unaligned])
-                        .unwrap(),
-                    [Some(0.5)]
-                );
+                let unaligned = [unaligned];
+                for scores in [
+                    index.quality_scores_for_hits(&[1.0, 0.0], &unaligned),
+                    index.quality_scores_for_hits_cancellable(
+                        &Cx::for_testing(),
+                        &[1.0, 0.0],
+                        &unaligned,
+                    ),
+                ] {
+                    assert_eq!(scores.unwrap(), [Some(0.5)]);
+                }
             }
         }
     }
@@ -6893,11 +7123,16 @@ mod tests {
                 doc_id: "recovered".into(),
             })
             .collect();
-        assert_eq!(
-            index.quality_scores_for_hits(&[1.0, 0.0], &hits).unwrap(),
-            [Some(0.5), Some(0.0)],
-            "an unusable aligned row can recover an earlier live sibling, while a healthy aligned row keeps its own score"
-        );
+        for scores in [
+            index.quality_scores_for_hits(&[1.0, 0.0], &hits),
+            index.quality_scores_for_hits_cancellable(&Cx::for_testing(), &[1.0, 0.0], &hits),
+        ] {
+            assert_eq!(
+                scores.unwrap(),
+                [Some(0.5), Some(0.0)],
+                "an unusable aligned row can recover an earlier live sibling, while a healthy aligned row keeps its own score"
+            );
+        }
         assert_eq!(
             index.quality_vector_for_doc_id("recovered").unwrap(),
             Some(vec![0.5, 0.5])
@@ -7014,11 +7249,13 @@ mod tests {
                 doc_id: id.into(),
                 score: 1.0,
             };
-            assert_eq!(
-                index.quality_scores_for_hits(&[1.0, 0.0], &[hit]).unwrap(),
-                [expected],
-                "{id}"
-            );
+            let hits = [hit];
+            for scores in [
+                index.quality_scores_for_hits(&[1.0, 0.0], &hits),
+                index.quality_scores_for_hits_cancellable(&Cx::for_testing(), &[1.0, 0.0], &hits),
+            ] {
+                assert_eq!(scores.unwrap(), [expected], "{id}");
+            }
         }
     }
 
