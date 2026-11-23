@@ -19491,6 +19491,20 @@ impl FsfsRuntime {
         budget: Duration,
         poll: Duration,
     ) -> SearchResult<bool> {
+        let refusal = if !contents.is_local() {
+            Some("compactor PID file belongs to a different host")
+        } else if contents.pid == 0 || i32::try_from(contents.pid).is_err() {
+            Some("compactor PID file must name a positive process ID")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            return Err(SearchError::InvalidConfig {
+                field: "daemon.pid_file".into(),
+                value: pid_path.display().to_string(),
+                reason: reason.into(),
+            });
+        }
         if !contents.is_alive() {
             if let Err(error) = fs::remove_file(pid_path)
                 && error.kind() != ErrorKind::NotFound
@@ -69021,9 +69035,8 @@ mod tests {
         assert!(!pid_path.exists(), "stale pid file must be removed");
 
         // Live: a sleeping child stands in for the daemon; SIGTERM ends it.
-        // A reaper thread waits on the child concurrently: a real daemon is
-        // reaped by init, but this child stays a zombie (and therefore
-        // "alive" to kill(pid, 0)) until someone waits on it.
+        // Reap concurrently so this also exercises the signal-probe fallback
+        // on Unix systems without Linux process descriptors.
         let mut live = Command::new("sleep")
             .arg("30")
             .spawn()
@@ -69039,6 +69052,60 @@ mod tests {
             !status.success(),
             "sleep must have died from the signal: {status:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compactor_stop_observes_exit_before_the_parent_reaps_it() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join(super::FSFS_DAEMON_PID_FILE);
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let mut contents = crate::lifecycle::PidFileContents::current("test");
+        contents.pid = child.id();
+        fs::write(&pid_path, serde_json::to_vec(&contents).unwrap()).unwrap();
+        let budget = Duration::from_secs(2);
+        let poll = Duration::from_millis(10);
+
+        let stopped = FsfsRuntime::stop_compaction_daemon(&contents, &pid_path, budget, poll);
+        let cleared = if matches!(&stopped, Ok(false)) {
+            Some(FsfsRuntime::stop_compaction_daemon(&contents, &pid_path, budget, poll))
+        } else {
+            let _ = child.kill();
+            None
+        };
+        let status = child.wait().expect("reap child after both stop calls");
+        assert!(matches!(stopped, Ok(false)), "{stopped:?}");
+        assert!(matches!(cleared, Some(Ok(true))), "{cleared:?}");
+        assert!(!pid_path.exists());
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compactor_stop_does_not_signal_a_pid_from_a_different_host() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join(super::FSFS_DAEMON_PID_FILE);
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let mut contents = crate::lifecycle::PidFileContents::current("test");
+        contents.pid = child.id();
+        contents.hostname.push_str("-foreign");
+        let recorded = serde_json::to_vec(&contents).unwrap();
+        fs::write(&pid_path, &recorded).unwrap();
+
+        let stopped = FsfsRuntime::stop_compaction_daemon(
+            &contents,
+            &pid_path,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        );
+        let still_running = child.try_wait().expect("poll owned child").is_none();
+        let _ = child.kill();
+        child.wait().expect("reap owned child");
+        assert!(still_running);
+        assert!(matches!(stopped, Err(SearchError::InvalidConfig { field, .. }) if field == "daemon.pid_file"));
+        assert_eq!(fs::read(pid_path).unwrap(), recorded);
     }
 
     #[test]

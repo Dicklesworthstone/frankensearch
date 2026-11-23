@@ -1530,17 +1530,51 @@ fn hostname() -> String {
 
 /// Check whether a PID is alive on the local system.
 #[cfg(unix)]
-#[allow(unsafe_code, clippy::cast_possible_wrap)]
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
-    // kill(pid, 0) is the canonical Unix check: returns 0 if the process
-    // exists (or EPERM if we lack permission, which still means alive).
-    // SAFETY: signal 0 does not deliver a signal; it only checks existence.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if ret == 0 {
-        return true;
+    let Some(pid) = positive_pid(pid) else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(alive) = pidfd_process_alive(pid) {
+        return alive;
     }
-    // EPERM means process exists but we can't signal it — still alive.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // A process we lack permission to signal still exists.
+    matches!(
+        rustix::process::test_kill_process(pid),
+        Ok(()) | Err(rustix::io::Errno::PERM)
+    )
+}
+
+#[cfg(unix)]
+fn positive_pid(pid: u32) -> Option<rustix::process::Pid> {
+    rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)
+}
+
+/// Linux marks a process descriptor readable at exit and hung up after reap.
+/// When descriptors are unavailable, the caller retains the Unix signal probe.
+#[cfg(target_os = "linux")]
+fn pidfd_process_alive(pid: rustix::process::Pid) -> Option<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::process::{PidfdFlags, pidfd_open};
+
+    let descriptor = match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::SRCH) => return Some(false),
+        Err(_) => return None,
+    };
+    let mut watched = PollFd::new(&descriptor, PollFlags::IN);
+    let ready = poll(
+        std::slice::from_mut(&mut watched),
+        Some(&Timespec::default()),
+    )
+    .ok()?;
+    if ready == 0 {
+        Some(true)
+    } else if watched.revents().intersects(PollFlags::IN | PollFlags::HUP) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[cfg(not(unix))]
@@ -1557,16 +1591,11 @@ pub(crate) fn is_pid_alive(_pid: u32) -> bool {
 /// Returns the OS error when the signal cannot be delivered (no such
 /// process, no permission).
 #[cfg(unix)]
-#[allow(unsafe_code, clippy::cast_possible_wrap)]
 pub(crate) fn request_termination(pid: u32) -> std::io::Result<()> {
-    // SAFETY: kill(2) with SIGTERM has no memory-safety preconditions; the
-    // target is identified by pid only and the result is checked below.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    let pid = positive_pid(pid).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "expected a positive PID")
+    })?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(std::io::Error::from)
 }
 
 #[cfg(not(unix))]
@@ -2254,5 +2283,13 @@ mod tests {
     #[test]
     fn nonexistent_pid_is_not_alive() {
         assert!(!is_pid_alive(999_999_999));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_targets_reject_zero_and_out_of_range_pids() {
+        assert!(positive_pid(0).is_none());
+        assert!(positive_pid(u32::MAX).is_none());
+        assert!(positive_pid(std::process::id()).is_some());
     }
 }

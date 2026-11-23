@@ -1912,10 +1912,14 @@ impl PidFileContents {
     /// Whether the PID in this file is still alive on the local host.
     #[must_use]
     pub fn is_alive(&self) -> bool {
-        if self.hostname != hostname() {
+        if !self.is_local() {
             return true; // Can't verify cross-host.
         }
         pid_is_alive(self.pid)
+    }
+
+    pub(crate) fn is_local(&self) -> bool {
+        self.hostname == hostname()
     }
 }
 
