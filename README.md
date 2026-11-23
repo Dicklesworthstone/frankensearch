@@ -1580,6 +1580,9 @@ producer protocols and indexing contract in `FSFS_UPGRADE_REUSE_PREVIOUS_BINARY`
 (an absolute path), and retain its source and SHA-256
 receipt. The test requires a different executable hash and exercises compatible
 reuse, default cold rebuilding, and independent source, producer, and artifact drift.
+The stage also exercises real-model recovery through `fsfs recover` and
+`fsfs-recover`. It checks quality-only rebuild and resume, and receipt-directed
+hybrid restoration followed by a fresh search with the source files unavailable.
 
 Select stages with `QUALITY_GATE_STAGES=fmt,check,clippy,tests`. The full Linux
 CLI suite uses all four models above. `scripts/rch-ensure-deps.sh --models-only`

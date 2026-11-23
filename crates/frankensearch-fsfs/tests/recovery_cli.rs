@@ -865,7 +865,7 @@ fn genuine_quality_only_source_rebuild_resumes_and_searches_without_fast_or_sour
             .env("FRANKENSEARCH_CHECK_UPDATES", "0");
     };
     let query = "how does recoverytoken preserve durable search generations";
-    let mut prepare = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    let mut prepare = RecoveryEntry::Installed.command();
     configure(&mut prepare);
     prepare
         .arg("--rebuild-source")
@@ -902,7 +902,7 @@ fn genuine_quality_only_source_rebuild_resumes_and_searches_without_fast_or_sour
     let sealed = files(&target);
     fs::rename(&source, directory.path().join("source-unavailable")).unwrap();
 
-    let mut apply = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    let mut apply = RecoveryEntry::Standalone.command();
     configure(&mut apply);
     apply.arg("--resume-file").arg(&receipt).args([
         "--apply",
@@ -1031,8 +1031,12 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
     let id = first["generation_id"].as_str().unwrap();
     let digest = first["manifest_sha256"].as_str().unwrap();
     let query = "how does recoverytoken preserve durable search generations";
-    for apply in [false, true] {
-        let mut command = recover(directory.path(), &root, id, digest);
+    let refined = serde_json::to_value(SearchOutputPhase::Refined).unwrap();
+    for (apply, entry) in [
+        (false, RecoveryEntry::Standalone),
+        (true, RecoveryEntry::Installed),
+    ] {
+        let mut command = recover_with_entry(entry, directory.path(), &root, id, digest);
         command
             .arg("--config")
             .arg(&config_path)
@@ -1052,7 +1056,6 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
         assert_eq!(result["data"]["selection_write_performed"], apply);
         assert_eq!(result["data"]["producer_admission_checked"], true);
         let phases = result["data"]["preview"].as_array().unwrap();
-        let refined = serde_json::to_value(SearchOutputPhase::Refined).unwrap();
         assert!(phases.iter().any(|phase| phase["phase"] == refined));
         assert_eq!(phases.last().unwrap()["hits"].as_array().unwrap().len(), 1);
         if !apply {
@@ -1069,7 +1072,7 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
         .arg(&root)
         .arg("--config")
         .arg(&config_path)
-        .args(["--format", "json", "--quiet"])
+        .args(["--format", "json", "--quiet", "--no-daemon"])
         .env("FRANKENSEARCH_CHECK_UPDATES", "0")
         .env("FRANKENSEARCH_MODEL_DIR", &models);
     let output = run(&mut search, directory.path(), Duration::from_secs(180));
@@ -1078,7 +1081,10 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(body(&output)["data"]["hits"].as_array().unwrap().len(), 1);
+    let payload = &body(&output)["data"];
+    assert_eq!(payload["phase"], refined);
+    assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["hits"][0]["path"], "alpha.md");
     let selected = fs::read(&pointer).unwrap();
     let mut confirm = recover(directory.path(), &root, id, digest);
     confirm.arg("--confirm-durability");

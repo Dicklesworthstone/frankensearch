@@ -43,9 +43,9 @@
 #              docs/evidence/perf/library-two-tier-latency-<date>-<host>.json (override with
 #              QUALITY_GATE_PERF_RECEIPT_OUT). Opt-in: it builds the facade in release
 #              and takes minutes; commit the receipt it writes.
-#   e2e        the real-model quickstart lane (index + INITIAL/REFINED search on the real
-#              binary) when the registered models are present; otherwise a typed SKIP that
-#              still fails the gate unless QUALITY_GATE_ALLOW_MODEL_SKIP=1
+#   e2e        real-model quickstart and recovery through the CLI when the registered
+#              models are present; otherwise a typed SKIP that still fails the gate
+#              unless QUALITY_GATE_ALLOW_MODEL_SKIP=1
 #   quickstart scripts/check_fsfs_executable_quickstart.sh against the freshly built binary
 #   lite       the model-free `--no-default-features` binary (every musl and Intel macOS
 #              release asset) indexes, searches and deletes lexically from a pristine
@@ -205,8 +205,9 @@ fi
 
 if want e2e; then
   if [ -d "$MODEL_DIR/potion-multilingual-128M" ] && [ -d "$MODEL_DIR/all-MiniLM-L6-v2" ]; then
-    run_stage e2e env FSFS_DEFAULT_E2E_MODEL_DIR="$MODEL_DIR" FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 \
-      cargo test --locked -p frankensearch-fsfs --test default_build_quickstart -- --include-ignored
+    run_stage e2e env FSFS_DEFAULT_E2E_MODEL_DIR="$MODEL_DIR" \
+      FRANKENSEARCH_RECOVERY_E2E_MODEL_DIR="$MODEL_DIR" FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 \
+      cargo test --locked -p frankensearch-fsfs --test default_build_quickstart --test recovery_cli -- --include-ignored
   elif [ "${QUALITY_GATE_ALLOW_MODEL_SKIP:-0}" = "1" ]; then
     skip e2e "registered models absent under $MODEL_DIR (allowed by QUALITY_GATE_ALLOW_MODEL_SKIP=1)"
   else
