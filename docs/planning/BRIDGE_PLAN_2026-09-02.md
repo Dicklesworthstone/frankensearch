@@ -205,6 +205,42 @@ Quill conformance and performance program.
   2.70 s current and 1.95 s signed in the first order, then 2.07 s current
   and 2.40 s signed in the reverse order. Keep these comparisons scoped to
   shared-host diagnostics. See `pair-r{2,3}/*/receipt.json`.
+- Existing release-build spans now separate model loading from first-query
+  latency for both stock executables. Five fresh daemons per arm each logged
+  one Potion load and one quality initialization. Every first and warm query
+  finished both phases. On the shared filesystem page cache, signed/current
+  medians were 281/288 ms for the Potion load body and 351/349 ms for quality
+  initialization. Tokenizer construction was 243/250 ms of the Potion span.
+  The Potion span starts after artifact admission. See `release-load/*/spans.json`
+  under `/data/tmp/fs-wire-20261123.Tlkyrv`.
+- The request framing repair wakes an accepted Unix peer when a partial
+  request becomes readable. The old reader missed a guard shorter than its
+  fallback tick.
+  The repaired reader wakes on a delimiter and on half-close, and completes
+  through the timer on a runtime without an I/O reactor. All 147 focused
+  daemon tests passed. Two matched development-build runs with opposite arm
+  order served 100 split and 100 complete readiness requests per arm. Split
+  suffix-to-reply medians fell from 5.25–5.32 ms to 0.52–0.86 ms. Complete
+  request medians remained around half a millisecond. Every arm also served
+  20 real Initial/Refined streams, reused the buffered result, rejected the
+  missing-path match, and stopped with an incomplete peer still connected.
+  See `split-{red,suite,ab,ba}.log` in the same evidence root.
+- The stock release pair reproduced the split-frame improvement with
+  identical socket and corpus inputs in both orders. Median suffix-to-reply
+  fell from 5.01–5.77 ms to 0.26 ms and p95 from 9.99–10.74 ms to
+  0.82–1.14 ms. All 80 unique two-phase requests and incomplete-peer shutdown
+  controls passed across four arms. The repaired release executable came
+  from clean `5127c80f` with SHA-256
+  `d0384158ebc20704b4063ac2d71c70267729b70374fc152dff7d4a93069932ec`.
+  Both comparisons used the shared host under load. See
+  `split-release-{ab,ba}.log` and `release-{ab,ba}/*/samples.json`.
+- The first stock run flagged an unnecessary mutable socket borrow. After
+  correcting the signature, clean `5127c80f` passed all 18 stages. The direct
+  daemon rerun passed 147 tests, the real-model executable suite passed 25,
+  and the source quickstart passed 12 commands and 22 negative controls
+  with zero owned processes remaining. Published code commit `3d5e7b5f`
+  has identical build inputs. See `split-gate{,-final}.log`,
+  `split-suite-final.log` and `tmp/fsfs-quickstart.tGFkNk4c/receipt.json`.
 
 ### Vision checklist
 
@@ -360,6 +396,16 @@ Quill conformance and performance program.
 - [x] Repeat the 1,000-file release comparison in both orders. Verify cold
   and warm terminal phases, buffered cache hits, planted ranking and five
   watcher edits per executable. Preserve the reversal in watch timing.
+- [x] Time the existing Potion load body and quality initialization on both
+  release-profile executables with fresh processes and a shared page cache.
+- [x] Reproduce the accepted socket's split-frame delay using a parked reader
+  and a guard shorter than its fallback timer. Capture the populated baseline.
+- [x] Verify reactor wake on both delimiter and EOF, timer fallback without
+  an I/O driver, framing limits, and cancellation and deadline behavior.
+- [x] Pair the development executable split and full-frame probes in both orders
+  with live rank, cache, missing-path and strict shutdown controls.
+- [x] Run the same socket probe in both orders with stock release binaries.
+- [x] Run the stock source gate and land the qualified request-framing repair.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
   independent fast and quality load times, peak RSS, per-generation disk
