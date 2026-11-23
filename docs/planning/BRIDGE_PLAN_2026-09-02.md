@@ -500,6 +500,18 @@ Quill conformance and performance program.
   See `recovery-workspace-gate.log` in the same directory. This qualifies
   cooperative generation recovery. The fixed-authority, CASS, retention,
   and fault-matrix milestones remain open.
+- The one-command `fsfs search --recover-source` rebuilt a damaged selection
+  with real Potion and MiniLM and returned the same filtered stream as a
+  fresh direct process. A fully excluding preview emitted a typed failed
+  terminal and preserved the selected bytes. `c9e16563` adds a stock case
+  that also checks predecessor bytes, a changed-source snippet, and reopening
+  after the source directory is moved. All 26 quickstart and ten recovery
+  cases passed with zero ignores in the Linux `e2e` stage. Formatting and
+  warnings-denied Clippy for the recovery test passed. The signed 1.13.0
+  binary ran the README recipe at default deadlines and its warm-cache
+  `--acquire-models` variant made zero IP connect calls. See
+  `recovery-gate.log`, `recovery-clippy.log`, the baseline streams, and
+  `recipe/` under `/data/tmp/fsfs-search-recovery.iewhnxd4`.
 - The installer at `109b3d58` made two loopback connections per case for
   alternate-scheme and uppercase HTTPS artifact URLs supplied with
   `--offline`. Lowercase HTTPS already refused before connecting. Commit
@@ -791,6 +803,13 @@ Quill conformance and performance program.
     and pin the candidate source, lockfile and toolchain.
   - [x] Verify what the current product does with both binaries and real
     models, including whether it retains work or re-embeds.
+  - [x] On native Apple Silicon, compare the live executable mapping and
+    code-directory hash before and after rebinding its original pathname.
+    The mapped inode and running hash stayed on the original while the path
+    selected the replacement. The running fixture also allowed a write-open,
+    so inode matching alone cannot assume Linux's executable-write exclusion.
+    See `mac-image-probe.log` under
+    `/data/tmp/fsfs-search-recovery.iewhnxd4`.
   - [ ] Establish executing-image identity on macOS before claiming
     cross-process reuse there.
   - [x] Reproduce offline installer network access with a loopback listener
@@ -819,6 +838,16 @@ Quill conformance and performance program.
   - [x] Check workspace compilation, strict lint, formatting, and the default
     fsfs suite on the candidate source.
   - [x] Record the scoped result on `bd-p6z6.4` and publish the qualification.
+  - [x] Run real-model `search --recover-source` on a damaged selector and
+    compare both filtered search phases with a fresh direct query.
+  - [x] Verify a fully excluding preview returns a typed failed terminal and
+    preserves the incumbent selection bytes.
+  - [x] Run the gate's real-model replay with the predecessor's artifact
+    bytes pinned and the sources unavailable at reopen.
+  - [x] Verify the README recovery example and record the scoped result on
+    `bd-p6z6.3`.
+  - [x] Pass formatting and strict lint for the changed test, then publish
+    the recovery coverage and both scoped tracker updates.
 - [ ] Resolve Quill R1 and union-horizon witnesses. Run full and scaled
   differential suites, then the competitive workloads with live Tantivy.
 
