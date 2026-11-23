@@ -411,6 +411,47 @@ impl TierSource {
         }
     }
 
+    /// Join retained generation and document semantics without requiring the
+    /// tiers to share a model, dimension, input instructions, or row coverage.
+    fn validate_pair_contract(&self, quality: &Self, field_prefix: &str) -> SearchResult<()> {
+        let ((fast_owner, fast_binding), (quality_owner, quality_binding)) = match (
+            self.admitted_pair(),
+            quality.admitted_pair(),
+        ) {
+            (None, None) => return Ok(()),
+            (Some(fast), Some(quality)) => (fast, quality),
+            _ => {
+                return Err(SearchError::InvalidConfig {
+                        field: format!("{field_prefix}.source_identity"),
+                        value: "mixed-admission".to_owned(),
+                        reason: "fast and quality tiers must both retain exact FSVI v2 admission or both use legacy sources"
+                            .to_owned(),
+                    });
+            }
+        };
+        if fast_owner.witness().generation != quality_owner.witness().generation {
+            return Err(SearchError::InvalidConfig {
+                field: format!("{field_prefix}.generation"),
+                value: "mismatch".to_owned(),
+                reason: "fast and quality tiers must share one complete artifact generation"
+                    .to_owned(),
+            });
+        }
+        let fast_identity = &fast_binding.frozen_identity().identity;
+        let quality_identity = &quality_binding.frozen_identity().identity;
+        if fast_identity.input.doc_id_semantics != quality_identity.input.doc_id_semantics
+            || fast_identity.space.kind != quality_identity.space.kind
+        {
+            return Err(SearchError::InvalidConfig {
+                field: format!("{field_prefix}.tier_contract"),
+                value: "mismatch".to_owned(),
+                reason: "fast and quality tiers require one document-ID contract and semantic/control kind"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// The on-disk artifact this tier serves.
     fn artifact_path(&self) -> &Path {
         match self {
@@ -625,14 +666,18 @@ impl TwoTierIndex {
     /// fingerprints come from each artifact's own validated header bytes.
     ///
     /// A quality path and its binding must be supplied together: a v2 tier
-    /// without a binding has no legitimate open path.
+    /// without a binding has no legitimate open path. Both tiers must share
+    /// the complete artifact generation, document-ID semantics, and
+    /// semantic/control kind. Their models, other input contracts, dimensions,
+    /// and document coverage may differ.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] when a quality path/binding is
-    /// supplied without its counterpart, typed admission failures (mapped
-    /// from [`FsviAdmissionError`], naming the tier), and the same path
-    /// validation errors as [`Self::open_with_paths`].
+    /// supplied without its counterpart or the cross-tier contract disagrees.
+    /// Also returns typed admission failures (mapped from
+    /// [`FsviAdmissionError`], naming the tier) and the same path validation
+    /// errors as [`Self::open_with_paths`].
     pub fn open_admitted_v2_with_paths(
         paths: &TwoTierIndexPaths,
         config: TwoTierConfig,
@@ -688,17 +733,20 @@ impl TwoTierIndex {
         paths: &TwoTierIndexPaths,
         config: TwoTierConfig,
     ) -> SearchResult<Self> {
+        if let Some(quality) = quality_source.as_ref() {
+            fast_source.validate_pair_contract(quality, "two_tier.v2")?;
+        }
         let fast_index = fast_source.index();
         let mut quality_alignment = QualityAlignment::None;
 
-        // A fast/quality pair is only blendable when both tiers came from the
-        // SAME publication: a crash between the two per-tier installs leaves
-        // a mixed-generation pair whose nonces disagree, and blending it
-        // silently launders vectors from different corpus states (bd-miio8).
-        // Legacy pre-nonce pairs read 0 == 0 and remain accepted. The
-        // degraded pair drops the quality SOURCE (not just its borrow), so a
-        // mixed-generation quality tier can never serve.
+        // Legacy pairs use their publication nonces to detect a crash between
+        // per-tier installs and degrade to fast-only (bd-miio8). Pre-nonce
+        // pairs still read 0 == 0. Admitted v2 tiers were joined above using
+        // their complete generation; the legacy u16 nonce is not its authority.
         let quality_source = quality_source.filter(|source| {
+            if source.admitted_owner().is_some() {
+                return true;
+            }
             let quality_nonce = source.index().publication_nonce();
             if quality_nonce == fast_index.publication_nonce() {
                 true
@@ -1320,39 +1368,19 @@ impl TwoTierIndex {
     /// Join the complete retained generation and cross-tier contracts before
     /// any graph reads vectors. Legacy publication nonces are insufficient.
     fn validate_native_hnsw_tiers(&self, requested_tier: &str) -> SearchResult<()> {
-        let (fast_owner, fast_binding) =
-            self.fast_source
-                .admitted_pair()
-                .ok_or_else(|| SearchError::InvalidConfig {
-                    field: format!("two_tier.native_{requested_tier}_hnsw.owner"),
-                    value: "legacy-fast".to_owned(),
-                    reason: "native retrieval requires an admitted FSVI v2 index".to_owned(),
-                })?;
+        self.fast_source
+            .admitted_pair()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: format!("two_tier.native_{requested_tier}_hnsw.owner"),
+                value: "legacy-fast".to_owned(),
+                reason: "native retrieval requires an admitted FSVI v2 index".to_owned(),
+            })?;
         match self.quality_source.as_ref() {
-            Some(TierSource::AdmittedV2 { owner, binding, .. }) => {
-                // Legacy publication nonces are not the full v2 generation.
-                // Join the exact retained witnesses before graph construction.
-                if fast_owner.witness().generation != owner.witness().generation {
-                    return Err(SearchError::InvalidConfig {
-                        field: format!("two_tier.native_{requested_tier}_hnsw.generation"),
-                        value: "mismatch".to_owned(),
-                        reason:
-                            "native retrieval tiers must share one complete artifact generation"
-                                .to_owned(),
-                    });
-                }
-                let fast_identity = &fast_binding.frozen_identity().identity;
-                let quality_identity = &binding.frozen_identity().identity;
-                if fast_identity.input.doc_id_semantics != quality_identity.input.doc_id_semantics
-                    || fast_identity.space.kind != quality_identity.space.kind
-                {
-                    return Err(SearchError::InvalidConfig {
-                        field: format!("two_tier.native_{requested_tier}_hnsw.tier_contract"),
-                        value: "mismatch".to_owned(),
-                        reason: "native retrieval tiers require one document-ID contract and semantic/control kind"
-                            .to_owned(),
-                    });
-                }
+            Some(quality @ TierSource::AdmittedV2 { .. }) => {
+                self.fast_source.validate_pair_contract(
+                    quality,
+                    &format!("two_tier.native_{requested_tier}_hnsw"),
+                )?;
             }
             Some(TierSource::PathOpened(_)) => {
                 return Err(SearchError::InvalidConfig {
@@ -7631,7 +7659,10 @@ mod tests {
 
     // ─── Attested vs declared identity discriminator (bd-9xuj T2-C4-write) ──
 
-    use frankensearch_core::generation::{ArtifactGenerationIdentityV1, QuantizationFormat};
+    use frankensearch_core::generation::{
+        ArtifactGenerationIdentityV1, EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1,
+        QuantizationFormat,
+    };
 
     /// Identity binding for `model_id` with canonical FSVI v2 storage, plus
     /// the in-memory-storage sibling bundle a producing embedder would hold.
@@ -7661,6 +7692,211 @@ mod tests {
             writer.write_record(doc_id, vector).expect("write v2 row");
         }
         writer.finish().expect("finish v2 fixture");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn admitted_v2_pair_rejects_incoherent_tiers_before_exact_open_or_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let fast_path = directory.path().join("fast.fsvi");
+        let quality_path = directory.path().join("quality.fsvi");
+        let (fast_binding, fast_identity) = fsvi_v2_binding("pair-fast", 2, 101);
+        let (quality_binding, quality_identity) = fsvi_v2_binding("pair-quality", 2, 101);
+        write_v2_tier(&fast_path, &fast_binding, &[("fast", &[1.0, 0.0])]);
+        write_v2_tier(&quality_path, &quality_binding, &[("quality", &[0.0, 1.0])]);
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .unwrap();
+        assert!(!index.has_native_fast_hnsw());
+        assert!(!index.has_native_quality_hnsw());
+        let before_fast = Arc::clone(index.fast_source.admitted_owner_arc().unwrap());
+        let before_quality = Arc::clone(
+            index
+                .quality_source
+                .as_ref()
+                .unwrap()
+                .admitted_owner_arc()
+                .unwrap(),
+        );
+        let embeddings = TieredQueryEmbeddings::progressive(
+            bound_query(&fast_identity, &[1.0, 0.0]),
+            bound_query(&quality_identity, &[0.0, 1.0]),
+        );
+        let cx = Cx::for_testing();
+
+        for (case, expected_field) in [
+            ("sequence", "two_tier.v2.generation"),
+            ("incarnation", "two_tier.v2.generation"),
+            ("kind", "two_tier.v2.tier_contract"),
+            ("document_ids", "two_tier.v2.tier_contract"),
+        ] {
+            let mut candidate_identity = quality_identity.clone();
+            let generation = match case {
+                "sequence" => ArtifactGenerationIdentityV1::new(102, [0x4d; 16]).unwrap(),
+                "incarnation" => ArtifactGenerationIdentityV1::new(101, [0x4e; 16]).unwrap(),
+                "kind" => {
+                    candidate_identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+                    candidate_identity.space.hash_control = None;
+                    candidate_identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+                    candidate_identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+                        role: "weights".to_owned(),
+                        sha256: "b".repeat(64),
+                        size: 1,
+                    }];
+                    quality_binding.generation()
+                }
+                "document_ids" => {
+                    candidate_identity.input.doc_id_semantics =
+                        "different-document-id-namespace".to_owned();
+                    quality_binding.generation()
+                }
+                _ => unreachable!(),
+            };
+            candidate_identity.space.input_contract_fingerprint =
+                candidate_identity.input.fingerprint();
+            candidate_identity.producer.space_fingerprint = candidate_identity.space.fingerprint();
+            let candidate_binding =
+                FsviV2IdentityBinding::new(generation, candidate_identity.freeze().unwrap())
+                    .unwrap();
+
+            for empty in [false, true] {
+                let candidate_path = directory.path().join(format!("{case}-{empty}.fsvi"));
+                let rows: &[(&str, &[f32])] = if empty {
+                    &[]
+                } else {
+                    &[("foreign-quality", &[0.0, 1.0])]
+                };
+                write_v2_tier(&candidate_path, &candidate_binding, rows);
+                let candidate_owner =
+                    admit_v2_tier(&candidate_path, &candidate_binding, "quality").unwrap();
+                // Both artifacts individually admit and their legacy nonces
+                // agree, including an empty but incompatible quality tier.
+                assert_eq!(
+                    before_fast.index.publication_nonce(),
+                    candidate_owner.index.publication_nonce()
+                );
+                let candidate_paths =
+                    TwoTierIndexPaths::new(&fast_path).with_quality_index(&candidate_path);
+                let error = TwoTierIndex::open_admitted_v2_with_paths(
+                    &candidate_paths,
+                    TwoTierConfig::default(),
+                    &fast_binding,
+                    Some(&candidate_binding),
+                )
+                .expect_err("incoherent tiers cannot become an exact-search index");
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, .. }
+                        if field == expected_field),
+                    "{case}, empty={empty}"
+                );
+                let error = index
+                    .try_replace_admitted_v2(
+                        &cx,
+                        &candidate_paths,
+                        &fast_binding,
+                        Some(&candidate_binding),
+                    )
+                    .expect_err("refused pair must not replace either incumbent owner");
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == expected_field));
+                assert!(Arc::ptr_eq(
+                    index.fast_source.admitted_owner_arc().unwrap(),
+                    &before_fast
+                ));
+                assert!(Arc::ptr_eq(
+                    index
+                        .quality_source
+                        .as_ref()
+                        .unwrap()
+                        .admitted_owner_arc()
+                        .unwrap(),
+                    &before_quality
+                ));
+                assert_eq!(index.fast_index_path(), paths.fast_index());
+                assert_eq!(index.quality_index_path(), paths.quality_index());
+                let activated = index
+                    .activate_owner_backed_search(&cx, &embeddings)
+                    .unwrap();
+                assert_eq!(activated.search_fast(1).unwrap()[0].doc_id, "fast");
+                assert_eq!(activated.search_quality(1).unwrap()[0].doc_id, "quality");
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_v2_pair_uses_full_generation_and_preserves_independent_coverage() {
+        for coverage in ["partial", "disjoint", "empty"] {
+            let directory = tempfile::tempdir().unwrap();
+            let fast_path = directory.path().join("fast.fsvi");
+            let quality_path = directory.path().join("quality.fsvi");
+            let (fast_binding, fast_identity) = fsvi_v2_binding("pair-fast", 2, 103);
+            let (quality_binding, mut quality_identity) = fsvi_v2_binding("pair-quality", 3, 103);
+            quality_identity.input.document_instruction =
+                "quality-specific document instruction".to_owned();
+            quality_identity.space.input_contract_fingerprint =
+                quality_identity.input.fingerprint();
+            quality_identity.producer.space_fingerprint = quality_identity.space.fingerprint();
+            let quality_binding = FsviV2IdentityBinding::new(
+                quality_binding.generation(),
+                quality_identity.freeze().unwrap(),
+            )
+            .unwrap();
+            write_v2_tier(
+                &fast_path,
+                &fast_binding,
+                &[("shared", &[1.0, 0.0]), ("fast-only", &[0.0, 1.0])],
+            );
+            let rows: &[(&str, &[f32])] = match coverage {
+                "partial" => &[
+                    ("shared", &[1.0, 0.0, 0.0]),
+                    ("quality-only", &[0.0, 1.0, 0.0]),
+                    ("another-quality-only", &[0.0, 0.0, 1.0]),
+                ],
+                "disjoint" => &[("quality-only", &[0.0, 1.0, 0.0])],
+                "empty" => &[],
+                _ => unreachable!(),
+            };
+            let mut writer = VectorIndex::create_v2(&quality_path, quality_binding.clone())
+                .unwrap()
+                .with_publication_nonce(17);
+            for (doc_id, vector) in rows {
+                writer.write_record(doc_id, vector).unwrap();
+            }
+            writer.finish().unwrap();
+            let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+            let index = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .expect("one full generation may have independent tier coverage and legacy nonces");
+            assert_ne!(
+                index.fast_tier().publication_nonce(),
+                index.quality_tier().unwrap().publication_nonce()
+            );
+            assert_eq!(index.fast_dimension(), 2);
+            assert_eq!(index.quality_dimension(), Some(3));
+            assert_eq!(index.quality_tier().unwrap().record_count(), rows.len());
+            let embeddings = TieredQueryEmbeddings::progressive(
+                bound_query(&fast_identity, &[0.0, 1.0]),
+                bound_query(&quality_identity, &[0.0, 1.0, 0.0]),
+            );
+            let activated = index
+                .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
+                .unwrap();
+            assert_eq!(activated.search_fast(1).unwrap()[0].doc_id, "fast-only");
+            let quality_hits = activated.search_quality(3).unwrap();
+            assert_eq!(quality_hits.len(), rows.len());
+            if !rows.is_empty() {
+                assert_eq!(quality_hits[0].doc_id, "quality-only");
+            }
+        }
     }
 
     #[test]
@@ -10542,7 +10778,7 @@ mod tests {
             .try_replace_admitted_v2(&cx, &next_paths, &next_fast, Some(&next_quality))
             .unwrap_err();
         assert!(matches!(error, SearchError::InvalidConfig { field, .. }
-            if field == "two_tier.native_fast_hnsw.generation"));
+            if field == "two_tier.v2.generation"));
         assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before_fast);
         assert_eq!(
             index.quality_admitted_owner().unwrap().witness(),
@@ -10673,23 +10909,22 @@ mod tests {
                 &[("mixed-quality", &[0.0, 1.0, 0.0, 0.0])],
             );
             // Both files are independently admissible and their legacy nonces
-            // agree. Native activation must still join their full v2 generations.
-            let ordinary = TwoTierIndex::open_admitted_v2_with_paths(
+            // agree. Ordinary open must join their full v2 generations before
+            // either exact retrieval or native graph activation is possible.
+            let error = TwoTierIndex::open_admitted_v2_with_paths(
                 &mixed_paths,
                 TwoTierConfig::default(),
                 &mixed_fast,
                 Some(&foreign_quality),
             )
-            .unwrap();
-            assert!(ordinary.quality_admitted_owner().is_some());
+            .expect_err("ordinary open must refuse mixed generations");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, .. } if field == "two_tier.v2.generation"
+            ));
             assert!(matches!(
                 index.try_replace_admitted_v2(&Cx::for_testing(), &mixed_paths, &mixed_fast, Some(&foreign_quality)),
-                Err(SearchError::InvalidConfig { field, .. })
-                    if field == if enable_fast {
-                        "two_tier.native_fast_hnsw.generation"
-                    } else {
-                        "two_tier.native_quality_hnsw.generation"
-                    }
+                Err(SearchError::InvalidConfig { field, .. }) if field == "two_tier.v2.generation"
             ));
             assert!(index.has_native_quality_hnsw());
             assert_eq!(index.has_native_fast_hnsw(), enable_fast);
