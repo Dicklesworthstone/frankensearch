@@ -79,7 +79,8 @@ use crate::rrf::{
 };
 
 mod filtering;
-use filtering::{LexicalRevalidation, RequestFilter};
+use filtering::LexicalRevalidation;
+pub(crate) use filtering::RequestFilter;
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -91,7 +92,7 @@ struct NormalizedExclusions {
 /// Which semantic lane the caller explicitly requested. Both modes share
 /// query parsing, phase publication, cancellation and final ranking.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SearchExecutionMode {
+pub(crate) enum SearchExecutionMode {
     Progressive,
     QualityOnly,
 }
@@ -1544,8 +1545,34 @@ impl TwoTierSearcher {
         .await
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     async fn search_with_mode(
+        &self,
+        cx: &Cx,
+        query: &str,
+        k: usize,
+        text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
+        on_phase: impl FnMut(SearchPhase) + Send,
+        mode: SearchExecutionMode,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<TwoTierMetrics> {
+        self.search_with_filter_state(
+            cx,
+            query,
+            k,
+            text_fn,
+            on_phase,
+            mode,
+            &mut RequestFilter::new(filter),
+        )
+        .await
+    }
+
+    /// Borrow request observations so an outer deadline can validate the last
+    /// published phase after dropping this future. Public searches own their
+    /// state locally; federation retains it through the timeout boundary.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) async fn search_with_filter_state(
         &self,
         cx: &Cx,
         query: &str,
@@ -1553,7 +1580,7 @@ impl TwoTierSearcher {
         text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
         mut on_phase: impl FnMut(SearchPhase) + Send,
         mode: SearchExecutionMode,
-        filter: Option<&dyn SearchFilter>,
+        request_filter: &mut RequestFilter<'_>,
     ) -> SearchResult<TwoTierMetrics> {
         let mut metrics = TwoTierMetrics::default();
 
@@ -1676,7 +1703,7 @@ impl TwoTierSearcher {
         // Admit the semantic identity before opening metadata or invoking a
         // predicate. Retain one lexical publication across both semantic
         // phases and every refill; unfiltered requests keep their old path.
-        let pinned_lexical = if filter.is_some() {
+        let pinned_lexical = if request_filter.is_active() {
             if let Some(lexical) = self.lexical.as_deref() {
                 let pinned = frankensearch_core::with_cancellation(
                     cx,
@@ -1693,7 +1720,6 @@ impl TwoTierSearcher {
             None
         };
         let lexical_source = pinned_lexical.as_deref().or(self.lexical.as_deref());
-        let mut request_filter = RequestFilter::new(filter);
         let telemetry_root_request_id = self
             .host_adapter
             .as_ref()
@@ -1744,7 +1770,7 @@ impl TwoTierSearcher {
                 &text_fn,
                 &mut metrics,
                 lexical_source,
-                &mut request_filter,
+                request_filter,
             )
             .await
         } else if mode == SearchExecutionMode::QualityOnly {
@@ -1767,7 +1793,7 @@ impl TwoTierSearcher {
                     &mut metrics,
                     telemetry_root_request_id.as_deref(),
                     lexical_source,
-                    &mut request_filter,
+                    request_filter,
                 ),
             );
             timeout(
@@ -1800,7 +1826,7 @@ impl TwoTierSearcher {
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
                 lexical_source,
-                &mut request_filter,
+                request_filter,
             );
             Box::pin(progressive_initial).await
         };
@@ -1992,7 +2018,7 @@ impl TwoTierSearcher {
                 telemetry_root_request_id.as_deref(),
                 telemetry_initial_event_id.clone(),
                 lexical_source,
-                &mut request_filter,
+                request_filter,
             ));
             let timeout_budget = Duration::from_millis(self.config.quality_timeout_ms);
             let timeout_start = cx.now();

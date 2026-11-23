@@ -19,7 +19,7 @@ use frankensearch_core::{ScoreSource, ScoredResult, SearchError, SearchPhase, Se
 use tracing::{debug, warn};
 
 use crate::normalize::{NormalizationMethod, normalize_scores_with_method};
-use crate::searcher::TwoTierSearcher;
+use crate::searcher::{RequestFilter, SearchExecutionMode, TwoTierSearcher};
 
 const DEFAULT_FEDERATED_RRF_K: f64 = 60.0;
 
@@ -72,7 +72,8 @@ pub struct FederatedConfig {
     /// enforced after the gather completes. Empty answers count, including
     /// quality-only requests that pass admission without requesting results.
     /// A shard whose optional refinement failed or exceeded its deadline after
-    /// publishing results also counts; coverage reports the degradation.
+    /// publishing results also counts if its retained phase is still eligible;
+    /// coverage reports the degradation.
     /// Fewer responses fail with [`SearchError::FederatedInsufficientResponses`].
     /// This knob never stops the gather early; that is `wait_for_indices`.
     pub min_indices: usize,
@@ -188,17 +189,21 @@ pub struct FederatedCoverage {
     /// Shards dispatched for this query (bounded by `max_indices`), in
     /// registration order.
     pub queried: Vec<String>,
-    /// Shards whose successful answers are included in fusion, including empty
-    /// answers and quality-only requests that pass admission without inference.
+    /// Shards whose successful, still-eligible answers are included in fusion,
+    /// including empty answers and quality-only requests that pass admission
+    /// without inference.
     pub answered: Vec<String>,
     /// Shards that returned an error.
     pub failed: Vec<FederatedShardError>,
-    /// Shards that exceeded `per_index_timeout_ms` before publishing any results.
+    /// Shards that exceeded `per_index_timeout_ms` without a usable published
+    /// phase. This includes a previously published phase that later filter
+    /// observations invalidated before the unfinished search was dropped.
     pub timed_out: Vec<String>,
     /// Answered shards whose optional quality refinement or final ranking
-    /// exceeded `per_index_timeout_ms`. Their last published result phase is
-    /// included in fusion and counts toward `min_indices`; no unfinished phase
-    /// is used. A quality stage's own timeout is in `refinement_failed`.
+    /// exceeded `per_index_timeout_ms`. Their last published result phase still
+    /// satisfies the filter and is included in fusion and `min_indices`; no
+    /// unfinished phase is used. A quality stage's own timeout is in
+    /// `refinement_failed`.
     pub refinement_timed_out: Vec<String>,
     /// Answered shards that published a `RefinementFailed` phase, including a
     /// quality stage's own timeout. Their last successful phase is retained
@@ -380,12 +385,15 @@ impl FederatedSearcher {
     /// `per_index_timeout_ms`) unless `wait_for_indices` requests an early
     /// stop. `min_indices` is a floor validated after the gather. When a shard
     /// publishes results before its deadline, those results survive a timeout
-    /// of its optional quality or final ranking stage; coverage identifies
-    /// that incomplete refinement. A reported quality-refinement failure also
-    /// preserves the last successful phase while keeping coverage incomplete,
-    /// even if a later rerank succeeds. A timeout before any phase has no
-    /// results to retain. Cancellation and returned errors never take this
-    /// fallback.
+    /// of its optional quality or final ranking stage if they remain eligible
+    /// under every metadata observation made before the timeout. A phase
+    /// invalidated by later observations is discarded and the shard counts as
+    /// timed out. Validation performs no new metadata lookup or ranking work.
+    /// Coverage identifies incomplete refinement. A reported quality-refinement
+    /// failure also preserves the last successful phase while keeping coverage
+    /// incomplete, even if a later rerank succeeds. A timeout before any phase
+    /// has no results to retain. Cancellation and returned errors never take
+    /// this fallback.
     /// Contributions are accumulated in index-name order, making scores and
     /// cutoff membership independent of completion order for the same shard
     /// replies. Explicit early stopping can still change which shards reply.
@@ -671,6 +679,10 @@ impl FederatedSearcher {
                     let timeout_start = cx.now();
                     let mut last_results = None;
                     let mut refinement_error = None;
+                    // The outer deadline drops the child's future. Keep its
+                    // metadata observations alive so a late rejection cannot
+                    // be erased before deciding whether its phase is usable.
+                    let mut request_filter = RequestFilter::new(filter);
                     let response = {
                         // Bind before the shard starts: exclusion and rerank
                         // lookups must never hydrate from another index's store.
@@ -685,34 +697,19 @@ impl FederatedSearcher {
                                 refinement_error = Some(error.diagnostic_code());
                             }
                         };
-                        let future = Box::pin(async move {
-                            match mode {
-                                FederatedSearchMode::Progressive => {
-                                    searcher
-                                        .search_with_filter(
-                                            cx,
-                                            query,
-                                            per_index_limit,
-                                            filter,
-                                            shard_text,
-                                            on_phase,
-                                        )
-                                        .await
-                                }
-                                FederatedSearchMode::QualityOnly => {
-                                    searcher
-                                        .search_quality_only_with_filter(
-                                            cx,
-                                            query,
-                                            per_index_limit,
-                                            filter,
-                                            shard_text,
-                                            on_phase,
-                                        )
-                                        .await
-                                }
-                            }
-                        });
+                        let execution_mode = match mode {
+                            FederatedSearchMode::Progressive => SearchExecutionMode::Progressive,
+                            FederatedSearchMode::QualityOnly => SearchExecutionMode::QualityOnly,
+                        };
+                        let future = Box::pin(searcher.search_with_filter_state(
+                            cx,
+                            query,
+                            per_index_limit,
+                            shard_text,
+                            on_phase,
+                            execution_mode,
+                            &mut request_filter,
+                        ));
                         timeout(timeout_start, timeout_budget, future).await
                     };
                     // The timeout has dropped the unfinished future. A provider
@@ -744,14 +741,24 @@ impl FederatedSearcher {
                             error,
                         },
                         Err(_elapsed) => match last_results {
-                            Some(hits) => ShardCompletion::Completed {
-                                shard: ShardResult {
-                                    name: index_name,
-                                    weight: index_weight,
-                                    hits,
+                            Some(hits) => match request_filter.all_scored_eligible(cx, &hits) {
+                                Ok(true) => ShardCompletion::Completed {
+                                    shard: ShardResult {
+                                        name: index_name,
+                                        weight: index_weight,
+                                        hits,
+                                    },
+                                    refinement_timed_out: true,
+                                    refinement_error,
                                 },
-                                refinement_timed_out: true,
-                                refinement_error,
+                                Ok(false) => ShardCompletion::TimedOut { index: index_name },
+                                Err(SearchError::Cancelled { phase, reason }) => {
+                                    ShardCompletion::Cancelled { phase, reason }
+                                }
+                                Err(error) => ShardCompletion::Failed {
+                                    index: index_name,
+                                    error,
+                                },
                             },
                             None => ShardCompletion::TimedOut { index: index_name },
                         },
@@ -3169,6 +3176,225 @@ mod tests {
                     );
                     assert!(response.coverage.timed_out.is_empty());
                     assert!(!response.coverage.is_complete());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn filtered_federation_deadline_rechecks_metadata_learned_after_initial() {
+        use frankensearch_core::filter::{DocTypeFilter, SearchFilter};
+        use frankensearch_core::{LexicalRead, ScoredResult};
+
+        struct MetadataState {
+            revoke_initial: bool,
+            cancel_on_drop: bool,
+            pins: AtomicU64,
+            lookups: AtomicU64,
+            initial_lookups: AtomicU64,
+            pending_drops: AtomicU64,
+        }
+
+        #[derive(Clone)]
+        struct LateMetadata(Arc<MetadataState>);
+
+        struct DeadlineFilter<'a> {
+            inner: DocTypeFilter,
+            state: &'a MetadataState,
+            cx: &'a asupersync::Cx,
+            cancel_on_recheck: bool,
+        }
+
+        impl SearchFilter for DeadlineFilter<'_> {
+            fn matches(&self, id: &str, metadata: Option<&serde_json::Value>) -> bool {
+                if self.cancel_on_recheck && self.state.pending_drops.load(Ordering::SeqCst) > 0 {
+                    self.cx.cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel while validating timed-out fallback"),
+                    );
+                }
+                self.inner.matches(id, metadata)
+            }
+
+            fn name(&self) -> &'static str {
+                "deadline-filter"
+            }
+        }
+
+        struct PendingMetadataDrop<'a> {
+            state: &'a MetadataState,
+            cx: &'a asupersync::Cx,
+        }
+
+        impl Drop for PendingMetadataDrop<'_> {
+            fn drop(&mut self) {
+                self.state.pending_drops.fetch_add(1, Ordering::SeqCst);
+                if self.state.cancel_on_drop {
+                    self.cx.cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel while dropping timed-out metadata refill"),
+                    );
+                }
+            }
+        }
+
+        impl LexicalRead for LateMetadata {
+            fn search<'a>(
+                &'a self,
+                _cx: &'a asupersync::Cx,
+                _query: &'a str,
+                _limit: usize,
+            ) -> SearchFuture<'a, Vec<ScoredResult>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn pin_search<'a>(
+                &'a self,
+                _cx: &'a asupersync::Cx,
+            ) -> SearchFuture<'a, Option<Arc<dyn LexicalRead>>> {
+                self.0.pins.fetch_add(1, Ordering::SeqCst);
+                let reader: Arc<dyn LexicalRead> = Arc::new(self.clone());
+                Box::pin(async move { Ok(Some(reader)) })
+            }
+
+            fn metadata_for_documents<'a>(
+                &'a self,
+                cx: &'a asupersync::Cx,
+                ids: &'a [&str],
+            ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+                Box::pin(async move {
+                    self.0.lookups.fetch_add(1, Ordering::SeqCst);
+                    if ids.contains(&"quality-tail") {
+                        let _drop = PendingMetadataDrop { state: &self.0, cx };
+                        return std::future::pending().await;
+                    }
+                    Ok(ids
+                        .iter()
+                        .map(|id| {
+                            let allowed = if *id == "initial" {
+                                if self.0.initial_lookups.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    return None;
+                                }
+                                !self.0.revoke_initial
+                            } else {
+                                false
+                            };
+                            let doc_type = if allowed { "keep" } else { "blocked" };
+                            Some(Arc::new(serde_json::json!({"doc_type": doc_type})))
+                        })
+                        .collect())
+                })
+            }
+
+            fn doc_count(&self) -> SearchResult<usize> {
+                Ok(7)
+            }
+        }
+
+        for (revoke_initial, min_indices, cancel_on_drop, cancel_on_recheck) in [
+            (true, 1, false, false),
+            (false, 1, false, false),
+            (true, 2, false, false),
+            (true, 1, true, false),
+            (false, 1, false, true),
+        ] {
+            asupersync::test_utils::run_test_with_cx(move |cx| async move {
+                // A short query's default multiplier selects six quality rows.
+                // Only the next refill reaches the pending tail, after quality
+                // has resolved the Initial document's unknown metadata.
+                let records: &[(&str, &[f32], &[f32])] = &[
+                    ("initial", &[1.0, 0.0], &[1.0, 0.0, 0.0]),
+                    ("blocked-a", &[], &[0.8, 0.6, 0.0]),
+                    ("blocked-b", &[], &[0.8, 0.6, 0.0]),
+                    ("blocked-c", &[], &[0.8, 0.6, 0.0]),
+                    ("blocked-d", &[], &[0.8, 0.6, 0.0]),
+                    ("blocked-e", &[], &[0.8, 0.6, 0.0]),
+                    ("quality-tail", &[], &[0.0, 1.0, 0.0]),
+                ];
+                let fast_calls = Arc::new(AtomicU64::new(0));
+                let quality_calls = Arc::new(AtomicU64::new(0));
+                let (_directory, child) = build_counted_quality_searcher(
+                    records,
+                    Some(Arc::new(StubEmbedder::new("quality", 3))),
+                    Arc::clone(&fast_calls),
+                    Arc::clone(&quality_calls),
+                );
+                let state = Arc::new(MetadataState {
+                    revoke_initial,
+                    cancel_on_drop,
+                    pins: AtomicU64::new(0),
+                    lookups: AtomicU64::new(0),
+                    initial_lookups: AtomicU64::new(0),
+                    pending_drops: AtomicU64::new(0),
+                });
+                let child = Arc::new(
+                    Arc::try_unwrap(child)
+                        .expect("fixture has one searcher owner")
+                        .with_lexical(Arc::new(LateMetadata(Arc::clone(&state)))),
+                );
+                let (_healthy_directory, healthy) = build_searcher(&[("healthy", &[1.0, 0.0])]);
+                let federated = FederatedSearcher::new()
+                    .with_config(FederatedConfig {
+                        per_index_timeout_ms: 1_000,
+                        candidate_pool_factor: 1,
+                        min_indices,
+                        ..FederatedConfig::default()
+                    })
+                    .add_index("late-metadata", child, 1.0)
+                    .add_index("healthy", healthy, 1.0);
+                let filter = DeadlineFilter {
+                    inner: DocTypeFilter::new(["keep"]),
+                    state: &state,
+                    cx: &cx,
+                    cancel_on_recheck,
+                };
+                let outcome = federated
+                    .search_with_filter(&cx, "retry behavior", 2, Some(&filter), |_| None)
+                    .await;
+                assert_eq!(fast_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(quality_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(state.pins.load(Ordering::SeqCst), 1);
+                assert_eq!(state.lookups.load(Ordering::SeqCst), 3);
+                assert_eq!(state.initial_lookups.load(Ordering::SeqCst), 2);
+                assert_eq!(state.pending_drops.load(Ordering::SeqCst), 1);
+                if cancel_on_drop || cancel_on_recheck {
+                    assert!(matches!(outcome, Err(SearchError::Cancelled { .. })));
+                } else if min_indices == 2 {
+                    assert!(matches!(
+                        outcome,
+                        Err(SearchError::FederatedInsufficientResponses {
+                            required: 2,
+                            received: 1,
+                        })
+                    ));
+                } else {
+                    let response = outcome.unwrap();
+                    assert!(!response.coverage.is_complete());
+                    assert!(response.coverage.failed.is_empty());
+                    assert!(response.coverage.refinement_failed.is_empty());
+                    assert!(
+                        response
+                            .hits
+                            .iter()
+                            .any(|hit| hit.result.doc_id == "healthy")
+                    );
+                    if revoke_initial {
+                        assert_eq!(response.hits.len(), 1);
+                        assert_eq!(response.coverage.answered, ["healthy"]);
+                        assert_eq!(response.coverage.timed_out, ["late-metadata"]);
+                        assert!(response.coverage.refinement_timed_out.is_empty());
+                    } else {
+                        assert_eq!(response.hits.len(), 2);
+                        assert!(
+                            response
+                                .hits
+                                .iter()
+                                .any(|hit| hit.result.doc_id == "initial")
+                        );
+                        assert_eq!(response.coverage.answered.len(), 2);
+                        assert!(response.coverage.timed_out.is_empty());
+                        assert_eq!(response.coverage.refinement_timed_out, ["late-metadata"]);
+                    }
                 }
             });
         }

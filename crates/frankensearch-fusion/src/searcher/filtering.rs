@@ -14,7 +14,10 @@ use super::{
     refill_vector_after_exclusions, should_exclude_document,
 };
 
-pub(super) struct RequestFilter<'a> {
+/// Keep observations outside a child future when an enclosing search owns its
+/// deadline. Dropping that child must not erase facts needed to validate a
+/// previously published fallback phase.
+pub(crate) struct RequestFilter<'a> {
     predicate: Option<&'a dyn SearchFilter>,
     metadata: AHashMap<DocId, Option<Arc<serde_json::Value>>>,
 }
@@ -30,7 +33,7 @@ pub(super) struct LexicalRevalidation<'a> {
 }
 
 impl<'a> RequestFilter<'a> {
-    pub(super) fn new(predicate: Option<&'a dyn SearchFilter>) -> Self {
+    pub(crate) fn new(predicate: Option<&'a dyn SearchFilter>) -> Self {
         Self {
             predicate,
             metadata: AHashMap::new(),
@@ -107,7 +110,7 @@ impl<'a> RequestFilter<'a> {
     /// a fallback response or a final ranker to reuse it. This consults only
     /// observations already made by the request; failure recovery must not
     /// start another metadata lookup or change the original ranking.
-    pub(super) fn all_scored_eligible(
+    pub(crate) fn all_scored_eligible(
         &self,
         cx: &Cx,
         results: &[ScoredResult],

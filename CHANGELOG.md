@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Federated search now retains request-scoped metadata observations across a
+  shard deadline and rechecks its last published phase before using it as a
+  fallback. A result rejected by a later metadata lookup cannot reappear when
+  unfinished refinement is dropped. Valid partial answers still count toward
+  the response floor, while revoked phases count as timed out and cancellation
+  remains terminal.
 - Synchronous hybrid filtering now preserves newly resolved metadata and
   refills eligible lexical, fast and quality candidates after later metadata
   rejects earlier hits. Progressive refinement also revalidates its retained
