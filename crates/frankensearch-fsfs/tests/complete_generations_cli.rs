@@ -280,6 +280,66 @@ fn json_output(output: &Output, success: bool) -> Value {
     value
 }
 
+#[test]
+fn named_socket_refusal_keeps_search_off_the_direct_route() {
+    for (layout, field) in [
+        ("0", "cli.daemon_socket"),
+        ("1", "complete_generation.daemon_socket"),
+    ] {
+        let fixture = Fixture::new();
+        let indexed = execute(
+            fixture
+                .lexical_discovery_command("index")
+                .env("FRANKENSEARCH_COMPLETE_GENERATIONS", layout),
+        );
+        assert_eq!(json_output(&indexed, true)["data"]["indexed_files"], 1);
+        assert_eq!(
+            fixture.store.join(COMPLETE_GENERATION_POINTER).exists(),
+            layout == "1"
+        );
+        let direct = execute(
+            fixture
+                .lexical_discovery_command("search")
+                .arg("--no-daemon"),
+        );
+        assert_eq!(
+            json_output(&direct, true)["data"]["hits"][0]["path"],
+            "alpha.md"
+        );
+
+        // Use a path the platform cannot bind so the failure is deterministic,
+        // regardless of whether another process owns a default daemon socket.
+        let socket = fixture.directory.path().join("s".repeat(128));
+        let named_search = || {
+            let mut command = fixture.lexical_discovery_command("search");
+            command.arg("--daemon-socket").arg(&socket);
+            command
+        };
+        let buffered = execute(&mut named_search());
+        let error = &json_output(&buffered, false)["error"];
+        assert_eq!(buffered.status.code(), Some(2));
+        assert_eq!(error["code"], "invalid_config");
+        assert_eq!(error["field"], field);
+
+        let streamed = execute(named_search().args(["--stream", "--format", "jsonl"]));
+        assert_eq!(streamed.status.code(), Some(2), "{streamed:?}");
+        let frames: Vec<Value> = std::str::from_utf8(&streamed.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[0]["event"], "started");
+        assert_eq!(frames[1]["event"], "terminal");
+        let terminal = &frames[1]["payload"];
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["exit_code"], 2);
+        assert_eq!(terminal["error"]["code"], "invalid_config");
+        assert_eq!(terminal["error"]["field"], field);
+        assert!(!socket.exists());
+    }
+}
+
 fn assert_only_selected_document_is_searchable(fixture: &Fixture, excludes: Option<&str>) {
     let mut index = fixture.lexical_discovery_command("index");
     index.arg("--no-watch-mode");

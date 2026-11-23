@@ -931,9 +931,9 @@ const fn daemon_spawn_suppressed() -> bool {
 
 /// Refuse a daemon socket path the platform cannot bind (`sun_path` is 108
 /// bytes on Linux and 104 on macOS, including the terminating NUL) before
-/// spawning a daemon that could never answer: the caller then searches in
-/// process at once instead of after the readiness timeout. A long macOS user
-/// name is enough to reach the limit under `~/Library/Caches`.
+/// spawning a daemon that could never answer. A default-socket search can
+/// then fall back without waiting through the readiness timeout. A long
+/// macOS user name is enough to reach the limit under `~/Library/Caches`.
 #[cfg(unix)]
 fn ensure_daemon_socket_path_fits(socket_path: &Path) -> SearchResult<()> {
     let capacity = daemon_socket_path_capacity();
@@ -9589,7 +9589,9 @@ impl FsfsRuntime {
                 // observed and would relabel the cancellation as a daemon
                 // outage, so the daemon wait's fail-closed result must
                 // propagate instead of being retried in process.
-                Err(error) if matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket") =>
+                Err(error)
+                    if search_runtime.cli_input.daemon_socket.is_none()
+                        && matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket") =>
                 {
                     warn!(
                         error_code = error_code_for(&error),
@@ -10066,7 +10068,9 @@ impl FsfsRuntime {
                     .search_payloads_via_daemon_with_sink(cx, query, limit, Some(&mut daemon_sink))
                     .await
                 {
-                    Err(error) if matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket") =>
+                    Err(error)
+                        if self.cli_input.daemon_socket.is_none()
+                            && matches!(&error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket") =>
                     {
                         warn!(error_code = error_code_for(&error), "daemon startup unavailable; using in-process retrieval");
                         let mut direct_sink = |payload: &SearchPayload| {
@@ -10581,8 +10585,8 @@ impl FsfsRuntime {
         }
     }
 
-    /// The daemon closed the connection before sending any frame. Callers
-    /// treat this field like an absent daemon and retrieve in process.
+    /// The daemon closed before sending any frame. Default-socket callers can
+    /// retrieve in process. An explicit named socket keeps this error.
     #[cfg(unix)]
     fn search_daemon_hung_up(socket_path: &Path, detail: &str) -> SearchError {
         SearchError::InvalidConfig {
@@ -44639,7 +44643,7 @@ mod tests {
     }
 
     /// A socket path longer than `sun_path` is refused before a daemon is
-    /// spawned, with the `cli.daemon_socket` error search falls back on,
+    /// spawned, with the `cli.daemon_socket` error a default search can fall back on,
     /// instead of after the readiness timeout of a daemon that cannot bind.
     #[cfg(unix)]
     #[test]
