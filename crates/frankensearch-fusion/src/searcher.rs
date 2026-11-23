@@ -1144,6 +1144,8 @@ impl TwoTierSearcher {
     /// The captured query contracts also admit every actual bound response
     /// after inference, before feedback-vector reads, exact scoring or graph
     /// traversal. A provider cannot relabel raw values with a later identity.
+    /// Explicit fast-only policy excludes the quality producer from admission
+    /// as well as execution; an unused tier cannot prevent fast retrieval.
     ///
     /// # Errors
     ///
@@ -1155,11 +1157,13 @@ impl TwoTierSearcher {
     /// certified-compatible case, which is comparison-grade telemetry and
     /// never an admission basis.
     fn admit_semantic_query(&self) -> SearchResult<(SemanticAdmission, QueryEmbeddingIdentities)> {
+        let quality_embedder = self
+            .quality_embedder
+            .as_ref()
+            .filter(|_| !self.config.fast_only);
         let identities = QueryEmbeddingIdentities {
             fast: capture_query_identity(self.fast_embedder.as_ref(), "fast")?,
-            quality: self
-                .quality_embedder
-                .as_ref()
+            quality: quality_embedder
                 .filter(|_| self.index.has_quality_index())
                 .map(|embedder| capture_query_identity(embedder.as_ref(), "quality"))
                 .transpose()?
@@ -1182,10 +1186,9 @@ impl TwoTierSearcher {
                 self.index.fast_embedder_revision(),
                 "fast",
             )?;
-            if let (Some(embedder), Some(revision)) = (
-                self.quality_embedder.as_ref(),
-                self.index.quality_embedder_revision(),
-            ) {
+            if let Some(embedder) = quality_embedder
+                && let Some(revision) = self.index.quality_embedder_revision()
+            {
                 admit_legacy_tier_embedder(
                     embedder.as_ref(),
                     identities.quality.as_ref(),
@@ -1206,20 +1209,18 @@ impl TwoTierSearcher {
         // an error — `should_run_quality` already keeps such a search on the
         // Initial phase — and a retained quality owner with no configured
         // embedder is simply never consulted.
-        let quality = match (
-            self.quality_embedder.as_ref(),
-            self.index.quality_admitted_binding(),
-        ) {
-            (Some(embedder), Some(binding)) => {
-                admit_tier_embedder(
-                    embedder.as_ref(),
-                    identities.quality.as_ref(),
-                    binding,
-                    "quality",
-                )?;
-                true
-            }
-            _ => false,
+        let quality = if let Some(embedder) = quality_embedder
+            && let Some(binding) = self.index.quality_admitted_binding()
+        {
+            admit_tier_embedder(
+                embedder.as_ref(),
+                identities.quality.as_ref(),
+                binding,
+                "quality",
+            )?;
+            true
+        } else {
+            false
         };
         Ok((SemanticAdmission::OwnerBacked { quality }, identities))
     }
@@ -7872,6 +7873,183 @@ mod tests {
                 query_admission_identity("response-quality", 6),
                 vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             )
+        }
+    }
+
+    #[test]
+    fn async_fast_only_does_not_admit_an_unused_quality_producer() {
+        for layout in ["exact-v2", "native-v2", "stamped-v1"] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_dir, index) = query_admission_index(layout);
+                for case in [
+                    "matching",
+                    "missing_identity",
+                    "unavailable",
+                    "malformed_identity",
+                    "foreign_space",
+                    "foreign_producer",
+                    "wrong_dimension",
+                ] {
+                    let fast = Arc::new(query_admission_embedder("fast"));
+                    let mut quality = query_admission_embedder("quality");
+                    match case {
+                        "matching" => {}
+                        "missing_identity" => {
+                            quality.identity_refusal = Some("embedder.identity");
+                        }
+                        "unavailable" => {
+                            quality.identity_refusal = Some("quality.provider_unavailable");
+                        }
+                        "malformed_identity" => quality.identity.space.dimension = 0,
+                        "foreign_space" => {
+                            quality.identity = query_admission_identity("foreign-quality", 6);
+                        }
+                        "foreign_producer" => {
+                            quality
+                                .identity
+                                .producer
+                                .implementation_revision
+                                .push_str("-foreign");
+                            quality.identity.validate().expect("valid foreign producer");
+                        }
+                        "wrong_dimension" => quality.reported_dimension = Some(7),
+                        _ => unreachable!("bounded admission fixture"),
+                    }
+                    let quality = Arc::new(quality);
+                    let searcher = TwoTierSearcher::new(
+                        index.clone(),
+                        fast.clone(),
+                        TwoTierConfig {
+                            fast_only: true,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_quality_embedder(quality.clone());
+                    let mut initial = Vec::new();
+                    let mut phase_count = 0;
+                    let metrics = searcher
+                        .search(
+                            &cx,
+                            "find documents related to this natural language query",
+                            2,
+                            |_| None,
+                            |phase| {
+                                phase_count += 1;
+                                match phase {
+                                    SearchPhase::Initial { results, .. } => initial = results,
+                                    other => panic!("fast-only must not refine: {other:?}"),
+                                }
+                            },
+                        )
+                        .await
+                        .expect("an unused quality provider cannot block fast-only retrieval");
+                    assert_eq!(phase_count, 1, "{layout}/{case}");
+                    assert_eq!(
+                        initial
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["doc-a", "doc-b"],
+                        "{layout}/{case}"
+                    );
+                    assert!(initial.iter().all(|hit| hit.quality_score.is_none()));
+                    assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only"));
+                    assert!(metrics.quality_embedder_id.is_none());
+                    assert_eq!(metrics.phase2_vectors_searched, 0);
+                    assert_eq!(fast.embed_count(), 1, "{layout}/{case}");
+                    assert_eq!(quality.identity_count(), 0, "{layout}/{case}");
+                    assert_eq!(quality.embed_count(), 0, "{layout}/{case}");
+                    assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 0);
+
+                    // Re-enable the same quality tier. Matching producers must
+                    // still refine, and every rejected producer must fail before
+                    // either inference or an Initial result is published.
+                    let progressive =
+                        TwoTierSearcher::new(index.clone(), fast.clone(), TwoTierConfig::default())
+                            .with_quality_embedder(quality.clone());
+                    let mut phases = Vec::new();
+                    let outcome = progressive
+                        .search(
+                            &cx,
+                            "find documents related to this natural language query",
+                            2,
+                            |_| None,
+                            |phase| match phase {
+                                SearchPhase::Initial { .. } => phases.push("initial"),
+                                SearchPhase::Refined { results, .. } => {
+                                    assert!(results.iter().any(|hit| hit.quality_score.is_some()));
+                                    phases.push("refined");
+                                }
+                                other => panic!("unexpected progressive phase: {other:?}"),
+                            },
+                        )
+                        .await;
+                    assert!(quality.identity_count() > 0, "{layout}/{case}");
+                    if case == "matching" {
+                        outcome.expect("matching progressive producers still refine");
+                        assert_eq!(phases, ["initial", "refined"], "{layout}/{case}");
+                        assert_eq!(fast.embed_count(), 2);
+                        assert_eq!(quality.embed_count(), 1);
+                    } else {
+                        outcome.expect_err("requested quality must remain fail-closed");
+                        assert!(phases.is_empty(), "{layout}/{case}");
+                        assert_eq!(fast.embed_count(), 1, "{layout}/{case}");
+                        assert_eq!(quality.embed_count(), 0, "{layout}/{case}");
+                        assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 0);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn async_fast_only_still_refuses_a_foreign_fast_producer_before_work() {
+        for layout in ["exact-v2", "native-v2", "stamped-v1"] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_dir, index) = query_admission_index(layout);
+                let fast = Arc::new(IdentityCountingEmbedder::new(
+                    "fast",
+                    query_admission_identity("foreign-fast", 4),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                ));
+                let mut quality = query_admission_embedder("quality");
+                quality.identity_refusal = Some("quality.provider_unavailable");
+                let quality = Arc::new(quality);
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    fast.clone(),
+                    TwoTierConfig {
+                        fast_only: true,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_quality_embedder(quality.clone());
+                let mut phases = 0;
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find documents related to this natural language query",
+                        2,
+                        |_| None,
+                        |_| phases += 1,
+                    )
+                    .await
+                    .expect_err("fast-only must still admit its requested fast producer");
+                let expected = if layout == "stamped-v1" {
+                    "search_activation.fast.producer_revision"
+                } else {
+                    "query_embedding.fast.space_identity"
+                };
+                assert!(
+                    matches!(&error, SearchError::InvalidConfig { field, .. } if field == expected),
+                    "{layout}: {error:?}"
+                );
+                assert_eq!(phases, 0);
+                assert_eq!(fast.embed_count(), 0);
+                assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 0);
+                assert_eq!(quality.identity_count(), 0);
+                assert_eq!(quality.embed_count(), 0);
+            });
         }
     }
 
