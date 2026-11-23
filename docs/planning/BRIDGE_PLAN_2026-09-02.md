@@ -390,6 +390,14 @@ Quill conformance and performance program.
   binary in all ten valid-route controls. Its SHA-256 is
   `708b415df84f7260e4ea611b6aa252ae3a6d7da1aa0d7b497160abdba83c3194`.
   See `transport-release-{probe,parity}.log` in the same evidence root.
+- Clean `d53c2ff6` passed all 18 stock quality stages in one invocation.
+  The real-model stage passed 25 cases, including the frozen predecessor
+  upgrade check. The source quickstart verified the exact revision and
+  passed 12 commands and 22 negative controls with zero owned processes
+  remaining. See `transport-gate.log` and
+  `transport-quickstart-receipt.json` in the same evidence root.
+- Landed as `ffbec5e5`. The only tracked difference from the gated revision
+  at that commit was an intervening update to this plan.
 
 ### Vision checklist
 
@@ -619,7 +627,7 @@ Quill conformance and performance program.
   valid direct, named and stdio controls.
 - [x] Repeat both layouts and the ranked-hit comparison on the stock
   optimized binary.
-- [ ] Run the stock quality stages on the exact revision and publish the
+- [x] Run the stock quality stages on the exact revision and publish the
   CLI transport fix.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
