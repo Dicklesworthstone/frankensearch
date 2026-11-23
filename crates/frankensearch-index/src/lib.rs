@@ -916,6 +916,10 @@ pub struct VectorIndex {
     pub(crate) wal_entries: Vec<wal::WalEntry>,
     /// WAL configuration.
     wal_config: WalConfig,
+    /// A failed append whose rollback could not be made durable forbids more
+    /// mutations on this owner. Reads keep its previously admitted rows; a
+    /// fresh write-capable open performs normal WAL recovery before clearing it.
+    wal_append_requires_reopen: bool,
     /// Lazily-built int8 quantization of the (contiguous, F16) main vector region,
     /// for the optional int8 two-pass scan (`search_top_k_int8_two_pass`). Built on
     /// first two-pass use, so exact-only callers never pay the quantization cost or
@@ -1944,6 +1948,7 @@ impl ValidatedFsviBytes {
             vectors_offset,
             wal_entries: Vec::new(),
             wal_config: WalConfig::default(),
+            wal_append_requires_reopen: false,
             vectors_i8: OnceLock::new(),
             vectors_nibbles: OnceLock::new(),
         };
@@ -2213,6 +2218,7 @@ impl VectorIndex {
             vectors_offset,
             wal_entries,
             wal_config: WalConfig::default(),
+            wal_append_requires_reopen: false,
             vectors_i8: OnceLock::new(),
             vectors_nibbles: OnceLock::new(),
         })
@@ -2903,7 +2909,12 @@ impl VectorIndex {
     /// Returns `SearchError::DimensionMismatch` for wrong embedding lengths,
     /// `SearchError::InvalidConfig` for invalid values or vectors that become
     /// unusable in the index's stored precision, and
-    /// `SearchError::Io` for filesystem failures.
+    /// `SearchError::Io` for filesystem failures. If a failed append cannot be
+    /// rolled back durably, returns `SearchError::SubsystemError` and refuses
+    /// further mutations on this handle. Reads remain available; close and
+    /// reopen the writer to recover the last complete WAL batches before
+    /// retrying. A complete but unacknowledged batch may replay after such an
+    /// uncertain failure.
     pub fn append_batch(&mut self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
         self.append_batch_impl(entries)
     }
@@ -2985,14 +2996,17 @@ impl VectorIndex {
         // is safe at every cut point because `open` deduplicates duplicate
         // WAL doc IDs with last-wins semantics.
         let wal_path = wal::wal_path_for(&self.path);
-        wal::append_wal_batch(
+        if let Err(error) = wal::append_index_wal_batch(
             &wal_path,
             &wal_entries,
             self.dimension(),
             self.quantization(),
-            next_generation(self.metadata.compaction_gen),
+            self.metadata.compaction_gen,
             self.wal_config.fsync_on_write,
-        )?;
+        ) {
+            self.wal_append_requires_reopen |= wal::append_requires_reopen(&error);
+            return Err(error);
+        }
 
         // Score newly appended rows at the precision replay will recover.
         if self.quantization() == Quantization::F16 {
@@ -3987,6 +4001,14 @@ impl VectorIndex {
 
     fn legacy_writer_file(&self, operation: &str) -> SearchResult<&File> {
         self.ensure_mutable_format(operation)?;
+        if self.wal_append_requires_reopen {
+            return Err(SearchError::InvalidConfig {
+                field: "wal.append_recovery".to_owned(),
+                value: operation.to_owned(),
+                reason: "a failed WAL append could not be rolled back durably; close and reopen the writer for recovery before further mutations"
+                    .to_owned(),
+            });
+        }
         if let Some(FsviMapLock::Exclusive { file, .. }) = &self.map_lock {
             return Ok(file);
         }
@@ -6543,10 +6565,10 @@ fn temporary_output_path(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 pub(crate) fn sync_parent_directory(path: &Path) -> SearchResult<()> {
-    if let Some(parent) = path.parent() {
-        let dir = File::open(parent)?;
-        dir.sync_all()?;
-    }
+    // A bare relative filename has an empty parent, not `None`. Its durable
+    // directory entry belongs to the current directory just like `./name`.
+    let dir = File::open(snapshot_parent_or_current(path))?;
+    dir.sync_all()?;
     Ok(())
 }
 
@@ -10334,6 +10356,198 @@ mod tests {
             !reader.is_deleted(0),
             "fresh reader: the main-slab record must not be tombstoned by a failed update"
         );
+    }
+
+    #[test]
+    fn failed_wal_append_is_retryable_without_losing_acknowledged_updates() {
+        use wal::WalAppendIoStage::{Batch, FileSync, Header};
+
+        for quantization in [Quantization::F16, Quantization::F32] {
+            for (established, stage) in [
+                (false, Header),
+                (false, Batch),
+                (true, Batch),
+                (true, FileSync),
+            ] {
+                let path = temp_index_path("wal-live-owner-retry");
+                let mut writer =
+                    VectorIndex::create_with_revision(&path, "test", "r1", 2, quantization)
+                        .expect("writer");
+                writer
+                    .write_record("stable", &[1.0, 0.0])
+                    .expect("main record");
+                writer.finish().expect("publish main");
+                let mut index = VectorIndex::open_writer(&path).expect("open writer");
+                if established {
+                    index
+                        .append("accepted", &[0.0, 1.0])
+                        .expect("initial append");
+                }
+                let wal_path = wal::wal_path_for(&path);
+                let original_main = fs::read(&path).expect("main bytes");
+                let original_wal = if established {
+                    fs::read(&wal_path).expect("WAL bytes")
+                } else {
+                    assert!(!wal_path.exists());
+                    Vec::new()
+                };
+                let mut expected_ids = index.live_doc_ids().expect("initial ids");
+
+                let fault = wal::fail_append_at(stage, None);
+                let error = index
+                    .append("stable", &[0.0, 1.0])
+                    .expect_err("a failed replacement cannot be acknowledged");
+                drop(fault);
+                assert!(!wal::append_requires_reopen(&error));
+                assert_eq!(fs::read(&path).unwrap(), original_main);
+                assert_eq!(fs::read(&wal_path).unwrap(), original_wal);
+                assert_eq!(index.live_doc_ids().unwrap(), expected_ids);
+                let hits = index.search_top_k(&[1.0, 0.0], 10, None).unwrap();
+                assert_eq!(hits[0].doc_id, "stable");
+                assert_eq!(hits[0].score.to_bits(), 1.0_f32.to_bits());
+
+                index
+                    .append("retry", &[-1.0, 0.0])
+                    .expect("same-owner retry");
+                expected_ids.insert("retry".to_owned());
+                drop(index);
+                let reopened = VectorIndex::open_read_only(&path).expect("reopen accepted updates");
+                assert_eq!(reopened.live_doc_ids().unwrap(), expected_ids);
+                let hits = reopened.search_top_k(&[1.0, 0.0], 10, None).unwrap();
+                assert_eq!(hits[0].doc_id, "stable");
+                assert_eq!(hits[0].score.to_bits(), 1.0_f32.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_wal_rollback_requires_reopen_but_keeps_retained_reads() {
+        use wal::WalAppendIoStage::{Batch, FileSync, Header, Rollback, RollbackSync};
+
+        for quantization in [Quantization::F16, Quantization::F32] {
+            for primary in [Header, Batch, FileSync] {
+                for rollback in [Rollback, RollbackSync] {
+                    let path = temp_index_path("wal-live-owner-poison");
+                    let mut writer =
+                        VectorIndex::create_with_revision(&path, "test", "r1", 2, quantization)
+                            .expect("writer");
+                    writer
+                        .write_record("stable", &[1.0, 0.0])
+                        .expect("main record");
+                    writer.finish().expect("publish main");
+                    let mut index = VectorIndex::open_writer(&path).expect("open writer");
+                    if primary != Header {
+                        index
+                            .append("accepted", &[0.0, 1.0])
+                            .expect("accepted append");
+                    }
+                    let mut expected_ids = index.live_doc_ids().unwrap();
+                    let fault = wal::fail_append_at(primary, Some(rollback));
+                    let error = index
+                        .append("failed", &[0.0, 1.0])
+                        .expect_err("uncertain append");
+                    drop(fault);
+                    assert!(wal::append_requires_reopen(&error));
+                    assert_eq!(index.live_doc_ids().unwrap(), expected_ids);
+                    let hits = index.search_top_k(&[1.0, 0.0], 10, None).unwrap();
+                    assert_eq!(hits[0].doc_id, "stable");
+                    assert_eq!(hits[0].score.to_bits(), 1.0_f32.to_bits());
+
+                    let wal_path = wal::wal_path_for(&path);
+                    let before_refusals = fs::read(&wal_path).unwrap();
+                    for mutation in [
+                        index.append("later", &[1.0, 0.0]),
+                        index.soft_delete("stable").map(|_| ()),
+                        index.compact().map(|_| ()),
+                    ] {
+                        assert!(matches!(
+                            mutation,
+                            Err(SearchError::InvalidConfig { field, .. })
+                                if field == "wal.append_recovery"
+                        ));
+                    }
+                    assert_eq!(fs::read(&wal_path).unwrap(), before_refusals);
+                    drop(index);
+
+                    // A failed barrier followed by failed truncation leaves a
+                    // complete, unacknowledged batch. Recovery may admit it;
+                    // only the poisoned old owner must retain its old view.
+                    if primary == FileSync && rollback == Rollback {
+                        expected_ids.insert("failed".to_owned());
+                    }
+                    let mut recovered =
+                        VectorIndex::open_writer(&path).expect("recover torn suffix");
+                    assert_eq!(recovered.live_doc_ids().unwrap(), expected_ids);
+                    recovered
+                        .append("after-reopen", &[-1.0, 0.0])
+                        .expect("fresh writer is usable");
+                    expected_ids.insert("after-reopen".to_owned());
+                    drop(recovered);
+                    let reopened =
+                        VectorIndex::open_read_only(&path).expect("reopen recovered data");
+                    assert_eq!(reopened.live_doc_ids().unwrap(), expected_ids);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_optional_wal_rewrite_does_not_poison_acknowledged_append() {
+        use wal::WalAppendIoStage::{Header, Rollback};
+
+        for quantization in [Quantization::F16, Quantization::F32] {
+            for rollback in [None, Some(Rollback)] {
+                let path = temp_index_path("wal-optional-rewrite-failure");
+                let mut writer =
+                    VectorIndex::create_with_revision(&path, "test", "r1", 2, quantization)
+                        .expect("writer");
+                writer
+                    .write_record("stable", &[1.0, 0.0])
+                    .expect("main record");
+                writer.finish().expect("publish main");
+                let mut index = VectorIndex::open_writer(&path).expect("open writer");
+                index
+                    .append("pending", &[1.0, 0.0])
+                    .expect("initial append");
+
+                // The canonical WAL already has a header. Only the optional
+                // deduplicating rewrite to its separate temp file hits this.
+                let fault = wal::fail_append_at(Header, rollback);
+                index
+                    .append("pending", &[0.0, 1.0])
+                    .expect("canonical update is durable");
+                drop(fault);
+                let (logged, _, _) =
+                    wal::read_wal(&wal::wal_path_for(&path), 2, quantization).unwrap();
+                assert_eq!(
+                    logged.len(),
+                    2,
+                    "failed rewrite leaves durable old/new pairs"
+                );
+                index
+                    .append("later", &[-1.0, 0.0])
+                    .expect("live writer remains usable");
+                drop(index);
+
+                let reopened =
+                    VectorIndex::open_read_only(&path).expect("reopen acknowledged updates");
+                assert_eq!(
+                    reopened.live_doc_ids().unwrap(),
+                    std::collections::HashSet::from([
+                        "stable".to_owned(),
+                        "pending".to_owned(),
+                        "later".to_owned()
+                    ])
+                );
+                let hits = reopened.search_top_k(&[1.0, 0.0], 10, None).unwrap();
+                let pending = hits.iter().find(|hit| hit.doc_id == "pending").unwrap();
+                assert_eq!(
+                    pending.score.to_bits(),
+                    0.0_f32.to_bits(),
+                    "the acknowledged replacement survives replay"
+                );
+            }
+        }
     }
 
     #[test]

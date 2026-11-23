@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- Incremental vector appends now validate the existing WAL header and roll
+  back failed writes or durability barriers before releasing the writer lock.
+  A failed rollback blocks further mutations on that handle until reopening
+  performs recovery, so a later successful append cannot disappear behind a
+  torn batch. Header mismatches preserve the original bytes, and ordinary
+  appends do not rescan the log.
+- Bare relative vector-index paths now sync the current directory correctly
+  when publishing an index or creating, rewriting, compacting and removing its
+  WAL sidecar.
 - Federated search now retains request-scoped metadata observations across a
   shard deadline and rechecks its last published phase before using it as a
   fallback. A result rejected by a later metadata lookup cannot reappear when

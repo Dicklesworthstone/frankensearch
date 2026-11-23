@@ -1204,10 +1204,90 @@ fn wal_dimension(dimension: usize) -> SearchResult<u32> {
     })
 }
 
+#[derive(Clone, Copy)]
+enum WalAppendGeneration {
+    Exact(u8),
+    AfterMain(u8),
+}
+
+impl WalAppendGeneration {
+    const fn fresh(self) -> u8 {
+        match self {
+            Self::Exact(generation) => generation,
+            Self::AfterMain(generation) => crate::next_generation(generation),
+        }
+    }
+
+    const fn accepts(self, generation: u8) -> bool {
+        generation == self.fresh() || matches!(self, Self::AfterMain(0)) && generation == 0
+    }
+}
+
+/// An uncertain append must not be followed by another acknowledged mutation
+/// on the same index handle. Retain both failures, rather than disguising an
+/// unsuccessful rollback as the original, safely retryable I/O error.
+#[derive(Debug)]
+struct WalAppendRollbackFailed {
+    append: SearchError,
+    rollback: std::io::Error,
+}
+
+impl std::fmt::Display for WalAppendRollbackFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "WAL append failed ({}), and rollback failed ({}); close and reopen the writer before further mutations",
+            self.append, self.rollback
+        )
+    }
+}
+
+impl std::error::Error for WalAppendRollbackFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.append)
+    }
+}
+
+pub(crate) fn append_requires_reopen(error: &SearchError) -> bool {
+    matches!(error, SearchError::SubsystemError { source, .. }
+        if source.is::<WalAppendRollbackFailed>())
+}
+
+/// Append against the generation of the writer's retained main index.
+/// Historical WAL generation zero is accepted only for main generation zero,
+/// exactly as it is by write-capable open. A wrapped generation-255 main must
+/// not accidentally admit that historical sentinel merely because its next
+/// generation is one too.
+pub(crate) fn append_index_wal_batch(
+    wal_path: &Path,
+    entries: &[WalEntry],
+    dimension: usize,
+    quantization: Quantization,
+    main_generation: u8,
+    fsync: bool,
+) -> SearchResult<()> {
+    append_wal_batch_for_generation(
+        wal_path,
+        entries,
+        dimension,
+        quantization,
+        WalAppendGeneration::AfterMain(main_generation),
+        fsync,
+    )
+}
+
 /// Append a batch of entries to the WAL file.
 ///
 /// If the WAL file does not exist, a header is written first.
-/// The batch is CRC32-protected so partial writes are detectable.
+/// The batch is validated and encoded before any filesystem mutation. Its
+/// header is checked under the same descriptor lock used for the append.
+/// Failed writes or requested durability barriers roll back to the original
+/// file length before releasing that lock. A failed rollback is a typed
+/// error, for which the live index writer must refuse subsequent mutations.
+///
+/// This does not replay the existing batches on each append. A fresh writer
+/// must first use the existing open/recovery path to repair a torn tail; a
+/// live writer relies on its exclusive ownership and the rollback discipline.
 pub(crate) fn append_wal_batch(
     wal_path: &Path,
     entries: &[WalEntry],
@@ -1216,9 +1296,51 @@ pub(crate) fn append_wal_batch(
     compaction_gen: u8,
     fsync: bool,
 ) -> SearchResult<()> {
+    append_wal_batch_for_generation(
+        wal_path,
+        entries,
+        dimension,
+        quantization,
+        WalAppendGeneration::Exact(compaction_gen),
+        fsync,
+    )
+}
+
+fn append_wal_batch_for_generation(
+    wal_path: &Path,
+    entries: &[WalEntry],
+    dimension: usize,
+    quantization: Quantization,
+    generation: WalAppendGeneration,
+    fsync: bool,
+) -> SearchResult<()> {
+    // Refuse an invalid batch before creating, repairing, or extending a WAL.
+    let mut header = Vec::with_capacity(WAL_HEADER_SIZE);
+    write_wal_header(&mut header, dimension, quantization, generation.fresh())?;
+    let mut batch = Vec::new();
+    batch.extend_from_slice(&BATCH_MAGIC);
+    let entry_count = wal_entry_count(entries.len())?;
+    batch.extend_from_slice(&entry_count.to_le_bytes());
+    for entry in entries {
+        if entry.embedding.len() != dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: dimension,
+                found: entry.embedding.len(),
+            });
+        }
+        let doc_bytes = entry.doc_id.as_bytes();
+        let doc_id_len = wal_doc_id_len(doc_bytes.len())?;
+        batch.extend_from_slice(&doc_id_len.to_le_bytes());
+        batch.extend_from_slice(doc_bytes);
+        encode_vector(&mut batch, &entry.embedding, quantization);
+    }
+    let crc = crc32_of(&batch);
+    batch.extend_from_slice(&crc.to_le_bytes());
+
     // Try to create a new WAL file atomically. If successful, we are the creator
     // and responsible for writing the header.
     let created = OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(wal_path);
@@ -1226,10 +1348,8 @@ pub(crate) fn append_wal_batch(
     let mut created_fresh = false;
     let mut writer = match created {
         Ok(file) => {
-            let mut writer = acquire_wal_writer_lock(wal_path, file)?;
             created_fresh = true;
-            write_wal_header(&mut writer.file, dimension, quantization, compaction_gen)?;
-            writer
+            acquire_wal_writer_lock(wal_path, file)?
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // File exists — open in write mode (not append) so we can
@@ -1242,71 +1362,82 @@ pub(crate) fn append_wal_batch(
             // and initialize with a header.
             let file = open_fsvi_regular_file(
                 wal_path,
-                OpenOptions::new().write(true).create(true).truncate(false),
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false),
             )?;
             // Before any length is observed or offset resolved: a second
             // appender that reads the end offset concurrently would clobber
             // this batch, and the refusal must happen before a single byte
             // of this one is written.
-            let mut writer = acquire_wal_writer_lock(wal_path, file)?;
-            let existing_len = writer.file.metadata()?.len();
-            if existing_len < WAL_HEADER_SIZE as u64 {
-                // Empty or truncated file — the creator likely crashed before
-                // flushing the header. Truncate in-place and write a fresh
-                // header. We keep the file handle open to avoid a TOCTOU race
-                // where a concurrent writer could land valid data between a
-                // drop and a reopen-with-truncate.
-                warn!(
-                    path = %wal_path.display(),
-                    existing_len,
-                    "WAL file smaller than header; truncating and writing fresh header"
-                );
-                writer.file.set_len(0)?;
-                writer.file.seek(std::io::SeekFrom::Start(0))?;
-                write_wal_header(&mut writer.file, dimension, quantization, compaction_gen)?;
-                // `.create(true)` above may have re-created a dirent that a
-                // concurrent delete removed after our `create_new` failed, or
-                // repaired one a crashed creator never durably linked; either
-                // way the dirent needs the same parent sync as a fresh create.
-                created_fresh = true;
-            } else {
-                // Seek to end so the batch is appended after existing data.
-                writer.file.seek(std::io::SeekFrom::End(0))?;
-            }
-            writer
+            acquire_wal_writer_lock(wal_path, file)?
         }
         Err(error) => return Err(error.into()),
     };
 
-    // Build batch bytes.
-    let mut batch = Vec::new();
-    batch.extend_from_slice(&BATCH_MAGIC);
-    let entry_count = wal_entry_count(entries.len())?;
-    batch.extend_from_slice(&entry_count.to_le_bytes());
-
-    for entry in entries {
-        let doc_bytes = entry.doc_id.as_bytes();
-        let doc_id_len = wal_doc_id_len(doc_bytes.len())?;
-        batch.extend_from_slice(&doc_id_len.to_le_bytes());
-        batch.extend_from_slice(doc_bytes);
-        encode_vector(&mut batch, &entry.embedding, quantization);
+    let original_len = writer.file.metadata()?.len();
+    let prefix_len = usize::try_from(original_len.min(WAL_HEADER_SIZE as u64))
+        .expect("bounded WAL header length fits usize");
+    let mut original_prefix = vec![0; prefix_len];
+    writer.file.read_exact(&mut original_prefix)?;
+    // Recognizable foreign formats remain evidence even if their headers are
+    // short. Never turn an incomplete v2/future header into a fresh legacy WAL.
+    if let Some(version) = other_wal_version(&original_prefix) {
+        return Err(wal_corrupted(
+            wal_path,
+            format!("version mismatch: expected {WAL_VERSION}, got {version}"),
+        ));
+    }
+    let initialize_header = original_len < WAL_HEADER_SIZE as u64;
+    if !initialize_header {
+        validate_append_header(wal_path, &original_prefix, &header, generation)?;
+    } else {
+        // A short original header is backed up as well as its length. Merely
+        // truncating on failure could preserve overwritten bytes instead of
+        // restoring the pre-attempt image.
+        created_fresh = true;
     }
 
-    let crc = crc32_of(&batch);
-    batch.extend_from_slice(&crc.to_le_bytes());
-
-    writer.file.write_all(&batch)?;
-
-    if fsync {
-        writer.file.sync_all()?;
-        if created_fresh {
-            // A durable first append also needs the CREATE dirent persisted:
-            // file fsync alone does not guarantee the new sidecar survives a
-            // crash on every filesystem, and a vanished sidecar silently
-            // loses every acknowledged append.
-            #[cfg(unix)]
-            crate::sync_parent_directory(wal_path)?;
+    let write_result = (|| -> SearchResult<()> {
+        if initialize_header {
+            writer.file.set_len(0)?;
+            writer.file.seek(std::io::SeekFrom::Start(0))?;
+            write_append_bytes(&mut writer.file, &header, WalAppendIoStage::Header)?;
+        } else {
+            writer.file.seek(std::io::SeekFrom::Start(original_len))?;
         }
+        write_append_bytes(&mut writer.file, &batch, WalAppendIoStage::Batch)?;
+        if fsync {
+            #[cfg(test)]
+            append_io_checkpoint(WalAppendIoStage::FileSync)?;
+            writer.file.sync_all()?;
+            if created_fresh {
+                // The new directory entry is part of a durable first append.
+                #[cfg(unix)]
+                {
+                    #[cfg(test)]
+                    append_io_checkpoint(WalAppendIoStage::DirectorySync)?;
+                    crate::sync_parent_directory(wal_path)?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(append) = write_result {
+        let rollback = rollback_append(
+            &mut writer.file,
+            original_len,
+            initialize_header.then_some(original_prefix.as_slice()),
+        );
+        return match rollback {
+            Ok(()) => Err(append),
+            Err(rollback) => Err(SearchError::SubsystemError {
+                subsystem: "wal-append",
+                source: Box::new(WalAppendRollbackFailed { append, rollback }),
+            }),
+        };
     }
 
     debug!(
@@ -1316,6 +1447,145 @@ pub(crate) fn append_wal_batch(
         "appended WAL batch"
     );
     Ok(())
+}
+
+fn validate_append_header(
+    path: &Path,
+    actual: &[u8],
+    expected: &[u8],
+    generation: WalAppendGeneration,
+) -> SearchResult<()> {
+    if actual[..4] != WAL_MAGIC {
+        return Err(wal_corrupted(path, "bad magic bytes"));
+    }
+    if actual[4..11] != expected[4..11] {
+        return Err(wal_corrupted(
+            path,
+            "WAL version, dimension or quantization mismatch",
+        ));
+    }
+    if !generation.accepts(actual[11]) {
+        return Err(wal_corrupted(path, "WAL generation mismatch"));
+    }
+    if actual[12..16] != [0; 4] {
+        return Err(wal_corrupted(path, "WAL reserved bytes must be zero"));
+    }
+    if actual[16..] != crc32_of(&actual[..16]).to_le_bytes() {
+        return Err(wal_corrupted(path, "WAL header CRC mismatch"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalAppendIoStage {
+    Header,
+    Batch,
+    #[cfg(test)]
+    FileSync,
+    #[cfg(all(test, unix))]
+    DirectorySync,
+    #[cfg(test)]
+    Rollback,
+    #[cfg(test)]
+    RollbackSync,
+}
+
+fn write_append_bytes(
+    file: &mut fs::File,
+    bytes: &[u8],
+    stage: WalAppendIoStage,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if take_append_fault(stage) {
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        return Err(std::io::Error::other("injected partial WAL write"));
+    }
+    let _ = stage;
+    file.write_all(bytes)
+}
+
+#[cfg(test)]
+fn append_io_checkpoint(stage: WalAppendIoStage) -> std::io::Result<()> {
+    if take_append_fault(stage) {
+        return Err(std::io::Error::other("injected WAL durability failure"));
+    }
+    Ok(())
+}
+
+fn rollback_append(
+    file: &mut fs::File,
+    original_len: u64,
+    original_header: Option<&[u8]>,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    append_io_checkpoint(WalAppendIoStage::Rollback)?;
+    if let Some(header) = original_header {
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(header)?;
+    }
+    file.set_len(original_len)?;
+    #[cfg(test)]
+    append_io_checkpoint(WalAppendIoStage::RollbackSync)?;
+    file.sync_all()
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct WalAppendFault {
+    primary: Option<WalAppendIoStage>,
+    rollback: Option<WalAppendIoStage>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_FAULT: std::cell::Cell<Option<WalAppendFault>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn take_append_fault(stage: WalAppendIoStage) -> bool {
+    APPEND_FAULT.with(|slot| {
+        let Some(mut fault) = slot.get() else {
+            return false;
+        };
+        let should_fail = if fault.primary == Some(stage) {
+            fault.primary = None;
+            true
+        } else if fault.rollback == Some(stage) {
+            fault.rollback = None;
+            true
+        } else {
+            false
+        };
+        slot.set(Some(fault));
+        should_fail
+    })
+}
+
+#[cfg(test)]
+pub(crate) struct WalAppendFaultGuard(Option<WalAppendFault>);
+
+#[cfg(test)]
+impl Drop for WalAppendFaultGuard {
+    fn drop(&mut self) {
+        APPEND_FAULT.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Inject a single real-file write/barrier failure, optionally followed by a
+/// rollback failure. Scope and thread confinement keep other tests unaffected.
+#[cfg(test)]
+pub(crate) fn fail_append_at(
+    primary: WalAppendIoStage,
+    rollback: Option<WalAppendIoStage>,
+) -> WalAppendFaultGuard {
+    WalAppendFaultGuard(APPEND_FAULT.with(|slot| {
+        slot.replace(Some(WalAppendFault {
+            primary: Some(primary),
+            rollback,
+        }))
+    }))
 }
 
 fn write_wal_header(
@@ -2748,6 +3018,234 @@ mod tests {
         let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-0");
+    }
+
+    #[test]
+    fn append_refuses_foreign_and_mismatched_headers_without_mutation() {
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let path = temp_wal_path("append-header-admission");
+            append_wal_batch(
+                &path,
+                &[make_entry("accepted", 1.0, 4)],
+                4,
+                quantization,
+                7,
+                true,
+            )
+            .unwrap();
+            let accepted = fs::read(&path).unwrap();
+            for mismatch in ["dimension", "quantization", "generation", "crc", "reserved"] {
+                let mut original = accepted.clone();
+                let mut dimension = 4;
+                let mut requested_quantization = quantization;
+                let mut generation = 7;
+                match mismatch {
+                    "dimension" => dimension = 3,
+                    "quantization" => {
+                        requested_quantization = match quantization {
+                            Quantization::F16 => Quantization::F32,
+                            Quantization::F32 => Quantization::F16,
+                        };
+                    }
+                    "generation" => generation = 8,
+                    "crc" => original[16] ^= 1,
+                    "reserved" => {
+                        original[12] = 1;
+                        let crc = crc32_of(&original[..16]);
+                        original[16..20].copy_from_slice(&crc.to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+                fs::write(&path, &original).unwrap();
+                let rejected = append_wal_batch(
+                    &path,
+                    &[make_entry("refused", 2.0, dimension)],
+                    dimension,
+                    requested_quantization,
+                    generation,
+                    true,
+                );
+                assert!(rejected.is_err(), "must refuse {mismatch} before append");
+                assert_eq!(fs::read(&path).unwrap(), original, "{mismatch}");
+            }
+            for version in [IDENTITY_BOUND_WAL_VERSION, 99] {
+                for length in [6, WAL_HEADER_SIZE - 1, WAL_HEADER_SIZE + 1] {
+                    let mut original = vec![0; length];
+                    original[..4].copy_from_slice(&WAL_MAGIC);
+                    original[4..6].copy_from_slice(&version.to_le_bytes());
+                    fs::write(&path, &original).unwrap();
+                    let rejected = append_wal_batch(
+                        &path,
+                        &[make_entry("refused", 2.0, 4)],
+                        4,
+                        quantization,
+                        7,
+                        true,
+                    );
+                    assert!(rejected.is_err(), "foreign version {version}, len {length}");
+                    assert_eq!(fs::read(&path).unwrap(), original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_append_restores_the_exact_file_before_a_same_writer_retry() {
+        for quantization in [Quantization::F16, Quantization::F32] {
+            for original_kind in ["empty", "short-header", "accepted-batch"] {
+                let stages: &[WalAppendIoStage] = if original_kind == "accepted-batch" {
+                    &[WalAppendIoStage::Batch, WalAppendIoStage::FileSync]
+                } else {
+                    &[
+                        WalAppendIoStage::Header,
+                        WalAppendIoStage::Batch,
+                        WalAppendIoStage::FileSync,
+                        #[cfg(unix)]
+                        WalAppendIoStage::DirectorySync,
+                    ]
+                };
+                for &stage in stages {
+                    let path = temp_wal_path("append-rollback-retry");
+                    let mut original = Vec::new();
+                    if original_kind == "accepted-batch" {
+                        append_wal_batch(
+                            &path,
+                            &[make_entry("accepted", 1.0, 4)],
+                            4,
+                            quantization,
+                            7,
+                            true,
+                        )
+                        .unwrap();
+                        original = fs::read(&path).unwrap();
+                    } else if original_kind == "short-header" {
+                        write_wal_header(&mut original, 4, quantization, 7).unwrap();
+                        original.truncate(13);
+                        fs::write(&path, &original).unwrap();
+                    }
+                    let fault = fail_append_at(stage, None);
+                    let error = append_wal_batch(
+                        &path,
+                        &[make_entry("failed", 2.0, 4)],
+                        4,
+                        quantization,
+                        7,
+                        true,
+                    )
+                    .expect_err("injected write or durability failure");
+                    drop(fault);
+                    assert!(!append_requires_reopen(&error));
+                    assert_eq!(
+                        fs::read(&path).unwrap(),
+                        original,
+                        "{original_kind}, {stage:?} must restore the exact pre-attempt image"
+                    );
+
+                    append_wal_batch(
+                        &path,
+                        &[make_entry("retry", 3.0, 4)],
+                        4,
+                        quantization,
+                        7,
+                        true,
+                    )
+                    .expect("a rolled-back append permits retry without a recovery reopen");
+                    let (entries, generation, valid_len) =
+                        read_wal(&path, 4, quantization).unwrap();
+                    let ids: Vec<_> = entries.iter().map(|entry| entry.doc_id.as_str()).collect();
+                    let expected = if original_kind == "accepted-batch" {
+                        vec!["accepted", "retry"]
+                    } else {
+                        vec!["retry"]
+                    };
+                    assert_eq!(ids, expected);
+                    assert_eq!(generation, 7);
+                    assert_eq!(valid_len, fs::metadata(&path).unwrap().len());
+                    assert!(matches!(
+                        inspect_wal_strict(&path).unwrap(),
+                        StrictWalInspection::LegacyV1(_)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_append_accepts_legacy_zero_only_for_main_generation_zero() {
+        let path = temp_wal_path("append-legacy-generation-zero");
+        append_wal_batch(
+            &path,
+            &[make_entry("legacy", 1.0, 4)],
+            4,
+            Quantization::F16,
+            0,
+            true,
+        )
+        .unwrap();
+        let original = fs::read(&path).unwrap();
+        for main_generation in [1, u8::MAX] {
+            assert!(
+                append_index_wal_batch(
+                    &path,
+                    &[make_entry("refused", 2.0, 4)],
+                    4,
+                    Quantization::F16,
+                    main_generation,
+                    true,
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        append_index_wal_batch(
+            &path,
+            &[make_entry("accepted", 2.0, 4)],
+            4,
+            Quantization::F16,
+            0,
+            true,
+        )
+        .expect("the same historical generation accepted at open remains writable");
+        let (entries, generation, _) = read_wal(&path, 4, Quantization::F16).unwrap();
+        assert_eq!(generation, 0);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].doc_id, "legacy");
+        assert_eq!(entries[1].doc_id, "accepted");
+    }
+
+    #[test]
+    fn invalid_append_batch_has_no_filesystem_effect() {
+        for existing in [false, true] {
+            let path = temp_wal_path("invalid-append-before-mutation");
+            if existing {
+                append_wal_batch(
+                    &path,
+                    &[make_entry("accepted", 1.0, 4)],
+                    4,
+                    Quantization::F16,
+                    7,
+                    true,
+                )
+                .unwrap();
+            }
+            let before = if existing {
+                fs::read(&path).unwrap()
+            } else {
+                Vec::new()
+            };
+            for invalid in [
+                make_entry("wrong-dimension", 1.0, 3),
+                make_entry(&"x".repeat(usize::from(u16::MAX) + 1), 1.0, 4),
+            ] {
+                assert!(
+                    append_wal_batch(&path, &[invalid], 4, Quantization::F16, 7, true).is_err()
+                );
+                assert_eq!(path.exists(), existing);
+                if existing {
+                    assert_eq!(fs::read(&path).unwrap(), before);
+                }
+            }
+        }
     }
 
     // ─── bd-vbzm tests end ───
