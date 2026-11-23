@@ -1,9 +1,10 @@
-//! Complete fast/quality FSVI images retained as one authority Vector component.
+//! Independently covered fast/quality FSVI images in one authority Vector component.
 //!
 //! This container preserves each tier's existing FSVI v2 format and independent
 //! identity admission. The caller supplies both trusted bindings and the source
 //! checkpoint; neither identity is inferred from the image or the other tier.
-//! Partial coverage and sharded layouts are not represented by this format.
+//! Complete and explicitly partial-quality cohorts have distinct wire versions;
+//! sharded layouts are not represented by either version.
 //!
 //! # FSVC version 1 wire contract
 //!
@@ -32,6 +33,17 @@
 //! may differ. The aggregate Vector receipt authenticates every container byte
 //! and the shared document set/source cut. Per-tier metadata must describe the
 //! embedded FSVI images' own lengths, hashes, dimensions and physical counts.
+//!
+//! # FSVC version 2 partial-quality contract
+//!
+//! Version 2 uses the same 192-byte framing, with version exactly 2. The header
+//! document set and count describe the complete fast tier. The independently
+//! admitted quality live rows must be a nonempty strict ordered subset of those
+//! fast live rows. Each embedded FSVI image authenticates its own ordered live
+//! document set, and each tier retains its own exact component receipt. The
+//! aggregate receipt still describes the complete fast corpus for the ordinary
+//! lexical/metadata join. Callers must explicitly select partial quality;
+//! neither version can satisfy admission requested for the other coverage policy.
 
 use std::fmt;
 use std::ops::Range;
@@ -52,11 +64,34 @@ pub const VECTOR_COHORT_HEADER_BYTES_V1: usize = 192;
 const HEADER_BYTES_WIRE: u16 = 192;
 const MAGIC: &[u8; 4] = b"FSVC";
 const VERSION: u16 = 1;
+const PARTIAL_QUALITY_VERSION: u16 = 2;
 const FAST_ENTRY: usize = 80;
 const QUALITY_ENTRY: usize = 136;
 const CHUNK_BYTES: usize = 1024 * 1024;
 
-/// Immutable complete vector cohort with two independently admitted owners.
+/// The coverage relationship required of independently selected vector tiers.
+///
+/// This is an admission requirement, not a caller-supplied coverage estimate.
+/// Actual live counts and document sets are derived from both admitted owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorCohortCoverage {
+    /// Both tiers contain the same complete ordered live-document set (FSVC v1).
+    Complete,
+    /// Quality contains a nonempty strict ordered subset of the complete fast
+    /// corpus (FSVC v2). Empty quality belongs to a fast-only generation.
+    PartialQuality,
+}
+
+impl VectorCohortCoverage {
+    const fn wire_version(self) -> u16 {
+        match self {
+            Self::Complete => VERSION,
+            Self::PartialQuality => PARTIAL_QUALITY_VERSION,
+        }
+    }
+}
+
+/// Immutable vector cohort with two independently admitted owners.
 ///
 /// Admission is synchronous and checks cancellation between bounded chunks and
 /// validation stages. It opens no paths and creates no runtime or tasks.
@@ -84,6 +119,7 @@ struct AdmittedTiers {
     quality: Arc<ValidatedFsviBytes>,
     fast_receipt: ExactComponentReceiptV1,
     quality_receipt: ExactComponentReceiptV1,
+    coverage: VectorCohortCoverage,
 }
 
 impl ExactVectorCohortV1 {
@@ -104,6 +140,36 @@ impl ExactVectorCohortV1 {
         source: SourceCheckpointV1,
         max_image_bytes: usize,
     ) -> SearchResult<Self> {
+        Self::build_with_coverage(
+            cx,
+            fast,
+            quality,
+            source,
+            VectorCohortCoverage::Complete,
+            max_image_bytes,
+        )
+    }
+
+    /// Admit and pack two independently selected images under an explicit
+    /// coverage contract.
+    ///
+    /// Complete coverage retains the FSVC v1 contract of [`Self::build`].
+    /// Partial quality emits FSVC v2 and proves that its nonempty live corpus is
+    /// a strict ordered subset of the fast tier. Tombstones are excluded from
+    /// both live corpora. The aggregate receipt always covers the full fast
+    /// corpus, while [`Self::quality_receipt`] retains the measured quality set.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::build`], additionally refusing an empty,
+    /// complete, reordered or foreign quality corpus for partial admission.
+    pub fn build_with_coverage(
+        cx: &Cx,
+        fast: (&FsviV2IdentityBinding, Arc<[u8]>),
+        quality: (&FsviV2IdentityBinding, Arc<[u8]>),
+        source: SourceCheckpointV1,
+        coverage: VectorCohortCoverage,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
         checkpoint(cx)?;
         let total = checked_total(fast.1.len(), quality.1.len(), max_image_bytes)?;
         let fast_bytes = Arc::clone(&fast.1);
@@ -113,6 +179,7 @@ impl ExactVectorCohortV1 {
             (fast.0, fast.1, 0..fast_bytes.len()),
             (quality.0, quality.1, 0..quality_bytes.len()),
             source,
+            coverage,
         )?;
         let mut bytes = Vec::new();
         bytes
@@ -120,7 +187,7 @@ impl ExactVectorCohortV1 {
             .map_err(|_| refused("allocation"))?;
         bytes.resize(VECTOR_COHORT_HEADER_BYTES_V1, 0);
         bytes[..4].copy_from_slice(MAGIC);
-        bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        bytes[4..6].copy_from_slice(&coverage.wire_version().to_le_bytes());
         bytes[6..8].copy_from_slice(&HEADER_BYTES_WIRE.to_le_bytes());
         bytes[8..40].copy_from_slice(&source.to_bytes());
         bytes[40..72].copy_from_slice(&tiers.fast_receipt.docset_digest);
@@ -162,13 +229,45 @@ impl ExactVectorCohortV1 {
         source: SourceCheckpointV1,
         max_image_bytes: usize,
     ) -> SearchResult<Self> {
+        Self::admit_with_coverage(
+            cx,
+            bytes,
+            expected_fast,
+            expected_quality,
+            source,
+            VectorCohortCoverage::Complete,
+            max_image_bytes,
+        )
+    }
+
+    /// Decode selected cohort bytes under the caller's exact coverage policy.
+    ///
+    /// A complete request accepts only FSVC v1, and a partial-quality request
+    /// accepts only FSVC v2. The header cannot grant a broader policy than the
+    /// caller selected. Both tiers, their ordered live sets and their source
+    /// checkpoint are revalidated before any owner is returned.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::admit`], additionally refusing coverage
+    /// policy substitution or a quality corpus that is not a nonempty strict
+    /// ordered subset under partial admission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_with_coverage(
+        cx: &Cx,
+        bytes: Arc<[u8]>,
+        expected_fast: &FsviV2IdentityBinding,
+        expected_quality: &FsviV2IdentityBinding,
+        source: SourceCheckpointV1,
+        coverage: VectorCohortCoverage,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
         checkpoint(cx)?;
         if bytes.len() > max_image_bytes {
             return Err(refused("image-budget"));
         }
         if bytes.len() < VECTOR_COHORT_HEADER_BYTES_V1
             || &bytes[..4] != MAGIC
-            || read_u16(&bytes, 4)? != VERSION
+            || read_u16(&bytes, 4)? != coverage.wire_version()
             || read_u16(&bytes, 6)? != HEADER_BYTES_WIRE
         {
             return Err(refused("header"));
@@ -196,6 +295,7 @@ impl ExactVectorCohortV1 {
             ),
             (expected_quality, Arc::clone(&bytes), fast.end..quality.end),
             source,
+            coverage,
         )?;
         if bytes[40..72] != tiers.fast_receipt.docset_digest
             || read_u64(&bytes, 72)? != tiers.fast_receipt.live_document_count
@@ -262,6 +362,12 @@ impl ExactVectorCohortV1 {
     pub const fn quality_receipt(&self) -> &ExactComponentReceiptV1 {
         &self.tiers.quality_receipt
     }
+
+    /// Coverage policy proved from the independently admitted tier owners.
+    #[must_use]
+    pub const fn coverage(&self) -> VectorCohortCoverage {
+        self.tiers.coverage
+    }
 }
 
 fn admit_tiers(
@@ -269,6 +375,7 @@ fn admit_tiers(
     fast: (&FsviV2IdentityBinding, Arc<[u8]>, Range<usize>),
     quality: (&FsviV2IdentityBinding, Arc<[u8]>, Range<usize>),
     source: SourceCheckpointV1,
+    coverage: VectorCohortCoverage,
 ) -> SearchResult<AdmittedTiers> {
     checkpoint(cx)?;
     let fast_identity = &fast.0.frozen_identity().identity;
@@ -294,17 +401,59 @@ fn admit_tiers(
     checkpoint(cx)?;
     let fast_receipt = owner_receipt(cx, &fast, source)?;
     let quality_receipt = owner_receipt(cx, &quality, source)?;
-    if fast_receipt.docset_digest != quality_receipt.docset_digest
-        || fast_receipt.live_document_count != quality_receipt.live_document_count
-    {
-        return Err(refused("complete-coverage"));
+    match coverage {
+        VectorCohortCoverage::Complete => {
+            if fast_receipt.docset_digest != quality_receipt.docset_digest
+                || fast_receipt.live_document_count != quality_receipt.live_document_count
+            {
+                return Err(refused("complete-coverage"));
+            }
+        }
+        VectorCohortCoverage::PartialQuality => {
+            validate_partial_quality(cx, &fast, &quality)?;
+        }
     }
     Ok(AdmittedTiers {
         fast,
         quality,
         fast_receipt,
         quality_receipt,
+        coverage,
     })
+}
+
+fn validate_partial_quality(
+    cx: &Cx,
+    fast: &ValidatedFsviBytes,
+    quality: &ValidatedFsviBytes,
+) -> SearchResult<()> {
+    if quality.live_count() == 0 || quality.live_count() >= fast.live_count() {
+        return Err(refused("partial-quality-count"));
+    }
+    // Walk both immutable row orders once. A subset digest or matching count
+    // alone cannot establish membership, and accepting reordered quality IDs
+    // would lose the canonical source order used by the component join.
+    let mut fast_rows = 0..fast.record_count();
+    for physical in 0..quality.record_count() {
+        checkpoint(cx)?;
+        let quality_row = quality.row(physical)?;
+        if !quality_row.flags().is_live() {
+            continue;
+        }
+        let mut found = false;
+        for fast_physical in fast_rows.by_ref() {
+            checkpoint(cx)?;
+            let fast_row = fast.row(fast_physical)?;
+            if fast_row.flags().is_live() && fast_row.doc_id() == quality_row.doc_id() {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(refused("partial-quality-document-set"));
+        }
+    }
+    checkpoint(cx)
 }
 
 fn owner_receipt(
@@ -443,7 +592,7 @@ fn refused(reason: &str) -> SearchError {
     SearchError::InvalidConfig {
         field: "vector_cohort".to_owned(),
         value: reason.to_owned(),
-        reason: "complete fast/quality vector cohort admission failed".to_owned(),
+        reason: "fast/quality vector cohort admission failed".to_owned(),
     }
 }
 
@@ -930,6 +1079,270 @@ mod tests {
         assert_eq!(cohort.quality().record_count(), 3);
         assert_eq!(cohort.receipt().live_document_count, 2);
         fixture.admit(cohort.bytes()).unwrap();
+    }
+
+    fn partial_fixture() -> Fixture {
+        let mut fixture = Fixture::new(3);
+        fixture.fast_bytes = write_image(
+            fixture.directory.path(),
+            "partial-fast.fsvi",
+            &fixture.fast,
+            &[
+                ("zeta", true),
+                ("alpha", true),
+                ("beta", true),
+                ("gamma", true),
+                ("deleted-fast", false),
+            ],
+        );
+        fixture.quality_bytes = write_image(
+            fixture.directory.path(),
+            "partial-quality.fsvi",
+            &fixture.quality,
+            &[("zeta", true), ("gamma", true), ("deleted-quality", false)],
+        );
+        fixture
+    }
+
+    fn build_partial(fixture: &Fixture) -> SearchResult<ExactVectorCohortV1> {
+        ExactVectorCohortV1::build_with_coverage(
+            &Cx::for_testing(),
+            (&fixture.fast, Arc::clone(&fixture.fast_bytes)),
+            (&fixture.quality, Arc::clone(&fixture.quality_bytes)),
+            source(),
+            VectorCohortCoverage::PartialQuality,
+            BUDGET,
+        )
+    }
+
+    fn admit_partial(fixture: &Fixture, bytes: Arc<[u8]>) -> SearchResult<ExactVectorCohortV1> {
+        ExactVectorCohortV1::admit_with_coverage(
+            &Cx::for_testing(),
+            bytes,
+            &fixture.fast,
+            &fixture.quality,
+            source(),
+            VectorCohortCoverage::PartialQuality,
+            BUDGET,
+        )
+    }
+
+    #[test]
+    fn partial_quality_roundtrip_retains_full_anchor_and_independent_subset_receipts() {
+        let fixture = partial_fixture();
+        let built = build_partial(&fixture).unwrap();
+        let bytes = built.bytes();
+        assert_eq!(read_u16(&bytes, 4).unwrap(), PARTIAL_QUALITY_VERSION);
+        assert_eq!(built.coverage(), VectorCohortCoverage::PartialQuality);
+        assert_eq!(built.receipt().live_document_count, 4);
+        assert_eq!(built.fast_receipt().live_document_count, 4);
+        assert_eq!(built.quality_receipt().live_document_count, 2);
+        assert_eq!(
+            built.receipt().docset_digest,
+            built.fast_receipt().docset_digest
+        );
+        assert_ne!(
+            built.receipt().docset_digest,
+            built.quality_receipt().docset_digest
+        );
+        for receipt in [
+            built.receipt(),
+            built.fast_receipt(),
+            built.quality_receipt(),
+        ] {
+            assert_eq!(receipt.source_checkpoint, source().to_bytes());
+        }
+        assert_eq!(built.fast().dimension(), 2);
+        assert_eq!(built.quality().dimension(), 3);
+        assert_eq!(built.fast().tombstone_count(), 1);
+        assert_eq!(built.quality().tombstone_count(), 1);
+        assert!(fixture.admit(Arc::clone(&bytes)).is_err());
+
+        let reopened = admit_partial(&fixture, Arc::clone(&bytes)).unwrap();
+        assert_eq!(reopened.coverage(), built.coverage());
+        assert_eq!(reopened.receipt(), built.receipt());
+        assert_eq!(reopened.fast_receipt(), built.fast_receipt());
+        assert_eq!(reopened.quality_receipt(), built.quality_receipt());
+        assert_eq!(reopened.fast().witness(), built.fast().witness());
+        assert_eq!(reopened.quality().witness(), built.quality().witness());
+        assert!(Arc::ptr_eq(&reopened.fast().bytes, &bytes));
+        assert!(Arc::ptr_eq(&reopened.quality().bytes, &bytes));
+        let quality = Arc::clone(reopened.quality());
+        drop(reopened);
+        drop(bytes);
+        let hits = quality.search_top_k(&[1.0, 0.0, 0.0], 10, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter()
+                .all(|hit| matches!(hit.doc_id.as_str(), "zeta" | "gamma"))
+        );
+    }
+
+    #[test]
+    fn partial_quality_policy_cannot_relabel_complete_or_forge_anchor_coverage() {
+        let complete = Fixture::new(3);
+        let complete_bytes = complete.build().bytes();
+        assert!(admit_partial(&complete, Arc::clone(&complete_bytes)).is_err());
+        let mut relabeled_complete = complete_bytes.to_vec();
+        relabeled_complete[4..6].copy_from_slice(&PARTIAL_QUALITY_VERSION.to_le_bytes());
+        assert!(admit_partial(&complete, relabeled_complete.into()).is_err());
+
+        let partial = partial_fixture();
+        let built = build_partial(&partial).unwrap();
+        let mut relabeled_partial = built.bytes().to_vec();
+        relabeled_partial[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        assert!(partial.admit(relabeled_partial.into()).is_err());
+
+        for forge_digest in [false, true] {
+            let mut changed = built.bytes().to_vec();
+            if forge_digest {
+                changed[40..72].copy_from_slice(&built.quality_receipt().docset_digest);
+            } else {
+                changed[72..80]
+                    .copy_from_slice(&built.quality_receipt().live_document_count.to_le_bytes());
+            }
+            assert!(admit_partial(&partial, changed.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn partial_quality_rejects_non_subsets_even_with_recomputed_payload_receipts() {
+        let fixture = partial_fixture();
+        let original = build_partial(&fixture).unwrap().bytes();
+        let quality_start = VECTOR_COHORT_HEADER_BYTES_V1 + fixture.fast_bytes.len();
+        for (name, rows) in [
+            ("empty", vec![]),
+            ("deleted-only", vec![("zeta", false)]),
+            (
+                "complete",
+                vec![
+                    ("zeta", true),
+                    ("alpha", true),
+                    ("beta", true),
+                    ("gamma", true),
+                ],
+            ),
+            (
+                "same-count-foreign",
+                vec![("zeta", true), ("foreign", true)],
+            ),
+            ("resurrected", vec![("zeta", true), ("deleted-fast", true)]),
+        ] {
+            let image = write_image(fixture.directory.path(), name, &fixture.quality, &rows);
+            ValidatedFsviBytes::from_arc(Arc::clone(&image), &fixture.quality).unwrap();
+            assert!(
+                ExactVectorCohortV1::build_with_coverage(
+                    &Cx::for_testing(),
+                    (&fixture.fast, Arc::clone(&fixture.fast_bytes)),
+                    (&fixture.quality, Arc::clone(&image)),
+                    source(),
+                    VectorCohortCoverage::PartialQuality,
+                    BUDGET,
+                )
+                .is_err(),
+                "build {name}"
+            );
+            // A valid replacement FSVI and a freshly recomputed envelope hash
+            // cannot authenticate membership in the retained fast live corpus.
+            let mut changed = original[..quality_start].to_vec();
+            changed.extend_from_slice(&image);
+            write_entry(
+                &mut changed,
+                QUALITY_ENTRY,
+                2,
+                quality_start,
+                &GenerationComponentReceiptV1 {
+                    byte_len: u64::try_from(image.len()).unwrap(),
+                    sha256: Sha256::digest(&image).into(),
+                },
+            )
+            .unwrap();
+            assert!(
+                admit_partial(&fixture, changed.into()).is_err(),
+                "open {name}"
+            );
+        }
+        admit_partial(&fixture, original).unwrap();
+    }
+
+    #[test]
+    fn partial_quality_preserves_identity_source_budget_and_cancellation_admission() {
+        let fixture = partial_fixture();
+        let bytes = build_partial(&fixture).unwrap().bytes();
+        let cx = Cx::for_testing();
+        let other_source = SourceCheckpointV1::derive(&CommitRange { low: 4, high: 10 });
+        for (fast, quality, checkpoint_value, budget) in [
+            (&fixture.quality, &fixture.fast, source(), BUDGET),
+            (&fixture.fast, &fixture.fast, source(), BUDGET),
+            (&fixture.fast, &fixture.quality, other_source, BUDGET),
+            (&fixture.fast, &fixture.quality, source(), bytes.len() - 1),
+        ] {
+            assert!(
+                ExactVectorCohortV1::admit_with_coverage(
+                    &cx,
+                    Arc::clone(&bytes),
+                    fast,
+                    quality,
+                    checkpoint_value,
+                    VectorCohortCoverage::PartialQuality,
+                    budget,
+                )
+                .is_err()
+            );
+        }
+        let mut identity = fixture.quality.frozen_identity().identity.clone();
+        identity
+            .producer
+            .implementation_revision
+            .push_str("-foreign");
+        let foreign =
+            FsviV2IdentityBinding::new(fixture.quality.generation(), identity.freeze().unwrap())
+                .unwrap();
+        assert!(
+            ExactVectorCohortV1::admit_with_coverage(
+                &cx,
+                Arc::clone(&bytes),
+                &fixture.fast,
+                &foreign,
+                source(),
+                VectorCohortCoverage::PartialQuality,
+                BUDGET,
+            )
+            .is_err()
+        );
+        for offset in 0..VECTOR_COHORT_HEADER_BYTES_V1 {
+            let mut changed = bytes.to_vec();
+            changed[offset] ^= 1;
+            assert!(
+                admit_partial(&fixture, changed.into()).is_err(),
+                "header {offset}"
+            );
+        }
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            ExactVectorCohortV1::admit_with_coverage(
+                &cx,
+                Arc::clone(&bytes),
+                &fixture.fast,
+                &fixture.quality,
+                source(),
+                VectorCohortCoverage::PartialQuality,
+                BUDGET,
+            ),
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            ExactVectorCohortV1::build_with_coverage(
+                &cx,
+                (&fixture.fast, Arc::clone(&fixture.fast_bytes)),
+                (&fixture.quality, Arc::clone(&fixture.quality_bytes)),
+                source(),
+                VectorCohortCoverage::PartialQuality,
+                BUDGET,
+            ),
+            Err(SearchError::Cancelled { .. })
+        ));
+        admit_partial(&fixture, bytes).unwrap();
     }
 
     #[test]

@@ -35,6 +35,15 @@
 //! same artifact generation, document-ID semantics, space kind and complete
 //! ordered live coverage. The aggregate Ann receipt authenticates all framing
 //! and payload bytes plus that same source checkpoint and document set.
+//!
+//! # FSAC version 2 partial-quality contract
+//!
+//! An explicitly admitted partial-quality Vector cohort selects version 2,
+//! retaining the same 192-byte framing. Its header and aggregate Ann receipt
+//! describe the full fast corpus. Each present graph remains independently
+//! authenticated against its actual vector owner, including the smaller quality
+//! document set. The selected Vector cohort determines the required version;
+//! changing the encoded version cannot grant a different coverage policy.
 
 use std::fmt;
 use std::sync::Arc;
@@ -47,18 +56,19 @@ use sha2::{Digest as _, Sha256};
 
 use crate::ValidatedFsviBytes;
 use crate::native_hnsw::{NativeHnswGenerationReceiptV2, ValidatedNativeHnsw};
-use crate::vector_cohort::ExactVectorCohortV1;
+use crate::vector_cohort::{ExactVectorCohortV1, VectorCohortCoverage};
 
 /// Encoded overhead of a complete FSAC v1 fast/quality graph cohort.
 pub const ANN_COHORT_HEADER_BYTES_V1: usize = 192;
 const HEADER_BYTES_WIRE: u16 = 192;
 const MAGIC: &[u8; 4] = b"FSAC";
 const VERSION: u16 = 1;
+const PARTIAL_QUALITY_VERSION: u16 = 2;
 const FAST_ENTRY: usize = 80;
 const QUALITY_ENTRY: usize = 136;
 const CHUNK_BYTES: usize = 1024 * 1024;
 
-/// Immutable independently admitted graphs over one complete vector cohort.
+/// Immutable independently admitted graphs over one admitted vector cohort.
 ///
 /// Construction and admission are synchronous, open no paths and start no
 /// runtime or tasks. Cancellation is checked around graph admission and between
@@ -85,12 +95,14 @@ impl fmt::Debug for NativeAnnCohortV1 {
 }
 
 impl NativeAnnCohortV1 {
-    /// Validate and pack the explicitly configured graphs for a full cohort.
+    /// Validate and pack the explicitly configured graphs for a selected cohort.
     ///
     /// Exact/HNSW, HNSW/exact and HNSW/HNSW are represented independently.
     /// Exact/exact has no Ann component and is rejected by this constructor.
     /// Receipts must come from the caller's selected graph artifacts; the
     /// encoded container does not discover or select replacement receipts.
+    /// Complete vector coverage emits FSAC v1; an explicitly admitted partial
+    /// quality cohort emits FSAC v2. Neither policy changes a graph's owner.
     ///
     /// # Errors
     /// Refuses an empty graph set, incompatible receipts/owners, malformed
@@ -117,7 +129,7 @@ impl NativeAnnCohortV1 {
             .map_err(|_| refused("allocation"))?;
         bytes.resize(ANN_COHORT_HEADER_BYTES_V1, 0);
         bytes[..4].copy_from_slice(MAGIC);
-        bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        bytes[4..6].copy_from_slice(&cohort_version(cohort).to_le_bytes());
         bytes[6..8].copy_from_slice(&HEADER_BYTES_WIRE.to_le_bytes());
         bytes[8..40].copy_from_slice(&cohort.receipt().source_checkpoint);
         bytes[40..72].copy_from_slice(&cohort.receipt().docset_digest);
@@ -170,7 +182,7 @@ impl NativeAnnCohortV1 {
         }
         if bytes.len() < ANN_COHORT_HEADER_BYTES_V1
             || &bytes[..4] != MAGIC
-            || read_u16(&bytes, 4)? != VERSION
+            || read_u16(&bytes, 4)? != cohort_version(cohort)
             || read_u16(&bytes, 6)? != HEADER_BYTES_WIRE
         {
             return Err(refused("header"));
@@ -282,6 +294,13 @@ impl NativeAnnCohortV1 {
     #[must_use]
     pub fn into_graphs(self) -> (Option<ValidatedNativeHnsw>, Option<ValidatedNativeHnsw>) {
         (self.fast, self.quality)
+    }
+}
+
+const fn cohort_version(cohort: &ExactVectorCohortV1) -> u16 {
+    match cohort.coverage() {
+        VectorCohortCoverage::Complete => VERSION,
+        VectorCohortCoverage::PartialQuality => PARTIAL_QUALITY_VERSION,
     }
 }
 
@@ -555,6 +574,20 @@ mod tests {
             quality_rows: &[(&str, bool)],
             identical: bool,
         ) -> Self {
+            Self::with_coverage(
+                fast_rows,
+                quality_rows,
+                identical,
+                VectorCohortCoverage::Complete,
+            )
+        }
+
+        fn with_coverage(
+            fast_rows: &[(&str, bool)],
+            quality_rows: &[(&str, bool)],
+            identical: bool,
+            coverage: VectorCohortCoverage,
+        ) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let fast_binding = binding("fast-control", 2);
             let quality_binding = if identical {
@@ -570,11 +603,12 @@ mod tests {
                 &quality_binding,
                 quality_rows,
             );
-            let cohort = ExactVectorCohortV1::build(
+            let cohort = ExactVectorCohortV1::build_with_coverage(
                 &Cx::for_testing(),
                 (&fast_binding, fast_vectors),
                 (&quality_binding, quality_vectors),
                 source(),
+                coverage,
                 BUDGET,
             )
             .unwrap();
@@ -703,6 +737,111 @@ mod tests {
             assert!(hits.iter().any(|hit| hit.doc_id() == "zeta"));
             assert!(hits.iter().any(|hit| hit.doc_id() == "alpha"));
         }
+    }
+
+    #[test]
+    fn partial_quality_graphs_retain_actual_owners_and_full_fast_anchor() {
+        let fixture = Fixture::with_coverage(
+            FAST_ROWS,
+            &[("zeta", true), ("old-quality", false)],
+            false,
+            VectorCohortCoverage::PartialQuality,
+        );
+        for (fast, quality) in [(true, false), (false, true), (true, true)] {
+            let built = fixture.build(fast, quality).unwrap();
+            let image = built.bytes();
+            assert_eq!(read_u16(&image, 4).unwrap(), PARTIAL_QUALITY_VERSION);
+            let reopened = fixture.admit(image, fast, quality).unwrap();
+            assert_eq!(reopened.receipt(), built.receipt());
+            assert_eq!(reopened.receipt().live_document_count, 2);
+            assert_eq!(
+                reopened.receipt().docset_digest,
+                fixture.cohort.fast_receipt().docset_digest
+            );
+            assert_ne!(
+                reopened.receipt().docset_digest,
+                fixture.cohort.quality_receipt().docset_digest
+            );
+            assert_eq!(reopened.receipt().source_checkpoint, source().to_bytes());
+            assert_eq!(reopened.fast().is_some(), fast);
+            assert_eq!(reopened.quality().is_some(), quality);
+            if let Some(graph) = reopened.fast() {
+                assert_eq!(graph.owner_witness(), fixture.cohort.fast().witness());
+                assert!(graph.matches_build_policy(fast_policy(), 101));
+                assert_eq!(
+                    graph
+                        .search(&Cx::for_testing(), &[1.0, 0.0], 10, None)
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+            if let Some(graph) = reopened.quality() {
+                assert_eq!(graph.owner_witness(), fixture.cohort.quality().witness());
+                assert!(graph.matches_build_policy(quality_policy(), 903));
+                let hits = graph
+                    .search(&Cx::for_testing(), &[1.0, 0.0, 0.0], 10, None)
+                    .unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id(), "zeta");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_quality_graph_admission_rejects_policy_and_owner_substitution() {
+        let complete = Fixture::new();
+        let partial = Fixture::with_coverage(
+            FAST_ROWS,
+            &[("zeta", true)],
+            false,
+            VectorCohortCoverage::PartialQuality,
+        );
+        let other_subset = Fixture::with_coverage(
+            FAST_ROWS,
+            &[("alpha", true)],
+            false,
+            VectorCohortCoverage::PartialQuality,
+        );
+        // Even a fast-only graph needs the selected vector cohort's coverage
+        // version; no quality payload is needed to make this policy observable.
+        assert!(
+            partial
+                .admit(complete.build(true, false).unwrap().bytes(), true, false)
+                .is_err()
+        );
+        assert!(
+            complete
+                .admit(partial.build(true, false).unwrap().bytes(), true, false)
+                .is_err()
+        );
+
+        let complete_graphs = complete.build(true, true).unwrap();
+        let mut relabeled = complete_graphs.bytes().to_vec();
+        relabeled[4..6].copy_from_slice(&PARTIAL_QUALITY_VERSION.to_le_bytes());
+        assert!(partial.admit(relabeled.into(), true, true).is_err());
+
+        let image = partial.build(true, true).unwrap().bytes();
+        assert!(
+            NativeAnnCohortV1::admit(
+                &Cx::for_testing(),
+                Arc::clone(&image),
+                &other_subset.cohort,
+                Some(&partial.fast_receipt),
+                Some(&partial.quality_receipt),
+                BUDGET,
+            )
+            .is_err()
+        );
+        for offset in 0..ANN_COHORT_HEADER_BYTES_V1 {
+            let mut changed = image.to_vec();
+            changed[offset] ^= 1;
+            assert!(
+                partial.admit(changed.into(), true, true).is_err(),
+                "header {offset}"
+            );
+        }
+        partial.admit(image, true, true).unwrap();
     }
 
     #[test]
