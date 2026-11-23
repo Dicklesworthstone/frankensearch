@@ -583,6 +583,9 @@ async fn receive<W: Write + Send>(
     state: &mut ReceiveState,
     output: &mut W,
 ) -> SearchResult<Option<OutputError>> {
+    let mut config = crate::FsfsConfig::default();
+    config.indexing.offline = true;
+    let runtime = FsfsRuntime::new(config);
     receive_with_query_expansion(
         cx,
         peer,
@@ -592,7 +595,7 @@ async fn receive<W: Write + Send>(
         format,
         state,
         output,
-        FsfsRuntime::expand_search_query(cx, &request.search.query),
+        runtime.expand_search_query(cx, &request.search.query),
     )
     .await
 }
@@ -659,7 +662,7 @@ impl FsfsRuntime {
             query,
             limit,
             output,
-            Self::expand_search_query(cx, query),
+            self.expand_search_query(cx, query),
         )
         .await
     }

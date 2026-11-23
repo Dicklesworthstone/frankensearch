@@ -1445,7 +1445,7 @@ impl FsfsRuntime {
             limit,
             started,
             writer,
-            Self::expand_search_query(cx, query),
+            self.expand_search_query(cx, query),
         ))
         .await
     }

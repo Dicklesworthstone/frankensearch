@@ -5118,6 +5118,54 @@ mod loader_only {
     }
 
     #[cfg(all(unix, feature = "semantic-loaders"))]
+    fn observe_expansion_proxy(
+        run: impl FnOnce(&str) -> CommandOutcome,
+    ) -> (CommandOutcome, Vec<String>) {
+        use std::io::{BufRead, BufReader, ErrorKind, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let (running, done) = mpsc::channel::<()>();
+        let observer = thread::spawn(move || {
+            let mut connects = Vec::new();
+            let mut finished = false;
+            loop {
+                match listener.accept() {
+                    Ok((mut peer, _)) => {
+                        peer.set_read_timeout(Some(FAILURE_TIMEOUT)).unwrap();
+                        peer.set_write_timeout(Some(FAILURE_TIMEOUT)).unwrap();
+                        let mut line = String::new();
+                        BufReader::new(&mut peer).read_line(&mut line).unwrap();
+                        connects.push(line.trim_end().to_owned());
+                        peer.write_all(
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if finished {
+                            return Ok(connects);
+                        }
+                        // Drain any connection queued just before the process exited.
+                        finished = done.recv_timeout(Duration::from_millis(10))
+                            != Err(RecvTimeoutError::Timeout);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+        let output = run(&proxy);
+        drop(running);
+        (
+            output,
+            observer.join().unwrap().expect("observe loopback proxy"),
+        )
+    }
+
+    #[cfg(all(unix, feature = "semantic-loaders"))]
     #[test]
     #[ignore = "requires the pinned real fast and quality models"]
     fn cold_complete_daemons_preserve_explicit_network_policy() {
@@ -5254,6 +5302,32 @@ mod loader_only {
             );
 
             if socket_name.is_some() {
+                let (expanded, connects) = observe_expansion_proxy(|proxy| {
+                    fsfs.run_with_env(
+                        root,
+                        &format!("{label}-expand"),
+                        args.iter()
+                            .copied()
+                            .chain([policy, "--expand", "--format", "json"]),
+                        QUICKSTART_TIMEOUT,
+                        &[
+                            ("FRANKENSEARCH_OFFLINE", inherited),
+                            ("FRANKENSEARCH_CHECK_UPDATES", "0"),
+                            ("ANTHROPIC_API_KEY", "synthetic-query-expansion-test"),
+                            ("ALL_PROXY", proxy),
+                            ("NO_PROXY", ""),
+                            ("no_proxy", ""),
+                        ],
+                    )
+                });
+                let expanded = parse_success_envelope(label, &expanded);
+                assert_eq!(expanded["data"]["phase"], "refined", "{expanded}");
+                assert_eq!(expanded["data"]["hits"], result["data"]["hits"]);
+                if policy == "--offline" {
+                    assert!(connects.is_empty(), "offline expansion opened {connects:?}");
+                } else {
+                    assert_eq!(connects, ["CONNECT api.anthropic.com:443 HTTP/1.1"]);
+                }
                 let refused = fsfs.run_with_env(
                     root,
                     &format!("{label}-opposite-policy"),

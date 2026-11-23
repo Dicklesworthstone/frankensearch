@@ -483,7 +483,7 @@ impl FsfsRuntime {
             root,
             query,
             limit,
-            Self::expand_search_query(cx, query),
+            self.expand_search_query(cx, query),
         )
         .await
     }

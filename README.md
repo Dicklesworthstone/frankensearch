@@ -765,11 +765,13 @@ successor. Existing readers keep their original bundle throughout either
 operation. A delete with no matches leaves the selected generation unchanged.
 
 `search --expand` pins one generation across all variants and counts each
-variant's final ranking once. Expansion executes directly even when `--daemon`
-is set; streamed searches deliver Initial before waiting for optional expansion.
-The expansion provider is a remote LLM API: the query text goes to Anthropic
-or OpenAI when the matching API key is set (see the FAQ). Without a key, the
-original query's normal phases are retained.
+variant's final ranking once. For forwarded complete-generation searches,
+the CLI generates the variants and the daemon owns the retained reader. Legacy
+stores run expanded searches directly. Streams deliver Initial before
+waiting for optional expansion. Online expansion sends query text to
+Anthropic or OpenAI when the matching API key is set (see the FAQ).
+Under the offline policy or without a key, the original query keeps its
+normal search phases.
 Ordinary direct and forwarded searches save explanation context beside the
 store; `explain` refuses context from a different generation or from a multi-query
 fusion whose component explanations are unavailable.
@@ -1879,7 +1881,7 @@ Use both: keep `rg` for exact matches and use `fsfs` for intent-level retrieval.
 ## FAQ
 
 ### Does it run fully local?
-Yes. Search/indexing runs on your machine. Network access is only needed for model downloads, update checks, and `fsfs search --expand`. Expansion sends the query text to `api.anthropic.com` when `ANTHROPIC_API_KEY` is set, otherwise to `api.openai.com` when `OPENAI_API_KEY` is set; with neither key it warns and searches the original query only. Documents and index contents are never sent.
+Yes. Search and indexing run on your machine. Network access supports model downloads, update checks, and optional online query expansion. With `fsfs search --expand`, the CLI sends query text to `api.anthropic.com` when `ANTHROPIC_API_KEY` is set, otherwise to `api.openai.com` when `OPENAI_API_KEY` is set. Offline searches and searches without a provider key use the original query. Documents and index contents stay local.
 
 ### Can I use only the library and skip `fsfs`?
 Yes. Add `frankensearch` as a dependency and wire your own app/runtime.

@@ -9568,7 +9568,7 @@ impl FsfsRuntime {
                 cx,
                 query,
                 limit,
-                Self::expand_search_query(cx, query),
+                search_runtime.expand_search_query(cx, query),
             ))
             .await?
         } else if search_runtime.cli_input.daemon {
@@ -9907,7 +9907,7 @@ impl FsfsRuntime {
             stream_id,
             writer,
             resources_override,
-            Self::expand_search_query(cx, query),
+            self.expand_search_query(cx, query),
         ))
         .await
     }
@@ -13927,6 +13927,7 @@ impl FsfsRuntime {
     }
 
     async fn expand_search_query(
+        &self,
         cx: &Cx,
         query: &str,
     ) -> SearchResult<query_expansion::ExpansionResult> {
@@ -13937,7 +13938,14 @@ impl FsfsRuntime {
             })
         };
         checkpoint()?;
-        if Self::is_lexical_complement_query(query) {
+        let offline = self.config.indexing.offline;
+        if offline || Self::is_lexical_complement_query(query) {
+            if offline {
+                info!(
+                    reason_code = "query.expansion.offline",
+                    "using the original query under the offline policy"
+                );
+            }
             return Ok(query_expansion::ExpansionResult {
                 queries: vec![query_expansion::ExpandedQuery {
                     text: query.to_owned(),
@@ -49994,7 +50002,7 @@ mod tests {
                         }
                     }
                 }
-                let expansion = FsfsRuntime::expand_search_query(&cx, query).await.unwrap();
+                let expansion = runtime.expand_search_query(&cx, query).await.unwrap();
                 assert!(expansion.backend_used.is_none());
                 assert_eq!(expansion.queries.len(), 1);
                 assert_eq!(expansion.queries[0].text, query);

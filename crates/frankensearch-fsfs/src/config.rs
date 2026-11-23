@@ -957,7 +957,7 @@ pub struct IndexingConfig {
     pub model_dir: String,
     /// Forbid all model-network acquisition while still permitting verified
     /// artifacts already present under `model_dir`. The CLI also skips its
-    /// implicit background release check while offline.
+    /// background release check and remote query expansion while offline.
     #[serde(default)]
     pub offline: bool,
     pub embedding_batch_size: usize,
