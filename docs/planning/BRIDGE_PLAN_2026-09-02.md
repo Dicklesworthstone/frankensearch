@@ -513,9 +513,20 @@ Quill conformance and performance program.
   Silicon. Both installs verified the model pair, indexed two documents and
   ranked `retry.md` first in both search phases with one completed terminal.
   The Linux install, index and search trace recorded zero IP `connect`
-  calls. See `baseline.log`, `candidate.log`, `installer-red.log`,
+  calls with startup update checks disabled for that probe. See
+  `baseline.log`, `candidate.log`, `installer-red.log`,
   `installer-gate.log`, `linux-signed.log`, `linux-connect.log`, and
   `mac-signed.log` under `/data/tmp/fsfs-offline-installer.qh4vs5h5`.
+- With the ordinary update settings restored, the signed Linux installation
+  at `e1517a1b` still succeeded after two GitHub CONNECT attempts by the model
+  verification subprocesses. `4396ac4b` passes `--offline` to both commands.
+  The installer check preserves the exact online download and verification
+  order. Both native signed installs passed again with update settings left
+  at their defaults. Linux tracing shows both verifier invocations received
+  `--offline`, zero IP `connect` calls and zero requests at the refusing
+  proxy. See `model-verifier-{red,gate}.log`, `{linux,mac}-verifier-signed.log`,
+  and the traces under `unsuppressed.92yk05z5/` and `verify-offline.8lalvygp/`
+  in the same evidence directory.
 
 ### Vision checklist
 
@@ -790,6 +801,12 @@ Quill conformance and performance program.
   - [x] Install the signed Apple Silicon archive from a local file URL and
     run indexing and progressive search from the installed binary.
   - [x] Record scoped installer evidence and publish the repair.
+  - [x] Replay the signed install with the ordinary update notifier enabled.
+  - [x] Propagate offline policy to each model verifier and keep the online
+    download and verification sequence intact.
+  - [x] Re-run the installer stage and both signed native installs with the
+    notifier enabled. Check Linux process tracing and the refusing proxy.
+  - [x] Record and publish the model-verifier fix.
 - [ ] Advance retained FSVI v2 authority and recovery, then exercise CASS,
   native and ordinary CLI and facade restart cases.
   - [x] Check the installed CLI's quality-only prepare, resume, and fresh search
