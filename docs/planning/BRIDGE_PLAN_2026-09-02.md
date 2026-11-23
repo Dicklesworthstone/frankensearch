@@ -462,6 +462,32 @@ Quill conformance and performance program.
   owned processes remaining. The exact installed binary then repeated the
   live named shutdown and compactor controls on their respective layouts.
   See `verified-quickstart-receipt.json` and `candidate-installed.log`.
+- The installed CLI at `3335a842` and signed Linux 1.13.0 both reported a
+  ten-second `daemon.stop` timeout for a compactor that had exited zero and
+  dropped its PID file. The parent held the child unreaped. A successor
+  started on the same index before the first child was reaped. Both older
+  binaries also signaled an owned test process from a receipt naming a
+  different host. See `baseline-foreign.log` and `signed-baseline.log`
+  under `/data/tmp/fsfs-compactor-exit.f26vhtLP`.
+- `19534675` uses Linux process descriptors to observe exit before reaping.
+  It refuses foreign-host and invalid numeric PID receipts before sending
+  a signal. The Unix signal probe remains available when process
+  descriptors cannot be used.
+- The focused executable returned successful stops for two successive
+  compactors while their parent still held their exit status. An actual
+  paused compactor retained its PID receipt and returned the original
+  timeout. With `pidfd_open` forced to return `ENOSYS`, a real reaped
+  compactor stopped through the signal probe. The foreign and zero PID
+  controls left their receipt bytes and the owned sentinel intact. See
+  `candidate-focused.log` and its syscall traces in the same evidence root.
+- Clean `19534675` passed all 18 stock stages in one run, including the
+  three new fsfs tests and 36 real-model end-to-end cases. The source
+  quickstart passed 12 commands and 22 negative controls with no owned
+  processes remaining. The installed binary repeated the live exit,
+  successor, paused-process, fallback, and PID receipt controls. Its
+  SHA-256 is `7268d9f75cd67f3098b0d2a236bf0c4977e029c89e376253c60c0f69911e44c4`.
+  See `stock-gate.log`, `verified-quickstart-receipt.json`, and
+  `candidate-installed.log` in the same evidence root.
 - The previous optimized `fsfs update` tried to contact GitHub when offline
   was selected by CLI, environment or config. Both `--check` and apply
   reached the refusing loopback control. The repair checks resolved offline
@@ -857,6 +883,15 @@ Quill conformance and performance program.
   listeners with the repaired client.
 - [x] Repeat the listener and compactor controls on the installed quickstart
   executable, finish the stock gate, and publish with scoped Bead evidence.
+- [x] Reproduce the compactor timeout on the installed current and signed
+  binaries. Observe the kernel's exit status before reaping the child.
+- [x] Reproduce signaling a local test process through a foreign receipt.
+- [x] Distinguish compactor exit from reaping and reject invalid or foreign
+  process targets. Run focused process and input tests.
+- [x] Verify restart, the live timeout, and the Unix signal-probe fallback
+  through the CLI. Check receipt bytes on every refusal.
+- [x] Run the stock gates, pin the installed executable, repeat the process
+  controls, and publish with scoped Bead evidence.
 - [x] Reproduce the updater's offline leak with the optimized executable
   and a refusing loopback proxy.
 - [x] Apply the resolved offline policy before remote release checks or
