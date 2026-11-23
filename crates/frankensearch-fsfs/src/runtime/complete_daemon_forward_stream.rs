@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -459,7 +459,7 @@ where
     let mut turn_reads = 0;
     loop {
         retained_search_checkpoint(cx)?;
-        let remaining = control::remaining(started, timeout)?;
+        control::remaining(started, timeout)?;
         // A warm daemon can keep the socket readable through an entire large
         // result set. Checkpoints alone cannot let another task request
         // cancellation on the same worker: yield after bounded byte/syscall
@@ -474,8 +474,17 @@ where
         }
         let read_limit = chunk.len().min(MAX_RECEIVE_TURN_BYTES - turn_bytes);
         turn_reads += 1;
-        match peer.read(&mut chunk[..read_limit]) {
-            Ok(0) => {
+        match control::read_response_chunk(
+            cx,
+            peer,
+            &mut chunk[..read_limit],
+            started,
+            timeout,
+            IO_POLL_INTERVAL,
+        )
+        .await
+        {
+            Ok(Some(0)) => {
                 if !record.is_empty() {
                     return Err(io::Error::new(
                         ErrorKind::UnexpectedEof,
@@ -501,7 +510,7 @@ where
                 state.emit(terminal, format, output)?;
                 return Ok(error);
             }
-            Ok(count) => {
+            Ok(Some(count)) => {
                 turn_bytes += count;
                 for part in chunk[..count].split_inclusive(|byte| *byte == b'\n') {
                     retained_search_checkpoint(cx)?;
@@ -552,13 +561,12 @@ where
                     }
                 }
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                asupersync::time::sleep(cx.now(), remaining.min(IO_POLL_INTERVAL)).await;
+            Ok(None) => {
                 turn_bytes = 0;
                 turn_reads = 0;
             }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error.into()),
+            Err(SearchError::Io(error)) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
 }
@@ -731,6 +739,7 @@ mod tests {
     use super::*;
     use crate::FsfsConfig;
     use crate::stream_protocol::{StreamStartedEvent, terminal_event_completed};
+    use std::io::Read;
     use std::net::Shutdown;
 
     fn request() -> ForwardedSearch {

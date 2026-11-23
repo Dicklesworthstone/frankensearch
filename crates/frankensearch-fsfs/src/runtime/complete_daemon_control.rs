@@ -6,19 +6,23 @@
 //! closed without reaching search execution.
 
 use std::fs;
+use std::future::{Future, poll_fn};
 use std::io::{self, ErrorKind, Read};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::pin::pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use asupersync::runtime::reactor::Interest;
 use frankensearch_core::{SearchError, SearchResult};
 use serde::Deserialize;
 
 use super::{
     FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL,
-    complete_cli_error, retained_search_checkpoint, write_response,
+    admission, complete_cli_error, retained_search_checkpoint, write_response,
 };
 
 const CONTROL_PROTOCOL: &str = "fsfs.complete_generation.control";
@@ -119,8 +123,8 @@ pub(super) async fn exchange(
 ) -> SearchResult<Vec<u8>> {
     retained_search_checkpoint(cx)?;
     let started = Instant::now();
-    let mut peer = connect_and_send(cx, path, request, started, timeout).await?;
-    let bytes = read_response(cx, &mut peer, response_limit, remaining(started, timeout)?).await?;
+    let peer = connect_and_send(cx, path, request, started, timeout).await?;
+    let bytes = read_response(cx, &peer, response_limit, remaining(started, timeout)?).await?;
     retained_search_checkpoint(cx)?;
     remaining(started, timeout)?;
     Ok(bytes)
@@ -256,7 +260,7 @@ pub(super) fn remaining(started: Instant, timeout: Duration) -> SearchResult<Dur
 
 pub(super) async fn read_response(
     cx: &Cx,
-    peer: &mut UnixStream,
+    peer: &UnixStream,
     limit: usize,
     timeout: Duration,
 ) -> SearchResult<Vec<u8>> {
@@ -266,19 +270,27 @@ pub(super) async fn read_response(
     })?;
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
+    let mut turn_reads = 0;
     loop {
         retained_search_checkpoint(cx)?;
-        let left = remaining(started, timeout)?;
+        remaining(started, timeout)?;
+        // Bound a turn to 64 KiB, including interruptions in the call budget.
+        if turn_reads == 8 {
+            admission::yield_turn(cx).await?;
+            turn_reads = 0;
+            continue;
+        }
         let count_limit = (capacity - bytes.len()).min(chunk.len());
-        match peer.read(&mut chunk[..count_limit]) {
-            Ok(0) => {
+        turn_reads += 1;
+        match read_response_chunk(cx, peer, &mut chunk[..count_limit], started, timeout, IO_POLL_INTERVAL).await {
+            Ok(Some(0)) => {
                 return Err(io::Error::new(
                     ErrorKind::UnexpectedEof,
                     "daemon closed before a complete response frame",
                 )
                 .into());
             }
-            Ok(count) => {
+            Ok(Some(count)) => {
                 bytes.extend_from_slice(&chunk[..count]);
                 if bytes.len() > limit {
                     return Err(complete_cli_error(
@@ -301,13 +313,47 @@ pub(super) async fn read_response(
                     return Ok(bytes);
                 }
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                asupersync::time::sleep(cx.now(), left.min(IO_POLL_INTERVAL)).await;
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error.into()),
+            Ok(None) => turn_reads = 0,
+            Err(SearchError::Io(error)) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
+}
+
+/// Read one chunk. A missing count means the fallback tick elapsed.
+pub(super) async fn read_response_chunk(
+    cx: &Cx,
+    mut peer: &UnixStream,
+    buffer: &mut [u8],
+    started: Instant,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> SearchResult<Option<usize>> {
+    match peer.read(buffer) {
+        Ok(count) => return Ok(Some(count)),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error.into()),
+    }
+    let wait = remaining(started, timeout)?.min(poll_interval);
+    let mut fallback = pin!(asupersync::time::sleep(cx.now(), wait));
+    let mut registration = None;
+    poll_fn(|task| {
+        retained_search_checkpoint(cx)?;
+        remaining(started, timeout)?;
+        if fallback.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Ok(None));
+        }
+        if !admission::arm_io(cx, peer, &mut registration, Interest::READABLE, task.waker()) {
+            return Poll::Pending;
+        }
+        // A response or EOF can arrive between WouldBlock and registration.
+        match peer.read(buffer) {
+            Ok(count) => Poll::Ready(Ok(Some(count))),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error.into())),
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -317,6 +363,68 @@ mod tests {
     use std::io::Write;
     use std::net::Shutdown;
     use std::os::unix::net::UnixListener;
+
+    fn resume_waiting_read(data: &[u8], reactor: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .enable_platform_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let (peer, mut sender) = UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let tick = if reactor { Duration::from_secs(5) } else { IO_POLL_INTERVAL };
+            let started = Instant::now();
+            let mut buffer = [0; 32];
+            let count = {
+                let operation = async {
+                    loop {
+                        if let Some(count) = read_response_chunk(
+                            &cx, &peer, &mut buffer, started, Duration::from_secs(10), tick,
+                        ).await.unwrap() {
+                            break count;
+                        }
+                    }
+                };
+                let mut operation = pin!(operation);
+                let mut guard = pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(2)));
+                let mut sent = false;
+                poll_fn(|task| {
+                    assert!(guard.as_mut().poll(task).is_pending(), "reader missed guard");
+                    if let Poll::Ready(count) = operation.as_mut().poll(task) {
+                        assert!(sent);
+                        return Poll::Ready(count);
+                    }
+                    if !sent {
+                        if data.is_empty() {
+                            sender.shutdown(Shutdown::Write).unwrap();
+                        } else {
+                            sender.write_all(data).unwrap();
+                        }
+                        sent = true;
+                    }
+                    Poll::Pending
+                }).await
+            };
+            assert_eq!(&buffer[..count], data);
+        });
+    }
+
+    #[test]
+    fn parked_response_reader_wakes_for_data() {
+        resume_waiting_read(b"response", true);
+    }
+
+    #[test]
+    fn parked_response_reader_wakes_for_eof() {
+        resume_waiting_read(b"", true);
+    }
+
+    #[test]
+    fn parked_response_reader_has_timer_fallback() {
+        resume_waiting_read(b"response", false);
+        resume_waiting_read(b"", false);
+    }
 
     #[test]
     fn client_socket_is_nonblocking_and_closes_on_exec() {
@@ -406,21 +514,21 @@ mod tests {
                 (b"12345\n".as_slice(), 5),
                 (b"{}\n{}\n".as_slice(), 20),
             ] {
-                let (mut peer, mut sender) = UnixStream::pair().unwrap();
+                let (peer, mut sender) = UnixStream::pair().unwrap();
                 peer.set_nonblocking(true).unwrap();
                 sender.write_all(response).unwrap();
                 sender.shutdown(Shutdown::Write).unwrap();
                 assert!(
-                    read_response(&cx, &mut peer, limit, Duration::from_secs(1))
+                    read_response(&cx, &peer, limit, Duration::from_secs(1))
                         .await
                         .is_err()
                 );
             }
-            let (mut peer, mut sender) = UnixStream::pair().unwrap();
+            let (peer, mut sender) = UnixStream::pair().unwrap();
             peer.set_nonblocking(true).unwrap();
             sender.write_all(b"{}\n").unwrap();
             assert_eq!(
-                read_response(&cx, &mut peer, 3, Duration::from_secs(1))
+                read_response(&cx, &peer, 3, Duration::from_secs(1))
                     .await
                     .unwrap(),
                 b"{}\n"
@@ -431,16 +539,16 @@ mod tests {
     #[test]
     fn response_read_observes_cancellation_and_deadline() {
         run_test_with_cx(|cx| async move {
-            let (mut peer, _sender) = UnixStream::pair().unwrap();
+            let (peer, _sender) = UnixStream::pair().unwrap();
             peer.set_nonblocking(true).unwrap();
             cx.set_cancel_requested(true);
             assert!(matches!(
-                read_response(&cx, &mut peer, 20, Duration::from_secs(60)).await,
+                read_response(&cx, &peer, 20, Duration::from_secs(60)).await,
                 Err(SearchError::Cancelled { .. })
             ));
             cx.set_cancel_requested(false);
             assert!(
-                matches!(read_response(&cx, &mut peer, 20, Duration::ZERO).await,
+                matches!(read_response(&cx, &peer, 20, Duration::ZERO).await,
                 Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut)
             );
         });

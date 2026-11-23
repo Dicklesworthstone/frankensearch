@@ -521,7 +521,7 @@ impl FsfsRuntime {
         .await?;
         let response = control::read_response(
             cx,
-            &mut peer,
+            &peer,
             FSFS_DAEMON_RESPONSE_MAX_BYTES,
             control::remaining(started, request.search.delivery_budget())?,
         )
@@ -549,7 +549,7 @@ impl FsfsRuntime {
                 .await?;
                 let response = control::read_response(
                     cx,
-                    &mut peer,
+                    &peer,
                     FSFS_DAEMON_RESPONSE_MAX_BYTES,
                     control::remaining(started, request.search.delivery_budget())?,
                 )
