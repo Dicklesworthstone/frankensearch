@@ -3016,6 +3016,7 @@ mod tests {
             quality: bool,
             fault: Fault,
             sink: Arc<dyn EmbeddingVectorSink>,
+            max_retries: u32,
         ) -> (Rc<StorageBackedJobRunner>, Arc<BatchProbe>) {
             let probe = Arc::new(BatchProbe::new(
                 if quality {
@@ -3031,7 +3032,8 @@ mod tests {
             let queue = Arc::new(PersistentJobQueue::new(
                 storage.clone(),
                 JobQueueConfig {
-                    max_retries: 0,
+                    max_retries,
+                    retry_base_delay_ms: 0,
                     ..JobQueueConfig::default()
                 },
             ));
@@ -3172,7 +3174,7 @@ mod tests {
                 ] {
                     asupersync::test_utils::run_test_with_cx(|cx| async move {
                         let sink = Arc::new(InMemoryVectorSink::default());
-                        let (runner, probe) = runner_for(quality, fault, sink.clone());
+                        let (runner, probe) = runner_for(quality, fault, sink.clone(), 0);
                         ingest_three(&runner);
                         let result = runner.process_batch(&cx, "native-worker").await.unwrap();
                         let split =
@@ -3220,7 +3222,7 @@ mod tests {
         fn native_batch_bounds_retained_input_bytes_without_truncating_large_documents() {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let sink = Arc::new(InMemoryVectorSink::default());
-                let (runner, probe) = runner_for(false, Fault::None, sink.clone());
+                let (runner, probe) = runner_for(false, Fault::None, sink.clone(), 0);
                 let inputs: Vec<_> = [
                     MAX_NATIVE_BATCH_INPUT_BYTES / 2,
                     MAX_NATIVE_BATCH_INPUT_BYTES / 2,
@@ -3273,7 +3275,8 @@ mod tests {
                     for fault in [Fault::None, Fault::ProviderFailure] {
                         asupersync::test_utils::run_test_with_cx(|cx| async move {
                             let sink = Arc::new(InMemoryVectorSink::default());
-                            let (runner, probe) = runner_for(quality, fault, sink.clone());
+                            // The expired attempt must return to pending so the hook can claim it.
+                            let (runner, probe) = runner_for(quality, fault, sink.clone(), 1);
                             ingest_three(&runner);
                             let successor = Rc::new(RefCell::new(None));
                             let hook_runner = Rc::clone(&runner);
@@ -3388,7 +3391,7 @@ mod tests {
             for quality in [false, true] {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let sink = Arc::new(InMemoryVectorSink::default());
-                    let (runner, probe) = runner_for(quality, Fault::Park, sink.clone());
+                    let (runner, probe) = runner_for(quality, Fault::Park, sink.clone(), 0);
                     ingest_three(&runner);
                     let counter = Arc::new(CountingWake::default());
                     let waker = Waker::from(Arc::clone(&counter));
@@ -3424,7 +3427,7 @@ mod tests {
             for quality in [false, true] {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let sink = Arc::new(ClaimProbeSink::default());
-                    let (runner, probe) = runner_for(quality, Fault::None, sink.clone());
+                    let (runner, probe) = runner_for(quality, Fault::None, sink.clone(), 0);
                     ingest_three(&runner);
                     let hook_cx = cx.clone();
                     let _hook = ScopedClaimHook::install(ClaimHookStage::Persistence, move || {
