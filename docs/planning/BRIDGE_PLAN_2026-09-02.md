@@ -307,6 +307,46 @@ Quill conformance and performance program.
   checker and binary to that revision, passed 12 commands and 22 controls,
   and left zero owned processes. See `client-gate.log` and
   `tmp/fsfs-quickstart.ywj32UhB/receipt.json` in the same evidence root.
+- Offline `search --expand` previously attempted a remote provider
+  connection when a key was present. The prior optimized binary
+  attempted eight tunnels across direct and forwarded complete-generation
+  searches and direct legacy searches, using both output modes. The
+  loopback proxy refused each tunnel. The repair consults resolved offline
+  policy before selecting a provider and keeps the original query. In the
+  development executable, all eight offline runs made zero IP connects,
+  the full ranked records matched the original-query controls, and each
+  stream preserved Initial, Refined, and one completed terminal. Explicit
+  `--online` reached the loopback proxy for both providers. The checked-in
+  executable regression failed on the old binary at the offline
+  connection assertion and passed on the repair. See
+  `offline-baseline-legacy.log`, `offline-dev-legacy.log`, and
+  `offline-regression-{red,final}.log` under
+  `/data/tmp/fs-offline-expand-20261123.xQW0yO`.
+- The stock optimized build from clean `ec7403a6` repeated the eight
+  offline cases with zero IP connects and exact ranked-hit parity. The
+  explicit online OpenAI and Anthropic controls each reached the loopback
+  proxy and fell back to the original query after refusal. Candidate
+  executable SHA-256
+  `bf4ae647a0b2c179c050640ca14afdc339df4851c1c9e7d9ff9d1d128e3981ec`.
+  See `offline-release-probe.log`, `offline-release-parity.log`, and the
+  per-command traces in `candidate-release/` in the same evidence root.
+- After four upstream search changes, the combined optimized build from
+  clean `4d6f3770` repeated all eight offline cases with zero IP connects
+  and both explicit online provider controls. Every hit and score matched
+  the prior baseline. Its executable SHA-256 is
+  `824998c9ddbdc50b17f24ebc0a419d5be2bbfc7c0c66d2855608dd9ebd145770`.
+  See `offline-integrated-release-{probe,parity}.log` under the same root.
+- All 18 stock quality stages passed on clean `4d6f3770` across the
+  integrated run and its serial real-model replay. The initial integrated
+  run passed 17 stages and stopped the upgrade case at a missing predecessor
+  binary. The replay used the separately retained byte-identical
+  predecessor and passed all 25 real-model cases. The source quickstart
+  bound its checker and executable to `4d6f3770`, passed 12 commands and 22
+  controls, and left zero owned processes. Earlier runs retain the long
+  Unix-socket fixture failure, intermittent diagnostics assertion, and
+  overlapping Cargo target failure. See `offline-integrated-gate.log`,
+  `offline-integrated-e2e-replay.log`, and
+  `integrated-quickstart-receipt.json` under the same root.
 
 ### Vision checklist
 
@@ -496,6 +536,24 @@ Quill conformance and performance program.
 - [x] Repeat both client orders with stock release binaries and retain the
   actual executable hashes and transport timing samples.
 - [x] Run the stock quality gate and publish the qualified client-read repair.
+- [x] Reproduce remote expansion under resolved offline policy on the
+  previous release-profile executable. Exercise direct and named-daemon
+  buffered and streamed search with a refusing loopback proxy.
+- [x] Check the policy before provider discovery and blocking HTTP on each
+  search path. Keep the original query and its normal phases offline.
+- [x] Run the executable regression against the previous optimized build and
+  the repaired development build. Cover complete stores and legacy direct
+  search, preserving the red and green receipts.
+- [x] Repeat the regression with the repaired stock release binary.
+  Verify CLI, environment, and config precedence, original ranking parity,
+  strict stream termination, and explicit online controls for both providers.
+- [x] Apply the offline repair atop the four intervening upstream search
+  changes and compare the entire fsfs and README diff to the tested patch.
+- [x] Repeat the offline and online executable controls on the combined
+  optimized build.
+- [x] Pass every stock quality stage on the combined revision with a short
+  disk-backed fixture directory. Keep the predecessor executable in the
+  current evidence root and run retries serially before publication.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
   independent fast and quality load times, peak RSS, per-generation disk
