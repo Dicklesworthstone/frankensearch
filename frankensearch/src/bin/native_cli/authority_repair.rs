@@ -3,9 +3,9 @@
 //! Source admission never produces a searchable partial snapshot. This explicit
 //! operation keeps the selected physical authority pair through model loading
 //! and rebuilding, then publishes a fully admitted Repair successor. Explicit
-//! retained-vector repair skips models and source export, preserves stored
-//! vector bits and Quill bytes, and can build fresh independently seeded graphs.
-//! Reusing the selected ANN object address is refused before publication.
+//! retained-vector repair skips models and source export, preserving stored
+//! vector bits and Quill bytes. Either route can build independently seeded
+//! graphs; reusing the selected ANN object address is refused before publication.
 
 use frankensearch::native_ann::{NativeGenerationSource, NativeGenerationVectorSource};
 use frankensearch_core::generation::GenerationComponentRole;
@@ -34,20 +34,10 @@ pub(super) struct RetainedVectorOptions {
 
 pub(super) fn validate_options(options: &Options) -> Result<()> {
     let vectors = &options.repair_vectors;
-    if !vectors.reuse_vectors {
-        if options.retrieval != Some(NativeBuildRetrieval::Exact)
-            || vectors.primary_seed.is_some()
-            || vectors.quality_seed.is_some()
-        {
-            return Err(bad(
-                "authority-repair without --reuse-vectors requires explicit --retrieval exact and no graph seeds",
-            ));
-        }
-        return Ok(());
-    }
-    if options.models.is_some()
-        || options.quality.backend.is_some()
-        || options.quality.directory.is_some()
+    if vectors.reuse_vectors
+        && (options.models.is_some()
+            || options.quality.backend.is_some()
+            || options.quality.directory.is_some())
     {
         return Err(bad(
             "--reuse-vectors cannot be combined with model directory or backend options",
@@ -61,7 +51,7 @@ pub(super) fn validate_options(options: &Options) -> Result<()> {
         }
         Some(NativeBuildRetrieval::Hnsw { .. }) if vectors.primary_seed.is_some() => Ok(()),
         _ => Err(bad(
-            "--reuse-vectors requires explicit --retrieval exact without seeds or --retrieval hnsw with --hnsw-seed",
+            "authority-repair requires explicit --retrieval exact without seeds or --retrieval hnsw with --hnsw-seed",
         )),
     }
 }
@@ -129,6 +119,7 @@ where
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;
+    let (primary, quality) = vector_policies(options, &selected)?;
     let work_path = new_path(
         options
             .work
@@ -146,7 +137,6 @@ where
     let (built, prepared) = if options.repair_vectors.reuse_vectors {
         // This branch never invokes the loader or exports the retained corpus.
         // Actual source/vector bytes, not the selected graph, authorize repair.
-        let (primary, quality) = vector_policies(options, &selected)?;
         let source = open_vector_source(cx, &root, &selected, options.max_image_bytes)?;
         source.source().authority().next_sequence()?;
         let built = source.rebuild(
@@ -192,15 +182,15 @@ where
         )?
         .with_batch_size(options.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-        .with_fast_storage(
-            rebuild_precision(&selected.identity)?,
-            NativeBuildRetrieval::Exact,
-        )
+        .with_fast_storage(rebuild_precision(&selected.identity)?, primary)
         .add_documents(documents);
-        if let (Some(identity), Some(quality)) = (&selected.quality_identity, &loaded.quality) {
+        if let (Some(identity), Some(provider)) = (&selected.quality_identity, &loaded.quality) {
             builder = builder
-                .with_quality_embedder(Arc::clone(quality))?
-                .with_quality_storage(rebuild_precision(identity)?, NativeBuildRetrieval::Exact)?;
+                .with_quality_embedder(Arc::clone(provider))?
+                .with_quality_storage(
+                    rebuild_precision(identity)?,
+                    quality.ok_or_else(|| bad("missing quality repair retrieval policy"))?,
+                )?;
         }
         let source_cut = source.metadata().commit_range.clone();
         let built = if selected.quality_identity.is_some() {
@@ -224,10 +214,8 @@ where
             &source,
             &built,
             options.max_image_bytes,
-            NativeBuildRetrieval::Exact,
-            source
-                .quality_binding()
-                .map(|_| NativeBuildRetrieval::Exact),
+            primary,
+            quality,
             false,
         )?;
         (built, prepared)
@@ -446,17 +434,19 @@ fn prepare_repair(
             "repair must preserve the complete authenticated document set and source checkpoint",
         ));
     }
+    if candidate
+        .manifest()
+        .components()
+        .ann
+        .is_some_and(|ann| Some(ann) == retained.manifest().components().ann)
+    {
+        return Err(bad("repair must use a new ANN object address"));
+    }
     if reuse_vectors
-        && (built.component_bytes(GenerationComponentRole::Lexical)
-            != Some(retained.lexical_bytes())
-            || candidate
-                .manifest()
-                .components()
-                .ann
-                .is_some_and(|ann| Some(ann) == retained.manifest().components().ann))
+        && built.component_bytes(GenerationComponentRole::Lexical) != Some(retained.lexical_bytes())
     {
         return Err(bad(
-            "retained-vector repair must preserve exact Quill bytes and use a new ANN object address",
+            "retained-vector repair must preserve exact Quill bytes",
         ));
     }
     if candidate.owned_image_bytes() > u64::try_from(max_image_bytes)? {

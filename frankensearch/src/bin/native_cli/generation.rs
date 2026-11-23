@@ -184,17 +184,17 @@ Repair explicitly admits the selected control state, metadata and complete store
 source even when vector or ANN images are damaged or missing. It needs no healthy\n\
 ancestor and never serves a partial generation. It rebuilds every stored tier\n\
 with the same full producer identities, precision, source checkpoint and document\n\
-fields, then publishes a complete higher-sequence Repair successor. Explicit\n\
---retrieval exact is required for repair that reruns inference; old images remain\n\
-untouched. With --reuse-vectors, repair instead requires intact authenticated\n\
-vectors and never loads models. It preserves the same source and each tier's\n\
-precision, and accepts explicit --retrieval exact or hnsw. HNSW requires\n\
+fields, then publishes a complete higher-sequence Repair successor. Both repair\n\
+routes require explicit --retrieval exact or hnsw; old images remain untouched.\n\
+With --reuse-vectors, repair instead requires intact authenticated vectors and\n\
+never loads models. It preserves exact vector values and Quill bytes without\n\
+exporting the corpus or running inference. HNSW requires\n\
 --hnsw-seed: choose a fresh seed so the rebuilt graph has a new immutable object\n\
 address. --quality-hnsw-seed selects an independent full-tier seed; otherwise it\n\
 uses --hnsw-seed. A repeated old whole-graph receipt is refused before staging.\n\
 Seed flags require HNSW, and --reuse-vectors excludes model directory/backend\n\
-options. Both repair routes accept\n\
-no replacement input, source advancement, model migration or topology change.\n\
+options. Both repair routes accept no replacement input, source advancement,\n\
+model migration or topology change.\n\
 Damaged source, control state, unsafe root entries or a competing head refuse.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
 contract. Unsupported filesystems fail before indexing. Cooperative-local is\n\

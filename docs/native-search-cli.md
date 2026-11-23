@@ -507,6 +507,50 @@ corrupt current generation. Library integrations can use
 `BoundImmutableReindexPlan` with their own authorized executor; a serialized
 report cannot recreate that process-local execution capability.
 
+### Repair damaged vectors and graphs from authenticated source
+
+`authority-repair` reconstructs the generation selected by a trusted receipt even
+when its vector or ANN images are missing or corrupt. Its control state, metadata
+and complete stored Quill source must still authenticate. No healthy ancestor or
+original JSONL file is required. The repair re-embeds every stored tier with the
+same local producers, preserves their identities and persisted F16/F32 precision,
+and publishes a complete higher-sequence `Repair` successor with the same source
+checkpoint and document fields.
+
+Choose retrieval explicitly. To restore native ANN retrieval after vector loss:
+
+```sh
+./target/release/frankensearch-native authority-repair \
+  --from-receipt "$HOME/frankensearch-authority/g1.json" \
+  --work-dir "$HOME/frankensearch-authority/repair-work" \
+  --receipt "$HOME/frankensearch-authority/repaired.json" \
+  --retrieval hnsw --hnsw-seed 23 \
+  --model-dir /absolute/path/to/installed/models
+```
+
+Full two-tier generations also require their matching quality model options.
+`--quality-hnsw-seed` optionally selects an independent quality graph seed;
+otherwise both tiers use `--hnsw-seed`. HNSW uses the default construction
+parameters. Select a fresh seed: reproducing the selected ANN component's old
+immutable address is refused before staging, even if a new embedding pass was
+completed. `--retrieval exact` remains available and excludes seed flags.
+
+If the vectors still authenticate and only the graphs need rebuilding, add
+`--reuse-vectors` and omit model options. This route preserves the exact vector
+values and Quill bytes without loading models, exporting the corpus or running
+inference. It accepts the same explicit exact/HNSW choices and graph seeds.
+
+Both routes retain the original physical authority pair through preparation and
+publication. A competing publisher causes refusal rather than replacing its
+selection. Damaged source or control state, changed producers, cancellation and
+immutable object collisions also refuse; old images remain intact. Repair does
+not accept replacement input, source advancement, model migration or topology
+changes. Source re-embedding obeys the retained-source and encoded-image budgets.
+Successful output reports `event: "repaired"`, `publication: "committed"`, the
+selected retrieval policy, and whether vectors were reused. The saved receipt
+supports the existing `authority-recover` reconciliation after interrupted
+publication or lost output.
+
 ### Incremental authority upserts and deletes
 
 `authority-update` applies a JSONL delta to the exact generation selected by

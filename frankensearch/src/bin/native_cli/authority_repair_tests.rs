@@ -18,7 +18,7 @@ fn arguments() -> Vec<String> {
 }
 
 #[test]
-fn repair_requires_explicit_exact_retrieval_and_excludes_source_or_model_migration() {
+fn repair_requires_explicit_retrieval_and_excludes_source_or_model_migration() {
     let options = Options::parse(arguments()).unwrap().unwrap();
     assert_eq!(options.command, Command::Repair);
     assert!(is_command("authority-repair"));
@@ -28,7 +28,33 @@ fn repair_requires_explicit_exact_retrieval_and_excludes_source_or_model_migrati
     assert!(Options::parse(missing).is_err());
     let mut ann = arguments();
     *ann.last_mut().unwrap() = "hnsw".to_owned();
-    assert!(Options::parse(ann).is_err());
+    assert!(Options::parse(ann.clone()).is_err());
+    ann.extend(
+        [
+            "--hnsw-seed",
+            "23",
+            "--quality-hnsw-seed",
+            "31",
+            "--model-dir",
+            "models",
+            "--quality-model-dir",
+            "quality",
+        ]
+        .map(str::to_owned),
+    );
+    let options = Options::parse(ann).unwrap().unwrap();
+    assert!(!options.repair_vectors.reuse_vectors);
+    assert_eq!(options.repair_vectors.primary_seed, Some(23));
+    assert_eq!(options.repair_vectors.quality_seed, Some(31));
+    assert!(matches!(
+        options.retrieval,
+        Some(NativeBuildRetrieval::Hnsw { .. })
+    ));
+    for flag in ["--hnsw-seed", "--quality-hnsw-seed"] {
+        let mut exact = arguments();
+        exact.extend([flag, "23"].map(str::to_owned));
+        assert!(Options::parse(exact).is_err());
+    }
     for extra in [
         vec!["--input", "replacement.jsonl"],
         vec!["--source-low", "1"],
@@ -429,186 +455,204 @@ mod lifecycle {
     fn repair_rebuilds_damaged_or_missing_derived_images_for_every_topology_and_empty_source() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             use NativeGenerationTopology::{FastOnly, FullProgressive, QualityOnly};
-            for (topology, ann, role, missing, empty) in [
-                (
-                    FastOnly,
-                    false,
-                    GenerationComponentRole::Vector,
-                    false,
-                    false,
-                ),
-                (
-                    QualityOnly,
-                    false,
-                    GenerationComponentRole::Vector,
-                    true,
-                    false,
-                ),
-                (
-                    FullProgressive,
-                    false,
-                    GenerationComponentRole::Vector,
-                    false,
-                    false,
-                ),
-                (FastOnly, true, GenerationComponentRole::Ann, true, false),
-                (
-                    QualityOnly,
-                    true,
-                    GenerationComponentRole::Ann,
-                    false,
-                    false,
-                ),
-                (
-                    FullProgressive,
-                    true,
-                    GenerationComponentRole::Vector,
-                    true,
-                    false,
-                ),
-                (
-                    FullProgressive,
-                    true,
-                    GenerationComponentRole::Ann,
-                    false,
-                    false,
-                ),
-                (FastOnly, false, GenerationComponentRole::Vector, true, true),
-                (
-                    FullProgressive,
-                    false,
-                    GenerationComponentRole::Vector,
-                    false,
-                    true,
-                ),
-            ] {
-                let fixture = fixture(&cx, topology, ann, empty).await;
-                let original_source = serde_json::to_value(
-                    fixture
-                        .snapshot
-                        .source_documents(&cx, MAX_INPUT_BYTES)
-                        .unwrap(),
-                )
-                .unwrap();
-                let original_manifest = fixture.snapshot.retained_snapshot().manifest();
-                assert!(
-                    original_manifest.predecessor().is_none(),
-                    "generation one needs no healthy ancestor"
-                );
-                let path = damage(&cx, &fixture, role, missing);
-                assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
-                let before_calls = fixture.primary.calls.load(Ordering::SeqCst);
-                let quality_calls = fixture
-                    .quality
-                    .as_ref()
-                    .map(|provider| provider.calls.load(Ordering::SeqCst));
-                let options = fixture.options("repaired");
-                let mut output = Vec::new();
-                let mut loads = 0;
-                with_loader(&cx, &options, &mut output, |mode| {
-                    loads += 1;
-                    assert_eq!(mode, fixture.selected.query_mode(None).unwrap());
-                    Ok(fixture.models())
-                })
-                .await
-                .unwrap();
-                assert_eq!(loads, 1);
-                let rows = usize::try_from(fixture.selected.documents).unwrap();
-                assert_eq!(
-                    fixture.primary.calls.load(Ordering::SeqCst),
-                    before_calls + rows
-                );
-                if let Some(provider) = &fixture.quality {
-                    assert_eq!(
-                        provider.calls.load(Ordering::SeqCst),
-                        quality_calls.unwrap() + rows
+            for repair_graph in [false, true] {
+                for (topology, ann, role, missing, empty) in [
+                    (
+                        FastOnly,
+                        false,
+                        GenerationComponentRole::Vector,
+                        false,
+                        false,
+                    ),
+                    (
+                        QualityOnly,
+                        false,
+                        GenerationComponentRole::Vector,
+                        true,
+                        false,
+                    ),
+                    (
+                        FullProgressive,
+                        false,
+                        GenerationComponentRole::Vector,
+                        false,
+                        false,
+                    ),
+                    (FastOnly, true, GenerationComponentRole::Ann, true, false),
+                    (
+                        QualityOnly,
+                        true,
+                        GenerationComponentRole::Ann,
+                        false,
+                        false,
+                    ),
+                    (
+                        FullProgressive,
+                        true,
+                        GenerationComponentRole::Vector,
+                        true,
+                        false,
+                    ),
+                    (
+                        FullProgressive,
+                        true,
+                        GenerationComponentRole::Ann,
+                        false,
+                        false,
+                    ),
+                    (FastOnly, false, GenerationComponentRole::Vector, true, true),
+                    (
+                        FullProgressive,
+                        false,
+                        GenerationComponentRole::Vector,
+                        false,
+                        true,
+                    ),
+                ] {
+                    let fixture = fixture(&cx, topology, ann, empty).await;
+                    let original_source = serde_json::to_value(
+                        fixture
+                            .snapshot
+                            .source_documents(&cx, MAX_INPUT_BYTES)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let original_manifest = fixture.snapshot.retained_snapshot().manifest();
+                    assert!(
+                        original_manifest.predecessor().is_none(),
+                        "generation one needs no healthy ancestor"
                     );
-                }
-                let receipt = Receipt::read(&options.receipt).unwrap();
-                let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
-                assert_eq!(reopened.topology(), topology);
-                assert_eq!(receipt.identity, fixture.selected.identity);
-                assert_eq!(receipt.quality_identity, fixture.selected.quality_identity);
-                assert_eq!(
-                    receipt.generation.sequence,
-                    fixture.selected.generation.sequence + 1
-                );
-                assert_ne!(receipt.generation.nonce, fixture.selected.generation.nonce);
-                assert_eq!(
-                    receipt.authority().unwrap().sequence,
-                    fixture.selected.authority().unwrap().sequence + 1
-                );
-                assert_eq!(
-                    reopened.retrieval_configuration(),
-                    NativeBuildRetrieval::Exact
-                );
-                assert_eq!(
-                    reopened.quality_retrieval_configuration(),
-                    fixture
+                    let path = damage(&cx, &fixture, role, missing);
+                    assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                    let before_calls = fixture.primary.calls.load(Ordering::SeqCst);
+                    let quality_calls = fixture
                         .quality
                         .as_ref()
-                        .map(|_| NativeBuildRetrieval::Exact)
-                );
-                assert_eq!(
-                    serde_json::to_value(reopened.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
-                        .unwrap(),
-                    original_source
-                );
-                assert_eq!(
-                    reopened.metadata().commit_range,
-                    fixture.snapshot.metadata().commit_range
-                );
-                let repaired = reopened.retained_snapshot().manifest();
-                assert_eq!(
-                    repaired.predecessor(),
-                    Some(fixture.selected.authority().unwrap())
-                );
-                assert_eq!(
-                    repaired.document_set_sha256(),
-                    original_manifest.document_set_sha256()
-                );
-                assert_eq!(
-                    repaired.source_checkpoint_sha256(),
-                    original_manifest.source_checkpoint_sha256()
-                );
-                assert!(repaired.components().ann.is_none());
-                let action = match repaired {
-                    ActivationManifest::V1(manifest) => manifest.action,
-                    ActivationManifest::V2(manifest) => manifest.action,
-                };
-                assert_eq!(action, GenerationAuthorityActionV1::Repair);
-                if missing {
-                    assert!(!path.exists());
-                } else {
-                    assert_eq!(fs::read(&path).unwrap(), b"damaged-component-evidence");
-                }
-                let hits = if let Some(quality) = &fixture.quality {
-                    reopened
-                        .search_refined_text(
-                            &cx,
-                            fixture.primary.as_ref(),
-                            quality.as_ref(),
-                            "retry",
-                            2,
+                        .map(|provider| provider.calls.load(Ordering::SeqCst));
+                    let options = if repair_graph {
+                        let mut options = fixture.vector_options(
+                            "repaired",
+                            Some(23),
+                            fixture.quality.as_ref().map(|_| 31),
+                        );
+                        options.repair_vectors.reuse_vectors = false;
+                        options
+                    } else {
+                        fixture.options("repaired")
+                    };
+                    let (primary_policy, quality_policy) =
+                        vector_policies(&options, &fixture.selected).unwrap();
+                    let mut output = Vec::new();
+                    let mut loads = 0;
+                    with_loader(&cx, &options, &mut output, |mode| {
+                        loads += 1;
+                        assert_eq!(mode, fixture.selected.query_mode(None).unwrap());
+                        Ok(fixture.models())
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(loads, 1);
+                    let rows = usize::try_from(fixture.selected.documents).unwrap();
+                    assert_eq!(
+                        fixture.primary.calls.load(Ordering::SeqCst),
+                        before_calls + rows
+                    );
+                    if let Some(provider) = &fixture.quality {
+                        assert_eq!(
+                            provider.calls.load(Ordering::SeqCst),
+                            quality_calls.unwrap() + rows
+                        );
+                    }
+                    let receipt = Receipt::read(&options.receipt).unwrap();
+                    let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(reopened.topology(), topology);
+                    assert_eq!(receipt.identity, fixture.selected.identity);
+                    assert_eq!(receipt.quality_identity, fixture.selected.quality_identity);
+                    assert_eq!(
+                        receipt.generation.sequence,
+                        fixture.selected.generation.sequence + 1
+                    );
+                    assert_ne!(receipt.generation.nonce, fixture.selected.generation.nonce);
+                    assert_eq!(
+                        receipt.authority().unwrap().sequence,
+                        fixture.selected.authority().unwrap().sequence + 1
+                    );
+                    assert_eq!(reopened.retrieval_configuration(), primary_policy);
+                    assert_eq!(reopened.quality_retrieval_configuration(), quality_policy);
+                    assert_eq!(
+                        serde_json::to_value(
+                            reopened.source_documents(&cx, MAX_INPUT_BYTES).unwrap()
                         )
-                        .await
-                        .unwrap()
-                } else {
-                    reopened
-                        .search_text(&cx, fixture.primary.as_ref(), "retry", 2)
-                        .await
-                        .unwrap()
-                };
-                assert_eq!(hits.is_empty(), empty);
-                if !empty {
-                    assert!(hits.iter().any(|hit| hit.doc_id == "retry"));
+                        .unwrap(),
+                        original_source
+                    );
+                    assert_eq!(
+                        reopened.metadata().commit_range,
+                        fixture.snapshot.metadata().commit_range
+                    );
+                    let repaired = reopened.retained_snapshot().manifest();
+                    assert_eq!(
+                        repaired.predecessor(),
+                        Some(fixture.selected.authority().unwrap())
+                    );
+                    assert_eq!(
+                        repaired.document_set_sha256(),
+                        original_manifest.document_set_sha256()
+                    );
+                    assert_eq!(
+                        repaired.source_checkpoint_sha256(),
+                        original_manifest.source_checkpoint_sha256()
+                    );
+                    assert_eq!(repaired.components().ann.is_some(), repair_graph);
+                    if repair_graph {
+                        assert_ne!(
+                            repaired.components().ann,
+                            original_manifest.components().ann
+                        );
+                    }
+                    let action = match repaired {
+                        ActivationManifest::V1(manifest) => manifest.action,
+                        ActivationManifest::V2(manifest) => manifest.action,
+                    };
+                    assert_eq!(action, GenerationAuthorityActionV1::Repair);
+                    if missing {
+                        assert!(!path.exists());
+                    } else {
+                        assert_eq!(fs::read(&path).unwrap(), b"damaged-component-evidence");
+                    }
+                    let hits = if let Some(quality) = &fixture.quality {
+                        reopened
+                            .search_refined_text(
+                                &cx,
+                                fixture.primary.as_ref(),
+                                quality.as_ref(),
+                                "retry",
+                                2,
+                            )
+                            .await
+                            .unwrap()
+                    } else {
+                        reopened
+                            .search_text(&cx, fixture.primary.as_ref(), "retry", 2)
+                            .await
+                            .unwrap()
+                    };
+                    assert_eq!(hits.is_empty(), empty);
+                    if !empty {
+                        assert!(hits.iter().any(|hit| hit.doc_id == "retry"));
+                    }
+                    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    assert_eq!(report["event"], "repaired");
+                    assert_eq!(report["publication"], "committed");
+                    assert_eq!(report["serving"], "activated");
+                    assert_eq!(report["model_migrated"], false);
+                    assert_eq!(report["source"], "authenticated_retained_source");
+                    assert_eq!(report["vectors_reused"], false);
+                    assert_eq!(
+                        report["retrieval"],
+                        if repair_graph { "hnsw" } else { "exact" }
+                    );
                 }
-                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
-                assert_eq!(report["event"], "repaired");
-                assert_eq!(report["publication"], "committed");
-                assert_eq!(report["serving"], "activated");
-                assert_eq!(report["model_migrated"], false);
-                assert_eq!(report["retrieval"], "exact");
             }
         });
     }
@@ -728,56 +772,102 @@ mod lifecycle {
     #[test]
     fn model_mismatch_drift_failure_and_cancellation_never_publish_partial_repairs() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let fixture =
-                fixture(&cx, NativeGenerationTopology::FullProgressive, true, false).await;
-            damage(&cx, &fixture, GenerationComponentRole::Ann, false);
-            let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
-            for case in [
-                "wrong-primary",
-                "wrong-quality",
-                "missing-quality",
-                "load-cancel",
-                "inference-error",
-                "inference-cancel",
-                "drift",
-            ] {
-                let primary = Provider::new(false);
-                let quality = Provider::new(true);
-                match case {
-                    "wrong-primary" => primary.drifted.store(true, Ordering::SeqCst),
-                    "wrong-quality" => quality.drifted.store(true, Ordering::SeqCst),
-                    "inference-error" => quality.fault.store(1, Ordering::SeqCst),
-                    "inference-cancel" => quality.fault.store(2, Ordering::SeqCst),
-                    "drift" => quality.fault.store(3, Ordering::SeqCst),
-                    _ => {}
-                }
-                let options = fixture.options(case);
-                let error = with_loader(&cx, &options, &mut Vec::new(), |_| {
-                    if case == "load-cancel" {
-                        cx.set_cancel_requested(true);
-                        return Err(bad("loader failure must not hide cancellation"));
+            for repair_graph in [false, true] {
+                let fixture =
+                    fixture(&cx, NativeGenerationTopology::FullProgressive, true, false).await;
+                damage(&cx, &fixture, GenerationComponentRole::Ann, false);
+                let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                for case in [
+                    "wrong-primary",
+                    "wrong-quality",
+                    "missing-quality",
+                    "load-cancel",
+                    "inference-error",
+                    "inference-cancel",
+                    "drift",
+                ] {
+                    let primary = Provider::new(false);
+                    let quality = Provider::new(true);
+                    match case {
+                        "wrong-primary" => primary.drifted.store(true, Ordering::SeqCst),
+                        "wrong-quality" => quality.drifted.store(true, Ordering::SeqCst),
+                        "inference-error" => quality.fault.store(1, Ordering::SeqCst),
+                        "inference-cancel" => quality.fault.store(2, Ordering::SeqCst),
+                        "drift" => quality.fault.store(3, Ordering::SeqCst),
+                        _ => {}
                     }
-                    Ok(Models {
-                        fast: primary.clone(),
-                        quality: (case != "missing-quality")
-                            .then(|| quality.clone() as Arc<dyn Embedder>),
+                    let options = if repair_graph {
+                        let mut options = fixture.vector_options(case, Some(43), Some(47));
+                        options.repair_vectors.reuse_vectors = false;
+                        options
+                    } else {
+                        fixture.options(case)
+                    };
+                    let error = with_loader(&cx, &options, &mut Vec::new(), |_| {
+                        if case == "load-cancel" {
+                            cx.set_cancel_requested(true);
+                            return Err(bad("loader failure must not hide cancellation"));
+                        }
+                        Ok(Models {
+                            fast: primary.clone(),
+                            quality: (case != "missing-quality")
+                                .then(|| quality.clone() as Arc<dyn Embedder>),
+                        })
                     })
+                    .await
+                    .unwrap_err();
+                    if matches!(case, "load-cancel" | "inference-cancel") {
+                        assert!(matches!(
+                            error.downcast_ref::<SearchError>(),
+                            Some(SearchError::Cancelled { .. })
+                        ));
+                    }
+                    cx.set_cancel_requested(false);
+                    if matches!(
+                        case,
+                        "wrong-primary" | "wrong-quality" | "missing-quality" | "load-cancel"
+                    ) {
+                        assert_eq!(primary.calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+                        assert!(!options.work.as_ref().unwrap().exists());
+                    }
+                    assert!(!options.receipt.exists());
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        before
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn source_hnsw_repair_refuses_old_graph_address_and_invalid_quality_seed() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture(&cx, NativeGenerationTopology::FastOnly, true, false).await;
+            let graph = damage(&cx, &fixture, GenerationComponentRole::Ann, false);
+            let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+            for (case, primary_seed, quality_seed) in
+                [("repeated-seed", 17, None), ("quality-seed", 43, Some(47))]
+            {
+                let mut options = fixture.vector_options(case, Some(primary_seed), quality_seed);
+                options.repair_vectors.reuse_vectors = false;
+                let calls = fixture.primary.calls.load(Ordering::SeqCst);
+                let mut loads = 0;
+                let error = with_loader(&cx, &options, &mut Vec::new(), |_| {
+                    loads += 1;
+                    Ok(fixture.models())
                 })
                 .await
                 .unwrap_err();
-                if matches!(case, "load-cancel" | "inference-cancel") {
-                    assert!(matches!(
-                        error.downcast_ref::<SearchError>(),
-                        Some(SearchError::Cancelled { .. })
-                    ));
-                }
-                cx.set_cancel_requested(false);
-                if matches!(
-                    case,
-                    "wrong-primary" | "wrong-quality" | "missing-quality" | "load-cancel"
-                ) {
-                    assert_eq!(primary.calls.load(Ordering::SeqCst), 0);
-                    assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+                if case == "repeated-seed" {
+                    assert!(error.to_string().contains("new ANN object address"));
+                    assert_eq!(loads, 1);
+                    assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), calls + 2);
+                } else {
+                    assert!(error.to_string().contains("complete two-tier selection"));
+                    assert_eq!(loads, 0);
+                    assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), calls);
                     assert!(!options.work.as_ref().unwrap().exists());
                 }
                 assert!(!options.receipt.exists());
@@ -785,6 +875,7 @@ mod lifecycle {
                     fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
                     before
                 );
+                assert_eq!(fs::read(&graph).unwrap(), b"damaged-component-evidence");
             }
         });
     }
@@ -792,78 +883,86 @@ mod lifecycle {
     #[test]
     fn publication_during_model_loading_refuses_original_repair_pair_without_rebasing() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let fixture = fixture(&cx, NativeGenerationTopology::FastOnly, false, false).await;
-            let winner = NativeIndexBuilder::new(
-                fixture.parent.join("winner-work"),
-                new_generation(2).unwrap(),
-                fixture.primary.clone(),
-            )
-            .unwrap()
-            .with_fast_storage(NativeBuildPrecision::F16, NativeBuildRetrieval::Exact)
-            .add_documents(
-                fixture
-                    .snapshot
-                    .source_documents(&cx, MAX_INPUT_BYTES)
-                    .unwrap(),
-            )
-            .build_exact_generation(
-                &cx,
-                EmbedderTierTag::Fast,
-                CommitRange { low: 4, high: 10 },
-                DEFAULT_IMAGE_BYTES,
-            )
-            .await
-            .unwrap();
-            damage(&cx, &fixture, GenerationComponentRole::Vector, true);
-            let root = admit_root(&fixture.selected.root).unwrap();
-            let original_pair = fixture.snapshot.retained_snapshot().authority_pair();
-            let options = fixture.options("stale-repair");
-            let mut winning_receipt = None;
-            let error = with_loader(&cx, &options, &mut Vec::new(), |_| {
-                let published = stage_and_publish(
-                    &cx,
-                    &root,
-                    &fixture.selected.root,
-                    &fixture.parent.join("winner.json"),
-                    &winner,
-                    Some(&fixture.snapshot),
-                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
-                )?;
-                winning_receipt = Some(published.receipt);
-                Ok(fixture.models())
-            })
-            .await
-            .unwrap_err();
-            let failure = error.downcast_ref::<PublicationFailure>().unwrap();
-            assert_eq!(failure.0["publication"], "not_committed");
-            let winner = winning_receipt.unwrap();
-            let current = winner.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
-            assert_eq!(current.metadata().commit_range.high, 10);
-            let attempt = Receipt::read(&options.receipt)
+            for repair_graph in [false, true] {
+                let fixture = fixture(&cx, NativeGenerationTopology::FastOnly, false, false).await;
+                let winner = NativeIndexBuilder::new(
+                    fixture.parent.join("winner-work"),
+                    new_generation(2).unwrap(),
+                    fixture.primary.clone(),
+                )
                 .unwrap()
-                .recovery_attempt()
+                .with_fast_storage(NativeBuildPrecision::F16, NativeBuildRetrieval::Exact)
+                .add_documents(
+                    fixture
+                        .snapshot
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap(),
+                )
+                .build_exact_generation(
+                    &cx,
+                    EmbedderTierTag::Fast,
+                    CommitRange { low: 4, high: 10 },
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .await
                 .unwrap();
-            assert_eq!(attempt.expected, original_pair);
-            assert_ne!(attempt.candidate, winner.authority().unwrap());
-            assert!(
-                Receipt::read(&options.receipt)
-                    .unwrap()
-                    .open(&cx, DEFAULT_IMAGE_BYTES)
-                    .is_err()
-            );
-            // A later invocation with the old receipt must refuse before loading.
-            let retry = fixture.options("stale-input");
-            let mut loads = 0;
-            assert!(
-                with_loader(&cx, &retry, &mut Vec::new(), |_| {
-                    loads += 1;
+                damage(&cx, &fixture, GenerationComponentRole::Vector, true);
+                let root = admit_root(&fixture.selected.root).unwrap();
+                let original_pair = fixture.snapshot.retained_snapshot().authority_pair();
+                let options = if repair_graph {
+                    let mut options = fixture.vector_options("stale-repair", Some(43), None);
+                    options.repair_vectors.reuse_vectors = false;
+                    options
+                } else {
+                    fixture.options("stale-repair")
+                };
+                let mut winning_receipt = None;
+                let error = with_loader(&cx, &options, &mut Vec::new(), |_| {
+                    let published = stage_and_publish(
+                        &cx,
+                        &root,
+                        &fixture.selected.root,
+                        &fixture.parent.join("winner.json"),
+                        &winner,
+                        Some(&fixture.snapshot),
+                        PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                    )?;
+                    winning_receipt = Some(published.receipt);
                     Ok(fixture.models())
                 })
                 .await
-                .is_err()
-            );
-            assert_eq!(loads, 0);
-            assert!(!retry.receipt.exists());
+                .unwrap_err();
+                let failure = error.downcast_ref::<PublicationFailure>().unwrap();
+                assert_eq!(failure.0["publication"], "not_committed");
+                let winner = winning_receipt.unwrap();
+                let current = winner.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(current.metadata().commit_range.high, 10);
+                let attempt = Receipt::read(&options.receipt)
+                    .unwrap()
+                    .recovery_attempt()
+                    .unwrap();
+                assert_eq!(attempt.expected, original_pair);
+                assert_ne!(attempt.candidate, winner.authority().unwrap());
+                assert!(
+                    Receipt::read(&options.receipt)
+                        .unwrap()
+                        .open(&cx, DEFAULT_IMAGE_BYTES)
+                        .is_err()
+                );
+                // A later invocation with the old receipt must refuse before loading.
+                let retry = fixture.options("stale-input");
+                let mut loads = 0;
+                assert!(
+                    with_loader(&cx, &retry, &mut Vec::new(), |_| {
+                        loads += 1;
+                        Ok(fixture.models())
+                    })
+                    .await
+                    .is_err()
+                );
+                assert_eq!(loads, 0);
+                assert!(!retry.receipt.exists());
+            }
         });
     }
 
