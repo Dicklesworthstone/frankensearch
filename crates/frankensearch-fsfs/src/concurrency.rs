@@ -1529,20 +1529,8 @@ fn hostname() -> String {
 }
 
 /// Check whether a PID is alive on the local system.
-#[cfg(unix)]
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
-    let Some(pid) = positive_pid(pid) else {
-        return false;
-    };
-    #[cfg(target_os = "linux")]
-    if let Some(alive) = pidfd_process_alive(pid) {
-        return alive;
-    }
-    // A process we lack permission to signal still exists.
-    matches!(
-        rustix::process::test_kill_process(pid),
-        Ok(()) | Err(rustix::io::Errno::PERM)
-    )
+    ProcessTarget::open(pid).is_some_and(|process| process.is_alive())
 }
 
 #[cfg(unix)]
@@ -1550,60 +1538,85 @@ fn positive_pid(pid: u32) -> Option<rustix::process::Pid> {
     rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)
 }
 
-/// Linux marks a process descriptor readable at exit and hung up after reap.
-/// When descriptors are unavailable, the caller retains the Unix signal probe.
-#[cfg(target_os = "linux")]
-fn pidfd_process_alive(pid: rustix::process::Pid) -> Option<bool> {
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    use rustix::process::{PidfdFlags, pidfd_open};
+/// Retain the same process for shutdown and exit observation when the
+/// kernel supports process descriptors. Other Unix targets use PID probes.
+pub(crate) enum ProcessTarget {
+    #[cfg(target_os = "linux")]
+    Descriptor(rustix::fd::OwnedFd),
+    #[cfg(target_os = "linux")]
+    Exited,
+    #[cfg(unix)]
+    Pid(rustix::process::Pid),
+    #[cfg(not(unix))]
+    Unsupported,
+}
 
-    let descriptor = match pidfd_open(pid, PidfdFlags::empty()) {
-        Ok(descriptor) => descriptor,
-        Err(rustix::io::Errno::SRCH) => return Some(false),
-        Err(_) => return None,
-    };
-    let mut watched = PollFd::new(&descriptor, PollFlags::IN);
-    let ready = poll(
-        std::slice::from_mut(&mut watched),
-        Some(&Timespec::default()),
-    )
-    .ok()?;
-    if ready == 0 {
-        Some(true)
-    } else if watched.revents().intersects(PollFlags::IN | PollFlags::HUP) {
-        Some(false)
-    } else {
-        None
+impl ProcessTarget {
+    #[cfg(unix)]
+    pub(crate) fn open(pid: u32) -> Option<Self> {
+        let pid = positive_pid(pid)?;
+        #[cfg(target_os = "linux")]
+        match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+            Ok(descriptor) => return Some(Self::Descriptor(descriptor)),
+            Err(rustix::io::Errno::SRCH) => return Some(Self::Exited),
+            Err(_) => {}
+        }
+        Some(Self::Pid(pid))
     }
-}
 
-#[cfg(not(unix))]
-pub(crate) fn is_pid_alive(_pid: u32) -> bool {
-    // Conservative: assume alive on unsupported platforms.
-    true
-}
+    #[cfg(not(unix))]
+    pub(crate) fn open(pid: u32) -> Option<Self> {
+        (pid != 0 && i32::try_from(pid).is_ok()).then_some(Self::Unsupported)
+    }
 
-/// Ask a process to shut down cleanly (`SIGTERM`); the fsfs daemons trap it
-/// through `ShutdownCoordinator` and exit on their next poll.
-///
-/// # Errors
-///
-/// Returns the OS error when the signal cannot be delivered (no such
-/// process, no permission).
-#[cfg(unix)]
-pub(crate) fn request_termination(pid: u32) -> std::io::Result<()> {
-    let pid = positive_pid(pid).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "expected a positive PID")
-    })?;
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(std::io::Error::from)
-}
+    pub(crate) fn is_alive(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Descriptor(descriptor) => {
+                use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
-#[cfg(not(unix))]
-pub(crate) fn request_termination(_pid: u32) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "daemon --stop needs Unix signals on this platform",
-    ))
+                // Linux marks the descriptor readable at exit, then hung up
+                // after reap. A failed poll must not report an exit.
+                let mut watched = PollFd::new(descriptor, PollFlags::IN);
+                poll(
+                    std::slice::from_mut(&mut watched),
+                    Some(&Timespec::default()),
+                )
+                .is_err()
+                    || !watched.revents().intersects(PollFlags::IN | PollFlags::HUP)
+            }
+            #[cfg(target_os = "linux")]
+            Self::Exited => false,
+            #[cfg(unix)]
+            Self::Pid(pid) => matches!(
+                rustix::process::test_kill_process(*pid),
+                Ok(()) | Err(rustix::io::Errno::PERM)
+            ),
+            #[cfg(not(unix))]
+            Self::Unsupported => true,
+        }
+    }
+
+    /// Ask the observed process to exit cleanly with `SIGTERM`.
+    pub(crate) fn request_termination(&self) -> std::io::Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Descriptor(descriptor) => {
+                rustix::process::pidfd_send_signal(descriptor, rustix::process::Signal::TERM)
+                    .map_err(std::io::Error::from)
+            }
+            #[cfg(target_os = "linux")]
+            Self::Exited => Err(rustix::io::Errno::SRCH.into()),
+            #[cfg(unix)]
+            Self::Pid(pid) => rustix::process::kill_process(*pid, rustix::process::Signal::TERM)
+                .map_err(std::io::Error::from),
+            #[cfg(not(unix))]
+            Self::Unsupported => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "daemon --stop needs Unix signals on this platform",
+            )),
+        }
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

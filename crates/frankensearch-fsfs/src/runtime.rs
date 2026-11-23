@@ -19491,21 +19491,17 @@ impl FsfsRuntime {
         budget: Duration,
         poll: Duration,
     ) -> SearchResult<bool> {
-        let refusal = if !contents.is_local() {
-            Some("compactor PID file belongs to a different host")
-        } else if contents.pid == 0 || i32::try_from(contents.pid).is_err() {
-            Some("compactor PID file must name a positive process ID")
-        } else {
-            None
+        let pid_file_error = |reason: &str| SearchError::InvalidConfig {
+            field: "daemon.pid_file".into(),
+            value: pid_path.display().to_string(),
+            reason: reason.into(),
         };
-        if let Some(reason) = refusal {
-            return Err(SearchError::InvalidConfig {
-                field: "daemon.pid_file".into(),
-                value: pid_path.display().to_string(),
-                reason: reason.into(),
-            });
+        if !contents.is_local() {
+            return Err(pid_file_error("compactor PID file belongs to a different host"));
         }
-        if !contents.is_alive() {
+        let process = crate::concurrency::ProcessTarget::open(contents.pid)
+            .ok_or_else(|| pid_file_error("compactor PID file must name a positive process ID"))?;
+        if !process.is_alive() {
             if let Err(error) = fs::remove_file(pid_path)
                 && error.kind() != ErrorKind::NotFound
             {
@@ -19513,12 +19509,28 @@ impl FsfsRuntime {
             }
             return Ok(true);
         }
+        #[cfg(target_os = "linux")]
+        {
+            let lock_path = pid_path.with_file_name(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME);
+            if !crate::lifecycle::has_linux_publication_owner(&lock_path, contents.pid)? {
+                if !process.is_alive() {
+                    return Ok(false);
+                }
+                return Err(pid_file_error("recorded PID does not hold this index's publication lock"));
+            }
+        }
         let started = std::time::Instant::now();
-        crate::concurrency::request_termination(contents.pid).map_err(SearchError::Io)?;
+        if let Err(error) = process.request_termination() {
+            return if process.is_alive() {
+                Err(SearchError::Io(error))
+            } else {
+                Ok(false)
+            };
+        }
         let mut alive = true;
         while alive && started.elapsed() < budget {
             std::thread::sleep(poll);
-            alive = contents.is_alive();
+            alive = process.is_alive();
         }
         if alive {
             return Err(SearchError::InvalidConfig {
@@ -51861,6 +51873,7 @@ mod tests {
         // A fake daemon that exits (unlinks its socket) on `:shutdown` and
         // reports whether it was asked to.
         fn fake_daemon(path: PathBuf, deadline: Instant) -> std::thread::JoinHandle<bool> {
+            fs::create_dir_all(path.parent().expect("socket parent")).expect("daemon dir");
             let _ = fs::remove_file(&path);
             let listener = UnixListener::bind(&path).expect("bind fake daemon");
             listener
@@ -51919,7 +51932,6 @@ mod tests {
         assert_ne!(current, older_protocol);
         assert!(!other_index.to_str().unwrap().contains(&stem));
 
-        fs::create_dir_all(socket_dir).expect("daemon dir");
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut paths = vec![&current, &older_protocol];
         if super::ensure_daemon_socket_path_fits(&legacy).is_ok() {
@@ -51927,6 +51939,7 @@ mod tests {
         } else {
             // A legacy daemon could never have bound this oversized path.
             // Keep the real current/older-protocol fallback sockets live.
+            fs::create_dir_all(legacy.parent().expect("legacy socket parent")).expect("daemon dir");
             assert!(UnixListener::bind(&legacy).is_err());
         }
         let asked = paths
@@ -69013,8 +69026,50 @@ mod tests {
     }
 
     #[cfg(unix)]
+    const STOP_TEST_INDEX_ROOT: &str = "FSFS_TEST_COMPACTOR_STOP_INDEX_ROOT";
+
+    #[cfg(unix)]
+    fn start_stop_test_owner(index_root: &Path) -> std::process::Child {
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "runtime::tests::daemon_stop_clears_a_stale_pid_file_and_terminates_a_live_daemon",
+            ])
+            .env(STOP_TEST_INDEX_ROOT, index_root)
+            .spawn()
+            .expect("spawn publication lease holder");
+        let started = Instant::now();
+        let ready_path = index_root.join("stop-test-ready");
+        let ready = loop {
+            if ready_path.is_file() {
+                break true;
+            }
+            let status = child.try_wait().expect("poll owner");
+            assert!(
+                status.is_none(),
+                "owner exited before acquiring its lease: {status:?}"
+            );
+            if started.elapsed() >= Duration::from_secs(10) {
+                let _ = child.kill();
+                child.wait().expect("reap timed-out owner");
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(ready, "owner did not acquire its publication lease");
+        child
+    }
+
+    #[cfg(unix)]
     #[test]
     fn daemon_stop_clears_a_stale_pid_file_and_terminates_a_live_daemon() {
+        if let Some(root) = std::env::var_os(STOP_TEST_INDEX_ROOT) {
+            let root = PathBuf::from(root);
+            let _lease = crate::lifecycle::PublicationLease::acquire(&root).expect("take lease");
+            fs::write(root.join("stop-test-ready"), b"").expect("announce ownership");
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let index_root = temp.path().join("index");
         fs::create_dir_all(&index_root).expect("create index root");
@@ -69034,13 +69089,10 @@ mod tests {
             .expect("a stale pid file is cleared, not an error");
         assert!(!pid_path.exists(), "stale pid file must be removed");
 
-        // Live: a sleeping child stands in for the daemon; SIGTERM ends it.
+        // The live child holds the store lease until SIGTERM ends it.
         // Reap concurrently so this also exercises the signal-probe fallback
         // on Unix systems without Linux process descriptors.
-        let mut live = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
+        let mut live = start_stop_test_owner(&index_root);
         write_pid_file(live.id());
         let wait_thread =
             std::thread::spawn(move || live.wait().expect("wait for the signalled child"));
@@ -69050,7 +69102,7 @@ mod tests {
         let status = wait_thread.join().expect("wait thread");
         assert!(
             !status.success(),
-            "sleep must have died from the signal: {status:?}"
+            "the lease holder must have died from the signal: {status:?}"
         );
     }
 
@@ -69061,7 +69113,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let pid_path = temp.path().join(super::FSFS_DAEMON_PID_FILE);
-        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let mut child = start_stop_test_owner(temp.path());
         let mut contents = crate::lifecycle::PidFileContents::current("test");
         contents.pid = child.id();
         fs::write(&pid_path, serde_json::to_vec(&contents).unwrap()).unwrap();
@@ -69080,6 +69132,35 @@ mod tests {
         assert!(matches!(cleared, Some(Ok(true))), "{cleared:?}");
         assert!(!pid_path.exists());
         assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compactor_stop_rejects_the_pid_of_another_index_owner() {
+        let requested = tempfile::tempdir().expect("requested index");
+        let other = tempfile::tempdir().expect("other index");
+        let _requested_lease =
+            crate::lifecycle::PublicationLease::acquire(requested.path()).expect("requested lease");
+        let mut child = start_stop_test_owner(other.path());
+        let mut contents = crate::lifecycle::PidFileContents::current("test");
+        contents.pid = child.id();
+        let recorded = serde_json::to_vec(&contents).unwrap();
+        let pid_path = requested.path().join(super::FSFS_DAEMON_PID_FILE);
+        fs::write(&pid_path, &recorded).unwrap();
+
+        let stopped = FsfsRuntime::stop_compaction_daemon(
+            &contents,
+            &pid_path,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        );
+        let still_running = child.try_wait().expect("poll other owner").is_none();
+        let _ = child.kill();
+        child.wait().expect("reap other owner");
+        assert!(still_running);
+        assert!(matches!(stopped, Err(SearchError::InvalidConfig { field, reason, .. })
+            if field == "daemon.pid_file" && reason.contains("publication lock")));
+        assert_eq!(fs::read(pid_path).unwrap(), recorded);
     }
 
     #[cfg(unix)]

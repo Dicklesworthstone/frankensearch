@@ -61,6 +61,57 @@ impl PublicationLease {
     }
 }
 
+/// Check the kernel's live exclusive flock for the selected lock inode.
+#[cfg(target_os = "linux")]
+pub(crate) fn has_linux_publication_owner(lock_path: &Path, pid: u32) -> std::io::Result<bool> {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match std::fs::symlink_metadata(lock_path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let proc_pid = std::fs::read_link("/proc/self")?;
+    if proc_pid.to_str().and_then(|pid| pid.parse().ok()) != Some(std::process::id()) {
+        return Ok(false);
+    }
+    let device = (
+        rustix::fs::major(metadata.dev()),
+        rustix::fs::minor(metadata.dev()),
+    );
+    for line in BufReader::new(std::fs::File::open("/proc/locks")?).lines() {
+        let line = line?;
+        let mut fields = line.split_ascii_whitespace().skip(1);
+        if fields.next() != Some("FLOCK")
+            || fields.next() != Some("ADVISORY")
+            || fields.next() != Some("WRITE")
+            || fields.next().and_then(|owner| owner.parse().ok()) != Some(pid)
+        {
+            continue;
+        }
+        let Some(identity) = fields.next() else {
+            continue;
+        };
+        let mut parts = identity.split(':');
+        let major = parts
+            .next()
+            .and_then(|part| u32::from_str_radix(part, 16).ok());
+        let minor = parts
+            .next()
+            .and_then(|part| u32::from_str_radix(part, 16).ok());
+        let inode = parts.next().and_then(|part| part.parse().ok());
+        if (major, minor, inode) == (Some(device.0), Some(device.1), Some(metadata.ino())) {
+            let current = std::fs::symlink_metadata(lock_path)?;
+            return Ok(current.is_file()
+                && current.dev() == metadata.dev()
+                && current.ino() == metadata.ino());
+        }
+    }
+    Ok(false)
+}
+
 // The native lease creates missing directories and rewrites its owner record.
 // Inspect the nearest existing ancestor without creating anything first. Its
 // canonical ancestry catches both a nested index root and a symlink pointing
