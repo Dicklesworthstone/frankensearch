@@ -4033,9 +4033,12 @@ impl TwoTierSearcher {
             let missing = missing_candidate_ids(&fast_hits, hits);
             if !missing.is_empty() {
                 cancellation_checkpoint(cx, "quality_to_fast_candidate_evidence")?;
-                let supplemental =
-                    self.index
-                        .fast_candidates_with_producer(cx, &evidence.query, &missing)?;
+                let supplemental = self.index.fast_candidates_with_producer(
+                    cx,
+                    &evidence.query,
+                    &missing,
+                    self.search_params,
+                )?;
                 if !supplemental.is_empty() {
                     // Rebuild from raw observations: calibration and hubness
                     // apply once, and graph diffusion sees the full refined
@@ -11556,7 +11559,14 @@ mod tests {
                         ("doc-c", &[0.6, 0.8, 0.0, 0.0, 0.0, 0.0]),
                     ],
                 );
-                for calibrated in [false, true] {
+                for (calibrated, parallel) in [
+                    (false, None),
+                    (true, None),
+                    (false, Some(false)),
+                    (true, Some(false)),
+                    (false, Some(true)),
+                    (true, Some(true)),
+                ] {
                     let fast = Arc::new(query_admission_embedder("fast"));
                     let quality = Arc::new(query_admission_embedder("quality"));
                     let mut searcher = TwoTierSearcher::new(
@@ -11570,6 +11580,13 @@ mod tests {
                         },
                     )
                     .with_quality_embedder(quality.clone());
+                    if let Some(parallel_enabled) = parallel {
+                        searcher = searcher.with_search_params(SearchParams {
+                            parallel_enabled,
+                            parallel_threshold: 0,
+                            parallel_chunk_size: 1,
+                        });
+                    }
                     if calibrated {
                         searcher =
                             searcher.with_score_calibrator(CalibratorConfig::TemperatureScaling(
@@ -11606,7 +11623,7 @@ mod tests {
                             .map(|hit| hit.doc_id.as_str())
                             .collect::<Vec<_>>(),
                         ["doc-c", "doc-b"],
-                        "layout={layout}, calibrated={calibrated}"
+                        "layout={layout}, calibrated={calibrated}, parallel={parallel:?}"
                     );
                     let discovered = &results[1];
                     assert_eq!(discovered.fast_score, Some(searcher.calibrate_score(0.0)));

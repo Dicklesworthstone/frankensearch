@@ -34,6 +34,12 @@ const GATHER_SELECTIVITY_DIVISOR: usize = 50;
 /// Bound work between cooperative checks independently of Rayon chunk tuning.
 const SCAN_CHECKPOINT_INTERVAL: usize = 256;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static GATHER_SCAN_CHUNKS: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The raw numeric API keeps its existing noncancellable kernel. Retained-tier
 /// callers instantiate the same traversal with their context, so cancellation
 /// cannot accidentally select a different scorer or visibility policy.
@@ -496,6 +502,7 @@ impl VectorIndex {
         query: &[f32],
         limit: usize,
         filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
     ) -> SearchResult<ClassifiedHits> {
         ScanCancellation::checkpoint(cx)?;
         self.ensure_query_dimension(query)?;
@@ -506,13 +513,7 @@ impl VectorIndex {
             limit,
             self.record_count().saturating_add(self.wal_entries.len()),
             |candidate_limit| {
-                self.search_top_k_controlled::<false>(
-                    query,
-                    candidate_limit,
-                    filter,
-                    SearchParams::default(),
-                    cx,
-                )
+                self.search_top_k_controlled::<false>(query, candidate_limit, filter, params, cx)
             },
             |hit| self.classified_hit_is_usable(hit),
             || self.classified_search_census_cancellable(cx, filter.is_some()),
@@ -815,9 +816,22 @@ impl VectorIndex {
         }
         let mut heap = if self.record_count() > 0 {
             if let Some(ids) = filter.candidate_doc_ids() {
-                self.scan_gather_doc_ids(ids, filter, query, limit, UncancelledScan)?
+                self.scan_gather_doc_ids(
+                    ids,
+                    filter,
+                    query,
+                    limit,
+                    Some(PARALLEL_CHUNK_SIZE),
+                    UncancelledScan,
+                )?
             } else if let Some(allowed) = filter.candidate_hashes() {
-                self.scan_gather_hashes(allowed, query, limit, UncancelledScan)?
+                self.scan_gather_hashes(
+                    allowed,
+                    query,
+                    limit,
+                    Some(PARALLEL_CHUNK_SIZE),
+                    UncancelledScan,
+                )?
             } else {
                 return self.bench_scan_filtered(query, limit, Some(filter));
             }
@@ -897,7 +911,7 @@ impl VectorIndex {
             // checks the full predicate. Hash-only allow-lists cannot safely
             // represent this view when a collision occurs.
             heap = if let Some(gathered) =
-                self.try_gather_filtered(query, limit, Some(&visible_main), cancel)?
+                self.try_gather_filtered(query, limit, Some(&visible_main), params, cancel)?
             {
                 gathered
             } else if params.parallel_enabled && self.record_count() >= params.parallel_threshold {
@@ -984,7 +998,7 @@ impl VectorIndex {
             // rayon overhead is not worth it, so stay serial. Bit-identical either
             // way — `compare_best_first` is a strict total order.
             cancel.checkpoint()?;
-            if winners.len() >= PAR_SORT_THRESHOLD {
+            if use_parallel && winners.len() >= PAR_SORT_THRESHOLD {
                 winners.par_sort_unstable_by(compare_best_first);
             } else {
                 winners.sort_unstable_by(compare_best_first);
@@ -994,7 +1008,9 @@ impl VectorIndex {
         }
 
         let mut heap = if has_main {
-            if let Some(gathered) = self.try_gather_filtered(query, limit, filter, cancel)? {
+            if let Some(gathered) =
+                self.try_gather_filtered(query, limit, filter, params, cancel)?
+            {
                 gathered
             } else if use_parallel {
                 self.scan_parallel(query, limit, filter, chunk_size, cancel)?
@@ -1663,6 +1679,7 @@ impl VectorIndex {
         query: &[f32],
         limit: usize,
         filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
         cancel: impl ScanCancellation,
     ) -> SearchResult<Option<BinaryHeap<HeapEntry>>> {
         cancel.checkpoint()?;
@@ -1670,11 +1687,20 @@ impl VectorIndex {
             return Ok(None);
         };
         let count = self.record_count();
+        let parallel_chunk_size = (params.parallel_enabled && count >= params.parallel_threshold)
+            .then_some(params.parallel_chunk_size.max(1));
         if let Some(ids) = active_filter.candidate_doc_ids()
             && ids.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) < count
         {
             return self
-                .scan_gather_doc_ids(ids, active_filter, query, limit, cancel)
+                .scan_gather_doc_ids(
+                    ids,
+                    active_filter,
+                    query,
+                    limit,
+                    parallel_chunk_size,
+                    cancel,
+                )
                 .map(Some);
         }
         let Some(allowed) = active_filter.candidate_hashes() else {
@@ -1683,7 +1709,7 @@ impl VectorIndex {
         if count == 0 || allowed.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) >= count {
             return Ok(None);
         }
-        self.scan_gather_hashes(allowed, query, limit, cancel)
+        self.scan_gather_hashes(allowed, query, limit, parallel_chunk_size, cancel)
             .map(Some)
     }
 
@@ -1692,10 +1718,11 @@ impl VectorIndex {
         allowed: &DocIdHashSet,
         query: &[f32],
         limit: usize,
+        parallel_chunk_size: Option<usize>,
         cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         let positions = self.gather_positions_for_hashes(allowed, cancel)?;
-        self.scan_gather_positions(&positions, query, limit, cancel)
+        self.scan_gather_positions(&positions, query, limit, parallel_chunk_size, cancel)
     }
 
     fn scan_gather_doc_ids(
@@ -1704,6 +1731,7 @@ impl VectorIndex {
         filter: &dyn SearchFilter,
         query: &[f32],
         limit: usize,
+        parallel_chunk_size: Option<usize>,
         cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         cancel.checkpoint()?;
@@ -1728,7 +1756,7 @@ impl VectorIndex {
         cancel.checkpoint()?;
         positions.sort_unstable();
         cancel.checkpoint()?;
-        self.scan_gather_positions(&positions, query, limit, cancel)
+        self.scan_gather_positions(&positions, query, limit, parallel_chunk_size, cancel)
     }
 
     fn gather_positions_for_hashes(
@@ -1796,12 +1824,15 @@ impl VectorIndex {
         positions: &[usize],
         query: &[f32],
         limit: usize,
+        parallel_chunk_size: Option<usize>,
         cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         cancel.checkpoint()?;
-        if positions.len() > PARALLEL_CHUNK_SIZE {
+        if let Some(chunk_size) = parallel_chunk_size
+            && positions.len() > chunk_size
+        {
             let partials: SearchResult<Vec<BinaryHeap<HeapEntry>>> = positions
-                .par_chunks(PARALLEL_CHUNK_SIZE)
+                .par_chunks(chunk_size)
                 .map(|chunk| self.gather_range(chunk, query, limit, cancel))
                 .collect();
             return merge_partial_heaps(partials?, limit, cancel);
@@ -1817,6 +1848,12 @@ impl VectorIndex {
         cancel: impl ScanCancellation,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         cancel.checkpoint()?;
+        #[cfg(test)]
+        GATHER_SCAN_CHUNKS.with(|observation| {
+            if let Some(chunks) = observation.borrow_mut().as_mut() {
+                chunks.push(positions.len());
+            }
+        });
         let mut heap = BinaryHeap::with_capacity(limit.min(positions.len()).saturating_add(1));
         let dim = self.dimension();
         let mut cutoff = f32::NEG_INFINITY;
@@ -2597,6 +2634,138 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn selective_gather_obeys_parallel_policy_and_preserves_exact_results() {
+        use frankensearch_core::{BitsetFilter, IncludeDocIdsFilter};
+
+        fn observe_chunks(
+            pool: &rayon::ThreadPool,
+            search: impl FnOnce() -> Vec<VectorHit> + Send,
+        ) -> (Vec<VectorHit>, Vec<usize>) {
+            pool.broadcast(|_| {
+                GATHER_SCAN_CHUNKS.with(|chunks| *chunks.borrow_mut() = Some(Vec::new()));
+            });
+            let hits = pool.install(search);
+            let chunks = pool
+                .broadcast(|_| {
+                    GATHER_SCAN_CHUNKS.with(|chunks| chunks.borrow_mut().take().unwrap())
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+            (hits, chunks)
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let selected = 64;
+        let query = [1.0, 0.0];
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let (_path, index) =
+                cancellation_index("gather-policy", quantization, CANCELLATION_TEST_ROWS);
+            let allowed: HashSet<_> = (0..selected).map(|i| format!("doc-{i:05}")).collect();
+            let exact = IncludeDocIdsFilter::new(allowed.iter().cloned());
+            let hashed = BitsetFilter::from_doc_ids(allowed.iter().cloned());
+            let predicate =
+                PredicateFilter::new("selected-row-reference", move |id| allowed.contains(id));
+            let sequential = SearchParams {
+                parallel_enabled: false,
+                parallel_threshold: 0,
+                parallel_chunk_size: 7,
+            };
+            let cx = Cx::for_testing();
+            let (reference, chunks) = observe_chunks(&pool, || {
+                index
+                    .search_top_k_classified_cancellable(
+                        &cx,
+                        &query,
+                        23,
+                        Some(&predicate),
+                        sequential,
+                    )
+                    .unwrap()
+                    .hits
+            });
+            assert!(
+                chunks.is_empty(),
+                "the reference uses the full predicate scan"
+            );
+            for filter in [&exact as &dyn SearchFilter, &hashed as &dyn SearchFilter] {
+                for (params, expected_chunk_size) in [
+                    (sequential, None),
+                    (
+                        SearchParams {
+                            parallel_enabled: true,
+                            parallel_threshold: usize::MAX,
+                            ..sequential
+                        },
+                        None,
+                    ),
+                    (
+                        SearchParams {
+                            parallel_enabled: true,
+                            ..sequential
+                        },
+                        Some(7),
+                    ),
+                    (
+                        SearchParams {
+                            parallel_enabled: true,
+                            parallel_chunk_size: 0,
+                            ..sequential
+                        },
+                        Some(1),
+                    ),
+                    (
+                        SearchParams {
+                            parallel_enabled: true,
+                            parallel_chunk_size: selected + 1,
+                            ..sequential
+                        },
+                        None,
+                    ),
+                ] {
+                    let (actual, chunks) = observe_chunks(&pool, || {
+                        index
+                            .search_top_k_classified_cancellable(
+                                &cx,
+                                &query,
+                                23,
+                                Some(filter),
+                                params,
+                            )
+                            .unwrap()
+                            .hits
+                    });
+                    assert_same_hits(&actual, &reference);
+                    assert_eq!(chunks.iter().sum::<usize>(), selected);
+                    if let Some(chunk_size) = expected_chunk_size {
+                        assert_eq!(chunks.len(), selected.div_ceil(chunk_size));
+                        assert!(chunks.iter().all(|&size| size > 0 && size <= chunk_size));
+                    } else {
+                        assert_eq!(chunks, [selected]);
+                    }
+                }
+            }
+
+            // A gathered pool larger than the old fixed 1024-row threshold
+            // must still remain one sequential batch when parallelism is off.
+            let positions: Vec<_> = (0..index.record_count()).collect();
+            let reference = index.search_top_k(&query, 23, None).unwrap();
+            let (actual, chunks) = observe_chunks(&pool, || {
+                let heap = index
+                    .scan_gather_positions(&positions, &query, 23, None, &cx)
+                    .unwrap();
+                index.resolve_hits::<true>(heap, &cx).unwrap()
+            });
+            assert_same_hits(&actual, &reference);
+            assert_eq!(chunks, [positions.len()]);
+        }
+    }
+
+    #[test]
     fn cancellable_exact_checks_unfiltered_collect_all_and_gather_rows() {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
@@ -2642,7 +2811,13 @@ mod tests {
                         .gather_range(&positions, &[1.0, 0.0], 23, cancel)
                         .map(|_| ()),
                     "parallel-gather" => index
-                        .scan_gather_positions(&positions, &[1.0, 0.0], 23, cancel)
+                        .scan_gather_positions(
+                            &positions,
+                            &[1.0, 0.0],
+                            23,
+                            Some(PARALLEL_CHUNK_SIZE),
+                            cancel,
+                        )
                         .map(|_| ()),
                     "gather-positions" => index
                         .gather_positions_for_hashes(&hashes, cancel)
@@ -3758,7 +3933,13 @@ mod tests {
         assert_eq!(hit_ids(&classified.hits), ["negative"]);
         assert_eq!(classified.zero_signal, None);
         let cancellable = index
-            .search_top_k_classified_cancellable(&Cx::for_testing(), &[1.0, 0.0], 1, None)
+            .search_top_k_classified_cancellable(
+                &Cx::for_testing(),
+                &[1.0, 0.0],
+                1,
+                None,
+                SearchParams::default(),
+            )
             .unwrap();
         assert_eq!(cancellable.hits, classified.hits);
         assert_eq!(cancellable.zero_signal, classified.zero_signal);

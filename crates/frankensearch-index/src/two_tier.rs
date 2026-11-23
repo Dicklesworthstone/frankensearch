@@ -2029,6 +2029,8 @@ impl TwoTierIndex {
     /// the requested IDs are scored, exactly and without ANN truncation. Hits
     /// retain their fast physical or WAL ordinals; absent, deleted and unusable
     /// vectors contribute no observation. This does not mint retrieval coverage.
+    /// The request's scan policy also governs selective gathers, including
+    /// sequential-only execution and the parallel threshold and chunk size.
     ///
     /// # Errors
     /// Returns a typed identity, dimension, decode or cancellation error before
@@ -2038,6 +2040,7 @@ impl TwoTierIndex {
         cx: &Cx,
         query: &BoundQueryEmbedding,
         doc_ids: &[&str],
+        params: Option<SearchParams>,
     ) -> SearchResult<Vec<VectorHit>> {
         tier_checkpoint(cx, "fast_candidate_evidence")?;
         let index = self.fast_tier();
@@ -2057,7 +2060,13 @@ impl TwoTierIndex {
         // The gather allocates for matched rows, never the corpus-wide bound.
         let limit = index.record_count().saturating_add(index.wal_entries.len());
         Ok(index
-            .search_top_k_classified_cancellable(cx, query.vector(), limit, Some(&filter))?
+            .search_top_k_classified_cancellable(
+                cx,
+                query.vector(),
+                limit,
+                Some(&filter),
+                params.unwrap_or_default(),
+            )?
             .hits)
     }
 
@@ -4166,6 +4175,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn fast_candidate_evidence_is_complete_admitted_and_cancellable() {
         let dir = temp_index_dir("fast-candidate-evidence");
         fs::create_dir_all(&dir).unwrap();
@@ -4188,32 +4198,70 @@ mod tests {
             writer.write_record(id, &vector).unwrap();
         }
         writer.write_legacy_f16_zero_fixture("unusable");
+        // Keep the selected set below the real file-backed gather threshold.
+        for row in 0..300 {
+            writer
+                .write_record(&format!("unselected-{row}"), &[1.0, 0.0])
+                .unwrap();
+        }
         writer.finish().unwrap();
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
         let cx = Cx::for_testing();
         let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity.clone()).unwrap();
-        let hits = index
-            .fast_candidates_with_producer(
-                &cx,
-                &query,
-                &["b", "c", "negative", "missing", "unusable", "b"],
-            )
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
             .unwrap();
-        assert_eq!(
-            hits.iter()
-                .map(|hit| hit.doc_id.as_str())
-                .collect::<Vec<_>>(),
-            ["b", "c", "negative"]
-        );
-        assert_eq!(
-            hits.iter().map(|hit| hit.score).collect::<Vec<_>>(),
-            [1.0, 0.0, -1.0]
-        );
-        assert!(hits.iter().all(|hit| hit.index != u32::MAX));
+        for parallel in [None, Some(false), Some(true)] {
+            let params = parallel.map(|parallel_enabled| SearchParams {
+                parallel_enabled,
+                parallel_threshold: 0,
+                parallel_chunk_size: 1,
+            });
+            pool.broadcast(|_| {
+                crate::search::GATHER_SCAN_CHUNKS
+                    .with(|chunks| *chunks.borrow_mut() = Some(Vec::new()));
+            });
+            let hits = pool
+                .install(|| {
+                    index.fast_candidates_with_producer(
+                        &cx,
+                        &query,
+                        &["b", "c", "negative", "missing", "unusable", "b"],
+                        params,
+                    )
+                })
+                .unwrap();
+            let chunks: Vec<_> = pool
+                .broadcast(|_| {
+                    crate::search::GATHER_SCAN_CHUNKS
+                        .with(|chunks| chunks.borrow_mut().take().unwrap())
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["b", "c", "negative"]
+            );
+            assert_eq!(
+                hits.iter().map(|hit| hit.score).collect::<Vec<_>>(),
+                [1.0, 0.0, -1.0]
+            );
+            assert!(hits.iter().all(|hit| hit.index != u32::MAX));
+            assert_eq!(chunks.iter().sum::<usize>(), 5);
+            if parallel == Some(true) {
+                assert_eq!(chunks, [1; 5], "the evidence scan retains request chunking");
+            } else {
+                assert_eq!(chunks, [5], "the evidence scan stays sequential");
+            }
+        }
         let zero = BoundQueryEmbedding::new(vec![0.0, 0.0], identity).unwrap();
         assert!(
             index
-                .fast_candidates_with_producer(&cx, &zero, &["b"])
+                .fast_candidates_with_producer(&cx, &zero, &["b"], None)
                 .unwrap()
                 .is_empty()
         );
@@ -4223,13 +4271,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            index.fast_candidates_with_producer(&cx, &foreign, &[]),
+            index.fast_candidates_with_producer(&cx, &foreign, &[], None),
             Err(SearchError::InvalidConfig { field, .. })
                 if field == "search_activation.fast.producer_revision"
         ));
         cx.set_cancel_requested(true);
         assert!(matches!(
-            index.fast_candidates_with_producer(&cx, &query, &["b"]),
+            index.fast_candidates_with_producer(&cx, &query, &["b"], None),
             Err(SearchError::Cancelled { .. })
         ));
     }
