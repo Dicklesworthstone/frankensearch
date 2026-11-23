@@ -3140,6 +3140,7 @@ mod tests {
                                 assert!(batches.is_empty());
                                 assert_eq!(probe.single_calls.load(Ordering::SeqCst), inputs.len());
                             }
+                            drop(batches);
                             for (id, text) in &inputs {
                                 let row = entries
                                     .iter()
@@ -3320,6 +3321,7 @@ mod tests {
                                         && text != "replacement input"),
                                 "split retries must not infer a superseded attempt or its successor's input"
                             );
+                            drop(batches);
                             let successor = successor.borrow();
                             let claim = successor.as_ref().unwrap();
                             assert!(matches!(
