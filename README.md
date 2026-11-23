@@ -853,6 +853,24 @@ These operations preserve the original bundles and keep the existing complete
 store's identity and publication checks. The standalone `fsfs-recover` utility
 remains available with the same options and shared implementation.
 
+### Rebuild from source and replay a search
+
+If you still have the original files, use `--recover-source` to rebuild a
+cooperative complete-generation store and run the search against the validated
+replacement. Run it with an explicit store outside the source directory.
+
+```bash
+fsfs search "how do I retry transient network errors?" \
+  --recover-source ./documents --index-dir ./search-store --offline \
+  --filter path:retry.md --limit 1 --stream --format jsonl
+```
+
+The command uses installed models, previews the requested query with its
+filter and limit, and publishes only after the preview returns a valid hit.
+It then runs the requested search against that generation. A rejected preview
+leaves the selection intact. For intentional model downloads, add
+`--acquire-models --online` in place of `--offline`.
+
 ## Reproducible Showcase Suite
 
 Use this sequence to reproduce the core demo + benchmark evidence bundle:
@@ -1583,6 +1601,8 @@ reuse, default cold rebuilding, and independent source, producer, and artifact d
 The stage also exercises real-model recovery through `fsfs recover` and
 `fsfs-recover`. It checks quality-only rebuild and resume, and receipt-directed
 hybrid restoration followed by a fresh search with the source files unavailable.
+It also checks that `fsfs search --recover-source` preserves the selection on an
+empty preview and replays the original filtered stream after recovery.
 
 Select stages with `QUALITY_GATE_STAGES=fmt,check,clippy,tests`. The full Linux
 CLI suite uses all four models above. `scripts/rch-ensure-deps.sh --models-only`

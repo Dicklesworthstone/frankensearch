@@ -1,5 +1,5 @@
 //! Fresh-process recovery command tests. Container durability tests require no
-//! model; the ignored semantic workflow requires explicitly supplied real models.
+//! model; the ignored semantic workflows require explicitly supplied real models.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
@@ -1094,4 +1094,166 @@ fn genuine_models_preview_restore_and_fresh_search_without_source_files() {
     assert_eq!(fs::read(&pointer).unwrap(), selected);
     assert_eq!(files(&old_root), old_bytes);
     assert_eq!(files(&new_root), new_bytes);
+}
+
+#[cfg(all(feature = "semantic-loaders", not(feature = "embedded-models")))]
+#[test]
+#[ignore = "requires FRANKENSEARCH_RECOVERY_E2E_MODEL_DIR with verified Potion and MiniLM models"]
+fn genuine_search_recovery_validates_and_replays_the_original_stream() {
+    let models = std::env::var_os("FRANKENSEARCH_RECOVERY_E2E_MODEL_DIR")
+        .expect("provide the verified real-model cache");
+    let models = fs::canonicalize(models).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let store = directory.path().join("store");
+    fs::create_dir(&source).unwrap();
+    let alpha = source.join("alpha.md");
+    fs::write(
+        &alpha,
+        "Retry transient requests with jitter and exponential backoff.",
+    )
+    .unwrap();
+    fs::write(
+        source.join("beta.md"),
+        "Growing tomatoes calls for a sunny garden and consistent watering.",
+    )
+    .unwrap();
+
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("FRANKENSEARCH_") || name.starts_with("FSFS_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .current_dir(directory.path())
+            .env("HOME", directory.path())
+            .env("XDG_CONFIG_HOME", directory.path().join("empty-config"))
+            .env("FRANKENSEARCH_MODEL_DIR", &models)
+            .env("FRANKENSEARCH_COMPLETE_GENERATIONS", "1")
+            .env("FRANKENSEARCH_GENERATION_RETENTION", "off")
+            .env("FRANKENSEARCH_SEARCH_QUALITY_TIMEOUT_MS", "10000");
+        command
+    };
+    let mut index = command();
+    index
+        .arg("index")
+        .arg(&source)
+        .arg("--index-dir")
+        .arg(&store)
+        .args(["--offline", "--format", "json", "--quiet"]);
+    let output = run(&mut index, directory.path(), Duration::from_secs(180));
+    assert!(output.status.success(), "{output:?}");
+    let indexed = body(&output);
+    let predecessor = Path::new(indexed["data"]["generation_path"].as_str().unwrap());
+    let predecessor_bytes = files(predecessor);
+    let pointer = store.join(COMPLETE_GENERATION_POINTER);
+    let incumbent = fs::read(&pointer).unwrap();
+    fs::write(
+        &alpha,
+        "Retry transient requests with jitter and exponential backoff. sourceupdatedtoken.",
+    )
+    .unwrap();
+
+    let query = "how do I retry transient requests with jittered backoff";
+    let search = |filter: &str| {
+        let mut command = command();
+        command
+            .args(["search", query, "--index-dir"])
+            .arg(&store)
+            .args([
+                "--offline",
+                "--no-daemon",
+                "--no-rerank",
+                "--stream",
+                "--format",
+                "jsonl",
+                "--quiet",
+                "--limit",
+                "1",
+                "--filter",
+                filter,
+            ]);
+        command
+    };
+    let frames = |output: &Output| {
+        std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let mut rejected = search("path:missing.md");
+    rejected.arg("--recover-source").arg(&source);
+    let output = run(&mut rejected, directory.path(), Duration::from_secs(180));
+    assert!(!output.status.success(), "{output:?}");
+    let denied = frames(&output);
+    assert_eq!(denied.len(), 2, "{denied:?}");
+    assert_eq!(denied[0]["event"], "started");
+    assert_eq!(denied[1]["event"], "terminal");
+    assert_eq!(denied[1]["payload"]["status"], "failed");
+    assert_eq!(denied[1]["payload"]["error"]["code"], "invalid_config");
+    assert_eq!(fs::read(&pointer).unwrap(), incumbent);
+    assert_eq!(files(predecessor), predecessor_bytes);
+
+    fs::write(&pointer, b"unreadable selection").unwrap();
+    let mut recover_search = search("path:alpha.md");
+    recover_search.arg("--recover-source").arg(&source);
+    let output = run(
+        &mut recover_search,
+        directory.path(),
+        Duration::from_secs(180),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let recovered = frames(&output);
+    let events: Vec<_> = recovered
+        .iter()
+        .map(|frame| frame["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "started", "progress", "result", "progress", "result", "terminal"
+        ]
+    );
+    assert_eq!(recovered[0]["payload"]["query"], query);
+    assert_eq!(recovered[0]["payload"]["semantic_admitted"], true);
+    assert_eq!(recovered[1]["payload"]["stage"], "retrieve.fast");
+    assert_eq!(recovered[3]["payload"]["stage"], "retrieve.quality");
+    assert_eq!(recovered[5]["payload"]["status"], "completed");
+    assert_eq!(recovered[5]["payload"]["exit_code"], 0);
+    for result in [&recovered[2], &recovered[4]] {
+        let item = &result["payload"]["item"];
+        assert_eq!(result["payload"]["rank"], 1);
+        assert_eq!(item["path"], "alpha.md");
+        assert_eq!(item["lexical_rank"], 0);
+        assert_eq!(item["semantic_rank"], 0);
+        assert!(
+            item["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("sourceupdatedtoken")
+        );
+    }
+
+    let selected = fs::read(&pointer).unwrap();
+    assert_ne!(selected, incumbent);
+    assert_ne!(selected, b"unreadable selection");
+    fs::rename(&source, directory.path().join("source-unavailable")).unwrap();
+    let output = run(
+        &mut search("path:alpha.md"),
+        directory.path(),
+        Duration::from_secs(180),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let reopened = frames(&output);
+    assert_eq!(reopened.len(), recovered.len());
+    for index in [1, 2, 3, 4, 5] {
+        assert_eq!(reopened[index]["event"], recovered[index]["event"]);
+        assert_eq!(reopened[index]["payload"], recovered[index]["payload"]);
+    }
+    assert_eq!(fs::read(&pointer).unwrap(), selected);
+    assert_eq!(files(predecessor), predecessor_bytes);
 }
