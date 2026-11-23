@@ -4,8 +4,8 @@
 //! Fusion/ranking algorithms (e.g. query-biased `PageRank`) are implemented
 //! in higher-level crates when graph features are enabled.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,10 +48,49 @@ impl GraphEdge {
 /// `DocumentGraph` is intentionally lightweight and does not enforce
 /// graph-theory invariants beyond stable node counting and deterministic
 /// upsert behavior for identical `(neighbor, edge_type)` edges.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// Deserialization restores every referenced endpoint and recomputes the
+/// cached node count, while preserving the serialized adjacency lists.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DocumentGraph {
     adjacency: HashMap<GraphDocId, Vec<GraphEdge>>,
     node_count: usize,
+}
+
+impl<'de> Deserialize<'de> for DocumentGraph {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Keep both the named and sequential serde representations unchanged.
+        // The stored count is a cache, not authority for the imported node set.
+        #[derive(Deserialize)]
+        #[serde(rename = "DocumentGraph")]
+        struct Fields {
+            adjacency: HashMap<GraphDocId, Vec<GraphEdge>>,
+            #[serde(rename = "node_count")]
+            _node_count: usize,
+        }
+
+        let Fields { mut adjacency, .. } = Fields::deserialize(deserializer)?;
+        // Rankers dense-index adjacency keys, so sinks referenced only by an
+        // edge must become explicit keys just as they do through add_edge().
+        // Deduplicate borrowed IDs before cloning: many edges may share a sink.
+        let missing_nodes: HashSet<&str> = adjacency
+            .values()
+            .flatten()
+            .map(|edge| edge.neighbor_doc_id.as_str())
+            .filter(|id| !adjacency.contains_key(*id))
+            .collect();
+        let missing_nodes: Vec<GraphDocId> = missing_nodes.into_iter().map(str::to_owned).collect();
+        for doc_id in missing_nodes {
+            adjacency.entry(doc_id).or_default();
+        }
+
+        Ok(Self {
+            node_count: adjacency.len(),
+            adjacency,
+        })
+    }
 }
 
 impl DocumentGraph {
@@ -216,11 +255,133 @@ mod tests {
 
         let encoded = serde_json::to_string(&graph).expect("serialize graph");
         let decoded: DocumentGraph = serde_json::from_str(&encoded).expect("deserialize graph");
+        assert_eq!(decoded, graph);
         let neighbors = decoded.neighbors("doc-a");
         assert_eq!(neighbors.len(), 1);
         assert_eq!(
             neighbors[0].edge_type,
             EdgeType::Custom("semantic_link".to_string())
         );
+    }
+
+    #[test]
+    fn deserialize_recomputes_stale_node_counts() {
+        for stored_count in [0, 1, 3, usize::MAX] {
+            let encoded = serde_json::json!({
+                "adjacency": {
+                    "doc-a": [{
+                        "neighbor_doc_id": "doc-b",
+                        "edge_type": "reference",
+                        "weight": 1.0
+                    }],
+                    "doc-b": []
+                },
+                "node_count": stored_count
+            });
+            let graph: DocumentGraph = serde_json::from_value(encoded).expect("import graph");
+
+            assert_eq!(graph.node_count(), 2);
+            assert!(!graph.is_empty());
+            assert_eq!(graph.edge_count(), 1);
+            assert!(graph.contains_node("doc-a"));
+            assert!(graph.contains_node("doc-b"));
+            assert_eq!(
+                serde_json::to_value(&graph).expect("serialize repaired graph")["node_count"],
+                2,
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_restores_shared_endpoints_and_preserves_mutation_invariants() {
+        let encoded = serde_json::json!({
+            "adjacency": {
+                "doc-a": [
+                    {"neighbor_doc_id": "sink", "edge_type": "reference", "weight": 1.0},
+                    {"neighbor_doc_id": "sink", "edge_type": "similar", "weight": 0.5},
+                    {"neighbor_doc_id": "doc-a", "edge_type": "thread_reply", "weight": 0.25}
+                ],
+                "doc-b": [
+                    {"neighbor_doc_id": "sink", "edge_type": "import", "weight": 0.75}
+                ],
+                "isolated": []
+            },
+            "node_count": 3
+        });
+        let mut graph: DocumentGraph = serde_json::from_value(encoded).expect("import graph");
+        let mut expected = DocumentGraph::new();
+        expected.add_edge("doc-a", "sink", EdgeType::Reference, 1.0);
+        expected.add_edge("doc-a", "sink", EdgeType::Similar, 0.5);
+        expected.add_edge("doc-a", "doc-a", EdgeType::ThreadReply, 0.25);
+        expected.add_edge("doc-b", "sink", EdgeType::Import, 0.75);
+        expected.add_node("isolated");
+
+        assert_eq!(graph, expected);
+        assert_eq!(graph.node_count(), 4);
+        assert_eq!(graph.edge_count(), 4);
+        assert!(graph.contains_node("sink"));
+        assert!(graph.neighbors("sink").is_empty());
+        let repaired = serde_json::to_value(&graph).expect("serialize repaired graph");
+        assert_eq!(repaired["node_count"], 4);
+        assert_eq!(repaired["adjacency"]["sink"], serde_json::json!([]));
+        assert_eq!(
+            serde_json::from_value::<DocumentGraph>(repaired).expect("reopen repaired graph"),
+            graph,
+        );
+
+        graph.add_node("sink");
+        assert_eq!(graph.node_count(), 4);
+        graph.add_edge("sink", "new-doc", EdgeType::Reference, 1.0);
+        assert_eq!(graph.node_count(), 5);
+        graph.add_edge("sink", "new-doc", EdgeType::Reference, 0.5);
+        assert_eq!(graph.node_count(), 5);
+        assert_eq!(graph.edge_count(), 5);
+        assert!((graph.neighbors("sink")[0].weight - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn deserialize_empty_graph_discards_stale_nonzero_count() {
+        let graph: DocumentGraph = serde_json::from_value(serde_json::json!({
+            "adjacency": {},
+            "node_count": 42
+        }))
+        .expect("import empty graph");
+
+        assert!(graph.is_empty());
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(graph.edge_count(), 0);
+        assert_eq!(graph, DocumentGraph::new());
+    }
+
+    #[test]
+    fn deserialize_preserves_sequence_wire_representation() {
+        let graph: DocumentGraph = serde_json::from_value(serde_json::json!([
+            {"doc-a": []},
+            1
+        ]))
+        .expect("deserialize the original two-field sequence");
+
+        assert_eq!(graph.node_count(), 1);
+        assert!(graph.contains_node("doc-a"));
+        assert_eq!(
+            serde_json::to_value(&graph).expect("serialize named fields"),
+            serde_json::json!({"adjacency": {"doc-a": []}, "node_count": 1}),
+        );
+    }
+
+    #[test]
+    fn deserialize_preserves_required_field_and_edge_validation() {
+        for encoded in [
+            serde_json::json!({"adjacency": {}}),
+            serde_json::json!({"node_count": 0}),
+            serde_json::json!({"adjacency": {}, "node_count": -1}),
+            serde_json::json!({"adjacency": {"doc-a": {}}, "node_count": 1}),
+            serde_json::json!({
+                "adjacency": {"doc-a": [{"edge_type": "reference", "weight": 1.0}]},
+                "node_count": 1
+            }),
+        ] {
+            assert!(serde_json::from_value::<DocumentGraph>(encoded).is_err());
+        }
     }
 }
