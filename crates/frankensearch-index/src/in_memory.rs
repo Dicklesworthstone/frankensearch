@@ -105,6 +105,10 @@ std::thread_local! {
     /// Independent seam for allocation of the query suffix envelopes.
     static FAIL_NEXT_RESIDUAL_QUERY_SUFFIX_ALLOCATION: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Observe actual gathered scoring work only in a test-owned Rayon pool.
+    /// Other tests and production searches retain no per-query history.
+    static GATHER_SCAN_CHUNKS: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2752,7 +2756,9 @@ impl InMemoryVectorIndex {
         // Selective hash-addressable filter → gather the allow-set and exact-scan
         // only those positions (work ∝ |allow-set|, not corpus N). Bit-identical to
         // the per-document scan below.
-        if let Some(hits) = self.try_gather_filtered(query, limit, filter, count)? {
+        if let Some(hits) =
+            self.try_gather_filtered_with_params(query, limit, filter, count, params)?
+        {
             return Ok(hits);
         }
 
@@ -3418,8 +3424,9 @@ impl InMemoryVectorIndex {
     }
 
     /// Exact f16 top-k over an explicit list of candidate positions (the
-    /// selective-filter gather fast-path). Parallel above `PARALLEL_CHUNK_SIZE`
-    /// positions, serial below (tiny allow-sets don't amortize rayon overhead). The
+    /// selective-filter gather fast-path). The caller applies the corpus-size
+    /// threshold and supplies a chunk size only when parallel work is permitted.
+    /// A single gathered chunk stays serial to avoid Rayon overhead. The
     /// parallel path scans disjoint position chunks into per-chunk bounded heaps and
     /// merges by the `(score, index)` total order — order-independent, exactly like
     /// [`Self::scan_parallel`] — so it is bit-identical to the serial gather, to the
@@ -3429,10 +3436,11 @@ impl InMemoryVectorIndex {
         positions: &[usize],
         query: &[f32],
         limit: usize,
+        parallel_chunk_size: Option<usize>,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
-        if positions.len() > PARALLEL_CHUNK_SIZE {
+        if let Some(chunk_size) = parallel_chunk_size.filter(|&size| positions.len() > size) {
             let partials: SearchResult<Vec<BinaryHeap<HeapEntry>>> = positions
-                .par_chunks(PARALLEL_CHUNK_SIZE)
+                .par_chunks(chunk_size)
                 .map(|chunk| self.gather_range(chunk, query, limit))
                 .collect();
             return merge_partial_heaps(partials?, limit);
@@ -3449,6 +3457,12 @@ impl InMemoryVectorIndex {
         query: &[f32],
         limit: usize,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        #[cfg(test)]
+        GATHER_SCAN_CHUNKS.with(|observation| {
+            if let Some(chunks) = observation.borrow_mut().as_mut() {
+                chunks.push(positions.len());
+            }
+        });
         let mut heap = bounded_heap(limit.min(positions.len()), "gather_heap")?;
         let mut cutoff = f32::NEG_INFINITY;
         for &index in positions {
@@ -3480,9 +3494,22 @@ impl InMemoryVectorIndex {
         filter: Option<&dyn SearchFilter>,
         count: usize,
     ) -> SearchResult<Option<Vec<VectorHit>>> {
+        self.try_gather_filtered_with_params(query, limit, filter, count, SearchParams::default())
+    }
+
+    fn try_gather_filtered_with_params(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        count: usize,
+        params: SearchParams,
+    ) -> SearchResult<Option<Vec<VectorHit>>> {
         let Some(f) = filter else {
             return Ok(None);
         };
+        let parallel_chunk_size = (params.parallel_enabled && count >= params.parallel_threshold)
+            .then_some(params.parallel_chunk_size.max(1));
         if let Some(ids) = f.candidate_doc_ids()
             && ids.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) < count
         {
@@ -3510,7 +3537,7 @@ impl InMemoryVectorIndex {
                 }
             }
             positions.sort_unstable();
-            let heap = self.scan_gather(&positions, query, limit)?;
+            let heap = self.scan_gather(&positions, query, limit, parallel_chunk_size)?;
             return Ok(Some(self.resolve_heap(heap)?));
         }
         let Some(allowed) = f.candidate_hashes() else {
@@ -3530,7 +3557,7 @@ impl InMemoryVectorIndex {
         // Ascending position order → sequential slab access (cache-friendly); not
         // required for correctness (the heap's total order is position-independent).
         positions.sort_unstable();
-        let heap = self.scan_gather(&positions, query, limit)?;
+        let heap = self.scan_gather(&positions, query, limit, parallel_chunk_size)?;
         Ok(Some(self.resolve_heap(heap)?))
     }
 
@@ -3575,7 +3602,7 @@ impl InMemoryVectorIndex {
         let mut positions: Vec<usize> =
             allowed.iter().filter_map(|h| map.get(h).copied()).collect();
         positions.sort_unstable();
-        let heap = self.scan_gather(&positions, query, limit)?;
+        let heap = self.scan_gather(&positions, query, limit, Some(PARALLEL_CHUNK_SIZE))?;
         self.resolve_heap(heap)
     }
 
@@ -6158,6 +6185,143 @@ mod tests {
                 .unwrap());
             let gather = ids(index.bench_gather_filtered(&query, 25, &filter).unwrap());
             assert_eq!(gather, scan, "parallel gather != scan (qseed={qseed})");
+        }
+    }
+
+    #[test]
+    fn selective_gather_obeys_parallel_policy_and_preserves_exact_results() {
+        use frankensearch_core::{BitsetFilter, IncludeDocIdsFilter, PredicateFilter};
+
+        fn observe_chunks(
+            pool: &rayon::ThreadPool,
+            search: impl FnOnce() -> Vec<VectorHit> + Send,
+        ) -> (Vec<(String, u32, u32)>, Vec<usize>) {
+            pool.broadcast(|_| {
+                GATHER_SCAN_CHUNKS.with(|chunks| *chunks.borrow_mut() = Some(Vec::new()));
+            });
+            let hits = pool.install(search);
+            let chunks = pool
+                .broadcast(|_| {
+                    GATHER_SCAN_CHUNKS.with(|chunks| chunks.borrow_mut().take().unwrap())
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+            let fingerprint = hits
+                .into_iter()
+                .map(|hit| (hit.doc_id.to_string(), hit.index, hit.score.to_bits()))
+                .collect();
+            (fingerprint, chunks)
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let selected = PARALLEL_CHUNK_SIZE * 2 + 1;
+        let count = selected * GATHER_SELECTIVITY_DIVISOR + 1;
+        let query = make_normalized_vec(8, 17.0);
+        for duplicate in [false, true] {
+            let mut ids: Vec<_> = (0..count).map(|i| format!("doc-{i:05}")).collect();
+            let mut vectors: Vec<_> = (0..count)
+                .map(|i| make_normalized_vec(8, i as f32))
+                .collect();
+            let allowed: HashSet<_> = ids[..selected].iter().cloned().collect();
+            let exact = IncludeDocIdsFilter::new(allowed.iter().cloned());
+            let hashed = BitsetFilter::from_doc_ids(allowed.iter().cloned());
+            let predicate =
+                PredicateFilter::new("selected-row-reference", move |id| allowed.contains(id));
+            if duplicate {
+                ids.push(ids[17].clone());
+                vectors.push(vectors[17].clone());
+            }
+            let index = InMemoryVectorIndex::from_vectors(ids, vectors, 8).unwrap();
+            let sequential = SearchParams {
+                parallel_enabled: false,
+                parallel_threshold: 0,
+                parallel_chunk_size: 73,
+            };
+            let (reference, chunks) = observe_chunks(&pool, || {
+                index
+                    .search_top_k_with_params(&query, 17, Some(&predicate), sequential)
+                    .unwrap()
+            });
+            assert!(
+                chunks.is_empty(),
+                "the oracle must use the full predicate scan"
+            );
+            let gathered_rows = selected + usize::from(duplicate);
+            for (hash_only, filter) in [
+                (false, &exact as &dyn SearchFilter),
+                (true, &hashed as &dyn SearchFilter),
+            ] {
+                // Hash collisions/duplicate IDs deliberately disable hash-only
+                // gathers. Exact identities still gather every physical copy.
+                if duplicate && hash_only {
+                    continue;
+                }
+                for (params, expected_chunk_size) in [
+                    (sequential, None),
+                    (
+                        SearchParams {
+                            parallel_enabled: true,
+                            parallel_threshold: usize::MAX,
+                            ..sequential
+                        },
+                        None,
+                    ),
+                    (
+                        SearchParams {
+                            parallel_enabled: true,
+                            ..sequential
+                        },
+                        Some(73),
+                    ),
+                    (
+                        SearchParams {
+                            parallel_enabled: true,
+                            parallel_chunk_size: 0,
+                            ..sequential
+                        },
+                        Some(1),
+                    ),
+                    (
+                        SearchParams {
+                            parallel_enabled: true,
+                            parallel_chunk_size: gathered_rows + 1,
+                            ..sequential
+                        },
+                        None,
+                    ),
+                ] {
+                    let (actual, chunks) = observe_chunks(&pool, || {
+                        index
+                            .search_top_k_with_params(&query, 17, Some(filter), params)
+                            .unwrap()
+                    });
+                    assert_eq!(
+                        actual, reference,
+                        "gather must preserve scores and row ties"
+                    );
+                    assert_eq!(chunks.iter().sum::<usize>(), gathered_rows);
+                    if let Some(chunk_size) = expected_chunk_size {
+                        assert_eq!(chunks.len(), gathered_rows.div_ceil(chunk_size));
+                        assert!(chunks.iter().all(|&size| size > 0 && size <= chunk_size));
+                    } else {
+                        assert_eq!(chunks, [gathered_rows]);
+                    }
+                }
+
+                let (default, chunks) = observe_chunks(&pool, || {
+                    index.search_top_k(&query, 17, Some(filter)).unwrap()
+                });
+                assert_eq!(default, reference);
+                if SearchParams::default().parallel_enabled {
+                    assert_eq!(chunks.len(), gathered_rows.div_ceil(PARALLEL_CHUNK_SIZE));
+                } else {
+                    assert_eq!(chunks, [gathered_rows]);
+                }
+            }
         }
     }
 

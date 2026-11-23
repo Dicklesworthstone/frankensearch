@@ -476,7 +476,8 @@ impl SyncTwoTierSearcher {
         self
     }
 
-    /// Override brute-force parallel search for fast and direct quality-only retrieval.
+    /// Override exact-scan parallelism for fast and quality retrieval, including
+    /// progressive refinement, filtered refills, and missing candidate evidence.
     #[must_use]
     pub const fn with_search_params(mut self, params: SearchParams) -> Self {
         self.search_params = Some(params);
@@ -1341,7 +1342,12 @@ impl SyncTwoTierSearcher {
                 quality_index.record_count(),
                 filter,
                 |limit, candidates| {
-                    quality_index.search_top_k_classified(quality_query.vector(), limit, candidates)
+                    quality_index.search_top_k_classified_with_params(
+                        quality_query.vector(),
+                        limit,
+                        candidates,
+                        self.search_params.unwrap_or_default(),
+                    )
                 },
             )
             .and_then(|ClassifiedHits { mut hits, .. }| {
@@ -1369,10 +1375,11 @@ impl SyncTwoTierSearcher {
                     // gather scores only the selected candidate union.
                     refined_fast_hits.extend(
                         fast_index
-                            .search_top_k_classified(
+                            .search_top_k_classified_with_params(
                                 fast_query.vector(),
                                 fast_index.record_count(),
                                 Some(&candidates),
+                                self.search_params.unwrap_or_default(),
                             )?
                             .hits,
                     );
@@ -2714,6 +2721,138 @@ mod tests {
                 assert_eq!(filtered[0].fast_score, None);
                 assert!(metrics.coverage.is_none(), "v1 does not mint v2 coverage");
                 assert!(metrics.zero_signal.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn progressive_quality_scan_obeys_explicit_parallel_policy() {
+        struct ObserveQualityScan {
+            caller: std::thread::ThreadId,
+            caller_visits: AtomicUsize,
+            worker_visits: AtomicUsize,
+            exclude_b: bool,
+        }
+
+        impl SearchFilter for ObserveQualityScan {
+            fn matches(&self, doc_id: &str, _: Option<&serde_json::Value>) -> bool {
+                // Only the quality owner contains b/c. Observing their scan
+                // proves where refinement executes without counting Initial
+                // or the exact evidence lookup for the retained fast row.
+                if doc_id != "a" {
+                    let visits = if std::thread::current().id() == self.caller {
+                        &self.caller_visits
+                    } else {
+                        &self.worker_visits
+                    };
+                    visits.fetch_add(1, Ordering::Relaxed);
+                }
+                !(self.exclude_b && doc_id == "b")
+            }
+
+            fn name(&self) -> &'static str {
+                "observe-quality-scan"
+            }
+        }
+
+        for attested in [false, true] {
+            let directory = temp_dir("sync-quality-scan-policy");
+            let (index, fast, quality) = if attested {
+                let (fast, fast_identity) = attested_tier(
+                    directory.path(),
+                    "fast.fsvi",
+                    "persisted-fast",
+                    1,
+                    &[("a", &[0.6, 0.8])],
+                );
+                let (quality, quality_identity) = attested_tier(
+                    directory.path(),
+                    "quality.fsvi",
+                    "persisted-quality",
+                    1,
+                    &[
+                        ("a", &[0.0, 0.0, 1.0]),
+                        ("b", &[1.0, 0.0, 0.0]),
+                        ("c", &[0.8, 0.6, 0.0]),
+                    ],
+                );
+                (
+                    InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap(),
+                    fast_identity,
+                    quality_identity,
+                )
+            } else {
+                let (fast, quality) = persisted_producer_pair(directory.path());
+                (
+                    InMemoryTwoTierIndex::from_dir(directory.path()).unwrap(),
+                    fast,
+                    quality,
+                )
+            };
+            let index = Arc::new(index);
+            let query = TieredQueryEmbeddings::progressive(
+                BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+                BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+            );
+            for exclude_b in [false, true] {
+                let mut expected_results = None;
+                for parallel in [None, Some(false), Some(true)] {
+                    let mut searcher = SyncTwoTierSearcher::new(
+                        Arc::clone(&index),
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            quality_weight: 1.0,
+                            explain: true,
+                            ..TwoTierConfig::default()
+                        },
+                    );
+                    if let Some(parallel_enabled) = parallel {
+                        searcher = searcher.with_search_params(SearchParams {
+                            parallel_enabled,
+                            parallel_threshold: 0,
+                            parallel_chunk_size: 1,
+                        });
+                    }
+                    let observed = ObserveQualityScan {
+                        caller: std::thread::current().id(),
+                        caller_visits: AtomicUsize::new(0),
+                        worker_visits: AtomicUsize::new(0),
+                        exclude_b,
+                    };
+                    let mut phases = searcher.search_iter_with_filter(&query, 1, Some(&observed));
+                    let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+                        panic!("Initial must precede independent quality work");
+                    };
+                    assert_eq!(results[0].doc_id, "a");
+                    assert_eq!(observed.caller_visits.load(Ordering::Relaxed), 0);
+                    assert_eq!(observed.worker_visits.load(Ordering::Relaxed), 0);
+                    let Some(SearchPhase::Refined { results, .. }) = phases.next() else {
+                        panic!("independent quality retrieval must refine Initial");
+                    };
+                    assert_eq!(results[0].doc_id, if exclude_b { "c" } else { "b" });
+                    assert!(results[0].fast_score.is_none());
+                    assert!(results[0].quality_score.is_some());
+                    assert!(results[0].index.is_none());
+                    assert!(phases.next().is_none());
+                    if parallel == Some(true) {
+                        assert_eq!(observed.caller_visits.load(Ordering::Relaxed), 0);
+                        assert!(observed.worker_visits.load(Ordering::Relaxed) > 0);
+                    } else {
+                        assert!(observed.caller_visits.load(Ordering::Relaxed) > 0);
+                        assert_eq!(observed.worker_visits.load(Ordering::Relaxed), 0);
+                    }
+                    let serialized = serde_json::to_value(&results).unwrap();
+                    assert_eq!(
+                        *expected_results.get_or_insert_with(|| serialized.clone()),
+                        serialized
+                    );
+                    let (collected, metrics) = searcher
+                        .search_collect_with_filter(&query, 1, Some(&observed))
+                        .unwrap();
+                    assert_eq!(serde_json::to_value(collected).unwrap(), serialized);
+                    assert_eq!(metrics.phase2_vectors_searched, 2);
+                    assert_eq!(metrics.incomplete_embeddings, 0);
+                }
             }
         }
     }
@@ -6143,7 +6282,9 @@ mod tests {
             BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
         );
         let filter = DocTypeFilter::new(["keep"]);
-        for enabled in [false, true] {
+        for (enabled, parallel_enabled) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let lexical = Arc::new(CancellingQualityMetadata {
                 cancellations: AtomicUsize::new(0),
             });
@@ -6155,6 +6296,11 @@ mod tests {
                 },
             )
             .with_lexical(lexical.clone())
+            .with_search_params(SearchParams {
+                parallel_enabled,
+                parallel_threshold: 0,
+                parallel_chunk_size: 1,
+            })
             .with_mmr_config(MmrConfig {
                 enabled,
                 candidate_pool: 2,
