@@ -10,12 +10,22 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use frankensearch_fsfs::generation_store::COMPLETE_GENERATION_POINTER;
 use frankensearch_fsfs::{FsCategory, FsfsConfig, MountTable, read_system_mounts};
 use serde_json::Value;
+
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // A failed assertion must not leave an owned query daemon behind.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -337,6 +347,100 @@ fn named_socket_refusal_keeps_search_off_the_direct_route() {
         assert_eq!(terminal["error"]["code"], "invalid_config");
         assert_eq!(terminal["error"]["field"], field);
         assert!(!socket.exists());
+    }
+}
+
+#[test]
+fn named_stop_only_stops_the_selected_query_daemon() {
+    for (layout, missing_field) in [
+        ("0", "cli.daemon_socket"),
+        ("1", "complete_generation.daemon_stop"),
+    ] {
+        let fixture = Fixture::new();
+        let command = |name| {
+            let mut command = fixture.lexical_discovery_command(name);
+            command.env("FRANKENSEARCH_COMPLETE_GENERATIONS", layout);
+            command
+        };
+        let indexed = execute(&mut command("index"));
+        assert_eq!(json_output(&indexed, true)["data"]["indexed_files"], 1);
+        assert_eq!(
+            fixture.store.join(COMPLETE_GENERATION_POINTER).exists(),
+            layout == "1"
+        );
+        let direct = json_output(&execute(command("search").arg("--no-daemon")), true);
+        let hits = &direct["data"]["hits"];
+        assert_eq!(hits[0]["path"], "alpha.md");
+
+        let sockets = tempfile::tempdir_in("/tmp").expect("short Unix socket directory");
+        let selected = sockets.path().join("selected.sock");
+        let other = sockets.path().join("other.sock");
+        let search = |socket: &Path| {
+            json_output(
+                &execute(command("search").arg("--daemon-socket").arg(socket)),
+                true,
+            )
+        };
+        let serve = |socket: &Path| {
+            let mut daemon = Daemon(
+                command("serve")
+                    .args(["--daemon", "--idle-timeout-ms", "60000", "--daemon-socket"])
+                    .arg(socket)
+                    .stdin(Stdio::null())
+                    .spawn()
+                    .expect("start query daemon"),
+            );
+            let started = Instant::now();
+            while !socket.exists() {
+                let status = daemon.0.try_wait().unwrap();
+                assert!(status.is_none() && started.elapsed() < Duration::from_secs(20));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(&search(socket)["data"]["hits"], hits);
+            daemon
+        };
+        let mut selected_daemon = serve(&selected);
+        let mut other_daemon = serve(&other);
+
+        // A named stop must bypass the legacy compactor's state entirely.
+        let pid_file = fixture.store.join("daemon.pid");
+        let unrelated_pid = b"not a compaction daemon PID receipt";
+        fs::write(&pid_file, unrelated_pid).unwrap();
+        let stop = |socket: &Path| {
+            execute(
+                command("daemon")
+                    .args(["--stop", "--daemon-socket"])
+                    .arg(socket),
+            )
+        };
+        let stop_and_wait = |daemon: &mut Daemon, socket: &Path| {
+            let stopped = stop(socket);
+            assert!(stopped.status.success(), "{stopped:?}");
+            let receipt: Value = serde_json::from_slice(&stopped.stdout).unwrap();
+            assert_eq!(receipt["stopped"], true);
+            assert_eq!(receipt["socket"], socket.to_str().unwrap());
+            let started = Instant::now();
+            loop {
+                if let Some(status) = daemon.0.try_wait().unwrap() {
+                    assert!(status.success(), "{status:?}");
+                    break;
+                }
+                assert!(started.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!socket.exists());
+        };
+        stop_and_wait(&mut selected_daemon, &selected);
+        let missing = stop(&selected);
+        assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+        assert_eq!(
+            json_output(&missing, false)["error"]["field"],
+            missing_field
+        );
+        assert_eq!(fs::read(&pid_file).unwrap(), unrelated_pid);
+        assert!(other_daemon.0.try_wait().unwrap().is_none());
+        assert_eq!(&search(&other)["data"]["hits"], hits);
+        stop_and_wait(&mut other_daemon, &other);
     }
 }
 
@@ -1209,16 +1313,6 @@ fn complete_cli_binary_exclusion_only_named_daemon_needs_no_models() {
     use frankensearch_fsfs::stream_protocol::{
         StreamEvent, StreamFrame, StreamTerminalStatus, decode_stream_frame_ndjson,
     };
-    use std::process::{Child, Stdio};
-
-    struct Daemon(Child);
-    impl Drop for Daemon {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
     let fixture = exclusion_only_fixture();
     let selection = fs::read(fixture.store.join(COMPLETE_GENERATION_POINTER)).unwrap();
     let socket_root = tempfile::tempdir_in("/tmp").expect("short Unix socket directory");
@@ -1404,18 +1498,6 @@ fn named_daemon_refusal_preserves_public_error_in_stream_terminal() {
         StreamTerminalStatus, TOON_STREAM_RECORD_SEPARATOR, decode_stream_frame_ndjson,
         decode_stream_frame_toon, validate_stream_frame,
     };
-    use std::process::{Child, Stdio};
-
-    struct Daemon(Child);
-    impl Drop for Daemon {
-        fn drop(&mut self) {
-            // This guard owns exactly the foreground process spawned below.
-            // A failed assertion must not leave a query daemon behind.
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
     let frames = |output: &Output, format: &str, expected_query: &str| -> Vec<StreamFrame<Value>> {
         let text = std::str::from_utf8(&output.stdout).expect("UTF-8 stream");
         let frames = if format == "jsonl" {

@@ -676,8 +676,8 @@ where
                 idx += 1;
             }
             "--daemon-socket" => {
-                // `daemon` takes it for a complete-generation store, whose
-                // query daemon it is (start, and `--stop`).
+                // A named `daemon --stop` targets a query daemon. The runtime
+                // checks the store layout when starting a named daemon.
                 if !matches!(
                     command,
                     CliCommand::Search | CliCommand::Serve | CliCommand::Daemon

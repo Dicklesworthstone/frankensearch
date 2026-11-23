@@ -19128,8 +19128,12 @@ impl FsfsRuntime {
     /// compaction to merge them into the main index, keeping search
     /// results fresh without manual intervention.
     async fn run_daemon_command(&self, cx: &Cx) -> SearchResult<()> {
-        // `--daemon-socket` names a complete-generation store's query daemon;
-        // this legacy compaction daemon has no socket.
+        #[cfg(unix)]
+        if self.cli_input.daemon_stop
+            && let Some(socket) = self.cli_input.daemon_socket.as_deref()
+        {
+            return self.run_named_query_daemon_stop(socket);
+        }
         if self.cli_input.daemon_socket.is_some() {
             return Err(SearchError::InvalidConfig {
                 field: "cli.flag".to_owned(),
@@ -19351,8 +19355,41 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    /// `fsfs daemon --stop`: stop this index's compaction daemon and every
-    /// query daemon `fsfs search` started for it. The compaction daemon
+    /// Stop the explicitly named legacy query daemon without reading the
+    /// compactor's PID file or enumerating this index's default sockets.
+    #[cfg(unix)]
+    fn run_named_query_daemon_stop(&self, socket: &Path) -> SearchResult<()> {
+        let started = Instant::now();
+        let (asked, running) = self.stop_query_daemons(Duration::from_secs(10), "daemon --stop")?;
+        let socket = socket.display();
+        if asked == 0 || running > 0 {
+            let reason = if asked == 0 {
+                "no query daemon accepted shutdown on the named socket"
+            } else {
+                "the named query daemon still accepts connections after shutdown was requested"
+            };
+            return Err(SearchError::InvalidConfig {
+                field: "cli.daemon_socket".into(),
+                value: socket.to_string(),
+                reason: reason.into(),
+            });
+        }
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if self.cli_input.format == OutputFormat::Table {
+            println!("daemon: stopped the query daemon on {socket} after {elapsed_ms}ms");
+        } else {
+            let receipt = serde_json::json!({
+                "stopped": true,
+                "socket": socket.to_string(),
+                "elapsed_ms": elapsed_ms,
+            });
+            println!("{receipt}");
+        }
+        Ok(())
+    }
+
+    /// `fsfs daemon --stop` without a named socket stops this index's compaction
+    /// daemon and every default query daemon. The compaction daemon
     /// recorded in the index root's pid file is signalled and awaited; a pid
     /// file whose process is already gone (crash, SIGKILL) is cleared so the
     /// next start does not trip over it. Query daemons are asked over their
@@ -68931,11 +68968,10 @@ mod tests {
         assert_eq!(request.as_deref().map(str::trim), Some(":shutdown"));
     }
 
-    /// The legacy compaction daemon has no socket: a `--daemon-socket` (which
-    /// names a complete-generation query daemon) is refused, for a stop too,
-    /// rather than ignored.
+    /// Legacy compaction startup refuses a socket. A Unix named stop selects
+    /// the query transport and reports when its endpoint is absent.
     #[test]
-    fn legacy_compaction_daemon_refuses_a_daemon_socket() {
+    fn legacy_daemon_socket_flag_distinguishes_start_and_stop() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let index_root = temp.path().join("index");
@@ -68947,10 +68983,15 @@ mod tests {
                 let error = runtime
                     .run_daemon_command(&cx)
                     .await
-                    .expect_err("a socket is refused");
+                    .expect_err("no query daemon is listening");
+                let (expected_field, expected_reason) = if stop && cfg!(unix) {
+                    ("cli.daemon_socket", "no query daemon accepted shutdown")
+                } else {
+                    ("cli.flag", "serve --daemon")
+                };
                 assert!(
                     matches!(&error, SearchError::InvalidConfig { field, reason, .. }
-                        if field == "cli.flag" && reason.contains("serve --daemon")),
+                        if field == expected_field && reason.contains(expected_reason)),
                     "stop={stop}: {error}"
                 );
             }

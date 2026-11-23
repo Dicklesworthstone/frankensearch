@@ -381,7 +381,9 @@ fails (`*.fslx.quarantine`), and reindexes the documents it held. The first sear
 (about 3 s for potion, plus the MiniLM session for the quality stage); the
 query daemon that `fsfs search` starts by default keeps later searches to tens
 of milliseconds and exits on its own after ten idle minutes; `fsfs daemon --stop`
-stops it sooner, and the next search starts a fresh one.
+stops it sooner, and the next search starts a fresh one. Use
+`fsfs daemon --stop --index-dir STORE --daemon-socket PATH` to stop a single
+named query daemon on either a complete or a legacy store.
 
 `--stream` also uses that warm daemon: Initial can arrive while quality
 refinement is still running, followed by Refined or RefinementFailed and one terminal
