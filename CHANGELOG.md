@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Synchronous hybrid filtering now preserves newly resolved metadata and
+  refills eligible lexical, fast and quality candidates after later metadata
+  rejects earlier hits. Progressive refinement also revalidates its retained
+  fast window. Exhausted semantic pools retain a typed zero-signal reason,
+  and repeatedly changing predicates cannot cause an endless refill loop.
 - Native HNSW refresh now reuses graph topology across logical deletion and
   restoration when retained document identities and persisted vectors match.
   Fast and quality tiers bind reused graphs to fresh owner receipts, including
