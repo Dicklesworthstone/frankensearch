@@ -8,7 +8,8 @@
 //! same corpus anchors the expected results.
 //!
 //! The feature-gated conformance cases additionally request cancellation from
-//! deterministic checkpoints *inside* collection, hydration, and publication.
+//! deterministic checkpoints *inside* collection, result materialization,
+//! hydration, and publication.
 //! Those checkpoints flip the real request `Cx`; public methods still discover
 //! and return their own typed cancellation outcome.
 
@@ -796,6 +797,243 @@ fn real_public_search_methods_cancel_during_collection_and_retry_exactly() {
     });
 }
 
+#[cfg(feature = "conformance-internals")]
+#[test]
+fn real_public_full_searches_cancel_during_result_materialization_and_retry_exactly() {
+    use frankensearch_quill::QuillSearchIndex;
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("materialization fixture directory");
+        let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("create durable materialization fixture");
+        LexicalWrite::index_documents(
+            &writer,
+            &cx,
+            &[
+                IndexableDocument::new("doc-a", "alpha first document")
+                    .with_metadata("ordinal", "a"),
+                IndexableDocument::new("doc-b", "alpha second document")
+                    .with_metadata("ordinal", "b"),
+                IndexableDocument::new("doc-c", "alpha third document")
+                    .with_metadata("ordinal", "c"),
+            ],
+        )
+        .await
+        .expect("ingest materialization fixture");
+        LexicalWrite::commit(&writer, &cx)
+            .await
+            .expect("publish materialization fixture");
+        let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("open durable reader");
+        let writer_pin = LexicalRead::pin_search(&writer, &cx)
+            .await
+            .expect("pin writer publication")
+            .expect("Quill supports pinned search");
+        let reader_pin = reader.pin_search(&cx).expect("pin reader publication");
+        let snapshot_before = writer.search_snapshot().expect("published snapshot");
+        let writer_state_before = writer
+            .conformance_pending_writer_state()
+            .expect("capture writer state");
+        let readers = [
+            (
+                "writer",
+                &writer as &dyn LexicalRead,
+                writer.conformance_cancellation_controller(),
+            ),
+            (
+                "durable reader",
+                &reader as &dyn LexicalRead,
+                reader.conformance_cancellation_controller(),
+            ),
+            (
+                "pinned writer",
+                writer_pin.as_ref(),
+                writer.conformance_cancellation_controller(),
+            ),
+            (
+                "pinned durable reader",
+                &reader_pin as &dyn LexicalRead,
+                reader.conformance_cancellation_controller(),
+            ),
+        ];
+
+        for (boundary, source, controller) in readers {
+            for (query, expected_count) in [(QUERY, 3), ("unmatched", 0)] {
+                let control = source
+                    .search(&cx, query, LIMIT)
+                    .await
+                    .expect("full-search control");
+                assert_eq!(control.len(), expected_count, "{boundary}: control hits");
+                assert!(control.iter().all(|result| result.metadata.is_some()));
+                controller
+                    .arm(
+                        ConformanceCancellationStage::ResultMaterialization,
+                        u64::MAX,
+                    )
+                    .expect("arm unreachable materialization cancellation");
+                let discovery = source
+                    .search(&cx, query, LIMIT)
+                    .await
+                    .expect("discover post-ranking materialization checkpoints");
+                let checkpoint_count = controller.observed_checkpoints();
+                assert_eq!(
+                    checkpoint_count,
+                    u64::try_from(control.len() + 1).expect("fixture count fits u64"),
+                    "{boundary}: every ranked hit and final return must be reached"
+                );
+                assert!(!controller.fired());
+                controller.disarm();
+                assert_results_identical(&discovery, &control, boundary);
+
+                for trigger_ordinal in 1..=checkpoint_count {
+                    assert!(!cx.is_cancel_requested());
+                    controller
+                        .arm(
+                            ConformanceCancellationStage::ResultMaterialization,
+                            trigger_ordinal,
+                        )
+                        .expect("arm post-ranking cancellation");
+                    let SearchError::Cancelled { phase, reason } = source
+                        .search(&cx, query, LIMIT)
+                        .await
+                        .expect_err("post-ranking cancellation must not return a result batch")
+                    else {
+                        panic!("{boundary}: materialization returned a non-cancellation error");
+                    };
+                    assert_eq!(phase, "search", "{boundary}: cancellation phase");
+                    assert_eq!(reason, "Quill observed request cancellation");
+                    assert!(controller.fired());
+                    assert_eq!(controller.observed_checkpoints(), trigger_ordinal);
+                    assert!(cx.is_cancel_requested(), "{boundary}: real Cx cancellation");
+                    assert!(Arc::ptr_eq(
+                        &snapshot_before,
+                        &writer.search_snapshot().expect("unchanged publication"),
+                    ));
+                    assert_eq!(
+                        writer
+                            .conformance_pending_writer_state()
+                            .expect("writer state after cancellation"),
+                        writer_state_before,
+                    );
+
+                    controller.disarm();
+                    assert!(cx.is_cancel_requested());
+                    cx.set_cancel_requested(false);
+                    let retry = source
+                        .search(&cx, query, LIMIT)
+                        .await
+                        .expect("clean full-search retry");
+                    assert_results_identical(&retry, &control, boundary);
+                }
+            }
+        }
+    });
+}
+
+#[cfg(feature = "conformance-internals")]
+#[test]
+fn real_public_snippet_search_observes_cancellation_after_final_metadata() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let index = fixture_index(&cx).await;
+        let controller = index.conformance_cancellation_controller();
+        let snapshot_before = index.search_snapshot().expect("published snapshot");
+        let snippet_config = SnippetConfig::default();
+        let control = index
+            .search_with_snippets(&cx, QUERY, LIMIT, &snippet_config)
+            .expect("enriched-search control");
+        assert_eq!(control.len(), 3);
+        assert!(control.iter().all(|hit| {
+            hit.metadata.is_some()
+                && hit
+                    .snippet
+                    .as_deref()
+                    .is_some_and(|snippet| snippet.contains("<b>alpha</b>"))
+        }));
+
+        controller
+            .arm(ConformanceCancellationStage::SnippetTailCompletion, 1)
+            .expect("arm cancellation after final snippet metadata");
+        let error = index
+            .search_with_snippets(&cx, QUERY, LIMIT, &snippet_config)
+            .expect_err("cancelled enrichment must not return a result batch");
+        assert!(matches!(
+            error,
+            QuillIndexError::Cancelled { phase: "search" }
+        ));
+        assert!(controller.fired());
+        assert_eq!(controller.observed_checkpoints(), 1);
+        assert!(cx.is_cancel_requested());
+        assert!(Arc::ptr_eq(
+            &snapshot_before,
+            &index.search_snapshot().expect("unchanged publication"),
+        ));
+
+        controller.disarm();
+        assert!(cx.is_cancel_requested());
+        cx.set_cancel_requested(false);
+        let retry = index
+            .search_with_snippets(&cx, QUERY, LIMIT, &snippet_config)
+            .expect("clean enriched-search retry");
+        assert_eq!(retry.len(), control.len());
+        for (actual, expected) in retry.iter().zip(&control) {
+            assert_eq!(actual.document_id, expected.document_id);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            assert_eq!(actual.rank, expected.rank);
+            assert_eq!(actual.snippet, expected.snippet);
+            assert_eq!(actual.query_type, expected.query_type);
+            assert_eq!(actual.metadata, expected.metadata);
+        }
+    });
+}
+
+#[cfg(feature = "conformance-internals")]
+#[test]
+fn real_public_selected_snippets_observe_cancellation_after_final_content() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let index = fixture_index(&cx).await;
+        let controller = index.conformance_cancellation_controller();
+        let snapshot_before = index.search_snapshot().expect("published snapshot");
+        let snippet_config = SnippetConfig::default();
+        let document_ids = ["doc-c", "missing", "doc-a", "doc-c"];
+        let control = index
+            .snippets_for_documents(&cx, QUERY, &document_ids, &snippet_config, usize::MAX)
+            .expect("selected-snippets control");
+        assert_eq!(control.len(), document_ids.len());
+        assert!(control[0].is_some());
+        assert!(control[1].is_none());
+        assert!(control[2].is_some());
+        assert_eq!(control[0], control[3]);
+
+        controller
+            .arm(ConformanceCancellationStage::SnippetTailCompletion, 1)
+            .expect("arm cancellation after final selected snippet");
+        let error = index
+            .snippets_for_documents(&cx, QUERY, &document_ids, &snippet_config, usize::MAX)
+            .expect_err("cancelled snippet generation must not return a batch");
+        assert!(matches!(
+            error,
+            QuillIndexError::Cancelled { phase: "snippets" }
+        ));
+        assert!(controller.fired());
+        assert_eq!(controller.observed_checkpoints(), 1);
+        assert!(cx.is_cancel_requested());
+        assert!(Arc::ptr_eq(
+            &snapshot_before,
+            &index.search_snapshot().expect("unchanged publication"),
+        ));
+
+        controller.disarm();
+        assert!(cx.is_cancel_requested());
+        cx.set_cancel_requested(false);
+        let retry = index
+            .snippets_for_documents(&cx, QUERY, &document_ids, &snippet_config, usize::MAX)
+            .expect("clean selected-snippets retry");
+        assert_eq!(retry, control);
+    });
+}
+
 #[cfg(all(feature = "conformance-internals", feature = "pruning-conformance"))]
 #[test]
 fn pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly() {
@@ -991,6 +1229,51 @@ fn real_public_hydration_cancels_with_exact_retained_prefix_and_replays() {
             controller.disarm();
             cx.set_cancel_requested(false);
         }
+    });
+}
+
+#[cfg(feature = "conformance-internals")]
+#[test]
+fn real_public_hydration_observes_cancellation_after_final_metadata() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let index = fixture_index(&cx).await;
+        let controller = index.conformance_cancellation_controller();
+        let snapshot_before = index.search_snapshot().expect("published snapshot");
+        let (mut control, control_context) = candidate_parts(&index, &cx).await;
+        LexicalRead::hydrate_candidates(&index, &cx, control_context.as_ref(), &mut control)
+            .await
+            .expect("hydration control");
+
+        let (mut candidates, context) = candidate_parts(&index, &cx).await;
+        assert!(candidates.iter().all(|result| result.metadata.is_none()));
+        controller
+            .arm(ConformanceCancellationStage::FusionHydrationCompletion, 1)
+            .expect("arm cancellation after final metadata");
+        let SearchError::Cancelled { phase, reason } =
+            LexicalRead::hydrate_candidates(&index, &cx, context.as_ref(), &mut candidates)
+                .await
+                .expect_err("hydration must observe cancellation before successful return")
+        else {
+            panic!("completed hydration returned a non-cancellation error");
+        };
+        assert_eq!(phase, "fusion metadata hydration");
+        assert_eq!(reason, "Quill observed request cancellation");
+        assert!(controller.fired());
+        assert_eq!(controller.observed_checkpoints(), 1);
+        assert!(cx.is_cancel_requested());
+        assert_results_identical(&candidates, &control, "all metadata was materialized");
+        assert!(Arc::ptr_eq(
+            &snapshot_before,
+            &index.search_snapshot().expect("unchanged publication"),
+        ));
+
+        controller.disarm();
+        assert!(cx.is_cancel_requested());
+        cx.set_cancel_requested(false);
+        LexicalRead::hydrate_candidates(&index, &cx, context.as_ref(), &mut candidates)
+            .await
+            .expect("completed metadata retries cleanly after cancellation");
+        assert_results_identical(&candidates, &control, "completed hydration retry");
     });
 }
 

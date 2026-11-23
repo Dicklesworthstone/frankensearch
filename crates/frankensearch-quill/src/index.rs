@@ -4100,6 +4100,13 @@ pub enum ConformanceCancellationStage {
     /// never advances the other's ordinal: the stage guard rejects a
     /// non-matching stage before the counter moves.
     ParallelIngestWorkerFailure = 8,
+    /// One ranked hit before result materialization, or the completed result
+    /// batch before it is returned. Collection has already finished.
+    ResultMaterialization = 9,
+    /// The complete deferred-metadata batch before successful return.
+    FusionHydrationCompletion = 10,
+    /// The complete ranked or selected-document snippet batch before return.
+    SnippetTailCompletion = 11,
 }
 
 /// Fixed-size conformance receipt for the complete retained scalar writer
@@ -4227,6 +4234,9 @@ impl ConformanceCancellationStage {
             Self::PruningTraceSegmentRecorded => 6,
             Self::SnippetTailAdmission => 7,
             Self::ParallelIngestWorkerFailure => 8,
+            Self::ResultMaterialization => 9,
+            Self::FusionHydrationCompletion => 10,
+            Self::SnippetTailCompletion => 11,
         }
     }
 }
@@ -11809,11 +11819,16 @@ impl QuillReader {
             return Ok(Vec::new());
         }
         let search = self.search_paginated_on(cx, query, limit, 0, false, snapshot)?;
+        check_cancel(cx, "search")?;
         let mut results = Vec::new();
         results
             .try_reserve_exact(search.hits.len())
             .map_err(|_| invalid_state("could not allocate lexical results"))?;
         for hit in search.hits.iter() {
+            #[cfg(feature = "conformance-internals")]
+            self.conformance_controller
+                .checkpoint(ConformanceCancellationStage::ResultMaterialization, cx);
+            check_cancel(cx, "search")?;
             let metadata = hydrate_metadata
                 .then(|| snapshot.materialize_metadata(hit.global_docid))
                 .transpose()?
@@ -11831,6 +11846,10 @@ impl QuillReader {
                 metadata,
             });
         }
+        #[cfg(feature = "conformance-internals")]
+        self.conformance_controller
+            .checkpoint(ConformanceCancellationStage::ResultMaterialization, cx);
+        check_cancel(cx, "search")?;
         Ok(results)
     }
 
@@ -12904,6 +12923,10 @@ impl QuillReader {
                 metadata: snapshot.materialize_metadata(hit.global_docid)?,
             });
         }
+        #[cfg(feature = "conformance-internals")]
+        self.conformance_controller
+            .checkpoint(ConformanceCancellationStage::SnippetTailCompletion, cx);
+        check_cancel(cx, "search")?;
         Ok(results)
     }
 
@@ -13002,6 +13025,10 @@ impl QuillReader {
                 generator.snippet_or_prefix(&content[..end])
             }));
         }
+        #[cfg(feature = "conformance-internals")]
+        self.conformance_controller
+            .checkpoint(ConformanceCancellationStage::SnippetTailCompletion, cx);
+        check_cancel(cx, "snippets")?;
         Ok(snippets)
     }
 
@@ -15661,6 +15688,11 @@ fn quill_hydrate_candidates<'a>(
                 .materialize_metadata(global_docid)
                 .map_err(SearchError::from)?;
         }
+        #[cfg(feature = "conformance-internals")]
+        conformance_pin
+            .controller
+            .checkpoint(ConformanceCancellationStage::FusionHydrationCompletion, cx);
+        check_cancel(cx, "fusion metadata hydration").map_err(SearchError::from)?;
         Ok(())
     })
 }
