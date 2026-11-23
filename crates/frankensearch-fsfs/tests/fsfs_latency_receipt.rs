@@ -443,7 +443,9 @@ fn final_phase(response: &Value) -> Option<&str> {
 fn has_hit(payload: &Value, path: &str) -> bool {
     payload["hits"]
         .as_array()
-        .is_some_and(|hits| hits.iter().any(|hit| hit["path"].as_str() == Some(path)))
+        .unwrap_or_else(|| panic!("search response has no hits array: {payload}"))
+        .iter()
+        .any(|hit| hit["path"].as_str() == Some(path))
 }
 
 struct WatchGuard(Child);
