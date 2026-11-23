@@ -102,6 +102,27 @@ impl<'a> RequestFilter<'a> {
         Ok(included)
     }
 
+    /// A failed refinement may have learned that an Initial candidate is no
+    /// longer eligible. Check the entire retained pool before allowing either
+    /// a fallback response or a final ranker to reuse it. This consults only
+    /// observations already made by the request; failure recovery must not
+    /// start another metadata lookup or change the original ranking.
+    pub(super) fn all_scored_eligible(
+        &self,
+        cx: &Cx,
+        results: &[ScoredResult],
+    ) -> SearchResult<bool> {
+        if !self.is_active() {
+            return Ok(true);
+        }
+        for result in results {
+            if !self.includes(cx, &result.doc_id)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn attach_metadata(&self, results: &mut [ScoredResult]) {
         if self.is_active() {
             for result in results {

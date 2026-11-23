@@ -1436,7 +1436,10 @@ impl TwoTierSearcher {
     /// Same as [`Self::search`]. A filtered request also propagates lexical
     /// snapshot, retrieval and metadata errors instead of interpreting a
     /// failed metadata lookup as missing metadata. An error during refinement
-    /// preserves the last successful phase through `RefinementFailed`.
+    /// preserves the last successful phase through `RefinementFailed` only if
+    /// its retained candidates still satisfy the filter. If refinement learned
+    /// that one of those candidates is ineligible, the original error or timeout
+    /// is returned without reusing that pool for fallback or final ranking.
     /// Cancellation always terminates the request.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(query_len = query.len(), k))]
@@ -2002,6 +2005,23 @@ impl TwoTierSearcher {
             };
             phase2_latency = phase2_start.elapsed();
 
+            // Initial can contain an unknown-metadata candidate that a later
+            // quality lookup rejects. A failed or timed-out refinement must
+            // not republish that row, including an undisplayed candidate the
+            // final ranker could promote. Cancellation remains terminal and
+            // must not be recorded as a quality-provider failure.
+            let fallback_check = match &phase2_result {
+                Err(_) => request_filter.all_scored_eligible(cx, &initial_hits),
+                Ok(Err(error)) if !matches!(error, SearchError::Cancelled { .. }) => {
+                    request_filter.all_scored_eligible(cx, &initial_hits)
+                }
+                _ => Ok(true),
+            };
+            let (phase2_result, fallback_eligible) = match fallback_check {
+                Ok(eligible) => (phase2_result, eligible),
+                Err(error) => (Ok(Err(error)), false),
+            };
+
             match phase2_result {
                 Err(_elapsed) => {
                     metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
@@ -2018,6 +2038,19 @@ impl TwoTierSearcher {
                             latency_ms: phase2_latency_ms,
                         };
                         let _ = circuit_breaker.record_outcome(&outcome);
+                    }
+                    if !fallback_eligible {
+                        if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                            self.emit_session_stop_telemetry(
+                                root_request_id,
+                                telemetry_last_event_id.clone(),
+                                LifecycleState::Degraded,
+                                LifecycleSeverity::Error,
+                                Some(timeout_error.diagnostic_code().to_owned()),
+                                search_started_at.elapsed(),
+                            );
+                        }
+                        return Err(timeout_error);
                     }
                     if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                         let refinement_failed_event_id = self.emit_search_telemetry(
@@ -2174,6 +2207,19 @@ impl TwoTierSearcher {
                         self.export_error(&err);
                         if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
                             let _ = circuit_breaker.record_outcome(&QualityOutcome::Error);
+                        }
+                        if !fallback_eligible {
+                            if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                                self.emit_session_stop_telemetry(
+                                    root_request_id,
+                                    telemetry_last_event_id.clone(),
+                                    LifecycleState::Degraded,
+                                    LifecycleSeverity::Error,
+                                    Some(err.diagnostic_code().to_owned()),
+                                    search_started_at.elapsed(),
+                                );
+                            }
+                            return Err(err);
                         }
                         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                             let refinement_failed_event_id = self.emit_search_telemetry(
@@ -20704,6 +20750,165 @@ mod tests {
                         assert!(matches!(error, SearchError::InvalidConfig { .. }));
                     }
                 });
+            }
+        }
+    }
+
+    #[test]
+    fn async_filter_refinement_failure_cannot_republish_revoked_initial_candidates() {
+        struct LateFailureLexical {
+            refining: std::sync::atomic::AtomicBool,
+            pending: bool,
+            revoked_observations: AtomicU64,
+            failures: AtomicU64,
+        }
+
+        impl LexicalRead for LateFailureLexical {
+            fn search<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                _query: &'a str,
+                _limit: usize,
+            ) -> SearchFuture<'a, Vec<ScoredResult>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn metadata_for_documents<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                ids: &'a [&str],
+            ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+                Box::pin(async move {
+                    if !self.refining.load(Ordering::SeqCst) {
+                        return Ok(vec![None; ids.len()]);
+                    }
+                    if ids.contains(&"quality-tail") {
+                        self.failures.fetch_add(1, Ordering::SeqCst);
+                        if self.pending {
+                            return std::future::pending().await;
+                        }
+                        return Err(SearchError::InvalidConfig {
+                            field: "fixture.metadata".to_owned(),
+                            value: "unreadable_quality_tail".to_owned(),
+                            reason: "the quality refill cannot read its next candidate".to_owned(),
+                        });
+                    }
+                    Ok(ids
+                        .iter()
+                        .map(|id| {
+                            let allowed = *id == "initial-safe";
+                            if !allowed {
+                                self.revoked_observations.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Some(Arc::new(serde_json::json!({ "allowed": allowed })))
+                        })
+                        .collect())
+                })
+            }
+
+            fn doc_count(&self) -> SearchResult<usize> {
+                Ok(4)
+            }
+        }
+
+        for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+            for pending in [false, true] {
+                for hidden in [false, true] {
+                    let cx = Cx::for_testing();
+                    let fast_rows: &[(&str, &[f32])] = if hidden {
+                        &[
+                            ("initial-safe", &[1.0, 0.0, 0.0, 0.0]),
+                            ("initial-revoked", &[0.5, 0.5, 0.0, 0.0]),
+                        ]
+                    } else {
+                        &[("initial-revoked", &[1.0, 0.0, 0.0, 0.0])]
+                    };
+                    let quality_rows: &[(&str, &[f32])] = &[
+                        ("initial-revoked", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                        ("quality-revoked", &[0.0, 0.8, 0.2, 0.0, 0.0, 0.0]),
+                        ("quality-tail", &[0.0, 0.5, 0.5, 0.0, 0.0, 0.0]),
+                    ];
+                    let (_dir, index) =
+                        query_admission_index_with_rows(layout, fast_rows, quality_rows);
+                    let lexical = Arc::new(LateFailureLexical {
+                        refining: std::sync::atomic::AtomicBool::new(false),
+                        pending,
+                        revoked_observations: AtomicU64::new(0),
+                        failures: AtomicU64::new(0),
+                    });
+                    let adapter = Arc::new(RecordingHostAdapter::new("revoked_initial"));
+                    let mut searcher = TwoTierSearcher::new(
+                        index,
+                        Arc::new(query_admission_embedder("fast")),
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            quality_timeout_ms: 0,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_quality_embedder(Arc::new(query_admission_embedder("quality")))
+                    .with_lexical(lexical.clone())
+                    .with_host_adapter(adapter.clone());
+                    if hidden {
+                        // The displayed page stays eligible. The undisplayed
+                        // MMR pool must not retain the later-revoked candidate.
+                        searcher = searcher.with_mmr_config(MmrConfig {
+                            enabled: true,
+                            candidate_pool: 2,
+                            ..MmrConfig::default()
+                        });
+                    }
+                    let filter =
+                        AsyncTestFilter(|_: &str, metadata: Option<&serde_json::Value>| {
+                            metadata.is_none_or(|value| value["allowed"] == true)
+                        });
+                    let phases = Mutex::new(Vec::new());
+                    let mut future = Box::pin(searcher.search_with_filter(
+                        &cx,
+                        "find relevant material",
+                        1,
+                        Some(&filter),
+                        |_| None,
+                        |phase| {
+                            if let SearchPhase::Initial { results, .. } = &phase {
+                                assert_eq!(results.len(), 1);
+                                assert_eq!(
+                                    results[0].doc_id,
+                                    if hidden {
+                                        "initial-safe"
+                                    } else {
+                                        "initial-revoked"
+                                    }
+                                );
+                                lexical.refining.store(true, Ordering::SeqCst);
+                            }
+                            phases.lock().unwrap().push(phase);
+                        },
+                    ));
+                    let outcome = future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    assert!(lexical.revoked_observations.load(Ordering::SeqCst) > 0);
+                    assert_eq!(lexical.failures.load(Ordering::SeqCst), 1);
+                    let Poll::Ready(Err(error)) = outcome else {
+                        panic!(
+                            "{layout}, pending={pending}, hidden={hidden}: a revoked Initial \
+                             pool cannot authorize fallback: {outcome:?}"
+                        );
+                    };
+                    if pending {
+                        assert!(matches!(error, SearchError::SearchTimeout { .. }));
+                    } else {
+                        assert!(matches!(
+                            error,
+                            SearchError::InvalidConfig { field, .. } if field == "fixture.metadata"
+                        ));
+                    }
+                    assert!(matches!(
+                        phases.lock().unwrap().as_slice(),
+                        [SearchPhase::Initial { .. }]
+                    ));
+                }
             }
         }
     }
