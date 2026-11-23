@@ -275,6 +275,38 @@ Quill conformance and performance program.
   executable to that revision, passed 12 commands and 22 negative controls,
   and finished with zero owned processes remaining. See `output-gate.log`
   and `tmp/fsfs-quickstart.oWqPGaoY/receipt.json` in the same evidence root.
+- The CLI now wakes when a forwarded daemon response is readable. Both
+  parked-reader reactor regressions missed a guard on the timer-only
+  baseline, once for data and once for EOF. The timer fallback control
+  and all 153 focused daemon tests passed on the repair. Buffered reads
+  yield after a bounded turn, including on interrupted reads. A relay
+  forwarded real replies through the same retained daemon to both client
+  builds. In two development-build orders, with 24 queries per mode and arm
+  after a common warm-up, median reply-release-to-stdout time fell from
+  5.30–5.82 ms to 0.78–0.79 ms buffered and from 4.36–4.39 ms to
+  0.53–0.58 ms streamed.
+  Both modes preserved full ranked hit records, including streamed Initial
+  and Refined results. The missing-path and single-terminal controls passed.
+  See `client-{red,green}.log` and `client-dev-{ab,ba}.log` under
+  `/data/tmp/fs-receive-20261123.9CTwvr`.
+- The stock release comparison used 24 queries per mode and arm in both
+  orders, with the same daemon build and warm-up sequence. Median
+  reply-release-to-stdout time fell from 5.11–6.23 ms to 0.22 ms buffered
+  and from 3.95 ms to 0.12–0.14 ms streamed. Ranked records including
+  scores matched for every timed reply. Both modes passed the missing-path
+  control, streaming produced one completed terminal, and both daemons
+  stopped cleanly. Buffered process-start-to-stdout p95 moved from
+  35.91 to 38.35 ms in one order and from 35.70 to 27.24 ms in the other.
+  The relay timings isolate the client delivery step on a shared host.
+  The clean candidate `07a01fba` executable SHA-256 is
+  `ba3a852d18c4241034b8962639bf42ff152000ce3d51d9e26bd989bbd5767f21`.
+  See `client-release-{ab,ba}.log` and `release-{ab,ba}/*/samples.json`
+  in the same evidence root.
+- Clean `07a01fba` passed all 18 stock quality stages, including 25 tests
+  in the real-model executable stage. The source quickstart bound the
+  checker and binary to that revision, passed 12 commands and 22 controls,
+  and left zero owned processes. See `client-gate.log` and
+  `tmp/fsfs-quickstart.ywj32UhB/receipt.json` in the same evidence root.
 
 ### Vision checklist
 
@@ -454,6 +486,16 @@ Quill conformance and performance program.
   Require ranked-result parity, one stream terminal, missing-path controls,
   parallel readiness while parked, and clean shutdown.
 - [x] Run the stock quality gate and land the qualified response-writer repair.
+- [x] Reproduce the client reply wait with parked Unix socket reads for both
+  delayed data and EOF. Run the timer-only control separately.
+- [x] Verify buffered and streamed CLI receive paths use the readable reactor.
+  Check byte limits, cancellation, deadlines and a single stream terminal.
+- [x] Run both development clients in both orders through the same retained
+  daemon. Check release-to-stdout delivery, ranked hit records in both phases,
+  a missing-path control, and clean shutdown.
+- [x] Repeat both client orders with stock release binaries and retain the
+  actual executable hashes and transport timing samples.
+- [x] Run the stock quality gate and publish the qualified client-read repair.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
   independent fast and quality load times, peak RSS, per-generation disk
