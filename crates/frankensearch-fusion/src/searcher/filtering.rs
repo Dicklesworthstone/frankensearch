@@ -405,13 +405,48 @@ impl<'a> RequestFilter<'a> {
         exclusions: Option<&NormalizedExclusions>,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         source: &'static str,
+        retrieve: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
+    ) -> SearchResult<bool> {
+        self.reconcile_vectors_with_history(
+            cx,
+            lexical,
+            lexical_pool,
+            hits,
+            target,
+            retrieval_limit,
+            physical_upper_bound,
+            exclusions,
+            text_fn,
+            source,
+            &mut AHashSet::new(),
+            retrieve,
+        )
+        .await
+    }
+
+    /// Share revocation history across alternating semantic arms. A fresh
+    /// history on every pass would let an unstable predicate cycle between
+    /// fast and quality pools without reaching either arm's local guard.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn reconcile_vectors_with_history(
+        &mut self,
+        cx: &Cx,
+        lexical: Option<&dyn LexicalRead>,
+        lexical_pool: LexicalRevalidation<'_>,
+        hits: &mut Vec<VectorHit>,
+        target: usize,
+        retrieval_limit: &mut usize,
+        physical_upper_bound: usize,
+        exclusions: Option<&NormalizedExclusions>,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        source: &'static str,
+        revoked: &mut AHashSet<DocId>,
         mut retrieve: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
     ) -> SearchResult<bool> {
         if !self.is_active() {
             return Ok(false);
         }
         let mut replaced = false;
-        let mut revoked = AHashSet::new();
         loop {
             self.revalidate_lexical(
                 cx,
