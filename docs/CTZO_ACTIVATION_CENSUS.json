@@ -79,8 +79,8 @@
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": "activate_owner_backed_search",
-      "count": 5,
-      "note": "run_phase1 admits the fast response and activates its retained retrieval. run_phase2 admits the quality response before PRF and activates the final quality query for retrieval, eligibility reconciliation, and coverage. Direct quality-only retrieval has its own activation. 5ba13f72 kept filtered reconciliation and coverage inside the final quality activation, removing the separate replay constructor."
+      "count": 6,
+      "note": "run_phase1 admits the fast response and activates its retained retrieval. run_phase2 admits the quality response before PRF and activates the final quality query for retrieval, eligibility reconciliation, and coverage. Direct quality-only retrieval has its own activation. 5ba13f72 kept filtered reconciliation and coverage inside the final quality activation, removing the separate replay constructor. eea0715d adds a fast-only activation in reconcile_refinement_vectors when metadata revokes a candidate and Phase 1 used the native fast owner. The refill uses the original bound query and explicit scan parameters."
     },
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
