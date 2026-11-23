@@ -8656,6 +8656,7 @@ mod tests {
         let mut completeness = ScanCompleteness::default();
         super::collect_snapshot_for_root(
             &root,
+            &[],
             &discovery,
             Some(&mount_table),
             &mut snapshot,
@@ -8690,6 +8691,7 @@ mod tests {
         let mut completeness = ScanCompleteness::default();
         super::collect_snapshot_for_root(
             &symlink_root,
+            &[],
             &discovery,
             None,
             &mut snapshot,
@@ -8732,6 +8734,7 @@ mod tests {
         let mut completeness = ScanCompleteness::default();
         super::collect_snapshot_for_root(
             &symlink_root,
+            &[],
             &discovery,
             None,
             &mut snapshot,
