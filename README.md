@@ -386,7 +386,8 @@ stops it sooner, and the next search starts a fresh one.
 `--stream` also uses that warm daemon: Initial can arrive while quality
 refinement is still running, followed by Refined or RefinementFailed and one terminal
 event. JSONL and TOON announce complete cached replays with `daemon_cache_hit`.
-Use `--no-daemon` for direct execution. A daemon policy or producer mismatch is
+Use `--no-daemon` for direct execution. Omit `--daemon-socket` in that mode.
+A daemon policy or producer mismatch is
 an error requiring a daemon restart or explicit direct execution; a request
 that has delivered Initial is never silently retried.
 

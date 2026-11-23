@@ -1022,6 +1022,15 @@ where
     normalize_stream_settings(&mut input)?;
     apply_daemon_settings(&mut input, daemon_preference);
     validate_required_args(&input)?;
+    if daemon_preference == Some(false) && input.daemon_socket.is_some() {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.daemon_socket".into(),
+            value: "--daemon-socket".into(),
+            reason:
+                "--no-daemon requires local execution. Omit --daemon-socket or select --daemon."
+                    .into(),
+        });
+    }
 
     Ok(input)
 }
@@ -2289,6 +2298,7 @@ mod tests {
     fn parse_daemon_socket_is_accepted_by_search_serve_and_daemon_only() {
         for command in [
             &["search", "query"][..],
+            &["serve"],
             &["serve", "--daemon"],
             &["daemon"],
             &["daemon", "--stop"],
@@ -2322,6 +2332,33 @@ mod tests {
             err.to_string()
                 .contains("--no-daemon is only valid for search or serve commands")
         );
+    }
+
+    #[test]
+    fn parse_final_no_daemon_rejects_named_socket() {
+        const SOCKET: &str = "/tmp/fsfs-q.sock";
+        for command in [&["search", "query"][..], &["serve"]] {
+            for flags in [
+                &["--no-daemon", "--daemon-socket", SOCKET][..],
+                &["--daemon-socket", SOCKET, "--daemon", "--no-daemon"],
+            ] {
+                let args = command.iter().chain(flags).copied();
+                let error = parse_cli_args(args).expect_err("conflicting transport flags");
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket"
+                ));
+            }
+            let args = command.iter().copied().chain([
+                "--no-daemon",
+                "--daemon",
+                "--daemon-socket",
+                SOCKET,
+            ]);
+            let selected = parse_cli_args(args).expect("the final --daemon selects the socket");
+            assert!(selected.daemon);
+            assert_eq!(selected.daemon_socket.as_deref(), Some(Path::new(SOCKET)));
+        }
     }
 
     #[test]
