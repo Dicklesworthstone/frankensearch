@@ -241,6 +241,40 @@ Quill conformance and performance program.
   with zero owned processes remaining. Published code commit `3d5e7b5f`
   has identical build inputs. See `split-gate{,-final}.log`,
   `split-suite-final.log` and `tmp/fsfs-quickstart.tGFkNk4c/receipt.json`.
+- Buffered and streamed replies now resume on writable-socket readiness
+  after a slow reader frees space. The original timer still covers runtimes
+  without a reactor. Both full-socket reactor regressions failed on the
+  baseline, the timer control passed, and all 150 focused daemon tests
+  passed on the repair. A 640-document retained store produced a roughly
+  1.3 MB buffered reply and 795 KB stream. Two development-build runs with
+  opposite arm order preserved ranked results, one stream terminal,
+  missing-path behavior, parallel readiness, and clean shutdown. Median
+  time from starting to drain the parked prefix to receiving new bytes fell
+  from 5.33–5.49 ms to 0.39–0.40 ms buffered and from 5.88–6.79 ms to
+  0.37–0.40 ms streamed. See `backpressure-{red,green}.log`,
+  `output-dev-v2-{ab,ba}.log`, and `dev-v2-{ab,ba}/*/samples.json` under
+  `/data/tmp/fs-drain-20261123.it2iHg`.
+- Stock release builds reproduced the improvement in both run orders, with
+  24 paused replies per mode and arm. Median resume time fell from
+  4.82–5.06 ms to 0.15–0.16 ms buffered and from 3.38–6.14 ms to 0.21 ms
+  streamed. Median time to finish after initiating the drain fell from
+  31.29–35.93 ms to 1.01–1.12 ms buffered and from 4.11–7.88 ms to
+  0.66–0.69 ms streamed. All timed replies preserved ranked paths, and full
+  eager hit records including scores matched across binaries in both modes.
+  The candidate also delivered 20 ordinary real-model Initial/Refined
+  streams, a cache hit, a missing-path control, and clean shutdown with an
+  incomplete peer still connected. These shared-host measurements isolate
+  transport after backpressure. The candidate came from clean `1d11f188`
+  with SHA-256
+  `d389752ec7176edc9f7a903d292f325cf7942bc2b60bc8e2a18bfffd4557e7e8`.
+  See `output-release-v2-{ab,ba}.log`, `output-release-item-parity.log`,
+  `release-v2-{ab,ba}/*/samples.json`, and `normal-release.log` in the same
+  evidence root.
+- Clean `1d11f188` passed all 18 stages of the stock quality gate, including
+  25 real-model executable tests. The source quickstart bound its checker and
+  executable to that revision, passed 12 commands and 22 negative controls,
+  and finished with zero owned processes remaining. See `output-gate.log`
+  and `tmp/fsfs-quickstart.oWqPGaoY/receipt.json` in the same evidence root.
 
 ### Vision checklist
 
@@ -406,6 +440,20 @@ Quill conformance and performance program.
   with live rank, cache, missing-path and strict shutdown controls.
 - [x] Run the same socket probe in both orders with stock release binaries.
 - [x] Run the stock source gate and land the qualified request-framing repair.
+- [x] Reproduce timer-bound output in buffered and streamed Unix socket pairs.
+  Fill the socket, park the writer, and drain the peer before the fallback.
+- [x] Establish the executable baseline on a 640-file store. Verify that the
+  queued prefix stays stable while the rest of the answer remains unwritten.
+- [x] Verify writable-reactor wake and timer fallback for both reply modes.
+  Exercise the exact output bytes, half-close, deadlines, cancellation, and
+  cooperative write bounds.
+- [x] Compare large buffered and streamed replies in both development-build
+  orders. Require ranked-result parity, one stream terminal, missing-path
+  controls, parallel readiness while parked, and clean shutdown.
+- [x] Repeat the comparison with stock release binaries in both orders.
+  Require ranked-result parity, one stream terminal, missing-path controls,
+  parallel readiness while parked, and clean shutdown.
+- [x] Run the stock quality gate and land the qualified response-writer repair.
 - [ ] On a booked native host, compare the signed release with a current
   release-profile build in both run orders. Retain latency percentiles,
   independent fast and quality load times, peak RSS, per-generation disk
