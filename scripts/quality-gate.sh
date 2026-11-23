@@ -309,7 +309,9 @@ sys.exit(bool(d["hits"]))'; then
     printf 'lite complete-generation search after delete still matched:\n%s\n' "$out"
     return 1
   fi
-  rm -rf "$work"
+  # Retain the corpus, indexes and executable for inspection. Repository policy
+  # requires explicit permission before deleting even temporary test artifacts.
+  printf '[quality-gate] lite artifacts: %s\n' "$work"
 }
 if want lite; then
   run_stage lite lite_smoke

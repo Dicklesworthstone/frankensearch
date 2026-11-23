@@ -17,7 +17,7 @@ use super::{
 /// Keep observations outside a child future when an enclosing search owns its
 /// deadline. Dropping that child must not erase facts needed to validate a
 /// previously published fallback phase.
-pub(crate) struct RequestFilter<'a> {
+pub struct RequestFilter<'a> {
     predicate: Option<&'a dyn SearchFilter>,
     metadata: AHashMap<DocId, Option<Arc<serde_json::Value>>>,
 }
