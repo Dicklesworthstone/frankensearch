@@ -107,7 +107,49 @@ Quill conformance and performance program.
   11,878 fast windows over 581 indexed files with one exclusion. Both unchanged
   reruns preserved all 581 files. Both arms reached Refined on all 253 frozen
   code queries. The paired nDCG@10 and Recall@100 differences were zero for
-  both phases. See `code-workload/paired-quality.log` and the index receipts.
+  both phases. GNU time recorded peak RSS of 995,456 KiB for the signed
+  release and 1,002,788 KiB for the selected current binary during fresh
+  indexing. See `code-workload/paired-quality.log` and the index receipts.
+- Complete-generation daemon intake previously polled its listener on a 10 ms
+  timer. `3acf2f4f` connects the bounded listener to the caller-owned reactor.
+  The real-socket regression hit its guard deadline before the repair. All 145
+  complete-daemon tests passed with the repair, including the wake and timer
+  fallback tests. In two runs reversing arm order, each executable answered
+  80 readiness probes, 80 cached queries and 30 uncached two-phase queries on
+  a 24-file store. Median readiness fell from 10.50–10.54 ms to 0.28–0.35 ms,
+  cached replies from 20.70–20.92 ms to 9.15–9.34 ms, and Initial results from
+  16.34–16.69 ms to 6.06–6.10 ms. Refined results fell from 27.92–28.52 ms
+  to 17.92–18.01 ms. Both arms passed the incomplete-peer and shutdown
+  controls. These are matched debug-build diagnostics on a shared Linux
+  host. See `daemon-ready-{red,green,ab,ba}.log` and `socket-{ab,ba}`.
+- All 18 stages of the stock quality gate passed locally on clean
+  `3acf2f4f`. The four-model executable lane passed 25 cases with a genuine
+  predecessor. The installed source quickstart used the same executable as
+  the timing probe, passed 12 commands and 22 negative controls, and left
+  zero owned processes. See `daemon-ready-gate.log` and
+  `tmp/fsfs-quickstart.pKCPXYNT/receipt.json`. `bd-hp0hs` is closed.
+- A separate study recorded the existing quality-loader span in five fresh
+  daemons per executable with a shared filesystem page cache. All ten first
+  queries and ten warm queries reached Refined. The signed 1.13.0 release
+  had a 367 ms median loader span, and the development reactor build had a
+  373 ms median. See `model-load-diagnostic/*/trials.json`.
+- On the code corpus with a canary (582 indexed files, 11,879 fast windows),
+  signed 1.13.0 preserved all 582 files on repeat and published a new
+  generation for each of four in-place edits. Each new token appeared and
+  each old token disappeared through the live daemon. A separate direct CLI
+  found each new token and the daemon served the last edit after watch stopped.
+  Three warm edits reached the daemon in 2.44–2.63 s. The store retained
+  75,102,339 logical bytes after the run, counting hard links once. The debug
+  reactor build indexed and retained the same files and windows on repeat,
+  then exceeded the probe's 90 s initial edit guard and 30 s watch shutdown
+  guard. Its daemon accepted a separate stop and removed its socket. See
+  `cw-signed/receipt.json` and `code-watch-diagnostic.log`.
+- A separate 120 s CPU sample of debug watch startup on a copy reproduced
+  the stalled selector. The process spent 99% of a core, with 4,301 samples
+  and zero lost. Sparse RaptorQ matrix access dominated the leaf samples.
+  The incomplete successor had written the 7,041,536-byte fast FSVI without
+  its repair sidecar. This identifies where to instrument a release-profile
+  watch and cancellation test. See `watch-profile/{hotspots,time}.log`.
 
 ### Vision checklist
 
@@ -220,8 +262,35 @@ Quill conformance and performance program.
 - [x] Materialize the 582-file versioned code corpus used by the existing
   product evaluator and retain its 253 frozen relevance judgments.
 - [x] Run both optimized executables on the same code corpus and judgments.
-- [ ] Recheck latency on a booked native host, isolate model-load cost and
-  qualify the code workload's peak memory, retained bytes and live watch cuts.
+- [x] Trace complete-generation listener intake and find where its fixed
+  10 ms tick controls readiness even with a caller-owned reactor. Track this
+  product repair in `bd-hp0hs` and keep the broader timing Bead open.
+- [x] Measure the baseline executable's readiness, cached responses, and both
+  stream phases with real models, a planted document and a missing-path filter.
+- [x] Reproduce the missing listener wake using a real socket with no intake
+  timer. Wire readiness into the bounded owner and close the re-arm race.
+- [x] Exercise the reactor path, timer fallback, incomplete senders, capacity,
+  deadlines and shutdown controls in the focused daemon suite.
+- [x] Complete the stock source gate, including four-model CLI e2e and the
+  source-build quickstart. Land the exact qualified code and close `bd-hp0hs`.
+- [x] Repeat the populated executable comparison in both orders, capture the
+  raw samples and terminal shutdown results, and update both Beads with the
+  measured scope.
+- [x] Separate the quality-loader span from first-query latency in fresh
+  daemon processes. Report the two executable profiles and page-cache scope.
+- [x] Capture fresh code-index peak RSS for both earlier release-profile runs.
+- [x] Check the signed release's old and new token membership through the
+  live daemon during in-place code-corpus edits. Verify the selector and
+  each new hit from a separate reader and after stopping watch.
+- [x] Retain the debug watch timeout and verify both owned processes stopped.
+- [x] Sample the stalled startup on a scratch copy and locate the RaptorQ
+  activity for the release-profile investigation.
+- [ ] Repeat the code-corpus watcher on the qualified current release-profile
+  build. Profile initial reconciliation and cancellation if it repeats the miss.
+- [ ] On a booked native host, compare the signed release with a current
+  release-profile build in both run orders. Retain latency percentiles,
+  independent fast and quality load times, peak RSS, per-generation disk
+  usage, retained bytes, and every missed terminal phase for both workloads.
 - [ ] Qualify cross-executable macOS reuse and the remaining documented
   installer and updater paths.
 - [ ] Advance retained FSVI v2 authority and recovery, then exercise CASS,
