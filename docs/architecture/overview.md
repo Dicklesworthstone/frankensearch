@@ -8,7 +8,7 @@ This document is the contributor-facing map of the current `frankensearch` works
 |---|---|
 | `frankensearch-core` | Shared contracts: traits (`Embedder`, `LexicalRead`, …), errors, config, canonicalization, query classes, telemetry types |
 | `frankensearch-embed` | Embedder implementations (hash control, Model2Vec/potion, FastEmbed/MiniLM, native multilingual) and model discovery/cache/download glue |
-| `frankensearch-index` | FSVI vector format, search kernels (brute force, optional `ann` via `frankenhnsw`, in-tree `native_hnsw` not yet on the search path), index builders |
+| `frankensearch-index` | FSVI vector format, brute-force search, optional `ann` via `frankenhnsw`, and opt-in in-tree `native_hnsw` routes for admitted v2 tiers; index builders |
 | `frankensearch-quill` | Native pure-Rust BM25 lexical engine (FSLX segments, delta-visible indexing); the default lexical backend behind the facade `lexical`/`quill` features and the only one `fsfs` ships |
 | `frankensearch-lexical` | Tantivy-backed lexical implementation, retained as the pinned conformance oracle (`lexical-tantivy`) and for external CASS schema-v8 interop (`cass-compat`); not in default builds |
 | `frankensearch-quill-gauntlet` | Differential conformance / metamorphic / perf gauntlet certifying Quill against the Tantivy oracle (`publish = false`) |
@@ -39,7 +39,7 @@ frankensearch-quill  -> (core, index formats; optional durability)
 frankensearch-fusion -> (embed, index, optional quill/lexical/rerank)
 frankensearch-quill-gauntlet -> (quill, lexical as the pinned Tantivy oracle, fusion)
 frankensearch-fsfs   -> (core, embed, index, fusion, quill, storage, durability, tui, optional native rerank; lexical only behind `shadow-oracle`)
-frankensearch-ops    -> (core, tui)
+frankensearch-ops    -> (core, tui, fsqlite with async-api, fsqlite-types)
 frankensearch facade -> (core, embed, index, fusion, quill by default for `lexical`; optional lexical-tantivy/rerank/storage/durability)
 ```
 
@@ -59,6 +59,7 @@ graph TD
   tui[frankensearch-tui]
   fsfs[frankensearch-fsfs]
   ops[frankensearch-ops]
+  fsqlite[FrankenSQLite]
   facade[frankensearch]
 
   core --> embed
@@ -96,7 +97,22 @@ graph TD
   rerank -. rerank feature .-> fsfs
   tui --> ops
   core --> ops
+  fsqlite --> ops
 ```
+
+`TwoTierIndex::enable_native_fast_hnsw` and
+`TwoTierIndex::enable_native_quality_hnsw` install the in-tree native HNSW
+route for their respective admitted v2 tier. Each tier remains independently
+configured; these methods require its frozen identity binding. The ordinary
+`fsfs` search path still defaults to brute force. The explicit native library
+and `frankensearch-native` CLI surfaces are described in
+[native search](../native-search-cli.md); their availability does not change that
+product default.
+
+Ops stores telemetry directly through FrankenSQLite's dedicated-worker
+`AsyncConnection` synchronous entry points (`async-api`). It does not depend
+on the `frankensearch-storage` crate. Its experimental product status remains
+unchanged.
 
 ## 2) End-to-End Data Flow
 

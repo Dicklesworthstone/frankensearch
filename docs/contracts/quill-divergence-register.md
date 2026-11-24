@@ -5,8 +5,12 @@ disposition changes append superseding events rather than rewriting prior
 evidence.
 **Owning beads:** `bd-quill-e0-contracts-j53p.4` (language policy) and
 `bd-quill-e6-gauntlet-scale-rm3q.8` (campaign population and terminal census).
-**Design of record:** plan §15.6. **Oracle:** tantivy `0.26.1` +
-`frankensearch-lexical` (pinned by the gauntlet's version contract).
+**Design of record:** plan §15.6. **Current executable oracle:** Tantivy
+`0.26.2` + `frankensearch-lexical`, bound by the gauntlet's
+[`oracle-version-contract.json`](../../crates/frankensearch-quill-gauntlet/oracle-version-contract.json)
+and `Cargo.lock`. Historical observations retain their original dependency
+contract and lexical audit revision, including the earlier `0.26.1` and
+`0.27.0` generations. Their retained decoding paths do not admit fresh runs.
 
 ## Doctrine
 

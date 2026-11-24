@@ -12,6 +12,20 @@ assignments to `false`. This makes the evidence used for a false→true review
 stable across the flip itself; changing a fixture, target, estimator, or any
 other manifest byte still invalidates prior evidence.
 
+The November 23 oracle-label correction from `0.27.0` to the linked registry
+`0.26.2` changes that hash from
+`03b5b0ab47a3d79b2418b720fec716aa11056792b8ca86678e35ccd8d052403a` to
+`32a6a5e0f4ed48b6fd86949fa2ed3e7bc71654c0f5e750a96b03c7eb2df6937d`.
+Only the current unmeasured v8 sentinels and generated run-plan identity move
+with it. Historical placeholders, measured receipts and dependency-contract
+decoders keep their original bytes and identities. Prior-manifest measurements
+cannot admit a current-manifest claim; fresh paired measurements are required.
+All ten gates remain inactive, and no target, comparator or statistical rule
+changes with this correction.
+The integrity split is zero newly decidable measured rows: zero WIN and zero
+LOSE. The ten updated sentinels still contain no measurements and cannot
+authorize a win or a release claim.
+
 Applicability plan schema
 `frankensearch.quill-perf-applicability-plan.v2` binds that independently
 normalized manifest SHA-256 into every plan hash. QG-1 additionally declares

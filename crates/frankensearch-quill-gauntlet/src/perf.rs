@@ -13928,20 +13928,33 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (QG-10 typed dependency facts): the manifest now binds
-        // evidence v8 and declares QG-10's deterministic structural witness as
-        // Required instead of Diagnostic. No threshold, fixture, or activation
-        // policy changed. Activation remains the sole administrative
-        // normalization exception.
+        // GOLDEN-CHANGE (bd-current-oracle-routing-docs-2fzfn): correct the
+        // stale 0.27.0 label to the actual linked 0.26.2 oracle. Only the label
+        // changes; targets, fixtures, rules and inactive flags remain frozen.
+        // Retain the previous label's exact identity below. The earlier QG-10
+        // amendment introduced evidence v8 and made its structural witness
+        // Required. Activation remains the sole normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "03b5b0ab47a3d79b2418b720fec716aa11056792b8ca86678e35ccd8d052403a",
+            "32a6a5e0f4ed48b6fd86949fa2ed3e7bc71654c0f5e750a96b03c7eb2df6937d",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
             lower_sha256_hex(manifest.as_bytes()),
             "the all-inactive manifest's normalized digest equals its raw-file digest"
+        );
+
+        let retired_oracle = manifest.replacen("tantivy 0.26.2 via", "tantivy 0.27.0 via", 1);
+        assert_eq!(
+            perf_manifest_contract_sha256(&retired_oracle),
+            "03b5b0ab47a3d79b2418b720fec716aa11056792b8ca86678e35ccd8d052403a",
+            "the prior oracle label retains its original manifest identity"
+        );
+        assert_ne!(
+            perf_manifest_contract_sha256(manifest),
+            perf_manifest_contract_sha256(&retired_oracle),
+            "correcting an oracle label must not relabel prior measurements"
         );
 
         let activated = manifest.replacen("activated = false", "activated = true", 1);
