@@ -105,6 +105,38 @@ pub fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
     }
 }
 
+/// Replacement reads ordinary index documents, so duplicates and mutation records
+/// fail before opening a model or constructing any part of the successor.
+pub fn read_update_input(reader: &mut impl BufRead, replace_source: bool) -> Result<Edits> {
+    if replace_source {
+        Ok(super::read_documents(reader)?
+            .into_iter()
+            .map(|document| (document.id.clone(), Some(document)))
+            .collect())
+    } else {
+        read_edits(reader)
+    }
+}
+
+/// Convert a complete inventory into changes against exactly this retained
+/// predecessor. In particular, an empty inventory removes all previous IDs.
+pub fn remove_omitted_documents(cx: &Cx, index: cohort::Index<'_>, edits: &mut Edits) -> Result<()> {
+    for document in cohort_documents(index) {
+        update_checkpoint(cx)?;
+        edits.entry(document.id.clone()).or_insert(None);
+    }
+    Ok(())
+}
+
+fn cohort_documents<'a>(
+    index: cohort::Index<'a>,
+) -> Box<dyn Iterator<Item = &'a IndexableDocument> + 'a> {
+    match index {
+        cohort::Index::Single(index) => Box::new(index.vectors().documents().iter()),
+        cohort::Index::Sharded(index) => Box::new(index.vectors().documents()),
+    }
+}
+
 // Bound the final retained source cohort, not just the delta. Repeated updates
 // must not evade the CLI's source limits by adding a bounded batch every time.
 pub fn validate_final_cohort<'a>(
@@ -112,14 +144,7 @@ pub fn validate_final_cohort<'a>(
     index: impl Into<cohort::Index<'a>>,
     edits: &Edits,
 ) -> Result<usize> {
-    let index = index.into();
-    // Iterate the complete source inventory, not just its first partition.
-    // The iterator borrows bodies; input accounting does not clone the corpus.
-    let documents: Box<dyn Iterator<Item = &'a IndexableDocument> + 'a> = match index {
-        cohort::Index::Single(index) => Box::new(index.vectors().documents().iter()),
-        cohort::Index::Sharded(index) => Box::new(index.vectors().documents()),
-    };
-    validate_final_source(cx, documents, edits)
+    validate_final_source(cx, cohort_documents(index.into()), edits)
 }
 
 /// Apply the same final-cohort limits to retained hybrid and authority sources.
@@ -374,17 +399,23 @@ where
             "new destinations must be outside the predecessor and must not overlap",
         ));
     }
-    let edits = match &options.input {
-        Some(path) => read_edits(&mut BufReader::new(File::open(path)?))?,
-        None => read_edits(&mut io::stdin().lock())?,
+    let mut edits = match &options.input {
+        Some(path) => read_update_input(
+            &mut BufReader::new(File::open(path)?),
+            options.replace_source,
+        )?,
+        None => read_update_input(&mut io::stdin().lock(), options.replace_source)?,
     };
-    let edited_ids = edits.len();
     update_checkpoint(cx)?;
     let models = load(
         options.models.as_deref(),
         previous.quality_producer.is_some(),
     )?;
     let index = sharded::Opened::open(cx, &previous, models).await?;
+    if options.replace_source {
+        remove_omitted_documents(cx, index.borrow(), &mut edits)?;
+    }
+    let edited_ids = edits.len();
     let selection = match &index {
         sharded::Opened::Single(index) => {
             apply(cx, &previous, index, &directory, edits, options.batch_size)

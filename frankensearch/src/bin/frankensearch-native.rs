@@ -94,7 +94,7 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--query-cache-entries N (0..1024 per model, default 0)]\n\
          [--lexical-only (fixed snapshot; no models or write controls)]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
-         [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\
+         [--input JSONL] [--replace-source] [--model-dir DIR] [--batch-size N]\n\
          [--shard-size N (required for sharded receipts)]\n\n\
   rebuild --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
           [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
@@ -120,6 +120,8 @@ The original query deadline covers all requested phases.\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
 Updates use op=upsert with those fields, or {\"op\":\"delete\",\"id\":\"...\"}.\n\
 The last update for an ID wins; every input record must be valid.\n\
+With update --replace-source, supply index documents with unique IDs. Omitted\n\
+IDs are removed from the successor; an empty inventory selects zero documents.\n\
 Omit --input to read stdin. Content is passed to the models without hidden\n\
 canonicalization; prepare/chunk documents explicitly. IDs must be unique.\n\
 Models are local-only; no downloads or hash fallback. Both tiers are required\n\
@@ -171,6 +173,7 @@ struct Options {
     new_receipt: Option<PathBuf>,
     directory: Option<PathBuf>,
     input: Option<PathBuf>,
+    replace_source: bool,
     models: Option<PathBuf>,
     quality: models::QualityOptions,
     query: Option<String>,
@@ -221,6 +224,7 @@ impl Options {
             new_receipt: None,
             directory: None,
             input: None,
+            replace_source: false,
             models: None,
             quality: models::QualityOptions::default(),
             query: None,
@@ -299,6 +303,7 @@ impl Options {
                 {
                     options.directory = Some(PathBuf::from(value(&mut args)?));
                 }
+                "--replace-source" if command == Command::Update => options.replace_source = true,
                 "--input" if matches!(command, Command::Index | Command::Update) => {
                     options.input = Some(PathBuf::from(value(&mut args)?));
                 }

@@ -2922,20 +2922,6 @@ async fn build_and_publish_update(
     )
 }
 
-fn read_authority_update_input(
-    reader: &mut impl BufRead,
-    replace_source: bool,
-) -> Result<mutations::Edits> {
-    if replace_source {
-        Ok(read_documents(reader)?
-            .into_iter()
-            .map(|document| (document.id.clone(), Some(document)))
-            .collect())
-    } else {
-        mutations::read_edits(reader)
-    }
-}
-
 async fn update_generation_with_loader<F>(
     cx: &Cx,
     options: &Options,
@@ -2978,11 +2964,11 @@ where
             replace_source: options.replace_source,
         },
         || match &options.input {
-            Some(path) => read_authority_update_input(
+            Some(path) => mutations::read_update_input(
                 &mut BufReader::new(File::open(path)?),
                 options.replace_source,
             ),
-            None => read_authority_update_input(&mut io::stdin().lock(), options.replace_source),
+            None => mutations::read_update_input(&mut io::stdin().lock(), options.replace_source),
         },
     )?;
     let document_count = prepared.document_count;

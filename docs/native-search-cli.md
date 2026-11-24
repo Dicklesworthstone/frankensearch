@@ -1841,6 +1841,13 @@ is an explicit delete plus upsert. All records, even superseded records, must
 be valid. Unknown operations/fields, invalid IDs, malformed input, or an
 oversized final source cohort reject the update.
 
+For a complete rescan, pass `--replace-source --input inventory.jsonl` to
+`update`. Supply the same document records as `index`, in any order, with a
+unique ID per record. Every omitted ID disappears from the successor, including
+when the inventory is empty. The `edited_ids` count includes both supplied
+and removed IDs. For a sharded receipt, provide the desired `--shard-size`.
+Moving an unchanged document between partitions preserves its vector reuse.
+
 Unchanged content reuses the admitted vector in each eligible tier. A title or
 metadata-only change therefore updates Quill and retained text without running
 embedding inference again. New or changed content is embedded by the original

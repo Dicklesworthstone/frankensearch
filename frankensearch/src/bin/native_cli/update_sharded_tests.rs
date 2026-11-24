@@ -302,6 +302,89 @@ fn sharded_update_command_repartitions_reuses_and_reopens_the_complete_successor
 }
 
 #[test]
+fn replacement_inventory_updates_single_and_sharded_selections_from_a_rescan() {
+    run_test_with_cx(|cx| async move {
+        for partitioned in [false, true] {
+            let f = fixture(&cx, true, true).await;
+            let mut options = f.options(
+                concat!(
+                    "{\"id\":\"z\",\"content\":\"common stable-z\",\"title\":\"revised\"}\n",
+                    "{\"id\":\"fresh\",\"content\":\"arrived yesterday\"}\n",
+                    "{\"id\":\"a\",\"content\":\"changed today\"}\n",
+                ),
+                3,
+            );
+            if !partitioned {
+                let original = f.root.path().join("single");
+                let (_, selection) =
+                    super::super::build(&cx, &options, &original, source(), f.models())
+                        .await
+                        .unwrap();
+                options.receipt = f.root.path().join("single.json");
+                save_selection(&selection, &options.receipt).unwrap();
+                options.shard_size = None;
+            }
+            options.replace_source = true;
+            let before = f.counts();
+            let incumbent = fs::read(&options.receipt).unwrap();
+            let mut output = Vec::new();
+            execute_with_loader(&cx, &options, &mut output, |_, _| Ok(f.models()))
+                .await
+                .unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["edited_ids"], 6); // three supplied plus three omitted
+            let selected = Selection::read(options.new_receipt.as_ref().unwrap()).unwrap();
+            let next = sharded::Opened::open(&cx, &selected, f.models()).await.unwrap();
+            let documents = cohort_documents(next.borrow()).collect::<Vec<_>>();
+            assert_eq!(
+                documents.iter().map(|doc| doc.id.as_str()).collect::<Vec<_>>(),
+                ["a", "fresh", "z"]
+            );
+            assert_eq!(documents[2].title.as_deref(), Some("revised"));
+            assert_eq!(f.counts(), (before.0 + 2, before.1.map(|n| n + 2)));
+            assert_eq!(fs::read(&options.receipt).unwrap(), incumbent);
+            assert!(f.index.vectors().document("c").is_some());
+        }
+    });
+}
+
+#[test]
+fn replacement_inventory_refuses_invalid_records_before_loading_and_accepts_empty() {
+    run_test_with_cx(|cx| async move {
+        let f = fixture(&cx, false, false).await;
+        for invalid in [
+            "{\"id\":\"a\",\"content\":\"one\"}\n{\"id\":\"a\",\"content\":\"two\"}",
+            "{\"op\":\"delete\",\"id\":\"a\"}",
+            "{\"id\":\"a\",\"content\":\"one\"}\n{",
+        ] {
+            let mut options = f.options(invalid, 3);
+            options.replace_source = true;
+            let mut output = Vec::new();
+            assert!(
+                execute_with_loader(&cx, &options, &mut output, |_, _| {
+                    panic!("invalid replacement reached model loading")
+                })
+                .await
+                .is_err()
+            );
+            assert!(output.is_empty());
+            assert!(!options.new_receipt.as_ref().unwrap().exists());
+            assert!(!options.directory.as_ref().unwrap().exists());
+        }
+        let mut options = f.options("", 3);
+        options.replace_source = true;
+        execute_with_loader(&cx, &options, &mut Vec::new(), |_, _| Ok(f.models()))
+            .await
+            .unwrap();
+        let selection = Selection::read(options.new_receipt.as_ref().unwrap()).unwrap();
+        let empty = sharded::open(&cx, &selection, f.models()).await.unwrap();
+        assert_eq!(empty.vectors().document_count(), 0);
+        assert!(empty.vectors().quality().is_none());
+        assert_eq!(f.counts(), (5, None));
+    });
+}
+
+#[test]
 fn delete_all_keeps_an_empty_required_shard_and_can_be_updated_after_restart() {
     run_test_with_cx(|cx| async move {
         let f = fixture(&cx, true, true).await;

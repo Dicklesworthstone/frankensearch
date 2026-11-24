@@ -653,6 +653,46 @@ fn update_admission_preserves_last_edit_wins_and_rejects_invalid_records() {
         "new.json",
     ]);
     assert_eq!(options.command, Command::Update);
+    assert!(!options.replace_source);
+    let replace = [
+        "update",
+        "--receipt",
+        "old",
+        "--index-dir",
+        "new",
+        "--new-receipt",
+        "next",
+        "--replace-source",
+    ];
+    assert!(
+        Options::parse(replace.map(str::to_owned))
+            .unwrap()
+            .unwrap()
+            .replace_source
+    );
+    assert!(
+        Options::parse(
+            replace
+                .into_iter()
+                .chain(["--replace-source"])
+                .map(str::to_owned)
+        )
+        .is_err()
+    );
+    assert!(
+        Options::parse(
+            [
+                "index",
+                "--receipt",
+                "r",
+                "--index-dir",
+                "new",
+                "--replace-source"
+            ]
+            .map(str::to_owned)
+        )
+        .is_err()
+    );
     let edits = update::read_edits(&mut Cursor::new(concat!(
         "{\"op\":\"upsert\",\"id\":\"a\",\"content\":\"first\"}\n",
         "{\"op\":\"delete\",\"id\":\"a\"}\n",
