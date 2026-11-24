@@ -174,16 +174,17 @@ mod lifecycle {
     use super::super::super::{
         CommitRange, DEFAULT_IMAGE_BYTES, HnswParams, IndexableDocument, MAX_INPUT_BYTES,
         NativeBuildPrecision, NativeGenerationSnapshot, NativeGenerationTopology,
-        PublicationFailure, SearchError, create_root, recover, save_receipt, stage_and_publish,
-        write_immutable,
+        PROGRESSIVE_RECEIPT_SCHEMA, PublicationFailure, SearchError, create_root, recover,
+        save_receipt, stage_and_publish, write_immutable,
     };
     use super::*;
     use frankensearch_core::generation::{
         ActivationManifest, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
-        EmbeddingSpaceKindV1, GenerationComponentRole,
+        EmbeddingSpaceKindV1, GenerationComponentRole, SourceCheckpointV1,
     };
     use frankensearch_core::{ModelCategory, SearchFuture, SearchResult};
     use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
+    use frankensearch_index::vector_cohort::ExactVectorCohortV1;
     use std::fs;
     use std::io;
     use std::os::unix::fs::DirBuilderExt as _;
@@ -357,8 +358,9 @@ mod lifecycle {
             EmbedderTierTag::Fast
         };
         let primary = Provider::new(tier == EmbedderTierTag::Quality);
-        let quality =
-            (topology == NativeGenerationTopology::FullProgressive).then(|| Provider::new(true));
+        let partial = matches!(topology, NativeGenerationTopology::PartialQuality { .. });
+        let quality = (topology == NativeGenerationTopology::FullProgressive || partial)
+            .then(|| Provider::new(true));
         let retrieval = if ann {
             NativeBuildRetrieval::Hnsw {
                 params: HnswParams::default(),
@@ -385,7 +387,14 @@ mod lifecycle {
             builder = builder
                 .with_quality_embedder(quality.clone())
                 .unwrap()
-                .with_quality_storage(NativeBuildPrecision::F32, retrieval)
+                .with_quality_storage(
+                    if partial {
+                        NativeBuildPrecision::F16
+                    } else {
+                        NativeBuildPrecision::F32
+                    },
+                    retrieval,
+                )
                 .unwrap();
         }
         if !empty {
@@ -398,7 +407,17 @@ mod lifecycle {
             ]);
         }
         let source = CommitRange { low: 4, high: 9 };
-        let built = if quality.is_some() {
+        let built = if partial {
+            builder
+                .build_partial_quality_generation(
+                    cx,
+                    source,
+                    ["retry".to_owned()],
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .await
+                .unwrap()
+        } else if quality.is_some() {
             builder
                 .build_progressive_generation(cx, source, DEFAULT_IMAGE_BYTES)
                 .await
@@ -1104,6 +1123,312 @@ mod lifecycle {
         });
     }
 
+    fn partial_topology() -> NativeGenerationTopology {
+        NativeGenerationTopology::PartialQuality {
+            quality_documents: 1,
+            total_documents: 2,
+            coverage_ppm: 500_000,
+        }
+    }
+
+    fn partial_cohort(
+        cx: &Cx,
+        receipt: &Receipt,
+        snapshot: &NativeGenerationSnapshot,
+    ) -> ExactVectorCohortV1 {
+        ExactVectorCohortV1::admit_with_coverage(
+            cx,
+            snapshot
+                .retained_snapshot()
+                .closure()
+                .bytes(GenerationComponentRole::Vector)
+                .unwrap(),
+            &receipt.binding().unwrap(),
+            &receipt.quality_binding().unwrap().unwrap(),
+            SourceCheckpointV1::derive(&snapshot.metadata().commit_range),
+            VectorCohortCoverage::PartialQuality,
+            DEFAULT_IMAGE_BYTES,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn partial_vector_repair_preserves_sparse_quality_bits_without_models_or_source_export() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (primary_seed, quality_seed, missing) in
+                [(Some(41), Some(43), false), (None, None, true)]
+            {
+                let fixture = fixture(&cx, partial_topology(), true, false).await;
+                let original = partial_cohort(&cx, &fixture.selected, &fixture.snapshot);
+                let lexical = fixture
+                    .snapshot
+                    .retained_snapshot()
+                    .closure()
+                    .bytes(GenerationComponentRole::Lexical)
+                    .unwrap();
+                let source_documents = serde_json::to_value(
+                    fixture
+                        .snapshot
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap(),
+                )
+                .unwrap();
+                let damaged = damage(&cx, &fixture, GenerationComponentRole::Ann, missing);
+                assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                let root = admit_root(&fixture.selected.root).unwrap();
+                let source =
+                    open_vector_source(&cx, &root, &fixture.selected, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(source.source().topology(), partial_topology());
+                // Healthy vector membership authorizes this path. Source-only
+                // and ordinary complete admission must still refuse it.
+                assert!(
+                    NativeGenerationSource::admit(
+                        &cx,
+                        Arc::clone(source.retained_vector_source().source()),
+                        source.source().binding(),
+                        source.source().quality_binding(),
+                        EmbedderTierTag::Fast,
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    NativeGenerationVectorSource::admit(
+                        &cx,
+                        Arc::clone(source.retained_vector_source()),
+                        source.source().binding(),
+                        source.source().quality_binding(),
+                        EmbedderTierTag::Fast,
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .is_err()
+                );
+
+                let primary_calls = fixture.primary.calls.load(Ordering::SeqCst);
+                let quality = fixture.quality.as_ref().unwrap();
+                let quality_calls = quality.calls.load(Ordering::SeqCst);
+                let mut options =
+                    fixture.vector_options("partial-repaired", primary_seed, quality_seed);
+                options.max_source_bytes = 0;
+                let mut loads = 0;
+                let mut output = Vec::new();
+                with_loader(&cx, &options, &mut output, |_| {
+                    loads += 1;
+                    Err(bad("partial vector repair must not load a model"))
+                })
+                .await
+                .unwrap();
+                assert_eq!(loads, 0);
+                assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), primary_calls);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls);
+
+                let receipt = Receipt::read(&options.receipt).unwrap();
+                let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(reopened.topology(), partial_topology());
+                assert_eq!(receipt.quality_documents, Some(1));
+                assert_eq!(receipt.identity, fixture.selected.identity);
+                assert_eq!(receipt.quality_identity, fixture.selected.quality_identity);
+                assert_eq!(
+                    receipt.generation.sequence,
+                    fixture.selected.generation.sequence + 1
+                );
+                let repaired = partial_cohort(&cx, &receipt, &reopened);
+                for (old, new) in [
+                    (original.fast(), repaired.fast()),
+                    (original.quality(), repaired.quality()),
+                ] {
+                    assert_eq!(
+                        old.identity_binding().frozen_identity(),
+                        new.identity_binding().frozen_identity()
+                    );
+                    assert_eq!(old.record_count(), new.record_count());
+                    for physical in 0..old.record_count() {
+                        let old = old.row(physical).unwrap();
+                        let new = new.row(physical).unwrap();
+                        assert_eq!(old.doc_id(), new.doc_id());
+                        assert_eq!(old.flags(), new.flags());
+                        assert_eq!(old.vector_bytes(), new.vector_bytes());
+                    }
+                }
+                assert_eq!(repaired.quality().row(0).unwrap().doc_id(), "retry");
+                assert_eq!(repaired.quality_receipt().live_document_count, 1);
+                assert_eq!(
+                    reopened
+                        .retained_snapshot()
+                        .closure()
+                        .bytes(GenerationComponentRole::Lexical)
+                        .unwrap(),
+                    lexical
+                );
+                assert_eq!(
+                    serde_json::to_value(reopened.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
+                        .unwrap(),
+                    source_documents
+                );
+                assert_eq!(
+                    reopened.metadata().commit_range,
+                    fixture.snapshot.metadata().commit_range
+                );
+                let manifest = reopened.retained_snapshot().manifest();
+                let previous = fixture.snapshot.retained_snapshot().manifest();
+                assert_eq!(
+                    manifest.predecessor(),
+                    Some(fixture.selected.authority().unwrap())
+                );
+                assert_eq!(
+                    manifest.document_set_sha256(),
+                    previous.document_set_sha256()
+                );
+                assert_eq!(
+                    manifest.source_checkpoint_sha256(),
+                    previous.source_checkpoint_sha256()
+                );
+                assert_ne!(manifest.components().ann, previous.components().ann);
+                assert_eq!(manifest.components().ann.is_some(), primary_seed.is_some());
+                let (primary, quality_policy) =
+                    vector_policies(&options, &fixture.selected).unwrap();
+                assert_eq!(reopened.retrieval_configuration(), primary);
+                assert_eq!(reopened.quality_retrieval_configuration(), quality_policy);
+                if missing {
+                    assert!(!damaged.exists());
+                } else {
+                    assert_eq!(fs::read(&damaged).unwrap(), b"damaged-component-evidence");
+                }
+                for retained in [fixture.snapshot.as_ref(), &reopened] {
+                    let hits = retained
+                        .search_progressive_with_partial_quality(
+                            &cx,
+                            fixture.primary.as_ref(),
+                            quality.as_ref(),
+                            "retry",
+                            2,
+                        )
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(hits.len(), 2);
+                    assert!(
+                        hits.iter()
+                            .find(|hit| hit.doc_id == "retry")
+                            .unwrap()
+                            .quality_score
+                            .is_some()
+                    );
+                    let uncovered = hits.iter().find(|hit| hit.doc_id == "garden").unwrap();
+                    assert!(uncovered.fast_score.is_some());
+                    assert!(uncovered.quality_score.is_none());
+                    assert!(
+                        retained
+                            .search_progressive_with_quality(
+                                &cx,
+                                fixture.primary.as_ref(),
+                                quality.as_ref(),
+                                "retry",
+                                2,
+                            )
+                            .is_err()
+                    );
+                }
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["source"], "authenticated_retained_vectors");
+                assert_eq!(report["vectors_reused"], true);
+                assert_eq!(report["selection"]["quality_documents"], 1);
+            }
+        });
+    }
+
+    #[test]
+    fn partial_vector_repair_refuses_source_only_forged_coverage_and_unhealthy_vectors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture(&cx, partial_topology(), true, false).await;
+            let graph = damage(&cx, &fixture, GenerationComponentRole::Ann, false);
+            let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+            for case in [
+                "repeated-seed",
+                "source-only",
+                "complete-receipt",
+                "foreign-quality",
+                "budget",
+                "cancelled",
+                "damaged-vector",
+            ] {
+                let mut options = fixture.vector_options(case, Some(47), Some(53));
+                match case {
+                    "repeated-seed" => {
+                        options.repair_vectors.primary_seed = Some(17);
+                        options.repair_vectors.quality_seed = Some(17);
+                    }
+                    "source-only" => options.repair_vectors.reuse_vectors = false,
+                    "complete-receipt" | "foreign-quality" => {
+                        let mut receipt = fixture.selected.clone();
+                        if case == "complete-receipt" {
+                            receipt.schema = PROGRESSIVE_RECEIPT_SCHEMA.to_owned();
+                            receipt.quality_documents = None;
+                        } else {
+                            let mut identity =
+                                receipt.quality_identity.as_ref().unwrap().identity.clone();
+                            identity
+                                .producer
+                                .implementation_revision
+                                .push_str("-foreign");
+                            receipt.quality_identity = Some(identity.freeze().unwrap());
+                        }
+                        receipt.validate().unwrap();
+                        let path = fixture.parent.join(format!("wrong-{case}.json"));
+                        save_receipt(&receipt, &path).unwrap();
+                        options.from_receipt = Some(path);
+                    }
+                    "budget" => options.max_image_bytes = 1,
+                    "cancelled" => cx.set_cancel_requested(true),
+                    "damaged-vector" => {
+                        damage(&cx, &fixture, GenerationComponentRole::Vector, false);
+                    }
+                    _ => unreachable!(),
+                }
+                let mut loads = 0;
+                let error = with_loader(&cx, &options, &mut Vec::new(), |_| {
+                    loads += 1;
+                    Err(bad("partial repair must not fall back to models"))
+                })
+                .await
+                .unwrap_err();
+                if case == "cancelled" {
+                    assert!(matches!(
+                        error.downcast_ref::<SearchError>(),
+                        Some(SearchError::Cancelled { .. })
+                    ));
+                }
+                cx.set_cancel_requested(false);
+                assert_eq!(loads, 0, "case {case}");
+                if case != "repeated-seed" {
+                    assert!(!options.work.as_ref().unwrap().exists(), "case {case}");
+                }
+                assert!(!options.receipt.exists(), "case {case}");
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    before
+                );
+                assert_eq!(fs::read(&graph).unwrap(), b"damaged-component-evidence");
+            }
+            let complete =
+                self::fixture(&cx, NativeGenerationTopology::FullProgressive, true, false).await;
+            let root = admit_root(&complete.selected.root).unwrap();
+            let source =
+                open_vector_source(&cx, &root, &complete.selected, DEFAULT_IMAGE_BYTES).unwrap();
+            assert!(
+                NativeGenerationVectorSource::admit_partial_quality(
+                    &cx,
+                    Arc::clone(source.retained_vector_source()),
+                    source.source().binding(),
+                    source.source().quality_binding().unwrap(),
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .is_err()
+            );
+        });
+    }
+
     #[test]
     fn retained_vector_failures_never_fallback_to_models_or_publish_partial_repairs() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -1164,97 +1489,118 @@ mod lifecycle {
     #[test]
     fn retained_vector_publication_keeps_its_original_physical_parent_after_another_repair_wins() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let fixture = fixture(&cx, NativeGenerationTopology::FastOnly, true, false).await;
-            damage(&cx, &fixture, GenerationComponentRole::Ann, false);
-            let root = admit_root(&fixture.selected.root).unwrap();
-            let source =
-                open_vector_source(&cx, &root, &fixture.selected, DEFAULT_IMAGE_BYTES).unwrap();
-            let original_pair = source.source().retained_source().authority_pair();
-            let build = |label: &str| {
-                source
-                    .rebuild(
-                        &cx,
-                        fixture.parent.join(label),
-                        new_generation(2).unwrap(),
-                        NativeBuildRetrieval::Exact,
-                        None,
-                        DEFAULT_IMAGE_BYTES,
-                    )
-                    .unwrap()
-            };
-            let stale = build("stale-vector-work");
-            let stale_prepared = prepare_repair(
-                source.source(),
-                &stale,
-                DEFAULT_IMAGE_BYTES,
-                NativeBuildRetrieval::Exact,
-                None,
-                true,
-            )
-            .unwrap();
-            let winner = build("winning-vector-work");
-            let winning_prepared = prepare_repair(
-                source.source(),
-                &winner,
-                DEFAULT_IMAGE_BYTES,
-                NativeBuildRetrieval::Exact,
-                None,
-                true,
-            )
-            .unwrap();
-            let published = stage_prepared_and_publish(
-                &cx,
-                &root,
-                &fixture.selected.root,
-                &fixture.parent.join("winning-vector.json"),
-                &winner,
-                winning_prepared,
-                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
-            )
-            .unwrap();
-            let selected = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
-            let stale_receipt = fixture.parent.join("stale-vector.json");
-            let result = stage_prepared_and_publish(
-                &cx,
-                &root,
-                &fixture.selected.root,
-                &stale_receipt,
-                &stale,
-                stale_prepared,
-                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
-            );
-            let Err(error) = result else {
-                panic!("stale vector repair must not replace the winning selection");
-            };
-            assert_eq!(
-                error.downcast_ref::<PublicationFailure>().unwrap().0["publication"],
-                "not_committed"
-            );
-            assert_eq!(
-                Receipt::read(&stale_receipt)
-                    .unwrap()
-                    .recovery_attempt()
-                    .unwrap()
-                    .expected,
-                original_pair
-            );
-            assert_eq!(
-                fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
-                selected
-            );
-            published.receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
-            let options = fixture.vector_options("stale-vector-retry", None, None);
-            let mut loads = 0;
-            assert!(
-                with_loader(&cx, &options, &mut Vec::new(), |_| {
-                    loads += 1;
-                    Err(bad("no loader on a stale vector receipt"))
-                })
-                .await
-                .is_err()
-            );
-            assert_eq!(loads, 0);
-            assert!(!options.work.as_ref().unwrap().exists());
+            for topology in [NativeGenerationTopology::FastOnly, partial_topology()] {
+                let fixture = fixture(&cx, topology, true, false).await;
+                damage(&cx, &fixture, GenerationComponentRole::Ann, false);
+                let root = admit_root(&fixture.selected.root).unwrap();
+                let source =
+                    open_vector_source(&cx, &root, &fixture.selected, DEFAULT_IMAGE_BYTES).unwrap();
+                let original_pair = source.source().retained_source().authority_pair();
+                let quality_policy = source
+                    .source()
+                    .quality_binding()
+                    .map(|_| NativeBuildRetrieval::Exact);
+                let build = |label: &str| {
+                    source
+                        .rebuild(
+                            &cx,
+                            fixture.parent.join(label),
+                            new_generation(2).unwrap(),
+                            NativeBuildRetrieval::Exact,
+                            quality_policy,
+                            DEFAULT_IMAGE_BYTES,
+                        )
+                        .unwrap()
+                };
+                let stale = build("stale-vector-work");
+                if matches!(topology, NativeGenerationTopology::PartialQuality { .. }) {
+                    // A vector-admitted source cannot authorize the source-only
+                    // repair route, even when the proposed subset is unchanged.
+                    assert!(
+                        prepare_repair(
+                            source.source(),
+                            &stale,
+                            DEFAULT_IMAGE_BYTES,
+                            NativeBuildRetrieval::Exact,
+                            quality_policy,
+                            false,
+                        )
+                        .is_err()
+                    );
+                }
+                let stale_prepared = prepare_repair(
+                    source.source(),
+                    &stale,
+                    DEFAULT_IMAGE_BYTES,
+                    NativeBuildRetrieval::Exact,
+                    quality_policy,
+                    true,
+                )
+                .unwrap();
+                let winner = build("winning-vector-work");
+                let winning_prepared = prepare_repair(
+                    source.source(),
+                    &winner,
+                    DEFAULT_IMAGE_BYTES,
+                    NativeBuildRetrieval::Exact,
+                    quality_policy,
+                    true,
+                )
+                .unwrap();
+                let published = stage_prepared_and_publish(
+                    &cx,
+                    &root,
+                    &fixture.selected.root,
+                    &fixture.parent.join("winning-vector.json"),
+                    &winner,
+                    winning_prepared,
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                )
+                .unwrap();
+                let selected = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let stale_receipt = fixture.parent.join("stale-vector.json");
+                let result = stage_prepared_and_publish(
+                    &cx,
+                    &root,
+                    &fixture.selected.root,
+                    &stale_receipt,
+                    &stale,
+                    stale_prepared,
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                );
+                let Err(error) = result else {
+                    panic!("stale vector repair must not replace the winning selection");
+                };
+                assert_eq!(
+                    error.downcast_ref::<PublicationFailure>().unwrap().0["publication"],
+                    "not_committed"
+                );
+                assert_eq!(
+                    Receipt::read(&stale_receipt)
+                        .unwrap()
+                        .recovery_attempt()
+                        .unwrap()
+                        .expected,
+                    original_pair
+                );
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    selected
+                );
+                published.receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let options = fixture.vector_options("stale-vector-retry", None, None);
+                let mut loads = 0;
+                assert!(
+                    with_loader(&cx, &options, &mut Vec::new(), |_| {
+                        loads += 1;
+                        Err(bad("no loader on a stale vector receipt"))
+                    })
+                    .await
+                    .is_err()
+                );
+                assert_eq!(loads, 0);
+                assert!(!options.work.as_ref().unwrap().exists());
+            }
         });
     }
 

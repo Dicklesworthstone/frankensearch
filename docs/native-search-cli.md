@@ -282,8 +282,10 @@ Full-query tuning remains restricted to complete full generations.
 `authority-serve` retains both producers and accepts `"mode":"partial"` explicitly;
 its default remains fast. Source fetch, lexical search, publication-attempt
 recovery, and retained rollback use the complete admitted source. Partial sources
-currently refuse update, rebuild, repair, and ordinary model activation; these
-operations need an explicit policy for preserving or changing the subset.
+support graph repair with `authority-repair --reuse-vectors` when both vector
+owners still authenticate. They currently refuse update, rebuild, source-only
+repair, and ordinary model activation; these operations need an explicit policy
+for preserving or changing the subset.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
 A warm partial server can adopt that completed generation through the explicit
@@ -637,6 +639,16 @@ If the vectors still authenticate and only the graphs need rebuilding, add
 `--reuse-vectors` and omit model options. This route preserves the exact vector
 values and Quill bytes without loading models, exporting the corpus or running
 inference. It accepts the same explicit exact/HNSW choices and graph seeds.
+This includes partial quality generations: the complete fast owner and the
+sparse quality owner must both authenticate, and the repaired generation keeps
+the same covered IDs, quality count, source cohort and per-tier vector values.
+It remains a partial generation with explicit partial query mode; graph repair
+does not fill missing quality coverage.
+
+Source-only re-embedding still refuses partial quality generations. Their source
+metadata authenticates a coverage commitment but cannot reconstruct the exact
+quality subset when its vector owner is unavailable. Healthy retained vectors
+are therefore required for partial repair.
 
 Both routes retain the original physical authority pair through preparation and
 publication. A competing publisher causes refusal rather than replacing its

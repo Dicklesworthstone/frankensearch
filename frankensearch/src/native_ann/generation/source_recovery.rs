@@ -17,7 +17,7 @@ use frankensearch_index::exact_component_adapters::vector_component_receipt;
 use frankensearch_index::generation_root::generation_reader::{
     OpenedGenerationSourceV1, OpenedGenerationVectorSourceV1, component_object_name_v1,
 };
-use frankensearch_index::vector_cohort::ExactVectorCohortV1;
+use frankensearch_index::vector_cohort::{ExactVectorCohortV1, VectorCohortCoverage};
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{
     DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillIndexError, QuillSnapshotIndex,
@@ -49,14 +49,17 @@ pub struct NativeGenerationSource {
     primary: FsviV2IdentityBinding,
     quality: Option<FsviV2IdentityBinding>,
     tier: EmbedderTierTag,
+    topology: NativeGenerationTopology,
 }
 
 /// Authenticated retained vectors and source for repair without model inference.
 ///
 /// The source and every independently identified vector tier are fully admitted,
-/// including exact physical rows, complete live membership, source checkpoint
-/// and metadata. The selected ANN image may be missing or corrupt and is never
-/// read. This capability consequently has no search interface or conversion to
+/// including exact physical rows, independently checked live membership, source
+/// checkpoint and metadata. Explicit partial admission retains a proper quality
+/// subset of the complete fast and lexical corpus. The selected ANN image may
+/// be missing or corrupt and is never read. This capability consequently has no
+/// search interface or conversion to
 /// an ordinary generation snapshot.
 ///
 /// [`Self::rebuild`] preserves the source image and the exact stored vector bits
@@ -88,29 +91,82 @@ impl NativeGenerationVectorSource {
         tier: EmbedderTierTag,
         max_image_bytes: usize,
     ) -> SearchResult<Self> {
+        Self::admit_with_coverage(
+            cx,
+            authority,
+            primary,
+            quality,
+            tier,
+            VectorCohortCoverage::Complete,
+            max_image_bytes,
+        )
+    }
+
+    /// Admit a healthy complete fast owner and its retained proper quality subset.
+    ///
+    /// The independently expected bindings and actual FSVC v2 live rows must
+    /// agree with the authenticated source metadata. Partial coverage is never
+    /// inferred from a count or accepted by ordinary complete admission. This
+    /// capability can rebuild damaged ANN images without filling or changing
+    /// the selected quality subset, and does not admit the damaged accelerator.
+    ///
+    /// # Errors
+    /// Refuses complete or malformed coverage, foreign identities, corrupt
+    /// vectors/source, inconsistent metadata, image limits and cancellation.
+    pub fn admit_partial_quality(
+        cx: &Cx,
+        authority: Arc<OpenedGenerationVectorSourceV1>,
+        fast: &FsviV2IdentityBinding,
+        quality: &FsviV2IdentityBinding,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
+        Self::admit_with_coverage(
+            cx,
+            authority,
+            fast,
+            Some(quality),
+            EmbedderTierTag::Fast,
+            VectorCohortCoverage::PartialQuality,
+            max_image_bytes,
+        )
+    }
+
+    fn admit_with_coverage(
+        cx: &Cx,
+        authority: Arc<OpenedGenerationVectorSourceV1>,
+        primary: &FsviV2IdentityBinding,
+        quality: Option<&FsviV2IdentityBinding>,
+        tier: EmbedderTierTag,
+        coverage: VectorCohortCoverage,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.generation.vector_recovery_admit")?;
         if authority.retained_image_bytes() > u64::try_from(max_image_bytes).unwrap_or(u64::MAX) {
             return Err(refused("vector-recovery", "encoded-image-limit"));
         }
-        let source = NativeGenerationSource::admit(
+        let components = admit_source_components_with_coverage(
             cx,
-            Arc::clone(authority.source()),
+            authority.source().manifest(),
             primary,
             quality,
             tier,
+            authority.source().lexical_bytes(),
+            &authority.source().metadata_bytes(),
+            coverage,
             max_image_bytes,
         )?;
-        let checkpoint_value = SourceCheckpointV1::derive(&source.metadata().commit_range);
+        let checkpoint_value = SourceCheckpointV1::derive(&components.metadata.commit_range);
         let activation = authority.source().manifest();
         let vector_bytes = authority.vector_bytes();
         let cohort = quality
             .map(|quality| {
-                ExactVectorCohortV1::admit(
+                ExactVectorCohortV1::admit_with_coverage(
                     cx,
                     Arc::clone(&vector_bytes),
                     primary,
                     quality,
                     checkpoint_value,
+                    coverage,
                     max_image_bytes,
                 )
             })
@@ -141,7 +197,7 @@ impl NativeGenerationVectorSource {
             .map_or(&primary_receipt, ExactVectorCohortV1::receipt);
         if vector_receipt.bytes != activation.components().vector
             || vector_receipt.docset_digest != activation.document_set_sha256()
-            || vector_receipt.live_document_count != source.metadata().total_documents
+            || vector_receipt.live_document_count != components.metadata.total_documents
         {
             return Err(refused("vector-recovery", "selected-vector-mismatch"));
         }
@@ -149,16 +205,16 @@ impl NativeGenerationVectorSource {
             .map_err(|_| refused("vector-recovery", "invalid-live-document-set"))?;
         let metadata_bytes = authority.source().metadata_bytes();
         let metadata_receipt = ExactComponentReceiptV1::for_metadata_manifest(
-            source.metadata(),
+            &components.metadata,
             &metadata_bytes,
             &documents,
         )
         .map_err(|_| refused("vector-recovery", "metadata-document-set-mismatch"))?;
         metadata_receipt
-            .verify_metadata_manifest(source.metadata(), &metadata_bytes)
+            .verify_metadata_manifest(&components.metadata, &metadata_bytes)
             .map_err(|_| refused("vector-recovery", "metadata-receipt-mismatch"))?;
         validate_artifact_metadata(
-            source.metadata(),
+            &components.metadata,
             primary,
             activation,
             &owner,
@@ -167,6 +223,34 @@ impl NativeGenerationVectorSource {
                 (binding, cohort.quality().as_ref(), cohort.quality_receipt())
             }),
         )?;
+        let topology = match (cohort.as_ref(), coverage, tier) {
+            (Some(cohort), VectorCohortCoverage::PartialQuality, _) => {
+                let quality_documents = cohort.quality_receipt().live_document_count;
+                let total_documents = cohort.fast_receipt().live_document_count;
+                let coverage_ppm = u32::try_from(
+                    u128::from(quality_documents) * 1_000_000 / u128::from(total_documents),
+                )
+                .map_err(|_| refused("vector-recovery", "quality-coverage-overflow"))?;
+                NativeGenerationTopology::PartialQuality {
+                    quality_documents,
+                    total_documents,
+                    coverage_ppm,
+                }
+            }
+            (Some(_), VectorCohortCoverage::Complete, _) => {
+                NativeGenerationTopology::FullProgressive
+            }
+            (None, _, EmbedderTierTag::Quality) => NativeGenerationTopology::QualityOnly,
+            (None, _, EmbedderTierTag::Fast) => NativeGenerationTopology::FastOnly,
+        };
+        let source = NativeGenerationSource {
+            authority: Arc::clone(authority.source()),
+            components,
+            primary: primary.clone(),
+            quality: quality.cloned(),
+            tier,
+            topology,
+        };
         let quality = cohort.as_ref().map(|cohort| Arc::clone(cohort.quality()));
         checkpoint(cx, "native_ann.generation.vector_recovery_ready")?;
         Ok(Self {
@@ -238,6 +322,14 @@ impl NativeGenerationSource {
             primary: primary.clone(),
             quality: quality.cloned(),
             tier,
+            topology: if quality.is_some() {
+                NativeGenerationTopology::FullProgressive
+            } else {
+                match tier {
+                    EmbedderTierTag::Fast => NativeGenerationTopology::FastOnly,
+                    EmbedderTierTag::Quality => NativeGenerationTopology::QualityOnly,
+                }
+            },
         })
     }
 
@@ -256,14 +348,7 @@ impl NativeGenerationSource {
     /// Authenticated intended topology; this is not a claim of healthy vectors.
     #[must_use]
     pub const fn topology(&self) -> NativeGenerationTopology {
-        if self.quality.is_some() {
-            NativeGenerationTopology::FullProgressive
-        } else {
-            match self.tier {
-                EmbedderTierTag::Fast => NativeGenerationTopology::FastOnly,
-                EmbedderTierTag::Quality => NativeGenerationTopology::QualityOnly,
-            }
-        }
+        self.topology
     }
 
     /// Primary tier selected by the caller and authenticated metadata.
@@ -285,7 +370,7 @@ impl NativeGenerationSource {
         &self.primary
     }
 
-    /// Independent expected quality binding for a complete two-tier generation.
+    /// Independent expected quality binding for a two-tier generation.
     #[must_use]
     pub const fn quality_binding(&self) -> Option<&FsviV2IdentityBinding> {
         self.quality.as_ref()
@@ -326,7 +411,38 @@ fn admit_source_components(
     metadata_bytes: &[u8],
     max_image_bytes: usize,
 ) -> SearchResult<SourceComponents> {
+    admit_source_components_with_coverage(
+        cx,
+        activation,
+        primary,
+        quality,
+        tier,
+        lexical_bytes,
+        metadata_bytes,
+        VectorCohortCoverage::Complete,
+        max_image_bytes,
+    )
+}
+
+// Only retained-vector admission may request partial source metadata. It must
+// independently admit the selected FSVC subset before returning a capability.
+// Public source-only recovery cannot recover that membership from metadata.
+#[allow(clippy::too_many_arguments)]
+fn admit_source_components_with_coverage(
+    cx: &Cx,
+    activation: &ActivationManifest,
+    primary: &FsviV2IdentityBinding,
+    quality: Option<&FsviV2IdentityBinding>,
+    tier: EmbedderTierTag,
+    lexical_bytes: Arc<[u8]>,
+    metadata_bytes: &[u8],
+    coverage: VectorCohortCoverage,
+    max_image_bytes: usize,
+) -> SearchResult<SourceComponents> {
     checkpoint(cx, "native_ann.generation.recovery_components")?;
+    if coverage == VectorCohortCoverage::PartialQuality && quality.is_none() {
+        return Err(refused("source-recovery", "missing-quality-binding"));
+    }
     if activation.generation() != primary.generation()
         || quality.is_some_and(|binding| binding.generation() != activation.generation())
     {
@@ -369,13 +485,32 @@ fn admit_source_components(
     checkpoint(cx, "native_ann.generation.recovery_metadata")?;
     let metadata: GenerationManifest = serde_json::from_slice(metadata_bytes)
         .map_err(|_| refused("source-recovery", "invalid-metadata-json"))?;
-    if metadata.metadata.contains_key(NATIVE_QUALITY_COVERAGE_KEY) {
+    if coverage == VectorCohortCoverage::Complete
+        && metadata.metadata.contains_key(NATIVE_QUALITY_COVERAGE_KEY)
+    {
         // This recovery builder always re-embeds every source in every tier.
         // It has no explicit quality-subset membership/reuse contract, and must
         // not silently turn a partial generation into a complete one.
         return Err(refused(
             "source-recovery",
             "partial-quality-repair-unsupported",
+        ));
+    }
+    let declared_coverage = metadata
+        .metadata
+        .get(NATIVE_QUALITY_COVERAGE_KEY)
+        .map(String::as_str);
+    if !matches!(
+        (coverage, declared_coverage),
+        (VectorCohortCoverage::Complete, None)
+            | (
+                VectorCohortCoverage::PartialQuality,
+                Some("partial_quality")
+            )
+    ) {
+        return Err(refused(
+            "source-recovery",
+            "quality-coverage-contract-mismatch",
         ));
     }
     let tier_count = if quality.is_some() { 2 } else { 1 };
@@ -407,10 +542,15 @@ fn admit_source_components(
             EmbedderTierTag::Fast => "fast",
             EmbedderTierTag::Quality => "quality",
         };
+        let minimum_rows = if position == 1 && coverage == VectorCohortCoverage::PartialQuality {
+            1
+        } else {
+            metadata.total_documents
+        };
         if artifact.embedder_tier != expected_tier
             || metadata.embedders.get(name) != Some(binding.frozen_identity())
             || usize::try_from(artifact.dimension).ok() != Some(binding.dimension())
-            || artifact.vector_count < metadata.total_documents
+            || artifact.vector_count < minimum_rows
             || (quality.is_none()
                 && (artifact.size_bytes != declared.vector.byte_len
                     || artifact.checksum != lower_hex(&declared.vector.sha256)))

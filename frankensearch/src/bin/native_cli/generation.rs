@@ -164,9 +164,10 @@ including streaming, filters, deadlines and optional reranking. Full and direct\
 quality modes require complete coverage and refuse partial generations. Results\n\
 report quality document counts and coverage. Full-query tuning remains full-only.\n\
 Partial generations support search, fetch, read-only serve, attempt recovery and\n\
-retained rollback. Update, rebuild, repair and model activation refuse partial\n\
-sources until subset-preserving mutation is available. Quality completion still\n\
-requires a fast-only source. A warm partial session accepts mode=partial explicitly.\n\
+retained rollback. Graph repair with --reuse-vectors also preserves partial coverage.\n\
+Update, rebuild, source-only repair and ordinary model activation refuse partial\n\
+sources. Explicit quality completion accepts fast-only or partial sources. A warm\n\
+partial session accepts mode=partial explicitly.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
 missing or invalid graphs fail admission without substituting exact retrieval.\n\
@@ -203,7 +204,9 @@ fields, then publishes a complete higher-sequence Repair successor. Both repair\
 routes require explicit --retrieval exact or hnsw; old images remain untouched.\n\
 With --reuse-vectors, repair instead requires intact authenticated vectors and\n\
 never loads models. It preserves exact vector values and Quill bytes without\n\
-exporting the corpus or running inference. HNSW requires\n\
+exporting the corpus or running inference. Partial generations require this route:\n\
+both vector owners must authenticate and the exact quality subset is retained.\n\
+HNSW requires\n\
 --hnsw-seed: choose a fresh seed so the rebuilt graph has a new immutable object\n\
 address. --quality-hnsw-seed selects an independent full-tier seed; otherwise it\n\
 uses --hnsw-seed. A repeated old whole-graph receipt is refused before staging.\n\
