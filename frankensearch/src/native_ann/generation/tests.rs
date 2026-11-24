@@ -3233,7 +3233,12 @@ mod qualified_rollback {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+        // The caller may explicitly select a qualified fixture filesystem.
+        // Admission below still requires the complete production root contract.
+        let base = std::env::var_os("FRANKENSEARCH_TEST_TMPDIR")
+            .or_else(|| std::env::var_os("HOME"))
+            .expect("a test directory or HOME is required");
+        let parent = PathBuf::from(base).join(format!(
             ".frankensearch-native-update-{label}-{}-{stamp}",
             std::process::id(),
         ));
@@ -4791,6 +4796,99 @@ mod qualified_rollback {
             }
 
             #[test]
+            fn partial_replacement_inventory_preserves_sparse_membership_and_exact_old_readers() {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let fixture = fixture_with_quality_input(&cx, true).await;
+                    let retained = &fixture.snapshot;
+                    let root_path = fixture.parent.join("root");
+                    let root = admit_root(&root_path);
+                    let authority_before = fs::read(root_path.join("AUTHORITY")).unwrap();
+                    let old_fast = vector_bits(&retained.readers.vector);
+                    let old_quality = vector_bits(retained.readers.quality.as_ref().unwrap());
+                    let replacement = vec![
+                        IndexableDocument::new("n", "new live document"),
+                        IndexableDocument::new("b", "beta cohort document")
+                            .with_title("Rescanned title")
+                            .with_metadata("version", "rescan"),
+                        IndexableDocument::new("a", "fast-tail-ordinary cohort"),
+                    ];
+                    let built = retained
+                        .begin_partial_quality_update(
+                            &cx,
+                            fixture.parent.join("replacement"),
+                            ArtifactGenerationIdentityV1::new(8, [0xf1; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            fixture.quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .replace_documents(&cx, replacement.clone())
+                        .unwrap()
+                        .build(&cx, CommitRange { low: 1, high: 5 }, BUDGET)
+                        .await
+                        .unwrap();
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 2);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(built.metadata().total_documents, 3);
+                    assert_eq!(built.coverage(), VectorCohortCoverage::PartialQuality);
+                    assert_eq!(
+                        fs::read(root_path.join("AUTHORITY")).unwrap(),
+                        authority_before
+                    );
+                    let current = publish_partial(&cx, &root, &built, retained, 0xf2);
+                    assert_eq!(current.partial_quality_document_ids(&cx).unwrap(), ["b"]);
+                    assert_eq!(
+                        current.topology(),
+                        NativeGenerationTopology::PartialQuality {
+                            quality_documents: 1,
+                            total_documents: 3,
+                            coverage_ppm: 333_333,
+                        }
+                    );
+                    let new_fast = vector_bits(&current.readers.vector);
+                    let new_quality = vector_bits(current.readers.quality.as_ref().unwrap());
+                    assert_eq!(new_fast["b"], old_fast["b"]);
+                    assert_eq!(new_quality["b"], old_quality["b"]);
+                    assert_eq!(new_quality.len(), 1);
+                    assert_eq!(
+                        new_fast.keys().map(String::as_str).collect::<Vec<_>>(),
+                        ["a", "b", "n"],
+                    );
+                    let mut expected = replacement;
+                    expected.sort_by(|left, right| left.id.cmp(&right.id));
+                    let mut actual = current.source_documents(&cx, BUDGET).unwrap();
+                    actual.sort_by(|left, right| left.id.cmp(&right.id));
+                    assert_eq!(
+                        serde_json::to_value(actual).unwrap(),
+                        serde_json::to_value(expected).unwrap(),
+                    );
+                    assert_eq!(vector_bits(&retained.readers.vector), old_fast);
+                    assert_eq!(
+                        vector_bits(retained.readers.quality.as_ref().unwrap()),
+                        old_quality,
+                    );
+                    let hits = current
+                        .search_progressive_with_partial_quality(
+                            &cx,
+                            fixture.fast.as_ref(),
+                            fixture.quality.as_ref(),
+                            "unmatched",
+                            3,
+                        )
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(hits.len(), 3);
+                    assert!(hits.iter().all(|hit| ["a", "b", "n"].contains(&hit.doc_id.as_str())));
+                    assert_eq!(
+                        retained.partial_quality_document_ids(&cx).unwrap(),
+                        ["b", "e"],
+                    );
+                });
+            }
+
+            #[test]
             fn partial_updates_precision_changes_do_not_promote_uncovered_documents() {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let fixture = fixture(&cx).await;
@@ -4869,6 +4967,35 @@ mod qualified_rollback {
                         for id in ids {
                             plan = plan.delete_document(id);
                         }
+                        assert!(matches!(
+                            plan.build(&cx, CommitRange { low: 1, high: 5 }, BUDGET)
+                                .await,
+                            Err(SearchError::InvalidConfig { .. })
+                        ));
+                        assert!(!work.exists());
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                    }
+                    for ids in [vec![], vec!["b"], vec!["a", "c"]] {
+                        let work = fixture
+                            .parent
+                            .join(format!("replacement-boundary-{}", ids.join("-")));
+                        let plan = retained
+                            .begin_partial_quality_update(
+                                &cx,
+                                &work,
+                                ArtifactGenerationIdentityV1::new(8, [0xef; 16]).unwrap(),
+                                fixture.fast.clone(),
+                                fixture.quality.clone(),
+                                BUDGET,
+                            )
+                            .unwrap()
+                            .replace_documents(
+                                &cx,
+                                ids.into_iter()
+                                    .map(|id| IndexableDocument::new(id, "replacement")),
+                            )
+                            .unwrap();
                         assert!(matches!(
                             plan.build(&cx, CommitRange { low: 1, high: 5 }, BUDGET)
                                 .await,
