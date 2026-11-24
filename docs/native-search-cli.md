@@ -293,6 +293,8 @@ that exact partial query, as described below. Fresh-input rebuild and source-onl
 repair still refuse partial sources.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
+Its `--quality-ids` option instead publishes a larger partial subset for bounded
+quality backfill while preserving every already covered ID.
 A warm partial server can adopt that completed generation through the explicit
 `activate_quality_completion` request described below.
 Sharded authority generations remain unsupported.
@@ -349,24 +351,49 @@ queries skip a warm server's reranker; a lexical-only startup rejects its model
 options. Ordinary and sharded receipt-based `search`/`serve` commands also support
 selected-tier reranking, with the retained source policy described below.
 
-### Complete quality for an existing fast-only or partial generation
+### Complete or extend quality for an existing fast-only or partial generation
 
-`authority-complete-quality` completes the independently bound quality tier of
-the selected fast-only or partial-quality generation. It reads the authenticated
-retained source, reuses the fast vectors and exact lexical image, and publishes a
-full successor at the same source checkpoint. For partial quality, it also reuses
-every already covered quality row and embeds only the missing documents.
-Original JSONL files are unnecessary, and the fast model performs no document
-inference.
+`authority-complete-quality` extends the independently bound quality tier of the
+selected fast-only or partial-quality generation. It reads the authenticated
+retained source, reuses the fast vectors and exact lexical image, and publishes
+one successor at the same source checkpoint. Omitting `--quality-ids` completes
+all missing quality rows and produces a full generation. For partial quality,
+existing quality vectors are reused. Original JSONL files are unnecessary, and
+the fast model performs no document inference.
 
 ```sh
 ./target/release/frankensearch-native authority-complete-quality \
   --from-receipt "$HOME/frankensearch-authority/fast.json" \
   --work-dir "$HOME/frankensearch-authority/full-work" \
   --receipt "$HOME/frankensearch-authority/full.json" \
+  --model-dir /absolute/path/to/installed/models \
   --quality-backend native-int8 \
+  --quality-model-dir /absolute/path/to/verified/native-quality-model \
   --retrieval hnsw
 ```
+
+For bounded backfill, add `--quality-ids` with the **complete successor quality
+membership**, including every previously covered ID. The list must add at least
+one uncovered source ID while leaving at least one source document uncovered:
+
+```sh
+./target/release/frankensearch-native authority-complete-quality \
+  --from-receipt "$HOME/frankensearch-authority/partial.json" \
+  --work-dir "$HOME/frankensearch-authority/partial-backfill-work" \
+  --receipt "$HOME/frankensearch-authority/partial-next.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --quality-ids '["document-a","document-b","document-c"]'
+```
+
+Use the predecessor's matching quality backend and model-directory options when
+it has a native quality tier. Only newly selected rows require quality inference.
+Empty, duplicate, unknown, unchanged or shrinking selections refuse before model
+loading or staging, as does a selection that drops a previously covered ID even
+when its count increases. A list covering the entire source also refuses; omit
+`--quality-ids` to request full completion explicitly. Repeated bounded backfills
+can resume from each newly published receipt until the remaining rows are ready
+for full completion. This also supports starting with a fast-only predecessor,
+whose existing quality membership is empty.
 
 The configured fast provider must still match its retained identity. Choose the
 quality provider with the usual local model-directory and quality-backend flags.
@@ -380,16 +407,23 @@ their retained artifacts. The command
 accepts the ordinary batch, source-byte and image-byte limits, but refuses
 replacement source input, source-cut overrides and model-migration flags.
 
-Publication requires the entire quality tier to be built and admitted, with the
+Publication requires the entire requested quality membership to be built and admitted, with the
 same document set, source checkpoint, fast identity, existing quality identity
 and lexical receipt. A cancelled or failed build leaves the incumbent selected. A competing publication
 refuses the original expected-authority pair instead of rebasing. Work files
-remain available after failure. This route produces a complete two-tier
-generation; partial quality coverage is not exposed as complete.
+remain available after failure. Bounded backfill retains truthful partial
+coverage and explicit `--mode partial`; full and direct quality search still
+require complete coverage. A failed inference cannot publish a shorter list.
 
-A running fast-only or partial-quality server can adopt the completed receipt
+Library callers use `NativeGenerationSnapshot::begin_quality_completion`, then
+`NativeQualityCompletion::build_partial(&cx, complete_quality_ids, max_image_bytes)`
+for bounded backfill or `build(&cx, max_image_bytes)` for full completion. Bounded
+backfill rejects a change to existing quality precision so it can reuse every
+retained quality vector; it still permits a different quality graph policy.
+
+A running fast-only or partial-quality server can adopt either successor receipt
 without restarting. Start it with `--allow-model-activation`; its ready event
-then reports `quality_completion_activation_enabled: true`. Publish the full
+then reports `quality_completion_activation_enabled: true`. Publish the
 successor separately with `authority-complete-quality`, then send a JSONL request
 with these fields:
 
@@ -397,7 +431,7 @@ with these fields:
 | --- | --- |
 | `op` | `"activate_quality_completion"` |
 | `id` | Your request identifier |
-| `receipt` | Absolute path to the newly published full receipt |
+| `receipt` | Absolute path to the newly published full or expanded partial receipt |
 | `expected_authority` | Exact byte array from the warm session's current selection event |
 | `model_dir` | Explicit local model root for ONNX; optional when native quality uses its own directory |
 | `quality_backend`, `quality_model_dir` | The usual explicit native-quality options, when used |
@@ -408,15 +442,20 @@ must remain identical, including its own prepared-input contract. The fast and
 quality tiers may retain independently different input contracts; completion
 does not reinterpret either one. Original source scope and query policy are
 preserved. Fast query embeddings remain reusable, while the quality query cache
-is recreated for the admitted provider. New queries use the full retained
-generation; references to the old partial snapshot keep their original coverage.
+is recreated for the admitted provider. A partial successor requires a strictly
+larger quality count, and admission proves that its actual authenticated quality
+IDs include every previous member before loading the quality model.
+Equal-count substitutions and larger sets that drop old members refuse.
+References to the old snapshot keep their original coverage. An expanded partial
+session still defaults to fast search, accepts explicit partial refinement, and
+remains eligible for later backfill activation; a full successor enables full
+and direct quality search.
 
 This request only adopts an already published successor. It does not build
 vectors, publish another generation or download models. Missing permission,
 changed producers, changed source or lexical images, stale authority, loading
 failure and cancellation leave the previous serving selection intact. Ordinary
-`activate_model` preserves partial coverage and cannot perform this transition
-to full coverage.
+`activate_model` preserves exact partial membership and cannot expand coverage.
 
 ### Rebuild an existing authority generation
 
@@ -1143,7 +1182,7 @@ For a partial session, build the successor using `authority-rebuild
 checkpoint, complete stored source, lexical image, and actual quality-covered
 IDs. The server compares authenticated vector membership before loading either
 model; equal counts cannot authorize a different subset. Source edits use the
-separate partial update operation, and expansion to full coverage uses
+separate partial update operation, and coverage expansion uses
 `activate_quality_completion`. Each tier retains its own prepared-input contract,
 including when those contracts differ between fast and quality.
 

@@ -88,7 +88,8 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       [--input JSONL] [--model-dir DIR] [--batch-size N]\n\
       [--quality-backend onnx|native-int8|native-f32|native-multilingual]\n\
       [--quality-model-dir DIR] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
-  authority-complete-quality --from-receipt FAST_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
+  authority-complete-quality --from-receipt INCOMPLETE_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
+      [--quality-ids '[\"document-a\",\"document-b\"]' (complete successor subset)]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--retrieval exact|hnsw] [--batch-size N] [--max-source-bytes N]\n\
       [--max-image-bytes N]\n\n\
@@ -176,7 +177,9 @@ permits independent producer replacement. Rebuild --query also requires explicit
 Source-only repair and fresh-input rebuild still refuse partial sources.\n\
 Granted warm model activation\n\
 preserves the exact partial source and covered IDs. Explicit quality\n\
-completion accepts fast-only or partial sources. Warm sessions accept mode=partial.\n\
+completion accepts fast-only or partial sources. --quality-ids checkpoints a\n\
+larger proper subset, retaining every covered ID; omit it to complete all rows.\n\
+Warm sessions accept mode=partial and explicit activation of quality backfills.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
 missing or invalid graphs fail admission without substituting exact retrieval.\n\
@@ -308,12 +311,15 @@ contracts stay fixed. No model is downloaded and no new authority is published.\
 Partial model activation also requires the exact source checkpoint, full source,\n\
 Quill image and authenticated quality-covered IDs; it cannot expand coverage.\n\
 The same grant accepts op=activate_quality_completion for an already published\n\
-authority-complete-quality successor of a fast-only session. It retains the fast\n\
+authority-complete-quality successor of a fast-only or partial session. Each\n\
+partial successor must preserve all covered IDs and expand actual membership.\n\
+It retains the fast\n\
 model and loads only the explicitly selected quality model, using quality_backend\n\
 and quality_model_dir for native quality or model_dir for ONNX. The exact fast\n\
 identity, retrieval policy, source checkpoint, document set and Quill image must\n\
-match the serving generation. Full/quality queries become available only after\n\
-complete admission and a final current-head check; failure keeps fast serving.\n\
+match the serving generation. Partial successors keep explicit partial retrieval;\n\
+full/quality queries become available after full coverage admission and a final\n\
+current-head check. Failure keeps the previous serving selection.\n\
 Explicit --lexical-only on authority-search/serve runs retained Quill keyword\n\
 search without loading or invoking a model. It excludes model options and\n\
 --allow-updates, but permits source fetch and granted activation. The complete\n\
@@ -681,7 +687,7 @@ impl Options {
                         }
                     });
                 }
-                "--quality-ids" if command == Command::Index => {
+                "--quality-ids" if matches!(command, Command::Index | Command::CompleteQuality) => {
                     let encoded = value(&mut args)?;
                     if encoded.len() > MAX_RECORD_BYTES {
                         return Err(bad("quality ID selection exceeds the encoded-record limit"));
@@ -1714,6 +1720,7 @@ fn prepare_publication(
 enum PublicationIntent {
     PreserveTopology,
     CompleteQuality,
+    BackfillQuality,
     RebuildPartialQuality,
 }
 
@@ -1756,7 +1763,12 @@ fn prepare_publication_with_intent(
                             })
                     }
                 },
-                PublicationIntent::CompleteQuality => {
+                PublicationIntent::CompleteQuality | PublicationIntent::BackfillQuality => {
+                    let expected_coverage = if intent == PublicationIntent::BackfillQuality {
+                        VectorCohortCoverage::PartialQuality
+                    } else {
+                        VectorCohortCoverage::Complete
+                    };
                     let quality_identity_matches = match snapshot.topology() {
                         NativeGenerationTopology::FastOnly => true,
                         NativeGenerationTopology::PartialQuality { .. } => {
@@ -1770,7 +1782,7 @@ fn prepare_publication_with_intent(
                     };
                     quality_identity_matches
                         && built.quality_binding().is_some()
-                        && built.coverage() == VectorCohortCoverage::Complete
+                        && built.coverage() == expected_coverage
                         && built.binding().frozen_identity()
                             == snapshot.metadata().embedders.get("fast").ok_or_else(|| {
                                 bad("quality completion requires the retained fast identity")
@@ -1845,7 +1857,9 @@ fn prepare_publication_with_intent(
     )?;
     if matches!(
         intent,
-        PublicationIntent::CompleteQuality | PublicationIntent::RebuildPartialQuality
+        PublicationIntent::CompleteQuality
+            | PublicationIntent::BackfillQuality
+            | PublicationIntent::RebuildPartialQuality
     ) {
         let previous = predecessor
             .ok_or_else(|| bad("quality maintenance requires its selected predecessor"))?
@@ -1888,6 +1902,48 @@ fn prepare_partial_quality_rebuild(
     let preview = built.preview_candidate(cx, &prepared.candidate)?;
     if preview.partial_quality_document_ids(cx)? != predecessor.partial_quality_document_ids(cx)? {
         return Err(serve_refused("partial_quality_rebuild_coverage_mismatch"));
+    }
+    checkpoint(cx)?;
+    Ok(prepared)
+}
+
+fn prepare_partial_quality_completion(
+    cx: &Cx,
+    built: &NativeBuiltExactGeneration,
+    predecessor: &NativeGenerationSnapshot,
+    max_image_bytes: usize,
+) -> Result<PreparedPublication> {
+    checkpoint(cx)?;
+    let prepared = prepare_publication_with_intent(
+        built,
+        Some(predecessor),
+        max_image_bytes,
+        PublicationIntent::BackfillQuality,
+    )?;
+    let previous_ids = match predecessor.topology() {
+        NativeGenerationTopology::FastOnly => Vec::new(),
+        NativeGenerationTopology::PartialQuality { .. } => {
+            predecessor.partial_quality_document_ids(cx)?
+        }
+        NativeGenerationTopology::QualityOnly | NativeGenerationTopology::FullProgressive => {
+            return Err(serve_refused(
+                "quality_backfill_requires_incomplete_quality",
+            ));
+        }
+    };
+    // Authenticate actual membership before staging. Larger counts alone do
+    // not prove that every previously covered document remains represented.
+    let preview = built.preview_candidate(cx, &prepared.candidate)?;
+    let next_ids = preview.partial_quality_document_ids(cx)?;
+    if next_ids.len() <= previous_ids.len()
+        || previous_ids
+            .iter()
+            .any(|id| next_ids.binary_search(id).is_err())
+    {
+        return Err(serve_refused("quality_backfill_coverage_not_expanded"));
+    }
+    if preview.retrieval_configuration() != predecessor.retrieval_configuration() {
+        return Err(serve_refused("quality_backfill_fast_retrieval_mismatch"));
     }
     checkpoint(cx)?;
     Ok(prepared)

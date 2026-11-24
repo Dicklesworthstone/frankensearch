@@ -356,6 +356,42 @@ impl ReindexFixture {
     }
 
     async fn build(&self, cx: &Cx, models: &Models, ann: bool) -> NativeBuiltExactGeneration {
+        if matches!(
+            self.previous.topology(),
+            NativeGenerationTopology::PartialQuality { .. }
+        ) {
+            let retrieval = if ann {
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 47,
+                }
+            } else {
+                NativeBuildRetrieval::Exact
+            };
+            // Keep the original lexical image, including its freshness witness.
+            // A fresh Quill build can differ even with identical source text.
+            return self
+                .previous
+                .begin_partial_quality_model_migration(
+                    cx,
+                    self.parent.join("after-work"),
+                    new_generation(2).unwrap(),
+                    Arc::clone(&models.fast),
+                    Arc::clone(models.quality.as_ref().unwrap()),
+                    MAX_INPUT_BYTES,
+                )
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+                .with_quality_storage(NativeBuildPrecision::F32, retrieval)
+                .unwrap()
+                .build(
+                    cx,
+                    self.previous.metadata().commit_range.clone(),
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .await
+                .unwrap();
+        }
         reindex_build(
             cx,
             &self.parent,
@@ -621,35 +657,74 @@ fn bound_partial_reindex_rejects_implicit_mode_and_policy_before_model_loading()
 #[test]
 fn bound_partial_reindex_refuses_same_count_quality_membership_substitution_before_queries() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
-        let fixture = ReindexFixture::new(&cx, PARTIAL_REINDEX_TOPOLOGY, false).await;
-        let (primary, quality, loaded) = fixture.replacements();
-        let quality = quality.unwrap();
-        let built = NativeIndexBuilder::new(
-            fixture.parent.join("substituted-work"),
-            new_generation(2).unwrap(),
-            primary.clone(),
-        )
-        .unwrap()
-        .with_quality_embedder(quality.clone())
-        .unwrap()
-        .add_documents(reindex_documents())
-        .build_partial_quality_generation(
+        let seed = ReindexFixture::new(&cx, NativeGenerationTopology::FastOnly, false).await;
+        let quality = reindex_provider("replacement-quality");
+        let loaded = reindex_models(&seed.primary, Some(&quality));
+        // Both candidates retain one seed's exact lexical image. Independent
+        // Quill builds would carry different wall-clock freshness witnesses.
+        let built = seed
+            .previous
+            .begin_quality_completion(
+                &cx,
+                seed.parent.join("substituted-work"),
+                new_generation(3).unwrap(),
+                seed.primary.clone(),
+                quality.clone(),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap()
+            .build_partial(&cx, ["selected-garden".to_owned()], DEFAULT_IMAGE_BYTES)
+            .await
+            .unwrap();
+        let original = seed
+            .previous
+            .begin_quality_completion(
+                &cx,
+                seed.parent.join("selected-partial-work"),
+                new_generation(2).unwrap(),
+                seed.primary.clone(),
+                reindex_provider("original-quality"),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap()
+            .build_partial(&cx, ["selected-retry".to_owned()], DEFAULT_IMAGE_BYTES)
+            .await
+            .unwrap();
+        let prepared =
+            prepare_partial_quality_completion(&cx, &original, &seed.previous, DEFAULT_IMAGE_BYTES)
+                .unwrap();
+        let root = admit_root(&seed.selected.root).unwrap();
+        let selected_path = seed.parent.join("selected-partial.json");
+        let selected = stage_prepared_and_publish(
             &cx,
-            fixture.previous.metadata().commit_range.clone(),
-            ["selected-garden".to_owned()],
-            DEFAULT_IMAGE_BYTES,
+            &root,
+            &seed.selected.root,
+            &selected_path,
+            &original,
+            prepared,
+            PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
         )
-        .await
         .unwrap();
-        let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
-        let options = fixture.options();
+        let lexical = frankensearch_core::generation::GenerationComponentRole::Lexical;
+        assert_eq!(
+            built.component_bytes(lexical),
+            selected
+                .snapshot
+                .retained_snapshot()
+                .closure()
+                .bytes(lexical),
+        );
+        let authority = fs::read(seed.selected.root.join("AUTHORITY")).unwrap();
+        let mut options = seed.options();
+        options.from_receipt = Some(selected_path);
+        options.mode = Some(QueryMode::Partial);
         let mut output = Vec::new();
         let error = reindex::execute(
             &cx,
             &options,
-            &fixture.root,
-            &fixture.selected,
-            &fixture.previous,
+            &root,
+            &selected.receipt,
+            &selected.snapshot,
             &built,
             &loaded,
             &mut output,
@@ -662,12 +737,12 @@ fn bound_partial_reindex_refuses_same_count_quality_membership_substitution_befo
                 .contains("partial_quality_rebuild_coverage_mismatch")
         );
         assert!(output.is_empty());
-        assert_eq!(primary.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(seed.primary.queries.load(Ordering::SeqCst), 0);
         assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
         assert!(!options.receipt.exists());
         assert!(!options.rollback_receipt.as_ref().unwrap().exists());
         assert_eq!(
-            fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+            fs::read(seed.selected.root.join("AUTHORITY")).unwrap(),
             authority
         );
     });

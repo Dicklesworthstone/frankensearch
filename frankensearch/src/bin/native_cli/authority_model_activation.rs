@@ -4,10 +4,11 @@
 //! retains the original qualified root, admits the selected successor, and
 //! replaces the model, reader and fixed scope together. Partial model changes
 //! retain the exact source cohort, checkpoint and authenticated quality subset.
-//! Explicit quality completion retains the fast model and admits a full
-//! successor of the same source cohort. An existing partial quality tier must
-//! retain its producer identity as coverage expands. Neither operation rebuilds,
-//! publishes, writes a receipt or downloads a model.
+//! Explicit quality completion retains the fast model and admits a full or
+//! strictly expanded partial successor of the same source cohort. An existing
+//! partial quality tier must retain its producer identity and every covered ID
+//! as coverage expands. Neither operation rebuilds, publishes, writes a receipt
+//! or downloads a model.
 
 use super::{
     Arc, AuthorityModels, AuthorityRefV1, AuthoritySession, Cx, Deserialize, Embedder,
@@ -185,8 +186,16 @@ impl AuthoritySession {
             return Err(serve_refused("model_activation_root_or_tier_mismatch"));
         }
         if completes_quality {
-            if selected.topology() != NativeGenerationTopology::FullProgressive {
-                return Err(serve_refused("quality_completion_requires_full"));
+            match selected.topology() {
+                NativeGenerationTopology::FullProgressive => {}
+                NativeGenerationTopology::PartialQuality {
+                    quality_documents, ..
+                } => {
+                    if quality_documents <= self.receipt.quality_documents.unwrap_or(0) {
+                        return Err(serve_refused("quality_completion_coverage_not_expanded"));
+                    }
+                }
+                _ => return Err(serve_refused("quality_completion_requires_quality")),
             }
             if selected.identity != self.receipt.identity {
                 return Err(serve_refused("quality_completion_fast_identity_mismatch"));
@@ -282,6 +291,34 @@ impl AuthoritySession {
             }
             if snapshot.retrieval_configuration() != self.snapshot.retrieval_configuration() {
                 return Err(serve_refused("quality_completion_fast_retrieval_mismatch"));
+            }
+            if matches!(
+                snapshot.topology(),
+                NativeGenerationTopology::PartialQuality { .. }
+            ) {
+                // Counts are only an early refusal. Admitted owners must prove
+                // that a larger partial cohort kept every previous quality ID.
+                // A full successor already proves complete coverage of this
+                // exact unchanged source through ordinary full admission above.
+                let next_ids = snapshot.partial_quality_document_ids(cx).map_err(|error| {
+                    bounded_error(error.into(), "quality_completion_coverage_mismatch")
+                })?;
+                let previous_ids = if self.receipt.quality_documents.is_some() {
+                    self.snapshot
+                        .partial_quality_document_ids(cx)
+                        .map_err(|error| {
+                            bounded_error(error.into(), "quality_completion_coverage_mismatch")
+                        })?
+                } else {
+                    Vec::new()
+                };
+                if next_ids.len() <= previous_ids.len()
+                    || previous_ids
+                        .iter()
+                        .any(|id| next_ids.binary_search(id).is_err())
+                {
+                    return Err(serve_refused("quality_completion_coverage_mismatch"));
+                }
             }
         }
         let scope = prepare_scope(

@@ -1,12 +1,12 @@
-//! Complete independent quality coverage using one retained authority.
+//! Complete or incrementally expand quality coverage using one retained authority.
 
 use super::{
-    BlockingPoolHandle, Cx, MAX_RECORD_BYTES, Models, NativeBuildPrecision,
-    NativeGenerationTopology, Options, PublicationIntent, PublicationOptions, QueryMode, Receipt,
-    Result, Write, admit_root, bad, checkpoint, emit_indexed, execution_context,
-    load_authority_models, new_generation, new_path, prepare_publication_with_intent,
-    rebuild_precision, retained_rebuild_documents, separate_destinations,
-    stage_prepared_and_publish,
+    BlockingPoolHandle, Cx, IndexableDocument, MAX_RECORD_BYTES, Models, NativeBuildPrecision,
+    NativeGenerationSnapshot, NativeGenerationTopology, Options, PublicationIntent,
+    PublicationOptions, QueryMode, Receipt, Result, Write, admit_root, bad, checkpoint,
+    emit_indexed, execution_context, load_authority_models, new_generation, new_path,
+    prepare_partial_quality_completion, prepare_publication_with_intent, rebuild_precision,
+    retained_rebuild_documents, separate_destinations, stage_prepared_and_publish,
 };
 
 pub(super) async fn run(
@@ -69,11 +69,11 @@ where
         .ok_or_else(|| bad("the artifact generation sequence is exhausted"))?;
     // Enforce the ordinary CLI source/record limits before model loading. The
     // completion plan then retains that same admitted source, never a file path.
-    drop(retained_rebuild_documents(
-        cx,
-        &snapshot,
-        options.max_source_bytes,
-    )?);
+    let documents = retained_rebuild_documents(cx, &snapshot, options.max_source_bytes)?;
+    if let Some(ids) = &options.quality_ids {
+        validate_backfill_selection(cx, &snapshot, &documents, ids)?;
+    }
+    drop(documents);
     // A partial predecessor already owns independently admitted quality rows.
     // Preserve their encoding so completion can reuse them exactly; only a new
     // quality tier receives the CLI's default F32 storage policy.
@@ -88,7 +88,7 @@ where
     let quality = loaded.quality.ok_or_else(|| {
         bad("quality completion requires an independently supplied quality model")
     })?;
-    let built = snapshot
+    let completion = snapshot
         .begin_quality_completion(
             cx,
             &work_path,
@@ -99,15 +99,24 @@ where
         )?
         .with_batch_size(options.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-        .with_quality_storage(quality_precision, quality_retrieval)?
-        .build(cx, options.max_image_bytes)
-        .await?;
-    let prepared = prepare_publication_with_intent(
-        &built,
-        Some(&snapshot),
-        options.max_image_bytes,
-        PublicationIntent::CompleteQuality,
-    )?;
+        .with_quality_storage(quality_precision, quality_retrieval)?;
+    let built = if let Some(ids) = &options.quality_ids {
+        completion
+            .build_partial(cx, ids.iter().cloned(), options.max_image_bytes)
+            .await?
+    } else {
+        completion.build(cx, options.max_image_bytes).await?
+    };
+    let prepared = if options.quality_ids.is_some() {
+        prepare_partial_quality_completion(cx, &built, &snapshot, options.max_image_bytes)?
+    } else {
+        prepare_publication_with_intent(
+            &built,
+            Some(&snapshot),
+            options.max_image_bytes,
+            PublicationIntent::CompleteQuality,
+        )?
+    };
     let published = stage_prepared_and_publish(
         cx,
         &root,
@@ -124,6 +133,47 @@ where
         built.retrieval_configuration(),
         built.quality_retrieval_configuration(),
     )
+}
+
+fn validate_backfill_selection(
+    cx: &Cx,
+    snapshot: &NativeGenerationSnapshot,
+    documents: &[IndexableDocument],
+    ids: &[String],
+) -> Result<()> {
+    checkpoint(cx)?;
+    let selected: std::collections::BTreeSet<_> = ids.iter().map(String::as_str).collect();
+    if selected.is_empty() || selected.len() != ids.len() || selected.len() >= documents.len() {
+        return Err(bad(
+            "quality backfill requires a unique nonempty proper subset; omit --quality-ids for full completion",
+        ));
+    }
+    let source_ids: std::collections::BTreeSet<_> = documents
+        .iter()
+        .map(|document| document.id.as_str())
+        .collect();
+    if !selected.is_subset(&source_ids) {
+        return Err(bad(
+            "quality backfill IDs must belong to the selected source",
+        ));
+    }
+    let previous = match snapshot.topology() {
+        NativeGenerationTopology::FastOnly => Vec::new(),
+        NativeGenerationTopology::PartialQuality { .. } => {
+            snapshot.partial_quality_document_ids(cx)?
+        }
+        NativeGenerationTopology::QualityOnly | NativeGenerationTopology::FullProgressive => {
+            return Err(bad("quality backfill requires incomplete quality coverage"));
+        }
+    };
+    if selected.len() <= previous.len() || previous.iter().any(|id| !selected.contains(id.as_str()))
+    {
+        return Err(bad(
+            "quality backfill must retain every covered document and add new IDs",
+        ));
+    }
+    checkpoint(cx)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -183,6 +233,28 @@ mod tests {
             options.retrieval,
             Some(NativeBuildRetrieval::Hnsw { .. })
         ));
+    }
+
+    #[test]
+    fn bounded_completion_accepts_only_explicit_unique_quality_membership() {
+        let mut args = arguments();
+        args.extend(["--quality-ids", r#"["garden","retry"]"#].map(str::to_owned));
+        let options = Options::parse(args).unwrap().unwrap();
+        assert_eq!(
+            options.quality_ids,
+            Some(vec!["garden".to_owned(), "retry".to_owned()])
+        );
+        for selection in [
+            "[]",
+            r#"["retry","retry"]"#,
+            r#"[""]"#,
+            r#"["\u0000"]"#,
+            r#"{"id":"retry"}"#,
+        ] {
+            let mut args = arguments();
+            args.extend(["--quality-ids", selection].map(str::to_owned));
+            assert!(Options::parse(args).is_err(), "{selection}");
+        }
     }
 
     #[test]
@@ -343,11 +415,35 @@ mod tests {
             ann: bool,
             quality: Option<Arc<Provider>>,
         ) -> Fixture {
+            fixture_with_documents(
+                cx,
+                ann,
+                quality,
+                vec![
+                    IndexableDocument::new("retry", "retry network requests")
+                        .with_metadata("revision", "old"),
+                    IndexableDocument::new("garden", "garden flowers"),
+                ],
+            )
+            .await
+        }
+
+        async fn fixture_with_documents(
+            cx: &Cx,
+            ann: bool,
+            quality: Option<Arc<Provider>>,
+            documents: Vec<IndexableDocument>,
+        ) -> Fixture {
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+            let parent = PathBuf::from(
+                std::env::var_os("FRANKENSEARCH_TEST_TMPDIR")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .unwrap(),
+            )
+            .join(format!(
                 ".frankensearch-quality-completion-{}-{stamp}",
                 std::process::id(),
             ));
@@ -371,11 +467,7 @@ mod tests {
                     NativeBuildRetrieval::Exact
                 },
             )
-            .add_documents([
-                IndexableDocument::new("retry", "retry network requests")
-                    .with_metadata("revision", "old"),
-                IndexableDocument::new("garden", "garden flowers"),
-            ]);
+            .add_documents(documents);
             let built = if let Some(quality) = quality {
                 builder
                     .with_quality_embedder(quality)
@@ -443,6 +535,303 @@ mod tests {
             options.work = Some(fixture.parent.join(format!("{label}-work")));
             options.receipt = fixture.parent.join(format!("{label}.json"));
             options
+        }
+
+        fn backfill_documents() -> Vec<IndexableDocument> {
+            vec![
+                IndexableDocument::new("retry", "retry network requests")
+                    .with_metadata("revision", "old"),
+                IndexableDocument::new("garden", "garden flowers"),
+                IndexableDocument::new("notes", "field notes"),
+                IndexableDocument::new("uncovered", "a final document"),
+            ]
+        }
+
+        #[test]
+        fn bounded_completion_publishes_truthful_partial_receipts_and_resumes_to_full() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for ann in [false, true] {
+                    for starts_partial in [false, true] {
+                        let quality = Provider::new(true);
+                        let fixture = fixture_with_documents(
+                            &cx,
+                            ann,
+                            starts_partial.then(|| quality.clone()),
+                            backfill_documents(),
+                        )
+                        .await;
+                        let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                        let mut bounded = options(&fixture, "bounded");
+                        bounded.quality_ids =
+                            Some(["garden", "notes", "retry"].map(str::to_owned).into());
+                        let mut output = Vec::new();
+                        with_loader(&cx, &bounded, &mut output, || {
+                            Ok(Models {
+                                fast: fixture.fast.clone(),
+                                quality: Some(quality.clone()),
+                            })
+                        })
+                        .await
+                        .unwrap();
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                        assert_eq!(quality.calls.load(Ordering::SeqCst), 3);
+                        let receipt = Receipt::read(&bounded.receipt).unwrap();
+                        assert_eq!(receipt.quality_documents, Some(3));
+                        assert_eq!(receipt.identity, fixture.selected.identity);
+                        assert_eq!(
+                            receipt.query_mode(Some(QueryMode::Partial)).unwrap(),
+                            QueryMode::Partial
+                        );
+                        assert!(receipt.query_mode(Some(QueryMode::Full)).is_err());
+                        let partial = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                        assert_eq!(
+                            partial.topology(),
+                            NativeGenerationTopology::PartialQuality {
+                                quality_documents: 3,
+                                total_documents: 4,
+                                coverage_ppm: 750_000,
+                            }
+                        );
+                        assert_eq!(
+                            partial.partial_quality_document_ids(&cx).unwrap(),
+                            vec!["garden".to_owned(), "notes".to_owned(), "retry".to_owned()]
+                        );
+                        assert_eq!(
+                            partial.retained_snapshot().manifest().components().lexical,
+                            fixture
+                                .snapshot
+                                .retained_snapshot()
+                                .manifest()
+                                .components()
+                                .lexical,
+                        );
+                        assert_eq!(
+                            partial.metadata().commit_range,
+                            fixture.snapshot.metadata().commit_range
+                        );
+                        assert_eq!(
+                            partial.retrieval_configuration(),
+                            fixture.snapshot.retrieval_configuration()
+                        );
+                        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                        assert_eq!(report["publication"], "committed");
+                        assert_eq!(report["selection"]["quality_documents"], 3);
+
+                        let mut complete = options(&fixture, "resumed-full");
+                        complete.from_receipt = Some(bounded.receipt.clone());
+                        with_loader(&cx, &complete, &mut Vec::new(), || {
+                            Ok(Models {
+                                fast: fixture.fast.clone(),
+                                quality: Some(quality.clone()),
+                            })
+                        })
+                        .await
+                        .unwrap();
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                        assert_eq!(quality.calls.load(Ordering::SeqCst), 4);
+                        let complete = Receipt::read(&complete.receipt).unwrap();
+                        let full = complete.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                        assert_eq!(full.topology(), NativeGenerationTopology::FullProgressive);
+                        assert_eq!(complete.quality_identity, receipt.quality_identity);
+                        assert_eq!(complete.quality_documents, None);
+                        // Retained readers remain pinned to their original coverage.
+                        assert_eq!(partial.partial_quality_document_ids(&cx).unwrap().len(), 3);
+                        assert_eq!(fixture.snapshot.topology(), fixture.selected.topology());
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn bounded_completion_refuses_invalid_or_regressing_membership_before_loading() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let quality = Provider::new(true);
+                let fixture =
+                    fixture_with_documents(&cx, false, Some(quality.clone()), backfill_documents())
+                        .await;
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                let selections = [
+                    vec![],
+                    vec!["garden", "garden"],
+                    vec!["garden", "unknown"],
+                    vec!["garden", "notes", "retry", "uncovered"],
+                    vec!["garden"],
+                    vec!["notes", "retry"],
+                ];
+                for (index, selection) in selections.into_iter().enumerate() {
+                    let mut options = options(&fixture, &format!("invalid-backfill-{index}"));
+                    options.quality_ids = Some(selection.into_iter().map(str::to_owned).collect());
+                    let loaded = AtomicUsize::new(0);
+                    let mut output = Vec::new();
+                    assert!(
+                        with_loader(&cx, &options, &mut output, || {
+                            loaded.fetch_add(1, Ordering::SeqCst);
+                            Ok(Models {
+                                fast: fixture.fast.clone(),
+                                quality: Some(quality.clone()),
+                            })
+                        })
+                        .await
+                        .is_err()
+                    );
+                    assert_eq!(loaded.load(Ordering::SeqCst), 0);
+                    assert!(output.is_empty());
+                    assert!(!options.work.as_ref().unwrap().exists());
+                    assert!(!options.receipt.exists());
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        authority
+                    );
+                }
+                assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            });
+        }
+
+        #[test]
+        fn bounded_completion_publication_authenticates_membership_instead_of_only_counts() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let seed = fixture_with_documents(&cx, false, None, backfill_documents()).await;
+                let quality = Provider::new(true);
+                // Derive both sides from one admitted fast source. Rebuilding
+                // Quill independently would introduce wall-clock manifest bytes
+                // and could fail source equality before the membership guard.
+                let mut candidates = Vec::new();
+                for (label, ids) in [
+                    ("same-count", vec!["retry"]),
+                    ("dropped-old", vec!["notes", "retry"]),
+                ] {
+                    let built = seed
+                        .snapshot
+                        .begin_quality_completion(
+                            &cx,
+                            seed.parent.join(format!("substituted-{label}")),
+                            new_generation(3).unwrap(),
+                            seed.fast.clone(),
+                            quality.clone(),
+                            MAX_INPUT_BYTES,
+                        )
+                        .unwrap()
+                        .build_partial(&cx, ids.into_iter().map(str::to_owned), DEFAULT_IMAGE_BYTES)
+                        .await
+                        .unwrap();
+                    candidates.push((label, built));
+                }
+                let first = seed
+                    .snapshot
+                    .begin_quality_completion(
+                        &cx,
+                        seed.parent.join("selected-partial-work"),
+                        new_generation(2).unwrap(),
+                        seed.fast.clone(),
+                        quality,
+                        MAX_INPUT_BYTES,
+                    )
+                    .unwrap()
+                    .build_partial(&cx, ["garden".to_owned()], DEFAULT_IMAGE_BYTES)
+                    .await
+                    .unwrap();
+                let prepared = prepare_partial_quality_completion(
+                    &cx,
+                    &first,
+                    &seed.snapshot,
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .unwrap();
+                let root = admit_root(&seed.selected.root).unwrap();
+                let selected = stage_prepared_and_publish(
+                    &cx,
+                    &root,
+                    &seed.selected.root,
+                    &seed.parent.join("selected-partial.json"),
+                    &first,
+                    prepared,
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                )
+                .unwrap();
+                let authority = fs::read(seed.selected.root.join("AUTHORITY")).unwrap();
+                for (label, built) in candidates {
+                    // A fully valid candidate with matching source and producers
+                    // must still prove it retained the actual old quality member.
+                    assert_eq!(
+                        built.component_bytes(GenerationComponentRole::Lexical),
+                        selected
+                            .snapshot
+                            .retained_snapshot()
+                            .closure()
+                            .bytes(GenerationComponentRole::Lexical),
+                    );
+                    prepare_publication_with_intent(
+                        &built,
+                        Some(&selected.snapshot),
+                        DEFAULT_IMAGE_BYTES,
+                        PublicationIntent::BackfillQuality,
+                    )
+                    .unwrap();
+                    let error = prepare_partial_quality_completion(
+                        &cx,
+                        &built,
+                        &selected.snapshot,
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .err()
+                    .expect("substituted quality coverage must refuse publication");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("quality_backfill_coverage_not_expanded"),
+                        "{label}: {error}",
+                    );
+                    assert_eq!(
+                        fs::read(seed.selected.root.join("AUTHORITY")).unwrap(),
+                        authority
+                    );
+                    selected.receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn bounded_completion_faults_leave_the_exact_predecessor_selected() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let old_quality = Provider::new(true);
+                let fixture =
+                    fixture_with_documents(&cx, true, Some(old_quality), backfill_documents())
+                        .await;
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                for fault in [1, 2, 3] {
+                    let quality = Provider::new(true);
+                    quality.fault.store(fault, Ordering::SeqCst);
+                    let mut options = options(&fixture, &format!("bounded-fault-{fault}"));
+                    options.quality_ids = Some(["garden", "retry"].map(str::to_owned).into());
+                    let mut output = Vec::new();
+                    let result = with_loader(&cx, &options, &mut output, || {
+                        Ok(Models {
+                            fast: fixture.fast.clone(),
+                            quality: Some(quality.clone()),
+                        })
+                    })
+                    .await;
+                    cx.set_cancel_requested(false);
+                    assert!(result.is_err());
+                    assert!(quality.calls.load(Ordering::SeqCst) > 0);
+                    assert!(output.is_empty());
+                    assert!(!options.receipt.exists());
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        authority
+                    );
+                    let retained = fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(
+                        retained.partial_quality_document_ids(&cx).unwrap(),
+                        vec!["garden".to_owned()]
+                    );
+                }
+            });
         }
 
         #[test]
