@@ -564,7 +564,8 @@ where
     )
 }
 
-fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocument>> {
+/// Authenticate the complete receipt-selected original fields without opening derived indexes.
+pub(super) fn selected_source(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocument>> {
     let mut limits = NativeHybridReopenLimits::default();
     limits.vectors.max_source_bytes = MAX_INPUT_BYTES as u64;
     limits.vectors.max_document_bytes = MAX_RECORD_BYTES as u64;
@@ -601,6 +602,11 @@ fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocu
             "recovered source differs from the trusted selection's generation or count",
         ));
     }
+    Ok(documents)
+}
+
+fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocument>> {
+    let documents = selected_source(cx, selection)?;
     // A library snapshot can use a broader source-ID contract than this CLI.
     // Reject it explicitly instead of silently dropping or renaming documents.
     let mut bytes = 0_usize;

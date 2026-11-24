@@ -50,7 +50,7 @@ fn stopped_command_pool_is_refused_before_input_models_or_candidate_paths() {
                     quality_completion::execute(&cx, &options, &mut output, Some(handle.clone()))
                         .await
                 }
-                Command::Search | Command::Serve => unreachable!(),
+                Command::Search | Command::Serve | Command::Export => unreachable!(),
             }
             .unwrap_err();
             assert!(matches!(
@@ -125,6 +125,11 @@ fn parser_requires_explicit_destinations_and_rejects_inapplicable_options() {
             "x",
         ],
         vec!["index", "--index-dir", "--receipt", "r"],
+        vec!["export"],
+        vec!["export", "--receipt", "r", "--model-dir", "models"],
+        vec!["export", "--receipt", "r", "--query", "needle"],
+        vec!["export", "--receipt", "r", "--input", "replacement.jsonl"],
+        vec!["export", "--receipt", "r", "--shard-size", "1"],
     ] {
         assert!(Options::parse(args.into_iter().map(str::to_owned)).is_err());
     }
@@ -248,6 +253,72 @@ fn source() -> Vec<IndexableDocument> {
         retry,
         IndexableDocument::new("garden.md", "garden flowers in spring"),
     ]
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn receipt_export_round_trips_original_documents_and_rejects_incomplete_sources() {
+    run_test_with_cx(|cx| async move {
+        for partitioned in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = temporary.path().join("index");
+            let receipt = temporary.path().join("selection.json");
+            let mut original = source();
+            original[0].content.push_str("\n東京 \"quoted\"");
+            let build_options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+            let export_options = || options(&["export", "--receipt", receipt.to_str().unwrap()]);
+            let (models, _, _) = fixture_models(true);
+            let (selection, vector) = if partitioned {
+                let (index, selection) =
+                    sharded::build(&cx, &build_options, &directory, original.clone(), models, 1)
+                        .await
+                        .unwrap();
+                let path = index.vectors().partitions()[0]
+                    .fast()
+                    .vector_path()
+                    .to_owned();
+                (selection, path)
+            } else {
+                let (index, selection) =
+                    build(&cx, &build_options, &directory, original.clone(), models)
+                        .await
+                        .unwrap();
+                let path = index.vectors().fast().vector_path().to_owned();
+                (selection, path)
+            };
+            save_selection(&selection, &receipt).unwrap();
+            fs::rename(vector, temporary.path().join("displaced.fsvi")).unwrap();
+
+            let mut output = Vec::new();
+            execute(&cx, export_options(), &mut output, None)
+                .await
+                .unwrap();
+            let mut restored = read_documents(&mut Cursor::new(output.as_slice())).unwrap();
+            restored.sort_by(|a, b| a.id.cmp(&b.id));
+            original.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(
+                serde_json::to_value(restored).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+
+            // A complete first partition cannot be exposed if a later source fails admission.
+            let source_path = directory.join(if partitioned {
+                "shard-000001/native.source.jsonl"
+            } else {
+                "native.source.jsonl"
+            });
+            let mut damaged = fs::read(&source_path).unwrap();
+            damaged[0] ^= 1;
+            fs::write(source_path, damaged).unwrap();
+            output.clear();
+            assert!(
+                execute(&cx, export_options(), &mut output, None)
+                    .await
+                    .is_err()
+            );
+            assert!(output.is_empty());
+        }
+    });
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

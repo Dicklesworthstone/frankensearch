@@ -2387,7 +2387,7 @@ fn export(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     write_export(cx, &documents, options.max_source_bytes, output)
 }
 
-fn write_export(
+pub(super) fn write_export(
     cx: &Cx,
     documents: &[IndexableDocument],
     max_bytes: usize,

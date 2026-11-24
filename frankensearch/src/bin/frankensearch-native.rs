@@ -77,12 +77,14 @@ const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   authority-index / authority-complete-quality / authority-rebuild / authority-update /\n\
-  authority-repair / authority-search / authority-fetch / authority-serve /\n\
+  authority-repair / authority-search / authority-export / authority-fetch / authority-serve /\n\
   authority-recover / authority-rollback:\n\
          fixed AUTHORITY generations, retained source, repair and warm stdio serving\n\
          (use authority-index --help for the complete command contract)\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N] [--shard-size N]\n\
+  export --receipt JSON\n\
+         Write the complete selected source as index JSONL without models.\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
          [--mode full|fast|quality] [--limit N] [--stream] [--filter JSON]\n\
          [--timeout-ms N] [--reranker-dir DIR] [--rerank-window N]\n\
@@ -140,6 +142,7 @@ Stdout is JSON. This command does not change fsfs stores or CURRENT pointers.\n"
 enum Command {
     Index,
     Search,
+    Export,
     Serve,
     Update,
     Rebuild,
@@ -208,13 +211,14 @@ impl Options {
         let command = match command.as_str() {
             "index" => Command::Index,
             "search" => Command::Search,
+            "export" => Command::Export,
             "serve" => Command::Serve,
             "update" => Command::Update,
             "rebuild" => Command::Rebuild,
             "complete-quality" => Command::CompleteQuality,
             _ => {
                 return Err(bad(
-                    "expected index, search, serve, update, rebuild, or complete-quality; use --help",
+                    "expected index, search, export, serve, update, rebuild, or complete-quality; use --help",
                 ));
             }
         };
@@ -253,6 +257,9 @@ impl Options {
             }
             if !seen.insert(flag.clone()) {
                 return Err(bad("an option may only be supplied once"));
+            }
+            if command == Command::Export && flag != "--receipt" {
+                return Err(bad("export accepts only --receipt"));
             }
             match flag.as_str() {
                 "--fast-only" if matches!(command, Command::Index | Command::Rebuild) => {
@@ -838,7 +845,7 @@ async fn execute(
     // Native builders inherit the same caller-owned lane used for model and
     // query work, including warm updates and replacement-model builds. Refuse
     // a stopped lane before opening input, creating paths or loading models.
-    let context = if options.lexical_only {
+    let context = if options.lexical_only || options.command == Command::Export {
         cx.clone()
     } else {
         execution_context(cx, pool)?
@@ -846,6 +853,11 @@ async fn execute(
     let cx = &context;
     let pool = cx.blocking_pool_handle();
     match options.command {
+        Command::Export => {
+            let selection = Selection::read(&options.receipt)?;
+            let documents = update::selected_source(cx, &selection)?;
+            generation::write_export(cx, &documents, MAX_INPUT_BYTES, output)
+        }
         Command::Search if options.lexical_only => lexical::execute(cx, &options, output).await,
         Command::Serve if options.lexical_only => {
             lexical::serve_with_io(cx, &options, &mut io::stdin().lock(), output).await
