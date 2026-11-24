@@ -867,13 +867,17 @@ impl NativeGenerationSnapshot {
         )
     }
 
-    /// Complete the quality tier of this selected fast-only generation.
+    /// Complete the quality tier of this selected fast-only or partial generation.
     ///
     /// The fast producer must match its full retained identity, but no fast
     /// document inference is performed. All quality inputs come from this
     /// snapshot's authenticated Quill source; original input files are unnecessary.
-    /// The quality provider may have a different model and dimension while
-    /// preserving the stored prepared-input contract and semantic/control kind.
+    /// For a fast-only source the new quality provider may have a different model
+    /// and dimension while preserving the stored prepared-input contract and
+    /// semantic/control kind. A partial source requires its existing complete
+    /// quality identity: covered rows reuse their exact stored vectors and only
+    /// missing rows are inferred. Its quality precision and retrieval policy are
+    /// inherited unless explicitly overridden on the completion plan.
     ///
     /// The returned plan cannot edit sources, replace the fast model or change
     /// its precision. It builds a complete independently bound two-tier successor
@@ -881,8 +885,9 @@ impl NativeGenerationSnapshot {
     /// authority pair; a competing writer is never adopted as a new update base.
     ///
     /// # Errors
-    /// Refuses non-fast-only topology, historical selection, non-newer generation,
-    /// identity/input drift, source-budget exhaustion or cancellation before work.
+    /// Refuses complete or quality-only topology, historical selection, non-newer
+    /// generation, identity/input drift, source-budget exhaustion or cancellation
+    /// before work. Ordinary partial mutation and model migration remain separate.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_quality_completion(
         &self,
@@ -902,6 +907,7 @@ impl NativeGenerationSnapshot {
             self,
             max_source_bytes,
             Arc::clone(&self.readers.vector),
+            self.readers.quality.as_ref().map(Arc::clone),
         )
     }
 

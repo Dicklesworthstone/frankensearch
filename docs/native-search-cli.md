@@ -282,10 +282,13 @@ Full-query tuning remains restricted to complete full generations.
 `authority-serve` retains both producers and accepts `"mode":"partial"` explicitly;
 its default remains fast. Source fetch, lexical search, publication-attempt
 recovery, and retained rollback use the complete admitted source. Partial sources
-currently refuse update, rebuild, repair, and model activation; these operations
-need an explicit policy for preserving or changing the subset. Quality completion
-continues to require a fast-only source. Sharded authority generations remain
-unsupported.
+currently refuse update, rebuild, repair, and ordinary model activation; these
+operations need an explicit policy for preserving or changing the subset.
+`authority-complete-quality` explicitly fills the missing quality coverage and
+publishes a full generation before those ordinary maintenance operations resume.
+A warm partial server can adopt that completed generation through the explicit
+`activate_quality_completion` request described below.
+Sharded authority generations remain unsupported.
 
 Library callers use `build_partial_quality_generation(&cx, source, quality_ids,
 max_image_bytes)`, `NativeGenerationSnapshot::admit_partial_quality`, and
@@ -330,13 +333,15 @@ queries skip a warm server's reranker; a lexical-only startup rejects its model
 options. Ordinary and sharded receipt-based `search`/`serve` commands also support
 selected-tier reranking, with the retained source policy described below.
 
-### Complete quality for an existing fast-only generation
+### Complete quality for an existing fast-only or partial generation
 
-`authority-complete-quality` adds a complete, independently bound quality tier
-to the selected fast-only generation. It reads the authenticated retained source,
-reuses the fast vectors and exact lexical image, and publishes a full successor
-at the same source checkpoint. Original JSONL files are unnecessary, and the
-fast model performs no document inference.
+`authority-complete-quality` completes the independently bound quality tier of
+the selected fast-only or partial-quality generation. It reads the authenticated
+retained source, reuses the fast vectors and exact lexical image, and publishes a
+full successor at the same source checkpoint. For partial quality, it also reuses
+every already covered quality row and embeds only the missing documents.
+Original JSONL files are unnecessary, and the fast model performs no document
+inference.
 
 ```sh
 ./target/release/frankensearch-native authority-complete-quality \
@@ -349,17 +354,52 @@ fast model performs no document inference.
 
 The configured fast provider must still match its retained identity. Choose the
 quality provider with the usual local model-directory and quality-backend flags.
-`--retrieval` applies to the new quality tier; the existing fast precision and
-retrieval configuration stay bound to their retained artifacts. The command
+For a partial predecessor, that quality provider must match its independently
+retained identity too; completion cannot change the model. Existing quality
+precision and retrieval policy are inherited, including F16 storage.
+`--retrieval` can explicitly change the quality retrieval policy without changing
+its vectors' precision. A newly added quality tier defaults to F32 and exact
+retrieval. The existing fast precision and retrieval configuration stay bound to
+their retained artifacts. The command
 accepts the ordinary batch, source-byte and image-byte limits, but refuses
 replacement source input, source-cut overrides and model-migration flags.
 
 Publication requires the entire quality tier to be built and admitted, with the
-same document set, source checkpoint, fast identity and lexical receipt. A
-cancelled or failed build leaves the incumbent selected. A competing publication
+same document set, source checkpoint, fast identity, existing quality identity
+and lexical receipt. A cancelled or failed build leaves the incumbent selected. A competing publication
 refuses the original expected-authority pair instead of rebasing. Work files
 remain available after failure. This route produces a complete two-tier
 generation; partial quality coverage is not exposed as complete.
+
+A running fast-only or partial-quality server can adopt the completed receipt
+without restarting. Start it with `--allow-model-activation`; its ready event
+then reports `quality_completion_activation_enabled: true`. Publish the full
+successor separately with `authority-complete-quality`, then send a JSONL request
+with these fields:
+
+| Field | Value |
+| --- | --- |
+| `op` | `"activate_quality_completion"` |
+| `id` | Your request identifier |
+| `receipt` | Absolute path to the newly published full receipt |
+| `expected_authority` | Exact byte array from the warm session's current selection event |
+| `model_dir` | Explicit local model root for ONNX; optional when native quality uses its own directory |
+| `quality_backend`, `quality_model_dir` | The usual explicit native-quality options, when used |
+
+The operation retains the fast provider and admits the quality provider against
+the completed receipt. For a partial predecessor, the existing quality identity
+must remain identical, including its own prepared-input contract. The fast and
+quality tiers may retain independently different input contracts; completion
+does not reinterpret either one. Original source scope and query policy are
+preserved. Fast query embeddings remain reusable, while the quality query cache
+is recreated for the admitted provider. New queries use the full retained
+generation; references to the old partial snapshot keep their original coverage.
+
+This request only adopts an already published successor. It does not build
+vectors, publish another generation or download models. Missing permission,
+changed producers, changed source or lexical images, stale authority, loading
+failure and cancellation leave the previous serving selection intact. Ordinary
+`activate_model` remains unavailable while the session is partial.
 
 ### Rebuild an existing authority generation
 

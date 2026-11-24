@@ -1,11 +1,12 @@
-//! Add a complete independent quality tier using one retained fast authority.
+//! Complete independent quality coverage using one retained authority.
 
 use super::{
     BlockingPoolHandle, Cx, MAX_RECORD_BYTES, Models, NativeBuildPrecision,
     NativeGenerationTopology, Options, PublicationIntent, PublicationOptions, QueryMode, Receipt,
     Result, Write, admit_root, bad, checkpoint, emit_indexed, execution_context,
     load_authority_models, new_generation, new_path, prepare_publication_with_intent,
-    retained_rebuild_documents, separate_destinations, stage_prepared_and_publish,
+    rebuild_precision, retained_rebuild_documents, separate_destinations,
+    stage_prepared_and_publish,
 };
 
 pub(super) async fn run(
@@ -42,9 +43,12 @@ where
             .as_deref()
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
-    if selected.topology() != NativeGenerationTopology::FastOnly {
+    if !matches!(
+        selected.topology(),
+        NativeGenerationTopology::FastOnly | NativeGenerationTopology::PartialQuality { .. }
+    ) {
         return Err(bad(
-            "quality completion requires a fast-only authority receipt",
+            "quality completion requires a fast-only or partial-quality authority receipt",
         ));
     }
     let work_path = new_path(
@@ -70,6 +74,16 @@ where
         &snapshot,
         options.max_source_bytes,
     )?);
+    // A partial predecessor already owns independently admitted quality rows.
+    // Preserve their encoding so completion can reuse them exactly; only a new
+    // quality tier receives the CLI's default F32 storage policy.
+    let quality_precision = selected
+        .quality_identity
+        .as_ref()
+        .map(rebuild_precision)
+        .transpose()?
+        .unwrap_or(NativeBuildPrecision::F32);
+    let quality_retrieval = options.build_retrieval(snapshot.quality_retrieval_configuration());
     let loaded = load_models()?;
     let quality = loaded.quality.ok_or_else(|| {
         bad("quality completion requires an independently supplied quality model")
@@ -85,7 +99,7 @@ where
         )?
         .with_batch_size(options.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-        .with_quality_storage(NativeBuildPrecision::F32, options.build_retrieval(None))?
+        .with_quality_storage(quality_precision, quality_retrieval)?
         .build(cx, options.max_image_bytes)
         .await?;
     let prepared = prepare_publication_with_intent(
@@ -321,6 +335,14 @@ mod tests {
         }
 
         async fn fixture(cx: &Cx, ann: bool) -> Fixture {
+            fixture_with_quality(cx, ann, None).await
+        }
+
+        async fn fixture_with_quality(
+            cx: &Cx,
+            ann: bool,
+            quality: Option<Arc<Provider>>,
+        ) -> Fixture {
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -332,7 +354,7 @@ mod tests {
             fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
             let root = create_root(&parent.join("root")).expect("qualified Linux root required");
             let fast = Provider::new(false);
-            let built = NativeIndexBuilder::new(
+            let builder = NativeIndexBuilder::new(
                 parent.join("original-work"),
                 new_generation(1).unwrap(),
                 fast.clone(),
@@ -353,15 +375,42 @@ mod tests {
                 IndexableDocument::new("retry", "retry network requests")
                     .with_metadata("revision", "old"),
                 IndexableDocument::new("garden", "garden flowers"),
-            ])
-            .build_exact_generation(
-                cx,
-                EmbedderTierTag::Fast,
-                CommitRange { low: 4, high: 9 },
-                DEFAULT_IMAGE_BYTES,
-            )
-            .await
-            .unwrap();
+            ]);
+            let built = if let Some(quality) = quality {
+                builder
+                    .with_quality_embedder(quality)
+                    .unwrap()
+                    .with_quality_storage(
+                        NativeBuildPrecision::F16,
+                        if ann {
+                            NativeBuildRetrieval::Hnsw {
+                                params: HnswParams::default(),
+                                seed: 29,
+                            }
+                        } else {
+                            NativeBuildRetrieval::Exact
+                        },
+                    )
+                    .unwrap()
+                    .build_partial_quality_generation(
+                        cx,
+                        CommitRange { low: 4, high: 9 },
+                        ["garden".to_owned()],
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                builder
+                    .build_exact_generation(
+                        cx,
+                        EmbedderTierTag::Fast,
+                        CommitRange { low: 4, high: 9 },
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .await
+                    .unwrap()
+            };
             let published = stage_and_publish(
                 cx,
                 &root,
@@ -495,6 +544,228 @@ mod tests {
                     let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
                     assert_eq!(report["publication"], "committed");
                 }
+            });
+        }
+
+        #[test]
+        fn partial_completion_reuses_covered_rows_and_inherits_quality_storage_and_retrieval() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for ann in [false, true] {
+                    let quality = Provider::new(true);
+                    let fixture = fixture_with_quality(&cx, ann, Some(quality.clone())).await;
+                    let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                    let options = options(&fixture, "complete-partial");
+                    let mut output = Vec::new();
+                    with_loader(&cx, &options, &mut output, || {
+                        Ok(Models {
+                            fast: fixture.fast.clone(),
+                            quality: Some(quality.clone()),
+                        })
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 2);
+                    let receipt = Receipt::read(&options.receipt).unwrap();
+                    assert_eq!(
+                        receipt.topology(),
+                        NativeGenerationTopology::FullProgressive
+                    );
+                    assert_eq!(receipt.identity, fixture.selected.identity);
+                    assert_eq!(receipt.quality_identity, fixture.selected.quality_identity);
+                    assert_eq!(receipt.quality_documents, None);
+                    let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(
+                        reopened.quality_retrieval_configuration(),
+                        fixture.snapshot.quality_retrieval_configuration(),
+                    );
+                    assert_eq!(
+                        reopened.retained_snapshot().manifest().components().lexical,
+                        fixture
+                            .snapshot
+                            .retained_snapshot()
+                            .manifest()
+                            .components()
+                            .lexical,
+                    );
+                    assert_eq!(
+                        reopened.metadata().commit_range,
+                        fixture.snapshot.metadata().commit_range,
+                    );
+                    // Completion makes a previously uncovered document eligible
+                    // for direct quality retrieval after an independent reopen.
+                    let hits = reopened
+                        .search_quality_text(&cx, quality.as_ref(), "retry", 1)
+                        .await
+                        .unwrap();
+                    assert_eq!(hits[0].doc_id, "retry");
+                    assert!(matches!(
+                        fixture.snapshot.topology(),
+                        NativeGenerationTopology::PartialQuality {
+                            quality_documents: 1,
+                            total_documents: 2,
+                            ..
+                        }
+                    ));
+                    fixture.fast.fault.store(0, Ordering::SeqCst);
+                    assert!(
+                        !fixture
+                            .snapshot
+                            .search_text(&cx, fixture.fast.as_ref(), "retry", 1)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    assert_eq!(report["publication"], "committed");
+                    assert!(report["selection"]["quality_identity"].is_object());
+                    assert!(report["selection"]["quality_documents"].is_null());
+                }
+            });
+        }
+
+        #[test]
+        fn partial_completion_refuses_foreign_quality_before_inference_and_preserves_selection() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let quality = Provider::new(true);
+                let fixture = fixture_with_quality(&cx, false, Some(quality.clone())).await;
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                let foreign = Provider::new(true);
+                foreign.drifted.store(true, Ordering::SeqCst);
+                let options = options(&fixture, "foreign-quality");
+                assert!(
+                    with_loader(&cx, &options, &mut Vec::new(), || Ok(Models {
+                        fast: fixture.fast.clone(),
+                        quality: Some(foreign.clone()),
+                    }))
+                    .await
+                    .is_err()
+                );
+                assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                assert!(!options.work.unwrap().exists());
+                assert!(!options.receipt.exists());
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    authority,
+                );
+                fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            });
+        }
+
+        #[test]
+        fn partial_completion_inference_failure_cancellation_and_drift_preserve_coverage() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let original_quality = Provider::new(true);
+                let fixture =
+                    fixture_with_quality(&cx, false, Some(original_quality.clone())).await;
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                for fault in [1, 2, 3] {
+                    let quality = Provider::new(true);
+                    quality.fault.store(fault, Ordering::SeqCst);
+                    let options = options(&fixture, &format!("partial-fault-{fault}"));
+                    let mut output = Vec::new();
+                    let result = with_loader(&cx, &options, &mut output, || {
+                        Ok(Models {
+                            fast: fixture.fast.clone(),
+                            quality: Some(quality.clone()),
+                        })
+                    })
+                    .await;
+                    cx.set_cancel_requested(false);
+                    assert!(result.is_err());
+                    assert!(output.is_empty());
+                    assert!(!options.receipt.exists());
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                    assert_eq!(original_quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        authority,
+                    );
+                    let reopened = fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(reopened.topology(), fixture.snapshot.topology());
+                    assert!(matches!(
+                        reopened.topology(),
+                        NativeGenerationTopology::PartialQuality {
+                            quality_documents: 1,
+                            total_documents: 2,
+                            ..
+                        }
+                    ));
+                }
+            });
+        }
+
+        #[test]
+        fn partial_completion_competing_winner_fences_stale_candidate_and_requires_explicit_intent()
+        {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let quality = Provider::new(true);
+                let fixture = fixture_with_quality(&cx, true, Some(quality.clone())).await;
+                let completed = fixture
+                    .snapshot
+                    .begin_quality_completion(
+                        &cx,
+                        fixture.parent.join("stale-work"),
+                        new_generation(2).unwrap(),
+                        fixture.fast.clone(),
+                        quality.clone(),
+                        MAX_INPUT_BYTES,
+                    )
+                    .unwrap()
+                    .build(&cx, DEFAULT_IMAGE_BYTES)
+                    .await
+                    .unwrap();
+                assert!(
+                    prepare_publication(&completed, Some(&fixture.snapshot), DEFAULT_IMAGE_BYTES)
+                        .is_err()
+                );
+                let prepared = prepare_publication_with_intent(
+                    &completed,
+                    Some(&fixture.snapshot),
+                    DEFAULT_IMAGE_BYTES,
+                    PublicationIntent::CompleteQuality,
+                )
+                .unwrap();
+                let winner_options = options(&fixture, "winner-completion");
+                with_loader(&cx, &winner_options, &mut Vec::new(), || {
+                    Ok(Models {
+                        fast: fixture.fast.clone(),
+                        quality: Some(quality.clone()),
+                    })
+                })
+                .await
+                .unwrap();
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let root = admit_root(&fixture.selected.root).unwrap();
+                assert!(
+                    stage_prepared_and_publish(
+                        &cx,
+                        &root,
+                        &fixture.selected.root,
+                        &fixture.parent.join("stale-completion.json"),
+                        &completed,
+                        prepared,
+                        PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    authority,
+                );
+                let receipt = Receipt::read(&winner_options.receipt).unwrap();
+                let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    reopened.topology(),
+                    NativeGenerationTopology::FullProgressive
+                );
             });
         }
 

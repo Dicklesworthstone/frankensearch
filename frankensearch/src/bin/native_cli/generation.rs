@@ -1681,7 +1681,7 @@ fn prepare_publication_with_intent(
 ) -> Result<PreparedPublication> {
     if intent == PublicationIntent::CompleteQuality && predecessor.is_none() {
         return Err(bad(
-            "quality completion requires a selected fast-only predecessor",
+            "quality completion requires a selected fast-only or partial-quality predecessor",
         ));
     }
     let (root_id, expected, previous) = match predecessor {
@@ -1705,7 +1705,18 @@ fn prepare_publication_with_intent(
                     NativeGenerationTopology::PartialQuality { .. } => false,
                 },
                 PublicationIntent::CompleteQuality => {
-                    snapshot.topology() == NativeGenerationTopology::FastOnly
+                    let quality_identity_matches = match snapshot.topology() {
+                        NativeGenerationTopology::FastOnly => true,
+                        NativeGenerationTopology::PartialQuality { .. } => {
+                            built.quality_binding().is_some_and(|binding| {
+                                snapshot.metadata().embedders.get("quality")
+                                    == Some(binding.frozen_identity())
+                            })
+                        }
+                        NativeGenerationTopology::QualityOnly
+                        | NativeGenerationTopology::FullProgressive => false,
+                    };
+                    quality_identity_matches
                         && built.quality_binding().is_some()
                         && built.coverage() == VectorCohortCoverage::Complete
                         && built.binding().frozen_identity()
@@ -4247,7 +4258,11 @@ async fn serve_session(
     ready["quality_completion_activation_enabled"] = serde_json::json!(
         session.allow_model_activation
             && !session.models.is_lexical()
-            && session.receipt.topology() == NativeGenerationTopology::FastOnly
+            && matches!(
+                session.receipt.topology(),
+                NativeGenerationTopology::FastOnly
+                    | NativeGenerationTopology::PartialQuality { .. }
+            )
     );
     ready["updates_enabled"] = serde_json::json!(session.update_limits.is_some());
     ready["fetch_enabled"] = serde_json::json!(true);
@@ -4546,7 +4561,9 @@ async fn serve(
         session = session.with_updates(options.batch_size, options.max_source_bytes)?;
     }
     if options.allow_model_activation {
-        session.receipt.require_complete_for_mutation()?;
+        // A partial session may explicitly adopt a completed quality tier.
+        // Ordinary model activation and updates enforce their own topology
+        // guards; this grant alone does not authorize changing the subset.
         session.require_current_selection()?;
         session.models.models()?;
         session.allow_model_activation = true;
