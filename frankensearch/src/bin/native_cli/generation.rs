@@ -104,6 +104,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
        [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]]\n\n\
   authority-update --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       --source-low N --source-high N [--input JSONL] [--replace-source]\n\
+      [--allow-coverage-transition]\n\
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-repair --from-receipt DAMAGED_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
@@ -216,7 +217,10 @@ Updates preserve the selected producers, topology, precision, and retrieval poli
 content is embedded; complete vector, graph, and Quill images are still produced.\n\
 The final cohort satisfies the combined encoded-source limits. Deleting every\n\
 document publishes a complete empty generation that later updates can populate,\n\
-except partial quality updates, which must retain a nonempty proper quality subset.\n\
+except partial quality updates, which require --allow-coverage-transition when\n\
+the surviving quality subset becomes empty or complete. This explicit option\n\
+derives fast-only, full, or partial coverage from retained membership; it never\n\
+embeds previously uncovered documents into quality. Empty successors are fast-only.\n\
 Updates require nonbackward source checkpoints and a new work directory/receipt.\n\
 Use rebuild for producer or retrieval changes. Update never changes old images.\n\
 Repair explicitly admits the selected control state, metadata and complete stored\n\
@@ -485,6 +489,7 @@ struct Options {
     complete_quality: bool,
     retained_source: bool,
     replace_source: bool,
+    allow_coverage_transition: bool,
     allow_activation: bool,
     allow_model_activation: bool,
     allow_updates: bool,
@@ -569,6 +574,7 @@ impl Options {
             complete_quality: false,
             retained_source: false,
             replace_source: false,
+            allow_coverage_transition: false,
             allow_activation: false,
             allow_model_activation: false,
             allow_updates: false,
@@ -624,6 +630,9 @@ impl Options {
                 }
                 "--replace-source" if command == Command::Update => {
                     options.replace_source = true;
+                }
+                "--allow-coverage-transition" if command == Command::Update => {
+                    options.allow_coverage_transition = true;
                 }
                 "--max-source-bytes"
                     if matches!(
@@ -1769,6 +1778,7 @@ enum PublicationIntent {
     CompleteQuality,
     BackfillQuality,
     RebuildPartialQuality,
+    UpdatePartialQualityCoverage,
 }
 
 fn prepare_publication_with_intent(
@@ -1862,6 +1872,17 @@ fn prepare_publication_with_intent(
                         })
                         && built.metadata().commit_range == snapshot.metadata().commit_range
                         && built.metadata().total_documents == snapshot.metadata().total_documents
+                }
+                PublicationIntent::UpdatePartialQualityCoverage => {
+                    matches!(
+                        snapshot.topology(),
+                        NativeGenerationTopology::PartialQuality { .. }
+                    ) && snapshot.metadata().embedders.get("fast")
+                        == Some(built.binding().frozen_identity())
+                        && built.quality_binding().is_none_or(|binding| {
+                            snapshot.metadata().embedders.get("quality")
+                                == Some(binding.frozen_identity())
+                        })
                 }
             };
             if built.binding().generation().sequence
@@ -1991,6 +2012,55 @@ fn prepare_partial_quality_completion(
     }
     if preview.retrieval_configuration() != predecessor.retrieval_configuration() {
         return Err(serve_refused("quality_backfill_fast_retrieval_mismatch"));
+    }
+    checkpoint(cx)?;
+    Ok(prepared)
+}
+
+fn prepare_update_coverage_transition(
+    cx: &Cx,
+    built: &NativeBuiltExactGeneration,
+    predecessor: &NativeGenerationSnapshot,
+    expected_quality_ids: &[String],
+    max_source_bytes: usize,
+    max_image_bytes: usize,
+) -> Result<PreparedPublication> {
+    checkpoint(cx)?;
+    let prepared = prepare_publication_with_intent(
+        built,
+        Some(predecessor),
+        max_image_bytes,
+        PublicationIntent::UpdatePartialQualityCoverage,
+    )?;
+    // Compare the admitted candidate's actual membership with the surviving
+    // predecessor IDs captured during source preflight. Counts alone cannot
+    // authorize a different subset or promote previously uncovered documents.
+    let preview = built.preview_candidate(cx, &prepared.candidate)?;
+    let membership_matches = match preview.topology() {
+        NativeGenerationTopology::FastOnly => expected_quality_ids.is_empty(),
+        NativeGenerationTopology::FullProgressive => {
+            let mut ids: Vec<_> = preview
+                .source_documents(cx, max_source_bytes)?
+                .into_iter()
+                .map(|document| document.id)
+                .collect();
+            ids.sort_unstable();
+            !ids.is_empty() && ids == expected_quality_ids
+        }
+        NativeGenerationTopology::PartialQuality { .. } => {
+            preview.partial_quality_document_ids(cx)? == expected_quality_ids
+        }
+        NativeGenerationTopology::QualityOnly => false,
+    };
+    if !membership_matches {
+        return Err(serve_refused("partial_quality_update_coverage_mismatch"));
+    }
+    if preview.retrieval_configuration() != predecessor.retrieval_configuration()
+        || (!expected_quality_ids.is_empty()
+            && preview.quality_retrieval_configuration()
+                != predecessor.quality_retrieval_configuration())
+    {
+        return Err(serve_refused("partial_quality_update_retrieval_mismatch"));
     }
     checkpoint(cx)?;
     Ok(prepared)
@@ -2897,6 +2967,7 @@ struct AuthorityUpdateSpec {
     limits: AuthorityUpdateLimits,
     max_image_bytes: usize,
     replace_source: bool,
+    allow_coverage_transition: bool,
 }
 
 struct PreparedAuthorityUpdate {
@@ -2904,6 +2975,7 @@ struct PreparedAuthorityUpdate {
     sequence: u64,
     edits: mutations::Edits,
     document_count: usize,
+    quality_document_ids: Option<Vec<String>>,
 }
 
 fn prepare_authority_update<F>(
@@ -2921,6 +2993,11 @@ where
         || snapshot.authority() != selected.authority()?
     {
         return Err(serve_refused("update_base_is_selected_predecessor"));
+    }
+    if spec.allow_coverage_transition && selected.quality_documents.is_none() {
+        return Err(serve_refused(
+            "coverage_transition_requires_partial_quality",
+        ));
     }
     if spec.limits.batch_size == 0
         || spec.limits.batch_size > MAX_DOCUMENTS
@@ -2958,18 +3035,23 @@ where
         }
     }
     let document_count = mutations::validate_final_source(cx, &documents, &edits)?;
-    if selected.quality_documents.is_some() {
+    let quality_document_ids = if selected.quality_documents.is_some() {
         let covered = snapshot.partial_quality_document_ids(cx)?;
-        let remaining = covered
-            .iter()
+        let remaining: Vec<_> = covered
+            .into_iter()
             .filter(|id| !matches!(edits.get(id.as_str()), Some(None)))
-            .count();
-        if remaining == 0 || remaining >= document_count {
+            .collect();
+        if !spec.allow_coverage_transition
+            && (remaining.is_empty() || remaining.len() >= document_count)
+        {
             return Err(serve_refused(
                 "partial_quality_update_requires_partial_coverage",
             ));
         }
-    }
+        Some(remaining)
+    } else {
+        None
+    };
     // The library prepares reuse from the same immutable image. Let these
     // preflight bodies go before loading a model or materializing that source.
     checkpoint(cx)?;
@@ -2978,6 +3060,7 @@ where
         sequence,
         edits,
         document_count,
+        quality_document_ids,
     })
 }
 
@@ -2995,6 +3078,7 @@ async fn build_and_publish_update(
         sequence,
         edits,
         document_count,
+        quality_document_ids,
     } = prepared;
     admit_serving_models(selected, loaded)?;
     let built = if selected.quality_documents.is_some() {
@@ -3024,7 +3108,16 @@ async fn build_and_publish_update(
                 };
             }
         }
-        Box::pin(transaction.build(cx, spec.source, spec.max_image_bytes)).await?
+        if spec.allow_coverage_transition {
+            Box::pin(transaction.build_with_realized_coverage(
+                cx,
+                spec.source,
+                spec.max_image_bytes,
+            ))
+            .await?
+        } else {
+            Box::pin(transaction.build(cx, spec.source, spec.max_image_bytes)).await?
+        }
     } else {
         let transaction = if let Some(quality) = &loaded.quality {
             snapshot.begin_progressive_update(
@@ -3075,11 +3168,18 @@ async fn build_and_publish_update(
             .await?
         }
     };
+    let expected_quality_identity = if spec.allow_coverage_transition
+        && quality_document_ids.as_ref().is_some_and(Vec::is_empty)
+    {
+        None
+    } else {
+        selected.quality_identity.as_ref()
+    };
     if built.binding().frozen_identity() != &selected.identity
         || built
             .quality_binding()
             .map(FsviV2IdentityBinding::frozen_identity)
-            != selected.quality_identity.as_ref()
+            != expected_quality_identity
     {
         return Err(bad("the provider changed after update identity admission"));
     }
@@ -3088,13 +3188,28 @@ async fn build_and_publish_update(
             "the built update differs from its admitted source cohort",
         ));
     }
-    stage_and_publish(
+    let publication = if spec.allow_coverage_transition {
+        let expected_ids = quality_document_ids
+            .as_deref()
+            .ok_or_else(|| serve_refused("coverage_transition_requires_partial_quality"))?;
+        prepare_update_coverage_transition(
+            cx,
+            &built,
+            snapshot,
+            expected_ids,
+            spec.limits.max_source_bytes,
+            spec.max_image_bytes,
+        )?
+    } else {
+        prepare_publication(&built, Some(snapshot), spec.max_image_bytes)?
+    };
+    stage_prepared_and_publish(
         cx,
         root,
         &selected.root,
         &spec.receipt,
         &built,
-        Some(snapshot),
+        publication,
         PublicationOptions {
             max_image_bytes: spec.max_image_bytes,
             scope,
@@ -3143,6 +3258,7 @@ where
             },
             max_image_bytes: options.max_image_bytes,
             replace_source: options.replace_source,
+            allow_coverage_transition: options.allow_coverage_transition,
         },
         || match &options.input {
             Some(path) => mutations::read_update_input(
@@ -4593,6 +4709,7 @@ impl AuthoritySession {
                 limits,
                 max_image_bytes: self.max_image_bytes,
                 replace_source,
+                allow_coverage_transition: false,
             },
             || Ok(edits),
         )?;

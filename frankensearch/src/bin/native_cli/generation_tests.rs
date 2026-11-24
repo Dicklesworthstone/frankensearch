@@ -180,6 +180,38 @@ fn source_replacement_requires_the_explicit_authority_update_option() {
     }
 }
 
+#[test]
+fn coverage_transitions_require_the_explicit_one_shot_update_option() {
+    let mut arguments = update_arguments();
+    assert!(
+        !parse(&arguments)
+            .unwrap()
+            .unwrap()
+            .allow_coverage_transition
+    );
+    arguments.push("--allow-coverage-transition");
+    assert!(
+        parse(&arguments)
+            .unwrap()
+            .unwrap()
+            .allow_coverage_transition
+    );
+    arguments.push("--allow-coverage-transition");
+    assert!(parse(&arguments).is_err());
+    for mut arguments in [
+        index_arguments(),
+        retained_rebuild_arguments(),
+        vec!["authority-serve", "--receipt", "selected.json"],
+    ] {
+        arguments.push("--allow-coverage-transition");
+        assert!(parse(&arguments).is_err_and(|error| {
+            error
+                .to_string()
+                .contains("unknown or inapplicable authority option")
+        }));
+    }
+}
+
 fn retained_rebuild_arguments() -> Vec<&'static str> {
     vec![
         "authority-rebuild",
@@ -8460,6 +8492,302 @@ mod progressive_authority {
                 assert_eq!(response[1]["quality_coverage"]["quality_documents"], 1);
                 assert_eq!(response[1]["results"].as_array().unwrap().len(), 3);
             }
+        });
+    }
+
+    #[test]
+    fn partial_authority_coverage_transitions_publish_and_reopen_truthful_successors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ann in [false, true] {
+                for replace_source in [false, true] {
+                    for (label, keep, topology) in [
+                        (
+                            "full",
+                            vec!["quality"],
+                            NativeGenerationTopology::FullProgressive,
+                        ),
+                        (
+                            "fast",
+                            vec!["fast-only", "garden"],
+                            NativeGenerationTopology::FastOnly,
+                        ),
+                        ("empty", vec![], NativeGenerationTopology::FastOnly),
+                    ] {
+                        let parent = private_parent();
+                        let fast = provider(false);
+                        let quality = provider(true);
+                        let (initial, selected) =
+                            publish_partial_cli(&cx, &parent, &fast, &quality, ann).await;
+                        let retained = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                        let receipt_bytes = fs::read(&initial.receipt).unwrap();
+                        let source = retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap();
+                        let records: Vec<_> = source
+                            .iter()
+                            .filter_map(|document| {
+                                if replace_source {
+                                    keep.contains(&document.id.as_str()).then(|| {
+                                        serde_json::json!({
+                                            "id": document.id, "content": document.content,
+                                        })
+                                    })
+                                } else {
+                                    (!keep.contains(&document.id.as_str())).then(
+                                        || serde_json::json!({"op": "delete", "id": document.id}),
+                                    )
+                                }
+                            })
+                            .collect();
+                        let input = parent.join("coverage-input.jsonl");
+                        fs::write(
+                            &input,
+                            records
+                                .iter()
+                                .map(serde_json::Value::to_string)
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                        .unwrap();
+                        let mut options =
+                            update_options(&parent, &initial.receipt, label, &input, 8);
+                        options.replace_source = replace_source;
+                        options.allow_coverage_transition = true;
+                        let before = calls(&fast, &quality);
+                        let mut output = Vec::new();
+                        update_generation_with_loader(&cx, &options, &mut output, |tier| {
+                            Ok(match tier {
+                                EmbedderTierTag::Fast => fast.clone(),
+                                EmbedderTierTag::Quality => quality.clone(),
+                            })
+                        })
+                        .await
+                        .unwrap();
+                        assert_eq!(calls(&fast, &quality), before, "deletions reuse vectors");
+                        let next = Receipt::read(&options.receipt).unwrap();
+                        let reopened = next.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                        assert_eq!(next.topology(), topology);
+                        assert_eq!(reopened.topology(), topology);
+                        assert_eq!(next.documents, u64::try_from(keep.len()).unwrap());
+                        assert_eq!(next.quality_documents, None);
+                        assert_eq!(next.identity, selected.identity);
+                        assert_eq!(
+                            next.quality_identity,
+                            if topology == NativeGenerationTopology::FullProgressive {
+                                selected.quality_identity.clone()
+                            } else {
+                                None
+                            }
+                        );
+                        assert_eq!(
+                            reopened.retrieval_configuration(),
+                            retained.retrieval_configuration()
+                        );
+                        assert_eq!(
+                            reopened.quality_retrieval_configuration(),
+                            if topology == NativeGenerationTopology::FullProgressive {
+                                retained.quality_retrieval_configuration()
+                            } else {
+                                None
+                            }
+                        );
+                        let ids: BTreeSet<_> = reopened
+                            .source_documents(&cx, MAX_INPUT_BYTES)
+                            .unwrap()
+                            .into_iter()
+                            .map(|document| document.id)
+                            .collect();
+                        assert_eq!(
+                            ids,
+                            keep.iter()
+                                .map(|id| (*id).to_owned())
+                                .collect::<BTreeSet<_>>()
+                        );
+                        assert_eq!(fs::read(&initial.receipt).unwrap(), receipt_bytes);
+                        assert_eq!(
+                            serde_json::to_value(
+                                retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap()
+                            )
+                            .unwrap(),
+                            serde_json::to_value(&source).unwrap()
+                        );
+                        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                        assert_eq!(report["event"], "updated");
+                        assert_eq!(report["publication"], "committed");
+
+                        let query = partial_search_options(
+                            &options.receipt,
+                            Some(if topology == NativeGenerationTopology::FullProgressive {
+                                QueryMode::Full
+                            } else {
+                                QueryMode::Fast
+                            }),
+                        );
+                        output.clear();
+                        search_with_loader(&cx, &query, &mut output, |tier| {
+                            Ok(match tier {
+                                EmbedderTierTag::Fast => fast.clone(),
+                                EmbedderTierTag::Quality => quality.clone(),
+                            })
+                        })
+                        .await
+                        .unwrap();
+                        assert!(!frames(&output).is_empty());
+
+                        // The empty successor remains an ordinary writable fast
+                        // generation; no special recovery or quality model is needed.
+                        if keep.is_empty() {
+                            let repopulate_input = parent.join("repopulate.jsonl");
+                            fs::write(
+                                &repopulate_input,
+                                "{\"op\":\"upsert\",\"id\":\"new\",\"content\":\"retry new content\"}\n",
+                            )
+                            .unwrap();
+                            let repopulate = update_options(
+                                &parent,
+                                &options.receipt,
+                                "repopulated",
+                                &repopulate_input,
+                                9,
+                            );
+                            update_generation_with_loader(
+                                &cx,
+                                &repopulate,
+                                &mut Vec::new(),
+                                |tier| {
+                                    assert_eq!(tier, EmbedderTierTag::Fast);
+                                    Ok(fast.clone())
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            let repopulated = Receipt::read(&repopulate.receipt).unwrap();
+                            assert_eq!(repopulated.documents, 1);
+                            assert_eq!(repopulated.topology(), NativeGenerationTopology::FastOnly);
+                            assert_eq!(
+                                repopulated
+                                    .open(&cx, DEFAULT_IMAGE_BYTES)
+                                    .unwrap()
+                                    .source_documents(&cx, MAX_INPUT_BYTES)
+                                    .unwrap()[0]
+                                    .id,
+                                "new"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn coverage_transition_publication_checks_membership_not_just_counts() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (initial, selected) =
+                publish_partial_cli(&cx, &parent, &fast, &quality, true).await;
+            let retained = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            let built = retained
+                .begin_partial_quality_update(
+                    &cx,
+                    parent.join("full-candidate"),
+                    new_generation(2).unwrap(),
+                    fast.clone(),
+                    quality.clone(),
+                    MAX_INPUT_BYTES,
+                )
+                .unwrap()
+                .delete_document("garden")
+                .delete_document("fast-only")
+                .build_with_realized_coverage(
+                    &cx,
+                    CommitRange { low: 2, high: 8 },
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .await
+                .unwrap();
+            assert!(prepare_publication(&built, Some(&retained), DEFAULT_IMAGE_BYTES).is_err());
+            let error = prepare_update_coverage_transition(
+                &cx,
+                &built,
+                &retained,
+                &["garden".to_owned()],
+                MAX_INPUT_BYTES,
+                DEFAULT_IMAGE_BYTES,
+            )
+            .err()
+            .expect("same-count wrong membership must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("partial_quality_update_coverage_mismatch")
+            );
+            prepare_update_coverage_transition(
+                &cx,
+                &built,
+                &retained,
+                &["quality".to_owned()],
+                MAX_INPUT_BYTES,
+                DEFAULT_IMAGE_BYTES,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority
+            );
+            assert!(
+                Receipt::read(&initial.receipt)
+                    .unwrap()
+                    .open(&cx, DEFAULT_IMAGE_BYTES)
+                    .is_ok()
+            );
+        });
+    }
+
+    #[test]
+    fn coverage_transition_option_refuses_complete_predecessor_before_input_or_models() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let mut initial = partial_index_options(&parent, false);
+            initial.partial_quality = false;
+            initial.progressive = true;
+            initial.quality_ids = None;
+            index_with_loader(&cx, &initial, &mut Vec::new(), |_| {
+                Ok(models(&fast, &quality))
+            })
+            .await
+            .unwrap();
+            let selected = Receipt::read(&initial.receipt).unwrap();
+            let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            let mut options = update_options(
+                &parent,
+                &initial.receipt,
+                "not-partial",
+                &parent.join("missing-input.jsonl"),
+                8,
+            );
+            options.allow_coverage_transition = true;
+            let mut output = Vec::new();
+            let error = update_generation_with_loader(&cx, &options, &mut output, |_| {
+                panic!("nonpartial topology must refuse before loading models")
+            })
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("coverage_transition_requires_partial_quality")
+            );
+            assert!(output.is_empty());
+            assert!(!options.work.as_ref().unwrap().exists());
+            assert!(!options.receipt.exists());
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority
+            );
         });
     }
 
