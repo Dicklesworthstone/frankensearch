@@ -4880,7 +4880,10 @@ mod qualified_rollback {
                         .await
                         .unwrap();
                     assert_eq!(hits.len(), 3);
-                    assert!(hits.iter().all(|hit| ["a", "b", "n"].contains(&hit.doc_id.as_str())));
+                    assert!(
+                        hits.iter()
+                            .all(|hit| ["a", "b", "n"].contains(&hit.doc_id.as_str()))
+                    );
                     assert_eq!(
                         retained.partial_quality_document_ids(&cx).unwrap(),
                         ["b", "e"],

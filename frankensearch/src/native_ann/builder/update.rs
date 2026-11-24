@@ -2299,8 +2299,7 @@ mod tests {
                         .await
                         .unwrap();
                     let old_fast = std::fs::read(old.fast().vector_path()).unwrap();
-                    let old_quality =
-                        std::fs::read(old.quality().unwrap().vector_path()).unwrap();
+                    let old_quality = std::fs::read(old.quality().unwrap().vector_path()).unwrap();
                     let replacement = vec![
                         IndexableDocument::new("new", "vertical"),
                         IndexableDocument::new("z-fast", "horizontal"),
@@ -4231,24 +4230,23 @@ mod tests {
                 assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
                 assert_eq!(next.partitions().len(), 1);
                 assert_eq!(old.partitions().len(), 3);
-                let cold = NativeIndexBuilder::new(
-                    dir.path().join("cold"),
-                    generation(2),
-                    fast.clone(),
-                )
-                .unwrap()
-                .with_quality_embedder(quality.clone())
-                .unwrap()
-                .with_fast_storage(NativeBuildPrecision::F16, graph(true))
-                .with_quality_storage(NativeBuildPrecision::F32, graph(false))
-                .unwrap()
-                .add_documents(replacement)
-                .build_sharded(&cx, 3)
-                .await
-                .unwrap();
+                let cold =
+                    NativeIndexBuilder::new(dir.path().join("cold"), generation(2), fast.clone())
+                        .unwrap()
+                        .with_quality_embedder(quality.clone())
+                        .unwrap()
+                        .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                        .with_quality_storage(NativeBuildPrecision::F32, graph(false))
+                        .unwrap()
+                        .add_documents(replacement)
+                        .build_sharded(&cx, 3)
+                        .await
+                        .unwrap();
                 assert_same_shards(&next, &cold);
                 assert_eq!(
-                    next.documents().map(|document| document.id.as_str()).collect::<Vec<_>>(),
+                    next.documents()
+                        .map(|document| document.id.as_str())
+                        .collect::<Vec<_>>(),
                     ["a", "x", "z-fast"],
                 );
                 assert_eq!(old.document_count(), 5);

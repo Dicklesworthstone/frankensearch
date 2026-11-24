@@ -9,12 +9,14 @@ no capability credit. Existing qualified work below remains unchanged.
 
 - [x] Refresh origin, source/worktree state and the current dependency graph.
   Merge remote `bbd81cdb` without rewriting either history; the integrated
-  checkpoint is `a35b1769`. Preserve the shared checkout's peer edits.
+  checkpoint is `a35b1769`. Later merge source replacement commit `12b7c0d1`
+  at `cea53452`; preserve both histories and the shared checkout's peer edits.
 - [x] Recover the established six-variant inventory and current release via
   the GitHub connector and existing release checker; retain the actual profiles.
 - [x] Inspect release-host admission. The configured Apple host answers SSH
   but DSR rejects its APFS writable roles: 6.41 GiB available versus the
   existing 40 GiB minimum. No threshold change or cleanup is authorized.
+  Fresh 05:27 UTC admission remains refused at 4.79 GiB; retain that receipt.
 - [ ] Upgrade one stable dependency at a time under `bd-dsbym`.
   - [x] Read the updater/research skills and primary sysinfo 0.40.4 source,
     migration guide and changelog; compare every actual call site.
@@ -44,6 +46,16 @@ no capability credit. Existing qualified work below remains unchanged.
       - [x] Supply the genuine retained `2e2b8026` prior executable to the
         two-executable test; the previous full run omitted this required input.
       - [ ] Complete all eighteen labels on the repaired committed source.
+      - [x] Retain the `60a07028` workspace failure: twelve Quill receipt
+        fixtures hardcode quota-exhausted `/dev/shm`. The same executable's
+        exact twelve cases pass on fresh private tmpfs, UID 1000 with the
+        original groups, including the sixty-second production age floor.
+        No source, gate, filesystem admission or host files change. Stop only
+        the already-failed owned run; retain actual SIGTERM result -15.
+      - [x] Rerun privately on unchanged `60a07028`: workspace tests pass
+        (500 seconds), alongside all compilation/Clippy/cross/proxy/installer
+        labels. Retire this incomplete run when origin advances to `12b7c0d1`;
+        retain SIGTERM -15. Neither retired run is a full stock pass.
     - [ ] Recheck actual foreground signals, both 128 MiB pressure profiles,
       and cancellation while paused under an explicit 100-per-mille load ceiling.
       This configured pressure probe cannot establish default-pressure behavior.
@@ -117,6 +129,22 @@ no capability credit. Existing qualified work below remains unchanged.
     joins/constructor expectations and necessary shared-handle clones. No
     suppressions. Explicit include-file rustfmt and workspace fmt pass.
   - [ ] Complete the unchanged full stock gate with all required inputs.
+- [ ] Qualify the newly published source replacement API, preserving peer credit.
+  - [x] Read both complete incoming diffs and merge `12b7c0d1` cleanly.
+    Complete and sparse-quality replacements reuse admitted surviving vectors;
+    empty/duplicate IDs, byte limits and cancellation precede staging.
+  - [x] Run strict hybrid all-target Clippy on the merged implementation.
+  - [x] Correct four formatter differences in new tests, without changing
+    any assertion, refusal, inference count, storage policy or time limit.
+  - [x] Execute replacement inventory positive/negative and authority tests:
+    all five cases pass, zero failures or ignores, including actual native HNSW.
+    Formatting passes. The two-file UBS scan flags two unchanged test-only
+    panic assertions requiring whole-component activation; review retains both
+    guards, all warnings and the nonzero scanner exit without suppressions.
+  - [ ] Run the entire stock gate on the new clean combined checkpoint with
+    the already demonstrated private tmpfs and the genuine prior executable.
+    The tests use control providers for replacement behavior; they do not
+    establish ordinary fsfs authority convergence or real-model replacement.
 - [ ] Complete remaining dependency review without relaxing audited identity,
   forbidden-runtime, profile, wire, installer or consumer contracts.
 - [ ] Recheck platform admission before any release. Keep the original
@@ -124,6 +152,10 @@ no capability credit. Existing qualified work below remains unchanged.
   - [x] Live source/registry audit finds thirteen public packages, all already
     published from `d1b9da15`; only `PUBLISHED_VERSION_SOURCE_MISMATCH` blocks
     the current unbumped candidate. Do not republish those versions.
+  - [x] Determine Homebrew applicability from the actual complete tap tree:
+    `3244f87d` has 56 files and no fsfs/frankensearch formula, cask or update
+    route. The connector was rate-limited; a fresh public Git snapshot supplies
+    the evidence. No existing entry needs updating; no brew install is claimed.
 - [ ] Publish qualified increments and scoped Beads/TODO evidence, verify
   both remote refs and dependency cycles, and fill the bounded honesty review.
 

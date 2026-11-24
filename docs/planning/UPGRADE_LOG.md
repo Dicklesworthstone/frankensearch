@@ -143,6 +143,45 @@ The genuine two-executable reuse case passes all original controls: current
 This is not a production logging fix or a performance result. Full integrated
 qualification remains pending; no test deadline, ignore or gate is relaxed.
 
+The clean `60a07028` rerun reaches twelve EDQUOT failures in Quill's receipt
+fixtures, which explicitly use `/dev/shm` despite the separate build target.
+The retained cache remains untouched. Every one of those exact twelve tests
+passes with the same ELF on fresh 4 GiB tmpfs in a private mount namespace,
+as UID 1000 with the original groups. This includes the original sixty-second
+stability floor, strict-read/writer hashing, corruption, descriptor budget and
+retained-reader assertions. Parent cache identity remains unchanged. No code,
+filesystem admission or test/gate change is involved. Retire only the failed
+owned run (actual SIGTERM -15); preserve `dependency-stock-gate-v4*` and
+`quill-private-shm-{control,all-failed-controls}.*`. DCG rejects a log-derived
+variable argument list; a fixed explicit list executes those twelve cases
+without a bypass. Unprivileged user-namespace admission was unavailable;
+the private mount setup drops back to the original user before executing tests.
+
+The same-source private stock rerun passes the entire workspace stage (500
+seconds), all compiler/strict-Clippy/cross guards, HTTP and installer stages.
+It is retired incomplete, SIGTERM -15, when a fresh origin read finds peer
+commit `12b7c0d1`. That commit adds complete replacement inventories to the
+native update API and explicitly leaves compiler/runtime qualification open.
+It is read in full and merged at `cea53452`, preserving authorship and both
+histories. The merged implementation passes strict hybrid all-target Clippy;
+four formatter differences in its new tests are corrected without behavioral
+changes. All five focused replacement tests pass, zero failures or ignores;
+their HNSW cases use the actual native graph engine. Formatting passes.
+The two-file UBS scan exits 1 with two unchanged test-only panic assertions
+requiring activation of the complete component closure. Both are reviewed and
+retained without suppression; this is not a zero-critical scan claim.
+A complete new clean-source stock run remains required. The replacement
+cases use control providers on real disk artifacts;
+they are not real-model replacement or ordinary fsfs authority-migration proof.
+The retired `60a07028` run is not an overall gate pass.
+
+Live Homebrew review reads the complete 56-file public tap tree at
+[`3244f87d`](https://github.com/Dicklesworthstone/homebrew-tap/tree/3244f87d7e5a242ff57690ca302c14fba644930b).
+There is no fsfs/frankensearch formula, cask or update route to update for this
+release. The GitHub connector's rate-limit 403 is retained as a refusal;
+a fresh read-only public Git snapshot supplies this finding. No tap mutation
+or Homebrew installation qualification is claimed.
+
 The live registry census covers 67 direct external dependencies. This is
 not a completed latest-version migration: the runtime/SQLite family, TUI,
 model producer, wire-format and frozen oracle upgrades need their own
