@@ -17,6 +17,7 @@ no capability credit. Existing qualified work below remains unchanged.
   but DSR rejects its APFS writable roles: 6.41 GiB available versus the
   existing 40 GiB minimum. No threshold change or cleanup is authorized.
   Fresh 05:27 UTC admission remains refused at 4.79 GiB; retain that receipt.
+  The 06:50 UTC recheck still refuses admission: 4.31 GiB versus 40 GiB.
 - [ ] Upgrade one stable dependency at a time under `bd-dsbym`.
   - [x] Read the updater/research skills and primary sysinfo 0.40.4 source,
     migration guide and changelog; compare every actual call site.
@@ -33,19 +34,22 @@ no capability credit. Existing qualified work below remains unchanged.
     Same 1,563-advisory snapshot: one vulnerability before, zero after;
     five informational warnings remain. Only cookie changes in this step.
     The HTTP/proxy gate passes. No production exploit is demonstrated.
-  - [ ] Execute the complete stock gate and actual signal/pressure controls.
+  - [x] Execute the complete stock gate and actual signal/pressure controls.
     - [x] Preserve the clean `8de81f7f` stock attempt: all stages through
       Quill passed, then fsfs linking hit EDQUOT on quota-enabled `/dev/shm`.
       Stop only the owned gate tree; retain terminal 143 and linker receipts.
     - [x] Copy the cache without deletion to the separately probed volume
       with 15 TB available: rsync terminal 0, 64,572,120,354 bytes transferred.
-    - [ ] Rerun the entire unchanged stock gate on the copied cache.
+    - [x] Rerun the entire unchanged stock gate on the copied cache.
       - [x] Retain the completed `a35b1769` attempt, terminal 1: fourteen
         labels pass; hybrid Clippy, workspace tests, facade tests and real-model
         e2e fail. The fsfs, HTTP, quickstart and lite stages pass. No skips.
       - [x] Supply the genuine retained `2e2b8026` prior executable to the
         two-executable test; the previous full run omitted this required input.
-      - [ ] Complete all eighteen labels on the repaired committed source.
+      - [x] Complete all eighteen labels on the repaired committed source.
+        Clean `ebae5455`, 06:04:09–06:49:39 UTC, terminal 0, no skip allowances.
+        Native thinkstation1, original UID/groups, private supported 4 GiB
+        tmpfs; original host quota and retained cache remain unchanged.
       - [x] Retain the `60a07028` workspace failure: twelve Quill receipt
         fixtures hardcode quota-exhausted `/dev/shm`. The same executable's
         exact twelve cases pass on fresh private tmpfs, UID 1000 with the
@@ -56,16 +60,21 @@ no capability credit. Existing qualified work below remains unchanged.
         (500 seconds), alongside all compilation/Clippy/cross/proxy/installer
         labels. Retire this incomplete run when origin advances to `12b7c0d1`;
         retain SIGTERM -15. Neither retired run is a full stock pass.
-    - [ ] Recheck actual foreground signals, both 128 MiB pressure profiles,
+    - [x] Recheck actual foreground signals, both 128 MiB pressure profiles,
       and cancellation while paused under an explicit 100-per-mille load ceiling.
       This configured pressure probe cannot establish default-pressure behavior.
       The first probe used 1, which the existing minimum-100 validator correctly
       refused. That receipt is not pressure proof; the corrected 13-command
       probe passes on preserved candidate ELF `bc531f43`, with no owned
       processes left and the incumbent independently searchable after each stop.
-    - [ ] Recheck strict Clippy and the affected pressure/doctor tests on
+      The final invocation-built default ELF `83d0c462` passes the same
+      thirteen commands; `/data/tmp/fsfs-foreground-95mjla_b/summary.json`
+      binds its exact hash, incumbent selection and independently served hits.
+    - [x] Recheck strict Clippy and the affected pressure/doctor tests on
       the separate `semantic-native` profile; retain its exact feature set.
-  - [ ] Preserve the legacy symlink watch repair as a permanent regression.
+      `--no-default-features --features semantic-native`: all-target strict
+      Clippy passes; pressure 223/0/0 and doctor 33/0/0. No platform pass.
+  - [x] Preserve the legacy symlink watch repair as a permanent regression.
     - [x] Reproduce historical ELF `83ff0d18`: watcher exit 2 and foreign
       cache/explain artifacts become searchable. Its source is not attested.
     - [x] Fresh known-source `2e2b8026` optimized executable passes: live
@@ -81,9 +90,17 @@ no capability credit. Existing qualified work below remains unchanged.
       assertion fails. Candidate passes all assertions. The first observer
       wrongly required the earlier lexical startup-error signature; retain
       its rejection and the reviewed actual artifact differences.
-    - [ ] Qualify current-source lexical watch with sibling and nested storage;
+    - [x] Qualify current-source lexical watch with sibling and nested storage;
       preserve the broader upgrade-reuse Bead and its original acceptance.
-- [ ] Repair the independently reproduced timeout-control fixture before
+      Final ELF `83d0c462` passes both layouts; historical `83ff0d18` still
+      reproduces the original bad behavior. One initial polling run encounters
+      the documented typed generation-change retry during publication. Retain
+      that failed observer run; permit only the exact typed reasons within its
+      unchanged twenty-second poll deadline. Final hit/inventory/shutdown
+      assertions remain; neither successful replay encounters that retry path.
+      The permanent stronger real-model handoff case also passes in the stock
+      e2e stage, with both original vector tiers and alternate bytes checked.
+- [x] Repair the independently reproduced timeout-control fixture before
   claiming a complete gate pass.
   - [x] Preserve clean `e591bf57` stock failures in both workspace and HTTP
     lanes: the one-second "stalled" child can already have exited successfully.
@@ -104,12 +121,12 @@ no capability credit. Existing qualified work below remains unchanged.
     - [x] Under the same two-second parent pause, the corrected child is
       still sleeping and the unchanged timeout/reaping assertion passes.
     - [x] HTTP-feature cohort: all eight pass, zero failures or ignores.
-  - [ ] Complete the stock gate on the committed fixture checkpoint.
-  - [ ] Publish the integrity split: this corrects a maintenance fixture;
+  - [x] Complete the stock gate on the committed fixture checkpoint.
+  - [x] Publish the integrity split: this corrects a maintenance fixture;
     no competitive benchmark rows, WINs, LOSEs, or performance gates change.
   - [x] Record the exact dependency change, primary sources and terminal
     results in the existing UPGRADE_LOG; preserve failed attempts.
-- [ ] Qualify the integrated partial-quality changes under the original gates.
+- [x] Qualify the integrated partial-quality changes under the original gates.
   - [x] Fix four strict-Clippy errors in the included activation tests: remove
     an already inherited import and borrow the existing query without cloning.
   - [x] Match the flag-specific two-tier refusal text in the repair test;
@@ -128,8 +145,11 @@ no capability credit. Existing qualified work below remains unchanged.
     Three-file scan: zero critical; six new notices are fixture assertions,
     joins/constructor expectations and necessary shared-handle clones. No
     suppressions. Explicit include-file rustfmt and workspace fmt pass.
-  - [ ] Complete the unchanged full stock gate with all required inputs.
-- [ ] Qualify the newly published source replacement API, preserving peer credit.
+  - [x] Complete the unchanged full stock gate with all required inputs.
+    All 598 facade library tests and 348 native CLI cases pass; real-model
+    CLI/recovery and genuine two-executable reuse also pass. This is native
+    host qualification, not a strict-remote or cross-platform release claim.
+- [x] Qualify the newly published source replacement API, preserving peer credit.
   - [x] Read both complete incoming diffs and merge `12b7c0d1` cleanly.
     Complete and sparse-quality replacements reuse admitted surviving vectors;
     empty/duplicate IDs, byte limits and cancellation precede staging.
@@ -141,7 +161,7 @@ no capability credit. Existing qualified work below remains unchanged.
     Formatting passes. The two-file UBS scan flags two unchanged test-only
     panic assertions requiring whole-component activation; review retains both
     guards, all warnings and the nonzero scanner exit without suppressions.
-  - [ ] Run the entire stock gate on the new clean combined checkpoint with
+  - [x] Run the entire stock gate on the new clean combined checkpoint with
     the already demonstrated private tmpfs and the genuine prior executable.
     The tests use control providers for replacement behavior; they do not
     establish ordinary fsfs authority convergence or real-model replacement.
@@ -149,6 +169,13 @@ no capability credit. Existing qualified work below remains unchanged.
   forbidden-runtime, profile, wire, installer or consumer contracts.
 - [ ] Recheck platform admission before any release. Keep the original
   six-variant acceptance; preserve the current release until all gates pass.
+  - [x] Re-execute the named DSR admission probe at 06:50 UTC: exit 1,
+    all five writable Apple roles refused at 4.31 GiB, minimum 40 GiB.
+  - [ ] Complete the remaining dependency migrations, then qualify all six
+    release variants, installers/updaters and all thirteen public crates
+    together with their registry consumer lanes;
+    select forward versions and publish/verify the actual releases. The native
+    source gate does not fulfill these original release conditions.
   - [x] Live source/registry audit finds thirteen public packages, all already
     published from `d1b9da15`; only `PUBLISHED_VERSION_SOURCE_MISMATCH` blocks
     the current unbumped candidate. Do not republish those versions.
@@ -156,8 +183,121 @@ no capability credit. Existing qualified work below remains unchanged.
     `3244f87d` has 56 files and no fsfs/frankensearch formula, cask or update
     route. The connector was rate-limited; a fresh public Git snapshot supplies
     the evidence. No existing entry needs updating; no brew install is claimed.
-- [ ] Publish qualified increments and scoped Beads/TODO evidence, verify
+- [x] Publish qualified increments and scoped Beads/TODO evidence, verify
   both remote refs and dependency cycles, and fill the bounded honesty review.
+  Qualified source `ebae5455` is already verified on both refs. Comments 5421
+  and 5422 bind the final results; the Beads-generated publication changes only
+  those two records among 1,488, preserving all prior comments and original
+  criteria/owners/status. Active cycles remain zero. This evidence-only update
+  adds no product-code change; final remote tips are retained separately.
+
+### Bounded work and honesty review for this continuation
+
+Window: after `c5a7464a` through qualified `ebae5455`, plus this evidence-only
+update. Inspect the actual twelve-commit log, owned test diffs, manifests,
+gate/configuration diff and reflog. The source purpose remains the README's
+fast first-pass local search followed by quality refinement.
+
+**Process worksheet.** Running search code does not branch on this checklist,
+bridge or tracker comments: these are PROCESS. The owner explicitly requested
+the granular TODO; the operator and `bd-dsbym` release decision consume it.
+It prevents the observed mistake of confusing focused controls, retired runs
+or missing test inputs with a completed source/release gate. Retire this block
+from active use after publication/handoff with the listed unmet conditions;
+retain it as dated history, without deletion. Raw receipts are the integrity
+exception: they prevent loss of exact failed runs and source/ELF identities;
+yes, needed at this multi-profile scale; yes, raw logs plus small identity
+records are the minimum; no, a commit hash alone cannot establish which ELF
+ran. No new project report framework or schema is created. Highest ready work:
+`br ready` is empty; the owned release task is still in progress. An extra hour
+of report design would add less value than the remaining product/dependency
+work, so stop at the existing three documents and scoped tracker comments.
+Verdict: LEGITIMATE GATE for the requested checklist, not feature credit.
+
+**Real-work worksheet.** My five nonmerge commits classify as USER for
+`8de81f7f` (doctor/metric handling), ENABLER for `e591bf57`, `8ba1188c`,
+`60a07028`, `ebae5455` (regression/fixture/build corrections). The two merges
+are ENABLER. The five peer native feature commits are USER/API work by their
+authors, not five new features authored here. This final tracker/docs update
+is PROCESS; UNKNOWN is zero. Tally including peer commits and the evidence
+update: USER 6, ENABLER 6, PROCESS 1. This is a diagnostic, not a quota.
+The visible authored change is honest unavailable-metric reporting; demonstrate
+it with doctor and its explicit OS-error controls, without claiming a live OS
+failure was induced. Removing the PROCESS update would leave runtime behavior
+identical, but would hide the owner-requested completion boundaries. Enablers
+are exercised by the actual stock gate, downstream product tests, installed
+CLI and native profile. Oldest bounded open item is Quill E6 `bd-quill-e6-gauntlet-scale-rm3q`
+(July 16); this block instead finishes the owner's existing release predecessor
+and unqualified integrated source, leaving E6's original criteria intact.
+There is no swarm or close farming, and no new follow-up launders acceptance.
+Verdict: DRIFTING in cost—qualification and fixture/infrastructure repair
+dominate this authored block. Correction: stop adding reporting machinery,
+publish the tested increment, and keep the next capability block on the
+existing authority/model-provisioning/dependency graph when its prerequisites
+are admitted. Do not present this block as broad new search functionality.
+
+**Honesty inventory.** Each answer is bounded to the artifacts above.
+
+1. No (checked: every owned test diff and unchanged gate/configuration;
+   assertions, ignores, deadlines and tolerances are retained).
+2. No (checked: new OS-error controls are labeled unit injections; actual
+   process/filesystem/model proof is separate; no fixture masquerades as it).
+3. No (checked: changed paths contain no regenerated golden or snapshot).
+4. Yes: timeout/capture fixtures and one flag-specific diagnostic assertion
+   change; old actual counterexamples and unchanged behavioral guards justify
+   them. The external live-poll observer also honors only the exact documented
+   generation-change retry within its original deadline. No stock gate,
+   production admission, suppression, retry ceiling or test budget is relaxed.
+5. No (checked: stock invocation has every original label, genuine prior
+   executable, actual models and no skip allowance or affinity override).
+6. No accepted result is zero-run (checked: all eighteen gate labels, exact
+   focused counts and process commands). The empty initial UBS baseline is
+   excluded and replaced by the populated scan; it remains recorded.
+7. No (checked: cited commands have observed terminal results and raw receipts;
+   retired and blocked invocations receive no pass credit).
+8. No (checked: control-provider replacement tests, injected OS errors,
+   historical unattested ELF, actual model/process tests and private native
+   host results retain their distinct proof classes).
+9. No material failure is omitted (checked: original quota, fixture, missing
+   input, observer failures and each retired run remain in this TODO/log and
+   Beads). This is qualified source; release and project completion stay open.
+10. No cited qualification result loses stderr (checked: combined or separate
+    raw stdout/stderr files; routine absence probes are not pass evidence).
+11. No (checked: this continuation closes zero Beads and creates none;
+    `bd-dsbym` and the peer reuse task keep their original acceptance).
+12. No (checked: tracker status/owner/priority/description/dependencies match
+    the published originals; documentation appends evidence, not new targets).
+13. No (checked: solo continuation; no subagent tracker closes).
+14. No (checked: no subagent dispatches or swarm panes).
+15. No (checked: peer code is read and the combined source re-executed;
+    no peer report substitutes for compilation/runtime qualification).
+16. No (checked: no panes farming refusals and no new closures).
+17. No (checked: no inter-agent agreement is claimed; this is solo verification,
+    not independent certification).
+18. No (checked: eighteen stock labels, thirteen foreground commands,
+    sibling/nested layouts and original acceptance predate their results;
+    no competitive rows or selected performance denominator is reported).
+19. Yes: explain the avoidable wrong precise-update command, initial imports,
+    empty UBS extraction, incorrect old-watch observer expectation, invalid
+    load ceiling 1, late SIGSTOP discovery, missing prior-executable input and
+    final live-poll conflict classification. All failed attempts remain; each
+    corrected observer/configuration is labeled, not silently substituted.
+    Waiting-driver setup errors and retired source selections are not evidence.
+20. Strongest evidence: the re-executable clean-source full stock invocation
+    and source-bound installed ELF, plus adversarial old failures and actual
+    final foreground/watch controls. `dependency-stock-gate-v6-result.json`
+    and `final-candidate-validation-completion.json` bind the terminal results.
+
+Older-session check remains the bounded CASS sweep and five direct views in
+`/data/tmp/fs-exec.SoVtXGnZ/honesty-{search,view}-*`; the release-history review
+adds no current pass credit. Disposition for the yes answers: corrections are
+in place, failures are disclosed in commentary and retained here/Beads, and
+countermeasures are explicit under RH-1 (independent before/after fixture
+controls, unchanged gates), RH-2 (proof classes and nonzero census), RH-4
+(no commit-count credit), RH-15 (fixed deadlines) and RH-9/RH-10 (no
+closure/spec laundering). Failed attempts stay explicit throughout.
+Two unchanged test-only panic assertions remain visible in the additional UBS
+scan; do not call it zero-critical. Zero new competitive rows, WINs or LOSEs.
 
 ## November 23 execution — OrangeSparrow
 

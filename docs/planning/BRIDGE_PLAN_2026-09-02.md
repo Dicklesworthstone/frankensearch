@@ -1,6 +1,62 @@
 # Bridge Plan: frankensearch
 
-## Current execution — November 24, 2026
+## Current release continuation — November 24, 2026
+
+The latest combined source `ebae5455e9ea2fe48920e5bf789c4622cd7d4d34`
+passes all eighteen stock quality-gate labels, terminal 0, no skip allowances,
+at 06:49:39 UTC. This preserves peer partial-quality work through `bbd81cdb`
+and source replacement API `12b7c0d1`, with their authorship intact. The gate
+runs natively on thinkstation1 with the original user/groups and fresh supported
+tmpfs in a private mount namespace; host cache bytes and quota stay unchanged.
+This source is published and both remote refs select it before the evidence
+update. No new binary or crate release is published by this continuation.
+
+- Migrate direct sysinfo to 0.40.4 with explicit original features, propagate
+  fallible metric initialization and warn when doctor cannot establish disk
+  inventory. Preserve unavailable load and existing pressure/admission policies.
+  Patch the pre-existing cookie lock entry for RUSTSEC-2026-0594; the same
+  advisory snapshot changes from one vulnerability to zero, with five existing
+  informational warnings. Broader dependency migrations remain unfinished.
+- Qualify the integrated native work: five focused source replacement cases,
+  all 598 facade library and 348 native CLI cases pass. Source replacement
+  tests use control providers on real exact/HNSW artifacts; this does not
+  complete ordinary fsfs authority convergence or prove real-model replacement.
+- Preserve watch authority with a stronger permanent real-model handoff
+  regression: moved alias, both vector tiers, original content assertions,
+  alternate destination bytes and explicit later alias search all pass.
+  Historical executable controls still fail. Genuine two-executable compatible
+  reuse, drift refusals, real-model CLI and recovery pass in the stock run.
+- Repair two independently reproduced test-fixture failures without changing
+  privacy assertions, the 50 ms timeout, ignores, gate configuration or
+  tolerances. Retain all failed/retired runs and observer mistakes. One extra
+  lexical polling observer is corrected to honor only the exact documented
+  generation-change retry within its original deadline; the stock gate is
+  unchanged. No competitive result or performance gate is affected.
+- The invocation-built installed default executable passes twelve quickstart
+  commands and 22 controls, then thirteen actual signal/pressure commands and
+  sibling/nested lexical alias-watch probes. Exact incumbent selection remains
+  searchable after each stop. The separate semantic-native profile passes
+  strict all-target Clippy, 223 pressure tests and 33 doctor tests.
+
+`bd-dsbym` stays open: latest stable dependency migrations, all six release
+variants, thirteen forward-version public crates and their consumer qualification
+remain.
+The named Apple DSR probe still refuses admission at 06:50 UTC: 4.31 GiB free,
+40 GiB required across every writable APFS role. The complete live Homebrew
+tap has no fsfs entry to update. Related peer Beads keep their original owners,
+requirements and status; this execution closes none.
+
+Current evidence root: `/data/tmp/fs-next-20261124`, including
+`candidate-gate-identity-v6.json`, `dependency-stock-gate-v6-result.json`,
+`fsfs-quickstart.6NsWYW2c/receipt.json` and
+`final-candidate-validation-completion.json`. The gate log SHA256 is
+`a3982811acb74c8ae58b1a4ccdf9d0ec6049d6fb082545a20b49d47a747a3520`.
+The existing [execution TODO](BUG_FIX_TODO.md) and
+[upgrade log](UPGRADE_LOG.md) retain the detailed boundaries and honesty review.
+All runtime results bind to `ebae5455` and its actual executables; later
+tracker/documentation-only publication does not change that executed identity.
+
+## Earlier execution — November 24, 2026
 
 The core local search product works, and the current combined source now passes
 the complete stock quality gate. The project is not finished: full authority

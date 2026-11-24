@@ -190,6 +190,59 @@ currently rejects the configured Apple builder's writable APFS container
 (6.37 GiB available against the existing 40 GiB requirement); the original
 six-variant binary and thirteen-crate release acceptance stays open.
 
+### Qualified November 24 checkpoint
+
+Clean `ebae5455e9ea2fe48920e5bf789c4622cd7d4d34` completes the unchanged
+stock gate, 06:04:09–06:49:39 UTC: all eighteen labels pass, terminal 0,
+no model/cross skip allowances. Native thinkstation1, pinned nightly and
+lock `ad2c99a0`; dev/test debug=0, incremental=0, jobs=8, repository
+`-Zthreads=4`. The original UID/GID/groups are observed inside the private
+mount namespace. Its new tmpfs has a 4 GiB volume cap; the original host
+mount, quota and retained cache remain unchanged. This is native-host
+source qualification, not remote, platform-release or performance evidence.
+Log SHA256:
+`a3982811acb74c8ae58b1a4ccdf9d0ec6049d6fb082545a20b49d47a747a3520`.
+
+The facade library passes 598 cases and the native CLI 348, including the
+integrated partial-quality chain and replacement API. Four-model CLI/recovery,
+the stronger real-model watch handoff and genuine two-executable reuse pass.
+The invocation-built installed default ELF is
+`83d0c462fee50194382bde023f944c3bf2fb52d3d95799d185dfe476b04bf288`;
+its quickstart passes twelve commands and 22 controls, no owned processes.
+`fsfs-quickstart.6NsWYW2c/receipt.json` binds the current source and build.
+This default ELF is byte-identical to the earlier integrated fsfs build;
+the newly merged native replacement API is exercised separately by the
+library/CLI tests. No ordinary fsfs authority-migration claim follows.
+
+That retained default ELF passes thirteen actual foreground commands:
+SIGTERM/SIGINT, cooperative 128 MiB admission in both profiles and cancellation
+while paused under the explicit 100-per-mille load ceiling. Every interrupted
+replacement preserves the exact incumbent selection and independent search.
+Fresh sibling/nested lexical alias-watch probes preserve the other destination
+byte-for-byte, publish the live document and shut down normally. The historical
+ELF still reproduces the bad behavior. One first final observer run fails on
+the documented typed generation-change retry while polling during publication.
+It remains a failed observer receipt. The observer now permits only the exact
+code/field/exit/reason within its original twenty-second poll deadline; all
+hit/inventory/shutdown assertions remain. Both fresh successful layouts avoid
+that retry path. No product code or stock gate changes in this correction.
+
+The separate `--no-default-features --features semantic-native` profile passes
+all-target strict Clippy, 223 pressure tests and 33 doctor tests, zero failures
+or ignores. Evidence: `final-candidate-validation{,-completion}.json`,
+`final-{foreground,watch-*,native-*}.log`. Original failures, retired runs,
+invalid controls and scanner notices remain available. Fixture corrections
+admit correctness lanes only: zero competitive rows, WINs or LOSEs, and no
+performance-gate change.
+
+Source `ebae5455` is pushed without rewriting history and verified on both
+remote refs before the evidence-only update. The 06:50 UTC DSR recheck returns
+exit 1: Apple APFS has 4.31 GiB against 40 GiB for all five writable roles.
+Remaining dependency migrations, the established six release variants,
+thirteen forward-version public crates and their consumer qualification remain
+on `bd-dsbym`.
+No versions, tags or releases change, and no original Bead is closed here.
+
 ## 2026-11-21 - v1.13.0 release dependency preparation
 
 Refreshed semver-compatible lockfile dependencies (130+ entries including
