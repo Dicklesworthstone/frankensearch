@@ -540,6 +540,26 @@ impl NativePartialQualityUpdate {
         documents.into_iter().fold(self, Self::upsert_document)
     }
 
+    /// Replace the complete source cohort while retaining surviving quality membership.
+    ///
+    /// Omitted IDs are deleted, previously covered survivors remain covered, and
+    /// new IDs remain fast-only. The replacement supersedes earlier pending edits;
+    /// later upserts/deletes still apply normally. Unchanged content reuses only
+    /// its own admitted tier vectors, including after source-order changes.
+    ///
+    /// # Errors
+    /// Refuses empty/duplicate IDs, the configured input byte limit, or
+    /// cancellation before any files or inference. Finalization also refuses
+    /// replacements with empty or complete quality coverage.
+    pub fn replace_documents(
+        mut self,
+        cx: &Cx,
+        documents: impl IntoIterator<Item = IndexableDocument>,
+    ) -> SearchResult<Self> {
+        self.update = self.update.replace_documents(cx, documents)?;
+        Ok(self)
+    }
+
     /// Remove an ID from the source and every tier that previously covered it.
     #[must_use]
     pub fn delete_document(mut self, id: impl Into<String>) -> Self {
@@ -1117,6 +1137,67 @@ impl NativeIndexUpdate {
     #[must_use]
     pub fn upsert_documents(self, documents: impl IntoIterator<Item = IndexableDocument>) -> Self {
         documents.into_iter().fold(self, Self::upsert_document)
+    }
+
+    /// Replace the entire successor source with an authoritative document inventory.
+    ///
+    /// Omitted predecessor IDs are deleted from every tier. Earlier pending edits
+    /// are discarded; subsequent upserts/deletes still have their normal meaning.
+    /// This supports complete rescans without re-embedding unchanged content:
+    /// inference reuse still requires the exact ID, content, producer and storage
+    /// identity, independently of input order or old shard boundaries.
+    ///
+    /// Unlike incremental upserts, duplicate IDs are refused rather than resolved
+    /// by arrival order. The inventory is validated before installing its edits;
+    /// this method creates no files, runs no inference and changes no selection.
+    /// An empty replacement is allowed for complete topologies. Build-time source
+    /// and topology checks remain authoritative, including settings changed later.
+    ///
+    /// # Errors
+    /// Refuses empty/duplicate IDs, documents exceeding the currently configured
+    /// input byte limit, an unavailable retained predecessor, or cancellation.
+    pub fn replace_documents(
+        mut self,
+        cx: &Cx,
+        documents: impl IntoIterator<Item = IndexableDocument>,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.update.replace_source")?;
+        let mut edits = BTreeMap::new();
+        for document in documents {
+            checkpoint(cx, "native_ann.update.replace_source")?;
+            if document.id.is_empty() {
+                return Err(invalid(
+                    "update.replacement_documents",
+                    "empty-id",
+                    "replacement source document IDs must be nonempty and unique",
+                ));
+            }
+            super::input_budget::validate_document_size(
+                document.content.len(),
+                self.builder.max_batch_input_bytes,
+            )?;
+            if edits.insert(document.id.clone(), Some(document)).is_some() {
+                return Err(invalid(
+                    "update.replacement_documents",
+                    "duplicate-id",
+                    "replacement source document IDs must be nonempty and unique",
+                ));
+            }
+        }
+        let source = self.builder.reuse.as_ref().ok_or_else(|| {
+            invalid(
+                "update.source",
+                "missing",
+                "source replacement requires a retained predecessor",
+            )
+        })?;
+        for previous in source.documents() {
+            checkpoint(cx, "native_ann.update.replace_source")?;
+            edits.entry(previous.id.clone()).or_insert(None);
+        }
+        checkpoint(cx, "native_ann.update.replace_source_complete")?;
+        self.edits = edits;
+        Ok(self)
     }
 
     /// Remove this ID from all successor tiers and retained source documents.
@@ -2200,6 +2281,188 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn replacement_inventory_matches_rebuild_and_reuses_unchanged_tier_vectors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for precision in [NativeBuildPrecision::F16, NativeBuildPrecision::F32] {
+                for ann in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let fast = Provider::new("replacement-fast", 2);
+                    let quality = Provider::new("replacement-quality", 3);
+                    let old = builder(&dir.path().join("old"), &fast, &quality)
+                        .with_fast_storage(precision, graph(ann))
+                        .with_quality_storage(precision, graph(!ann))
+                        .unwrap()
+                        .build(&cx)
+                        .await
+                        .unwrap();
+                    let old_fast = std::fs::read(old.fast().vector_path()).unwrap();
+                    let old_quality =
+                        std::fs::read(old.quality().unwrap().vector_path()).unwrap();
+                    let replacement = vec![
+                        IndexableDocument::new("new", "vertical"),
+                        IndexableDocument::new("z-fast", "horizontal"),
+                        IndexableDocument::new("a", "fractional")
+                            .with_title("Replacement title")
+                            .with_metadata("revision", "replacement"),
+                        IndexableDocument::new("b", "horizontal"),
+                    ];
+                    let pending = old
+                        .begin_update(&cx, dir.path().join("next"), generation(2))
+                        .unwrap()
+                        .delete_document("a")
+                        .upsert_document(IndexableDocument::new("discarded", "vertical"))
+                        .replace_documents(&cx, replacement.clone())
+                        .unwrap();
+                    assert!(!dir.path().join("next").exists());
+                    assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                    assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                    let next = pending.build(&cx).await.unwrap();
+                    assert_eq!(fast.submitted.load(Ordering::SeqCst), 7);
+                    assert_eq!(quality.submitted.load(Ordering::SeqCst), 7);
+                    assert_eq!(next.documents().len(), 4);
+                    for absent in ["c", "x", "discarded"] {
+                        assert!(next.document(absent).is_none());
+                    }
+                    assert_eq!(
+                        next.document("a").unwrap().metadata["revision"],
+                        "replacement"
+                    );
+                    let cold = NativeIndexBuilder::new(
+                        dir.path().join("cold"),
+                        generation(2),
+                        fast.clone(),
+                    )
+                    .unwrap()
+                    .with_quality_embedder(quality.clone())
+                    .unwrap()
+                    .with_fast_storage(precision, graph(ann))
+                    .with_quality_storage(precision, graph(!ann))
+                    .unwrap()
+                    .add_documents(replacement)
+                    .build(&cx)
+                    .await
+                    .unwrap();
+                    assert_same_tier(next.fast(), cold.fast());
+                    assert_same_tier(next.quality().unwrap(), cold.quality().unwrap());
+                    assert_eq!(
+                        next.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                        "new"
+                    );
+                    assert_eq!(
+                        old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                        "b"
+                    );
+                    assert_eq!(std::fs::read(old.fast().vector_path()).unwrap(), old_fast);
+                    assert_eq!(
+                        std::fs::read(old.quality().unwrap().vector_path()).unwrap(),
+                        old_quality
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn replacement_inventory_rejects_invalid_tail_and_cancellation_before_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let fast = Provider::new("replacement-fast", 2);
+            let quality = Provider::new("replacement-quality", 3);
+            let old = builder(&dir.path().join("old"), &fast, &quality)
+                .build(&cx)
+                .await
+                .unwrap();
+            for (label, tail) in [
+                ("duplicate", IndexableDocument::new("a", "different")),
+                ("empty", IndexableDocument::new("", "invalid")),
+                ("oversized", IndexableDocument::new("large", "x".repeat(21))),
+            ] {
+                let path = dir.path().join(label);
+                let pending = old
+                    .begin_update(&cx, &path, generation(2))
+                    .unwrap()
+                    .with_max_batch_input_bytes(20)
+                    .unwrap();
+                assert!(
+                    pending
+                        .replace_documents(
+                            &cx,
+                            documents().into_iter().chain(std::iter::once(tail)),
+                        )
+                        .is_err()
+                );
+                assert!(!path.exists());
+            }
+            for cancel_after in [0, 2, documents().len()] {
+                let path = dir.path().join(format!("cancel-{cancel_after}"));
+                let pending = old.begin_update(&cx, &path, generation(2)).unwrap();
+                let mut source = documents().into_iter();
+                let mut read = 0_usize;
+                let replacement = std::iter::from_fn(|| {
+                    if read == cancel_after {
+                        cx.set_cancel_requested(true);
+                    }
+                    read += 1;
+                    source.next()
+                });
+                assert!(matches!(
+                    pending.replace_documents(&cx, replacement),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                cx.set_cancel_requested(false);
+                assert!(!path.exists());
+            }
+            assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+            assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+            assert_eq!(old.documents().len(), 5);
+            assert_eq!(
+                old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                "b"
+            );
+        });
+    }
+
+    #[test]
+    fn replacement_inventory_can_clear_a_complete_cohort_and_accept_later_edits() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let fast = Provider::new("replacement-fast", 2);
+            let quality = Provider::new("replacement-quality", 3);
+            let old = builder(&dir.path().join("old"), &fast, &quality)
+                .build(&cx)
+                .await
+                .unwrap();
+            let empty = old
+                .begin_update(&cx, dir.path().join("empty"), generation(2))
+                .unwrap()
+                .replace_documents(&cx, [])
+                .unwrap()
+                .build(&cx)
+                .await
+                .unwrap();
+            assert_eq!(empty.documents().len(), 0);
+            assert!(empty.quality().is_some());
+            assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+            assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+            let revised = old
+                .begin_update(&cx, dir.path().join("revised"), generation(2))
+                .unwrap()
+                .replace_documents(&cx, documents())
+                .unwrap()
+                .delete_document("c")
+                .upsert_document(IndexableDocument::new("new", "vertical"))
+                .build(&cx)
+                .await
+                .unwrap();
+            assert_eq!(revised.documents().len(), 5);
+            assert!(revised.document("c").is_none());
+            assert!(revised.document("new").is_some());
+            assert_eq!(fast.submitted.load(Ordering::SeqCst), 6);
+            assert_eq!(quality.submitted.load(Ordering::SeqCst), 6);
+        });
     }
 
     #[test]
@@ -3936,6 +4199,64 @@ mod tests {
                     assert_eq!(actual.metadata, expected.metadata);
                 }
             }
+        }
+
+        #[test]
+        fn replacement_inventory_repartitions_all_retained_shards_without_reembedding_survivors() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("replacement-fast", 2);
+                let quality = Provider::new("replacement-quality", 3);
+                let old = builder(&dir.path().join("old"), &fast, &quality)
+                    .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                    .with_quality_storage(NativeBuildPrecision::F32, graph(false))
+                    .unwrap()
+                    .build_sharded(&cx, 2)
+                    .await
+                    .unwrap();
+                let replacement = vec![
+                    IndexableDocument::new("z-fast", "horizontal"),
+                    IndexableDocument::new("x", "diagonal"),
+                    IndexableDocument::new("a", "fractional").with_title("New title"),
+                ];
+                let next = old
+                    .begin_update(&cx, dir.path().join("next"), generation(2))
+                    .unwrap()
+                    .replace_documents(&cx, replacement.clone())
+                    .unwrap()
+                    .build_sharded(&cx, 3)
+                    .await
+                    .unwrap();
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(next.partitions().len(), 1);
+                assert_eq!(old.partitions().len(), 3);
+                let cold = NativeIndexBuilder::new(
+                    dir.path().join("cold"),
+                    generation(2),
+                    fast.clone(),
+                )
+                .unwrap()
+                .with_quality_embedder(quality.clone())
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                .with_quality_storage(NativeBuildPrecision::F32, graph(false))
+                .unwrap()
+                .add_documents(replacement)
+                .build_sharded(&cx, 3)
+                .await
+                .unwrap();
+                assert_same_shards(&next, &cold);
+                assert_eq!(
+                    next.documents().map(|document| document.id.as_str()).collect::<Vec<_>>(),
+                    ["a", "x", "z-fast"],
+                );
+                assert_eq!(old.document_count(), 5);
+                assert_eq!(
+                    old.search_fast(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                    "b"
+                );
+            });
         }
 
         #[test]
