@@ -1,5 +1,38 @@
 # Open bug repair TODO
 
+## November 24 source-replacement wiring — OrangeSparrow
+
+Owner-requested implementation checklist for `bd-native-authority-replace-source-6o6m1`.
+Retire this active block when the feature is published or handed off with exact
+unmet criteria; retain dated history. It earns no capability credit.
+
+- [x] Refresh origin and preserve the dirty shared checkout in the existing
+  isolated worktree. Governing docs are unchanged from the full prior read.
+- [x] Find the actual unused connection: the library can replace a complete
+  inventory with vector reuse, while authority CLI/warm input only accepts deltas.
+- [x] Record the old real executable's refusal of `--replace-source`.
+- [x] Preserve the blocked parent migration. Its claim is refused; create one
+  additive feature under the exclusive graph lease, with original parent criteria
+  unchanged and all implementation/tests in the same unit.
+- [x] Wire cold CLI standard JSONL and mutually exclusive warm documents into
+  the existing complete-source library method; retain all source/publication limits.
+- [x] Verify exact/HNSW and fast/quality/full/partial flows: unchanged vectors,
+  omitted-ID deletion, metadata, new IDs, empty complete source, warm scopes/cache
+  refresh, independent quality membership and retained old readers.
+- [x] Verify malformed/duplicate/oversize/mixed input, authorization, stale head,
+  cancellation and partial-boundary refusals before inference/staging.
+  Four populated focused cases pass, including eight topology/retrieval combinations
+  and both cold and warm replacement. The stale control uses a valid different
+  authority. Full/single-tier empty inventories succeed; partial collapse refuses.
+- [ ] Execute actual-model cold and warm commands plus fresh-process readback;
+  retain ELF/source/feature/lock identity and adverse controls.
+- [ ] Run focused strict checks, scanner triage and the complete unchanged stock
+  gate on a clean source checkpoint. RCH admission currently queues all workers;
+  native quality-host runs must retain their actual execution class.
+- [ ] Reverify the feature's original criteria in a fresh solo pass, update Beads
+  honestly, publish source/evidence and verify both refs. The broader migration,
+  platform and release tasks retain their original acceptance.
+
 ## November 24 release continuation — OrangeSparrow
 
 Owner-requested execution checklist; Beads remains authoritative. This section

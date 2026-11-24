@@ -452,6 +452,24 @@ struct DocumentInput {
     metadata: HashMap<String, String>,
 }
 
+impl DocumentInput {
+    fn into_document(self, ids: &mut BTreeSet<String>) -> Result<IndexableDocument> {
+        if self.id.trim().is_empty()
+            || self.id.contains('\0')
+            || self.id.len() > usize::from(u16::MAX)
+            || !ids.insert(self.id.clone())
+        {
+            return Err(bad(
+                "IDs must be unique, nonblank, NUL-free, and at most 65535 bytes",
+            ));
+        }
+        let mut document = IndexableDocument::new(self.id, self.content);
+        document.title = self.title;
+        document.metadata = self.metadata;
+        Ok(document)
+    }
+}
+
 fn read_documents(reader: &mut impl BufRead) -> Result<Vec<IndexableDocument>> {
     let mut documents = Vec::new();
     let mut ids = BTreeSet::new();
@@ -485,21 +503,12 @@ fn read_documents(reader: &mut impl BufRead) -> Result<Vec<IndexableDocument>> {
                 error.column(),
             ))
         })?;
-        if input.id.trim().is_empty()
-            || input.id.contains('\0')
-            || input.id.len() > usize::from(u16::MAX)
-            || !ids.insert(input.id.clone())
-        {
-            return Err(bad(&format!(
-                "line {line}: IDs must be unique, nonblank, NUL-free, and at most 65535 bytes",
-            )));
-        }
+        let document = input
+            .into_document(&mut ids)
+            .map_err(|error| bad(&format!("line {line}: {error}")))?;
         if documents.len() == MAX_DOCUMENTS {
             return Err(bad("input exceeds the 100000-document limit"));
         }
-        let mut document = IndexableDocument::new(input.id, input.content);
-        document.title = input.title;
-        document.metadata = input.metadata;
         documents.push(document);
     }
     Ok(documents)

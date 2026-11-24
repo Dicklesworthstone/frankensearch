@@ -689,13 +689,37 @@ selected retrieval policy, and whether vectors were reused. The saved receipt
 supports the existing `authority-recover` reconciliation after interrupted
 publication or lost output.
 
-### Incremental authority upserts and deletes
+### Authority source updates
 
 `authority-update` applies a JSONL delta to the exact generation selected by
 `--from-receipt`. It recovers the complete source from the retained Quill image
 and reuses the stored vectors for unchanged document content. Title and metadata
 changes update the retained source and lexical image without document inference.
 Only the final new or changed content for each ID is embedded.
+
+For a complete rescan, add `--replace-source` and supply the same document
+JSONL used by `authority-index`, without `op` fields. That inventory is the
+whole successor source: omitted IDs are deleted, while unchanged content keeps
+its admitted vectors independently in each tier. Duplicate IDs are refused,
+rather than resolved by input order. Title and metadata replacements still
+avoid document inference. For example:
+
+```sh
+./target/release/frankensearch-native authority-update \
+  --from-receipt "$HOME/frankensearch-authority/g2.json" \
+  --work-dir "$HOME/frankensearch-authority/rescan-work" \
+  --receipt "$HOME/frankensearch-authority/rescan.json" \
+  --source-low 1 --source-high 63 \
+  --replace-source --input ./documents.jsonl \
+  --model-dir /absolute/path/to/installed/models
+```
+
+Both input modes preserve the selected producers, topology, precision and
+retrieval policy, with the same source/record/image budgets and expected-old
+publication. An empty replacement publishes a complete empty single-tier or
+full generation. Partial replacements must retain a nonempty proper quality
+subset; new IDs remain fast-only. A complete inventory never implicitly
+changes models or expands quality coverage.
 
 For a partial quality predecessor, membership follows the selected generation:
 surviving covered IDs remain covered, and changed covered content is re-embedded
@@ -1108,8 +1132,8 @@ does not build, publish, modify authority controls or write a receipt.
 
 ### Publish edits through the warm authority server
 
-Add `--allow-updates` to let the stdin controller apply durable incremental
-updates using the already loaded producers:
+Add `--allow-updates` to let the stdin controller apply durable source updates
+using the already loaded producers:
 
 ```sh
 ./target/release/frankensearch-native authority-serve \
@@ -1130,11 +1154,20 @@ fields:
 | `work_dir` | A new absolute work-directory path |
 | `new_receipt` | A new absolute receipt-file path |
 | `source_low`, `source_high` | The explicit inclusive source checkpoint, with neither boundary moving backward |
-| `changes` | An array of the upsert/delete objects accepted by `authority-update` |
+| `changes` | Incremental array of upsert/delete objects, mutually exclusive with `documents` |
+| `documents` | Complete replacement array of ordinary index documents, mutually exclusive with `changes` |
 
 An update contains at most 1,000 mutation records, counting overwritten edits,
 and must fit within the existing 1 MiB request limit. Every record is validated;
 the final operation for each ID wins. Empty `changes` may advance the checkpoint.
+Instead, supply a `documents` array to replace the complete source inventory.
+Its records use `id`, `content`, optional `title` and string-valued `metadata`;
+unknown fields and duplicate/invalid IDs refuse. The array is bounded to 1,000
+documents within the same 1 MiB request limit. Supply exactly one input array.
+Omitted IDs are deleted, and empty `documents` deliberately clears a complete
+cohort. `edited_ids` includes both supplied documents and omitted predecessor
+IDs, so this count can exceed the input-array length. Larger complete rescans
+use the one-shot `--replace-source` command and its existing JSONL limits.
 Single-tier and full sessions may produce an empty cohort. Partial sessions
 must preserve a nonempty proper quality subset. Every result satisfies the same
 100,000-document, 16 MiB record and 256 MiB encoded-source limits as the one-shot

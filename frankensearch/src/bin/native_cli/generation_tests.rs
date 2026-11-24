@@ -157,6 +157,19 @@ fn update_arguments() -> Vec<&'static str> {
     ]
 }
 
+#[test]
+fn source_replacement_requires_the_explicit_authority_update_option() {
+    let mut arguments = update_arguments();
+    assert!(!parse(&arguments).unwrap().unwrap().replace_source);
+    arguments.push("--replace-source");
+    assert!(parse(&arguments).unwrap().unwrap().replace_source);
+    arguments.push("--replace-source");
+    assert!(parse(&arguments).is_err());
+    for command in ["authority-index", "authority-rebuild", "authority-serve"] {
+        assert!(parse(&[command, "--replace-source"]).is_err());
+    }
+}
+
 fn retained_rebuild_arguments() -> Vec<&'static str> {
     vec![
         "authority-rebuild",
@@ -6307,6 +6320,122 @@ mod warm_authority {
     }
 
     #[test]
+    fn source_replacement_commands_and_warm_updates_preserve_single_tier_readers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for tier in [EmbedderTierTag::Fast, EmbedderTierTag::Quality] {
+                for ann in [false, true] {
+                    let parent = private_parent("replace-single");
+                    let provider = provider();
+                    let old = publish(&cx, &parent, None, &provider, tier, "old", ann).await;
+                    let retained = old.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    let old_receipt = fs::read(parent.join("old.json")).unwrap();
+                    let input = parent.join("inventory.jsonl");
+                    fs::write(&input, "{\"id\":\"retry-old\",\"content\":\"retry network requests\",\"title\":\"Rescanned title\"}\n").unwrap();
+                    let mut arguments = update_arguments();
+                    arguments.push("--replace-source");
+                    let mut options = parse(&arguments).unwrap().unwrap();
+                    options.from_receipt = Some(parent.join("old.json"));
+                    options.work = Some(parent.join("replacement-work"));
+                    options.receipt = parent.join("replacement.json");
+                    options.input = Some(input);
+                    let before = provider.calls.load(Ordering::Relaxed);
+                    update_generation_with_loader(&cx, &options, &mut Vec::new(), |requested| {
+                        assert_eq!(requested, tier);
+                        Ok(provider.clone())
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        provider.calls.load(Ordering::Relaxed),
+                        before,
+                        "metadata-only replacement must reuse the stored vector"
+                    );
+                    let current = Receipt::read(&options.receipt).unwrap();
+                    let opened = current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(current.documents, 1);
+                    assert_eq!(current.identity, old.identity);
+                    assert_eq!(
+                        opened.retrieval_configuration(),
+                        retained.retrieval_configuration()
+                    );
+                    assert_eq!(
+                        opened.source_documents(&cx, MAX_INPUT_BYTES).unwrap()[0]
+                            .title
+                            .as_deref(),
+                        Some("Rescanned title")
+                    );
+                    assert!(
+                        opened
+                            .source_document(&cx, "garden-old", MAX_INPUT_BYTES)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        retained
+                            .source_document(&cx, "garden-old", MAX_INPUT_BYTES)
+                            .unwrap()
+                            .is_some()
+                    );
+                    assert_eq!(fs::read(parent.join("old.json")).unwrap(), old_receipt);
+
+                    let mut session = open_session(&cx, current.clone(), &provider, false)
+                        .with_query_cache(&cx, query_cache::Config::parse("4").unwrap())
+                        .unwrap()
+                        .with_filter(
+                            &cx,
+                            Some(Filter::parse(r#"{"ids":["retry-old","new"]}"#).unwrap()),
+                            MAX_INPUT_BYTES,
+                        )
+                        .unwrap()
+                        .with_updates(2, MAX_INPUT_BYTES)
+                        .unwrap();
+                    let query = serde_json::json!({"query":"retry"});
+                    let primed = exchange(&cx, &mut session, std::slice::from_ref(&query)).await;
+                    assert_eq!(primed[1]["results"][0]["doc_id"], "retry-old");
+                    let before = provider.calls.load(Ordering::Relaxed);
+                    let request = serde_json::json!({
+                        "op":"update", "id":"replace", "expected_authority":current.authority,
+                        "work_dir":parent.join("warm-work"), "new_receipt":parent.join("warm.json"),
+                        "source_low":2, "source_high":9,
+                        "documents":[{"id":"new","content":"retry new searchable proof"}]
+                    });
+                    let response = exchange(&cx, &mut session, &[request]).await;
+                    assert_eq!(response[1]["event"], "updated", "{response:?}");
+                    assert_eq!(response[1]["documents"], 1);
+                    assert_eq!(response[1]["edited_ids"], 2);
+                    assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+                    assert!(
+                        session
+                            .snapshot
+                            .source_document(&cx, "retry-old", MAX_INPUT_BYTES)
+                            .unwrap()
+                            .is_none()
+                    );
+                    let searched = exchange(&cx, &mut session, &[query]).await;
+                    assert_eq!(searched[1]["results"].as_array().unwrap().len(), 1);
+                    assert_eq!(searched[1]["results"][0]["doc_id"], "new");
+                    assert_eq!(searched[1]["scope"]["eligible_documents"], 1);
+                    assert_eq!(
+                        opened.source_documents(&cx, MAX_INPUT_BYTES).unwrap()[0].id,
+                        "retry-old"
+                    );
+                    let before = provider.calls.load(Ordering::Relaxed);
+                    let empty = serde_json::json!({
+                        "op":"update", "expected_authority":session.receipt.authority,
+                        "work_dir":parent.join("empty-work"), "new_receipt":parent.join("empty.json"),
+                        "source_low":2, "source_high":10, "documents":[]
+                    });
+                    let empty = exchange(&cx, &mut session, &[empty]).await;
+                    assert_eq!(empty[1]["event"], "updated", "{empty:?}");
+                    assert_eq!(empty[1]["documents"], 0);
+                    assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+                    assert_eq!(session.snapshot.metadata().total_documents, 0);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn warm_authority_updates_reuse_the_model_and_install_complete_successors() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for (label, tier, ann) in [
@@ -8278,6 +8407,307 @@ mod progressive_authority {
                 assert_eq!(response[1]["quality_coverage"]["quality_documents"], 1);
                 assert_eq!(response[1]["results"].as_array().unwrap().len(), 3);
             }
+        });
+    }
+
+    #[test]
+    fn source_replacement_full_and_partial_updates_reuse_independent_tiers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for partial in [false, true] {
+                for ann in [false, true] {
+                    let parent = private_parent();
+                    let fast = provider(false);
+                    let quality = provider(true);
+                    let selected = if partial {
+                        publish_partial_cli(&cx, &parent, &fast, &quality, ann)
+                            .await
+                            .1
+                    } else {
+                        let documents = vec![
+                            IndexableDocument::new(
+                                "quality",
+                                "retry network with quality coverage",
+                            ),
+                            IndexableDocument::new(
+                                "fast-only",
+                                "retry fallback remains searchable",
+                            ),
+                            IndexableDocument::new("garden", "garden flowers"),
+                        ];
+                        let retrieval = if ann {
+                            NativeBuildRetrieval::Hnsw {
+                                params: HnswParams::default(),
+                                seed: 43,
+                            }
+                        } else {
+                            NativeBuildRetrieval::Exact
+                        };
+                        publish_full(&cx, &parent, &fast, &quality, documents, [retrieval; 2]).await
+                    };
+                    let previous = parent.join(if partial {
+                        "partial.json"
+                    } else {
+                        "initial.json"
+                    });
+                    let retained = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    let input = parent.join("inventory.jsonl");
+                    fs::write(&input, concat!(
+                        "{\"id\":\"quality\",\"content\":\"retry network with quality coverage\",\"title\":\"New metadata\"}\n",
+                        "{\"id\":\"new\",\"content\":\"retry newly added source\"}\n"
+                    )).unwrap();
+                    let mut options = update_options(&parent, &previous, "replacement", &input, 8);
+                    options.replace_source = true;
+                    let before = calls(&fast, &quality);
+                    update_generation_with_loader(&cx, &options, &mut Vec::new(), |tier| {
+                        Ok(match tier {
+                            EmbedderTierTag::Fast => fast.clone(),
+                            EmbedderTierTag::Quality => quality.clone(),
+                        })
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        calls(&fast, &quality),
+                        (before.0 + 1, before.1 + usize::from(!partial))
+                    );
+                    let current = Receipt::read(&options.receipt).unwrap();
+                    let root = admit_root(&current.root).unwrap();
+                    let opened = Arc::new(
+                        current
+                            .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                            .unwrap(),
+                    );
+                    assert_eq!(current.documents, 2);
+                    assert_eq!(current.identity, selected.identity);
+                    assert_eq!(current.quality_identity, selected.quality_identity);
+                    assert_eq!(
+                        opened.retrieval_configuration(),
+                        retained.retrieval_configuration()
+                    );
+                    assert_eq!(
+                        opened.quality_retrieval_configuration(),
+                        retained.quality_retrieval_configuration()
+                    );
+                    if partial {
+                        assert_eq!(
+                            opened.partial_quality_document_ids(&cx).unwrap(),
+                            ["quality"]
+                        );
+                    }
+                    assert!(
+                        opened
+                            .source_document(&cx, "garden", MAX_INPUT_BYTES)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        retained
+                            .source_document(&cx, "garden", MAX_INPUT_BYTES)
+                            .unwrap()
+                            .is_some()
+                    );
+                    let mut session = AuthoritySession::new(
+                        &cx,
+                        root,
+                        current.clone(),
+                        Arc::clone(&opened),
+                        models(&fast, &quality),
+                        (4, DEFAULT_IMAGE_BYTES),
+                        false,
+                    )
+                    .unwrap()
+                    .with_query_cache(&cx, query_cache::Config::parse("4").unwrap())
+                    .unwrap()
+                    .with_filter(
+                        &cx,
+                        Some(Filter::parse(r#"{"ids":["quality","new","warm-new"]}"#).unwrap()),
+                        MAX_INPUT_BYTES,
+                    )
+                    .unwrap()
+                    .with_updates(2, MAX_INPUT_BYTES)
+                    .unwrap();
+                    let before = calls(&fast, &quality);
+                    let request = serde_json::json!({
+                        "op":"update", "expected_authority":current.authority,
+                        "work_dir":parent.join("warm-work"), "new_receipt":parent.join("warm.json"),
+                        "source_low":2, "source_high":9,
+                        "documents":[
+                            {"id":"quality","content":"retry network with quality coverage","title":"Warm metadata"},
+                            {"id":"warm-new","content":"retry warm replacement proof"}
+                        ]
+                    });
+                    let response = exchange(&cx, &mut session, &[request]).await;
+                    assert_eq!(response[1]["event"], "updated", "{response:?}");
+                    assert_eq!(
+                        calls(&fast, &quality),
+                        (before.0 + 1, before.1 + usize::from(!partial))
+                    );
+                    assert!(
+                        session
+                            .snapshot
+                            .source_document(&cx, "new", MAX_INPUT_BYTES)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        opened
+                            .source_document(&cx, "new", MAX_INPUT_BYTES)
+                            .unwrap()
+                            .is_some()
+                    );
+                    let mode = if partial { "partial" } else { "full" };
+                    let response = exchange(
+                        &cx,
+                        &mut session,
+                        &[serde_json::json!({"query":"retry", "mode":mode, "stream":true})],
+                    )
+                    .await;
+                    let results = response.last().unwrap()["results"].as_array().unwrap();
+                    assert_eq!(results.len(), 2);
+                    assert!(results.iter().all(|hit| {
+                        ["quality", "warm-new"].contains(&hit["doc_id"].as_str().unwrap())
+                    }));
+                    if partial {
+                        assert_eq!(
+                            session.snapshot.partial_quality_document_ids(&cx).unwrap(),
+                            ["quality"]
+                        );
+                    } else {
+                        let before = calls(&fast, &quality);
+                        let request = serde_json::json!({
+                            "op":"update", "expected_authority":session.receipt.authority,
+                            "work_dir":parent.join("empty-work"), "new_receipt":parent.join("empty.json"),
+                            "source_low":2, "source_high":10, "documents":[]
+                        });
+                        let response = exchange(&cx, &mut session, &[request]).await;
+                        assert_eq!(response[1]["event"], "updated", "{response:?}");
+                        assert_eq!(session.receipt.documents, 0);
+                        assert_eq!(calls(&fast, &quality), before);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn source_replacement_invalid_input_and_partial_boundaries_precede_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (initial, selected) =
+                publish_partial_cli(&cx, &parent, &fast, &quality, true).await;
+            let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            let lock = fs::read(selected.root.join("LOCK")).unwrap();
+            let before = calls(&fast, &quality);
+            for (label, input) in [
+                ("duplicate", "{\"id\":\"quality\",\"content\":\"retry\"}\n{\"id\":\"quality\",\"content\":\"changed\"}\n".to_owned()),
+                ("blank", "{\"id\":\" \",\"content\":\"retry\"}\n".to_owned()),
+                ("nul", "{\"id\":\"bad\\u0000\",\"content\":\"retry\"}\n".to_owned()),
+                ("unknown-field", "{\"id\":\"quality\",\"content\":\"retry\",\"op\":\"upsert\"}\n".to_owned()),
+                ("oversize", "x".repeat(MAX_RECORD_BYTES + 1)),
+                ("empty-partial", String::new()),
+                ("full-subset", "{\"id\":\"quality\",\"content\":\"retry\"}\n".to_owned()),
+                ("no-subset", "{\"id\":\"new\",\"content\":\"retry\"}\n".to_owned()),
+            ] {
+                let path = parent.join(format!("{label}.jsonl"));
+                fs::write(&path, input).unwrap();
+                let mut options = update_options(&parent, &initial.receipt, label, &path, 8);
+                options.replace_source = true;
+                let mut loads = 0;
+                assert!(update_generation_with_loader(&cx, &options, &mut Vec::new(), |_| {
+                    loads += 1;
+                    Err(bad("invalid replacement must precede model loading"))
+                }).await.is_err(), "{label}");
+                assert_eq!(loads, 0, "{label}");
+                assert!(!options.work.unwrap().exists(), "{label}");
+                assert!(!options.receipt.exists(), "{label}");
+                assert_eq!(fs::read(selected.root.join("AUTHORITY")).unwrap(), authority);
+                assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock);
+            }
+            let root = admit_root(&selected.root).unwrap();
+            let opened = Arc::new(
+                selected
+                    .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                    .unwrap(),
+            );
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                selected.clone(),
+                Arc::clone(&opened),
+                models(&fast, &quality),
+                (4, DEFAULT_IMAGE_BYTES),
+                false,
+            )
+            .unwrap();
+            let base = serde_json::json!({
+                "op":"update", "expected_authority":selected.authority,
+                "work_dir":parent.join("warm-work"), "new_receipt":parent.join("warm.json"),
+                "source_low":2, "source_high":8, "documents":[]
+            });
+            let response = exchange(&cx, &mut session, std::slice::from_ref(&base)).await;
+            assert_eq!(response[1]["code"], "updates_disabled");
+            session = session.with_updates(2, MAX_INPUT_BYTES).unwrap();
+            for (label, documents) in [
+                (
+                    "duplicate",
+                    serde_json::json!([{"id":"quality","content":"retry"},{"id":"quality","content":"retry"}]),
+                ),
+                ("blank", serde_json::json!([{"id":" ","content":"retry"}])),
+                ("empty", serde_json::json!([])),
+                (
+                    "full-subset",
+                    serde_json::json!([{"id":"quality","content":"retry"}]),
+                ),
+                (
+                    "no-subset",
+                    serde_json::json!([{"id":"new","content":"retry"}]),
+                ),
+                (
+                    "oversize",
+                    serde_json::json!(vec![
+                        serde_json::json!({"id":"new","content":"retry"});
+                        MAX_AUTHORITY_MUTATIONS + 1
+                    ]),
+                ),
+            ] {
+                let mut request = base.clone();
+                request["documents"] = documents;
+                let response = exchange(&cx, &mut session, &[request]).await;
+                assert_eq!(response[1]["event"], "failed", "{label}: {response:?}");
+                assert!(Arc::ptr_eq(&session.snapshot, &opened));
+                assert!(!parent.join("warm-work").exists());
+                assert!(!parent.join("warm.json").exists());
+            }
+            let mut mixed = base.clone();
+            mixed["changes"] = serde_json::json!([]);
+            let response = exchange(&cx, &mut session, &[mixed]).await;
+            assert_eq!(response[1]["code"], "invalid_update_input");
+            let mut stale = base.clone();
+            let other_authority = AuthorityRefV1::new(1, [9; 16], 1, [8; 32], None).unwrap();
+            stale["expected_authority"] =
+                serde_json::json!(other_authority.canonical_bytes().to_vec());
+            assert_eq!(
+                exchange(&cx, &mut session, &[stale]).await[1]["code"],
+                "stale_expected_authority"
+            );
+            let mut backward = base.clone();
+            backward["source_high"] = serde_json::json!(2);
+            assert_eq!(
+                exchange(&cx, &mut session, &[backward]).await[1]["code"],
+                "backward_source_checkpoint"
+            );
+            cx.set_cancel_requested(true);
+            let request: AuthorityUpdateRequest = serde_json::from_value(base).unwrap();
+            assert!(session.update(&cx, request).await.is_err());
+            cx.set_cancel_requested(false);
+            assert_eq!(calls(&fast, &quality), before);
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority
+            );
+            assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock);
         });
     }
 

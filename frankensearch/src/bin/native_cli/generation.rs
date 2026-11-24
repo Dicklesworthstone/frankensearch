@@ -51,10 +51,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Models, Result, SCHEMA,
-    bad, emit, encode, execution_context, filter::Filter, models, new_generation, new_path,
-    positive as number, query, query_cache, read_documents, serve::source, update as mutations,
-    validate_query, value,
+    DocumentInput, MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Models,
+    Result, SCHEMA, bad, emit, encode, execution_context, filter::Filter, models, new_generation,
+    new_path, positive as number, query, query_cache, read_documents, serve::source,
+    update as mutations, validate_query, value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
@@ -100,7 +100,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       [--query TEXT --rollback-receipt NEW_JSON [--filter JSON] [--limit N] [--stream]\n\
        [--timeout-ms N] [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]]\n\n\
   authority-update --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
-      --source-low N --source-high N [--input EDITS_JSONL]\n\
+      --source-low N --source-high N [--input JSONL] [--replace-source]\n\
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-repair --from-receipt DAMAGED_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
@@ -193,8 +193,11 @@ An explicit --retrieval selects exact or default HNSW for every stored tier.\n\
 Concurrent publication refuses the captured old selection; retry explicitly\n\
 from the winning receipt. Rebuild never edits the old generation's images.\n\
 Update applies bounded upsert/delete JSONL to the retained source, with the last\n\
-operation for each ID winning. It reuses unchanged content vectors and preserves\n\
-the selected producers, topology, precision, and retrieval policy. Only changed or new\n\
+operation for each ID winning.\n\
+With --replace-source, input instead contains ordinary index documents defining\n\
+the complete successor inventory. Omitted IDs are deleted; duplicate IDs refuse.\n\
+Unchanged content reuses its independently admitted vectors in either mode.\n\
+Updates preserve the selected producers, topology, precision, and retrieval policy. Only changed or new\n\
 content is embedded; complete vector, graph, and Quill images are still produced.\n\
 The final cohort satisfies the combined encoded-source limits. Deleting every\n\
 document publishes a complete empty generation that later updates can populate,\n\
@@ -312,9 +315,11 @@ lexical and raw BM25 scores. Warm requests may choose mode=lexical; a lexical\n\
 session refuses fast/quality/full. There is no automatic fallback after a model error.\n\
 With --allow-updates, an explicit update request can publish and serve a successor\n\
 using the retained model: op=update, expected_authority, work_dir, new_receipt,\n\
-source_low, source_high, and changes (upsert/delete objects). Destinations must be\n\
-new absolute paths. At most 1000 mutations fit within the 1 MiB request budget;\n\
-an empty delta may advance the checkpoint. --batch-size requires this flag.\n\
+source_low, source_high, and exactly one of changes (upsert/delete objects) or\n\
+documents (the complete replacement inventory). Destinations must be new\n\
+absolute paths. At most 1000 mutations or documents fit within the 1 MiB request\n\
+budget. Empty changes advance the checkpoint; empty documents clear a complete\n\
+cohort. --batch-size requires this flag.\n\
 Updates retain producer, tier, precision and retrieval policy. They save a recovery\n\
 receipt before publication, compare the original authority pair, and install the\n\
 exact admitted successor. They report publication separately from reader activation.\n\
@@ -426,6 +431,7 @@ struct Options {
     cooperative_local: bool,
     migrate_model: bool,
     retained_source: bool,
+    replace_source: bool,
     allow_activation: bool,
     allow_model_activation: bool,
     allow_updates: bool,
@@ -505,6 +511,7 @@ impl Options {
             cooperative_local: false,
             migrate_model: false,
             retained_source: false,
+            replace_source: false,
             allow_activation: false,
             allow_model_activation: false,
             allow_updates: false,
@@ -549,6 +556,9 @@ impl Options {
                 "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
                 "--retained-source" if command == Command::Rebuild => {
                     options.retained_source = true;
+                }
+                "--replace-source" if command == Command::Update => {
+                    options.replace_source = true;
                 }
                 "--max-source-bytes"
                     if matches!(
@@ -2705,6 +2715,7 @@ struct AuthorityUpdateSpec {
     source: CommitRange,
     limits: AuthorityUpdateLimits,
     max_image_bytes: usize,
+    replace_source: bool,
 }
 
 struct PreparedAuthorityUpdate {
@@ -2758,7 +2769,13 @@ where
     spec.receipt = new_path(&spec.receipt)?;
     separate_destinations(&[&selected.root, &spec.work, &spec.receipt])?;
     let documents = retained_rebuild_documents(cx, snapshot, spec.limits.max_source_bytes)?;
-    let edits = read_edits()?;
+    let mut edits = read_edits()?;
+    if spec.replace_source {
+        for previous in &documents {
+            checkpoint(cx)?;
+            edits.entry(previous.id.clone()).or_insert(None);
+        }
+    }
     let document_count = mutations::validate_final_source(cx, &documents, &edits)?;
     if selected.quality_documents.is_some() {
         let covered = snapshot.partial_quality_document_ids(cx)?;
@@ -2815,12 +2832,16 @@ async fn build_and_publish_update(
             )?
             .with_batch_size(spec.limits.batch_size)?
             .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
-        for (id, document) in edits {
-            checkpoint(cx)?;
-            transaction = match document {
-                Some(document) => transaction.upsert_document(document),
-                None => transaction.delete_document(id),
-            };
+        if spec.replace_source {
+            transaction = transaction.replace_documents(cx, edits.into_values().flatten())?;
+        } else {
+            for (id, document) in edits {
+                checkpoint(cx)?;
+                transaction = match document {
+                    Some(document) => transaction.upsert_document(document),
+                    None => transaction.delete_document(id),
+                };
+            }
         }
         Box::pin(transaction.build(cx, spec.source, spec.max_image_bytes)).await?
     } else {
@@ -2845,12 +2866,16 @@ async fn build_and_publish_update(
         let mut transaction = transaction
             .with_batch_size(spec.limits.batch_size)?
             .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
-        for (id, document) in edits {
-            checkpoint(cx)?;
-            transaction = match document {
-                Some(document) => transaction.upsert_document(document),
-                None => transaction.delete_document(id),
-            };
+        if spec.replace_source {
+            transaction = transaction.replace_documents(cx, edits.into_values().flatten())?;
+        } else {
+            for (id, document) in edits {
+                checkpoint(cx)?;
+                transaction = match document {
+                    Some(document) => transaction.upsert_document(document),
+                    None => transaction.delete_document(id),
+                };
+            }
         }
         if selected.quality_identity.is_some() {
             Box::pin(transaction.build_progressive_generation(
@@ -2897,6 +2922,20 @@ async fn build_and_publish_update(
     )
 }
 
+fn read_authority_update_input(
+    reader: &mut impl BufRead,
+    replace_source: bool,
+) -> Result<mutations::Edits> {
+    if replace_source {
+        Ok(read_documents(reader)?
+            .into_iter()
+            .map(|document| (document.id.clone(), Some(document)))
+            .collect())
+    } else {
+        mutations::read_edits(reader)
+    }
+}
+
 async fn update_generation_with_loader<F>(
     cx: &Cx,
     options: &Options,
@@ -2936,10 +2975,14 @@ where
                 max_source_bytes: options.max_source_bytes,
             },
             max_image_bytes: options.max_image_bytes,
+            replace_source: options.replace_source,
         },
         || match &options.input {
-            Some(path) => mutations::read_edits(&mut BufReader::new(File::open(path)?)),
-            None => mutations::read_edits(&mut io::stdin().lock()),
+            Some(path) => read_authority_update_input(
+                &mut BufReader::new(File::open(path)?),
+                options.replace_source,
+            ),
+            None => read_authority_update_input(&mut io::stdin().lock(), options.replace_source),
         },
     )?;
     let document_count = prepared.document_count;
@@ -3702,7 +3745,8 @@ struct AuthorityUpdateRequest {
     new_receipt: PathBuf,
     source_low: u64,
     source_high: u64,
-    changes: Vec<mutations::Mutation>,
+    changes: Option<Vec<mutations::Mutation>>,
+    documents: Option<Vec<DocumentInput>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4261,11 +4305,34 @@ impl AuthoritySession {
         if expected != self.snapshot.authority() {
             return Err(serve_refused("stale_expected_authority"));
         }
-        if request.changes.len() > MAX_AUTHORITY_MUTATIONS {
-            return Err(serve_refused("update_mutation_limit"));
-        }
-        let edits = mutations::from_mutations(request.changes)
-            .map_err(|_| serve_refused("invalid_update_mutations"))?;
+        let (edits, replace_source) = match (request.changes, request.documents) {
+            (Some(changes), None) => {
+                if changes.len() > MAX_AUTHORITY_MUTATIONS {
+                    return Err(serve_refused("update_mutation_limit"));
+                }
+                (
+                    mutations::from_mutations(changes)
+                        .map_err(|_| serve_refused("invalid_update_mutations"))?,
+                    false,
+                )
+            }
+            (None, Some(documents)) => {
+                if documents.len() > MAX_AUTHORITY_MUTATIONS {
+                    return Err(serve_refused("update_mutation_limit"));
+                }
+                let mut ids = BTreeSet::new();
+                let mut edits = mutations::Edits::new();
+                for document in documents {
+                    checkpoint(cx)?;
+                    let document = document
+                        .into_document(&mut ids)
+                        .map_err(|_| serve_refused("invalid_update_documents"))?;
+                    edits.insert(document.id.clone(), Some(document));
+                }
+                (edits, true)
+            }
+            _ => return Err(serve_refused("invalid_update_input")),
+        };
         // A warm reader can intentionally outlive the head. Confirm that it is
         // still the exact writable base without adopting any refreshed pair.
         // The opener also refuses an unresolved previous publication attempt.
@@ -4302,6 +4369,7 @@ impl AuthoritySession {
                 },
                 limits,
                 max_image_bytes: self.max_image_bytes,
+                replace_source,
             },
             || Ok(edits),
         )?;
