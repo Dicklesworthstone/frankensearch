@@ -1713,7 +1713,9 @@ fn activation_path(root: &Path, sha256: &str) -> PathBuf {
     root.join(ACTIVATION_HISTORY).join(format!("{sha256}.json"))
 }
 
-fn history_has_objects(root: &Path) -> SearchResult<bool> {
+/// Activation records can survive a missing selection or bundle directory.
+/// Their presence identifies this protocol without choosing a generation.
+pub(crate) fn history_has_objects(root: &Path) -> SearchResult<bool> {
     let directory = root.join(ACTIVATION_HISTORY);
     match fs::symlink_metadata(&directory) {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
@@ -1739,6 +1741,24 @@ fn first_build_origin(cx: &Cx, root: &Path, candidate: &str) -> SearchResult<boo
     if history_has_objects(root)? {
         return Ok(false);
     }
+    Ok(!has_sealed_generation_except(cx, root, Some(candidate))?)
+}
+
+/// With no selected pointer, distinguish an unsealed first build from a store
+/// with surviving activation records or sealed bundles, including v1 bundles
+/// that predate activation history. This never opens or selects a candidate.
+pub(crate) fn has_unselected_generation_evidence(cx: &Cx, root: &Path) -> SearchResult<bool> {
+    checkpoint(cx)?;
+    if history_has_objects(root)? {
+        return Ok(true);
+    }
+    if entry_is_absent(&root.join(GENERATIONS))? {
+        return Ok(false);
+    }
+    has_sealed_generation_except(cx, root, None)
+}
+
+fn has_sealed_generation_except(cx: &Cx, root: &Path, except: Option<&str>) -> SearchResult<bool> {
     let parent = root.join(GENERATIONS);
     require_directory(&parent)?;
     for (ordinal, entry) in fs::read_dir(&parent)?.enumerate() {
@@ -1746,7 +1766,7 @@ fn first_build_origin(cx: &Cx, root: &Path, candidate: &str) -> SearchResult<boo
         if ordinal >= MAX_ARTIFACTS {
             return Err(retention_history_error(
                 root,
-                "initial generation inventory exceeds its entry bound",
+                "generation inventory exceeds its entry bound",
             ));
         }
         let entry = entry?;
@@ -1754,13 +1774,13 @@ fn first_build_origin(cx: &Cx, root: &Path, candidate: &str) -> SearchResult<boo
             continue;
         };
         if is_generation_id(&id)
-            && id != candidate
+            && Some(id.as_str()) != except
             && (!fs::symlink_metadata(entry.path())?.is_dir() || is_sealed(&entry.path())?)
         {
-            return Ok(false);
+            return Ok(true);
         }
     }
-    Ok(true)
+    Ok(false)
 }
 
 /// Stage a create-new immutable record and sync its directory before the caller

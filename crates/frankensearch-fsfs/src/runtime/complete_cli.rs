@@ -417,6 +417,17 @@ impl FsfsRuntime {
         )?;
         let generation = store.active(cx)?;
         retained_search_checkpoint(cx)?;
+        // A staged activation or sealed bundle (including v1) cannot
+        // distinguish a lost pointer from an incomplete first publication.
+        // Neither authorizes choosing a generation for the caller.
+        if generation.is_none()
+            && crate::generation_store::has_unselected_generation_evidence(cx, store.root())?
+        {
+            return Err(complete_cli_error(
+                "selection",
+                "no complete generation is selected but activation or sealed generation evidence remains; retry after any publisher finishes, or recover from a trusted generation receipt or an explicit source",
+            ));
+        }
         // A surviving legacy root cannot prove current authority after the
         // complete-generation protocol has been selected.
         if generation.is_none() && legacy_index_exists(store.root())? {
@@ -570,6 +581,7 @@ impl FsfsRuntime {
         // stale legacy data, including through the mutating legacy daemon.
         if complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
             || complete_entry_exists(&root.join("generations"))?
+            || crate::generation_store::history_has_objects(&root)?
         {
             return Ok(Some(root));
         }
@@ -2269,6 +2281,100 @@ mod diagnostic_retention_tests {
                     if field == "complete_generation.selection"
             ));
             assert!(abandoned.is_dir());
+        });
+    }
+
+    #[test]
+    fn surviving_activation_history_keeps_missing_selection_off_the_legacy_route() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("store");
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            let selected = publish_bundle(&store, &cx);
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            let saved = directory.path().join("saved-selection");
+            fs::rename(&pointer, &saved).unwrap();
+
+            // A pure complete store must not report a healthy first-run absence.
+            for command in [CliCommand::Status, CliCommand::Doctor] {
+                let runtime = diagnostic_runtime(&root, command);
+                let error = assert_emitted_admission_error(
+                    &runtime,
+                    &cx,
+                    &root,
+                    "recovery.state.readiness_unproven",
+                );
+                assert_eq!(
+                    error.field.as_deref(),
+                    Some("complete_generation.selection")
+                );
+                assert!(!pointer.exists());
+            }
+
+            // Model a partial restore that also lost the bundle tree, leaving
+            // the stale mutable lexical artifacts of a previous conversion.
+            let generations = root.join("generations");
+            let backup = directory.path().join("saved-generations");
+            fs::rename(&generations, &backup).unwrap();
+            fs::create_dir(root.join("lexical")).unwrap();
+            for command in [
+                CliCommand::Search,
+                CliCommand::Serve,
+                CliCommand::Daemon,
+                CliCommand::AppendBatch,
+                CliCommand::Delete,
+                CliCommand::Status,
+                CliCommand::Doctor,
+            ] {
+                let runtime = diagnostic_runtime(&root, command);
+                assert_eq!(
+                    runtime
+                        .complete_generation_command_root(false)
+                        .unwrap()
+                        .as_deref(),
+                    Some(root.as_path()),
+                );
+            }
+            assert!(!pointer.exists());
+            assert!(!generations.exists());
+            fs::rename(backup, generations).unwrap();
+            fs::rename(saved, pointer).unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(selected));
+        });
+    }
+
+    #[test]
+    fn missing_legacy_selection_with_a_sealed_v1_bundle_never_reports_an_empty_index() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("store");
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            let selected = publish_bundle(&store, &cx);
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            let legacy = format!(
+                "FSFS-COMPLETE-GENERATION-v1\n{}\n{}\n",
+                selected.id(),
+                selected.manifest_sha256()
+            );
+            fs::write(&pointer, &legacy).unwrap();
+            fs::rename(
+                root.join("activation-history"),
+                directory.path().join("saved-history"),
+            )
+            .unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(selected.clone()));
+            fs::rename(&pointer, directory.path().join("saved-selection")).unwrap();
+            for command in [CliCommand::Status, CliCommand::Doctor] {
+                let runtime = diagnostic_runtime(&root, command);
+                assert_emitted_admission_error(
+                    &runtime,
+                    &cx,
+                    &root,
+                    "recovery.state.readiness_unproven",
+                );
+                assert!(!pointer.exists());
+                assert!(selected.path().join(COMPLETE_GENERATION_MANIFEST).is_file());
+            }
         });
     }
 
