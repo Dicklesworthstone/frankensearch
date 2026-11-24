@@ -878,6 +878,129 @@ struct QualityActivationFixture {
 }
 
 impl QualityActivationFixture {
+    async fn new_partial(cx: &Cx, label: &str, fast_ann: bool, quality_ann: bool) -> Self {
+        let parent = private_parent(label);
+        let fast = provider();
+        let mut quality_identity = replacement_provider(true).identity.clone();
+        quality_identity.input.canonicalization.push_str("-quality");
+        quality_identity.space.input_contract_fingerprint = quality_identity.input.fingerprint();
+        quality_identity.producer.space_fingerprint = quality_identity.space.fingerprint();
+        quality_identity.validate().unwrap();
+        assert_ne!(quality_identity.input, fast.identity.input);
+        let quality = Arc::new(Provider {
+            identity: quality_identity,
+            calls: AtomicUsize::new(0),
+        });
+        let root_path = parent.join("root");
+        let root = create_root(&root_path).expect("qualified Linux root is required");
+        let retrieval = |ann| {
+            if ann {
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 43,
+                }
+            } else {
+                NativeBuildRetrieval::Exact
+            }
+        };
+        let built = NativeIndexBuilder::new(
+            parent.join("partial-work"),
+            new_generation(1).unwrap(),
+            fast.clone(),
+        )
+        .unwrap()
+        .with_fast_storage(NativeBuildPrecision::F32, retrieval(fast_ann))
+        .with_quality_embedder(quality.clone())
+        .unwrap()
+        .with_quality_storage(NativeBuildPrecision::F32, retrieval(quality_ann))
+        .unwrap()
+        .add_documents([
+            IndexableDocument::new("retry-first", "retry network requests"),
+            IndexableDocument::new("retry-second", "retry network failures"),
+            IndexableDocument::new("garden-private", "garden flowers"),
+        ])
+        .build_partial_quality_generation(
+            cx,
+            CommitRange { low: 1, high: 5 },
+            ["retry-first".to_owned()],
+            DEFAULT_IMAGE_BYTES,
+        )
+        .await
+        .unwrap();
+        let before = stage_and_publish(
+            cx,
+            &root,
+            &root_path,
+            &parent.join("first.json"),
+            &built,
+            None,
+            PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+        )
+        .unwrap()
+        .receipt;
+        let snapshot = before.open_on_root(cx, &root, DEFAULT_IMAGE_BYTES).unwrap();
+        let mut session = AuthoritySession::new(
+            cx,
+            root,
+            before.clone(),
+            snapshot,
+            Models {
+                fast: fast.clone(),
+                quality: Some(quality.clone()),
+            },
+            (3, DEFAULT_IMAGE_BYTES),
+            true,
+        )
+        .unwrap()
+        .with_filter(
+            cx,
+            Some(Filter::parse(r#"{"id_prefix":"retry-"}"#).unwrap()),
+            MAX_INPUT_BYTES,
+        )
+        .unwrap();
+        session.allow_model_activation = true;
+        let built = session
+            .snapshot
+            .begin_quality_completion(
+                cx,
+                parent.join("completion-work"),
+                new_generation(2).unwrap(),
+                fast.clone(),
+                quality.clone(),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap()
+            .build(cx, DEFAULT_IMAGE_BYTES)
+            .await
+            .unwrap();
+        let prepared = prepare_publication_with_intent(
+            &built,
+            Some(&session.snapshot),
+            DEFAULT_IMAGE_BYTES,
+            PublicationIntent::CompleteQuality,
+        )
+        .unwrap();
+        let completed = stage_prepared_and_publish(
+            cx,
+            &session.root,
+            &root_path,
+            &parent.join("completed.json"),
+            &built,
+            prepared,
+            PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+        )
+        .unwrap()
+        .receipt;
+        Self {
+            parent,
+            fast,
+            quality,
+            before,
+            completed,
+            session,
+        }
+    }
+
     async fn new(cx: &Cx, label: &str, fast_ann: bool, quality_ann: bool) -> Self {
         let parent = private_parent(label);
         let fast = provider();
@@ -1357,5 +1480,419 @@ fn quality_completion_activation_load_failure_drift_cancellation_and_head_race_k
         )
         .await;
         assert_eq!(replies[1]["results"][0]["doc_id"], "retry-first");
+    });
+}
+
+#[test]
+fn partial_quality_completion_activation_preserves_scope_fast_cache_and_old_readers() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        const QUERY: &str = "how do I retry network requests";
+        for (fast_ann, quality_ann) in [(false, true), (true, false)] {
+            let mut fixture = QualityActivationFixture::new_partial(
+                &cx,
+                "activate-partial-completion",
+                fast_ann,
+                quality_ann,
+            )
+            .await;
+            fixture.session = fixture
+                .session
+                .with_query_cache(&cx, query_cache::Config::parse("4").unwrap())
+                .unwrap();
+            let retained = Arc::clone(&fixture.session.snapshot);
+            let fast = Arc::clone(&fixture.session.models.models().unwrap().fast);
+            let before = exchange(
+                &cx,
+                &mut fixture.session,
+                &[serde_json::json!({"query":QUERY, "mode":"partial"})],
+            )
+            .await;
+            assert_eq!(before[0]["quality_completion_activation_enabled"], true);
+            assert_eq!(before[0]["default_mode"], "fast");
+            assert_eq!(before[1]["phase"], "refined");
+            assert_eq!(before[1]["quality_coverage"]["quality_documents"], 1);
+            assert_eq!(before[1]["results"].as_array().unwrap().len(), 2);
+            let fast_cache = Arc::clone(&fixture.session.query_models().models().unwrap().fast);
+            let quality_cache = Arc::clone(
+                fixture
+                    .session
+                    .query_models()
+                    .models()
+                    .unwrap()
+                    .quality
+                    .as_ref()
+                    .unwrap(),
+            );
+            let calls = (
+                fixture.fast.calls.load(Ordering::Relaxed),
+                fixture.quality.calls.load(Ordering::Relaxed),
+            );
+            let authority = fs::read(fixture.before.root.join("AUTHORITY")).unwrap();
+            let receipt = fs::read(fixture.parent.join("completed.json")).unwrap();
+            let request = activation_request(&fixture.message());
+            let mut loads = 0;
+            fixture
+                .session
+                .activate_model_with_loader(&cx, &request, |_, directory, tier, _| {
+                    loads += 1;
+                    assert_eq!(tier, EmbedderTierTag::Quality);
+                    assert!(directory.is_none());
+                    Ok(fixture.quality.clone())
+                })
+                .unwrap();
+            assert_eq!(loads, 1);
+            assert_eq!(fixture.session.receipt.authority, fixture.completed.authority);
+            assert_eq!(fixture.session.receipt.identity, fixture.before.identity);
+            assert_eq!(
+                fixture.session.receipt.quality_identity,
+                fixture.before.quality_identity
+            );
+            assert!(fixture.session.receipt.quality_documents.is_none());
+            assert_eq!(
+                fixture.session.snapshot.topology(),
+                NativeGenerationTopology::FullProgressive
+            );
+            assert_eq!(
+                fixture.session.snapshot.retrieval_configuration(),
+                retained.retrieval_configuration()
+            );
+            assert_eq!(
+                fixture.session.snapshot.quality_retrieval_configuration(),
+                retained.quality_retrieval_configuration()
+            );
+            assert!(Arc::ptr_eq(
+                &fast,
+                &fixture.session.models.models().unwrap().fast
+            ));
+            assert!(Arc::ptr_eq(
+                &fast_cache,
+                &fixture.session.query_models().models().unwrap().fast
+            ));
+            assert!(!Arc::ptr_eq(
+                &quality_cache,
+                fixture
+                    .session
+                    .query_models()
+                    .models()
+                    .unwrap()
+                    .quality
+                    .as_ref()
+                    .unwrap()
+            ));
+            assert_eq!(fixture.session.scope.as_ref().unwrap().len(), 2);
+            assert!(fixture.session.update_limits.is_none());
+            assert_eq!(fixture.fast.calls.load(Ordering::Relaxed), calls.0);
+            assert_eq!(fixture.quality.calls.load(Ordering::Relaxed), calls.1);
+            assert_eq!(
+                fs::read(fixture.before.root.join("AUTHORITY")).unwrap(),
+                authority
+            );
+            assert_eq!(fs::read(fixture.parent.join("completed.json")).unwrap(), receipt);
+            let after = exchange(
+                &cx,
+                &mut fixture.session,
+                &[
+                    serde_json::json!({"query":QUERY}),
+                    serde_json::json!({"query":QUERY, "mode":"quality"}),
+                    serde_json::json!({
+                        "query":QUERY, "mode":"quality", "filter":{"id_prefix":"garden-"}
+                    }),
+                ],
+            )
+            .await;
+            assert_eq!(after[0]["default_mode"], "full");
+            assert_eq!(after[0]["quality_completion_activation_enabled"], false);
+            assert_eq!(after[1]["phase"], "refined");
+            assert_eq!(after[2]["phase"], "quality");
+            for reply in &after[1..3] {
+                assert_eq!(reply["authority"], serde_json::json!(fixture.completed.authority));
+                let results = reply["results"].as_array().unwrap();
+                assert_eq!(results.len(), 2);
+                assert!(results.iter().all(|result| {
+                    result["doc_id"].as_str().unwrap().starts_with("retry-")
+                }));
+            }
+            assert!(after[3]["results"].as_array().unwrap().is_empty());
+            assert_eq!(fixture.fast.calls.load(Ordering::Relaxed), calls.0);
+            assert_eq!(fixture.quality.calls.load(Ordering::Relaxed), calls.1 + 1);
+            assert_eq!(
+                retained.topology(),
+                NativeGenerationTopology::PartialQuality {
+                    quality_documents: 1,
+                    total_documents: 3,
+                    coverage_ppm: 333_333,
+                }
+            );
+            let old_results = retained
+                .search_progressive_with_partial_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    QUERY,
+                    3,
+                )
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(old_results.len(), 3);
+            assert!(old_results.iter().any(|result| result.doc_id == "retry-second"));
+            assert!(
+                retained
+                    .search_progressive_with_quality(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        fixture.quality.as_ref(),
+                        QUERY,
+                        3,
+                    )
+                    .is_err()
+            );
+        }
+    });
+}
+
+#[test]
+fn partial_quality_completion_activation_refusals_keep_both_producers_and_query_caches() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let mut fixture =
+            QualityActivationFixture::new_partial(&cx, "partial-activation-refusal", false, true)
+                .await;
+        fixture.session = fixture
+            .session
+            .with_query_cache(&cx, query_cache::Config::parse("4").unwrap())
+            .unwrap();
+        let retained = Arc::clone(&fixture.session.snapshot);
+        let fast = Arc::clone(&fixture.session.models.models().unwrap().fast);
+        let quality = Arc::clone(
+            fixture.session.models.models().unwrap().quality.as_ref().unwrap(),
+        );
+        let fast_cache = Arc::clone(&fixture.session.query_models().models().unwrap().fast);
+        let quality_cache = Arc::clone(
+            fixture.session.query_models().models().unwrap().quality.as_ref().unwrap(),
+        );
+        exchange(
+            &cx,
+            &mut fixture.session,
+            &[serde_json::json!({"query":"retry", "mode":"partial"})],
+        )
+        .await;
+        let calls = (
+            fixture.fast.calls.load(Ordering::Relaxed),
+            fixture.quality.calls.load(Ordering::Relaxed),
+        );
+        let message = fixture.message();
+        let mut ordinary = message.clone();
+        ordinary["op"] = serde_json::json!("activate_model");
+        ordinary["model_dir"] = serde_json::json!(fixture.parent.join("unused-fast"));
+        let error = fixture
+            .session
+            .activate_model_with_loader(&cx, &activation_request(&ordinary), |_, _, _, _| {
+                panic!("ordinary migration cannot mutate a partial selection")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("partial_quality_mutation_unsupported"));
+        fixture.session.allow_model_activation = false;
+        let error = fixture
+            .session
+            .activate_model_with_loader(&cx, &activation_request(&message), |_, _, _, _| {
+                panic!("completion needs its startup grant")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("model_activation_disabled"));
+        fixture.session.allow_model_activation = true;
+        for (field, value, code) in [
+            (
+                "expected_authority",
+                serde_json::json!(fixture.completed.authority),
+                "stale_expected_authority",
+            ),
+            (
+                "receipt",
+                serde_json::json!(fixture.parent.join("first.json")),
+                "quality_completion_requires_full",
+            ),
+        ] {
+            let mut refused = message.clone();
+            refused[field] = value;
+            let error = fixture
+                .session
+                .activate_model_with_loader(&cx, &activation_request(&refused), |_, _, _, _| {
+                    panic!("partial completion preflight must precede model loading")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains(code), "{error}");
+        }
+        let request = activation_request(&message);
+        let error = fixture
+            .session
+            .activate_model_with_loader(&cx, &request, |_, _, _, _| {
+                Err(bad("private-partial-model-loading-error"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("model_activation_load_failed"));
+        assert!(!error.to_string().contains("private-partial"));
+        assert_eq!(fixture.fast.dimension(), fixture.quality.dimension());
+        let error = fixture
+            .session
+            .activate_model_with_loader(&cx, &request, |_, _, _, _| Ok(fixture.fast.clone()))
+            .unwrap_err();
+        assert!(error.to_string().contains("producer_identity_mismatch"));
+        let error = fixture
+            .session
+            .activate_model_with_loader(&cx, &request, |cx, _, _, _| {
+                cx.set_cancel_requested(true);
+                Ok(fixture.quality.clone())
+            })
+            .unwrap_err();
+        cx.set_cancel_requested(false);
+        assert!(matches!(
+            error.downcast_ref::<SearchError>(),
+            Some(SearchError::Cancelled { .. })
+        ));
+        assert_selection_unchanged(&fixture.session, &fixture.before, &retained, &fast);
+        assert_eq!(fixture.session.receipt.quality_identity, fixture.before.quality_identity);
+        assert!(Arc::ptr_eq(
+            &quality,
+            fixture.session.models.models().unwrap().quality.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &fast_cache,
+            &fixture.session.query_models().models().unwrap().fast
+        ));
+        assert!(Arc::ptr_eq(
+            &quality_cache,
+            fixture.session.query_models().models().unwrap().quality.as_ref().unwrap()
+        ));
+        assert_eq!(fixture.session.scope.as_ref().unwrap().len(), 2);
+        let replies = exchange(
+            &cx,
+            &mut fixture.session,
+            &[serde_json::json!({"query":"retry", "mode":"partial"})],
+        )
+        .await;
+        assert_eq!(replies[1]["phase"], "refined");
+        assert_eq!(replies[1]["authority"], serde_json::json!(fixture.before.authority));
+        assert_eq!(replies[1]["results"].as_array().unwrap().len(), 2);
+        assert_eq!(fixture.fast.calls.load(Ordering::Relaxed), calls.0);
+        assert_eq!(fixture.quality.calls.load(Ordering::Relaxed), calls.1);
+    });
+}
+
+#[test]
+fn partial_quality_completion_activation_rejects_quality_migration_and_racing_heads() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for changed_quality in [true, false] {
+            let mut fixture =
+                QualityActivationFixture::new_partial(&cx, "partial-activation-head", false, true)
+                    .await;
+            let retained = Arc::clone(&fixture.session.snapshot);
+            let fast = Arc::clone(&fixture.session.models.models().unwrap().fast);
+            let quality = Arc::clone(
+                fixture.session.models.models().unwrap().quality.as_ref().unwrap(),
+            );
+            let completed = fixture.completed.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let mut foreign_identity = fixture.quality.identity.clone();
+            foreign_identity.producer.implementation_revision.push_str("-other");
+            foreign_identity.validate().unwrap();
+            let foreign_quality = Arc::new(Provider {
+                identity: foreign_identity,
+                calls: AtomicUsize::new(0),
+            });
+            assert_eq!(foreign_quality.dimension(), fixture.quality.dimension());
+            let next_quality = if changed_quality {
+                foreign_quality
+            } else {
+                Arc::clone(&fixture.quality)
+            };
+            let built = NativeIndexBuilder::new(
+                fixture.parent.join("later-full-work"),
+                new_generation(3).unwrap(),
+                fixture.fast.clone(),
+            )
+            .unwrap()
+            .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+            .with_quality_embedder(next_quality)
+            .unwrap()
+            .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+            .unwrap()
+            .add_documents(retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
+            .build_progressive_generation(
+                &cx,
+                retained.metadata().commit_range.clone(),
+                DEFAULT_IMAGE_BYTES,
+            )
+            .await
+            .unwrap();
+            let root = admit_root(&fixture.before.root).unwrap();
+            let mut message = fixture.message();
+            let error = if changed_quality {
+                let next = stage_and_publish(
+                    &cx,
+                    &root,
+                    &fixture.before.root,
+                    &fixture.parent.join("later.json"),
+                    &built,
+                    Some(&completed),
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                )
+                .unwrap()
+                .receipt;
+                assert_eq!(next.documents, fixture.before.documents);
+                next.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                message["receipt"] = serde_json::json!(fixture.parent.join("later.json"));
+                fixture
+                    .session
+                    .activate_model_with_loader(
+                        &cx,
+                        &activation_request(&message),
+                        |_, _, _, _| {
+                            panic!("coverage completion cannot change its existing quality producer")
+                        },
+                    )
+                    .unwrap_err()
+            } else {
+                fixture
+                    .session
+                    .activate_model_with_loader(
+                        &cx,
+                        &activation_request(&message),
+                        |cx, _, tier, _| {
+                            assert_eq!(tier, EmbedderTierTag::Quality);
+                            stage_and_publish(
+                                cx,
+                                &root,
+                                &fixture.before.root,
+                                &fixture.parent.join("later.json"),
+                                &built,
+                                Some(&completed),
+                                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                            )?;
+                            Ok(fixture.quality.clone())
+                        },
+                    )
+                    .unwrap_err()
+            };
+            let code = if changed_quality {
+                "quality_completion_quality_identity_mismatch"
+            } else {
+                "model_activation_head_changed"
+            };
+            assert!(error.to_string().contains(code), "{error}");
+            assert_selection_unchanged(&fixture.session, &fixture.before, &retained, &fast);
+            assert!(Arc::ptr_eq(
+                &quality,
+                fixture.session.models.models().unwrap().quality.as_ref().unwrap()
+            ));
+            let replies = exchange(
+                &cx,
+                &mut fixture.session,
+                &[serde_json::json!({"query":"retry", "mode":"partial"})],
+            )
+            .await;
+            assert_eq!(replies[1]["authority"], serde_json::json!(fixture.before.authority));
+            assert_eq!(replies[1]["quality_coverage"]["quality_documents"], 1);
+            assert_eq!(replies[1]["results"].as_array().unwrap().len(), 2);
+        }
     });
 }

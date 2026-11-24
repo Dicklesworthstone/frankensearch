@@ -259,18 +259,30 @@ impl NativeQualityCompletion {
                 "quality completion requires a retained fast tier with absent or partial quality",
             ));
         }
-        // Retained source is already prepared input. A newly selected model
-        // cannot reinterpret its content selection or canonicalization contract.
+        // Retained source is already prepared input. A new quality tier must
+        // share the fast input contract. An existing partial tier instead keeps
+        // its independently admitted contract; completing coverage must not
+        // reinterpret that tier's content selection or canonicalization.
         let quality = TierPlan::new(Arc::clone(&quality_provider))?;
-        let fast_identity = snapshot.metadata().embedders.get("fast").ok_or_else(|| {
-            invalid(
-                "quality_completion.identity",
-                "missing",
-                "the selected fast tier must retain its authenticated identity",
-            )
-        })?;
-        if quality.identity.input != fast_identity.identity.input
-            || quality.identity.space.kind != fast_identity.identity.space.kind
+        let input_tier =
+            if snapshot.topology() == crate::native_ann::NativeGenerationTopology::FastOnly {
+                "fast"
+            } else {
+                "quality"
+            };
+        let expected_identity = snapshot
+            .metadata()
+            .embedders
+            .get(input_tier)
+            .ok_or_else(|| {
+                invalid(
+                    "quality_completion.identity",
+                    "missing",
+                    "the selected input tier must retain its authenticated identity",
+                )
+            })?;
+        if quality.identity.input != expected_identity.identity.input
+            || quality.identity.space.kind != expected_identity.identity.space.kind
         {
             return Err(invalid(
                 "quality_completion.input",

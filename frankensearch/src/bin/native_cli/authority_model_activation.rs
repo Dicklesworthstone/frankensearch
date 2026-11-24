@@ -4,8 +4,9 @@
 //! retains the original qualified root, admits the complete selected successor,
 //! and replaces the model, reader and fixed scope together. Explicit quality
 //! completion retains the fast model and admits a full successor of the same
-//! source cohort. Neither operation rebuilds, publishes, writes a receipt or
-//! downloads a model.
+//! source cohort. An existing partial quality tier must retain its producer
+//! identity as coverage expands. Neither operation rebuilds, publishes, writes
+//! a receipt or downloads a model.
 
 use super::{
     Arc, AuthorityModels, AuthorityRefV1, AuthoritySession, Cx, Deserialize, Embedder,
@@ -135,7 +136,10 @@ impl AuthoritySession {
         if !self.allow_model_activation {
             return Err(serve_refused("model_activation_disabled"));
         }
-        self.receipt.require_complete_for_mutation()?;
+        let completes_quality = request.completes_quality();
+        if !completes_quality {
+            self.receipt.require_complete_for_mutation()?;
+        }
         if !matches!(self.models, AuthorityModels::Semantic(_)) {
             return Err(serve_refused("model_activation_requires_hybrid"));
         }
@@ -146,13 +150,19 @@ impl AuthoritySession {
         if expected != self.snapshot.authority() {
             return Err(serve_refused("stale_expected_authority"));
         }
-        let completes_quality = request.completes_quality();
         let options = if completes_quality {
-            if self.receipt.topology() != NativeGenerationTopology::FastOnly {
-                return Err(serve_refused("quality_completion_requires_fast_only"));
+            if !matches!(
+                self.receipt.topology(),
+                NativeGenerationTopology::FastOnly
+                    | NativeGenerationTopology::PartialQuality { .. }
+            ) {
+                return Err(serve_refused(
+                    "quality_completion_requires_incomplete_quality",
+                ));
             }
             // The fast provider is retained, not reloaded from request paths.
-            // Refuse drift before reading a candidate or loading its quality model.
+            // Admit both existing producers for a partial tier before reading
+            // a candidate or loading its quality model.
             let admission = self.models.admit(&self.receipt);
             checkpoint(cx)?;
             admission?;
@@ -178,6 +188,13 @@ impl AuthoritySession {
             if selected.identity != self.receipt.identity {
                 return Err(serve_refused("quality_completion_fast_identity_mismatch"));
             }
+            if self.receipt.quality_identity.is_some()
+                && selected.quality_identity != self.receipt.quality_identity
+            {
+                return Err(serve_refused(
+                    "quality_completion_quality_identity_mismatch",
+                ));
+            }
             if selected.generation.sequence <= self.receipt.generation.sequence {
                 return Err(serve_refused("quality_completion_not_newer_generation"));
             }
@@ -200,6 +217,7 @@ impl AuthoritySession {
                 .zip(self.receipt.quality_identity.as_ref())
                 .is_some_and(|(next, previous)| next.identity.input != previous.identity.input)
             || (completes_quality
+                && self.receipt.topology() == NativeGenerationTopology::FastOnly
                 && selected.quality_identity.as_ref().is_some_and(|quality| {
                     quality.identity.input != self.receipt.identity.identity.input
                         || quality.identity.space.kind != self.receipt.identity.identity.space.kind

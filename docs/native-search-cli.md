@@ -282,10 +282,12 @@ Full-query tuning remains restricted to complete full generations.
 `authority-serve` retains both producers and accepts `"mode":"partial"` explicitly;
 its default remains fast. Source fetch, lexical search, publication-attempt
 recovery, and retained rollback use the complete admitted source. Partial sources
-currently refuse update, rebuild, repair, and model activation; these operations
-need an explicit policy for preserving or changing the subset.
+currently refuse update, rebuild, repair, and ordinary model activation; these
+operations need an explicit policy for preserving or changing the subset.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
+A warm partial server can adopt that completed generation through the explicit
+`activate_quality_completion` request described below.
 Sharded authority generations remain unsupported.
 
 Library callers use `build_partial_quality_generation(&cx, source, quality_ids,
@@ -368,6 +370,36 @@ and lexical receipt. A cancelled or failed build leaves the incumbent selected. 
 refuses the original expected-authority pair instead of rebasing. Work files
 remain available after failure. This route produces a complete two-tier
 generation; partial quality coverage is not exposed as complete.
+
+A running fast-only or partial-quality server can adopt the completed receipt
+without restarting. Start it with `--allow-model-activation`; its ready event
+then reports `quality_completion_activation_enabled: true`. Publish the full
+successor separately with `authority-complete-quality`, then send a JSONL request
+with these fields:
+
+| Field | Value |
+| --- | --- |
+| `op` | `"activate_quality_completion"` |
+| `id` | Your request identifier |
+| `receipt` | Absolute path to the newly published full receipt |
+| `expected_authority` | Exact byte array from the warm session's current selection event |
+| `model_dir` | Explicit local model root for ONNX; optional when native quality uses its own directory |
+| `quality_backend`, `quality_model_dir` | The usual explicit native-quality options, when used |
+
+The operation retains the fast provider and admits the quality provider against
+the completed receipt. For a partial predecessor, the existing quality identity
+must remain identical, including its own prepared-input contract. The fast and
+quality tiers may retain independently different input contracts; completion
+does not reinterpret either one. Original source scope and query policy are
+preserved. Fast query embeddings remain reusable, while the quality query cache
+is recreated for the admitted provider. New queries use the full retained
+generation; references to the old partial snapshot keep their original coverage.
+
+This request only adopts an already published successor. It does not build
+vectors, publish another generation or download models. Missing permission,
+changed producers, changed source or lexical images, stale authority, loading
+failure and cancellation leave the previous serving selection intact. Ordinary
+`activate_model` remains unavailable while the session is partial.
 
 ### Rebuild an existing authority generation
 

@@ -3334,10 +3334,22 @@ mod qualified_rollback {
         }
 
         async fn fixture(cx: &Cx) -> CompletionFixture {
+            fixture_with_quality_input(cx, false).await
+        }
+
+        async fn fixture_with_quality_input(cx: &Cx, distinct_input: bool) -> CompletionFixture {
             let parent = update_parent("partial-completion");
             let root = create_root(&parent.join("root"));
             let fast = Arc::new(ProgressiveProvider::new(false));
-            let quality = Arc::new(ProgressiveProvider::new(true));
+            let mut quality = ProgressiveProvider::new(true);
+            if distinct_input {
+                quality.identity.input.canonicalization.push_str("-quality");
+                quality.identity.space.input_contract_fingerprint =
+                    quality.identity.input.fingerprint();
+                quality.identity.producer.space_fingerprint = quality.identity.space.fingerprint();
+                quality.identity.validate().unwrap();
+            }
+            let quality = Arc::new(quality);
             let built = NativeIndexBuilder::new(
                 parent.join("source"),
                 ArtifactGenerationIdentityV1::new(7, [0xb1; 16]).unwrap(),
@@ -3441,16 +3453,117 @@ mod qualified_rollback {
         }
 
         #[test]
+        fn partial_completion_preserves_independent_quality_input_contract() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let fixture = fixture_with_quality_input(&cx, true).await;
+                let retained = &fixture.snapshot;
+                assert_ne!(
+                    retained.metadata().embedders["fast"].identity.input,
+                    retained.metadata().embedders["quality"].identity.input
+                );
+                let partial = retained
+                    .search_progressive_with_partial_quality(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        fixture.quality.as_ref(),
+                        "unmatched",
+                        4,
+                    )
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_eq!(partial.len(), 4);
+                assert!(
+                    partial
+                        .iter()
+                        .find(|hit| hit.doc_id == "a")
+                        .unwrap()
+                        .quality_score
+                        .is_none()
+                );
+                fixture.fast.calls.store(0, Ordering::SeqCst);
+                fixture.quality.calls.store(0, Ordering::SeqCst);
+
+                let wrong_quality = Arc::new(ProgressiveProvider::new(true));
+                let rejected = fixture.parent.join("wrong-quality-input");
+                assert!(
+                    retained
+                        .begin_quality_completion(
+                            &cx,
+                            &rejected,
+                            ArtifactGenerationIdentityV1::new(8, [0xc4; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            wrong_quality.clone(),
+                            BUDGET,
+                        )
+                        .is_err()
+                );
+                assert!(!rejected.exists());
+                assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(wrong_quality.calls.load(Ordering::SeqCst), 0);
+
+                let built = retained
+                    .begin_quality_completion(
+                        &cx,
+                        fixture.parent.join("independent-input-completed"),
+                        ArtifactGenerationIdentityV1::new(8, [0xc5; 16]).unwrap(),
+                        fixture.fast.clone(),
+                        fixture.quality.clone(),
+                        BUDGET,
+                    )
+                    .unwrap()
+                    .build(&cx, BUDGET)
+                    .await
+                    .unwrap();
+                assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    built.quality_binding().unwrap().frozen_identity(),
+                    &retained.metadata().embedders["quality"]
+                );
+                let candidate = built
+                    .candidate(
+                        [0xc6; 16],
+                        Some(retained.authority()),
+                        GenerationAuthorityActionV1::Activate,
+                        [0xc7; 32],
+                    )
+                    .unwrap();
+                let preview = built.preview_candidate(&cx, &candidate).unwrap();
+                let completed = preview
+                    .search_progressive_with_quality(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        fixture.quality.as_ref(),
+                        "unmatched",
+                        4,
+                    )
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_eq!(completed.len(), 4);
+                assert!(
+                    completed
+                        .iter()
+                        .find(|hit| hit.doc_id == "a")
+                        .unwrap()
+                        .quality_score
+                        .is_some()
+                );
+            });
+        }
+
+        #[test]
         fn partial_completion_preserves_vector_bits_and_reinfers_changed_precision() {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let fixture = fixture(&cx).await;
                 let retained = &fixture.snapshot;
                 let old_fast = vector_bits(&retained.readers.vector);
                 let old_quality = vector_bits(retained.readers.quality.as_ref().unwrap());
-                let old_source = serde_json::to_value(
-                    retained.source_documents(&cx, BUDGET).unwrap(),
-                )
-                .unwrap();
+                let old_source =
+                    serde_json::to_value(retained.source_documents(&cx, BUDGET).unwrap()).unwrap();
                 let root_path = fixture.parent.join("root");
                 let authority_before = fs::read(root_path.join("AUTHORITY")).unwrap();
                 let lock_before = fs::read(root_path.join("LOCK")).unwrap();
@@ -3520,10 +3633,12 @@ mod qualified_rollback {
                         )
                         .unwrap();
                     let preview = built.preview_candidate(&cx, &candidate).unwrap();
-                    assert_eq!(preview.topology(), NativeGenerationTopology::FullProgressive);
+                    assert_eq!(
+                        preview.topology(),
+                        NativeGenerationTopology::FullProgressive
+                    );
                     assert_eq!(vector_bits(&preview.readers.vector), old_fast);
-                    let completed_quality =
-                        vector_bits(preview.readers.quality.as_ref().unwrap());
+                    let completed_quality = vector_bits(preview.readers.quality.as_ref().unwrap());
                     assert_eq!(completed_quality.len(), 4);
                     if change_precision {
                         assert_ne!(
@@ -3558,7 +3673,10 @@ mod qualified_rollback {
                             coverage_ppm: 500_000,
                         }
                     );
-                    assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority_before);
+                    assert_eq!(
+                        fs::read(root_path.join("AUTHORITY")).unwrap(),
+                        authority_before
+                    );
                     assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_before);
                 }
             });
@@ -3575,8 +3693,16 @@ mod qualified_rollback {
                 for quality_changed in [false, true] {
                     let mut fast = ProgressiveProvider::new(false);
                     let mut quality = ProgressiveProvider::new(true);
-                    let changed = if quality_changed { &mut quality } else { &mut fast };
-                    changed.identity.producer.implementation_revision.push_str("-foreign");
+                    let changed = if quality_changed {
+                        &mut quality
+                    } else {
+                        &mut fast
+                    };
+                    changed
+                        .identity
+                        .producer
+                        .implementation_revision
+                        .push_str("-foreign");
                     changed.identity.validate().unwrap();
                     let fast = Arc::new(fast);
                     let quality = Arc::new(quality);
@@ -3642,7 +3768,10 @@ mod qualified_rollback {
                     "completion must not relax ordinary full-coverage updates"
                 );
                 assert!(!work.exists());
-                assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority_before);
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_before
+                );
                 assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_before);
                 let page = retained
                     .search_progressive_with_partial_quality(

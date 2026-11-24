@@ -4233,7 +4233,11 @@ async fn serve_session(
     ready["quality_completion_activation_enabled"] = serde_json::json!(
         session.allow_model_activation
             && !session.models.is_lexical()
-            && session.receipt.topology() == NativeGenerationTopology::FastOnly
+            && matches!(
+                session.receipt.topology(),
+                NativeGenerationTopology::FastOnly
+                    | NativeGenerationTopology::PartialQuality { .. }
+            )
     );
     ready["updates_enabled"] = serde_json::json!(session.update_limits.is_some());
     ready["fetch_enabled"] = serde_json::json!(true);
@@ -4532,7 +4536,9 @@ async fn serve(
         session = session.with_updates(options.batch_size, options.max_source_bytes)?;
     }
     if options.allow_model_activation {
-        session.receipt.require_complete_for_mutation()?;
+        // A partial session may explicitly adopt a completed quality tier.
+        // Ordinary model activation and updates enforce their own topology
+        // guards; this grant alone does not authorize changing the subset.
         session.require_current_selection()?;
         session.models.models()?;
         session.allow_model_activation = true;
