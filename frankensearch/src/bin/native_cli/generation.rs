@@ -2077,6 +2077,28 @@ where
         Some(path) => read_documents(&mut BufReader::new(File::open(path)?))?,
         None => read_documents(&mut io::stdin().lock())?,
     };
+    if options.partial_quality {
+        // Model startup may verify a producer by running inference. Reject
+        // invalid source membership before entering either model constructor.
+        let ids = options
+            .quality_ids
+            .as_deref()
+            .ok_or_else(|| bad("partial generation requires quality IDs"))?;
+        let selected: BTreeSet<_> = ids.iter().map(String::as_str).collect();
+        let source: BTreeSet<_> = documents
+            .iter()
+            .map(|document| document.id.as_str())
+            .collect();
+        if selected.is_empty()
+            || selected.len() != ids.len()
+            || selected.len() >= source.len()
+            || !selected.is_subset(&source)
+        {
+            return Err(bad(
+                "quality IDs must be unique and select a nonempty proper subset of the complete source",
+            ));
+        }
+    }
     let tier = options.tier.ok_or_else(|| bad("missing tier"))?;
     let mode = if options.progressive || options.partial_quality {
         QueryMode::Full

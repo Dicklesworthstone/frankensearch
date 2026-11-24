@@ -7901,12 +7901,19 @@ mod progressive_authority {
                 let mut options = partial_index_options(&parent, false);
                 options.quality_ids = Some(ids.into_iter().map(str::to_owned).collect());
                 let mut output = Vec::new();
+                let loads = AtomicUsize::new(0);
                 assert!(
                     index_with_loader(&cx, &options, &mut output, |_| {
+                        loads.fetch_add(1, Ordering::SeqCst);
                         Ok(models(&fast, &quality))
                     })
                     .await
                     .is_err()
+                );
+                assert_eq!(
+                    loads.load(Ordering::SeqCst),
+                    0,
+                    "invalid quality membership must refuse before model startup"
                 );
                 assert_eq!(calls(&fast, &quality), (0, 0));
                 assert!(!options.work.as_ref().unwrap().exists());
