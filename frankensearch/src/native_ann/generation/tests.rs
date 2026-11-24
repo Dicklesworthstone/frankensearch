@@ -3402,14 +3402,14 @@ mod qualified_rollback {
                     [0xb5; 16],
                 )
                 .unwrap();
-            let published = publisher
+            let outcome = publisher
                 .publish_prepared(cx, &candidate, &attempt, None, BUDGET as u64)
                 .unwrap();
             assert!(matches!(
-                published.publication,
+                outcome.publication,
                 PublicationOutcomeV1::Committed { .. }
             ));
-            let Some(GenerationActivationV1::Installed(opened)) = published.activation else {
+            let Some(GenerationActivationV1::Installed(opened)) = outcome.activation else {
                 panic!("partial fixture must activate its complete component closure")
             };
             let snapshot = NativeGenerationSnapshot::admit_partial_quality(
