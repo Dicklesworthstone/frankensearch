@@ -5,26 +5,28 @@
 //! one complete candidate, then uses the original authority pair exactly once.
 
 use frankensearch_core::RetrievalTopology;
+use frankensearch_core::generation::CanonicalDocsetV1;
 use frankensearch_core::recovery_plan::{
     BoundImmutableReindexPlan, ImmutableReindexAuthorization, ImmutableReindexBinding,
-    ImmutableReindexSource, ImmutableReindexTierBinding, InteractionPolicy, NetworkPolicy,
-    RecoveryPolicy, RecoveryRequest, RequestMode, SemanticReadiness, TrustedRecoveryContext,
-    VerifiedSemanticProvenance, plan,
+    ImmutableReindexPartialQuality, ImmutableReindexSource, ImmutableReindexTierBinding,
+    InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+    SemanticReadiness, TrustedRecoveryContext, VerifiedSemanticProvenance, plan,
 };
 use sha2::Digest as _;
 
 use super::{
     Arc, Command, Cx, EmbedderTierTag, Error, GenerationPublisherV1, MAX_RECEIPT_BYTES, Models,
     NativeBuildRetrieval, NativeBuiltExactGeneration, NativeGenerationSnapshot,
-    NativeGenerationTopology, NativeSearchPhase, Options, PROFILE, PROGRESSIVE_RECEIPT_SCHEMA,
-    PreparedPublication, PublicationFailure, PublicationOptions, PublishedGeneration,
-    QualifiedGenerationRoot, QueryMode, QueryPlan, RECEIPT_SCHEMA, Receipt, Result, SCHEMA,
-    SavedAttempt, ScoredResult, SearchError, Sha256, Write, WriterIdentityV1,
+    NativeGenerationTopology, NativeSearchPhase, Options, PARTIAL_QUALITY_RECEIPT_SCHEMA, PROFILE,
+    PROGRESSIVE_RECEIPT_SCHEMA, PreparedPublication, PublicationFailure, PublicationOptions,
+    PublishedGeneration, QualifiedGenerationRoot, QueryMode, QueryPlan, RECEIPT_SCHEMA, Receipt,
+    Result, SCHEMA, SavedAttempt, ScoredResult, SearchError, Sha256, Write, WriterIdentityV1,
     activation_manifest_path_v1, annotate_execution, annotate_scope, annotate_selection,
     annotate_snapshot_retrieval, bad, checkpoint, emit, encode, new_generation, new_path,
-    prepare_publication, publication_error, publish_and_admit_with_reconciliation, query,
-    query_admitted, query_controls, rebuild_identity, same_security_object, save_receipt,
-    separate_destinations, stage_prepared_and_publish, validate_query,
+    prepare_partial_quality_rebuild, prepare_publication, publication_error,
+    publish_and_admit_with_reconciliation, query, query_admitted, query_controls, rebuild_identity,
+    same_security_object, save_receipt, separate_destinations, stage_prepared_and_publish,
+    validate_query,
 };
 
 type Phases = Vec<(&'static str, Vec<ScoredResult>)>;
@@ -39,6 +41,27 @@ struct Inputs<'a> {
     text: &'a str,
     mode: QueryMode,
     query_policy: &'a query::Policy,
+}
+
+/// Resolve the exact replay mode before loading any replacement provider.
+pub(super) fn query_mode(selected: &Receipt, options: &Options) -> Result<QueryMode> {
+    if selected.quality_documents.is_some() {
+        if !options.retained_source {
+            return Err(super::serve_refused(
+                "partial_quality_rebuild_query_requires_retained_source",
+            ));
+        }
+        if options.mode != Some(QueryMode::Partial) {
+            return Err(super::serve_refused(
+                "partial_quality_rebuild_query_requires_partial_mode",
+            ));
+        }
+        selected.query_mode(options.mode)
+    } else if options.mode.is_some() {
+        Err(super::serve_refused("reindex_query_mode_conflict"))
+    } else {
+        selected.query_mode(None)
+    }
 }
 
 /// Called only after the normal rebuild path has prepared the complete corpus.
@@ -76,7 +99,6 @@ pub(super) async fn execute_with_policy(
     checkpoint(cx)?;
     if options.command != Command::Rebuild
         || !options.migrate_model
-        || options.mode.is_some()
         || options.lexical_only
         || options.from_receipt.is_none()
         || options.rollback_receipt.is_none()
@@ -84,7 +106,7 @@ pub(super) async fn execute_with_policy(
         || options.limit > 1_000
     {
         return Err(bad(
-            "reindex query requires explicit complete migration authorization",
+            "reindex query requires explicit migration authorization",
         ));
     }
     let text = options
@@ -95,7 +117,8 @@ pub(super) async fn execute_with_policy(
     if let Some(filter) = &options.filter {
         filter.validate()?;
     }
-    query_controls::validate_startup(options, selected.query_mode(None)?)?;
+    let mode = query_mode(selected, options)?;
+    query_controls::validate_startup(options, mode)?;
     if policy.maximum_ms() != options.timeout_ms
         || policy.full_query != options.full_query
         || policy.rerank.is_some() != options.reranker_dir.is_some()
@@ -124,12 +147,16 @@ pub(super) async fn execute_with_policy(
         built,
         loaded,
         text,
-        mode: selected.query_mode(None)?,
+        mode,
         query_policy: policy,
     };
-    let prepared = prepare_publication(built, Some(previous), options.max_image_bytes)?;
+    let prepared = if mode == QueryMode::Partial {
+        prepare_partial_quality_rebuild(cx, built, previous, options.max_image_bytes)?
+    } else {
+        prepare_publication(built, Some(previous), options.max_image_bytes)?
+    };
     let binding = inputs
-        .binding(&prepared)
+        .binding(cx, &prepared)
         .map_err(|_| bad("reindex binding admission refused"))?;
     let recovery_policy = RecoveryPolicy {
         interaction: InteractionPolicy::NonInteractive,
@@ -171,7 +198,7 @@ pub(super) async fn execute_with_policy(
         })?;
     checkpoint(cx)?;
     inputs
-        .binding(&prepared)
+        .binding(cx, &prepared)
         .and_then(|actual| recovery.validate_binding(&actual).map_err(Into::into))
         .map_err(|_| {
             inputs.failure(
@@ -220,7 +247,7 @@ pub(super) async fn execute_with_policy(
     })?;
 
     // Buffer the requested answer until every required replay phase succeeds.
-    // Full mode always consumes refinement, even for a nonstreaming response.
+    // Both two-tier modes consume refinement, even for a nonstreaming response.
     let mut phases = Phases::new();
     let replay = async {
         // Publication work does not spend the original query's time budget.
@@ -236,7 +263,8 @@ pub(super) async fn execute_with_policy(
                 text,
                 limit: options.limit,
                 mode: inputs.mode,
-                stream: inputs.mode == QueryMode::Full || policy.rerank.is_some(),
+                stream: matches!(inputs.mode, QueryMode::Full | QueryMode::Partial)
+                    || policy.rerank.is_some(),
                 deadline: deadline.as_ref(),
                 policy: Some(policy),
                 max_source_bytes: options.max_source_bytes,
@@ -313,19 +341,28 @@ pub(super) async fn execute_with_policy(
     }
 
     // The bound input plan still truthfully describes IdentityMismatch. Only
-    // admitted publication plus the completed semantic replay establishes Ready.
-    let terminal = plan(TrustedRecoveryContext::new(
-        &SemanticReadiness::Ready {
+    // admitted publication plus replay establishes the actual coverage state.
+    let readiness = match published.snapshot.topology() {
+        NativeGenerationTopology::PartialQuality { coverage_ppm, .. } => {
+            SemanticReadiness::PartialQualityCoverage {
+                provenance: VerifiedSemanticProvenance::Local,
+                coverage_ppm,
+            }
+        }
+        _ => SemanticReadiness::Ready {
             provenance: VerifiedSemanticProvenance::Local,
         },
+    };
+    let terminal = plan(TrustedRecoveryContext::new(
+        &readiness,
         RecoveryRequest {
             mode: RequestMode::Hybrid,
             requested_topology: match published.snapshot.topology() {
                 NativeGenerationTopology::FastOnly => RetrievalTopology::FastOnly,
                 NativeGenerationTopology::QualityOnly => RetrievalTopology::QualityOnly,
-                NativeGenerationTopology::FullProgressive => RetrievalTopology::FullProgressive,
-                NativeGenerationTopology::PartialQuality { .. } => {
-                    return Err(bad("partial quality model recovery is not supported"));
+                NativeGenerationTopology::FullProgressive
+                | NativeGenerationTopology::PartialQuality { .. } => {
+                    RetrievalTopology::FullProgressive
                 }
             },
         },
@@ -391,7 +428,7 @@ pub(super) async fn execute_with_policy(
 }
 
 impl Inputs<'_> {
-    fn binding(&self, prepared: &PreparedPublication) -> Result<ImmutableReindexBinding> {
+    fn binding(&self, cx: &Cx, prepared: &PreparedPublication) -> Result<ImmutableReindexBinding> {
         self.root.revalidate()?;
         self.selected.validate()?;
         let retained = self.previous.retained_snapshot();
@@ -492,6 +529,22 @@ impl Inputs<'_> {
         } else {
             (Some(primary), quality)
         };
+        let partial_quality = if self.mode == QueryMode::Partial {
+            let covered = self.previous.partial_quality_document_ids(cx)?;
+            let candidate = self.built.preview_candidate(cx, &prepared.candidate)?;
+            if candidate.partial_quality_document_ids(cx)? != covered {
+                return Err(super::serve_refused(
+                    "partial_quality_rebuild_coverage_mismatch",
+                ));
+            }
+            let documents = CanonicalDocsetV1::from_ordered_live_documents(covered)?;
+            Some(ImmutableReindexPartialQuality {
+                documents: u64::try_from(documents.len())?,
+                document_set_sha256: documents.digest(),
+            })
+        } else {
+            None
+        };
         let binding = ImmutableReindexBinding {
             root_id: retained.root_id(),
             expected_authority: self.previous.authority(),
@@ -511,6 +564,7 @@ impl Inputs<'_> {
             query_policy_sha256: query_policy.finalize().into(),
             fast,
             quality,
+            partial_quality,
         };
         binding.validate()?;
         Ok(binding)
@@ -539,14 +593,59 @@ impl Inputs<'_> {
             })
             .transpose()?;
         let mut phases = Phases::new();
-        if self.mode == QueryMode::Full {
+        if matches!(self.mode, QueryMode::Full | QueryMode::Partial) {
             let quality = self
                 .loaded
                 .quality
                 .as_deref()
                 .ok_or_else(|| bad("quality provider missing"))?;
-            let query = match (&scope, self.query_policy.query_pool()) {
-                (Some(scope), Some(pool)) => scope.search_progressive_with_quality_and_pool(
+            let query = match (
+                self.mode == QueryMode::Partial,
+                &scope,
+                self.query_policy.query_pool(),
+            ) {
+                (true, Some(scope), Some(pool)) => scope
+                    .search_progressive_with_partial_quality_and_pool(
+                        cx,
+                        self.loaded.fast.as_ref(),
+                        quality,
+                        self.text,
+                        self.options.limit,
+                        pool,
+                    )?,
+                (true, None, Some(pool)) => preview
+                    .search_progressive_with_partial_quality_and_pool(
+                        cx,
+                        self.loaded.fast.as_ref(),
+                        quality,
+                        self.text,
+                        self.options.limit,
+                        pool,
+                    )?,
+                (true, Some(scope), None) => scope.search_progressive_with_partial_quality(
+                    cx,
+                    self.loaded.fast.as_ref(),
+                    quality,
+                    self.text,
+                    self.options.limit,
+                )?,
+                (true, None, None) => preview.search_progressive_with_partial_quality(
+                    cx,
+                    self.loaded.fast.as_ref(),
+                    quality,
+                    self.text,
+                    self.options.limit,
+                )?,
+                (false, Some(scope), Some(pool)) => scope
+                    .search_progressive_with_quality_and_pool(
+                        cx,
+                        self.loaded.fast.as_ref(),
+                        quality,
+                        self.text,
+                        self.options.limit,
+                        pool,
+                    )?,
+                (false, None, Some(pool)) => preview.search_progressive_with_quality_and_pool(
                     cx,
                     self.loaded.fast.as_ref(),
                     quality,
@@ -554,22 +653,14 @@ impl Inputs<'_> {
                     self.options.limit,
                     pool,
                 )?,
-                (None, Some(pool)) => preview.search_progressive_with_quality_and_pool(
-                    cx,
-                    self.loaded.fast.as_ref(),
-                    quality,
-                    self.text,
-                    self.options.limit,
-                    pool,
-                )?,
-                (Some(scope), None) => scope.search_progressive_with_quality(
+                (false, Some(scope), None) => scope.search_progressive_with_quality(
                     cx,
                     self.loaded.fast.as_ref(),
                     quality,
                     self.text,
                     self.options.limit,
                 )?,
-                (None, None) => preview.search_progressive_with_quality(
+                (false, None, None) => preview.search_progressive_with_quality(
                     cx,
                     self.loaded.fast.as_ref(),
                     quality,
@@ -796,7 +887,9 @@ impl Inputs<'_> {
             new_generation(1)?.nonce,
         )?;
         let receipt = Receipt {
-            schema: if self.selected.quality_identity.is_some() {
+            schema: if self.selected.quality_documents.is_some() {
+                PARTIAL_QUALITY_RECEIPT_SCHEMA
+            } else if self.selected.quality_identity.is_some() {
                 PROGRESSIVE_RECEIPT_SCHEMA
             } else {
                 RECEIPT_SCHEMA
@@ -889,10 +982,9 @@ fn validate_phases(mode: QueryMode, rerank: bool, phases: &Phases) -> Result<()>
         QueryMode::Fast => &["initial"],
         QueryMode::Quality if rerank => &["quality", "reranked"],
         QueryMode::Quality => &["quality"],
-        QueryMode::Full if rerank => &["initial", "refined", "reranked"],
-        QueryMode::Full => &["initial", "refined"],
+        QueryMode::Full | QueryMode::Partial if rerank => &["initial", "refined", "reranked"],
+        QueryMode::Full | QueryMode::Partial => &["initial", "refined"],
         QueryMode::Lexical => return Err(bad("lexical queries cannot prove semantic recovery")),
-        QueryMode::Partial => return Err(bad("partial quality model recovery is not supported")),
     };
     if phases
         .iter()

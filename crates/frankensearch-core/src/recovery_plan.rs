@@ -81,7 +81,7 @@ use crate::{
 mod immutable_reindex;
 pub use immutable_reindex::{
     BoundImmutableReindexPlan, ImmutableReindexAuthorization, ImmutableReindexBinding,
-    ImmutableReindexSource, ImmutableReindexTierBinding,
+    ImmutableReindexPartialQuality, ImmutableReindexSource, ImmutableReindexTierBinding,
 };
 
 mod recovery_model_tier_wire {

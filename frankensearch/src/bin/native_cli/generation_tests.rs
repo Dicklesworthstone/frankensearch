@@ -1135,6 +1135,39 @@ fn rebuild_query_requires_explicit_migration_and_a_distinct_compensation_receipt
 }
 
 #[test]
+fn partial_rebuild_query_requires_explicit_partial_mode_and_retained_source() {
+    let authorization = [
+        "--query",
+        "retry requests",
+        "--migrate-model",
+        "--rollback-receipt",
+        "undo.json",
+    ];
+    let mut partial = retained_rebuild_arguments();
+    partial.extend(authorization);
+    partial.extend(["--mode", "partial"]);
+    let options = parse(&partial).unwrap().unwrap();
+    assert_eq!(options.mode, Some(QueryMode::Partial));
+    assert!(options.retained_source && options.migrate_model);
+
+    let mut fresh = rebuild_arguments();
+    fresh.extend(authorization);
+    fresh.extend(["--mode", "partial"]);
+    assert!(parse(&fresh).is_err());
+
+    let mut no_query = retained_rebuild_arguments();
+    no_query.extend(["--mode", "partial"]);
+    assert!(parse(&no_query).is_err());
+
+    for mode in ["fast", "quality", "full", "lexical"] {
+        let mut unsupported = retained_rebuild_arguments();
+        unsupported.extend(authorization);
+        unsupported.extend(["--mode", mode]);
+        assert!(parse(&unsupported).is_err(), "{mode}");
+    }
+}
+
+#[test]
 fn rebuild_source_boundaries_are_monotone_and_allow_an_unchanged_cut() {
     let previous = CommitRange { low: 2, high: 7 };
     for source in [
@@ -2808,7 +2841,12 @@ mod warm_authority {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+        let parent = PathBuf::from(
+            std::env::var_os("FRANKENSEARCH_TEST_TMPDIR")
+                .or_else(|| std::env::var_os("HOME"))
+                .unwrap(),
+        )
+        .join(format!(
             ".frankensearch-authority-serve-{label}-{}-{stamp}",
             std::process::id()
         ));
@@ -7772,7 +7810,12 @@ mod progressive_authority {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+        let parent = PathBuf::from(
+            std::env::var_os("FRANKENSEARCH_TEST_TMPDIR")
+                .or_else(|| std::env::var_os("HOME"))
+                .unwrap(),
+        )
+        .join(format!(
             ".frankensearch-authority-full-{}-{stamp}",
             std::process::id(),
         ));

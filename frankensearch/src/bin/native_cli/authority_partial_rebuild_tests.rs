@@ -159,7 +159,10 @@ fn partial_rebuild_preflight_and_inference_failure_leave_the_incumbent_selected(
         let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
         for (case, expected) in [
             ("fresh", "partial_quality_rebuild_requires_retained_source"),
-            ("query", "partial_quality_rebuild_query_unsupported"),
+            (
+                "query",
+                "partial_quality_rebuild_query_requires_partial_mode",
+            ),
             ("budget", "stored-payload-limit"),
         ] {
             let mut rebuild = options(&parent, &initial.receipt, case);

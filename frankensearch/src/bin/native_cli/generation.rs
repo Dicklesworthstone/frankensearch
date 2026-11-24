@@ -97,8 +97,9 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       [--max-source-bytes N] [--batch-size N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\
-      [--query TEXT --rollback-receipt NEW_JSON [--filter JSON] [--limit N] [--stream]\n\
-       [--timeout-ms N] [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]]\n\n\
+      [--query TEXT --rollback-receipt NEW_JSON [--mode partial]\n\
+       [--filter JSON] [--limit N] [--stream] [--timeout-ms N]\n\
+       [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]]\n\n\
   authority-update --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       --source-low N --source-high N [--input JSONL] [--replace-source]\n\
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
@@ -170,8 +171,10 @@ rollback. Updates preserve surviving covered IDs; new/uncovered IDs stay fast-on
 Removing all covered or all uncovered IDs refuses before model loading/staging.\n\
 Graph repair with --reuse-vectors preserves the exact subset. Partial rebuilds\n\
 require --retained-source and keep the source and covered IDs; --migrate-model\n\
-permits independent producer replacement. Source-only repair, fresh-input rebuild,\n\
-and rebuild --query still refuse partial sources. Granted warm model activation\n\
+permits independent producer replacement. Rebuild --query also requires explicit\n\
+--mode partial and preserves the exact covered subset through preview and replay.\n\
+Source-only repair and fresh-input rebuild still refuse partial sources.\n\
+Granted warm model activation\n\
 preserves the exact partial source and covered IDs. Explicit quality\n\
 completion accepts fast-only or partial sources. Warm sessions accept mode=partial.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
@@ -247,8 +250,10 @@ the target components; the ancestry walk remains bounded to 1024 links.\n\
 Recovery reports commit knowledge separately from bounded reader admission.\n\
 Rebuild --query requires --migrate-model and --rollback-receipt. This offline\n\
 identity-recovery path binds a typed RecoveryPlan to the exact old/candidate\n\
-authorities, source, producers and request. It previews a nonempty semantic\n\
-query before publication, replays it once after publication, and attempts one\n\
+authorities, source, producers and request. Partial recovery also binds the actual\n\
+quality subset's count and digest and retains partial coverage after success.\n\
+It previews a nonempty semantic query before publication, replays it once after\n\
+publication, and attempts one\n\
 higher-sequence rollback on replay failure. Cancellation or uncertain publication\n\
 keeps its actual outcome and receipts; neither grants permission to republish.\n\
 The original filter, fusion/candidate/beam policy and retained reranker are used\n\
@@ -806,7 +811,7 @@ impl Options {
                 {
                     options.rerank_window = number(&value(&mut args)?, 1_000)?;
                 }
-                "--mode" if command == Command::Search => {
+                "--mode" if matches!(command, Command::Search | Command::Rebuild) => {
                     options.mode = Some(match value(&mut args)?.as_str() {
                         "fast" => QueryMode::Fast,
                         "quality" => QueryMode::Quality,
@@ -914,7 +919,15 @@ impl Options {
                             "authority-rebuild --query requires --migrate-model and --rollback-receipt",
                         ));
                     }
+                    if options.mode.is_some()
+                        && (options.mode != Some(QueryMode::Partial) || !options.retained_source)
+                    {
+                        return Err(bad(
+                            "authority-rebuild --mode requires partial and --retained-source",
+                        ));
+                    }
                 } else if options.rollback_receipt.is_some()
+                    || options.mode.is_some()
                     || options.filter.is_some()
                     || options.stream
                     || options.timeout_ms.is_some()
@@ -2475,21 +2488,16 @@ where
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
     let partial_quality = selected.quality_documents.is_some();
-    if partial_quality {
-        if !options.retained_source {
-            return Err(serve_refused(
-                "partial_quality_rebuild_requires_retained_source",
-            ));
-        }
-        if options.query.is_some() {
-            return Err(serve_refused("partial_quality_rebuild_query_unsupported"));
-        }
+    if partial_quality && !options.retained_source {
+        return Err(serve_refused(
+            "partial_quality_rebuild_requires_retained_source",
+        ));
     }
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;
     if options.query.is_some() {
-        query_controls::validate_startup(options, selected.query_mode(None)?)?;
+        query_controls::validate_startup(options, reindex::query_mode(&selected, options)?)?;
     }
     let work_path = new_path(
         options

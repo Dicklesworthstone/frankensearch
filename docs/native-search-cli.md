@@ -287,8 +287,10 @@ repair with `authority-repair --reuse-vectors` when both vector owners still
 authenticate. `authority-rebuild --retained-source` can change retrieval policy
 or, with `--migrate-model`, either producer while preserving the source and exact
 quality subset. A granted warm `activate_model` request can adopt that partial
-successor without restarting. Fresh-input rebuild and source-only repair still
-refuse partial sources.
+successor without restarting. Adding `--query --mode partial` and a new
+`--rollback-receipt` to a retained-source model migration validates and retries
+that exact partial query, as described below. Fresh-input rebuild and source-only
+repair still refuse partial sources.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
 A warm partial server can adopt that completed generation through the explicit
@@ -511,9 +513,11 @@ covered IDs. Neither a model change nor a graph-policy change expands coverage.
 The source checkpoint, complete stored documents, exact lexical image, and
 covered-ID set stay fixed. Publication authenticates the candidate vector owners
 and compares their actual membership before staging; equal coverage counts are
-insufficient. Partial fresh-input rebuilds and the `--query` recovery executor
-remain unsupported and refuse before model loading. Use explicit completion to
-move to full coverage, or the ordinary partial update operation to change source.
+insufficient. The `--query` recovery executor supports this retained-source route
+only with explicit `--mode partial` and a new `--rollback-receipt`. Partial
+fresh-input rebuilds remain unsupported and refuse before model loading. Use
+explicit completion to move to full coverage, or the ordinary partial update
+operation to change source.
 
 Retained documents are already prepared input. This route may change producers
 and vector spaces, but must preserve each tier's complete input-preparation
@@ -581,31 +585,58 @@ migration to execute the offline identity-mismatch recovery path:
 ```
 
 This is a production consumer of the core `RecoveryPlan` for a verified local
-producer identity change. The existing complete authority must still be
-admissible. It supports fast-only, quality-only and complete two-tier generations,
-including independently configured native ANN tiers. All required producers are
-loaded locally; this operation does not acquire models or execute plans supplied
-as JSON. Unchanged identities, hash-control generations, empty replacement
-cohorts and unsupported recovery states are refused.
+producer identity change. The existing authority must still be
+admissible. It supports fast-only, quality-only, complete two-tier and explicitly
+selected partial-quality generations, including independently configured native
+ANN tiers. All required producers are loaded locally; this operation does not
+acquire models or execute plans supplied as JSON. Unchanged identities,
+hash-control generations, empty replacement cohorts and unsupported recovery
+states are refused.
+
+For a partial predecessor, retain its source and explicitly request partial
+retrieval:
+
+```sh
+./target/release/frankensearch-native authority-rebuild \
+  --from-receipt /absolute/path/to/partial-g1.json \
+  --work-dir /absolute/path/to/new-partial-rebuild-work \
+  --receipt /absolute/path/to/partial-g2.json \
+  --rollback-receipt /absolute/path/to/partial-g2-rollback.json \
+  --retained-source --migrate-model --mode partial \
+  --model-dir /absolute/path/to/replacement/models \
+  --query 'retry network requests' --limit 10 --stream
+```
+
+The retained source and exact quality-covered IDs remain unchanged. Omitting
+`--mode partial`, selecting full retrieval, supplying fresh input, or requesting
+full-query tuning refuses before model loading. This recovery never fills the
+missing quality rows or treats a successful fast-only query as validation of the
+partial quality tier.
 
 The command freezes one exact candidate and binds authorization to its authority
 reference, the original authority and artifact generation, both independent
 producer identities, source checkpoint, document counts and digests of the query
-and its complete policy. Retained-source migration preserves both preparation
-contracts. A freshly prepared complete `--input` cohort with explicit source
-boundaries remains available when preparation must change.
+and its complete policy. For partial quality, it also binds the actual covered
+document count and canonical digest of the sorted covered-ID set. The executor
+compares the actual predecessor and candidate membership before preview and
+again before publication; equal counts alone cannot authorize a different
+subset. Retained-source migration preserves the complete source and both
+preparation contracts. A freshly prepared complete `--input` cohort with
+explicit source boundaries remains available when preparation must change.
 
 Before any authority publication, a candidate preview opens the actual completed
 component images and executes the requested semantic query. A full generation
-must complete both fast and quality phases. `--filter JSON` fixes source
-membership before retrieval and fusion; `--max-source-bytes` bounds source
+or explicit partial query must complete both fast and quality phases.
+`--filter JSON` fixes source membership before retrieval and fusion;
+`--max-source-bytes` bounds source
 materialization for that scope. Blank queries, zero limits and empty scopes
 cannot substitute for semantic validation. Preview failure or cancellation leaves
 the old authority selected.
 
 An explicit `--reranker-dir` and `--rerank-window` also apply to fast-only and
-quality-only recovery. Both preview and replay must complete the requested
-cross-encoder stage using the same retained source, scope and model policy.
+quality-only recovery and to explicit partial-quality recovery. Both preview and
+replay must complete the requested cross-encoder stage using the same retained
+source, scope and model policy.
 `--timeout-ms` supplies a fresh equal total query budget to each execution;
 building and publishing do not spend those query budgets. Full-query tuning
 remains restricted to full generations. A preview failure never publishes, and
@@ -617,12 +648,17 @@ actual status and saved receipt. The command never repeats publication or change
 its expectation to a competing publisher's head. After proven publication, it
 replays the same query, filter and limit exactly once. Results are buffered until
 the complete replay succeeds; `--stream` then preserves separate Initial and
-Refined frames for a full query.
+Refined frames for full and explicit partial queries, followed by a reranked
+frame when configured. Successful partial recovery reports
+`partial_quality_coverage` readiness with the actual quality and total document
+counts; it does not report complete semantic readiness.
 
 An ordinary replay failure attempts one higher-sequence rollback to the retained
 predecessor, using the just-published authority as its expected pair. The rollback
 receipt is saved before changing authority, and every artifact image remains
-intact. Cancellation can prevent this compensation; the failure then reports the
+intact. A rollback to a partial predecessor preserves its exact covered IDs; the
+new receipt records the partial topology, quality count and producer identities.
+Cancellation can prevent this compensation; the failure then reports the
 known committed selection and that rollback is deferred. An unknown rollback
 keeps its own exact attempt for `authority-recover`. A competing publication is
 never overwritten. Output delivery failure after a successful replay preserves

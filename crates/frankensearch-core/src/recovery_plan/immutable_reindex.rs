@@ -41,6 +41,19 @@ pub struct ImmutableReindexTierBinding {
     pub provenance: VerifiedSemanticProvenance,
 }
 
+/// Exact quality membership preserved by a retained-source identity migration.
+///
+/// The executor derives this from the admitted old and candidate owners after
+/// comparing their complete sorted document identifiers. A matching count alone
+/// does not prove that the same subset remains covered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImmutableReindexPartialQuality {
+    /// Nonzero proper subset of the complete source and fast-tier census.
+    pub documents: u64,
+    /// Canonical digest of the exact retained quality document set.
+    pub document_set_sha256: [u8; 32],
+}
+
 /// Path-free facts identifying one complete immutable reindex attempt.
 ///
 /// These are trusted runtime inputs, not an attestation format. In particular,
@@ -68,7 +81,7 @@ pub struct ImmutableReindexBinding {
     pub source: CommitRange,
     /// Old live-document census, independently admitted from its components.
     pub previous_documents: u64,
-    /// Nonzero complete candidate live-document census across every tier.
+    /// Nonzero complete candidate source and fast-tier live-document census.
     pub documents: u64,
     /// Whether input preparation may change for the complete new corpus.
     pub source_kind: ImmutableReindexSource,
@@ -82,6 +95,9 @@ pub struct ImmutableReindexBinding {
     pub fast: Option<ImmutableReindexTierBinding>,
     /// Independent quality identity whenever that tier exists in the topology.
     pub quality: Option<ImmutableReindexTierBinding>,
+    /// Exact retained quality subset, when the two-tier candidate is partial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_quality: Option<ImmutableReindexPartialQuality>,
 }
 
 fn serialize_authority<S>(authority: &AuthorityRefV1, serializer: S) -> Result<S::Ok, S::Error>
@@ -96,12 +112,16 @@ fn invalid(field: &'static str) -> RecoveryContractError {
 }
 
 impl ImmutableReindexBinding {
-    /// Complete topology named by the two independent tier slots.
+    /// Requested topology named by the two independent tier slots.
+    ///
+    /// Partial quality still requests both tiers. Its realized coverage is
+    /// bound separately and a successful executor must report
+    /// [`SemanticReadiness::PartialQualityCoverage`], never complete readiness.
     ///
     /// # Errors
     ///
-    /// Refuses an absent semantic topology; there is no partial-quality,
-    /// lexical-only, hash-control or ANN-only recovery scope.
+    /// Refuses an absent semantic topology; there is no lexical-only,
+    /// hash-control or ANN-only recovery scope.
     pub fn topology(&self) -> Result<RetrievalTopology, RecoveryContractError> {
         match (&self.fast, &self.quality) {
             (Some(_), None) => Ok(RetrievalTopology::FastOnly),
@@ -170,6 +190,22 @@ impl ImmutableReindexBinding {
             && (self.source != self.previous_source || self.documents != self.previous_documents)
         {
             return Err(invalid("retained_source"));
+        }
+        if let Some(coverage) = &self.partial_quality {
+            if self.source_kind != ImmutableReindexSource::Retained
+                || self.fast.is_none()
+                || self.quality.is_none()
+                || coverage.documents == 0
+                || coverage.documents >= self.documents
+                || coverage.document_set_sha256 == [0; 32]
+            {
+                return Err(invalid("partial_quality"));
+            }
+            let coverage_ppm =
+                u128::from(coverage.documents) * 1_000_000 / u128::from(self.documents);
+            if !(1..1_000_000).contains(&coverage_ppm) {
+                return Err(invalid("partial_quality"));
+            }
         }
         let mut identity_changed = false;
         for tier in [&self.fast, &self.quality].into_iter().flatten() {
@@ -301,8 +337,8 @@ impl RecoveryPlan {
     /// Generic planning stays capability-blocked. This consumes an actual
     /// canonical `IdentityMismatch` plan, independently established immutable
     /// execution facts, and explicit exact consent. It does not grant model
-    /// acquisition, daemon repair, ANN-only repair, partial-tier mutation or
-    /// recovery from an untrusted current generation.
+    /// acquisition, daemon repair, ANN-only repair, changes to partial quality
+    /// membership, or recovery from an untrusted current generation.
     ///
     /// # Errors
     ///
@@ -349,13 +385,29 @@ impl RecoveryPlan {
         if self != canonical {
             return Err(unsupported("canonical_plan"));
         }
-        self.action = Some(simple_action(
-            "recovery.action.reindex_full",
-            "Build and verify one complete immutable candidate with the explicitly authorized \
+        let (code, description) = if binding.partial_quality.is_some() {
+            (
+                "recovery.action.reindex_preserve_partial_quality",
+                "Build and verify one immutable candidate with the explicitly authorized \
+                 local producers, preserving the retained source and exact quality subset. \
+                 Publish only against the retained authority and replay the original partial \
+                 request once. Report partial quality coverage after success; restore the \
+                 predecessor through a higher authority sequence if replay fails. Existing \
+                 images remain intact and uncertain outcomes retain their actual classification.",
+            )
+        } else {
+            (
+                "recovery.action.reindex_full",
+                "Build and verify one complete immutable candidate with the explicitly authorized \
              local producers. Publish only against the retained authority, replay the original \
              request once, and restore the predecessor through a higher authority sequence if \
              replay fails. Existing source and artifact images remain intact; cancellation or \
              uncertain publication must retain their actual runtime outcome.",
+            )
+        };
+        self.action = Some(simple_action(
+            code,
+            description,
             &[],
             false,
             true,
@@ -440,6 +492,7 @@ mod tests {
                 RetrievalTopology::QualityOnly | RetrievalTopology::FullProgressive
             )
             .then(|| tier("quality-contract-fixture")),
+            partial_quality: None,
         }
     }
 
@@ -525,6 +578,106 @@ mod tests {
                     Retryability::BlockedByCapability
                 );
             }
+        }
+    }
+
+    #[test]
+    fn retained_partial_migration_binds_exact_coverage_without_claiming_complete_readiness() {
+        let mut scope = binding(RetrievalTopology::FullProgressive);
+        scope.source_kind = ImmutableReindexSource::Retained;
+        scope.source = scope.previous_source.clone();
+        scope.previous_documents = 3;
+        scope.documents = 3;
+        scope.partial_quality = Some(ImmutableReindexPartialQuality {
+            documents: 1,
+            document_set_sha256: [10; 32],
+        });
+        let bound = bind(scope.clone());
+        assert_eq!(bound.plan().state(), &SemanticReadiness::IdentityMismatch);
+        assert!(!bound.plan().semantic_available());
+        assert_eq!(
+            scope.topology().unwrap(),
+            RetrievalTopology::FullProgressive
+        );
+        assert_eq!(
+            bound.plan().action().unwrap().code(),
+            "recovery.action.reindex_preserve_partial_quality"
+        );
+        bound.validate_binding(&scope).unwrap();
+        for substitution in 0..3 {
+            let mut changed = scope.clone();
+            match substitution {
+                0 => changed.partial_quality.as_mut().unwrap().documents = 2,
+                1 => {
+                    changed
+                        .partial_quality
+                        .as_mut()
+                        .unwrap()
+                        .document_set_sha256 = [11; 32]
+                }
+                _ => changed.partial_quality = None,
+            }
+            changed.validate().unwrap();
+            assert_eq!(
+                bound.validate_binding(&changed).unwrap_err(),
+                RecoveryContractError::ImmutableReindexBindingChanged
+            );
+            assert_eq!(
+                blocked(RetrievalTopology::FullProgressive)
+                    .bind_immutable_reindex(
+                        changed,
+                        ImmutableReindexAuthorization::authorize(&scope).unwrap(),
+                    )
+                    .unwrap_err(),
+                RecoveryContractError::MismatchedImmutableReindexAuthorization
+            );
+        }
+        let mut complete = scope.clone();
+        complete.partial_quality = None;
+        assert_eq!(
+            blocked(RetrievalTopology::FullProgressive)
+                .bind_immutable_reindex(
+                    scope,
+                    ImmutableReindexAuthorization::authorize(&complete).unwrap(),
+                )
+                .unwrap_err(),
+            RecoveryContractError::MismatchedImmutableReindexAuthorization
+        );
+    }
+
+    #[test]
+    fn partial_migration_refuses_unbound_coverage_or_replacement_source() {
+        let mut scope = binding(RetrievalTopology::FullProgressive);
+        scope.source_kind = ImmutableReindexSource::Retained;
+        scope.source = scope.previous_source.clone();
+        scope.documents = scope.previous_documents;
+        scope.partial_quality = Some(ImmutableReindexPartialQuality {
+            documents: 1,
+            document_set_sha256: [10; 32],
+        });
+        scope.validate().unwrap();
+        for refusal in 0..7 {
+            let mut changed = scope.clone();
+            match refusal {
+                0 => changed.partial_quality.as_mut().unwrap().documents = 0,
+                1 => changed.partial_quality.as_mut().unwrap().documents = changed.documents,
+                2 => {
+                    changed
+                        .partial_quality
+                        .as_mut()
+                        .unwrap()
+                        .document_set_sha256 = [0; 32]
+                }
+                3 => changed.source_kind = ImmutableReindexSource::Prepared,
+                4 => changed.fast = None,
+                5 => changed.quality = None,
+                _ => {
+                    changed.documents = u64::MAX;
+                    changed.previous_documents = u64::MAX;
+                }
+            }
+            assert_eq!(changed.validate().unwrap_err(), invalid("partial_quality"));
+            assert!(ImmutableReindexAuthorization::authorize(&changed).is_err());
         }
     }
 

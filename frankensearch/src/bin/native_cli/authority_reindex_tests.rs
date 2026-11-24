@@ -5,6 +5,12 @@ use std::sync::Mutex;
 
 const REINDEX_QUERY: &str = "retry private-reindex-query";
 const REINDEX_TUNING: &str = r#"{"candidate_multiplier":5,"fast_ef":16,"quality_ef":17,"rrf_k":0,"lexical_weight":2,"semantic_weight":3,"quality_weight":0.2}"#;
+const PARTIAL_REINDEX_TOPOLOGY: NativeGenerationTopology =
+    NativeGenerationTopology::PartialQuality {
+        quality_documents: 1,
+        total_documents: 3,
+        coverage_ppm: 333_333,
+    };
 
 type RerankObservation = (String, Vec<(String, String)>);
 
@@ -228,6 +234,16 @@ async fn reindex_build(
             .build_progressive_generation(cx, source, DEFAULT_IMAGE_BYTES)
             .await
             .unwrap()
+    } else if matches!(topology, NativeGenerationTopology::PartialQuality { .. }) {
+        builder
+            .build_partial_quality_generation(
+                cx,
+                source,
+                ["selected-retry".to_owned()],
+                DEFAULT_IMAGE_BYTES,
+            )
+            .await
+            .unwrap()
     } else {
         builder
             .build_exact_generation(
@@ -258,8 +274,12 @@ impl ReindexFixture {
     async fn new(cx: &Cx, topology: NativeGenerationTopology, ann: bool) -> Self {
         let parent = private_parent("bound-reindex");
         let primary = reindex_provider("original-primary");
-        let quality = (topology == NativeGenerationTopology::FullProgressive)
-            .then(|| reindex_provider("original-quality"));
+        let quality = matches!(
+            topology,
+            NativeGenerationTopology::FullProgressive
+                | NativeGenerationTopology::PartialQuality { .. }
+        )
+        .then(|| reindex_provider("original-quality"));
         let models = reindex_models(&primary, quality.as_ref());
         let built = reindex_build(cx, &parent, "before", 1, topology, &models, ann).await;
         let root_path = parent.join("root");
@@ -304,6 +324,9 @@ impl ReindexFixture {
             "--filter",
             r#"{"metadata":{"tenant":"selected"}}"#,
         ]);
+        if self.selected.quality_documents.is_some() {
+            arguments.extend(["--mode", "partial"]);
+        }
         let mut options = parse(&arguments).unwrap().unwrap();
         options.from_receipt = Some(self.parent.join("before.json"));
         options.receipt = self.parent.join("after.json");
@@ -344,6 +367,354 @@ impl ReindexFixture {
         )
         .await
     }
+}
+
+#[test]
+fn bound_partial_reindex_preserves_covered_ids_and_truthful_recovery_after_filtered_replay() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            for stream in [false, true] {
+                let fixture = ReindexFixture::new(&cx, PARTIAL_REINDEX_TOPOLOGY, ann).await;
+                let (primary, quality, loaded) = fixture.replacements();
+                let quality = quality.unwrap();
+                let old_receipt = fs::read(fixture.parent.join("before.json")).unwrap();
+                let mut options = fixture.options();
+                options.stream = stream;
+                let mut loaded = Some(loaded);
+                let mut requested = Vec::new();
+                let mut output = Vec::new();
+                Box::pin(rebuild_with_loader(&cx, &options, &mut output, |mode| {
+                    requested.push(mode);
+                    Ok(loaded.take().expect("replacement models load only once"))
+                }))
+                .await
+                .unwrap();
+                assert_eq!(requested, [QueryMode::Full]);
+                assert_eq!(primary.queries.load(Ordering::SeqCst), 2);
+                assert_eq!(quality.queries.load(Ordering::SeqCst), 2);
+                assert_eq!(primary.inner.calls.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.inner.calls.load(Ordering::SeqCst), 3);
+                let after = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(after.schema, PARTIAL_QUALITY_RECEIPT_SCHEMA);
+                assert_eq!(after.quality_documents, Some(1));
+                assert_eq!(after.documents, 3);
+                let active = after
+                    .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
+                    .unwrap();
+                assert_eq!(active.topology(), PARTIAL_REINDEX_TOPOLOGY);
+                assert_eq!(active.authority().sequence, 2);
+                assert_eq!(
+                    active.partial_quality_document_ids(&cx).unwrap(),
+                    ["selected-retry"]
+                );
+                assert_eq!(
+                    active.metadata().commit_range,
+                    fixture.previous.metadata().commit_range
+                );
+                assert_eq!(
+                    active.retrieval_configuration(),
+                    fixture.previous.retrieval_configuration()
+                );
+                assert_eq!(
+                    active.quality_retrieval_configuration(),
+                    fixture.previous.quality_retrieval_configuration()
+                );
+                assert_eq!(
+                    active.retained_snapshot().manifest().components().lexical,
+                    fixture
+                        .previous
+                        .retained_snapshot()
+                        .manifest()
+                        .components()
+                        .lexical
+                );
+                assert_eq!(
+                    serde_json::to_value(active.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
+                        .unwrap(),
+                    serde_json::to_value(
+                        fixture
+                            .previous
+                            .source_documents(&cx, MAX_INPUT_BYTES)
+                            .unwrap()
+                    )
+                    .unwrap()
+                );
+                let covered =
+                    frankensearch_core::generation::CanonicalDocsetV1::from_ordered_live_documents(
+                        ["selected-retry"],
+                    )
+                    .unwrap()
+                    .digest();
+                let responses = frames(&output);
+                assert_eq!(responses.len(), if stream { 2 } else { 1 });
+                assert_eq!(responses.last().unwrap()["phase"], "refined");
+                if stream {
+                    assert_eq!(responses[0]["phase"], "initial");
+                }
+                for response in &responses {
+                    assert_eq!(response["mode"], "partial");
+                    assert_eq!(response["publication"], "committed");
+                    assert_eq!(response["replay"], "complete");
+                    assert_eq!(
+                        response["recovery"]["plan"]["state"]["state"],
+                        "identity_mismatch"
+                    );
+                    assert_eq!(
+                        response["recovery"]["binding"]["partial_quality"]["documents"],
+                        1
+                    );
+                    assert_eq!(
+                        response["recovery"]["binding"]["partial_quality"]["document_set_sha256"],
+                        serde_json::json!(covered)
+                    );
+                    assert_eq!(
+                        response["recovery_result"]["state"]["state"],
+                        "partial_quality_coverage"
+                    );
+                    assert_eq!(
+                        response["recovery_result"]["state"]["detail"]["coverage_ppm"],
+                        333_333
+                    );
+                    assert_eq!(response["scope"]["eligible_documents"], 2);
+                    assert!(
+                        response["results"].as_array().unwrap().iter().all(|hit| {
+                            hit["doc_id"].as_str().unwrap().starts_with("selected-")
+                        })
+                    );
+                }
+                assert!(!String::from_utf8(output).unwrap().contains(REINDEX_QUERY));
+                assert!(!options.rollback_receipt.as_ref().unwrap().exists());
+                assert_eq!(
+                    fs::read(fixture.parent.join("before.json")).unwrap(),
+                    old_receipt
+                );
+                assert_eq!(fixture.primary.queries.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    fixture
+                        .quality
+                        .as_ref()
+                        .unwrap()
+                        .queries
+                        .load(Ordering::SeqCst),
+                    0
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn bound_partial_reindex_preview_and_replay_failures_preserve_exact_partial_authority() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for fail_query in [1, 2] {
+            let fixture = ReindexFixture::new(&cx, PARTIAL_REINDEX_TOPOLOGY, false).await;
+            let (primary, quality, loaded) = fixture.replacements();
+            let quality = quality.unwrap();
+            quality.fail_query.store(fail_query, Ordering::SeqCst);
+            let built = fixture.build(&cx, &loaded, false).await;
+            let options = fixture.options();
+            let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+            let old_receipt = fs::read(fixture.parent.join("before.json")).unwrap();
+            let mut output = Vec::new();
+            let error = reindex::execute(
+                &cx,
+                &options,
+                &fixture.root,
+                &fixture.selected,
+                &fixture.previous,
+                &built,
+                &loaded,
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+            let report = publication_failure(error.as_ref()).unwrap();
+            assert!(output.is_empty());
+            assert!(
+                !serde_json::to_string(&report)
+                    .unwrap()
+                    .contains("private inference failure")
+            );
+            assert_eq!(primary.queries.load(Ordering::SeqCst), fail_query);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), fail_query);
+            assert_eq!(
+                fs::read(fixture.parent.join("before.json")).unwrap(),
+                old_receipt
+            );
+            if fail_query == 1 {
+                assert_eq!(report["publication"], "not_attempted");
+                assert_eq!(report["reason"], "preview_refused");
+                assert!(!options.receipt.exists());
+                assert!(!options.rollback_receipt.as_ref().unwrap().exists());
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    authority
+                );
+            } else {
+                assert_eq!(report["publication"], "committed");
+                assert_eq!(report["replay"], "failed");
+                assert_eq!(report["rollback"]["status"], "committed");
+                let failed = Receipt::read(&options.receipt).unwrap();
+                let restored = Receipt::read(options.rollback_receipt.as_ref().unwrap()).unwrap();
+                assert_eq!(failed.authority().unwrap().sequence, 2);
+                assert_eq!(restored.authority().unwrap().sequence, 3);
+                assert_eq!(restored.schema, PARTIAL_QUALITY_RECEIPT_SCHEMA);
+                assert_eq!(restored.quality_documents, Some(1));
+                assert_eq!(restored.generation, fixture.selected.generation);
+                assert_eq!(restored.identity, fixture.selected.identity);
+                assert_eq!(restored.quality_identity, fixture.selected.quality_identity);
+                let active = restored
+                    .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
+                    .unwrap();
+                assert_eq!(active.topology(), PARTIAL_REINDEX_TOPOLOGY);
+                assert_eq!(active.metadata(), fixture.previous.metadata());
+                assert_eq!(
+                    active.partial_quality_document_ids(&cx).unwrap(),
+                    ["selected-retry"]
+                );
+                assert!(
+                    failed
+                        .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
+                        .is_err()
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn bound_partial_reindex_rejects_implicit_mode_and_policy_before_model_loading() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = ReindexFixture::new(&cx, PARTIAL_REINDEX_TOPOLOGY, false).await;
+        let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+        for refusal in 0..4 {
+            let mut options = fixture.options();
+            match refusal {
+                0 => options.mode = None,
+                1 => options.mode = Some(QueryMode::Full),
+                2 => options.retained_source = false,
+                _ => options.full_query = Some(query::FullQuery::parse(REINDEX_TUNING).unwrap()),
+            }
+            let mut loads = 0;
+            let mut output = Vec::new();
+            assert!(
+                Box::pin(rebuild_with_loader(&cx, &options, &mut output, |_| {
+                    loads += 1;
+                    Err(bad("invalid partial recovery must not load models"))
+                }))
+                .await
+                .is_err()
+            );
+            assert_eq!(loads, 0);
+            assert!(output.is_empty());
+            assert!(!options.work.as_ref().unwrap().exists());
+            assert!(!options.receipt.exists());
+            assert!(!options.rollback_receipt.as_ref().unwrap().exists());
+            assert_eq!(
+                fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                authority
+            );
+        }
+    });
+}
+
+#[test]
+fn bound_partial_reindex_refuses_same_count_quality_membership_substitution_before_queries() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = ReindexFixture::new(&cx, PARTIAL_REINDEX_TOPOLOGY, false).await;
+        let (primary, quality, loaded) = fixture.replacements();
+        let quality = quality.unwrap();
+        let built = NativeIndexBuilder::new(
+            fixture.parent.join("substituted-work"),
+            new_generation(2).unwrap(),
+            primary.clone(),
+        )
+        .unwrap()
+        .with_quality_embedder(quality.clone())
+        .unwrap()
+        .add_documents(reindex_documents())
+        .build_partial_quality_generation(
+            &cx,
+            fixture.previous.metadata().commit_range.clone(),
+            ["selected-garden".to_owned()],
+            DEFAULT_IMAGE_BYTES,
+        )
+        .await
+        .unwrap();
+        let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+        let options = fixture.options();
+        let mut output = Vec::new();
+        let error = reindex::execute(
+            &cx,
+            &options,
+            &fixture.root,
+            &fixture.selected,
+            &fixture.previous,
+            &built,
+            &loaded,
+            &mut output,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("partial_quality_rebuild_coverage_mismatch")
+        );
+        assert!(output.is_empty());
+        assert_eq!(primary.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+        assert!(!options.receipt.exists());
+        assert!(!options.rollback_receipt.as_ref().unwrap().exists());
+        assert_eq!(
+            fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+            authority
+        );
+    });
+}
+
+#[test]
+fn bound_partial_reindex_preserves_reranking_and_reports_partial_terminal_coverage() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = ReindexFixture::new(&cx, PARTIAL_REINDEX_TOPOLOGY, false).await;
+        let (primary, quality, loaded) = fixture.replacements();
+        let built = fixture.build(&cx, &loaded, false).await;
+        let mut options = fixture.options();
+        options.stream = true;
+        let (mut policy, reranker) = tuned_reindex_policy(&cx, &mut options, 0, [4_000_000; 2]);
+        // Partial mode supports the same bounded reranker, while complete-tier
+        // full-query tuning remains an explicit refusal.
+        options.full_query = None;
+        policy.full_query = None;
+        let mut output = Vec::new();
+        reindex::execute_with_policy(
+            &cx,
+            &options,
+            &fixture.root,
+            &fixture.selected,
+            &fixture.previous,
+            &built,
+            &loaded,
+            &policy,
+            &mut output,
+        )
+        .await
+        .unwrap();
+        let response = frames(&output);
+        assert_eq!(response.len(), 3);
+        assert_eq!(response[0]["phase"], "initial");
+        assert_eq!(response[1]["phase"], "refined");
+        assert_eq!(response[2]["phase"], "reranked");
+        assert_eq!(response[2]["results"][0]["doc_id"], "selected-garden");
+        assert_eq!(
+            response[2]["recovery_result"]["state"]["state"],
+            "partial_quality_coverage"
+        );
+        assert_eq!(reranker.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(primary.queries.load(Ordering::SeqCst), 2);
+        assert_eq!(quality.unwrap().queries.load(Ordering::SeqCst), 2);
+        assert!(!options.rollback_receipt.as_ref().unwrap().exists());
+    });
 }
 
 #[test]
