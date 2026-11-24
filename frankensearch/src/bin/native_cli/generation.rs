@@ -339,8 +339,11 @@ Unfiltered queries do not export source.\n\
 authority-export writes the complete selected source as ordinary index JSONL.\n\
 It validates the full inventory before writing stdout and loads no models.\n\
 --max-source-bytes bounds both raw source and encoded output, with the index\n\
-input limits also enforced. Empty selections emit zero records. Historical export\n\
-requires the current receipt and normal ancestry admission.\n\
+input limits also enforced. Empty selections emit zero records. Current complete\n\
+topologies can export with damaged vectors or graphs through authenticated source.\n\
+Partial selections require intact vectors to authenticate quality membership,\n\
+and can export despite a damaged graph. Historical export requires healthy\n\
+current and target selections and normal ancestry admission.\n\
 authority-fetch reads one selected document window without loading a model.\n\
 Its receipt selects the exact current authority unless --current-receipt selects\n\
 its authenticated predecessor explicitly. Offsets default to\n\
@@ -2349,13 +2352,25 @@ fn export(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     if receipt.documents > u64::try_from(MAX_DOCUMENTS)? {
         return Err(bad("retained source exceeds the 100000-document limit"));
     }
-    let (_root, snapshot) = open_read_selection(
-        cx,
-        &receipt,
-        options.current_receipt.as_deref(),
-        options.max_image_bytes,
-    )?;
-    let documents = snapshot.source_documents(cx, options.max_source_bytes)?;
+    let documents = if options.current_receipt.is_some() {
+        // Historical selection requires a complete authenticated ancestry.
+        let (_root, snapshot) = open_read_selection(
+            cx,
+            &receipt,
+            options.current_receipt.as_deref(),
+            options.max_image_bytes,
+        )?;
+        snapshot.source_documents(cx, options.max_source_bytes)?
+    } else {
+        let root = admit_root(&receipt.root)?;
+        repair::export_documents(
+            cx,
+            &root,
+            &receipt,
+            options.max_image_bytes,
+            options.max_source_bytes,
+        )?
+    };
     write_export(cx, &documents, options.max_source_bytes, output)
 }
 
