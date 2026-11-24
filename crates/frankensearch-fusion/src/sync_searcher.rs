@@ -54,6 +54,7 @@ enum AdmittedSyncQuery<'query> {
     Progressive {
         fast: &'query BoundQueryEmbedding,
         quality: Option<&'query BoundQueryEmbedding>,
+        hash_control: bool,
     },
     /// Direct quality retrieval, with no fast query or fast-vector access.
     QualityOnly {
@@ -881,7 +882,9 @@ impl SyncTwoTierSearcher {
             }
             return Ok(AdmittedSyncQuery::QualityOnly { quality });
         };
-        admit_tier_query(self.index.fast_index(), fast, "fast")?;
+        let fast_index = self.index.fast_index();
+        admit_tier_query(fast_index, fast, "fast")?;
+        let hash_control = admitted_tier_is_hash_control(fast_index, fast);
 
         let quality = if self.config.fast_only {
             // Disabled quality is outside this request's admission contract.
@@ -892,6 +895,14 @@ impl SyncTwoTierSearcher {
             match (query.quality(), self.index.quality_index()) {
                 (Some(bound), Some(quality_index)) => {
                     admit_tier_query(quality_index, bound, "quality")?;
+                    if !hash_control && admitted_tier_is_hash_control(quality_index, bound) {
+                        return Err(SearchError::InvalidConfig {
+                            field: "sync_search.quality_kind".to_owned(),
+                            value: "non_semantic".to_owned(),
+                            reason: "progressive refinement requires a semantic quality producer"
+                                .to_owned(),
+                        });
+                    }
                     Some(bound)
                 }
                 // A quality-bound query against an index with no quality tier is
@@ -901,7 +912,11 @@ impl SyncTwoTierSearcher {
                 _ => None,
             }
         };
-        Ok(AdmittedSyncQuery::Progressive { fast, quality })
+        Ok(AdmittedSyncQuery::Progressive {
+            fast,
+            quality,
+            hash_control,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -922,8 +937,12 @@ impl SyncTwoTierSearcher {
                 reason: "enabled MMR candidate pool must not exceed 1000".to_owned(),
             });
         }
-        let (fast_query, quality_query) = match admitted {
-            AdmittedSyncQuery::Progressive { fast, quality } => (fast, quality),
+        let (fast_query, quality_query, hash_control) = match admitted {
+            AdmittedSyncQuery::Progressive {
+                fast,
+                quality,
+                hash_control,
+            } => (fast, quality, hash_control),
             AdmittedSyncQuery::QualityOnly { quality } => {
                 return self.search_quality_only(quality, k, filter, want_phase);
             }
@@ -992,7 +1011,6 @@ impl SyncTwoTierSearcher {
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         metrics.phase1_vectors_searched = phase1_vectors_searched;
         metrics.zero_signal = zero_signal;
-        let hash_control = sync_fast_is_hash_control(&self.index);
         metrics.publish_vector_candidates(fast_hits.len(), hash_control);
         if hash_control && metrics.skip_reason.is_none() {
             // Same contract as the async searcher: hash vectors still run as
@@ -2600,14 +2618,19 @@ fn sync_fast_embedder_id(index: &InMemoryTwoTierIndex) -> &str {
     index.fast_embedder_id().unwrap_or("sync-fast-query")
 }
 
+/// Admission has already joined the query to this tier's space or complete
+/// producer fingerprint. Only unidentified legacy tiers need the name heuristic.
 #[must_use]
-fn sync_fast_is_hash_control(index: &InMemoryTwoTierIndex) -> bool {
-    index.fast_index().admitted_source_binding().map_or_else(
-        || frankensearch_core::is_hash_generation_id(sync_fast_embedder_id(index)),
-        |binding| {
-            binding.frozen_identity().identity.space.kind == EmbeddingSpaceKindV1::HashControl
-        },
-    )
+fn admitted_tier_is_hash_control(index: &InMemoryVectorIndex, query: &BoundQueryEmbedding) -> bool {
+    if index.space_fingerprint_hex().is_some()
+        || index
+            .embedder_revision()
+            .is_some_and(|revision| !revision.is_empty())
+    {
+        query.identity().space.kind == EmbeddingSpaceKindV1::HashControl
+    } else {
+        frankensearch_core::is_hash_generation_id(index.embedder_id().unwrap_or_default())
+    }
 }
 
 fn sync_fast_explanation_source(
@@ -4987,6 +5010,61 @@ mod tests {
                 metrics.hash_control_candidates
             );
             assert!(phase_metrics.hash_control_candidates > 0);
+        }
+    }
+
+    #[test]
+    fn persisted_producer_kind_controls_progressive_search_despite_display_names() {
+        for (fast_hash, quality_hash) in [(true, false), (false, false), (false, true)] {
+            let identity = |hash| {
+                if hash {
+                    EmbeddingIdentityBundleV1::explicit_test_model("looks-semantic", 2)
+                } else {
+                    semantic_identity("fnv1a-256", 2)
+                }
+            };
+            let fast = identity(fast_hash);
+            let quality = identity(quality_hash);
+            let dir = temp_dir("persisted-producer-kind");
+            let mut writer =
+                frankensearch_index::TwoTierIndex::create(dir.path(), TwoTierConfig::default())
+                    .unwrap();
+            writer.set_fast_embedder_id(fast.space.logical_model_id.as_str());
+            writer.set_quality_embedder_id(quality.space.logical_model_id.as_str());
+            writer.set_fast_identity(&fast).unwrap();
+            writer.set_quality_identity(&quality).unwrap();
+            writer
+                .add_record("a", &[1.0, 0.0], Some(&[1.0, 0.0]))
+                .unwrap();
+            drop(writer.finish().unwrap());
+            let index = Arc::new(InMemoryTwoTierIndex::from_dir(dir.path()).unwrap());
+            let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+            let query = TieredQueryEmbeddings::progressive(
+                BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+                BoundQueryEmbedding::new(vec![1.0, 0.0], quality).unwrap(),
+            );
+            if quality_hash {
+                for k in [0, 1] {
+                    assert_admission_refusal(&searcher, &query, k, "sync_search.quality_kind");
+                }
+            } else {
+                let (hits, metrics) = searcher.search_collect(&query, 1).unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id, "a");
+                if fast_hash {
+                    assert_eq!(hits[0].source, ScoreSource::HashControl);
+                    assert_eq!(hits[0].quality_score, None);
+                    assert_eq!(metrics.hash_control_candidates, 1);
+                    assert_eq!(metrics.semantic_candidates, 0);
+                    assert_eq!(metrics.phase2_vectors_searched, 0);
+                } else {
+                    assert_eq!(hits[0].source, ScoreSource::SemanticQuality);
+                    assert_eq!(hits[0].quality_score, Some(1.0));
+                    assert_eq!(metrics.hash_control_candidates, 0);
+                    assert_eq!(metrics.semantic_candidates, 1);
+                    assert_eq!(metrics.phase2_vectors_searched, 1);
+                }
+            }
         }
     }
 
