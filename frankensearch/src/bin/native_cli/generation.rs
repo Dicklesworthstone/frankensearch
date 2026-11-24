@@ -169,7 +169,8 @@ Removing all covered or all uncovered IDs refuses before model loading/staging.\
 Graph repair with --reuse-vectors preserves the exact subset. Partial rebuilds\n\
 require --retained-source and keep the source and covered IDs; --migrate-model\n\
 permits independent producer replacement. Source-only repair, fresh-input rebuild,\n\
-rebuild --query and ordinary warm model activation still refuse partial sources. Explicit quality\n\
+and rebuild --query still refuse partial sources. Granted warm model activation\n\
+preserves the exact partial source and covered IDs. Explicit quality\n\
 completion accepts fast-only or partial sources. Warm sessions accept mode=partial.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
@@ -278,7 +279,7 @@ quality cache. Model activation installs fresh caches only after admission;\n\
 failed activation preserves the previous caches. Enabled caching excludes\n\
 --lexical-only. Query/filter text and embeddings are never written to disk.\n\
 Requests use {\"id\":\"q1\",\"query\":\"text\",\"limit\":10} and may select\n\
-\"mode\":\"fast\"|\"quality\"|\"full\" and \"stream\":true. Full is the default for\n\
+\"mode\":\"fast\"|\"quality\"|\"full\"|\"partial\" and \"stream\":true. Full is the default for\n\
 a full generation. Streaming emits each requested semantic stage and an optional\n\
 final Reranked frame; empty or exclusion-only pools skip the scorer. It never follows a new\n\
 authority implicitly. With --allow-activation, an explicit request may select a\n\
@@ -294,6 +295,8 @@ migration using an exact receipt, expected_authority and explicit local model\n\
 paths. All selected producers, images and fixed scope are validated before the\n\
 swap; failure retains the old complete selection. Topology and prepared-input\n\
 contracts stay fixed. No model is downloaded and no new authority is published.\n\
+Partial model activation also requires the exact source checkpoint, full source,\n\
+Quill image and authenticated quality-covered IDs; it cannot expand coverage.\n\
 The same grant accepts op=activate_quality_completion for an already published\n\
 authority-complete-quality successor of a fast-only session. It retains the fast\n\
 model and loads only the explicitly selected quality model, using quality_backend\n\

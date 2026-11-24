@@ -7607,6 +7607,10 @@ mod progressive_authority {
         include!("authority_partial_rebuild_tests.rs");
     }
 
+    mod partial_model_activation_tests {
+        include!("authority_partial_model_activation_tests.rs");
+    }
+
     mod timeout_tests {
         include!("authority_timeout_tests.rs");
     }

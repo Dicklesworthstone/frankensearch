@@ -286,8 +286,9 @@ support subset-preserving `authority-update` and granted warm updates, plus grap
 repair with `authority-repair --reuse-vectors` when both vector owners still
 authenticate. `authority-rebuild --retained-source` can change retrieval policy
 or, with `--migrate-model`, either producer while preserving the source and exact
-quality subset. Fresh-input rebuild, source-only repair, and ordinary warm model
-activation still refuse partial sources.
+quality subset. A granted warm `activate_model` request can adopt that partial
+successor without restarting. Fresh-input rebuild and source-only repair still
+refuse partial sources.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
 A warm partial server can adopt that completed generation through the explicit
@@ -412,7 +413,8 @@ This request only adopts an already published successor. It does not build
 vectors, publish another generation or download models. Missing permission,
 changed producers, changed source or lexical images, stale authority, loading
 failure and cancellation leave the previous serving selection intact. Ordinary
-`activate_model` remains unavailable while the session is partial.
+`activate_model` preserves partial coverage and cannot perform this transition
+to full coverage.
 
 ### Rebuild an existing authority generation
 
@@ -1039,7 +1041,7 @@ owning lane, and cancellation is observed between reads and requests.
 
 Start a semantic authority server with `--allow-model-activation` to permit
 replacement of its local producer or both producers in a complete two-tier
-generation:
+or partial-quality generation:
 
 ```sh
 ./target/release/frankensearch-native authority-serve \
@@ -1059,14 +1061,14 @@ Lexical-only startup rejects the model-activation grant.
 | `id` | Optional request identifier |
 | `expected_authority` | Exact authority byte array from the session's last successful selection event |
 | `receipt` | Absolute path to the already published candidate's receipt |
-| `model_dir` | Explicit local model root for fast or ONNX quality; required for a full generation's fast tier |
+| `model_dir` | Explicit local model root for fast or ONNX quality; required for the fast tier of full and partial generations |
 | `quality_backend` | Optional explicit quality backend: `onnx`, `native-int8`, `native-f32`, or `native-multilingual` |
 | `quality_model_dir` | Exact verified native-quality model directory when choosing a native backend |
 
 Receipt and model paths must be absolute, UTF-8, NUL-free, and at most 4096 bytes.
 Model selection never inherits an unspecified process default and never downloads
 or acquires artifacts. Quality-only activation loads only its quality provider;
-a full generation loads and validates fast and quality independently.
+Full and partial generations load and validate fast and quality independently.
 
 The candidate must belong to the original qualified root, security profile and
 topology, and must advance the authority sequence. Each tier's prepared-input
@@ -1075,6 +1077,21 @@ membership are admitted before loading replacement models. Each new producer
 must then match its selected embedding space, producer and input identities.
 After loading, the server reopens that exact authority on its retained root to
 detect an intervening publication. It never follows a different head.
+
+For a partial session, build the successor using `authority-rebuild
+--retained-source --migrate-model`. Warm adoption requires the exact same source
+checkpoint, complete stored source, lexical image, and actual quality-covered
+IDs. The server compares authenticated vector membership before loading either
+model; equal counts cannot authorize a different subset. Source edits use the
+separate partial update operation, and expansion to full coverage uses
+`activate_quality_completion`. Each tier retains its own prepared-input contract,
+including when those contracts differ between fast and quality.
+
+Successful model activation replaces both query-embedding caches. A repeated
+query is embedded under the admitted replacement identities before becoming
+cacheable again. An activation refusal retains the previous models, caches,
+reader, and fixed scope. The next permitted update embeds documents with the
+installed producers and preserves that generation's partial coverage.
 
 Only after all checks pass does the request loop install the receipt, reader,
 fixed scope and complete model set together. The response reports

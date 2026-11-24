@@ -1,12 +1,13 @@
 //! Explicit local-model activation of an already published authority.
 //!
 //! A separate startup grant permits changing the serving producer. This path
-//! retains the original qualified root, admits the complete selected successor,
-//! and replaces the model, reader and fixed scope together. Explicit quality
-//! completion retains the fast model and admits a full successor of the same
-//! source cohort. An existing partial quality tier must retain its producer
-//! identity as coverage expands. Neither operation rebuilds, publishes, writes
-//! a receipt or downloads a model.
+//! retains the original qualified root, admits the selected successor, and
+//! replaces the model, reader and fixed scope together. Partial model changes
+//! retain the exact source cohort, checkpoint and authenticated quality subset.
+//! Explicit quality completion retains the fast model and admits a full
+//! successor of the same source cohort. An existing partial quality tier must
+//! retain its producer identity as coverage expands. Neither operation rebuilds,
+//! publishes, writes a receipt or downloads a model.
 
 use super::{
     Arc, AuthorityModels, AuthorityRefV1, AuthoritySession, Cx, Deserialize, Embedder,
@@ -137,9 +138,11 @@ impl AuthoritySession {
             return Err(serve_refused("model_activation_disabled"));
         }
         let completes_quality = request.completes_quality();
-        if !completes_quality {
-            self.receipt.require_complete_for_mutation()?;
-        }
+        let retains_partial_quality = !completes_quality
+            && matches!(
+                self.receipt.topology(),
+                NativeGenerationTopology::PartialQuality { .. }
+            );
         if !matches!(self.models, AuthorityModels::Semantic(_)) {
             return Err(serve_refused("model_activation_requires_hybrid"));
         }
@@ -234,6 +237,36 @@ impl AuthoritySession {
         let snapshot = Arc::new(
             snapshot.map_err(|error| bounded_error(error, "model_activation_admission_failed"))?,
         );
+        if retains_partial_quality {
+            // A model change may replace either producer, but it cannot select
+            // a different quality cohort. Equal counts do not prove membership:
+            // compare IDs authenticated by both retained quality vector owners.
+            let previous_ids = self
+                .snapshot
+                .partial_quality_document_ids(cx)
+                .map_err(|error| {
+                    bounded_error(error.into(), "model_activation_partial_coverage_mismatch")
+                })?;
+            let next_ids = snapshot.partial_quality_document_ids(cx).map_err(|error| {
+                bounded_error(error.into(), "model_activation_partial_coverage_mismatch")
+            })?;
+            if next_ids != previous_ids {
+                return Err(serve_refused("model_activation_partial_coverage_mismatch"));
+            }
+            // Partial model activation adopts a retained-source rebuild. Source
+            // edits use the ordinary partial update path; quality expansion uses
+            // explicit completion. Bind every source field and its exact cut
+            // before preparing a scope or constructing replacement providers.
+            let previous = self.snapshot.retained_snapshot().manifest();
+            let next = snapshot.retained_snapshot().manifest();
+            if next.source_checkpoint_sha256() != previous.source_checkpoint_sha256()
+                || next.document_set_sha256() != previous.document_set_sha256()
+                || next.components().lexical != previous.components().lexical
+                || snapshot.metadata().commit_range != self.snapshot.metadata().commit_range
+            {
+                return Err(serve_refused("model_activation_partial_source_mismatch"));
+            }
+        }
         if completes_quality {
             // A matching count or ID set cannot prove that bodies, titles or
             // metadata stayed unchanged. The exact retained Quill image covers
