@@ -41,6 +41,34 @@ with the patched lock. Raw evidence for this entry is retained under
 `/data/tmp/fs-next-20261124`; full stock and fresh executable qualification
 are still pending at this source checkpoint.
 
+The clean `8de81f7f` stock attempt passed every stage through Quill, then
+fsfs linking failed with EDQUOT on quota-enabled `/dev/shm`; one linker
+also bus-faulted. Only the owned gate tree was stopped (terminal 143).
+This is not an overall pass. The cache copy to a separate, write/execution-
+probed volume with 15 TB available completes with rsync exit 0, transferring
+64,572,120,354 bytes without deleting the original. The complete unchanged
+stock gate is still to be retried.
+
+The release review also re-executed the legacy watch alias failure. Retained
+historical ELF `83ff0d18` exits 2 after following the moved alias and exposes
+foreign query-cache/explain artifacts as search hits; its source is not
+attested. The source-bound optimized `2e2b8026` executable passes the same
+functional case, including a live update, unchanged independent destination
+and clean shutdown. The existing real-model handoff regression is now
+strengthened with alias movement between publication and watcher startup,
+two independently indexed destinations, byte inventory preservation and
+all previous vector/content assertions. The stronger test compiles and
+passes strict Clippy. Its same compiled harness runs one real-model test
+against each executable: the historical semantic watcher exits successfully
+but changes seventeen alternate-index artifacts, including both vector
+tiers, catalog and Quill; the unchanged byte-preservation assertion fails.
+The candidate passes every original and added assertion. The first result
+observer incorrectly required the earlier lexical startup-error signature;
+its rejection and the actual artifact differences remain in
+`watch-handoff-{old,old-review,candidate,candidate-result}.*`. No test assertion
+was relaxed. Fresh final-source stock and executable qualification remains
+pending; this focused compilation preceded the test's source checkpoint.
+
 The scoped UBS scan has zero critical findings. Comparing the same three
 files with the unchanged source leaves fifteen new findings, all assertions
 or unwraps inside tests; each was reviewed without adding suppressions.

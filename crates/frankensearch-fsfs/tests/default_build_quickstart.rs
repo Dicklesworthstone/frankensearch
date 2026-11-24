@@ -6445,6 +6445,55 @@ meta:
         assert_eq!(envelope["data"]["indexed_files"], 2);
         assert_eq!(envelope["data"]["quality_generation"]["dimension"], 384);
 
+        let other_corpus = temp.path().join("other-corpus");
+        let other_index = temp.path().join("other-index");
+        fs::create_dir_all(&other_corpus).unwrap();
+        fs::write(
+            other_corpus.join("independent.md"),
+            "Foreignaliasquartz belongs only to the independent index destination.",
+        )
+        .unwrap();
+        let other = fsfs.run_with_env(
+            temp.path(),
+            "watch-independent-index",
+            [
+                "index",
+                other_corpus.to_str().unwrap(),
+                "--index-dir",
+                other_index.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FSFS_COMPLETE_GENERATIONS", "0")],
+        );
+        assert_eq!(
+            parse_success_envelope("watch independent index", &other)["data"]["indexed_files"],
+            1
+        );
+        let inventory = |root: &Path| {
+            let mut directories = vec![root.to_path_buf()];
+            let mut files = std::collections::BTreeMap::new();
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        directories.push(path);
+                    } else {
+                        files.insert(
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            fs::read(&path).unwrap(),
+                        );
+                    }
+                }
+            }
+            files
+        };
+        let other_before = inventory(&other_index);
+        let alias = corpus.join("configured-index");
+        std::os::unix::fs::symlink(&index, &alias).unwrap();
+
         let stdout_path = fsfs.log_root.join("watch.stdout.log");
         let stderr_path = fsfs.log_root.join("watch.stderr.log");
         let mut watch = WatchChild(
@@ -6454,7 +6503,7 @@ meta:
                     corpus_arg,
                     "--watch",
                     "--index-dir",
-                    index_arg,
+                    alias.to_str().unwrap(),
                     "--format",
                     "jsonl",
                 ])
@@ -6482,6 +6531,11 @@ meta:
             !before.contains("live ingest pipeline initialized for watch mode"),
             "the test missed the startup handoff window; no handoff claim is valid"
         );
+        // The one-shot pass has already admitted the original destination.
+        // Watch startup, live ingestion and shutdown must keep that authority
+        // even when a later explicit command would follow the moved alias.
+        fs::rename(&alias, temp.path().join("original-index-alias")).unwrap();
+        std::os::unix::fs::symlink(&other_index, &alias).unwrap();
         fs::write(
             corpus.join("handoff.md"),
             "Handoffquartz database recovery uses transaction rollback to preserve atomicity.",
@@ -6551,6 +6605,15 @@ meta:
         eprintln!("[default-build-e2e] stage=watch-shutdown status={status} stderr:\n{stderr}");
         assert!(status.success(), "graceful watcher shutdown failed");
         drop(watch);
+        assert_eq!(
+            inventory(&other_index),
+            other_before,
+            "the watcher or shutdown changed the new alias destination"
+        );
+        assert_eq!(
+            alias.canonicalize().unwrap(),
+            other_index.canonicalize().unwrap()
+        );
 
         // Fresh handles must contain exactly one live row per file in BOTH
         // vector spaces. Query execution below verifies the lexical arm too.
@@ -6635,8 +6698,28 @@ meta:
                 "superseded lexical text remains: {result}"
             );
         }
+        let redirected = fsfs.run(
+            temp.path(),
+            "watch-retargeted-alias-search",
+            [
+                "search",
+                "Foreignaliasquartz",
+                "--fast-only",
+                "--no-daemon",
+                "--index-dir",
+                alias.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        let redirected = parse_success_envelope("watch retargeted alias search", &redirected);
+        let hits = redirected["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{redirected}");
+        assert_eq!(hits[0]["path"], "independent.md");
+        assert!(hits[0]["lexical_rank"].is_number());
         eprintln!(
-            "[default-build-e2e] stage=watch-handoff event=verified startup_create=true startup_modify=true live_create=true live_modify=true lexical=true fast=true quality=true post_exit=true"
+            "[default-build-e2e] stage=watch-handoff event=verified startup_create=true startup_modify=true live_create=true live_modify=true lexical=true fast=true quality=true post_exit=true alias_retargeted=true other_destination_unchanged=true"
         );
         Ok(())
     }

@@ -31,12 +31,44 @@ no capability credit. Existing qualified work below remains unchanged.
     five informational warnings remain. Only cookie changes in this step.
     The HTTP/proxy gate passes. No production exploit is demonstrated.
   - [ ] Execute the complete stock gate and actual signal/pressure controls.
+    - [x] Preserve the clean `8de81f7f` stock attempt: all stages through
+      Quill passed, then fsfs linking hit EDQUOT on quota-enabled `/dev/shm`.
+      Stop only the owned gate tree; retain terminal 143 and linker receipts.
+    - [x] Copy the cache without deletion to the separately probed volume
+      with 15 TB available: rsync terminal 0, 64,572,120,354 bytes transferred.
+    - [ ] Rerun the entire unchanged stock gate on the copied cache.
+    - [ ] Recheck actual foreground signals, both 128 MiB pressure profiles,
+      and cancellation while paused under an explicit 1-per-mille load ceiling.
+      This configured pressure probe cannot establish default-pressure behavior.
+    - [ ] Recheck strict Clippy and the affected pressure/doctor tests on
+      the separate `semantic-native` profile; retain its exact feature set.
+  - [ ] Preserve the legacy symlink watch repair as a permanent regression.
+    - [x] Reproduce historical ELF `83ff0d18`: watcher exit 2 and foreign
+      cache/explain artifacts become searchable. Its source is not attested.
+    - [x] Fresh known-source `2e2b8026` optimized executable passes: live
+      document stays in the admitted original index, moved-to index remains
+      byte-identical, explicit new alias search follows its new destination.
+    - [x] Strengthen the existing real-model handoff test with two real
+      destinations, alias movement before watcher initialization, unchanged
+      byte inventory, and all original vector/content/shutdown assertions.
+    - [x] Compile/lint the stronger test and execute its old-executable
+      negative control plus current-source positive; retain every attempt.
+      One test executes in each run. Historical semantic watcher exits 0
+      but changes seventeen alternate-index artifacts; the unchanged byte
+      assertion fails. Candidate passes all assertions. The first observer
+      wrongly required the earlier lexical startup-error signature; retain
+      its rejection and the reviewed actual artifact differences.
+    - [ ] Qualify current-source lexical watch with sibling and nested storage;
+      preserve the broader upgrade-reuse Bead and its original acceptance.
   - [x] Record the exact dependency change, primary sources and terminal
     results in the existing UPGRADE_LOG; preserve failed attempts.
 - [ ] Complete remaining dependency review without relaxing audited identity,
   forbidden-runtime, profile, wire, installer or consumer contracts.
 - [ ] Recheck platform admission before any release. Keep the original
   six-variant acceptance; preserve the current release until all gates pass.
+  - [x] Live source/registry audit finds thirteen public packages, all already
+    published from `d1b9da15`; only `PUBLISHED_VERSION_SOURCE_MISMATCH` blocks
+    the current unbumped candidate. Do not republish those versions.
 - [ ] Publish qualified increments and scoped Beads/TODO evidence, verify
   both remote refs and dependency cycles, and fill the bounded honesty review.
 
