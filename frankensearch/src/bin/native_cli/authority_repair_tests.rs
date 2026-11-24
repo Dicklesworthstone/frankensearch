@@ -471,6 +471,86 @@ mod lifecycle {
     }
 
     #[test]
+    fn source_export_recovers_reindexable_jsonl_from_damaged_vector_generations() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for topology in [
+                NativeGenerationTopology::FastOnly,
+                NativeGenerationTopology::QualityOnly,
+                NativeGenerationTopology::FullProgressive,
+            ] {
+                let fixture = fixture(&cx, topology, true, false).await;
+                let expected = fixture
+                    .snapshot
+                    .source_documents(&cx, MAX_INPUT_BYTES)
+                    .unwrap();
+                damage(&cx, &fixture, GenerationComponentRole::Vector, true);
+                assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let receipt = fixture.parent.join("selected.json");
+                let mut options = Options::parse([
+                    "authority-export".to_owned(),
+                    "--receipt".to_owned(),
+                    receipt.to_str().unwrap().to_owned(),
+                ])
+                .unwrap()
+                .unwrap();
+                let mut output = Vec::new();
+                crate::generation::export(&cx, &options, &mut output).unwrap();
+                let recovered = crate::read_documents(&mut std::io::Cursor::new(&output)).unwrap();
+                assert_eq!(
+                    serde_json::to_value(recovered).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                options.max_source_bytes = 1;
+                output.clear();
+                assert!(crate::generation::export(&cx, &options, &mut output).is_err());
+                assert!(output.is_empty());
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    authority
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn partial_source_export_survives_graph_damage_and_refuses_missing_membership_proof() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture(&cx, partial_topology(), true, false).await;
+            let expected = fixture
+                .snapshot
+                .source_documents(&cx, MAX_INPUT_BYTES)
+                .unwrap();
+            let receipt = fixture.parent.join("selected.json");
+            let options = Options::parse([
+                "authority-export".to_owned(),
+                "--receipt".to_owned(),
+                receipt.to_str().unwrap().to_owned(),
+            ])
+            .unwrap()
+            .unwrap();
+            damage(&cx, &fixture, GenerationComponentRole::Ann, false);
+            assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+            let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+            let mut output = Vec::new();
+            crate::generation::export(&cx, &options, &mut output).unwrap();
+            let recovered = crate::read_documents(&mut std::io::Cursor::new(&output)).unwrap();
+            assert_eq!(
+                serde_json::to_value(recovered).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            damage(&cx, &fixture, GenerationComponentRole::Vector, true);
+            output.clear();
+            assert!(crate::generation::export(&cx, &options, &mut output).is_err());
+            assert!(output.is_empty());
+            assert_eq!(
+                fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                authority
+            );
+        });
+    }
+
+    #[test]
     fn repair_rebuilds_damaged_or_missing_derived_images_for_every_topology_and_empty_source() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             use NativeGenerationTopology::{FastOnly, FullProgressive, QualityOnly};
