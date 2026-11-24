@@ -289,8 +289,10 @@ or, with `--migrate-model`, either producer while preserving the source and exac
 quality subset. A granted warm `activate_model` request can adopt that partial
 successor without restarting. Adding `--query --mode partial` and a new
 `--rollback-receipt` to a retained-source model migration validates and retries
-that exact partial query, as described below. Fresh-input rebuild and source-only
-repair still refuse partial sources.
+that exact partial query, as described below. Fresh-input rebuild still refuses
+partial sources. If vector damage prevents preserving the original quality
+subset, `authority-repair --complete-quality` explicitly re-embeds both tiers
+from authenticated source and publishes full quality coverage.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
 Its `--quality-ids` option instead publishes a larger partial subset for bounded
@@ -715,10 +717,11 @@ report cannot recreate that process-local execution capability.
 `authority-repair` reconstructs the generation selected by a trusted receipt even
 when its vector or ANN images are missing or corrupt. Its control state, metadata
 and complete stored Quill source must still authenticate. No healthy ancestor or
-original JSONL file is required. The repair re-embeds every stored tier with the
-same local producers, preserves their identities and persisted F16/F32 precision,
-and publishes a complete higher-sequence `Repair` successor with the same source
-checkpoint and document fields.
+original JSONL file is required. By default the repair re-embeds every stored tier
+with the same local producers, preserving their identities and persisted F16/F32
+precision. It publishes a complete higher-sequence `Repair` successor with the
+same source checkpoint and document fields. Explicit options below authorize
+full quality completion or a replacement producer when those are needed.
 
 Choose retrieval explicitly. To restore native ANN retrieval after vector loss:
 
@@ -748,21 +751,69 @@ the same covered IDs, quality count, source cohort and per-tier vector values.
 It remains a partial generation with explicit partial query mode; graph repair
 does not fill missing quality coverage.
 
-Source-only re-embedding still refuses partial quality generations. Their source
-metadata authenticates a coverage commitment but cannot reconstruct the exact
-quality subset when its vector owner is unavailable. Healthy retained vectors
-are therefore required for partial repair.
+When a partial generation's vectors are missing or corrupt, add
+`--complete-quality` to repair from source. The source metadata authenticates a
+coverage commitment but cannot reconstruct the original quality subset without
+its vector owner. This explicit option instead authorizes a full successor:
+every retained document is embedded by both matching local producers, including
+documents that previously had no quality row. The source fields, checkpoint and
+per-tier precision remain unchanged. The resulting receipt admits full and
+direct quality search.
 
-Both routes retain the original physical authority pair through preparation and
-publication. A competing publisher causes refusal rather than replacing its
-selection. Damaged source or control state, changed producers, cancellation and
-immutable object collisions also refuse; old images remain intact. Repair does
-not accept replacement input, source advancement, model migration or topology
-changes. Source re-embedding obeys the retained-source and encoded-image budgets.
+```sh
+./target/release/frankensearch-native authority-repair \
+  --from-receipt "$HOME/frankensearch-authority/partial.json" \
+  --work-dir "$HOME/frankensearch-authority/complete-repair-work" \
+  --receipt "$HOME/frankensearch-authority/full-repaired.json" \
+  --complete-quality --retrieval exact \
+  --model-dir /absolute/path/to/installed/models
+```
+
+`--complete-quality` is accepted only for a partial-quality receipt. It refuses a
+fast-only, quality-only or already complete source before model loading. Without
+the flag, source-only repair of partial quality still refuses. Preserving the
+original partial subset continues to require healthy retained vectors and
+`--reuse-vectors`. Completion re-embeds the full source; it does not perform the
+bounded vector reuse of `authority-complete-quality --quality-ids`.
+
+If the original producer is unavailable or an intentional replacement is needed,
+source repair accepts `--migrate-model` with explicitly chosen local model
+options. The primary and quality producers may change independently. Both
+replacement identities must retain their respective prepared-input contracts;
+repair cannot reinterpret the stored document bodies using a different outer
+canonicalization or content-selection policy. Persisted F16/F32 precision remains
+the same, and every vector is newly inferred under its actual producing identity.
+A replaced producer's original model and the old vector images are not required
+for this route.
+
+```sh
+./target/release/frankensearch-native authority-repair \
+  --from-receipt "$HOME/frankensearch-authority/g1.json" \
+  --work-dir "$HOME/frankensearch-authority/migration-repair-work" \
+  --receipt "$HOME/frankensearch-authority/migrated-repair.json" \
+  --migrate-model --retrieval hnsw --hnsw-seed 29 \
+  --model-dir /absolute/path/to/replacement/models
+```
+
+Add the matching quality backend/directory options for an explicitly selected
+native quality model. Combine `--migrate-model --complete-quality` when a damaged
+partial generation needs both replacement producers and full coverage. Both
+flags conflict with `--reuse-vectors`; unchanged producers remain mandatory
+without `--migrate-model`.
+
+Every repair retains the original physical authority pair through preparation
+and publication. A competing publisher causes refusal rather than replacing its
+selection. Damaged source or control state, changed prepared-input contracts,
+provider drift, cancellation and immutable object collisions also refuse; old
+images remain intact. Repair accepts no replacement input or source advancement.
+The only topology change it authorizes is explicit partial-to-full completion.
+Source re-embedding obeys the retained-source and encoded-image budgets.
 Successful output reports `event: "repaired"`, `publication: "committed"`, the
-selected retrieval policy, and whether vectors were reused. The saved receipt
-supports the existing `authority-recover` reconciliation after interrupted
-publication or lost output.
+selected retrieval policy, `vectors_reused`, `quality_completed`, and
+`model_migrated`. The last field reports whether the actual persisted producer
+identities changed, even when migration was authorized. Repair does not preview
+or replay a query. Its saved receipt supports the existing `authority-recover`
+reconciliation after interrupted publication or lost output.
 
 ### Authority source updates
 

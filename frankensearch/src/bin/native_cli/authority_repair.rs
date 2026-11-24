@@ -8,11 +8,12 @@
 //! graphs; reusing the selected ANN object address is refused before publication.
 
 use frankensearch::native_ann::{
-    NativeGenerationSource, NativeGenerationTopology, NativeGenerationVectorSource,
+    NativeGenerationQualityCompletionSource, NativeGenerationSource, NativeGenerationTopology,
+    NativeGenerationVectorSource,
 };
-use frankensearch_core::generation::GenerationComponentRole;
+use frankensearch_core::generation::{GenerationComponentRole, GenerationManifest};
 use frankensearch_index::generation_root::generation_reader::{
-    SourceOpenOutcomeV1, VectorSourceOpenOutcomeV1,
+    OpenedGenerationSourceV1, SourceOpenOutcomeV1, VectorSourceOpenOutcomeV1,
 };
 use frankensearch_index::vector_cohort::VectorCohortCoverage;
 use sha2::{Digest as _, Sha256};
@@ -35,15 +36,90 @@ pub(super) struct RetainedVectorOptions {
     pub(super) quality_seed: Option<u64>,
 }
 
+enum SourceRepair {
+    Preserve(NativeGenerationSource),
+    CompleteQuality(NativeGenerationQualityCompletionSource),
+}
+
+impl SourceRepair {
+    fn facts(&self) -> Result<RepairSourceFacts<'_>> {
+        match self {
+            Self::Preserve(source) => RepairSourceFacts::preserving(source, false),
+            Self::CompleteQuality(source) => Ok(RepairSourceFacts {
+                retained: source.retained_source(),
+                metadata: source.metadata(),
+                primary: source.binding(),
+                quality: Some(source.quality_binding()),
+                tier: EmbedderTierTag::Fast,
+                // This is the explicitly authorized successor coverage, never
+                // a claim that the damaged predecessor's subset was admitted.
+                coverage: VectorCohortCoverage::Complete,
+            }),
+        }
+    }
+
+    fn source_documents(
+        &self,
+        cx: &Cx,
+        max_source_bytes: usize,
+    ) -> Result<Vec<frankensearch::IndexableDocument>> {
+        Ok(match self {
+            Self::Preserve(source) => source.source_documents(cx, max_source_bytes)?,
+            Self::CompleteQuality(source) => source.source_documents(cx, max_source_bytes)?,
+        })
+    }
+}
+
+struct RepairSourceFacts<'a> {
+    retained: &'a Arc<OpenedGenerationSourceV1>,
+    metadata: &'a GenerationManifest,
+    primary: &'a FsviV2IdentityBinding,
+    quality: Option<&'a FsviV2IdentityBinding>,
+    tier: EmbedderTierTag,
+    coverage: VectorCohortCoverage,
+}
+
+impl<'a> RepairSourceFacts<'a> {
+    fn preserving(source: &'a NativeGenerationSource, reuse_vectors: bool) -> Result<Self> {
+        let coverage = match source.topology() {
+            NativeGenerationTopology::PartialQuality { .. } if reuse_vectors => {
+                VectorCohortCoverage::PartialQuality
+            }
+            NativeGenerationTopology::PartialQuality { .. } => {
+                return Err(bad(
+                    "partial quality repair requires authenticated retained vectors or explicit completion",
+                ));
+            }
+            _ => VectorCohortCoverage::Complete,
+        };
+        Ok(Self {
+            retained: source.retained_source(),
+            metadata: source.metadata(),
+            primary: source.binding(),
+            quality: source.quality_binding(),
+            tier: source.tier(),
+            coverage,
+        })
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct RepairIdentities {
+    primary: FrozenEmbeddingIdentityBundleV1,
+    quality: Option<FrozenEmbeddingIdentityBundleV1>,
+}
+
 pub(super) fn validate_options(options: &Options) -> Result<()> {
     let vectors = &options.repair_vectors;
     if vectors.reuse_vectors
         && (options.models.is_some()
             || options.quality.backend.is_some()
-            || options.quality.directory.is_some())
+            || options.quality.directory.is_some()
+            || options.complete_quality
+            || options.migrate_model)
     {
         return Err(bad(
-            "--reuse-vectors cannot be combined with model directory or backend options",
+            "--reuse-vectors cannot be combined with model options, --complete-quality, or --migrate-model",
         ));
     }
     match options.retrieval {
@@ -117,7 +193,12 @@ where
             .as_deref()
             .ok_or_else(|| bad("missing repair source receipt"))?,
     )?;
-    if !options.repair_vectors.reuse_vectors {
+    if options.complete_quality && selected.quality_documents.is_none() {
+        return Err(bad(
+            "--complete-quality requires a partial-quality repair source",
+        ));
+    }
+    if !options.repair_vectors.reuse_vectors && !options.complete_quality {
         // Source metadata alone does not authenticate the selected quality IDs.
         // Only healthy retained vectors can preserve a partial quality subset.
         selected.require_complete_for_mutation()?;
@@ -140,7 +221,7 @@ where
         .sequence
         .checked_add(1)
         .ok_or_else(|| bad("the artifact generation sequence is exhausted"))?;
-    let (built, prepared) = if options.repair_vectors.reuse_vectors {
+    let (built, prepared, model_migrated) = if options.repair_vectors.reuse_vectors {
         // This branch never invokes the loader or exports the retained corpus.
         // Actual source/vector bytes, not the selected graph, authorize repair.
         let source = open_vector_source(cx, &root, &selected, options.max_image_bytes)?;
@@ -163,20 +244,34 @@ where
             quality,
             true,
         )?;
-        (built, prepared)
+        (built, prepared, false)
     } else {
         // No complete snapshot open: a selected vector or graph may be damaged.
         // The source capability is not queryable and never follows a newer head.
-        let source = open_source(cx, &root, &selected, options.max_image_bytes)?;
-        source.authority().next_sequence()?;
+        let source = if options.complete_quality {
+            SourceRepair::CompleteQuality(open_quality_completion_source(
+                cx,
+                &root,
+                &selected,
+                options.max_image_bytes,
+            )?)
+        } else {
+            SourceRepair::Preserve(open_source(cx, &root, &selected, options.max_image_bytes)?)
+        };
+        let facts = source.facts()?;
+        facts.retained.head().authority.next_sequence()?;
         let documents = source.source_documents(cx, options.max_source_bytes)?;
         validate_retained_documents(cx, &documents)?;
-        let loaded = load_models(selected.query_mode(None)?);
+        let loaded = load_models(if options.complete_quality {
+            QueryMode::Full
+        } else {
+            selected.query_mode(None)?
+        });
         checkpoint(cx)?;
         let loaded = loaded?;
-        let identities = admit_models(&source, &loaded);
+        let identities = admit_models(&facts, &loaded, options.migrate_model);
         checkpoint(cx)?;
-        identities?;
+        let identities = identities?;
 
         // Move the complete authenticated documents directly into the builder.
         // Providers receive only content strings, never editable source records;
@@ -198,7 +293,7 @@ where
                     quality.ok_or_else(|| bad("missing quality repair retrieval policy"))?,
                 )?;
         }
-        let source_cut = source.metadata().commit_range.clone();
+        let source_cut = facts.metadata.commit_range.clone();
         let built = if selected.quality_identity.is_some() {
             Box::pin(builder.build_progressive_generation(cx, source_cut, options.max_image_bytes))
                 .await
@@ -213,18 +308,23 @@ where
         };
         checkpoint(cx)?;
         let built = built?;
-        let identities = admit_models(&source, &loaded);
+        let after = admit_models(&facts, &loaded, options.migrate_model);
         checkpoint(cx)?;
-        identities?;
-        let prepared = prepare_repair(
-            &source,
+        if after? != identities {
+            return Err(bad("the repair providers changed after identity admission"));
+        }
+        let prepared = prepare_repair_with_identities(
+            &facts,
             &built,
             options.max_image_bytes,
-            primary,
-            quality,
+            (primary, quality),
             false,
+            &identities,
         )?;
-        (built, prepared)
+        let model_migrated = identities.primary != *facts.primary.frozen_identity()
+            || identities.quality.as_ref()
+                != facts.quality.map(FsviV2IdentityBinding::frozen_identity);
+        (built, prepared, model_migrated)
     };
     let published = stage_prepared_and_publish(
         cx,
@@ -242,7 +342,8 @@ where
         "receipt": receipt_path,
         "source": if options.repair_vectors.reuse_vectors { "authenticated_retained_vectors" } else { "authenticated_retained_source" },
         "vectors_reused": options.repair_vectors.reuse_vectors,
-        "replaces": selected.authority, "model_migrated": false,
+        "replaces": selected.authority, "model_migrated": model_migrated,
+        "quality_completed": options.complete_quality,
         "selection": receipt,
     });
     annotate_retrieval(
@@ -347,12 +448,12 @@ pub(super) fn export_documents(
     }
 }
 
-fn open_source(
+fn open_source_capability(
     cx: &Cx,
     root: &QualifiedGenerationRoot,
     selected: &Receipt,
     max_image_bytes: usize,
-) -> Result<NativeGenerationSource> {
+) -> Result<(Arc<OpenedGenerationSourceV1>, usize)> {
     selected.validate()?;
     checkpoint(cx)?;
     let budget = u64::try_from(max_image_bytes)?.min(selected.image_bytes);
@@ -378,13 +479,23 @@ fn open_source(
             "the repair source differs from the selected root or profile",
         ));
     }
+    Ok((opened, usize::try_from(budget)?))
+}
+
+fn open_source(
+    cx: &Cx,
+    root: &QualifiedGenerationRoot,
+    selected: &Receipt,
+    max_image_bytes: usize,
+) -> Result<NativeGenerationSource> {
+    let (opened, budget) = open_source_capability(cx, root, selected, max_image_bytes)?;
     let source = NativeGenerationSource::admit(
         cx,
         opened,
         &selected.binding()?,
         selected.quality_binding()?.as_ref(),
         selected.tier,
-        usize::try_from(budget)?,
+        budget,
     );
     checkpoint(cx)?;
     let source = source?;
@@ -398,28 +509,79 @@ fn open_source(
     Ok(source)
 }
 
-fn admit_model(expected: &FrozenEmbeddingIdentityBundleV1, model: &dyn Embedder) -> Result<()> {
+fn open_quality_completion_source(
+    cx: &Cx,
+    root: &QualifiedGenerationRoot,
+    selected: &Receipt,
+    max_image_bytes: usize,
+) -> Result<NativeGenerationQualityCompletionSource> {
+    if selected.quality_documents.is_none() || selected.tier != EmbedderTierTag::Fast {
+        return Err(bad(
+            "quality-completing repair requires a partial-quality selection",
+        ));
+    }
+    let (opened, budget) = open_source_capability(cx, root, selected, max_image_bytes)?;
+    let quality = selected
+        .quality_binding()?
+        .ok_or_else(|| bad("partial-quality repair requires its independent quality identity"))?;
+    let source = NativeGenerationQualityCompletionSource::admit(
+        cx,
+        opened,
+        &selected.binding()?,
+        &quality,
+        budget,
+    );
+    checkpoint(cx)?;
+    let source = source?;
+    if source.metadata().total_documents != selected.documents {
+        return Err(bad(
+            "the repair source differs from the selected document count",
+        ));
+    }
+    Ok(source)
+}
+
+fn admit_model(
+    expected: &FrozenEmbeddingIdentityBundleV1,
+    model: &dyn Embedder,
+    migrate_model: bool,
+) -> Result<FrozenEmbeddingIdentityBundleV1> {
     // Normalize only the persisted encoding, exactly as the source builder
-    // does. Retained F16 remains F16; producer/input/space equality is strict.
+    // does. Retained F16 remains F16 and prepared input is never reinterpreted.
     let identity = rebuild_identity(expected, model, true, true)?;
-    if &identity != expected {
+    if !migrate_model && &identity != expected {
         return Err(bad(
             "authority-repair requires the selected complete producer identity",
         ));
     }
     rebuild_precision(expected)?;
-    Ok(())
+    Ok(identity)
 }
 
-fn admit_models(source: &NativeGenerationSource, models: &Models) -> Result<()> {
-    admit_model(source.binding().frozen_identity(), models.fast.as_ref())?;
-    match (source.quality_binding(), &models.quality) {
-        (Some(binding), Some(model)) => admit_model(binding.frozen_identity(), model.as_ref()),
-        (None, None) => Ok(()),
-        _ => Err(bad(
-            "the repair providers do not match the selected topology",
-        )),
-    }
+fn admit_models(
+    source: &RepairSourceFacts<'_>,
+    models: &Models,
+    migrate_model: bool,
+) -> Result<RepairIdentities> {
+    let primary = admit_model(
+        source.primary.frozen_identity(),
+        models.fast.as_ref(),
+        migrate_model,
+    )?;
+    let quality = match (source.quality, &models.quality) {
+        (Some(binding), Some(model)) => Some(admit_model(
+            binding.frozen_identity(),
+            model.as_ref(),
+            migrate_model,
+        )?),
+        (None, None) => None,
+        _ => {
+            return Err(bad(
+                "the repair providers do not match the selected topology",
+            ));
+        }
+    };
+    Ok(RepairIdentities { primary, quality })
 }
 
 // Only this explicit repair route can turn a nonqueryable source capability
@@ -433,35 +595,48 @@ fn prepare_repair(
     quality_policy: Option<NativeBuildRetrieval>,
     reuse_vectors: bool,
 ) -> Result<PreparedPublication> {
-    let retained = source.retained_source();
-    let coverage = match source.topology() {
-        NativeGenerationTopology::PartialQuality { .. } if reuse_vectors => {
-            VectorCohortCoverage::PartialQuality
-        }
-        NativeGenerationTopology::PartialQuality { .. } => {
-            return Err(bad(
-                "partial quality repair requires authenticated retained vectors",
-            ));
-        }
-        _ => VectorCohortCoverage::Complete,
+    let facts = RepairSourceFacts::preserving(source, reuse_vectors)?;
+    let identities = RepairIdentities {
+        primary: source.binding().frozen_identity().clone(),
+        quality: source
+            .quality_binding()
+            .map(|binding| binding.frozen_identity().clone()),
     };
-    if built.binding().generation().sequence <= source.binding().generation().sequence
-        || built.binding().frozen_identity() != source.binding().frozen_identity()
+    prepare_repair_with_identities(
+        &facts,
+        built,
+        max_image_bytes,
+        (primary_policy, quality_policy),
+        reuse_vectors,
+        &identities,
+    )
+}
+
+fn prepare_repair_with_identities(
+    source: &RepairSourceFacts<'_>,
+    built: &NativeBuiltExactGeneration,
+    max_image_bytes: usize,
+    policies: (NativeBuildRetrieval, Option<NativeBuildRetrieval>),
+    reuse_vectors: bool,
+    identities: &RepairIdentities,
+) -> Result<PreparedPublication> {
+    let retained = source.retained;
+    let (primary_policy, quality_policy) = policies;
+    if built.binding().generation().sequence <= source.primary.generation().sequence
+        || built.binding().frozen_identity() != &identities.primary
         || built
             .quality_binding()
             .map(FsviV2IdentityBinding::frozen_identity)
-            != source
-                .quality_binding()
-                .map(FsviV2IdentityBinding::frozen_identity)
-        || built.metadata().vector_artifacts[0].embedder_tier != source.tier()
-        || built.metadata().commit_range != source.metadata().commit_range
-        || built.metadata().total_documents != source.metadata().total_documents
-        || built.coverage() != coverage
+            != identities.quality.as_ref()
+        || built.metadata().vector_artifacts[0].embedder_tier != source.tier
+        || built.metadata().commit_range != source.metadata.commit_range
+        || built.metadata().total_documents != source.metadata.total_documents
+        || built.coverage() != source.coverage
         || built.retrieval_configuration() != primary_policy
         || built.quality_retrieval_configuration() != quality_policy
     {
         return Err(bad(
-            "repair must preserve source, topology and complete producer identities in a newer generation with the requested retrieval policies",
+            "repair must preserve source and authorized coverage and producer identities in a newer generation with the requested retrieval policies",
         ));
     }
     let writer = WriterIdentityV1::for_current_process()?;
@@ -473,7 +648,7 @@ fn prepare_repair(
     fence.update(object_id);
     let candidate = built.candidate(
         object_id,
-        Some(source.authority()),
+        Some(retained.head().authority),
         GenerationAuthorityActionV1::Repair,
         fence.finalize().into(),
     )?;

@@ -107,6 +107,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-repair --from-receipt DAMAGED_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       --retrieval exact|hnsw [--reuse-vectors]\n\
+      [--complete-quality] [--migrate-model]\n\
       [--hnsw-seed N] [--quality-hnsw-seed N]\n\
       [--model-dir DIR] [--quality-backend BACKEND]\n\
       [--quality-model-dir DIR] [--batch-size N] [--max-source-bytes N]\n\
@@ -174,7 +175,8 @@ Graph repair with --reuse-vectors preserves the exact subset. Partial rebuilds\n
 require --retained-source and keep the source and covered IDs; --migrate-model\n\
 permits independent producer replacement. Rebuild --query also requires explicit\n\
 --mode partial and preserves the exact covered subset through preview and replay.\n\
-Source-only repair and fresh-input rebuild still refuse partial sources.\n\
+Source-only partial repair requires --complete-quality and rebuilds both complete\n\
+tiers. Fresh-input rebuild still refuses partial sources.\n\
 Granted warm model activation\n\
 preserves the exact partial source and covered IDs. Explicit quality\n\
 completion accepts fast-only or partial sources. --quality-ids checkpoints a\n\
@@ -215,20 +217,24 @@ Use rebuild for producer or retrieval changes. Update never changes old images.\
 Repair explicitly admits the selected control state, metadata and complete stored\n\
 source even when vector or ANN images are damaged or missing. It needs no healthy\n\
 ancestor and never serves damaged images. Source-only repair rebuilds every stored tier\n\
-with the same full producer identities, precision, source checkpoint and document\n\
-fields, then publishes a complete higher-sequence Repair successor. Both repair\n\
+with the selected producer identities, precision, source checkpoint and document\n\
+fields, then publishes a complete higher-sequence Repair successor. Explicit\n\
+--migrate-model permits locally selected replacement producers while preserving each\n\
+tier's prepared-input contract and persisted precision. Both repair\n\
 routes require explicit --retrieval exact or hnsw; old images remain untouched.\n\
 With --reuse-vectors, repair instead requires intact authenticated vectors and\n\
 never loads models. It preserves exact vector values and Quill bytes without\n\
-exporting the corpus or running inference. Partial generations require this route:\n\
-both vector owners must authenticate and the exact quality subset is retained.\n\
+exporting the corpus or running inference. This route preserves a partial subset\n\
+only when both vector owners authenticate. With --complete-quality, source-only\n\
+repair instead rebuilds full coverage from a partial source even when its vectors\n\
+are damaged. It authenticates the source without claiming the old subset survived.\n\
 HNSW requires\n\
 --hnsw-seed: choose a fresh seed so the rebuilt graph has a new immutable object\n\
 address. --quality-hnsw-seed selects an independent full-tier seed; otherwise it\n\
 uses --hnsw-seed. A repeated old whole-graph receipt is refused before staging.\n\
 Seed flags require HNSW, and --reuse-vectors excludes model directory/backend\n\
-options. Both repair routes accept no replacement input, source advancement,\n\
-model migration or topology change.\n\
+options, --complete-quality and --migrate-model. Repair accepts no replacement\n\
+input or source advancement. Topology changes require explicit partial completion.\n\
 Damaged source, control state, unsafe root entries or a competing head refuse.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
 contract. Unsupported filesystems fail before indexing. Cooperative-local is\n\
@@ -452,6 +458,7 @@ struct Options {
     max_source_bytes: usize,
     cooperative_local: bool,
     migrate_model: bool,
+    complete_quality: bool,
     retained_source: bool,
     replace_source: bool,
     allow_activation: bool,
@@ -534,6 +541,7 @@ impl Options {
             max_source_bytes: MAX_INPUT_BYTES,
             cooperative_local: false,
             migrate_model: false,
+            complete_quality: false,
             retained_source: false,
             replace_source: false,
             allow_activation: false,
@@ -580,7 +588,12 @@ impl Options {
                 "--allow-damaged-current" if command == Command::Rollback => {
                     options.allow_damaged_current = true;
                 }
-                "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
+                "--migrate-model" if matches!(command, Command::Rebuild | Command::Repair) => {
+                    options.migrate_model = true;
+                }
+                "--complete-quality" if command == Command::Repair => {
+                    options.complete_quality = true;
+                }
                 "--retained-source" if command == Command::Rebuild => {
                     options.retained_source = true;
                 }

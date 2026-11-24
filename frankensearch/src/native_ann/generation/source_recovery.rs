@@ -52,6 +52,27 @@ pub struct NativeGenerationSource {
     topology: NativeGenerationTopology,
 }
 
+/// Authenticated source for explicitly rebuilding partial quality as full coverage.
+///
+/// Admission proves the complete retained source and both independently expected
+/// producer identities. The selected metadata must declare partial quality, but
+/// neither vector owner nor its ANN image is opened. In particular, this capability
+/// does not authenticate the old live quality membership or expose a topology
+/// claiming that those rows are healthy. Historical physical vector counts are
+/// never interpreted as proof of that membership.
+///
+/// This is an explicit alternative to subset-preserving repair when the selected
+/// vectors are damaged. The caller must re-embed every source document in both
+/// tiers, admit the new full generation, and publish against the captured pair in
+/// [`Self::retained_source`]. This handle has no search or vector-reuse interface
+/// and cannot be converted into a [`super::NativeGenerationSnapshot`].
+pub struct NativeGenerationQualityCompletionSource {
+    authority: Arc<OpenedGenerationSourceV1>,
+    components: SourceComponents,
+    primary: FsviV2IdentityBinding,
+    quality: FsviV2IdentityBinding,
+}
+
 /// Authenticated retained vectors and source for repair without model inference.
 ///
 /// The source and every independently identified vector tier are fully admitted,
@@ -395,6 +416,98 @@ impl NativeGenerationSource {
     }
 }
 
+impl NativeGenerationQualityCompletionSource {
+    /// Admit a selected partial-quality source for an explicit full rebuild.
+    ///
+    /// Both bindings must come independently from the caller's trusted selection.
+    /// Source admission reads only the selected metadata and complete Quill image;
+    /// missing or damaged vectors and graphs do not become searchable or reusable.
+    /// Ordinary [`NativeGenerationSource::admit`] continues to refuse partial
+    /// metadata, so this coverage expansion is never an implicit repair fallback.
+    ///
+    /// # Errors
+    /// Refuses complete or single-tier metadata, foreign identities, generation
+    /// disagreement, invalid source/metadata, image limits and cancellation.
+    pub fn admit(
+        cx: &Cx,
+        authority: Arc<OpenedGenerationSourceV1>,
+        fast: &FsviV2IdentityBinding,
+        quality: &FsviV2IdentityBinding,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.generation.quality_completion_source_admit")?;
+        if authority.retained_image_bytes() > u64::try_from(max_image_bytes).unwrap_or(u64::MAX) {
+            return Err(refused("source-recovery", "encoded-image-limit"));
+        }
+        let components = admit_source_components_with_coverage(
+            cx,
+            authority.manifest(),
+            fast,
+            Some(quality),
+            EmbedderTierTag::Fast,
+            authority.lexical_bytes(),
+            &authority.metadata_bytes(),
+            VectorCohortCoverage::PartialQuality,
+            max_image_bytes,
+        )?;
+        checkpoint(cx, "native_ann.generation.quality_completion_source_ready")?;
+        Ok(Self {
+            authority,
+            components,
+            primary: fast.clone(),
+            quality: quality.clone(),
+        })
+    }
+
+    /// Exact retained source capability and captured publication expectation.
+    #[must_use]
+    pub const fn retained_source(&self) -> &Arc<OpenedGenerationSourceV1> {
+        &self.authority
+    }
+
+    /// Exact authority selected for this explicit coverage-expanding recovery.
+    #[must_use]
+    pub fn authority(&self) -> AuthorityRefV1 {
+        self.authority.head().authority
+    }
+
+    /// Authenticated source metadata, including its unchanged source checkpoint.
+    /// Vector and ANN descriptions remain historical claims, not admitted images
+    /// or evidence of the old live quality membership.
+    #[must_use]
+    pub const fn metadata(&self) -> &GenerationManifest {
+        &self.components.metadata
+    }
+
+    /// Independently expected fast identity and original artifact generation.
+    #[must_use]
+    pub const fn binding(&self) -> &FsviV2IdentityBinding {
+        &self.primary
+    }
+
+    /// Independently expected quality identity and original artifact generation.
+    #[must_use]
+    pub const fn quality_binding(&self) -> &FsviV2IdentityBinding {
+        &self.quality
+    }
+
+    /// Recover every live source document for inference in both replacement tiers.
+    ///
+    /// The complete authenticated lexical census, source fields and metadata must
+    /// fit the byte budget. No source subset escapes on failure or cancellation.
+    ///
+    /// # Errors
+    /// Refuses invalid stored fields, noncanonical metadata, count mismatches,
+    /// source budget overflow, allocation failure and cancellation.
+    pub fn source_documents(
+        &self,
+        cx: &Cx,
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<IndexableDocument>> {
+        self.components.source_documents(cx, max_source_bytes)
+    }
+}
+
 struct SourceComponents {
     metadata: GenerationManifest,
     lexical: QuillSnapshotIndex,
@@ -424,9 +537,9 @@ fn admit_source_components(
     )
 }
 
-// Only retained-vector admission may request partial source metadata. It must
-// independently admit the selected FSVC subset before returning a capability.
-// Public source-only recovery cannot recover that membership from metadata.
+// Partial metadata is accepted only for retained-vector admission, which also
+// independently proves the FSVC subset, or explicit source-only full completion,
+// which makes no claim about the old subset and requires both replacement tiers.
 #[allow(clippy::too_many_arguments)]
 fn admit_source_components_with_coverage(
     cx: &Cx,
@@ -824,6 +937,25 @@ mod tests {
                 budget,
             )
         }
+
+        fn admit_for_completion(&self, cx: &Cx, budget: usize) -> SearchResult<SourceComponents> {
+            admit_source_components_with_coverage(
+                cx,
+                self.candidate.manifest(),
+                self.built.binding(),
+                self.built.quality_binding(),
+                EmbedderTierTag::Fast,
+                self.built
+                    .component_bytes(GenerationComponentRole::Lexical)
+                    .unwrap(),
+                &self
+                    .built
+                    .component_bytes(GenerationComponentRole::Metadata)
+                    .unwrap(),
+                VectorCohortCoverage::PartialQuality,
+                budget,
+            )
+        }
     }
 
     async fn fixture(cx: &Cx, tier: EmbedderTierTag, full: bool) -> Fixture {
@@ -845,6 +977,27 @@ mod tests {
         primary_policy: NativeBuildRetrieval,
         quality_policy: NativeBuildRetrieval,
         empty: bool,
+    ) -> Fixture {
+        fixture_with_coverage(
+            cx,
+            tier,
+            full,
+            primary_policy,
+            quality_policy,
+            empty,
+            VectorCohortCoverage::Complete,
+        )
+        .await
+    }
+
+    async fn fixture_with_coverage(
+        cx: &Cx,
+        tier: EmbedderTierTag,
+        full: bool,
+        primary_policy: NativeBuildRetrieval,
+        quality_policy: NativeBuildRetrieval,
+        empty: bool,
+        coverage: VectorCohortCoverage,
     ) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let primary = Arc::new(Provider::new("source-primary", 2));
@@ -874,7 +1027,11 @@ mod tests {
                 .unwrap();
         }
         let source = CommitRange { low: 3, high: 9 };
-        let built = if full {
+        let built = if coverage == VectorCohortCoverage::PartialQuality {
+            builder
+                .build_partial_quality_generation(cx, source, ["alpha".to_owned()], BUDGET)
+                .await
+        } else if full {
             builder
                 .build_progressive_generation(cx, source, BUDGET)
                 .await
@@ -883,7 +1040,7 @@ mod tests {
                 .build_exact_generation(cx, tier, source, BUDGET)
                 .await
         }
-        .expect("complete source fixture");
+        .expect("authenticated source fixture");
         let candidate = built
             .candidate(
                 [0x32; 16],
@@ -965,6 +1122,301 @@ mod tests {
                 matches!(error, crate::SearchError::InvalidConfig { value, .. }
                 if value == "partial-quality-repair-unsupported")
             );
+            assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn partial_completion_source_survives_derived_image_damage_without_query_admission() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let policy = NativeBuildRetrieval::Hnsw {
+                params: Default::default(),
+                seed: 17,
+            };
+            let fixture = fixture_with_coverage(
+                &cx,
+                EmbedderTierTag::Fast,
+                true,
+                policy,
+                policy,
+                false,
+                VectorCohortCoverage::PartialQuality,
+            )
+            .await;
+            assert!(matches!(
+                fixture.admit(&cx, BUDGET),
+                Err(SearchError::InvalidConfig { value, .. })
+                    if value == "partial-quality-repair-unsupported"
+            ));
+            let selected = fixture.candidate.manifest();
+            let lexical = fixture
+                .built
+                .component_bytes(GenerationComponentRole::Lexical)
+                .unwrap();
+            let metadata = fixture
+                .built
+                .component_bytes(GenerationComponentRole::Metadata)
+                .unwrap();
+            let exact_image_budget =
+                selected.canonical_bytes().len() + lexical.len() + metadata.len();
+            for role in [
+                GenerationComponentRole::Vector,
+                GenerationComponentRole::Ann,
+            ] {
+                let mut vector = fixture
+                    .built
+                    .component_bytes(GenerationComponentRole::Vector)
+                    .unwrap()
+                    .to_vec();
+                let mut ann = fixture
+                    .built
+                    .component_bytes(GenerationComponentRole::Ann)
+                    .unwrap()
+                    .to_vec();
+                match role {
+                    GenerationComponentRole::Vector => vector[0] ^= 1,
+                    GenerationComponentRole::Ann => ann[0] ^= 1,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    super::super::admit_components_with_coverage(
+                        &cx,
+                        selected,
+                        fixture.built.binding(),
+                        fixture.built.quality_binding(),
+                        DEFAULT_SCHEMA,
+                        QuillConfig::default(),
+                        [vector.into(), Arc::clone(&lexical), Arc::clone(&metadata)],
+                        Some(ann.into()),
+                        VectorCohortCoverage::PartialQuality,
+                        BUDGET,
+                    )
+                    .is_err(),
+                    "damaged derived images never become queryable"
+                );
+                let source = fixture
+                    .admit_for_completion(&cx, exact_image_budget)
+                    .unwrap();
+                let documents = source.source_documents(&cx, BUDGET).unwrap();
+                assert_eq!(documents.len(), 2);
+                let alpha = documents.iter().find(|doc| doc.id == "alpha").unwrap();
+                assert_eq!(alpha.content, "recover α unchanged");
+                assert_eq!(alpha.title.as_deref(), Some("Retained title"));
+                assert_eq!(alpha.metadata["a"], "first");
+                assert_eq!(alpha.metadata["z"], "last");
+                let beta = documents.iter().find(|doc| doc.id == "beta").unwrap();
+                assert_eq!(beta.content, "another document");
+                assert!(beta.title.is_none());
+                assert!(beta.metadata.is_empty());
+                assert_eq!(
+                    CanonicalDocsetV1::from_ordered_live_documents(
+                        documents.iter().map(|document| document.id.as_str()),
+                    )
+                    .unwrap()
+                    .digest(),
+                    selected.document_set_sha256(),
+                );
+            }
+            assert!(
+                fixture
+                    .admit_for_completion(&cx, exact_image_budget - 1)
+                    .is_err()
+            );
+            assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn partial_completion_source_requires_partial_metadata_and_independent_identities() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (tier, full) in [
+                (EmbedderTierTag::Fast, false),
+                (EmbedderTierTag::Quality, false),
+                (EmbedderTierTag::Fast, true),
+            ] {
+                let complete = fixture(&cx, tier, full).await;
+                assert!(complete.admit_for_completion(&cx, BUDGET).is_err());
+            }
+            let fixture = fixture_with_coverage(
+                &cx,
+                EmbedderTierTag::Fast,
+                true,
+                NativeBuildRetrieval::Exact,
+                NativeBuildRetrieval::Exact,
+                false,
+                VectorCohortCoverage::PartialQuality,
+            )
+            .await;
+            let lexical = fixture
+                .built
+                .component_bytes(GenerationComponentRole::Lexical)
+                .unwrap();
+            let metadata = fixture
+                .built
+                .component_bytes(GenerationComponentRole::Metadata)
+                .unwrap();
+            let fast = fixture.built.binding();
+            let quality = fixture.built.quality_binding().unwrap();
+            for replace_quality in [false, true] {
+                let original = if replace_quality { quality } else { fast };
+                let mut identity = original.frozen_identity().identity.clone();
+                identity
+                    .producer
+                    .implementation_revision
+                    .push_str("-foreign");
+                let foreign =
+                    FsviV2IdentityBinding::new(original.generation(), identity.freeze().unwrap())
+                        .unwrap();
+                let admitted = admit_source_components_with_coverage(
+                    &cx,
+                    fixture.candidate.manifest(),
+                    if replace_quality { fast } else { &foreign },
+                    Some(if replace_quality { &foreign } else { quality }),
+                    EmbedderTierTag::Fast,
+                    Arc::clone(&lexical),
+                    &metadata,
+                    VectorCohortCoverage::PartialQuality,
+                    BUDGET,
+                );
+                assert!(matches!(
+                    admitted,
+                    Err(SearchError::InvalidConfig { value, .. })
+                        if value == "expected-identity-mismatch"
+                ));
+            }
+            for marker in [None, Some("unknown")] {
+                let mut changed = fixture.built.metadata().clone();
+                if let Some(marker) = marker {
+                    changed
+                        .metadata
+                        .insert(NATIVE_QUALITY_COVERAGE_KEY.to_owned(), marker.to_owned());
+                } else {
+                    changed.metadata.remove(NATIVE_QUALITY_COVERAGE_KEY);
+                }
+                changed.manifest_hash = compute_manifest_hash(&changed).unwrap();
+                let changed = serde_json::to_vec(&changed).unwrap();
+                let manifest = reseal(
+                    &fixture,
+                    &changed,
+                    fixture.candidate.manifest().source_checkpoint_sha256(),
+                    fixture.candidate.manifest().document_set_sha256(),
+                );
+                assert!(matches!(
+                    admit_source_components_with_coverage(
+                        &cx,
+                        &manifest,
+                        fast,
+                        Some(quality),
+                        EmbedderTierTag::Fast,
+                        Arc::clone(&lexical),
+                        &changed,
+                        VectorCohortCoverage::PartialQuality,
+                        BUDGET,
+                    ),
+                    Err(SearchError::InvalidConfig { value, .. })
+                        if value == "quality-coverage-contract-mismatch"
+                ));
+            }
+            assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn partial_completion_source_preserves_exact_source_checks_budgets_and_cancellation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture_with_coverage(
+                &cx,
+                EmbedderTierTag::Fast,
+                true,
+                NativeBuildRetrieval::Exact,
+                NativeBuildRetrieval::Exact,
+                false,
+                VectorCohortCoverage::PartialQuality,
+            )
+            .await;
+            let lexical = fixture
+                .built
+                .component_bytes(GenerationComponentRole::Lexical)
+                .unwrap();
+            let metadata = fixture
+                .built
+                .component_bytes(GenerationComponentRole::Metadata)
+                .unwrap();
+            let selected = fixture.candidate.manifest();
+            for (source, docset) in [
+                ([0x91; 32], selected.document_set_sha256()),
+                (selected.source_checkpoint_sha256(), [0x92; 32]),
+            ] {
+                let manifest = reseal(&fixture, &metadata, source, docset);
+                assert!(
+                    admit_source_components_with_coverage(
+                        &cx,
+                        &manifest,
+                        fixture.built.binding(),
+                        fixture.built.quality_binding(),
+                        EmbedderTierTag::Fast,
+                        Arc::clone(&lexical),
+                        &metadata,
+                        VectorCohortCoverage::PartialQuality,
+                        BUDGET,
+                    )
+                    .is_err()
+                );
+            }
+            let mut damaged_lexical = lexical.to_vec();
+            damaged_lexical[0] ^= 1;
+            assert!(
+                admit_source_components_with_coverage(
+                    &cx,
+                    selected,
+                    fixture.built.binding(),
+                    fixture.built.quality_binding(),
+                    EmbedderTierTag::Fast,
+                    damaged_lexical.into(),
+                    &metadata,
+                    VectorCohortCoverage::PartialQuality,
+                    BUDGET,
+                )
+                .is_err()
+            );
+            let source = fixture.admit_for_completion(&cx, BUDGET).unwrap();
+            let documents = source.source_documents(&cx, BUDGET).unwrap();
+            let exact_source_bytes: usize = documents
+                .iter()
+                .map(|document| {
+                    let metadata: BTreeMap<_, _> = document.metadata.iter().collect();
+                    document.id.len()
+                        + document.content.len()
+                        + document.title.as_ref().map_or(0, String::len)
+                        + serde_json::to_vec(&metadata).unwrap().len()
+                })
+                .sum();
+            assert_eq!(
+                source
+                    .source_documents(&cx, exact_source_bytes)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(
+                source
+                    .source_documents(&cx, exact_source_bytes - 1)
+                    .is_err()
+            );
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                fixture.admit_for_completion(&cx, 0),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                source.source_documents(&cx, 0),
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            assert_eq!(source.source_documents(&cx, BUDGET).unwrap().len(), 2);
             assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
             assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
         });

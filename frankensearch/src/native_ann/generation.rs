@@ -53,7 +53,9 @@ use crate::{
 mod tests;
 
 mod source_recovery;
-pub use source_recovery::{NativeGenerationSource, NativeGenerationVectorSource};
+pub use source_recovery::{
+    NativeGenerationQualityCompletionSource, NativeGenerationSource, NativeGenerationVectorSource,
+};
 
 // The selected metadata image authenticates the full owner-bound native receipt.
 // Single-tier ANN components retain their raw graph image. Complete two-tier
