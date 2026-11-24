@@ -8551,6 +8551,20 @@ impl FsfsRuntime {
         cx: &Cx,
         shutdown: Option<&ShutdownCoordinator>,
     ) -> SearchResult<()> {
+        if self.cli_input.generation_id.is_some()
+            || self.cli_input.generation_manifest_sha256.is_some()
+        {
+            // Library entry points must honor the same explicit selection as
+            // main. This route validates the receipt before any legacy or
+            // daemon read and never falls back to the mutable store root.
+            return Box::pin(self.run_mode_with_complete_generations(
+                cx,
+                InterfaceMode::Cli,
+                shutdown,
+                false,
+            ))
+            .await;
+        }
         match self.cli_input.command {
             CliCommand::Help => print_cli_help(),
             CliCommand::Completions => self.run_completions_command(),
@@ -12701,13 +12715,24 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         retained_search_checkpoint(cx)?;
-        let store = crate::generation_store::CompleteGenerationStore::open(cx, root)?;
-        let generation = store.active(cx)?.ok_or_else(|| {
-            complete_cli::complete_cli_error(
-                "selection",
-                "no complete generation has been published",
-            )
-        })?;
+        self.cli_input.validate_retained_selection()?;
+        let store = crate::generation_store::CompleteGenerationStore::open_with_profile(
+            cx,
+            root,
+            frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        )?;
+        let generation = match (
+            self.cli_input.generation_id.as_deref(),
+            self.cli_input.generation_manifest_sha256.as_deref(),
+        ) {
+            (Some(id), Some(digest)) => store.open_retained(cx, id, digest)?,
+            _ => store.active(cx)?.ok_or_else(|| {
+                complete_cli::complete_cli_error(
+                    "selection",
+                    "no complete generation has been published",
+                )
+            })?,
+        };
         let session = Self::load_complete_explain_session_at_root(store.root())?;
         if let Some(session) = &session
             && (session.schema_version != EXPLAIN_SESSION_SCHEMA_VERSION
@@ -28619,6 +28644,15 @@ impl FsfsRuntime {
 
     fn validate_command_inputs(&self, command: CliCommand) -> SearchResult<()> {
         self.cli_input.validate_quality_only()?;
+        self.cli_input.validate_retained_selection()?;
+        if self.cli_input.generation_id.is_some()
+            && !matches!(command, CliCommand::Search | CliCommand::Explain)
+        {
+            return Err(complete_cli::complete_cli_error(
+                "selection",
+                "an explicit retained generation requires a foreground search or explain command",
+            ));
+        }
         self.cli_input.validate_search_recovery()?;
         if self.cli_input.recover_source.is_some() && command != CliCommand::Search {
             return Err(retained_recovery_error(
@@ -28677,6 +28711,11 @@ impl FsfsRuntime {
     ///
     /// Returns `SearchError` when onboarding/indexing flow cannot complete.
     pub async fn run_tui(&self, cx: &Cx) -> SearchResult<()> {
+        if self.cli_input.generation_id.is_some()
+            || self.cli_input.generation_manifest_sha256.is_some()
+        {
+            self.validate_command_inputs(CliCommand::Tui)?;
+        }
         let shell_model = FsfsTuiShellModel::from_config(&self.config);
         shell_model
             .validate()
@@ -30672,6 +30711,8 @@ Index Management:
 Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online
 Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --quality-only --ranking-priors --no-ranking-priors --rerank --expand
               --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>
+              --generation ID --manifest-sha256 HASH --index-dir STORE searches an exact retained generation locally.
+              Copy both values from one trusted publication receipt. The same selectors support the follow-up explain command.
               --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once.
               Recovery uses installed models by default. Add --acquire-models to download missing required models first; --offline still forbids acquisition.
               After provisioning, recovery captures the current selection; changes during rebuilding or preview prevent publication. It never retries automatically.

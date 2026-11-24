@@ -192,6 +192,7 @@ impl FsfsRuntime {
         };
         if matches!(effective_command, CliCommand::Search | CliCommand::Explain)
             && self.cli_input.recover_source.is_none()
+            && self.cli_input.generation_id.is_none()
             && CompleteGenerationStore::legacy_migration_pending(&root)?
             && Self::read_index_sentinel(&root)?.is_some_and(|sentinel| sentinel.generation_complete)
         {
@@ -566,6 +567,13 @@ impl FsfsRuntime {
         // the lease's alias-aware admission before either complete-store routing
         // or a legacy fallback can initialize locks, pins, or artifact directories.
         crate::lifecycle::reject_sealed_ancestry(&root)?;
+
+        if self.cli_input.generation_id.is_some()
+            || self.cli_input.generation_manifest_sha256.is_some()
+        {
+            self.cli_input.validate_retained_selection()?;
+            return Ok(Some(root));
+        }
 
         // Explicit source recovery chooses a fresh complete-store build even
         // when no selection exists. A malformed incumbent remains expected-old
@@ -1136,6 +1144,7 @@ impl FsfsRuntime {
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
+        self.cli_input.validate_retained_selection()?;
         self.cli_input.validate_search_recovery()?;
         let query = self
             .cli_input
@@ -1242,8 +1251,23 @@ impl FsfsRuntime {
             )
             .await;
         }
-        let reader = self.open_retained_search(cx, root).await?;
+        let reader = self.open_complete_cli_search(cx, root).await?;
         Box::pin(self.run_retained_search_with_writer(cx, root, reader, started, writer)).await
+    }
+
+    async fn open_complete_cli_search(
+        &self,
+        cx: &Cx,
+        root: &Path,
+    ) -> SearchResult<RetainedSearchReader> {
+        self.cli_input.validate_retained_selection()?;
+        match (
+            self.cli_input.generation_id.as_deref(),
+            self.cli_input.generation_manifest_sha256.as_deref(),
+        ) {
+            (Some(id), Some(digest)) => self.open_historical_search(cx, root, id, digest).await,
+            _ => self.open_retained_search(cx, root).await,
+        }
     }
 
     /// Render one search against the already admitted reader. Source recovery
@@ -1478,7 +1502,7 @@ impl FsfsRuntime {
     {
         // Pin before the expansion request. A publication during the LLM call
         // or between variants must not mix lexical, vector or catalog inputs.
-        let mut reader = self.open_retained_search(cx, root).await?;
+        let mut reader = self.open_complete_cli_search(cx, root).await?;
         reader
             .runtime
             .enable_complete_generation_explanations(root, &reader.generation)?;
@@ -5378,6 +5402,230 @@ mod tests {
                     assert!(!relative_child.exists());
                 }
             }
+        });
+    }
+
+    #[test]
+    fn historical_cli_search_and_explain_admit_the_receipted_generation() {
+        use crate::stream_protocol::{StreamEvent, StreamTerminalStatus};
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            runtime.generation_retention = GenerationRetention::Off;
+            fs::write(
+                source.join("alpha.md"),
+                "sharedtoken originalrelic document",
+            )
+            .unwrap();
+            let first = publish(&runtime, &cx, &root).await;
+            let old_id = first["data"]["generation_id"].as_str().unwrap();
+            let old_digest = first["data"]["manifest_sha256"].as_str().unwrap();
+            let old_path = Path::new(first["data"]["generation_path"].as_str().unwrap());
+            let old_bytes = sealed_inventory(old_path);
+            fs::write(source.join("alpha.md"), "sharedtoken replacement document").unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken added document").unwrap();
+            let current = publish(&runtime, &cx, &root).await;
+            let selected = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut output = Vec::new();
+            let active = search_runtime(&runtime);
+            Box::pin(active.run_complete_generation_search_with_writer(&cx, &root, &mut output))
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["data"]["hits"].as_array().unwrap().len(), 2);
+
+            let input = crate::adapters::cli::parse_cli_args([
+                "search",
+                "sharedtoken",
+                "--index-dir",
+                root.to_str().unwrap(),
+                "--generation",
+                old_id,
+                "--manifest-sha256",
+                old_digest,
+                "--filter=path:alpha.md",
+                "--format=json",
+            ])
+            .unwrap();
+            let historical = runtime.clone().with_cli_input(input);
+            assert!(!historical.cli_input.daemon);
+            assert_eq!(
+                historical
+                    .complete_generation_command_root(false)
+                    .unwrap()
+                    .as_deref(),
+                Some(root.as_path())
+            );
+            output.clear();
+            Box::pin(historical.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut output,
+            ))
+            .await
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            let old_hits = value["data"]["hits"].clone();
+            assert_eq!(old_hits.as_array().unwrap().len(), 1);
+            assert!(
+                old_hits[0]["snippet"]
+                    .as_str()
+                    .unwrap()
+                    .contains("originalrelic")
+            );
+
+            let mut explain = historical.clone();
+            explain.cli_input.command = CliCommand::Explain;
+            explain.cli_input.result_id = Some("R0".to_owned());
+            output.clear();
+            Box::pin(explain.run_complete_generation_explain_with_writer(&cx, &root, &mut output))
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["data"]["query"], "sharedtoken");
+            explain.cli_input.generation_id = None;
+            explain.cli_input.generation_manifest_sha256 = None;
+            assert!(
+                Box::pin(explain.run_complete_generation_explain_with_writer(
+                    &cx,
+                    &root,
+                    &mut Vec::new()
+                ))
+                .await
+                .is_err()
+            );
+
+            // Cache the current answer between historical reads, then damage
+            // selection. Neither event can redirect the receipted query.
+            output.clear();
+            Box::pin(active.run_complete_generation_search_with_writer(&cx, &root, &mut output))
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["data"]["hits"].as_array().unwrap().len(), 2);
+            fs::write(
+                root.join(COMPLETE_GENERATION_POINTER),
+                b"damaged selector\n",
+            )
+            .unwrap();
+            output.clear();
+            Box::pin(historical.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut output,
+            ))
+            .await
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["data"]["hits"], old_hits);
+            assert!(
+                Box::pin(active.run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut Vec::new()
+                ))
+                .await
+                .is_err()
+            );
+
+            // Public library dispatch must honor the same receipt as main,
+            // even when the active selection cannot be admitted.
+            Box::pin(historical.run_cli(&cx)).await.unwrap();
+            let mut direct_explain = historical.clone();
+            direct_explain.cli_input.command = CliCommand::Explain;
+            direct_explain.cli_input.result_id = Some("R0".to_owned());
+            Box::pin(direct_explain.run_mode(&cx, InterfaceMode::Cli))
+                .await
+                .unwrap();
+            assert!(
+                Box::pin(historical.run_mode(&cx, InterfaceMode::Tui))
+                    .await
+                    .is_err()
+            );
+
+            let mut stream = historical.clone();
+            stream.cli_input.stream = true;
+            stream.cli_input.format = OutputFormat::Jsonl;
+            output.clear();
+            Box::pin(stream.run_complete_generation_search_with_writer(&cx, &root, &mut output))
+                .await
+                .unwrap();
+            let frames = expansion_stream_frames(OutputFormat::Jsonl, &output);
+            let streamed_hits: Vec<_> = frames
+                .iter()
+                .filter_map(|frame| match &frame.event {
+                    StreamEvent::Result(result) => Some(&result.item),
+                    _ => None,
+                })
+                .collect();
+            assert!(!streamed_hits.is_empty());
+            let expected_path = old_hits[0]["path"].as_str().unwrap();
+            assert!(streamed_hits.iter().all(|hit| {
+                hit.path == expected_path
+                    && hit
+                        .snippet
+                        .as_deref()
+                        .is_some_and(|snippet| snippet.contains("originalrelic"))
+            }));
+            assert!(matches!(frames.last().map(|frame| &frame.event),
+                Some(StreamEvent::Terminal(terminal)) if terminal.status == StreamTerminalStatus::Completed));
+
+            for digest in [
+                "0".repeat(64),
+                current["data"]["manifest_sha256"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ] {
+                let mut wrong = historical.clone();
+                wrong.cli_input.generation_manifest_sha256 = Some(digest);
+                output.clear();
+                assert!(
+                    Box::pin(wrong.run_complete_generation_search_with_writer(
+                        &cx,
+                        &root,
+                        &mut output
+                    ))
+                    .await
+                    .is_err()
+                );
+                assert!(output.is_empty());
+            }
+            let mut missing = historical.clone();
+            missing.cli_input.generation_id = Some(format!(
+                "g-{}-{}-{}",
+                "0".repeat(32),
+                "0".repeat(8),
+                "0".repeat(16)
+            ));
+            output.clear();
+            assert!(
+                Box::pin(missing.run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output
+                ))
+                .await
+                .is_err()
+            );
+            assert!(output.is_empty());
+            assert!(Box::pin(missing.run_cli(&cx)).await.is_err());
+            assert_eq!(sealed_inventory(old_path), old_bytes);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                b"damaged selector\n"
+            );
+            fs::write(root.join(COMPLETE_GENERATION_POINTER), &selected).unwrap();
+            let mut reader = runtime
+                .open_historical_search(&cx, &root, old_id, old_digest)
+                .await
+                .unwrap();
+            assert_eq!(reader.generation().id(), old_id);
+            let results = reader.search(&cx, "originalrelic", 10).await.unwrap();
+            assert_eq!(results.last().unwrap().hits.len(), 1);
         });
     }
 

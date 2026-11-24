@@ -446,6 +446,37 @@ impl FsfsRuntime {
         cx: &Cx,
         store_root: &Path,
     ) -> SearchResult<RetainedSearchReader> {
+        self.open_retained_search_selection(cx, store_root, None)
+            .await
+    }
+
+    /// Open the exact retained generation named by a trusted publication receipt.
+    ///
+    /// The ID and inventory digest must come from the same receipt. This admits
+    /// its entire bundle and serving resources while retaining its reader pin.
+    /// Selection is never consulted or changed, so an intact historical bundle
+    /// remains searchable even when the active descriptor is damaged.
+    ///
+    /// # Errors
+    /// Returns invalid receipt, missing or changed bundle, producer mismatch,
+    /// configuration, or cancellation errors before any query is executed.
+    pub async fn open_historical_search(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        generation_id: &str,
+        manifest_sha256: &str,
+    ) -> SearchResult<RetainedSearchReader> {
+        self.open_retained_search_selection(cx, store_root, Some((generation_id, manifest_sha256)))
+            .await
+    }
+
+    async fn open_retained_search_selection(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        selection: Option<(&str, &str)>,
+    ) -> SearchResult<RetainedSearchReader> {
         use crate::generation_store::CompleteGenerationStore;
 
         retained_search_checkpoint(cx)?;
@@ -465,14 +496,17 @@ impl FsfsRuntime {
             store_root,
             frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
         )?;
-        let generation = store
-            .active(cx)?
-            .ok_or_else(|| SearchError::InvalidConfig {
-                field: "complete_generation.selection".to_owned(),
-                value: store.root().display().to_string(),
-                reason: "no complete generation has been published; rebuild the store first"
-                    .to_owned(),
-            })?;
+        let generation = match selection {
+            Some((id, digest)) => store.open_retained(cx, id, digest)?,
+            None => store
+                .active(cx)?
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "complete_generation.selection".to_owned(),
+                    value: store.root().display().to_string(),
+                    reason: "no complete generation has been published; rebuild the store first"
+                        .to_owned(),
+                })?,
+        };
         let mut runtime = self.clone();
         runtime.cli_input.index_dir = Some(generation.path().to_path_buf());
         // Retained readers never start a daemon or write a socket/cache under

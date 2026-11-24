@@ -215,6 +215,10 @@ pub struct CliInput {
     pub target_path: Option<PathBuf>,
     /// Optional explicit index directory override for index/status commands.
     pub index_dir: Option<PathBuf>,
+    /// Explicit retained generation from a trusted complete-store publication receipt.
+    pub generation_id: Option<String>,
+    /// Inventory digest paired with `generation_id` in the same trusted receipt.
+    pub generation_manifest_sha256: Option<String>,
     /// Explain result identifier.
     pub result_id: Option<String>,
     /// Filter expression (for search command).
@@ -304,6 +308,51 @@ impl CliInput {
             return Err(SearchError::InvalidConfig {
                 field: "cli.quality_only".into(),
                 value: "--quality-only".into(),
+                reason: reason.into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_retained_selection(&self) -> SearchResult<()> {
+        if self.generation_id.is_none() && self.generation_manifest_sha256.is_none() {
+            return Ok(());
+        }
+        let reason = if !matches!(self.command, CliCommand::Search | CliCommand::Explain) {
+            Some("--generation and --manifest-sha256 are only valid for search and explain")
+        } else if self.generation_id.as_ref().is_none_or(|id| id.len() != 60)
+            || self
+                .generation_manifest_sha256
+                .as_ref()
+                .is_none_or(|digest| {
+                    digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        {
+            Some(
+                "supply --generation ID and --manifest-sha256 SHA256 from the same trusted publication receipt",
+            )
+        } else if self
+            .index_dir
+            .as_ref()
+            .is_none_or(|root| root.as_os_str().is_empty())
+        {
+            Some("retained-generation search requires an explicit --index-dir STORE")
+        } else if self.daemon || self.daemon_socket.is_some() {
+            Some("retained-generation search runs locally; omit --daemon and --daemon-socket")
+        } else if self.recover_source.is_some() || self.acquire_models {
+            Some(
+                "retained-generation search cannot be combined with source recovery or model acquisition",
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.retained_generation".into(),
+                value: "--generation --manifest-sha256".into(),
                 reason: reason.into(),
             });
         }
@@ -971,6 +1020,22 @@ where
                 input.index_dir = Some(PathBuf::from(value));
                 idx += 2;
             }
+            "--generation" | "--manifest-sha256" => {
+                let value = expect_value(&tokens, idx, flag)?.to_owned();
+                let field = if flag == "--generation" {
+                    &mut input.generation_id
+                } else {
+                    &mut input.generation_manifest_sha256
+                };
+                if field.replace(value).is_some() {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.retained_generation".into(),
+                        value: flag.into(),
+                        reason: "each retained-generation selector may be supplied once".into(),
+                    });
+                }
+                idx += 2;
+            }
             "--recover-source" => {
                 let value = expect_value(&tokens, idx, "--recover-source")?;
                 input.recover_source = Some(PathBuf::from(value));
@@ -1044,7 +1109,10 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
     #[cfg(unix)]
     {
         // Default search path uses daemon transport to amortize startup/index warmup.
-        input.daemon = input.command == CliCommand::Search && input.recover_source.is_none();
+        input.daemon = input.command == CliCommand::Search
+            && input.recover_source.is_none()
+            && input.generation_id.is_none()
+            && input.generation_manifest_sha256.is_none();
     }
 
     #[cfg(not(unix))]
@@ -1055,6 +1123,7 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
 
 fn validate_required_args(input: &CliInput) -> SearchResult<()> {
     input.validate_quality_only()?;
+    input.validate_retained_selection()?;
     input.validate_search_recovery()?;
     input.validate_quality_completion()?;
     if input.command == CliCommand::Search && input.query.is_none() {
@@ -1351,6 +1420,8 @@ fn is_known_cli_flag(token: &str) -> bool {
                 | "--theme"
                 | "--config"
                 | "--index-dir"
+                | "--generation"
+                | "--manifest-sha256"
                 | "--recover-source"
                 | "--acquire-models"
                 | "--expand"
@@ -1367,6 +1438,142 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn retained_selection_preserves_search_policy_and_uses_local_transport() {
+        let id = format!("g-{}-{}-{}", "1".repeat(32), "2".repeat(8), "3".repeat(16));
+        let digest = "a".repeat(64);
+        let input = parse_cli_args([
+            "search",
+            "original query",
+            "--generation",
+            &id,
+            "--manifest-sha256",
+            &digest,
+            "--index-dir",
+            "/store",
+            "--quality-only",
+            "--filter=path:src",
+            "--rerank",
+            "--ranking-priors",
+            "--explain",
+            "--stream",
+            "--format=toon",
+        ])
+        .unwrap();
+        assert_eq!(input.generation_id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            input.generation_manifest_sha256.as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(input.filter.as_deref(), Some("path:src"));
+        assert_eq!(input.overrides.rerank, Some(true));
+        assert_eq!(input.overrides.ranking_priors, Some(true));
+        assert_eq!(input.overrides.explain, Some(true));
+        assert!(input.quality_only);
+        assert!(input.stream);
+        assert!(!input.daemon);
+        let explain = parse_cli_args([
+            "explain",
+            "R0",
+            "--generation",
+            &id,
+            "--manifest-sha256",
+            &digest,
+            "--index-dir",
+            "/store",
+        ])
+        .unwrap();
+        assert_eq!(explain.command, CliCommand::Explain);
+        assert!(!explain.daemon);
+        let literal = parse_cli_args(["search", "--", "--generation"]).unwrap();
+        assert_eq!(literal.query.as_deref(), Some("--generation"));
+        assert!(literal.generation_id.is_none());
+    }
+
+    #[test]
+    fn retained_selection_rejects_ambiguous_receipts_and_incompatible_commands() {
+        let id = format!("g-{}-{}-{}", "1".repeat(32), "2".repeat(8), "3".repeat(16));
+        let digest = "a".repeat(64);
+        let valid = vec![
+            "search",
+            "query",
+            "--index-dir",
+            "/store",
+            "--generation",
+            &id,
+            "--manifest-sha256",
+            &digest,
+        ];
+        for suffix in [
+            vec!["--daemon"],
+            vec!["--daemon-socket", "/socket"],
+            vec!["--recover-source", "/source"],
+            vec!["--acquire-models"],
+            vec!["--generation", &id],
+            vec!["--manifest-sha256", &digest],
+        ] {
+            let mut args = valid.clone();
+            args.extend(suffix);
+            assert!(parse_cli_args(args).is_err());
+        }
+        for args in [
+            vec![
+                "search",
+                "query",
+                "--generation",
+                &id,
+                "--index-dir",
+                "/store",
+            ],
+            vec![
+                "search",
+                "query",
+                "--manifest-sha256",
+                &digest,
+                "--index-dir",
+                "/store",
+            ],
+            vec![
+                "search",
+                "query",
+                "--generation",
+                &id,
+                "--manifest-sha256",
+                &digest,
+            ],
+            vec![
+                "search",
+                "query",
+                "--generation",
+                "../untrusted",
+                "--manifest-sha256",
+                &digest,
+                "--index-dir",
+                "/store",
+            ],
+            vec![
+                "index",
+                "--generation",
+                &id,
+                "--manifest-sha256",
+                &digest,
+                "--index-dir",
+                "/store",
+            ],
+            vec![
+                "status",
+                "--generation",
+                &id,
+                "--manifest-sha256",
+                &digest,
+                "--index-dir",
+                "/store",
+            ],
+        ] {
+            assert!(parse_cli_args(args).is_err());
+        }
+    }
 
     #[test]
     fn search_recovery_preserves_search_flags_and_selects_local_transport() {
