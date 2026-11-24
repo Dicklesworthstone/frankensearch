@@ -10,8 +10,9 @@ use frankensearch::native_ann::builder::live::NativeHybridSnapshot;
 use super::NativeLiveHybridIndex;
 use super::validate_id;
 use crate::{
-    ArtifactGenerationIdentityV1, Cx, Deserialize, Path, PathBuf, Result, SCHEMA, Selection, Write,
-    bad, emit, fs, live, new_generation, new_path, query, save_selection, sharded, update,
+    ArtifactGenerationIdentityV1, Cx, Deserialize, DocumentInput, Path, PathBuf, Result, SCHEMA,
+    Selection, Write, bad, emit, fs, live, new_generation, new_path, query, save_selection, sharded,
+    update,
 };
 
 pub(super) const MAX_MUTATIONS: usize = 1_000;
@@ -25,9 +26,55 @@ pub(super) enum Request {
         expected_generation: ArtifactGenerationIdentityV1,
         index_dir: PathBuf,
         new_receipt: PathBuf,
-        changes: Vec<update::Mutation>,
+        #[serde(default, deserialize_with = "supplied_array")]
+        changes: Option<Vec<update::Mutation>>,
+        #[serde(default, deserialize_with = "supplied_array")]
+        documents: Option<Vec<DocumentInput>>,
         shard_size: Option<usize>,
     },
+}
+
+// A missing field and an explicit null must remain distinct. In particular,
+// a malformed changes value cannot authorize an accompanying empty inventory.
+fn supplied_array<'de, D, T>(deserializer: D) -> std::result::Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Vec::<T>::deserialize(deserializer).map(Some)
+}
+
+struct UpdateInput {
+    changes: Option<Vec<update::Mutation>>,
+    documents: Option<Vec<DocumentInput>>,
+}
+
+impl UpdateInput {
+    fn into_edits(self, cx: &Cx, base: &live::Snapshot) -> Result<update::Edits> {
+        match (self.changes, self.documents) {
+            (Some(changes), None) => {
+                if changes.is_empty() || changes.len() > MAX_MUTATIONS {
+                    return Err(bad("an update must contain between 1 and 1000 mutations"));
+                }
+                update::from_mutations(changes)
+            }
+            (None, Some(documents)) => {
+                if documents.len() > MAX_MUTATIONS {
+                    return Err(bad("a replacement inventory may contain at most 1000 documents"));
+                }
+                let mut ids = std::collections::BTreeSet::new();
+                let mut edits = update::Edits::new();
+                for document in documents {
+                    checkpoint(cx)?;
+                    let document = document.into_document(&mut ids)?;
+                    edits.insert(document.id.clone(), Some(document));
+                }
+                update::remove_omitted_documents(cx, base.index(), &mut edits)?;
+                Ok(edits)
+            }
+            _ => Err(bad("an update requires exactly one changes or documents array")),
+        }
+    }
 }
 
 struct Prepared {
@@ -86,12 +133,12 @@ async fn prepare(
     expected: ArtifactGenerationIdentityV1,
     directory: &Path,
     receipt: &Path,
-    changes: Vec<update::Mutation>,
+    input: UpdateInput,
     progress: &mut Progress,
 ) -> Result<Prepared> {
     let base = live::Snapshot::Single(base.clone());
     prepare_with_partition(
-        &base, cx, expected, directory, receipt, changes, None, progress,
+        &base, cx, expected, directory, receipt, input, None, progress,
     )
     .await
 }
@@ -103,7 +150,7 @@ async fn prepare_with_partition(
     expected: ArtifactGenerationIdentityV1,
     directory: &Path,
     receipt: &Path,
-    changes: Vec<update::Mutation>,
+    input: UpdateInput,
     shard_size: Option<usize>,
     progress: &mut Progress,
 ) -> Result<Prepared> {
@@ -115,13 +162,10 @@ async fn prepare_with_partition(
             "expected_generation does not match the serving snapshot; no update started",
         ));
     }
-    if changes.is_empty() || changes.len() > MAX_MUTATIONS {
-        return Err(bad("an update must contain between 1 and 1000 mutations"));
-    }
     update::validate_partition_policy(matches!(base, live::Snapshot::Sharded(_)), shard_size)?;
     // Validate every operation, including overwritten entries, before touching
     // any path or starting a model. Final-cohort limits also apply to growth.
-    let edits = update::from_mutations(changes)?;
+    let edits = input.into_edits(cx, base)?;
     let count = update::validate_final_cohort(cx, base.index(), &edits)?;
     if let Some(size) = shard_size {
         sharded::validate_size(size, count)?;
@@ -204,6 +248,7 @@ pub(super) async fn execute<'l, W: Write>(
         index_dir,
         new_receipt,
         changes,
+        documents,
         shard_size,
     } = request;
     let mut progress = Progress::default();
@@ -214,16 +259,17 @@ pub(super) async fn execute<'l, W: Write>(
             return Err(bad("updates are disabled; start serve with --allow-updates for a trusted writing controller"));
         }
         let base = live.snapshot(cx).await?;
+        let input = UpdateInput { changes, documents };
         let prepared = match &base {
             live::Snapshot::Single(base) => {
                 update::validate_partition_policy(false, shard_size)?;
                 prepare(
-                    base, cx, expected_generation, &index_dir, &new_receipt, changes, &mut progress,
+                    base, cx, expected_generation, &index_dir, &new_receipt, input, &mut progress,
                 ).await?
             }
             live::Snapshot::Sharded(_) => {
                 prepare_with_partition(
-                    &base, cx, expected_generation, &index_dir, &new_receipt, changes,
+                    &base, cx, expected_generation, &index_dir, &new_receipt, input,
                     shard_size, &mut progress,
                 ).await?
             }

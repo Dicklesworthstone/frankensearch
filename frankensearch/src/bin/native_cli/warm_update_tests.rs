@@ -326,6 +326,58 @@ fn warm_update_reuses_models_and_unchanged_vectors_and_reopens_complete_successo
 }
 
 #[test]
+fn warm_replacement_inventory_requires_write_permission_and_an_unambiguous_valid_array() {
+    run_test_with_cx(|cx| async move {
+        let f = fixture(&cx, false).await;
+        let baseline = counts(&f);
+        let mut empty = message(&f, "rescan", &changes());
+        empty.as_object_mut().unwrap().remove("changes");
+        empty["documents"] = serde_json::json!([]);
+
+        let mut mixed = empty.clone();
+        mixed["changes"] = changes();
+        let mut duplicate = empty.clone();
+        duplicate["documents"] = serde_json::json!([
+            {"id":"kept","content":"first"}, {"id":"kept","content":"second"}
+        ]);
+        let mut oversized = empty.clone();
+        oversized["documents"] = serde_json::json!(vec![
+            serde_json::json!({"id":"document", "content":"body"}); MAX_MUTATIONS + 1
+        ]);
+        let mut stale = empty.clone();
+        stale["expected_generation"] =
+            serde_json::json!(ArtifactGenerationIdentityV1::new(1, [8; 16]).unwrap());
+        for (request, allowed) in [
+            (empty.clone(), false),
+            (mixed, true),
+            (duplicate, true),
+            (oversized, true),
+            (stale, true),
+        ] {
+            let frames = send(&f, &cx, request, allowed).await;
+            assert_eq!(frames[1]["ok"], false);
+            assert_eq!(frames[1]["receipt_state"], "not_started");
+            assert_eq!(counts(&f), baseline);
+            assert!(!f.root.path().join("rescan").exists());
+            assert!(!f.root.path().join("rescan.json").exists());
+        }
+        let mut malformed = empty.clone();
+        malformed["changes"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Request>(malformed).is_err());
+
+        let frames = send(&f, &cx, empty, true).await;
+        assert_eq!(frames[1]["ok"], true);
+        assert_eq!(frames[1]["edited_ids"], 3);
+        assert_eq!(frames[1]["receipt_state"], "durable");
+        assert_eq!(counts(&f), baseline);
+        let selected = f.live.snapshot(&cx).await.unwrap();
+        assert!(selected.index().vectors().documents().is_empty());
+        assert!(selected.index().vectors().quality().is_some());
+        assert_eq!(f.old.index().vectors().documents().len(), 3);
+    });
+}
+
+#[test]
 fn refused_updates_do_no_io_or_inference_and_do_not_widen_activation_permission() {
     run_test_with_cx(|cx| async move {
         let f = fixture(&cx, false).await;
@@ -397,6 +449,7 @@ async fn prepared(f: &Fixture, cx: &Cx, name: &str, progress: &mut Progress) -> 
         index_dir,
         new_receipt,
         changes,
+        documents,
         ..
     } = serde_json::from_value(message(f, name, &changes())).unwrap();
     prepare(
@@ -405,7 +458,7 @@ async fn prepared(f: &Fixture, cx: &Cx, name: &str, progress: &mut Progress) -> 
         expected_generation,
         &index_dir,
         &new_receipt,
-        changes,
+        UpdateInput { changes, documents },
         progress,
     )
     .await
@@ -510,6 +563,7 @@ fn dropping_pending_update_releases_provider_work_without_receipt_or_install() {
             index_dir,
             new_receipt,
             changes,
+            documents,
             ..
         } = serde_json::from_value(message(&f, "pending", &changes())).unwrap();
         let mut progress = Progress::default();
@@ -519,7 +573,7 @@ fn dropping_pending_update_releases_provider_work_without_receipt_or_install() {
             expected_generation,
             &index_dir,
             &new_receipt,
-            changes,
+            UpdateInput { changes, documents },
             &mut progress,
         ));
         assert!(

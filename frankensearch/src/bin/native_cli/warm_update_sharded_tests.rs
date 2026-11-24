@@ -117,6 +117,7 @@ async fn prepare_request(
         index_dir,
         new_receipt,
         changes,
+        documents,
         shard_size,
         ..
     } = serde_json::from_value(value).unwrap();
@@ -126,7 +127,7 @@ async fn prepare_request(
         expected_generation,
         &index_dir,
         &new_receipt,
-        changes,
+        UpdateInput { changes, documents },
         shard_size,
         progress,
     )
@@ -193,6 +194,46 @@ impl Reranker for Scorer {
                 .collect())
         })
     }
+}
+
+#[test]
+fn warm_sharded_replacement_inventory_installs_and_reopens_a_repartitioned_rescan() {
+    run_test_with_cx(|cx| async move {
+        let f = fixture(&cx, true).await;
+        let baseline = counts(&f);
+        let mut request = message(&f, "rescanned");
+        request.as_object_mut().unwrap().remove("changes");
+        request["documents"] = serde_json::json!([
+            {"id":"z", "content":"common stable-z", "title":"retained"},
+            {"id":"new", "content":"arrival common"},
+            {"id":"a", "content":"changed common"}
+        ]);
+        request["shard_size"] = serde_json::json!(1);
+        let frames = send(&f, &cx, request, true).await;
+        assert_eq!(frames[1]["ok"], true);
+        assert_eq!(frames[1]["edited_ids"], 6);
+        assert_eq!(frames[1]["receipt_state"], "durable");
+        let selected = Selection::read(&f.root.path().join("rescanned.json")).unwrap();
+        assert_eq!(
+            selected.generation,
+            f.live.snapshot(&cx).await.unwrap().generation()
+        );
+        let next = sharded::open(&cx, &selected, f.models.clone())
+            .await
+            .unwrap();
+        assert_eq!(next.vectors().partitions().len(), 3);
+        assert_eq!(
+            next.vectors().document("z").unwrap().title.as_deref(),
+            Some("retained")
+        );
+        assert!(next.vectors().document("c").is_none());
+        assert_eq!(
+            next.lexical().search(&cx, "arrival", 3).await.unwrap()[0].doc_id,
+            "new"
+        );
+        assert!(f.old.index().vectors().document("c").is_some());
+        assert_eq!(counts(&f), (baseline.0 + 2, baseline.1 + 2));
+    });
 }
 
 #[test]

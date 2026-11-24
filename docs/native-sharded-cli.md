@@ -223,6 +223,13 @@ predecessors and invalid partition policies do not become queries or successful
 partial transactions. The final source and partition limits include every
 unchanged survivor, not just the delta, and precede candidate creation.
 
+For a full rescan, send a `documents` array in place of `changes`. Each item
+uses the `index` document schema. Both layouts accept up to 1,000 unique
+records within the request byte limit. Omitted IDs are removed from the
+successor, and an empty array selects an empty corpus. The response counts
+supplied and removed IDs. The same generation check, `--allow-updates`
+permission and shard-size rules apply.
+
 The original retained model instances and source/vector owners feed the native
 live-update builder. No receipt is reopened or replacement model loaded during
 preparation. It builds every required successor tier and one global Quill index,
