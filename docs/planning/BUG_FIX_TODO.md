@@ -1,10 +1,11 @@
 # Open bug repair TODO
 
-## November 24 source-replacement wiring — OrangeSparrow
+## November 24 source-replacement wiring — published, OrangeSparrow
 
 Owner-requested implementation checklist for `bd-native-authority-replace-source-6o6m1`.
-Retire this active block when the feature is published or handed off with exact
-unmet criteria; retain dated history. It earns no capability credit.
+Qualified code `f02742f3` is published and verified on both remote refs. The
+feature Bead is closed on its original acceptance; this block is now dated
+history, retired from active tracking. It earns no capability credit.
 
 - [x] Refresh origin and preserve the dirty shared checkout in the existing
   isolated worktree. Governing docs are unchanged from the full prior read.
@@ -24,9 +25,14 @@ unmet criteria; retain dated history. It earns no capability credit.
   Four populated focused cases pass, including eight topology/retrieval combinations
   and both cold and warm replacement. The stale control uses a valid different
   authority. Full/single-tier empty inventories succeed; partial collapse refuses.
-- [ ] Execute actual-model cold and warm commands plus fresh-process readback;
+- [x] Execute actual-model cold and warm commands plus fresh-process readback;
   retain ELF/source/feature/lock identity and adverse controls.
-- [ ] Run focused strict checks, scanner triage and the complete unchanged stock
+  Twenty populated outcomes pass on clean `f02742f3`, with actual registered
+  Potion/MiniLM models and full/partial HNSW authorities. New IDs are searchable,
+  omitted IDs unavailable, and stored metadata survives cold and warm publication.
+  Malformed, mixed and stale controls refuse. The debug hybrid ELF is
+  `333b439ba6a5bc168e4ed7e27b0a62790855bc94aca7f0ace5abe8ae76f29383`.
+- [x] Run focused strict checks, scanner triage and the complete unchanged stock
   gate on a clean source checkpoint. RCH admission currently queues all workers;
   native quality-host runs must retain their actual execution class.
   - [x] Retire the initial `dbfccddb` run before changing source: six labels pass,
@@ -37,9 +43,134 @@ unmet criteria; retain dated history. It earns no capability credit.
     Finish the negative-control review: valid oversized JSON, unique over-limit
     warm IDs, exact refusal codes, and a valid cancelled request that succeeds
     unchanged when cancellation is cleared. Production implementation is unchanged.
-- [ ] Reverify the feature's original criteria in a fresh solo pass, update Beads
+  - [x] Final stock run: all eighteen labels PASS, no SKIP, terminal 0,
+    15:58:27–16:47:33 UTC, 2,946.66 seconds. Clean `f02742f3`, native
+    thinkstation1, original UID/groups and a fresh private 4 GiB tmpfs. The host
+    mount, quota and retained cache remain unchanged. No gate source or budget changes.
+  - [x] Facade library 598/0/0 and native CLI 352/0/0, including all four added
+    replacement cases. Focused v4 cases and strict hybrid Clippy pass. Final
+    UBS scans all three current Rust files: zero critical, 140 changed-line
+    notices triaged, no suppressions. Seven production notices concern bounded
+    owned ID keys and a HELP-string slash. Existing warnings are not claimed fixed.
+- [x] Reverify the feature's original criteria in a fresh solo pass, update Beads
   honestly, publish source/evidence and verify both refs. The broader migration,
   platform and release tasks retain their original acceptance.
+  - [x] Read all five original criteria again and bind each to actual code,
+    populated controls, source/ELF/model identities and terminal gate results.
+    This is solo verification, not independent certification.
+  - [x] Publish qualified `f02742f3` and verify both refs before closing the
+    feature. Preserve `bd-xomn.3`'s original prerequisites and acceptance.
+  - [x] Close only the owned feature Bead on cited evidence. Scope the tracker
+    export to that feature and owned `bd-dsbym` comments; preserve the unpublished
+    peer `bd-fsfs-current-product-envelope-lz056` update and all other records.
+  - [x] Add the user-facing Unreleased changelog entry and retain this detailed
+    implementation/verification history. Subsequent metadata changes contain
+    no product-code, dependency, model, gate or acceptance changes.
+
+Receipts: `/data/tmp/fs-wire.Vki6tW2z/stock-gate-v3-result.json`,
+`product-probe-final-result.json`, `original-acceptance-review.json`,
+`model-files-final.json`, `ubs-final-triage.json`, `focused-tests-v4.log` and
+`source-publication-refs.txt`. The complete gate log SHA256 is
+`f977935aad91cf5c0ad96490b53e0de1592abfa53049206fe3d963e18e9576bf`.
+Cargo.lock remains `ad2c99a06a8ffe5353a0775f396c95fd6c8ffebc7c095d0c61f2863bab83410c`.
+All nine registered model files are unchanged across the real-model probes.
+No performance, strict-remote, physical-Apple, binary-release or full-Quill-
+conformance result is claimed. `bd-dsbym` remains in progress: the fresh
+16:45:29 UTC Apple admission refuses 2.79 GiB available against 40 GiB. Its
+original 15:41 probe and both retired stock runs remain retained.
+
+### Bounded work and honesty review for source replacement
+
+Window: `e473ee17` through `dbfccddb`, `b1fe37b7`, `f02742f3` and this metadata
+update. Inspect the three actual source commits, their test diffs, unchanged
+manifests/gate/configuration, the published refs and this one owned Bead close.
+The README's purpose is two-tier hybrid local search: fast first-pass results,
+then quality refinement.
+
+**Process worksheet.** Runtime does not branch on this TODO or tracker comments.
+Consumer: the owner explicitly requested a granular TODO and current Beads.
+Gate and defect provenance: that request covers tracking this native rescan
+feature; the observed weak negative controls show why qualification must remain
+distinct from partial runs. Retirement: source publication and evidence-bound
+closure, now reached; preserve this as dated history. Raw logs/identity receipts
+are an integrity control: they prevent losing exact retired runs or confusing
+the ELF/source/model that ran; yes, needed for multiple profiles and attempts;
+yes, raw receipts are the minimum; no, a commit name alone cannot identify the
+executable. Highest ready capability work was this independent source-ingress
+feature after the blocked parent refused claiming; `br ready` was otherwise
+empty. Another hour of report design would deliver less value. Verdict:
+LEGITIMATE GATE for the requested checklist; no new report framework.
+
+**Real-work worksheet.** `dbfccddb` is USER: a cold rescan or warm replacement
+can remove omitted IDs and reuse unchanged vectors. `b1fe37b7` and `f02742f3`
+are ENABLER: corrected refusal controls for that feature. This tracker/evidence
+update is PROCESS, with a small user-facing changelog entry; UNKNOWN is zero.
+Tally: USER 1, ENABLER 2, PROCESS 1; no commit-count credit. A two-minute demo
+is the documented replacement command followed by fresh search/fetch. Removing
+PROCESS leaves runtime unchanged but loses the requested progress/evidence
+boundaries. The new controls are exercised by focused and full stock tests;
+actual model behavior is separately exercised by twenty live outcomes. The
+oldest bounded open item remains Quill E6, July 16; it has its own original
+dependency/conformance requirements, which this additive CLI feature cannot
+close. No swarm or close farming. No plan-only commit substitutes for code, and
+no follow-up carries away an unmet original condition. Verdict: DRIFTING in
+cost: starting gates before completing the negative-control review wasted two
+retired runs. Correction: finish that review before freezing source, then
+publish the qualified capability without adding more reporting machinery.
+
+**Honesty inventory.** Answers are bounded to this window and cited artifacts.
+
+1. No (checked: the full test diff adds/strengthens cases; no old assertion,
+   ignore, gate, tolerance or deadline is weakened).
+2. No (checked: existing providers are labeled unit controls; actual model
+   CLI/process proof is separate, and no new fake implementation is introduced).
+3. No (checked: changed paths contain no regenerated golden or snapshot).
+4. New regression tests and shared product document validation accompany the
+   feature. No test gate, suppression, skip, retry budget or tolerance changes
+   (checked: original predicate and unchanged gate/configuration diff).
+5. No (checked: all eighteen stock labels run on the recorded native host;
+   no benchmark hardcoding, special expected results or narrowed stock stages).
+6. No accepted test result is zero-run (checked: four populated focused cases,
+   all 352 native cases, 598 facade library cases and twenty live outcomes;
+   empty Quill inventory targets explicitly receive no pass credit).
+7. No (checked: cited results have observed terminal exits and raw receipts;
+   source publication is verified on both remote refs).
+8. No (checked: unit providers, actual Potion/MiniLM, debug profile, native
+   host and refused remote/Apple admission retain their actual proof classes).
+9. No material failure is omitted (checked: weak controls, both -15 retired
+   runs, queued RCH admission and both Apple refusals remain recorded).
+10. No (checked: claimed runs retain stdout/stderr or combined raw logs;
+    incidental reader/session checks are not qualification evidence).
+11. No (checked: only the owned additive feature closes after original-criteria
+    review and publication; broader migration/release requirements stay open).
+12. No (checked: the feature's original description and acceptance are unchanged;
+    parent prerequisites and peer acceptance are not edited).
+13. No (checked: this window is solo; the one owned close cites exact source).
+14. No (checked: no subagent dispatch or success-only delegation).
+15. No (checked: no subagent report substitutes for executed evidence).
+16. No (checked: no panes or refusal-only closes; the feature has live positives).
+17. No (checked: no agent agreement or independent certification is claimed).
+18. No (checked: topology/retrieval combinations, twenty live outcomes and
+    eighteen stock labels are defined before their results; no performance ratio).
+19. Yes: initial parser, oversize and cancellation negatives could fail for
+    another reason. Correct them in place with valid bases, exact refusal
+    classes and the identical valid cancelled request succeeding afterward.
+    Retain both prematurely started gate runs without full-pass credit.
+    One tracker-read formatter also expected a list instead of an issues object;
+    correct that read without changing its original JSON or counting it as a gate.
+20. Strongest evidence: the re-executable clean-source eighteen-stage stock run
+    plus source-bound ELF/model identities and the twenty actual cold/warm/fresh
+    process outcomes. The receipt files above identify every command and result.
+
+Older-session review remains the prior bounded CASS sweep and direct views.
+This window adds `cass-replacement-search.json` and `cass-replacement-view.json`:
+the inspected hit concerns Cargo vendoring, not this rescan feature, and supplies
+no current qualification or misconduct claim. No second corpus writer is started.
+Disposition: the weak controls are corrected, disclosed here and in commentary,
+and covered by RH-2's valid positive/negative comparisons; RH-1 retains the
+unchanged stock gates, RH-4 gives retired runs and commit counts no capability
+credit, and RH-9/RH-10 preserve the original broader acceptance. The source is
+qualified for this feature; overall release and project completion remain open.
 
 ## November 24 release continuation — OrangeSparrow
 

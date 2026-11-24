@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native authority rescans accept a complete document inventory through
+  `authority-update --replace-source` or a granted warm update's `documents`
+  array. Omitted IDs are removed, unchanged content reuses its stored vectors,
+  and metadata can change without embedding again. Partial-quality generations
+  retain their surviving covered IDs and admit new IDs to the fast tier.
+
 ### Fixed
 
 - Incremental vector appends now validate the existing WAL header and roll
