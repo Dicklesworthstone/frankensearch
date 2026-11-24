@@ -983,10 +983,13 @@ impl NativeGenerationSnapshot {
     /// Unchanged vectors retain their stored bits. Storage and graph policies
     /// are inherited independently and may be explicitly overridden on the plan.
     ///
-    /// The returned [`NativePartialQualityUpdate`] exposes only partial
-    /// finalization. Deleting all covered IDs or leaving only covered IDs refuses
-    /// before inference or work files. Use the explicit quality-completion
-    /// contract for coverage expansion. Source export uses
+    /// [`NativePartialQualityUpdate::build`] preserves partial topology and
+    /// refuses deletion of all covered or all uncovered IDs before inference or
+    /// work files. Explicitly select
+    /// [`NativePartialQualityUpdate::build_with_realized_coverage`] to derive a
+    /// fast-only or complete successor at those boundaries. Neither route adds
+    /// previously uncovered IDs to quality; use the explicit quality-completion
+    /// contract for that expansion. Source export uses
     /// [`Self::source_documents`]'s payload budget; the original authority and
     /// both owners remain pinned throughout construction. Publication still
     /// requires this snapshot's original expected authority pair.

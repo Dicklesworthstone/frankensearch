@@ -5843,6 +5843,476 @@ mod qualified_rollback {
                 });
             }
 
+            fn publish_and_reopen_realized(
+                cx: &Cx,
+                parent: &Path,
+                built: &NativeBuiltExactGeneration,
+                previous: &NativeGenerationSnapshot,
+            ) -> NativeGenerationSnapshot {
+                let root_path = parent.join("root");
+                let root = admit_root(&root_path);
+                let candidate = built
+                    .candidate(
+                        [0x91; 16],
+                        Some(previous.authority()),
+                        GenerationAuthorityActionV1::Activate,
+                        [0x92; 32],
+                    )
+                    .unwrap();
+                built.validate_candidate(cx, &candidate).unwrap();
+                stage(&root, built, &candidate);
+                let mut publisher =
+                    GenerationPublisherV1::new(&root, ROOT_ID, [0x93; 16], PROFILE).unwrap();
+                let attempt = publisher
+                    .prepare_attempt(
+                        &candidate,
+                        previous.retained_snapshot().authority_pair(),
+                        [0x93; 16],
+                        [0x94; 16],
+                    )
+                    .unwrap();
+                let outcome = publisher
+                    .publish_prepared(cx, &candidate, &attempt, None, BUDGET as u64)
+                    .unwrap();
+                assert!(matches!(
+                    outcome.publication,
+                    PublicationOutcomeV1::Committed { .. }
+                ));
+                assert!(matches!(
+                    outcome.activation,
+                    Some(GenerationActivationV1::Installed(_))
+                ));
+                let fresh_root = admit_root(&root_path);
+                let SnapshotOpenOutcomeV1::Opened(opened) = fresh_root
+                    .open_generation_snapshot_with_budget(ROOT_ID, PROFILE, None, BUDGET as u64)
+                    .unwrap()
+                else {
+                    panic!("a realized-coverage update must reopen its published component closure")
+                };
+                let reopened = match built.quality_binding() {
+                    None => NativeGenerationSnapshot::admit_exact(
+                        cx,
+                        opened,
+                        built.binding(),
+                        DEFAULT_SCHEMA,
+                        config(),
+                        BUDGET,
+                    ),
+                    Some(quality) => {
+                        let admit = if built.coverage() == VectorCohortCoverage::PartialQuality {
+                            NativeGenerationSnapshot::admit_partial_quality
+                        } else {
+                            NativeGenerationSnapshot::admit_progressive
+                        };
+                        admit(
+                            cx,
+                            opened,
+                            built.binding(),
+                            quality,
+                            DEFAULT_SCHEMA,
+                            config(),
+                            BUDGET,
+                        )
+                    }
+                }
+                .unwrap();
+                assert_eq!(reopened.authority(), candidate.authority());
+                reopened
+            }
+
+            #[test]
+            fn realized_coverage_updates_publish_exact_survivors_without_inference() {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    for graph in [false, true] {
+                        for replace in [false, true] {
+                            for (removed, expected_ids, topology) in [
+                                (
+                                    vec!["b", "e"],
+                                    vec!["a", "c"],
+                                    NativeGenerationTopology::FastOnly,
+                                ),
+                                (
+                                    vec!["a", "c"],
+                                    vec!["b", "e"],
+                                    NativeGenerationTopology::FullProgressive,
+                                ),
+                                (
+                                    vec!["a", "b", "c", "e"],
+                                    vec![],
+                                    NativeGenerationTopology::FastOnly,
+                                ),
+                                (
+                                    vec!["c"],
+                                    vec!["a", "b", "e"],
+                                    NativeGenerationTopology::PartialQuality {
+                                        quality_documents: 2,
+                                        total_documents: 3,
+                                        coverage_ppm: 666_666,
+                                    },
+                                ),
+                            ] {
+                                let fixture = fixture_with_quality_input(&cx, true).await;
+                                let retained = &fixture.snapshot;
+                                let root_path = fixture.parent.join("root");
+                                let authority_before =
+                                    fs::read(root_path.join("AUTHORITY")).unwrap();
+                                let old_fast = vector_bits(&retained.readers.vector);
+                                let old_quality =
+                                    vector_bits(retained.readers.quality.as_ref().unwrap());
+                                let documents = retained.source_documents(&cx, BUDGET).unwrap();
+                                let mut expected_source = documents
+                                    .iter()
+                                    .filter(|document| expected_ids.contains(&document.id.as_str()))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                expected_source.sort_by(|left, right| left.id.cmp(&right.id));
+                                let mut plan = retained
+                                    .begin_partial_quality_update(
+                                        &cx,
+                                        fixture.parent.join("realized"),
+                                        ArtifactGenerationIdentityV1::new(8, [0x95; 16]).unwrap(),
+                                        fixture.fast.clone(),
+                                        fixture.quality.clone(),
+                                        BUDGET,
+                                    )
+                                    .unwrap()
+                                    .with_fast_storage(
+                                        NativeBuildPrecision::F16,
+                                        progressive_policy(graph, false),
+                                    )
+                                    .with_quality_storage(
+                                        NativeBuildPrecision::F16,
+                                        progressive_policy(graph, true),
+                                    )
+                                    .unwrap();
+                                if replace {
+                                    plan = plan
+                                        .replace_documents(&cx, expected_source.clone())
+                                        .unwrap();
+                                } else {
+                                    for id in removed {
+                                        plan = plan.delete_document(id);
+                                    }
+                                }
+                                let built = plan
+                                    .build_with_realized_coverage(
+                                        &cx,
+                                        CommitRange { low: 1, high: 5 },
+                                        BUDGET,
+                                    )
+                                    .await
+                                    .unwrap();
+                                assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                                assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                                assert_eq!(
+                                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                                    authority_before
+                                );
+                                assert_eq!(
+                                    built.metadata().total_documents,
+                                    expected_ids.len() as u64
+                                );
+                                assert_eq!(
+                                    built.metadata().commit_range,
+                                    CommitRange { low: 1, high: 5 }
+                                );
+                                assert_progressive_policy(
+                                    built.retrieval_configuration(),
+                                    graph,
+                                    false,
+                                );
+                                if topology == NativeGenerationTopology::FastOnly {
+                                    assert!(built.quality_binding().is_none());
+                                    assert!(built.quality_retrieval_configuration().is_none());
+                                    assert!(!built.metadata().embedders.contains_key("quality"));
+                                } else {
+                                    assert_progressive_policy(
+                                        built.quality_retrieval_configuration().unwrap(),
+                                        graph,
+                                        true,
+                                    );
+                                }
+                                let current = publish_and_reopen_realized(
+                                    &cx,
+                                    &fixture.parent,
+                                    &built,
+                                    retained,
+                                );
+                                assert_eq!(current.topology(), topology);
+                                assert_eq!(
+                                    vector_bits(&current.readers.vector),
+                                    old_fast
+                                        .iter()
+                                        .filter(|(id, _)| expected_ids.contains(&id.as_str()))
+                                        .map(|(id, bits)| (id.clone(), bits.clone()))
+                                        .collect(),
+                                );
+                                if let Some(quality) = current.readers.quality.as_ref() {
+                                    assert_eq!(
+                                        vector_bits(quality),
+                                        old_quality
+                                            .iter()
+                                            .filter(|(id, _)| expected_ids.contains(&id.as_str()))
+                                            .map(|(id, bits)| (id.clone(), bits.clone()))
+                                            .collect(),
+                                    );
+                                }
+                                let mut actual_source =
+                                    current.source_documents(&cx, BUDGET).unwrap();
+                                actual_source.sort_by(|left, right| left.id.cmp(&right.id));
+                                assert_eq!(
+                                    serde_json::to_value(actual_source).unwrap(),
+                                    serde_json::to_value(expected_source).unwrap()
+                                );
+                                let hits = match topology {
+                                    NativeGenerationTopology::FastOnly => current
+                                        .search_text(&cx, fixture.fast.as_ref(), "unmatched", 10)
+                                        .await
+                                        .unwrap(),
+                                    NativeGenerationTopology::FullProgressive => current
+                                        .search_refined_text(
+                                            &cx,
+                                            fixture.fast.as_ref(),
+                                            fixture.quality.as_ref(),
+                                            "unmatched",
+                                            10,
+                                        )
+                                        .await
+                                        .unwrap(),
+                                    NativeGenerationTopology::PartialQuality { .. } => current
+                                        .search_progressive_with_partial_quality(
+                                            &cx,
+                                            fixture.fast.as_ref(),
+                                            fixture.quality.as_ref(),
+                                            "unmatched",
+                                            10,
+                                        )
+                                        .unwrap()
+                                        .collect()
+                                        .await
+                                        .unwrap(),
+                                    NativeGenerationTopology::QualityOnly => {
+                                        unreachable!("a partial update keeps the fast owner")
+                                    }
+                                };
+                                let mut ids = hits
+                                    .iter()
+                                    .map(|hit| hit.doc_id.as_str())
+                                    .collect::<Vec<_>>();
+                                ids.sort_unstable();
+                                assert_eq!(ids, expected_ids);
+                                assert_eq!(vector_bits(&retained.readers.vector), old_fast);
+                                assert_eq!(
+                                    vector_bits(retained.readers.quality.as_ref().unwrap()),
+                                    old_quality
+                                );
+                                assert_eq!(
+                                    retained.partial_quality_document_ids(&cx).unwrap(),
+                                    ["b", "e"]
+                                );
+                                assert_eq!(
+                                    retained.source_documents(&cx, BUDGET).unwrap().len(),
+                                    4
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+
+            #[test]
+            fn realized_coverage_infers_only_changed_members_in_their_original_tiers() {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    for complete in [false, true] {
+                        let fixture = fixture_with_quality_input(&cx, true).await;
+                        let retained = &fixture.snapshot;
+                        let replacement = if complete {
+                            vec![
+                                IndexableDocument::new("b", "beta cohort document")
+                                    .with_title("new title"),
+                                IndexableDocument::new("e", "quality-special"),
+                            ]
+                        } else {
+                            vec![
+                                IndexableDocument::new("a", "alpha cohort document"),
+                                IndexableDocument::new("n", "new live document"),
+                            ]
+                        };
+                        let built = retained
+                            .begin_partial_quality_update(
+                                &cx,
+                                fixture.parent.join("changed-realized"),
+                                ArtifactGenerationIdentityV1::new(8, [0x96; 16]).unwrap(),
+                                fixture.fast.clone(),
+                                fixture.quality.clone(),
+                                BUDGET,
+                            )
+                            .unwrap()
+                            .replace_documents(&cx, replacement)
+                            .unwrap()
+                            .build_with_realized_coverage(
+                                &cx,
+                                CommitRange { low: 1, high: 5 },
+                                BUDGET,
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(
+                            fixture.quality.calls.load(Ordering::SeqCst),
+                            usize::from(complete)
+                        );
+                        let current =
+                            publish_and_reopen_realized(&cx, &fixture.parent, &built, retained);
+                        if complete {
+                            assert_eq!(
+                                current.topology(),
+                                NativeGenerationTopology::FullProgressive
+                            );
+                            assert_eq!(
+                                stored_vector(&current.readers, "b"),
+                                stored_vector(&retained.readers, "b")
+                            );
+                            assert_eq!(
+                                vector_bits(current.readers.quality.as_ref().unwrap())["b"],
+                                vector_bits(retained.readers.quality.as_ref().unwrap())["b"]
+                            );
+                            assert_ne!(
+                                stored_vector(&current.readers, "e"),
+                                stored_vector(&retained.readers, "e")
+                            );
+                        } else {
+                            assert_eq!(current.topology(), NativeGenerationTopology::FastOnly);
+                            assert!(current.readers.quality.is_none());
+                            assert_eq!(
+                                stored_vector(&current.readers, "a"),
+                                stored_vector(&retained.readers, "a")
+                            );
+                        }
+                    }
+                });
+            }
+
+            #[test]
+            fn realized_coverage_refuses_backward_source_and_cancellation_before_work() {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let fixture = fixture(&cx).await;
+                    let retained = &fixture.snapshot;
+                    let root_path = fixture.parent.join("root");
+                    let authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                    let lock = fs::read(root_path.join("LOCK")).unwrap();
+                    for source in [
+                        CommitRange { low: 0, high: 5 },
+                        CommitRange { low: 1, high: 3 },
+                        CommitRange { low: 6, high: 5 },
+                    ] {
+                        for complete in [false, true] {
+                            let work = fixture.parent.join(format!(
+                                "realized-source-{}-{}-{complete}",
+                                source.low, source.high
+                            ));
+                            let mut plan = retained
+                                .begin_partial_quality_update(
+                                    &cx,
+                                    &work,
+                                    ArtifactGenerationIdentityV1::new(8, [0x97; 16]).unwrap(),
+                                    fixture.fast.clone(),
+                                    fixture.quality.clone(),
+                                    BUDGET,
+                                )
+                                .unwrap();
+                            for id in if complete { ["a", "c"] } else { ["b", "e"] } {
+                                plan = plan.delete_document(id);
+                            }
+                            assert!(
+                                plan.build_with_realized_coverage(&cx, source.clone(), BUDGET)
+                                    .await
+                                    .is_err()
+                            );
+                            assert!(!work.exists());
+                        }
+                    }
+                    let work = fixture.parent.join("realized-cancelled");
+                    let plan = retained
+                        .begin_partial_quality_update(
+                            &cx,
+                            &work,
+                            ArtifactGenerationIdentityV1::new(8, [0x98; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            fixture.quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .delete_document("b")
+                        .delete_document("e");
+                    cx.set_cancel_requested(true);
+                    let result = plan
+                        .build_with_realized_coverage(&cx, CommitRange { low: 1, high: 5 }, BUDGET)
+                        .await;
+                    cx.set_cancel_requested(false);
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                    assert!(!work.exists());
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
+                    assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock);
+                });
+            }
+
+            #[test]
+            fn realized_coverage_quality_failures_preserve_the_partial_predecessor() {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    for cancel in [false, true] {
+                        let fixture = fixture(&cx).await;
+                        let retained = &fixture.snapshot;
+                        let root_path = fixture.parent.join("root");
+                        let authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                        let lock = fs::read(root_path.join("LOCK")).unwrap();
+                        let old_fast = vector_bits(&retained.readers.vector);
+                        let old_quality = vector_bits(retained.readers.quality.as_ref().unwrap());
+                        let quality =
+                            Arc::new(FaultingQuality::new(fixture.quality.clone(), cancel));
+                        let plan = retained
+                            .begin_partial_quality_update(
+                                &cx,
+                                fixture.parent.join("failed-realized"),
+                                ArtifactGenerationIdentityV1::new(8, [0x99; 16]).unwrap(),
+                                fixture.fast.clone(),
+                                quality,
+                                BUDGET,
+                            )
+                            .unwrap()
+                            .delete_document("a")
+                            .delete_document("c")
+                            .upsert_document(IndexableDocument::new("e", "quality-special"));
+                        let result = plan
+                            .build_with_realized_coverage(
+                                &cx,
+                                CommitRange { low: 1, high: 5 },
+                                BUDGET,
+                            )
+                            .await;
+                        cx.set_cancel_requested(false);
+                        assert!(result.is_err());
+                        if cancel {
+                            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                        }
+                        assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
+                        assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock);
+                        assert_eq!(vector_bits(&retained.readers.vector), old_fast);
+                        assert_eq!(
+                            vector_bits(retained.readers.quality.as_ref().unwrap()),
+                            old_quality
+                        );
+                        assert_eq!(
+                            retained.partial_quality_document_ids(&cx).unwrap(),
+                            ["b", "e"]
+                        );
+                        assert_eq!(retained.source_documents(&cx, BUDGET).unwrap().len(), 4);
+                    }
+                });
+            }
+
             #[test]
             fn partial_updates_refuse_empty_or_complete_coverage_before_inference_or_files() {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {

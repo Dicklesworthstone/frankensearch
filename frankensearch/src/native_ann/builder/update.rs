@@ -566,10 +566,11 @@ impl NativeQualityCompletion {
 /// surviving members require full re-inference; ordinary updates still require
 /// both original identities.
 ///
-/// This plan exposes only partial-quality finalization. An edit that leaves an
-/// empty or fully covered source is refused before files or inference; topology
-/// transitions retain their separate explicit contracts. No build publishes,
-/// changes the selected authority, or invalidates an existing reader.
+/// [`Self::build`] preserves partial topology and refuses edits that leave empty
+/// or complete quality coverage. [`Self::build_with_realized_coverage`] explicitly
+/// permits those boundaries, deriving the successor topology from surviving
+/// admitted membership. No build publishes, changes the selected authority, or
+/// invalidates an existing reader.
 #[cfg(feature = "quill")]
 pub struct NativePartialQualityUpdate {
     update: NativeIndexUpdate,
@@ -692,8 +693,9 @@ impl NativePartialQualityUpdate {
     ///
     /// # Errors
     /// Refuses empty/duplicate IDs, the configured input byte limit, or
-    /// cancellation before any files or inference. Finalization also refuses
-    /// replacements with empty or complete quality coverage.
+    /// cancellation before any files or inference. [`Self::build`] also refuses
+    /// replacements with empty or complete quality coverage; explicitly select
+    /// [`Self::build_with_realized_coverage`] to admit those transitions.
     pub fn replace_documents(
         mut self,
         cx: &Cx,
@@ -784,6 +786,46 @@ impl NativePartialQualityUpdate {
         source: CommitRange,
         max_image_bytes: usize,
     ) -> SearchResult<NativeBuiltExactGeneration> {
+        Box::pin(self.build_with_coverage_policy(cx, source, max_image_bytes, false)).await
+    }
+
+    /// Build the exact topology left by these edits and retained quality membership.
+    ///
+    /// This explicitly permits a partial generation to cross a coverage boundary:
+    /// no surviving covered IDs yields fast-only, every surviving ID covered
+    /// yields complete progressive, and a proper subset remains partial quality.
+    /// An empty source is fast-only, retaining its fast identity for later updates.
+    /// No new or previously uncovered ID gains quality coverage. Completing those
+    /// rows still requires the separate quality-completion contract.
+    ///
+    /// Coverage comes from the retained quality owner's actual rows after all
+    /// source edits, including complete source replacement. Unchanged vectors
+    /// preserve their bits in their own tier; changed content and explicit model
+    /// or precision changes obey the ordinary independent inference rules. A
+    /// fast-only successor omits the quality provider, graph and metadata entry.
+    /// The original authority and both owners remain pinned through component
+    /// admission. Publish with the predecessor's original expected authority pair.
+    ///
+    /// # Errors
+    /// Refuses backward source boundaries, invalid source records, producer drift,
+    /// budget exhaustion or cancellation. Source and membership admission precede
+    /// inference and work-file creation. A failure never changes the predecessor.
+    pub async fn build_with_realized_coverage(
+        self,
+        cx: &Cx,
+        source: CommitRange,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        Box::pin(self.build_with_coverage_policy(cx, source, max_image_bytes, true)).await
+    }
+
+    async fn build_with_coverage_policy(
+        self,
+        cx: &Cx,
+        source: CommitRange,
+        max_image_bytes: usize,
+        realize_coverage: bool,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
         checkpoint(cx, "native_ann.partial_update.build")?;
         let retained = self.update.builder.reuse.as_ref().ok_or_else(|| {
             invalid(
@@ -801,7 +843,7 @@ impl NativePartialQualityUpdate {
             ));
         }
         let authority_pin = Arc::clone(&authority.snapshot);
-        let builder = self.update.prepare(cx)?;
+        let mut builder = self.update.prepare(cx)?;
         let selected = builder
             .reuse
             .as_ref()
@@ -813,13 +855,32 @@ impl NativePartialQualityUpdate {
                 )
             })?
             .preserved_partial_quality_ids(cx, &builder.documents)?;
-        let result = Box::pin(builder.build_partial_quality_generation(
-            cx,
-            source,
-            selected,
-            max_image_bytes,
-        ))
-        .await;
+        let result = if realize_coverage && selected.is_empty() {
+            // Empty membership is an explicit topology transition, including
+            // an empty source. Retain the old owners as reuse/publication pins,
+            // but never emit an empty quality tier as if it were complete.
+            builder.quality = None;
+            Box::pin(builder.build_exact_generation(
+                cx,
+                EmbedderTierTag::Fast,
+                source,
+                max_image_bytes,
+            ))
+            .await
+        } else if realize_coverage && selected.len() == builder.documents.len() {
+            // Every surviving ID already belonged to the admitted quality owner.
+            // This cannot silently infer previously uncovered rows or expand the
+            // old subset: the complete input is exactly its surviving members.
+            Box::pin(builder.build_progressive_generation(cx, source, max_image_bytes)).await
+        } else {
+            Box::pin(builder.build_partial_quality_generation(
+                cx,
+                source,
+                selected,
+                max_image_bytes,
+            ))
+            .await
+        };
         drop(authority_pin);
         result
     }
