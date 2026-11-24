@@ -26,22 +26,12 @@ pub(super) enum Request {
         expected_generation: ArtifactGenerationIdentityV1,
         index_dir: PathBuf,
         new_receipt: PathBuf,
-        #[serde(default, deserialize_with = "supplied_array")]
+        #[serde(default, deserialize_with = "super::supplied_array")]
         changes: Option<Vec<update::Mutation>>,
-        #[serde(default, deserialize_with = "supplied_array")]
+        #[serde(default, deserialize_with = "super::supplied_array")]
         documents: Option<Vec<DocumentInput>>,
         shard_size: Option<usize>,
     },
-}
-
-// A missing field and an explicit null must remain distinct. In particular,
-// a malformed changes value cannot authorize an accompanying empty inventory.
-fn supplied_array<'de, D, T>(deserializer: D) -> std::result::Result<Option<Vec<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Vec::<T>::deserialize(deserializer).map(Some)
 }
 
 struct UpdateInput {

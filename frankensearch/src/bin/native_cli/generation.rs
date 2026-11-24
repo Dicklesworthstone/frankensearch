@@ -331,6 +331,24 @@ identity, retrieval policy, source checkpoint, document set and Quill image must
 match the serving generation. Partial successors keep explicit partial retrieval;\n\
 full/quality queries become available after full coverage admission and a final\n\
 current-head check. Failure keeps the previous serving selection.\n\
+With both --allow-updates and --allow-model-activation, op=complete_quality\n\
+builds, publishes and installs quality coverage directly in the warm session.\n\
+Supply expected_authority, new absolute work_dir and new_receipt paths. Optional\n\
+quality_ids is the complete desired covered subset: nonempty, unique, strictly\n\
+larger than current coverage, retaining every covered ID. Alternatively,\n\
+max_new_quality_documents bounds the next missing IDs in lexicographic order\n\
+and automatically completes full coverage on the final batch. The two selectors\n\
+are exclusive; omit both for full completion. Null and zero limits are refused.\n\
+Source documents and their checkpoint stay retained.\n\
+A fast-only session loads only the explicitly selected local quality model:\n\
+quality_backend plus quality_model_dir for native quality, or model_dir for ONNX.\n\
+A partial session retains both model instances and rejects replacement model\n\
+options. Fast vectors are always reused; previously covered quality vectors and\n\
+query caches are retained. Optional retrieval=exact|hnsw selects quality retrieval;\n\
+otherwise existing quality policy is retained. Fast retrieval stays unchanged.\n\
+The request inherits --batch-size, source/image budgets and the fixed filter.\n\
+Replies report publication and serving separately. Partial coverage advertises\n\
+fast/partial/lexical; full/quality become available only after complete admission.\n\
 Explicit --lexical-only on authority-search/serve runs retained Quill keyword\n\
 search without loading or invoking a model. It excludes model options and\n\
 --allow-updates, but permits source fetch and granted activation. The complete\n\
@@ -3766,6 +3784,7 @@ struct AuthoritySearchRequest {
 
 /// Explicit execution policy. A missing or failed model never selects lexical
 /// execution; that choice must come from startup options or a query request.
+#[derive(Clone)]
 enum AuthorityModels {
     Semantic(Models),
     Lexical,
@@ -3894,7 +3913,9 @@ struct AuthorityUpdateRequest {
     new_receipt: PathBuf,
     source_low: u64,
     source_high: u64,
+    #[serde(default, deserialize_with = "super::serve::supplied_array")]
     changes: Option<Vec<mutations::Mutation>>,
+    #[serde(default, deserialize_with = "super::serve::supplied_array")]
     documents: Option<Vec<DocumentInput>>,
 }
 
@@ -3914,6 +3935,7 @@ enum AuthorityRequest {
     Search(AuthoritySearchRequest),
     TunedSearch(query_controls::SearchEnvelope),
     ModelActivation(model_activation::Request),
+    CompleteQuality(quality_completion::Request),
     Activate(AuthorityActivateRequest),
     Update(AuthorityUpdateRequest),
     Fetch(AuthorityFetchRequest),
@@ -4194,6 +4216,58 @@ impl AuthoritySession {
             annotate_execution(&mut response, QueryMode::Lexical);
         }
         response
+    }
+
+    /// Project capabilities from the admitted selection. This stays infallible
+    /// because publication replies use it after the durable commit.
+    fn annotate_query_capabilities(&self, response: &mut serde_json::Value) {
+        let semantic = !self.models.is_lexical();
+        let topology = self.receipt.topology();
+        let (default_mode, modes): (&str, &[&str]) = if !semantic {
+            ("lexical", &["lexical"])
+        } else {
+            match topology {
+                NativeGenerationTopology::FastOnly => ("fast", &["fast", "lexical"]),
+                NativeGenerationTopology::QualityOnly => ("quality", &["quality", "lexical"]),
+                NativeGenerationTopology::FullProgressive => {
+                    ("full", &["fast", "quality", "full", "lexical"])
+                }
+                NativeGenerationTopology::PartialQuality { .. } => {
+                    ("fast", &["fast", "partial", "lexical"])
+                }
+            }
+        };
+        response["query_modes"] = serde_json::json!(modes);
+        response["default_mode"] = serde_json::json!(default_mode);
+        response["progressive_available"] = serde_json::json!(
+            semantic
+                && (self.receipt.quality_identity.is_some() || self.query_policy.rerank.is_some())
+        );
+        let incomplete = matches!(
+            topology,
+            NativeGenerationTopology::FastOnly | NativeGenerationTopology::PartialQuality { .. }
+        );
+        let completion = semantic && incomplete && self.allow_model_activation;
+        response["quality_completion_activation_enabled"] = serde_json::json!(completion);
+        response["quality_completion_enabled"] =
+            serde_json::json!(completion && self.update_limits.is_some());
+        response["full_mode_reranker"] = serde_json::json!(
+            self.query_policy
+                .rerank
+                .as_ref()
+                .filter(|_| topology == NativeGenerationTopology::FullProgressive)
+                .map(|rerank| rerank.model.id())
+        );
+        response["rerank_modes"] = if self.query_policy.rerank.is_some() {
+            serde_json::json!(
+                modes
+                    .iter()
+                    .filter(|mode| **mode != "lexical")
+                    .collect::<Vec<_>>()
+            )
+        } else {
+            serde_json::json!([])
+        };
     }
 
     fn failure(
@@ -4650,26 +4724,9 @@ async fn serve_session(
     ready["documents"] = serde_json::json!(session.receipt.documents);
     ready["activation_enabled"] = serde_json::json!(session.allow_activation);
     ready["model_activation_enabled"] = serde_json::json!(session.allow_model_activation);
-    ready["quality_completion_activation_enabled"] = serde_json::json!(
-        session.allow_model_activation
-            && !session.models.is_lexical()
-            && matches!(
-                session.receipt.topology(),
-                NativeGenerationTopology::FastOnly
-                    | NativeGenerationTopology::PartialQuality { .. }
-            )
-    );
+    session.annotate_query_capabilities(&mut ready);
     ready["updates_enabled"] = serde_json::json!(session.update_limits.is_some());
     ready["fetch_enabled"] = serde_json::json!(true);
-    ready["query_modes"] = if session.models.is_lexical() {
-        serde_json::json!(["lexical"])
-    } else if session.receipt.quality_documents.is_some() {
-        serde_json::json!(["fast", "partial", "lexical"])
-    } else if session.receipt.quality_identity.is_some() {
-        serde_json::json!(["fast", "quality", "full", "lexical"])
-    } else {
-        serde_json::json!([session.receipt.query_mode(None)?.as_str(), "lexical"])
-    };
     ready["max_fetch_documents"] = serde_json::json!(source::MAX_DOCUMENTS);
     ready["max_fetch_content_bytes"] = serde_json::json!(source::MAX_CONTENT_BYTES);
     ready["max_fetch_response_bytes"] = serde_json::json!(source::MAX_RESPONSE_BYTES);
@@ -4683,27 +4740,6 @@ async fn serve_session(
     ready["query_cache_entries"] = serde_json::json!(session.query_cache.entries());
     ready["query_tuning_enabled"] =
         serde_json::json!(session.query_policy.query_overrides_enabled());
-    ready["full_mode_reranker"] = serde_json::json!(
-        session
-            .query_policy
-            .rerank
-            .as_ref()
-            .filter(|_| session.receipt.topology() == NativeGenerationTopology::FullProgressive)
-            .map(|rerank| rerank.model.id())
-    );
-    ready["rerank_modes"] = if session.query_policy.rerank.is_some() {
-        serde_json::Value::Array(
-            ready["query_modes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|mode| mode.as_str() != Some("lexical"))
-                .cloned()
-                .collect(),
-        )
-    } else {
-        serde_json::json!([])
-    };
     ready["rerank_window"] = serde_json::json!(
         session
             .query_policy
@@ -4714,13 +4750,6 @@ async fn serve_session(
     query_controls::annotate(&session.query_policy, QueryMode::Full, &mut ready);
     ready["max_source_bytes"] = serde_json::json!(session.max_source_bytes);
     ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
-    ready["default_mode"] =
-        serde_json::json!(session.models.query_mode(&session.receipt, None)?.as_str());
-    ready["progressive_available"] = serde_json::json!(
-        !session.models.is_lexical()
-            && (session.receipt.quality_identity.is_some()
-                || session.query_policy.rerank.is_some())
-    );
     emit(output, &ready)?;
     let mut record = Vec::new();
     let mut ordinal = 0_u64;
@@ -4795,11 +4824,8 @@ async fn serve_session(
                     });
                     if completes_quality {
                         response["fast_model_retained"] = serde_json::json!(true);
-                        response["progressive_available"] = serde_json::json!(true);
-                        response["query_modes"] =
-                            serde_json::json!(["fast", "quality", "full", "lexical"]);
-                        response["default_mode"] = serde_json::json!("full");
                     }
+                    session.annotate_query_capabilities(&mut response);
                     Some(response)
                 });
                 (id, result, false)
@@ -4819,6 +4845,20 @@ async fn serve_session(
                     Some(response)
                 });
                 (id, result, false)
+            }
+            AuthorityRequest::CompleteQuality(request) => {
+                let id = request
+                    .id
+                    .clone()
+                    .filter(|id| super::serve::validate_id(Some(id)).is_ok());
+                let result =
+                    Box::pin(session.complete_quality(cx, request))
+                        .await
+                        .map(|mut response| {
+                            response["request"] = serde_json::json!(ordinal);
+                            Some(response)
+                        });
+                (id, result, true)
             }
             AuthorityRequest::Update(request) => {
                 let id = request
@@ -4865,8 +4905,8 @@ async fn serve_session(
                 continue;
             }
         };
-        // Updates may already have committed, or returned a typed uncertain
-        // publication outcome. Neither can be erased by a late cancellation.
+        // Writer requests may already have committed, or returned a typed
+        // uncertain outcome. Neither can be erased by a late cancellation.
         if !is_update {
             checkpoint(cx)?;
         }

@@ -87,7 +87,7 @@ impl Request {
     }
 }
 
-fn validate_path(path: &Path) -> Result<()> {
+pub(super) fn validate_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
         || path
             .to_str()
@@ -98,7 +98,7 @@ fn validate_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn bounded_error(
+pub(super) fn bounded_error(
     error: Box<dyn Error + Send + Sync>,
     code: &'static str,
 ) -> Box<dyn Error + Send + Sync> {

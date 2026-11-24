@@ -31,6 +31,19 @@ pub mod source;
 
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
+// A missing array and an explicit null must remain distinct. In particular,
+// malformed changes cannot authorize an accompanying empty inventory, and
+// null quality IDs cannot request full quality completion.
+pub(super) fn supplied_array<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Vec::<T>::deserialize(deserializer).map(Some)
+}
+
 /// Read one bounded nonblank record using the same policy for hybrid and
 /// keyword-only sessions. False means EOF or an explicit quit/exit record.
 /// Never drain an oversized record; leave later input untouched on refusal.

@@ -3,12 +3,15 @@
 use frankensearch_index::vector_cohort::VectorCohortCoverage;
 
 use super::{
-    BlockingPoolHandle, Cx, IndexableDocument, MAX_DOCUMENTS, MAX_RECORD_BYTES, Models,
-    NativeBuildPrecision, NativeGenerationSnapshot, NativeGenerationTopology, Options,
-    PublicationIntent, PublicationOptions, QueryMode, Receipt, Result, Write, admit_root, bad,
-    checkpoint, emit_indexed, execution_context, load_authority_models, new_generation, new_path,
+    Arc, AuthorityModels, AuthorityRefV1, AuthoritySession, BlockingPoolHandle, Cx, Deserialize,
+    Embedder, EmbedderTierTag, Filter, HnswParams, IndexableDocument, MAX_DOCUMENTS,
+    MAX_RECORD_BYTES, Models, NativeBuildPrecision, NativeBuildRetrieval,
+    NativeBuiltExactGeneration, NativeGenerationSnapshot, NativeGenerationTopology, Options, Path,
+    PathBuf, PublicationIntent, PublicationOptions, PublishedGeneration, QualifiedGenerationRoot,
+    QueryMode, Receipt, Result, Write, admit_root, bad, checkpoint, emit_indexed,
+    execution_context, load_authority_models, model_activation, models, new_generation, new_path,
     prepare_partial_quality_completion, prepare_publication_with_intent, rebuild_precision,
-    retained_rebuild_documents, separate_destinations, stage_prepared_and_publish,
+    retained_rebuild_documents, separate_destinations, serve_refused, stage_prepared_and_publish,
 };
 
 pub(super) async fn run(
@@ -29,6 +32,59 @@ pub(super) async fn run(
     .await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Retrieval {
+    Exact,
+    Hnsw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Request {
+    op: String,
+    pub(super) id: Option<String>,
+    expected_authority: Vec<u8>,
+    work_dir: PathBuf,
+    new_receipt: PathBuf,
+    #[serde(default, deserialize_with = "super::super::serve::supplied_array")]
+    quality_ids: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "supplied_quality_document_limit")]
+    max_new_quality_documents: Option<usize>,
+    retrieval: Option<Retrieval>,
+    model_dir: Option<PathBuf>,
+    quality_backend: Option<String>,
+    quality_model_dir: Option<PathBuf>,
+}
+
+// Explicit null must not turn a bounded request into full completion.
+fn supplied_quality_document_limit<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    usize::deserialize(deserializer).map(Some)
+}
+
+struct CompletionSpec {
+    work: PathBuf,
+    receipt: PathBuf,
+    quality_ids: Option<Vec<String>>,
+    max_new_quality_documents: Option<usize>,
+    retrieval: Option<NativeBuildRetrieval>,
+    batch_size: usize,
+    max_source_bytes: usize,
+    max_image_bytes: usize,
+}
+
+struct PreparedCompletion {
+    spec: CompletionSpec,
+    sequence: u64,
+    quality_precision: NativeBuildPrecision,
+    quality_retrieval: NativeBuildRetrieval,
+}
+
 async fn with_loader<F>(
     cx: &Cx,
     options: &Options,
@@ -39,23 +95,73 @@ where
     F: FnOnce() -> Result<Models>,
 {
     checkpoint(cx)?;
-    if options.quality_ids.is_some() && options.max_new_quality_documents.is_some() {
-        return Err(bad(
-            "--quality-ids and --max-new-quality-documents cannot be combined",
-        ));
-    }
-    if options
-        .max_new_quality_documents
-        .is_some_and(|limit| limit == 0 || limit > MAX_DOCUMENTS)
-    {
-        return Err(bad("the new quality document limit is out of range"));
-    }
+    validate_completion_selection(
+        options.quality_ids.is_some(),
+        options.max_new_quality_documents,
+    )?;
     let selected = Receipt::read(
         options
             .from_receipt
             .as_deref()
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
+    let root = admit_root(&selected.root)?;
+    let snapshot = selected.open_on_root(cx, &root, options.max_image_bytes)?;
+    let prepared = prepare_completion(
+        cx,
+        &selected,
+        &snapshot,
+        CompletionSpec {
+            work: options
+                .work
+                .clone()
+                .ok_or_else(|| bad("missing work directory"))?,
+            receipt: options.receipt.clone(),
+            quality_ids: options.quality_ids.clone(),
+            max_new_quality_documents: options.max_new_quality_documents,
+            retrieval: options.retrieval,
+            batch_size: options.batch_size,
+            max_source_bytes: options.max_source_bytes,
+            max_image_bytes: options.max_image_bytes,
+        },
+    )?;
+    let loaded = load_models();
+    checkpoint(cx)?;
+    let loaded = loaded?;
+    let built = Box::pin(build_completion(cx, &snapshot, &prepared, &loaded)).await?;
+    let published = publish_completion(cx, &root, &selected, &snapshot, &prepared, &built, None)?;
+    emit_indexed(
+        output,
+        &published.receipt,
+        &prepared.spec.receipt,
+        built.retrieval_configuration(),
+        built.quality_retrieval_configuration(),
+    )
+}
+
+fn validate_completion_selection(
+    has_ids: bool,
+    max_new_quality_documents: Option<usize>,
+) -> Result<()> {
+    if has_ids && max_new_quality_documents.is_some() {
+        return Err(bad(
+            "--quality-ids and --max-new-quality-documents cannot be combined",
+        ));
+    }
+    if max_new_quality_documents.is_some_and(|limit| limit == 0 || limit > MAX_DOCUMENTS) {
+        return Err(bad("the new quality document limit is out of range"));
+    }
+    Ok(())
+}
+
+fn prepare_completion(
+    cx: &Cx,
+    selected: &Receipt,
+    snapshot: &NativeGenerationSnapshot,
+    mut spec: CompletionSpec,
+) -> Result<PreparedCompletion> {
+    checkpoint(cx)?;
+    validate_completion_selection(spec.quality_ids.is_some(), spec.max_new_quality_documents)?;
     if !matches!(
         selected.topology(),
         NativeGenerationTopology::FastOnly | NativeGenerationTopology::PartialQuality { .. }
@@ -64,16 +170,21 @@ where
             "quality completion requires a fast-only or partial-quality authority receipt",
         ));
     }
-    let work_path = new_path(
-        options
-            .work
-            .as_deref()
-            .ok_or_else(|| bad("missing work directory"))?,
-    )?;
-    let receipt_path = new_path(&options.receipt)?;
-    separate_destinations(&[&selected.root, &work_path, &receipt_path])?;
-    let root = admit_root(&selected.root)?;
-    let snapshot = selected.open_on_root(cx, &root, options.max_image_bytes)?;
+    if snapshot.retained_snapshot().selected_history_of().is_some()
+        || snapshot.authority() != selected.authority()?
+    {
+        return Err(serve_refused("quality_completion_base_not_current"));
+    }
+    if spec.batch_size == 0
+        || spec.batch_size > MAX_DOCUMENTS
+        || spec.max_source_bytes == 0
+        || spec.max_image_bytes == 0
+    {
+        return Err(serve_refused("quality_completion_invalid_limits"));
+    }
+    spec.work = new_path(&spec.work)?;
+    spec.receipt = new_path(&spec.receipt)?;
+    separate_destinations(&[&selected.root, &spec.work, &spec.receipt])?;
     snapshot.authority().next_sequence()?;
     let sequence = selected
         .generation
@@ -82,12 +193,12 @@ where
         .ok_or_else(|| bad("the artifact generation sequence is exhausted"))?;
     // Enforce the ordinary CLI source/record limits before model loading. The
     // completion plan then retains that same admitted source, never a file path.
-    let documents = retained_rebuild_documents(cx, &snapshot, options.max_source_bytes)?;
-    if let Some(ids) = &options.quality_ids {
-        validate_backfill_selection(cx, &snapshot, &documents, ids)?;
+    let documents = retained_rebuild_documents(cx, snapshot, spec.max_source_bytes)?;
+    if let Some(ids) = &spec.quality_ids {
+        validate_backfill_selection(cx, snapshot, &documents, ids)?;
     }
-    if options.max_new_quality_documents.is_some() {
-        validate_next_batch_source(cx, &snapshot, &documents)?;
+    if spec.max_new_quality_documents.is_some() {
+        validate_next_batch_source(cx, snapshot, &documents)?;
     }
     drop(documents);
     // A partial predecessor already owns independently admitted quality rows.
@@ -99,61 +210,90 @@ where
         .map(rebuild_precision)
         .transpose()?
         .unwrap_or(NativeBuildPrecision::F32);
-    let quality_retrieval = options.build_retrieval(snapshot.quality_retrieval_configuration());
-    let loaded = load_models();
+    let quality_retrieval = spec
+        .retrieval
+        .or(snapshot.quality_retrieval_configuration())
+        .unwrap_or_default();
     checkpoint(cx)?;
-    let loaded = loaded?;
-    let quality = loaded.quality.ok_or_else(|| {
+    Ok(PreparedCompletion {
+        spec,
+        sequence,
+        quality_precision,
+        quality_retrieval,
+    })
+}
+
+async fn build_completion(
+    cx: &Cx,
+    snapshot: &NativeGenerationSnapshot,
+    prepared: &PreparedCompletion,
+    loaded: &Models,
+) -> Result<NativeBuiltExactGeneration> {
+    let quality = loaded.quality.as_ref().ok_or_else(|| {
         bad("quality completion requires an independently supplied quality model")
     })?;
     let completion = snapshot
         .begin_quality_completion(
             cx,
-            &work_path,
-            new_generation(sequence)?,
-            loaded.fast,
-            quality,
-            options.max_source_bytes,
+            &prepared.spec.work,
+            new_generation(prepared.sequence)?,
+            Arc::clone(&loaded.fast),
+            Arc::clone(quality),
+            prepared.spec.max_source_bytes,
         )?
-        .with_batch_size(options.batch_size)?
+        .with_batch_size(prepared.spec.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-        .with_quality_storage(quality_precision, quality_retrieval)?;
-    let built = if let Some(ids) = &options.quality_ids {
+        .with_quality_storage(prepared.quality_precision, prepared.quality_retrieval)?;
+    if let Some(ids) = &prepared.spec.quality_ids {
         completion
-            .build_partial(cx, ids.iter().cloned(), options.max_image_bytes)
-            .await?
-    } else if let Some(limit) = options.max_new_quality_documents {
+            .build_partial(cx, ids.iter().cloned(), prepared.spec.max_image_bytes)
+            .await
+            .map_err(Into::into)
+    } else if let Some(limit) = prepared.spec.max_new_quality_documents {
         completion
-            .build_next_batch(cx, limit, options.max_image_bytes)
-            .await?
+            .build_next_batch(cx, limit, prepared.spec.max_image_bytes)
+            .await
+            .map_err(Into::into)
     } else {
-        completion.build(cx, options.max_image_bytes).await?
-    };
+        completion
+            .build(cx, prepared.spec.max_image_bytes)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+fn publish_completion(
+    cx: &Cx,
+    root: &QualifiedGenerationRoot,
+    selected: &Receipt,
+    snapshot: &NativeGenerationSnapshot,
+    completion: &PreparedCompletion,
+    built: &NativeBuiltExactGeneration,
+    scope: Option<(&Filter, usize)>,
+) -> Result<PublishedGeneration> {
+    let budget = completion.spec.max_image_bytes;
     let prepared = if built.coverage() == VectorCohortCoverage::PartialQuality {
-        prepare_partial_quality_completion(cx, &built, &snapshot, options.max_image_bytes)?
+        prepare_partial_quality_completion(cx, built, snapshot, budget)?
     } else {
         prepare_publication_with_intent(
-            &built,
-            Some(&snapshot),
-            options.max_image_bytes,
+            built,
+            Some(snapshot),
+            budget,
             PublicationIntent::CompleteQuality,
         )?
     };
-    let published = stage_prepared_and_publish(
+    stage_prepared_and_publish(
         cx,
-        &root,
+        root,
         &selected.root,
-        &receipt_path,
-        &built,
+        &completion.spec.receipt,
+        built,
         prepared,
-        PublicationOptions::unscoped(options.max_image_bytes),
-    )?;
-    emit_indexed(
-        output,
-        &published.receipt,
-        &receipt_path,
-        built.retrieval_configuration(),
-        built.quality_retrieval_configuration(),
+        PublicationOptions {
+            max_image_bytes: budget,
+            scope,
+            reconcile_unknown: false,
+        },
     )
 }
 
@@ -226,6 +366,195 @@ fn validate_backfill_selection(
     Ok(())
 }
 
+impl AuthoritySession {
+    pub(super) async fn complete_quality(
+        &mut self,
+        cx: &Cx,
+        request: Request,
+    ) -> Result<serde_json::Value> {
+        Box::pin(
+            self.complete_quality_with_loader(cx, request, |cx, directory, options| {
+                models::load_single(
+                    cx,
+                    directory,
+                    EmbedderTierTag::Quality,
+                    options,
+                    cx.blocking_pool_handle(),
+                )
+            }),
+        )
+        .await
+    }
+
+    async fn complete_quality_with_loader<F>(
+        &mut self,
+        cx: &Cx,
+        request: Request,
+        load_quality: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnOnce(&Cx, Option<&Path>, &models::QualityOptions) -> Result<Arc<dyn Embedder>>,
+    {
+        checkpoint(cx)?;
+        self.require_current_selection()?;
+        let limits = self
+            .update_limits
+            .ok_or_else(|| serve_refused("updates_disabled"))?;
+        if !self.allow_model_activation {
+            return Err(serve_refused("model_activation_disabled"));
+        }
+        self.models.admit(&self.receipt)?;
+        let mut loaded = self.models.models()?.clone();
+        super::super::serve::validate_id(request.id.as_deref())
+            .map_err(|_| serve_refused("invalid_request_id"))?;
+        if request.op != "complete_quality" {
+            return Err(serve_refused("invalid_quality_completion_request"));
+        }
+        for path in [request.work_dir.as_path(), request.new_receipt.as_path()]
+            .into_iter()
+            .chain(request.model_dir.as_deref())
+            .chain(request.quality_model_dir.as_deref())
+        {
+            model_activation::validate_path(path)?;
+        }
+        let expected = AuthorityRefV1::from_canonical_bytes(&request.expected_authority)
+            .map_err(|_| serve_refused("invalid_expected_authority"))?;
+        if expected != self.snapshot.authority() {
+            return Err(serve_refused("stale_expected_authority"));
+        }
+        let quality_retained = loaded.quality.is_some();
+        if quality_retained
+            && (request.model_dir.is_some()
+                || request.quality_backend.is_some()
+                || request.quality_model_dir.is_some())
+        {
+            return Err(serve_refused("quality_completion_retains_quality_model"));
+        }
+        let options = models::QualityOptions {
+            backend: request
+                .quality_backend
+                .as_deref()
+                .map(models::QualityBackend::parse)
+                .transpose()?,
+            directory: request.quality_model_dir,
+        };
+        if !quality_retained {
+            options.validate_usage(true)?;
+            if options.backend.unwrap_or_default() == models::QualityBackend::Onnx
+                && request.model_dir.is_none()
+            {
+                return Err(serve_refused("quality_completion_model_path_required"));
+            }
+        }
+        // Reuse the session's qualified root and exact authority. A retained
+        // reader remains queryable after a competing publication, but cannot
+        // become the writable base of a new quality completion.
+        let current = self
+            .receipt
+            .open_on_root(cx, &self.root, self.max_image_bytes)
+            .map_err(|error| {
+                model_activation::bounded_error(error, "quality_completion_base_not_current")
+            })?;
+        if current.retained_snapshot().authority_pair()
+            != self.snapshot.retained_snapshot().authority_pair()
+        {
+            return Err(serve_refused("quality_completion_base_changed"));
+        }
+        drop(current);
+        let prepared = prepare_completion(
+            cx,
+            &self.receipt,
+            &self.snapshot,
+            CompletionSpec {
+                work: request.work_dir,
+                receipt: request.new_receipt,
+                quality_ids: request.quality_ids,
+                max_new_quality_documents: request.max_new_quality_documents,
+                retrieval: request.retrieval.map(|retrieval| match retrieval {
+                    Retrieval::Exact => NativeBuildRetrieval::Exact,
+                    Retrieval::Hnsw => NativeBuildRetrieval::Hnsw {
+                        params: HnswParams::default(),
+                        seed: 42,
+                    },
+                }),
+                batch_size: limits.batch_size,
+                max_source_bytes: limits.max_source_bytes,
+                max_image_bytes: self.max_image_bytes,
+            },
+        )
+        .map_err(|error| {
+            model_activation::bounded_error(error, "quality_completion_preflight_failed")
+        })?;
+        if !quality_retained {
+            let quality = load_quality(cx, request.model_dir.as_deref(), &options);
+            checkpoint(cx)?;
+            loaded.quality = Some(quality.map_err(|error| {
+                model_activation::bounded_error(error, "quality_completion_load_failed")
+            })?);
+        }
+        // Query caches stay separate from document inference. An existing
+        // partial tier keeps both caches; a newly added quality tier receives
+        // its own cache while retaining the exact fast cache owner.
+        let cached = if quality_retained {
+            self.cached_query_models.clone()
+        } else {
+            self.cache_replacement_models(cx, &loaded, true)?
+        };
+        let built = Box::pin(build_completion(cx, &self.snapshot, &prepared, &loaded)).await?;
+        super::admit_serving_model(built.binding().frozen_identity(), loaded.fast.as_ref())?;
+        super::admit_serving_model(
+            built
+                .quality_binding()
+                .ok_or_else(|| serve_refused("quality_completion_missing_quality"))?
+                .frozen_identity(),
+            loaded
+                .quality
+                .as_ref()
+                .ok_or_else(|| serve_refused("quality_completion_missing_quality"))?
+                .as_ref(),
+        )?;
+        checkpoint(cx)?;
+        let previously_covered = self.receipt.quality_documents.unwrap_or(0);
+        let published = publish_completion(
+            cx,
+            &self.root,
+            &self.receipt,
+            &self.snapshot,
+            &prepared,
+            &built,
+            self.fixed_filter
+                .as_ref()
+                .map(|filter| (filter, self.max_source_bytes)),
+        )?;
+        // Publication returns the exact admitted snapshot and scope. Install
+        // it without reopening paths or checkpointing after the durable commit.
+        self.receipt = published.receipt;
+        self.snapshot = published.snapshot;
+        self.scope = published.scope;
+        self.models = AuthorityModels::Semantic(loaded);
+        self.cached_query_models = cached;
+        let mut response = self.response("quality_completed", true, None, request.id.as_deref());
+        response["operation"] = serde_json::json!("complete_quality");
+        response["publication"] = serde_json::json!("committed");
+        response["serving"] = serde_json::json!("activated");
+        response["previous_authority"] = serde_json::json!(expected.canonical_bytes().as_slice());
+        response["receipt"] = serde_json::json!(prepared.spec.receipt);
+        response["selection"] = serde_json::json!(self.receipt);
+        response["documents"] = serde_json::json!(self.receipt.documents);
+        response["quality_documents_added"] = serde_json::json!(
+            self.receipt
+                .quality_documents
+                .unwrap_or(self.receipt.documents)
+                - previously_covered
+        );
+        response["models_loaded"] = serde_json::json!(usize::from(!quality_retained));
+        response["fast_model_retained"] = serde_json::json!(true);
+        response["quality_model_retained"] = serde_json::json!(quality_retained);
+        self.annotate_query_capabilities(&mut response);
+        Ok(response)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{Command, MAX_DOCUMENTS, NativeBuildRetrieval, is_command};
@@ -243,6 +572,81 @@ mod tests {
         ]
         .map(str::to_owned)
         .into()
+    }
+
+    #[test]
+    fn warm_quality_completion_requires_explicit_arrays_and_rejects_writer_extras() {
+        let value = serde_json::json!({
+            "op": "complete_quality",
+            "expected_authority": [],
+            "work_dir": "/new-quality-work",
+            "new_receipt": "/new-quality.json",
+            "model_dir": "/local-models",
+        });
+        assert!(matches!(
+            serde_json::from_value::<super::super::AuthorityRequest>(value.clone()).unwrap(),
+            super::super::AuthorityRequest::CompleteQuality(_)
+        ));
+        let parsed: Request = serde_json::from_value(value.clone()).unwrap();
+        assert!(parsed.quality_ids.is_none());
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("all"),
+            serde_json::json!({}),
+        ] {
+            let mut candidate = value.clone();
+            candidate["quality_ids"] = invalid;
+            assert!(serde_json::from_value::<super::super::AuthorityRequest>(candidate).is_err());
+        }
+        for field in [
+            "documents",
+            "changes",
+            "filter",
+            "source_low",
+            "tier",
+            "batch_size",
+        ] {
+            let mut candidate = value.clone();
+            candidate[field] = serde_json::json!([]);
+            assert!(
+                serde_json::from_value::<Request>(candidate).is_err(),
+                "{field}"
+            );
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+        ] {
+            let mut candidate = value.clone();
+            candidate["max_new_quality_documents"] = invalid;
+            assert!(serde_json::from_value::<super::super::AuthorityRequest>(candidate).is_err());
+        }
+        let mut automatic = value.clone();
+        automatic["max_new_quality_documents"] = serde_json::json!(2);
+        let parsed: Request = serde_json::from_value(automatic).unwrap();
+        assert_eq!(parsed.max_new_quality_documents, Some(2));
+        assert!(parsed.quality_ids.is_none());
+        let mut partial = value;
+        partial["quality_ids"] = serde_json::json!(["garden", "retry"]);
+        partial["retrieval"] = serde_json::json!("hnsw");
+        let parsed: Request = serde_json::from_value(partial.clone()).unwrap();
+        assert_eq!(parsed.quality_ids.unwrap(), ["garden", "retry"]);
+        partial["retrieval"] = serde_json::json!("automatic");
+        assert!(serde_json::from_value::<Request>(partial).is_err());
+
+        // An explicit null mutation list must not become permission to clear
+        // the current corpus through an accompanying empty full inventory.
+        for field in ["changes", "documents"] {
+            let mut update = serde_json::json!({
+                "op": "update", "expected_authority": [],
+                "work_dir": "/new-update-work", "new_receipt": "/new-update.json",
+                "source_low": 1, "source_high": 2, "documents": [],
+            });
+            update[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<super::super::AuthorityRequest>(update).is_err());
+        }
     }
 
     #[test]
@@ -1015,6 +1419,709 @@ mod tests {
                 assert_eq!(
                     current.partial_quality_document_ids(&cx).unwrap(),
                     ["garden", "notes"]
+                );
+            });
+        }
+
+        fn warm_session(
+            cx: &Cx,
+            fixture: &Fixture,
+            quality: Option<Arc<Provider>>,
+        ) -> AuthoritySession {
+            let mut session = AuthoritySession::new(
+                cx,
+                admit_root(&fixture.selected.root).unwrap(),
+                fixture.selected.clone(),
+                Arc::clone(&fixture.snapshot),
+                Models {
+                    fast: fixture.fast.clone(),
+                    quality: quality.map(|model| model as Arc<dyn Embedder>),
+                },
+                (8, DEFAULT_IMAGE_BYTES),
+                false,
+            )
+            .unwrap()
+            .with_updates(2, MAX_INPUT_BYTES)
+            .unwrap()
+            .with_query_cache(
+                cx,
+                super::super::super::query_cache::Config::parse("4").unwrap(),
+            )
+            .unwrap()
+            .with_filter(
+                cx,
+                Some(serde_json::from_value(serde_json::json!({"id_prefix": "retry"})).unwrap()),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap();
+            session.allow_model_activation = true;
+            session
+        }
+
+        fn warm_request_value(
+            session: &AuthoritySession,
+            fixture: &Fixture,
+            label: &str,
+            ids: Option<&[&str]>,
+        ) -> serde_json::Value {
+            let mut request = serde_json::json!({
+                "op": "complete_quality", "id": label,
+                "expected_authority": session.snapshot.authority().canonical_bytes().as_slice(),
+                "work_dir": fixture.parent.join(format!("{label}-work")),
+                "new_receipt": fixture.parent.join(format!("{label}.json")),
+            });
+            if let Some(ids) = ids {
+                request["quality_ids"] = serde_json::json!(ids);
+            }
+            if session.models.models().unwrap().quality.is_none() {
+                request["model_dir"] = serde_json::json!(fixture.parent.join("local-models"));
+            }
+            request
+        }
+
+        #[test]
+        fn warm_quality_completion_reuses_models_caches_scope_and_retained_rows() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for ann in [false, true] {
+                    for starts_partial in [false, true] {
+                        let quality = Provider::new(true);
+                        let fixture = fixture_with_documents(
+                            &cx,
+                            ann,
+                            starts_partial.then(|| quality.clone()),
+                            backfill_documents(),
+                        )
+                        .await;
+                        let mut session =
+                            warm_session(&cx, &fixture, starts_partial.then(|| quality.clone()));
+                        let raw_fast = Arc::clone(&session.models.models().unwrap().fast);
+                        let cached_fast =
+                            Arc::clone(&session.query_models().models().unwrap().fast);
+                        let cached_quality =
+                            session.query_models().models().unwrap().quality.clone();
+                        fixture.fast.fault.store(0, Ordering::SeqCst);
+                        cached_fast.embed(&cx, "cached retry").await.unwrap();
+                        fixture.fast.fault.store(1, Ordering::SeqCst);
+                        let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                        let quality_calls = quality.calls.load(Ordering::SeqCst);
+                        let loads = AtomicUsize::new(0);
+                        let mut request = warm_request_value(
+                            &session,
+                            &fixture,
+                            "warm-partial",
+                            Some(&["garden", "notes", "retry"]),
+                        );
+                        if !starts_partial {
+                            request["retrieval"] =
+                                serde_json::json!(if ann { "hnsw" } else { "exact" });
+                        }
+                        let response = session
+                            .complete_quality_with_loader(
+                                &cx,
+                                serde_json::from_value(request).unwrap(),
+                                |_, _, _| -> Result<Arc<dyn Embedder>> {
+                                    loads.fetch_add(1, Ordering::SeqCst);
+                                    Ok(quality.clone())
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(loads.load(Ordering::SeqCst), usize::from(!starts_partial));
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                        assert_eq!(
+                            quality.calls.load(Ordering::SeqCst) - quality_calls,
+                            3 - usize::from(starts_partial),
+                        );
+                        assert_eq!(response["publication"], "committed");
+                        assert_eq!(response["serving"], "activated");
+                        assert_eq!(
+                            response["query_modes"],
+                            serde_json::json!(["fast", "partial", "lexical"])
+                        );
+                        assert_eq!(response["default_mode"], "fast");
+                        assert_eq!(response["quality_completion_enabled"], true);
+                        assert_eq!(response["scope"]["eligible_documents"], 1);
+                        assert_eq!(session.scope.as_ref().unwrap().len(), 1);
+                        assert!(Arc::ptr_eq(
+                            &raw_fast,
+                            &session.models.models().unwrap().fast
+                        ));
+                        assert!(Arc::ptr_eq(
+                            &cached_fast,
+                            &session.query_models().models().unwrap().fast
+                        ));
+                        if let Some(previous) = cached_quality {
+                            assert!(Arc::ptr_eq(
+                                &previous,
+                                session
+                                    .query_models()
+                                    .models()
+                                    .unwrap()
+                                    .quality
+                                    .as_ref()
+                                    .unwrap(),
+                            ));
+                        }
+                        cached_fast.embed(&cx, "cached retry").await.unwrap();
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                        assert_eq!(
+                            session.snapshot.retrieval_configuration(),
+                            fixture.snapshot.retrieval_configuration(),
+                        );
+                        assert_eq!(
+                            session
+                                .snapshot
+                                .retained_snapshot()
+                                .closure()
+                                .bytes(GenerationComponentRole::Lexical),
+                            fixture
+                                .snapshot
+                                .retained_snapshot()
+                                .closure()
+                                .bytes(GenerationComponentRole::Lexical),
+                        );
+                        assert_eq!(
+                            session.snapshot.metadata().commit_range,
+                            fixture.snapshot.metadata().commit_range
+                        );
+                        let partial = Arc::clone(&session.snapshot);
+                        let quality_retrieval = partial.quality_retrieval_configuration();
+                        let quality_identity = session.receipt.quality_identity.clone();
+                        let cached_quality = Arc::clone(
+                            session
+                                .query_models()
+                                .models()
+                                .unwrap()
+                                .quality
+                                .as_ref()
+                                .unwrap(),
+                        );
+                        cached_quality
+                            .embed(&cx, "cached quality retry")
+                            .await
+                            .unwrap();
+                        let quality_calls = quality.calls.load(Ordering::SeqCst);
+                        let request = warm_request_value(&session, &fixture, "warm-full", None);
+                        let response = session
+                            .complete_quality_with_loader(
+                                &cx,
+                                serde_json::from_value(request).unwrap(),
+                                |_, _, _| {
+                                    panic!("partial completion must retain its quality model")
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                        assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls + 1);
+                        assert_eq!(response["quality_documents_added"], 1);
+                        assert_eq!(response["models_loaded"], 0);
+                        assert_eq!(response["quality_model_retained"], true);
+                        assert_eq!(
+                            response["query_modes"],
+                            serde_json::json!(["fast", "quality", "full", "lexical"])
+                        );
+                        assert_eq!(response["default_mode"], "full");
+                        assert_eq!(response["quality_completion_enabled"], false);
+                        assert_eq!(session.receipt.quality_identity, quality_identity);
+                        assert_eq!(
+                            session.snapshot.quality_retrieval_configuration(),
+                            quality_retrieval
+                        );
+                        assert!(Arc::ptr_eq(
+                            &cached_quality,
+                            session
+                                .query_models()
+                                .models()
+                                .unwrap()
+                                .quality
+                                .as_ref()
+                                .unwrap(),
+                        ));
+                        quality.fault.store(1, Ordering::SeqCst);
+                        cached_quality
+                            .embed(&cx, "cached quality retry")
+                            .await
+                            .unwrap();
+                        assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls + 1);
+                        assert_eq!(
+                            session.snapshot.topology(),
+                            NativeGenerationTopology::FullProgressive
+                        );
+                        assert_eq!(partial.partial_quality_document_ids(&cx).unwrap().len(), 3);
+                        assert_eq!(fixture.snapshot.topology(), fixture.selected.topology());
+                        assert_eq!(
+                            fixture
+                                .snapshot
+                                .source_documents(&cx, MAX_INPUT_BYTES)
+                                .unwrap()
+                                .len(),
+                            4
+                        );
+                        Receipt::read(&fixture.parent.join("warm-full.json"))
+                            .unwrap()
+                            .open(&cx, DEFAULT_IMAGE_BYTES)
+                            .unwrap();
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn warm_quality_completion_preflights_grants_membership_and_source_budget() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for starts_partial in [false, true] {
+                    let quality = Provider::new(true);
+                    let fixture = fixture_with_documents(
+                        &cx,
+                        false,
+                        starts_partial.then(|| quality.clone()),
+                        backfill_documents(),
+                    )
+                    .await;
+                    let mut session =
+                        warm_session(&cx, &fixture, starts_partial.then(|| quality.clone()));
+                    let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                    let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                    let quality_calls = quality.calls.load(Ordering::SeqCst);
+                    let mut selections = vec![
+                        vec![],
+                        vec!["garden", "garden"],
+                        vec!["garden", "missing"],
+                        vec!["garden", "notes", "retry", "uncovered"],
+                    ];
+                    if starts_partial {
+                        selections.extend([vec!["garden"], vec!["notes", "retry"]]);
+                    }
+                    for (index, ids) in selections.into_iter().enumerate() {
+                        let label = format!("invalid-warm-subset-{index}");
+                        let request = warm_request_value(&session, &fixture, &label, Some(&ids));
+                        let loaded = AtomicUsize::new(0);
+                        let error = session
+                            .complete_quality_with_loader(
+                                &cx,
+                                serde_json::from_value(request).unwrap(),
+                                |_, _, _| -> Result<Arc<dyn Embedder>> {
+                                    loaded.fetch_add(1, Ordering::SeqCst);
+                                    Ok(quality.clone())
+                                },
+                            )
+                            .await
+                            .unwrap_err();
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("quality_completion_preflight_failed")
+                        );
+                        assert_eq!(loaded.load(Ordering::SeqCst), 0);
+                        assert!(!fixture.parent.join(format!("{label}-work")).exists());
+                        assert!(!fixture.parent.join(format!("{label}.json")).exists());
+                    }
+                    let granted_limits = session.update_limits;
+                    for refusal in [
+                        "updates",
+                        "model-grant",
+                        "source-budget",
+                        "model-options",
+                        "zero-batch",
+                        "excessive-batch",
+                        "mixed-selection",
+                    ] {
+                        session.update_limits = granted_limits;
+                        session.allow_model_activation = true;
+                        let mut value = warm_request_value(
+                            &session,
+                            &fixture,
+                            refusal,
+                            Some(&["garden", "retry"]),
+                        );
+                        match refusal {
+                            "updates" => session.update_limits = None,
+                            "model-grant" => session.allow_model_activation = false,
+                            "source-budget" => {
+                                session.update_limits.as_mut().unwrap().max_source_bytes = 1
+                            }
+                            "model-options" if starts_partial => {
+                                value["model_dir"] =
+                                    serde_json::json!(fixture.parent.join("different-models"));
+                            }
+                            "model-options" => {
+                                value.as_object_mut().unwrap().remove("model_dir");
+                            }
+                            "zero-batch" | "excessive-batch" => {
+                                value.as_object_mut().unwrap().remove("quality_ids");
+                                value["max_new_quality_documents"] =
+                                    serde_json::json!(if refusal == "zero-batch" {
+                                        0
+                                    } else {
+                                        MAX_DOCUMENTS + 1
+                                    });
+                            }
+                            "mixed-selection" => {
+                                value["max_new_quality_documents"] = serde_json::json!(2);
+                            }
+                            _ => unreachable!(),
+                        }
+                        let error = session
+                            .complete_quality_with_loader(
+                                &cx,
+                                serde_json::from_value(value).unwrap(),
+                                |_, _, _| panic!("preflight must precede model loading"),
+                            )
+                            .await
+                            .unwrap_err();
+                        let response = session.update_failure(1, None, error.as_ref());
+                        assert_eq!(response["publication"], "not_committed");
+                        assert_eq!(response["serving"], "not_activated");
+                        assert!(!fixture.parent.join(format!("{refusal}-work")).exists());
+                        assert!(!fixture.parent.join(format!("{refusal}.json")).exists());
+                    }
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        authority
+                    );
+                    assert!(Arc::ptr_eq(&session.snapshot, &fixture.snapshot));
+                    assert_eq!(session.scope.as_ref().unwrap().len(), 1);
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls);
+                }
+            });
+        }
+
+        #[test]
+        fn warm_quality_completion_faults_and_stale_heads_keep_the_retained_reader() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let fixture = fixture_with_documents(&cx, false, None, backfill_documents()).await;
+                let mut session = warm_session(&cx, &fixture, None);
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                let cached_fast = Arc::clone(&session.query_models().models().unwrap().fast);
+                for fault in [1, 2, 3] {
+                    let quality = Provider::new(true);
+                    quality.fault.store(fault, Ordering::SeqCst);
+                    let label = format!("warm-fault-{fault}");
+                    let request = warm_request_value(&session, &fixture, &label, None);
+                    let error = session
+                        .complete_quality_with_loader(
+                            &cx,
+                            serde_json::from_value(request).unwrap(),
+                            |_, _, _| -> Result<Arc<dyn Embedder>> { Ok(quality.clone()) },
+                        )
+                        .await
+                        .unwrap_err();
+                    if fault == 2 {
+                        assert!(matches!(
+                            error.downcast_ref::<SearchError>(),
+                            Some(SearchError::Cancelled { .. })
+                        ));
+                    }
+                    cx.set_cancel_requested(false);
+                    assert!(!fixture.parent.join(format!("{label}.json")).exists());
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        authority
+                    );
+                    assert!(Arc::ptr_eq(&session.snapshot, &fixture.snapshot));
+                    assert!(Arc::ptr_eq(
+                        &cached_fast,
+                        &session.query_models().models().unwrap().fast
+                    ));
+                    assert!(session.models.models().unwrap().quality.is_none());
+                    assert_eq!(session.scope.as_ref().unwrap().len(), 1);
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                }
+                // An independently published successor leaves this session's
+                // retained reader valid but cannot become an implicit write base.
+                let quality = Provider::new(true);
+                let mut winner = options(&fixture, "warm-competing-winner");
+                winner.quality_ids = Some(vec!["garden".to_owned()]);
+                with_loader(&cx, &winner, &mut Vec::new(), || {
+                    Ok(Models {
+                        fast: fixture.fast.clone(),
+                        quality: Some(quality),
+                    })
+                })
+                .await
+                .unwrap();
+                let winner_authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                assert_ne!(winner_authority, authority);
+                let request = warm_request_value(&session, &fixture, "stale-warm-base", None);
+                let error = session
+                    .complete_quality_with_loader(
+                        &cx,
+                        serde_json::from_value(request).unwrap(),
+                        |_, _, _| panic!("stale current authority must refuse before loading"),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("quality_completion_base_not_current")
+                );
+                assert!(!fixture.parent.join("stale-warm-base-work").exists());
+                assert!(!fixture.parent.join("stale-warm-base.json").exists());
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    winner_authority
+                );
+                assert!(Arc::ptr_eq(&session.snapshot, &fixture.snapshot));
+                assert_eq!(
+                    session
+                        .snapshot
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap()
+                        .len(),
+                    4
+                );
+            });
+        }
+
+        #[test]
+        fn warm_quality_completion_automatic_batches_resume_and_finish_with_full_admission() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for starts_partial in [false, true] {
+                    let quality = Provider::new(true);
+                    let fixture = fixture_with_documents(
+                        &cx,
+                        true,
+                        starts_partial.then(|| quality.clone()),
+                        backfill_documents(),
+                    )
+                    .await;
+                    let mut session =
+                        warm_session(&cx, &fixture, starts_partial.then(|| quality.clone()));
+                    let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                    let cached_fast = Arc::clone(&session.query_models().models().unwrap().fast);
+                    let mut cached_quality =
+                        session.query_models().models().unwrap().quality.clone();
+                    let loads = AtomicUsize::new(0);
+                    let mut covered = usize::from(starts_partial);
+                    let mut partial_reader = None;
+                    for step in 0..2 {
+                        let label = format!("automatic-warm-{step}");
+                        let mut request = warm_request_value(&session, &fixture, &label, None);
+                        request["max_new_quality_documents"] = serde_json::json!(2);
+                        let response = session
+                            .complete_quality_with_loader(
+                                &cx,
+                                serde_json::from_value(request).unwrap(),
+                                |_, _, _| -> Result<Arc<dyn Embedder>> {
+                                    loads.fetch_add(1, Ordering::SeqCst);
+                                    Ok(quality.clone())
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        let next_covered = (covered + 2).min(4);
+                        assert_eq!(response["quality_documents_added"], next_covered - covered);
+                        assert_eq!(response["publication"], "committed");
+                        assert_eq!(response["serving"], "activated");
+                        assert_eq!(quality.calls.load(Ordering::SeqCst), next_covered);
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                        assert_eq!(loads.load(Ordering::SeqCst), usize::from(!starts_partial));
+                        assert!(Arc::ptr_eq(
+                            &cached_fast,
+                            &session.query_models().models().unwrap().fast,
+                        ));
+                        if let Some(previous) = cached_quality.as_ref() {
+                            assert!(Arc::ptr_eq(
+                                previous,
+                                session
+                                    .query_models()
+                                    .models()
+                                    .unwrap()
+                                    .quality
+                                    .as_ref()
+                                    .unwrap(),
+                            ));
+                        }
+                        cached_quality = session.query_models().models().unwrap().quality.clone();
+                        assert_eq!(response["scope"]["eligible_documents"], 1);
+                        assert_eq!(
+                            session.snapshot.metadata().commit_range,
+                            fixture.snapshot.metadata().commit_range
+                        );
+                        if next_covered < 4 {
+                            let expected = if starts_partial {
+                                vec!["garden".to_owned(), "notes".to_owned(), "retry".to_owned()]
+                            } else {
+                                vec!["garden".to_owned(), "notes".to_owned()]
+                            };
+                            assert_eq!(
+                                session.snapshot.partial_quality_document_ids(&cx).unwrap(),
+                                expected
+                            );
+                            assert_eq!(response["default_mode"], "fast");
+                            assert_eq!(response["quality_completion_enabled"], true);
+                            partial_reader = Some(Arc::clone(&session.snapshot));
+                        } else {
+                            assert_eq!(
+                                session.snapshot.topology(),
+                                NativeGenerationTopology::FullProgressive
+                            );
+                            assert_eq!(response["default_mode"], "full");
+                            assert_eq!(response["quality_completion_enabled"], false);
+                            assert_eq!(session.receipt.quality_documents, None);
+                        }
+                        covered = next_covered;
+                    }
+                    assert_eq!(
+                        partial_reader
+                            .unwrap()
+                            .partial_quality_document_ids(&cx)
+                            .unwrap()
+                            .len(),
+                        2 + usize::from(starts_partial),
+                    );
+                    assert_eq!(fixture.snapshot.topology(), fixture.selected.topology());
+                    Receipt::read(&fixture.parent.join("automatic-warm-1.json"))
+                        .unwrap()
+                        .open(&cx, DEFAULT_IMAGE_BYTES)
+                        .unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn warm_quality_completion_wire_reports_actual_coverage_and_serves_the_new_selection() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let quality = Provider::new(true);
+                let fixture =
+                    fixture_with_documents(&cx, true, Some(quality.clone()), backfill_documents())
+                        .await;
+                let mut session = warm_session(&cx, &fixture, Some(quality));
+                fixture.fast.fault.store(0, Ordering::SeqCst);
+                let mut input = Vec::new();
+                for request in [
+                    warm_request_value(
+                        &session,
+                        &fixture,
+                        "wire-partial",
+                        Some(&["garden", "notes", "retry"]),
+                    ),
+                    serde_json::json!({"id": "partial-query", "query": "retry", "mode": "partial"}),
+                    serde_json::json!({"id": "too-soon", "query": "retry", "mode": "full"}),
+                ] {
+                    serde_json::to_writer(&mut input, &request).unwrap();
+                    input.push(b'\n');
+                }
+                let mut output = Vec::new();
+                super::super::super::serve_session(
+                    &cx,
+                    &mut session,
+                    &mut std::io::Cursor::new(input),
+                    &mut output,
+                )
+                .await
+                .unwrap();
+                let frames: Vec<serde_json::Value> = std::str::from_utf8(&output)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(frames[0]["quality_completion_enabled"], true);
+                let partial = frames
+                    .iter()
+                    .find(|frame| frame["id"] == "wire-partial")
+                    .unwrap();
+                assert_eq!(partial["event"], "quality_completed");
+                assert_eq!(partial["request"], 1);
+                assert_eq!(partial["publication"], "committed");
+                assert_eq!(partial["models_loaded"], 0);
+                assert_eq!(
+                    partial["query_modes"],
+                    serde_json::json!(["fast", "partial", "lexical"])
+                );
+                assert_eq!(partial["default_mode"], "fast");
+                let results = frames
+                    .iter()
+                    .find(|frame| frame["id"] == "partial-query")
+                    .unwrap();
+                assert_eq!(results["ok"], true);
+                assert_eq!(results["mode"], "partial");
+                assert_eq!(results["scope"]["eligible_documents"], 1);
+                assert!(
+                    results["results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|hit| hit["doc_id"] == "retry")
+                );
+                assert_eq!(
+                    frames
+                        .iter()
+                        .find(|frame| frame["id"] == "too-soon")
+                        .unwrap()["ok"],
+                    false
+                );
+                let partial_reader = Arc::clone(&session.snapshot);
+
+                let mut stale = warm_request_value(&session, &fixture, "wire-stale", None);
+                stale["expected_authority"] =
+                    serde_json::json!(fixture.snapshot.authority().canonical_bytes().as_slice());
+                let mut input = Vec::new();
+                for request in [
+                    stale,
+                    warm_request_value(&session, &fixture, "wire-full", None),
+                    serde_json::json!({"id": "quality-query", "query": "retry", "mode": "quality"}),
+                ] {
+                    serde_json::to_writer(&mut input, &request).unwrap();
+                    input.push(b'\n');
+                }
+                let mut output = Vec::new();
+                super::super::super::serve_session(
+                    &cx,
+                    &mut session,
+                    &mut std::io::Cursor::new(input),
+                    &mut output,
+                )
+                .await
+                .unwrap();
+                let frames: Vec<serde_json::Value> = std::str::from_utf8(&output)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let stale = frames
+                    .iter()
+                    .find(|frame| frame["id"] == "wire-stale")
+                    .unwrap();
+                assert_eq!(stale["code"], "stale_expected_authority");
+                assert_eq!(stale["publication"], "not_committed");
+                assert_eq!(stale["serving"], "not_activated");
+                assert!(!fixture.parent.join("wire-stale-work").exists());
+                let full = frames
+                    .iter()
+                    .find(|frame| frame["id"] == "wire-full")
+                    .unwrap();
+                assert_eq!(full["event"], "quality_completed");
+                assert_eq!(full["publication"], "committed");
+                assert_eq!(full["models_loaded"], 0);
+                assert_eq!(full["default_mode"], "full");
+                assert_eq!(
+                    full["query_modes"],
+                    serde_json::json!(["fast", "quality", "full", "lexical"])
+                );
+                assert_eq!(full["quality_completion_enabled"], false);
+                let results = frames
+                    .iter()
+                    .find(|frame| frame["id"] == "quality-query")
+                    .unwrap();
+                assert_eq!(results["ok"], true);
+                assert_eq!(results["mode"], "quality");
+                assert_eq!(results["scope"]["eligible_documents"], 1);
+                assert_eq!(results["results"][0]["doc_id"], "retry");
+                assert_eq!(
+                    partial_reader
+                        .partial_quality_document_ids(&cx)
+                        .unwrap()
+                        .len(),
+                    3
+                );
+                assert_eq!(
+                    session.snapshot.topology(),
+                    NativeGenerationTopology::FullProgressive
                 );
             });
         }
