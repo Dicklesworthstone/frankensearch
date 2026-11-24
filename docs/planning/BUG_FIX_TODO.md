@@ -29,6 +29,10 @@ unmet criteria; retain dated history. It earns no capability credit.
 - [ ] Run focused strict checks, scanner triage and the complete unchanged stock
   gate on a clean source checkpoint. RCH admission currently queues all workers;
   native quality-host runs must retain their actual execution class.
+  - [x] Retire the initial `dbfccddb` run before changing source: six labels pass,
+    then owned group termination yields -15. A parser negative lacked a valid
+    base-command control; add valid bases and exact refusal classification.
+    Retain the original run and all actual-model evidence without full-gate credit.
 - [ ] Reverify the feature's original criteria in a fresh solo pass, update Beads
   honestly, publish source/evidence and verify both refs. The broader migration,
   platform and release tasks retain their original acceptance.

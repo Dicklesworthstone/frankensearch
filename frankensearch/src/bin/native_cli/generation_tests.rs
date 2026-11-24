@@ -165,8 +165,18 @@ fn source_replacement_requires_the_explicit_authority_update_option() {
     assert!(parse(&arguments).unwrap().unwrap().replace_source);
     arguments.push("--replace-source");
     assert!(parse(&arguments).is_err());
-    for command in ["authority-index", "authority-rebuild", "authority-serve"] {
-        assert!(parse(&[command, "--replace-source"]).is_err());
+    for mut arguments in [
+        index_arguments(),
+        retained_rebuild_arguments(),
+        vec!["authority-serve", "--receipt", "selected.json"],
+    ] {
+        assert!(parse(&arguments).unwrap().is_some());
+        arguments.push("--replace-source");
+        assert!(parse(&arguments).is_err_and(|error| {
+            error
+                .to_string()
+                .contains("unknown or inapplicable authority option")
+        }));
     }
 }
 
