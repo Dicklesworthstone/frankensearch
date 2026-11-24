@@ -748,6 +748,28 @@ fn configured_builder(
 
 fn save_selection(selection: &Selection, path: &Path) -> Result<()> {
     let bytes = encode(selection, MAX_RECEIPT_BYTES)?;
+    write_new_receipt(path, |file| file.write_all(&bytes))?;
+    Ok(())
+}
+
+// A receipt selects a sealed generation. Publish its name only after its bytes
+// are durable. A hard link in the same directory gives no-replace semantics
+// on both Linux and macOS even when two independent publishers race.
+fn write_new_receipt(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = File::open(parent)?;
+    let mut nonce = [0; 16];
+    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    let staging = parent.join(format!(
+        ".native-receipt-{:032x}.tmp",
+        u128::from_be_bytes(nonce)
+    ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -755,14 +777,41 @@ fn save_selection(selection: &Selection, path: &Path) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| bad("receipt parent is missing"))?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    let mut file = options.open(&staging)?;
+    let published = write(&mut file)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::hard_link(&staging, path));
+    let cleanup = fs::remove_file(&staging);
+    published?;
+    directory.sync_all()?;
+    cleanup
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn failed_or_competing_receipt_writes_never_expose_a_partial_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("selection.json");
+    let error = write_new_receipt(&path, |file| {
+        file.write_all(b"{")?;
+        assert!(!path.try_exists()?);
+        Err(io::Error::other("injected write failure"))
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+
+    // The inner publisher wins after the outer has written its first byte.
+    // The loser must leave the winner's complete file in place.
+    let error = write_new_receipt(&path, |file| {
+        file.write_all(b"{")?;
+        write_new_receipt(&path, |winner| winner.write_all(b"winner\n"))?;
+        file.write_all(b"}")
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read(&path).unwrap().as_slice(), b"winner\n");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 #[cfg(test)]
