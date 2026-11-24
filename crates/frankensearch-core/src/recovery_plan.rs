@@ -1147,6 +1147,8 @@ pub enum RecoveryContractError {
     },
     #[error("lexical-only response requires exactly one degradation reason code")]
     MissingDegradationReason,
+    #[error("degradation reason must name a canonical unavailable semantic readiness state")]
+    InvalidDegradationReason,
     #[error("non-lexical response cannot carry a degradation reason code")]
     UnexpectedDegradationReason,
     #[error("recovery plan field `{field}` is inconsistent with the typed decision")]
@@ -1372,8 +1374,10 @@ impl SemanticResponseContract {
     /// # Errors
     ///
     /// Rejects impossible requested/realized topology pairs, out-of-range
-    /// coverage, semantic-score admission by lexical/hash lanes, and
-    /// missing or spurious degradation reasons.
+    /// coverage, semantic-score admission by lexical/hash lanes, and missing,
+    /// spurious, or noncanonical degradation reasons. Reasons must name an
+    /// unavailable [`SemanticReadiness`] state; rejected text is never included
+    /// in the validation error.
     pub fn new(
         requested_topology: RetrievalTopology,
         realized_topology: RetrievalTopology,
@@ -1484,7 +1488,26 @@ impl SemanticResponseContract {
             (RetrievalTopology::LexicalOnly, RetrievalTopology::LexicalOnly, Some(_)) => {
                 Err(RecoveryContractError::UnexpectedDegradationReason)
             }
-            (_, RetrievalTopology::LexicalOnly, Some(code)) if !code.trim().is_empty() => Ok(()),
+            (_, RetrievalTopology::LexicalOnly, Some(code)) if !code.trim().is_empty() => {
+                // Only unavailable states can explain semantic fallback. Exact
+                // codes keep provider bodies and caller text out of this public,
+                // serializable contract; syntactic reason-code validation alone
+                // would also admit false claims such as recovery.state.ready.
+                match code {
+                    "recovery.state.readiness_unproven"
+                    | "recovery.state.model_missing"
+                    | "recovery.state.model_unloadable"
+                    | "recovery.state.index_absent"
+                    | "recovery.state.identity_mismatch"
+                    | "recovery.state.daemon_mismatch"
+                    | "recovery.state.index_empty"
+                    | "recovery.state.manifest_unsafe"
+                    | "recovery.state.ann_stale"
+                    | "recovery.state.generation_incomplete"
+                    | "recovery.state.remote_unverified" => Ok(()),
+                    _ => Err(RecoveryContractError::InvalidDegradationReason),
+                }
+            }
             (_, RetrievalTopology::LexicalOnly, _) => {
                 Err(RecoveryContractError::MissingDegradationReason)
             }
@@ -4229,6 +4252,138 @@ mod tests {
             ),
             Err(RecoveryContractError::UnexpectedDegradationReason)
         );
+    }
+
+    #[test]
+    fn response_contract_accepts_every_canonical_unavailable_readiness_reason() {
+        let mut admitted_codes = std::collections::BTreeSet::new();
+        for state in unready_states() {
+            let code = state.state_code();
+            admitted_codes.insert(code);
+            for requested in [
+                RetrievalTopology::FastOnly,
+                RetrievalTopology::QualityOnly,
+                RetrievalTopology::FullProgressive,
+            ] {
+                let response = SemanticResponseContract::new(
+                    requested,
+                    RetrievalTopology::LexicalOnly,
+                    0,
+                    0,
+                    Some(code.to_owned()),
+                )
+                .expect("every unavailable readiness state permits truthful lexical fallback");
+                assert_eq!(response.degradation_reason_code(), Some(code));
+                assert_eq!(
+                    serde_json::to_value(&response).expect("serialize admitted response")["degradation_reason_code"],
+                    code
+                );
+            }
+        }
+        assert_eq!(admitted_codes.len(), 11);
+    }
+
+    #[test]
+    fn response_contract_rejects_false_or_private_reasons_without_echoing_them() {
+        let mut invalid_reasons: Vec<String> = representative_states()
+            .into_iter()
+            .filter(|state| {
+                state.semantic_available() || matches!(state, SemanticReadiness::HashControl)
+            })
+            .map(|state| state.state_code().to_owned())
+            .collect();
+        invalid_reasons.extend(
+            [
+                "recovery.state.unknown",
+                "recovery.action.acquire_model",
+                " recovery.state.model_missing",
+                "recovery.state.model_missing ",
+                "recovery.state.model_missing\nprovider-body",
+                "recovery.state.model_missing\0",
+                "Bearer recovery-private-canary",
+                "https://user:recovery-private-canary@example.test/model?query=private",
+                "/private/recovery-private-canary/source.txt",
+                "query text and vectors [0.25, 0.75]",
+            ]
+            .map(str::to_owned),
+        );
+        invalid_reasons.push("recovery-private-canary".repeat(65_536));
+        for reason in invalid_reasons {
+            for requested in [
+                RetrievalTopology::FastOnly,
+                RetrievalTopology::QualityOnly,
+                RetrievalTopology::FullProgressive,
+            ] {
+                let error = SemanticResponseContract::new(
+                    requested,
+                    RetrievalTopology::LexicalOnly,
+                    0,
+                    0,
+                    Some(reason.clone()),
+                )
+                .expect_err("only a canonical unavailable readiness code is admissible");
+                assert_eq!(error, RecoveryContractError::InvalidDegradationReason);
+                assert_eq!(
+                    error.to_string(),
+                    "degradation reason must name a canonical unavailable semantic readiness state"
+                );
+                assert_eq!(format!("{error:?}"), "InvalidDegradationReason");
+            }
+        }
+    }
+
+    #[test]
+    fn response_contract_preserves_missing_and_spurious_reason_classification() {
+        for reason in [
+            None,
+            Some(String::new()),
+            Some(" \t\r\n\u{2003}".to_owned()),
+        ] {
+            assert_eq!(
+                SemanticResponseContract::new(
+                    RetrievalTopology::FastOnly,
+                    RetrievalTopology::LexicalOnly,
+                    0,
+                    0,
+                    reason,
+                ),
+                Err(RecoveryContractError::MissingDegradationReason)
+            );
+        }
+        for reason in [
+            "recovery.state.model_missing",
+            "provider-private-canary",
+            "",
+        ] {
+            for (requested, realized, coverage) in [
+                (
+                    RetrievalTopology::LexicalOnly,
+                    RetrievalTopology::LexicalOnly,
+                    0,
+                ),
+                (
+                    RetrievalTopology::FullProgressive,
+                    RetrievalTopology::FullProgressive,
+                    COMPLETE_COVERAGE_PPM,
+                ),
+                (
+                    RetrievalTopology::HashControl,
+                    RetrievalTopology::HashControl,
+                    0,
+                ),
+            ] {
+                assert_eq!(
+                    SemanticResponseContract::new(
+                        requested,
+                        realized,
+                        coverage,
+                        0,
+                        Some(reason.to_owned()),
+                    ),
+                    Err(RecoveryContractError::UnexpectedDegradationReason)
+                );
+            }
+        }
     }
 
     #[test]
