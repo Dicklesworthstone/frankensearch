@@ -50,7 +50,7 @@ pub use tantivy::{
 };
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -1030,6 +1030,26 @@ pub fn load_doc(searcher: &Searcher, doc_address: DocAddress) -> SearchResult<Ta
         .map_err(|e| SearchError::SubsystemError {
             subsystem: "tantivy",
             source: Box::new(e),
+        })
+}
+
+/// Decode a stored metadata value without turning corrupted content into an absent field.
+fn stored_metadata(
+    document: &TantivyDocument,
+    fields: SchemaFields,
+) -> SearchResult<Option<serde_json::Value>> {
+    let Some(value) = document.get_first(fields.metadata_json) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(|| SearchError::SubsystemError {
+        subsystem: "tantivy.metadata",
+        source: "selected Tantivy metadata is not a stored string".into(),
+    })?;
+    serde_json::from_str(raw)
+        .map(Some)
+        .map_err(|_| SearchError::SubsystemError {
+            subsystem: "tantivy.metadata",
+            source: "selected Tantivy metadata is not valid JSON".into(),
         })
 }
 
@@ -3478,25 +3498,9 @@ impl TantivyIndex {
         for hit in search_result.hits {
             let doc = load_doc(&searcher, hit.doc_address)?;
 
-            let doc_id = doc
-                .get_first(self.fields.id)
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| {
-                    debug!("tantivy document missing id field, using empty doc_id");
-                    ""
-                })
-                .to_owned();
+            let doc_id = Self::stored_document_id(&doc, self.fields.id, hit.doc_address)?.to_owned();
 
-            let metadata = doc
-                .get_first(self.fields.metadata_json)
-                .and_then(|v| v.as_str())
-                .and_then(|s| match serde_json::from_str(s) {
-                    Ok(val) => Some(val),
-                    Err(e) => {
-                        debug!(doc_id = %doc_id, error = %e, "failed to deserialize metadata JSON");
-                        None
-                    }
-                });
+            let metadata = stored_metadata(&doc, self.fields)?;
 
             // Generate snippet from the document.
             let snippet = snippet_gen.as_ref().and_then(|generator| {
@@ -4036,30 +4040,23 @@ impl TantivyIndex {
             .collect()
         };
 
+        // Decode the pinned batch before changing any winner. A bad stored
+        // row must not leave a caller with a partially hydrated result set.
+        let mut by_id = HashMap::<DocId, Option<Arc<serde_json::Value>>>::new();
         for doc_address in doc_addresses {
             let doc = load_doc(searcher, doc_address)?;
-            let doc_id = doc
-                .get_first(self.fields.id)
-                .and_then(|value| value.as_str())
-                .unwrap_or_else(|| {
-                    debug!("tantivy document missing id field while hydrating metadata");
-                    ""
+            let id = Self::stored_document_id(&doc, self.fields.id, doc_address)?;
+            let metadata = stored_metadata(&doc, self.fields)?.map(Arc::new);
+            if by_id.insert(id.into(), metadata).is_some() {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "tantivy.metadata",
+                    source: "selected Tantivy ID has multiple live documents".into(),
                 });
-            let metadata = doc
-                .get_first(self.fields.metadata_json)
-                .and_then(|value| value.as_str())
-                .and_then(|raw| match serde_json::from_str(raw) {
-                    Ok(value) => Some(value),
-                    Err(error) => {
-                        debug!(%doc_id, %error, "failed to deserialize metadata JSON");
-                        None
-                    }
-                });
-            if let Some(result) = results
-                .iter_mut()
-                .find(|result| result.doc_id.as_str() == doc_id)
-            {
-                result.metadata = metadata;
+            }
+        }
+        for result in results {
+            if result.lexical_score.is_some() && result.metadata.is_none() {
+                result.metadata = by_id.get(&result.doc_id).cloned().flatten();
             }
         }
 
@@ -4157,25 +4154,9 @@ impl frankensearch_core::traits::LexicalRead for TantivyIndex {
                             source: Box::new(e),
                         })?;
 
-                let doc_id = doc
-                    .get_first(self.fields.id)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| {
-                        debug!("tantivy document missing id field, using empty doc_id");
-                        ""
-                    })
-                    .to_owned();
+                let doc_id = Self::stored_document_id(&doc, self.fields.id, doc_address)?;
 
-                let metadata = doc
-                    .get_first(self.fields.metadata_json)
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| match serde_json::from_str(s) {
-                        Ok(val) => Some(val),
-                        Err(e) => {
-                            debug!(doc_id = %doc_id, error = %e, "failed to deserialize metadata JSON");
-                            None
-                        }
-                    });
+                let metadata = stored_metadata(&doc, self.fields)?.map(Arc::new);
 
                 results.push(ScoredResult {
                     doc_id: doc_id.into(),
@@ -6435,8 +6416,9 @@ mod tests {
 
     #[test]
     fn selected_metadata_refuses_corrupt_json_instead_of_reporting_unknown() {
-        let index = TantivyIndex::in_memory().expect("create");
+        let dir = tempfile::tempdir().expect("tempdir");
         run_with_cx(|cx| async move {
+            let index = TantivyIndex::create(dir.path()).expect("create");
             let mut document = index.to_tantivy_doc(&IndexableDocument::new("damaged", "alpha"));
             document.add_text(index.fields.metadata_json, "{broken");
             {
@@ -6448,6 +6430,8 @@ mod tests {
                     .expect("write fixture");
             }
             index.commit(&cx).await.expect("publish malformed fixture");
+            drop(index);
+            let index = TantivyIndex::open_read_only(dir.path()).expect("reopen malformed fixture");
             let pinned = index
                 .pin_search(&cx)
                 .await
@@ -6457,6 +6441,13 @@ mod tests {
                 &index as &dyn frankensearch_core::traits::LexicalRead,
                 pinned.as_ref(),
             ] {
+                assert!(matches!(
+                    reader.search(&cx, "alpha", 10).await,
+                    Err(SearchError::SubsystemError {
+                        subsystem: "tantivy.metadata",
+                        ..
+                    })
+                ));
                 assert!(matches!(
                     reader.metadata_for_documents(&cx, &["damaged"]).await,
                     Err(SearchError::SubsystemError {
@@ -6472,6 +6463,26 @@ mod tests {
                     vec![None]
                 );
             }
+            assert!(matches!(
+                index.search_with_snippets(&cx, "alpha", 10, &SnippetConfig::default()),
+                Err(SearchError::SubsystemError {
+                    subsystem: "tantivy.metadata",
+                    ..
+                }),
+            ));
+            let batch = index.search_candidates(&cx, "alpha", 10).await.unwrap();
+            let (mut winners, context) = batch.into_parts();
+            assert_eq!(winners.len(), 1);
+            assert!(matches!(
+                index
+                    .hydrate_candidates(&cx, context.as_ref(), &mut winners)
+                    .await,
+                Err(SearchError::SubsystemError {
+                    subsystem: "tantivy.metadata",
+                    ..
+                }),
+            ));
+            assert!(winners[0].metadata.is_none());
             assert!(matches!(
                 pinned.search_candidates(&cx, "alpha", 10).await,
                 Err(SearchError::SubsystemError {
@@ -7226,7 +7237,14 @@ mod tests {
                 let export_error = idx
                     .all_documents()
                     .expect_err("shadow export must not silently omit a live row");
-                for error in [id_error, export_error] {
+                let search_error = idx
+                    .search(&cx, "orphansentinel", 1)
+                    .await
+                    .expect_err("ranked hits require a stored ID");
+                let snippet_error = idx
+                    .search_with_snippets(&cx, "orphansentinel", 1, &SnippetConfig::default())
+                    .expect_err("enriched hits require a stored ID");
+                for error in [id_error, export_error, search_error, snippet_error] {
                     assert!(matches!(
                         error,
                         SearchError::SubsystemError {
@@ -7710,16 +7728,32 @@ mod tests {
                 .expect("fresh search");
             assert_eq!(rev_of(&fresh[0]).as_deref(), Some("v2"));
 
-            // The retained batch hydrates from its PINNED generation N.
+            // Mixed winner lists may contain the same ID more than once.
+            // Only missing metadata on lexical winners belongs to this pin.
             let (mut winners, context) = batch.into_parts();
+            let mut semantic_only = winners[0].clone();
+            semantic_only.lexical_score = None;
+            semantic_only.source = ScoreSource::SemanticFast;
+            semantic_only.fast_score = Some(semantic_only.score);
+            winners.insert(0, semantic_only);
+            winners.push(fresh[0].clone());
+            winners.push(winners[1].clone());
             LexicalRead::hydrate_candidates(&idx, &cx, context.as_ref(), &mut winners)
                 .await
                 .expect("pinned hydration");
             assert_eq!(
-                rev_of(&winners[0]).as_deref(),
-                Some("v1"),
-                "hydration must read the scoring searcher, not the newest generation"
+                winners.iter().map(rev_of).collect::<Vec<_>>(),
+                [
+                    None,
+                    Some("v1".to_owned()),
+                    Some("v2".to_owned()),
+                    Some("v1".to_owned()),
+                ]
             );
+            assert!(Arc::ptr_eq(
+                winners[1].metadata.as_ref().unwrap(),
+                winners[3].metadata.as_ref().unwrap()
+            ));
         });
     }
 
