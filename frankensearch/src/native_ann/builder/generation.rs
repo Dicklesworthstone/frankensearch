@@ -163,7 +163,10 @@ impl NativeIndexBuilder {
     /// retain their own actual vector owners; no placeholder vectors are added.
     /// Fresh builders select the requested subset. A restricted
     /// [`super::NativePartialQualityUpdate`] retains only surviving covered IDs
-    /// and reuses their own unchanged vectors; other reuse plans are refused.
+    /// and reuses their own unchanged vectors. Explicit
+    /// [`super::NativeQualityCompletion::build_partial`] retains the exact source
+    /// and every existing quality row while adding selected missing rows. Other
+    /// reuse plans are refused.
     ///
     /// # Errors
     /// Rejects missing quality, empty/full/duplicate/unknown selections,
@@ -202,14 +205,14 @@ impl NativeIndexBuilder {
                 ));
             }
         }
-        if let Some(reuse) = &self.reuse
-            && reuse.preserved_partial_quality_ids(cx, &self.documents)? != selected
-        {
-            return Err(invalid(
-                "builder.generation.partial_quality",
-                "changed-membership",
-                "partial updates must preserve exactly the surviving covered IDs",
-            ));
+        if let (Some(reuse), Some(quality)) = (&self.reuse, &self.quality) {
+            reuse.validate_partial_quality_selection(
+                cx,
+                &self.documents,
+                &source,
+                &selected,
+                quality,
+            )?;
         }
         Box::pin(self.build_composite_generation(
             cx,
@@ -295,8 +298,10 @@ impl NativeIndexBuilder {
             let reuse = self
                 .reuse
                 .as_ref()
-                .map(|source| source.partial_quality_projection(cx).map(Arc::new))
-                .transpose()?;
+                .map(|source| source.partial_quality_projection(cx))
+                .transpose()?
+                .flatten()
+                .map(Arc::new);
             Some(Self {
                 directory: self.directory.join("partial-quality"),
                 generation: self.generation,

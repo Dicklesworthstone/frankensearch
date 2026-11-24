@@ -220,7 +220,7 @@ impl NativeIndexQualityCompletion {
     }
 }
 
-/// Complete an authority generation's absent or partial quality tier.
+/// Expand an authority generation's absent or partial quality tier.
 ///
 /// This owns the selected source and independent vector pins. It cannot edit
 /// documents, change fast precision or replace either retained producer. Existing
@@ -228,7 +228,9 @@ impl NativeIndexQualityCompletion {
 /// missing quality rows require document inference. An explicit quality precision
 /// change re-embeds that entire tier. The successor preserves the source checkpoint
 /// and exact Quill image. No authority changes until the caller publishes the fully
-/// admitted result with the predecessor's expected pair.
+/// admitted result with the predecessor's expected pair. [`Self::build`] completes
+/// every missing row; [`Self::build_partial`] checkpoints an explicitly selected
+/// larger proper subset without changing existing vector precision.
 #[cfg(feature = "quill")]
 pub struct NativeQualityCompletion {
     update: NativeIndexUpdate,
@@ -403,6 +405,50 @@ impl NativeQualityCompletion {
         let result = Box::pin(self.update.prepare(cx)?.build_progressive_generation(
             cx,
             self.source,
+            max_image_bytes,
+        ))
+        .await;
+        drop(authority_pin);
+        result
+    }
+
+    /// Add selected quality rows while retaining a proper partial-quality subset.
+    ///
+    /// `quality_document_ids` names the complete successor quality membership,
+    /// including every already covered ID. It must be a strict superset of the
+    /// retained membership and a nonempty proper subset of the unchanged source.
+    /// A fast-only predecessor has an empty retained quality membership. Use
+    /// [`Self::build`] to complete the entire corpus instead.
+    ///
+    /// Fast vectors, existing quality vectors, exact source bytes and the source
+    /// checkpoint are retained. Only newly selected quality rows require document
+    /// inference. Existing quality precision cannot change on this bounded route;
+    /// graph policy may change without changing stored vector values. Both
+    /// independent producer contracts remain required. No authority is published.
+    ///
+    /// # Errors
+    /// Refuses duplicate/unknown IDs, empty/full selections, dropped existing
+    /// members, no new members, changed source or retained precision, producer
+    /// drift, budget exhaustion and cancellation. Membership and policy checks
+    /// precede inference and work-file creation; a failed build returns no prefix.
+    pub async fn build_partial(
+        self,
+        cx: &Cx,
+        quality_document_ids: impl IntoIterator<Item = String>,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.quality_completion.partial_build")?;
+        let authority_pin = self
+            .update
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            .map(|authority| Arc::clone(&authority.snapshot));
+        let result = Box::pin(self.update.prepare(cx)?.build_partial_quality_generation(
+            cx,
+            self.source,
+            quality_document_ids,
             max_image_bytes,
         ))
         .await;
@@ -1657,10 +1703,102 @@ impl ReuseSource {
         Ok(selected)
     }
 
+    /// Ordinary edits preserve membership; explicit completion may only add rows.
+    #[cfg(feature = "quill")]
+    pub(super) fn validate_partial_quality_selection(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        source: &CommitRange,
+        selected: &BTreeSet<String>,
+        quality_plan: &TierPlan,
+    ) -> SearchResult<()> {
+        let completing = self.authority.as_ref().is_some_and(|authority| {
+            matches!(authority.intent, AuthorityUpdateIntent::CompleteQuality)
+        });
+        if !completing {
+            if self.preserved_partial_quality_ids(cx, documents)? != *selected {
+                return Err(invalid(
+                    "builder.generation.partial_quality",
+                    "changed-membership",
+                    "partial updates must preserve exactly the surviving covered IDs",
+                ));
+            }
+            return Ok(());
+        }
+        if self
+            .unchanged_authority_lexical(cx, documents, source)?
+            .is_none()
+        {
+            return Err(invalid(
+                "quality_completion.source",
+                "changed",
+                "bounded quality completion must retain the exact source and checkpoint",
+            ));
+        }
+        // The quality builder runs after fast artifacts are finalized. Admit its
+        // live provider now so drift cannot start that otherwise reusable work.
+        quality_plan.admit(quality_plan.embedder.identity()?)?;
+        let producer = quality_plan.identity.fingerprint();
+        let mut previous = BTreeSet::new();
+        for partition in &self.partitions {
+            checkpoint(cx, "native_ann.quality_completion.partial_membership")?;
+            let Some(quality) = &partition.quality else {
+                if self.completing_quality {
+                    continue;
+                }
+                return Err(invalid(
+                    "quality_completion.source",
+                    "missing-quality",
+                    "partial completion requires its retained quality owner",
+                ));
+            };
+            if quality.precision != quality_plan.precision
+                || quality.producer_fingerprint.as_ref() != Some(&producer)
+                || quality.coverage
+                    != (ReuseCoverage::PartialQuality {
+                        infer_missing: true,
+                    })
+            {
+                return Err(invalid(
+                    "quality_completion.reuse",
+                    "changed",
+                    "bounded quality completion must retain its quality producer and precision",
+                ));
+            }
+            for (position, document) in partition.documents.iter().enumerate() {
+                checkpoint(cx, "native_ann.quality_completion.partial_member")?;
+                if quality.physical_rows[position] != usize::MAX {
+                    previous.insert(document.id.clone());
+                }
+            }
+        }
+        if selected.len() <= previous.len() || !selected.is_superset(&previous) {
+            return Err(invalid(
+                "quality_completion.membership",
+                "not-expanded",
+                "bounded quality completion must retain every covered ID and add new members",
+            ));
+        }
+        Ok(())
+    }
+
     /// Project quality into a single-tier builder without borrowing the fast owner.
     #[cfg(feature = "quill")]
-    pub(super) fn partial_quality_projection(&self, cx: &Cx) -> SearchResult<Self> {
-        let authority = self.partial_quality_authority()?;
+    pub(super) fn partial_quality_projection(&self, cx: &Cx) -> SearchResult<Option<Self>> {
+        let authority =
+            match self.authority.as_ref().filter(|authority| {
+                matches!(authority.intent, AuthorityUpdateIntent::CompleteQuality)
+            }) {
+                Some(authority) => authority,
+                None => self.partial_quality_authority()?,
+            };
+        let completing = matches!(authority.intent, AuthorityUpdateIntent::CompleteQuality);
+        if completing && self.completing_quality {
+            // Fast-only completion owns no quality vectors to project. The
+            // selected subset is inferred with its independently admitted model.
+            return Ok(None);
+        }
         let mut partitions = Vec::with_capacity(self.partitions.len());
         for partition in &self.partitions {
             checkpoint(cx, "native_ann.partial_update.quality_reuse")?;
@@ -1671,16 +1809,15 @@ impl ReuseSource {
                     "partial reuse requires its admitted quality owner",
                 )
             })?;
-            if !matches!(
-                quality.coverage,
-                ReuseCoverage::PartialQuality {
-                    infer_missing: false
-                }
-            ) {
+            if quality.coverage
+                != (ReuseCoverage::PartialQuality {
+                    infer_missing: completing,
+                })
+            {
                 return Err(invalid(
                     "partial_update.source",
                     "invalid-coverage",
-                    "subset preservation cannot infer absent quality rows",
+                    "quality reuse must match its explicit preservation or completion intent",
                 ));
             }
             partitions.push(ReusePartition {
@@ -1689,11 +1826,11 @@ impl ReuseSource {
                 quality: None,
             });
         }
-        Ok(Self {
+        Ok(Some(Self {
             partitions,
             completing_quality: false,
             authority: Some(authority.clone()),
-        })
+        }))
     }
 
     /// Retain exact lexical bytes only for an identical complete source and cut.

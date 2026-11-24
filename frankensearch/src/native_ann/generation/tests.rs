@@ -3801,6 +3801,449 @@ mod qualified_rollback {
             });
         }
 
+        #[test]
+        fn partial_backfill_preserves_source_and_vectors_then_completes_only_the_remainder() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for quality_ann in [false, true] {
+                    let fixture = fixture_with_quality_input(&cx, true).await;
+                    let retained = &fixture.snapshot;
+                    let root_path = fixture.parent.join("root");
+                    let root = updates::admit_root(&root_path);
+                    let authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                    let lock = fs::read(root_path.join("LOCK")).unwrap();
+                    let old_fast = vector_bits(&retained.readers.vector);
+                    let old_quality = vector_bits(retained.readers.quality.as_ref().unwrap());
+                    let old_source =
+                        serde_json::to_value(retained.source_documents(&cx, BUDGET).unwrap())
+                            .unwrap();
+                    fs::rename(
+                        fixture.parent.join("source"),
+                        fixture.parent.join("relocated-source"),
+                    )
+                    .unwrap();
+
+                    let built = retained
+                        .begin_quality_completion(
+                            &cx,
+                            fixture.parent.join("backfilled"),
+                            ArtifactGenerationIdentityV1::new(8, [0x91; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            fixture.quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .with_batch_size(1)
+                        .unwrap()
+                        .with_quality_storage(
+                            NativeBuildPrecision::F16,
+                            progressive_policy(quality_ann, true),
+                        )
+                        .unwrap()
+                        .build_partial(&cx, ["e", "a", "b"].map(str::to_owned), BUDGET)
+                        .await
+                        .unwrap();
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(built.coverage(), VectorCohortCoverage::PartialQuality);
+                    assert_eq!(
+                        built.metadata().commit_range,
+                        retained.metadata().commit_range
+                    );
+                    assert_eq!(
+                        built.binding().frozen_identity(),
+                        &retained.metadata().embedders["fast"]
+                    );
+                    assert_eq!(
+                        built.quality_binding().unwrap().frozen_identity(),
+                        &retained.metadata().embedders["quality"]
+                    );
+                    assert_eq!(
+                        built.component_bytes(GenerationComponentRole::Lexical),
+                        retained
+                            .retained_snapshot()
+                            .closure()
+                            .bytes(GenerationComponentRole::Lexical)
+                    );
+                    assert_progressive_policy(built.retrieval_configuration(), true, false);
+                    assert_progressive_policy(
+                        built.quality_retrieval_configuration().unwrap(),
+                        quality_ann,
+                        true,
+                    );
+                    assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
+                    assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock);
+
+                    let current = updates::publish_partial(&cx, &root, &built, retained, 0x92);
+                    assert_eq!(
+                        current.topology(),
+                        NativeGenerationTopology::PartialQuality {
+                            quality_documents: 3,
+                            total_documents: 4,
+                            coverage_ppm: 750_000,
+                        }
+                    );
+                    assert_eq!(
+                        current.partial_quality_document_ids(&cx).unwrap(),
+                        ["a", "b", "e"],
+                    );
+                    assert_eq!(vector_bits(&current.readers.vector), old_fast);
+                    let new_quality = vector_bits(current.readers.quality.as_ref().unwrap());
+                    for (id, bits) in &old_quality {
+                        assert_eq!(&new_quality[id], bits);
+                    }
+                    assert_eq!(
+                        serde_json::to_value(current.source_documents(&cx, BUDGET).unwrap())
+                            .unwrap(),
+                        old_source,
+                    );
+                    let page = current
+                        .search_progressive_with_partial_quality(
+                            &cx,
+                            fixture.fast.as_ref(),
+                            fixture.quality.as_ref(),
+                            "unmatched",
+                            4,
+                        )
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(page.len(), 4);
+                    for hit in &page {
+                        assert_eq!(hit.quality_score.is_some(), hit.doc_id != "c");
+                    }
+                    assert_eq!(
+                        retained.partial_quality_document_ids(&cx).unwrap(),
+                        ["b", "e"],
+                    );
+                    assert_eq!(vector_bits(&retained.readers.vector), old_fast);
+                    assert_eq!(
+                        vector_bits(retained.readers.quality.as_ref().unwrap()),
+                        old_quality
+                    );
+
+                    fixture.fast.calls.store(0, Ordering::SeqCst);
+                    fixture.quality.calls.store(0, Ordering::SeqCst);
+                    let completed = current
+                        .begin_quality_completion(
+                            &cx,
+                            fixture.parent.join("completed-after-backfill"),
+                            ArtifactGenerationIdentityV1::new(9, [0x93; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            fixture.quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .build(&cx, BUDGET)
+                        .await
+                        .unwrap();
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(completed.coverage(), VectorCohortCoverage::Complete);
+                    let candidate = completed
+                        .candidate(
+                            [0x94; 16],
+                            Some(current.authority()),
+                            GenerationAuthorityActionV1::Activate,
+                            [0x95; 32],
+                        )
+                        .unwrap();
+                    let preview = completed.preview_candidate(&cx, &candidate).unwrap();
+                    assert_eq!(
+                        preview.topology(),
+                        NativeGenerationTopology::FullProgressive
+                    );
+                    assert_eq!(vector_bits(&preview.readers.vector), old_fast);
+                    let completed_quality = vector_bits(preview.readers.quality.as_ref().unwrap());
+                    for (id, bits) in &new_quality {
+                        assert_eq!(&completed_quality[id], bits);
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn partial_backfill_starts_from_fast_only_and_resumes_from_published_membership() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let parent = update_parent("fast-partial-backfill");
+                let root = create_root(&parent.join("root"));
+                let fast = Arc::new(ProgressiveProvider::new(false));
+                let quality = Arc::new(ProgressiveProvider::new(true));
+                let initial = NativeIndexBuilder::new(
+                    parent.join("source"),
+                    ArtifactGenerationIdentityV1::new(7, [0x96; 16]).unwrap(),
+                    fast.clone(),
+                )
+                .unwrap()
+                .add_documents(["a", "b", "c", "d"].map(|id| {
+                    IndexableDocument::new(id, format!("retained {id} corpus"))
+                        .with_title(format!("Title {id}"))
+                        .with_metadata("version", "original")
+                }))
+                .build_exact_generation(
+                    &cx,
+                    EmbedderTierTag::Fast,
+                    CommitRange { low: 1, high: 4 },
+                    BUDGET,
+                )
+                .await
+                .unwrap();
+                let candidate = initial
+                    .candidate(
+                        [0x97; 16],
+                        None,
+                        GenerationAuthorityActionV1::Activate,
+                        [0x98; 32],
+                    )
+                    .unwrap();
+                stage(&root, &initial, &candidate);
+                let original = Arc::new(publish(
+                    &cx,
+                    &root,
+                    &candidate,
+                    initial.binding(),
+                    ExpectedAuthorityPairV1::default(),
+                    [0x99; 16],
+                ));
+                let old_fast = vector_bits(&original.readers.vector);
+                let mut current = Arc::clone(&original);
+                for (step, selected) in [vec!["a"], vec!["c", "a"]].into_iter().enumerate() {
+                    fast.calls.store(0, Ordering::SeqCst);
+                    quality.calls.store(0, Ordering::SeqCst);
+                    let built = current
+                        .begin_quality_completion(
+                            &cx,
+                            parent.join(format!("backfill-{step}")),
+                            ArtifactGenerationIdentityV1::new(
+                                8 + u64::try_from(step).unwrap(),
+                                [0x9a; 16],
+                            )
+                            .unwrap(),
+                            fast.clone(),
+                            quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .with_quality_storage(
+                            NativeBuildPrecision::F32,
+                            progressive_policy(true, true),
+                        )
+                        .unwrap()
+                        .build_partial(&cx, selected.into_iter().map(str::to_owned), BUDGET)
+                        .await
+                        .unwrap();
+                    assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        built.component_bytes(GenerationComponentRole::Lexical),
+                        initial.component_bytes(GenerationComponentRole::Lexical),
+                    );
+                    let next = updates::publish_partial(
+                        &cx,
+                        &root,
+                        &built,
+                        &current,
+                        0x9b + u8::try_from(step).unwrap(),
+                    );
+                    assert_eq!(vector_bits(&next.readers.vector), old_fast);
+                    assert_eq!(
+                        next.partial_quality_document_ids(&cx).unwrap().len(),
+                        step + 1,
+                    );
+                    current = Arc::new(next);
+                }
+                assert_eq!(
+                    current.partial_quality_document_ids(&cx).unwrap(),
+                    ["a", "c"]
+                );
+                assert_eq!(original.topology(), NativeGenerationTopology::FastOnly);
+                assert!(original.readers.quality.is_none());
+                assert_eq!(vector_bits(&original.readers.vector), old_fast);
+            });
+        }
+
+        #[test]
+        fn partial_backfill_refuses_invalid_membership_and_policy_before_work() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let fixture = fixture(&cx).await;
+                let retained = &fixture.snapshot;
+                let root = fixture.parent.join("root");
+                let authority = fs::read(root.join("AUTHORITY")).unwrap();
+                let lock = fs::read(root.join("LOCK")).unwrap();
+                for (name, selected) in [
+                    ("empty", vec![]),
+                    ("unchanged", vec!["b", "e"]),
+                    ("replacement", vec!["a", "b"]),
+                    ("dropped", vec!["a", "b", "c"]),
+                    ("unknown", vec!["b", "e", "missing"]),
+                    ("blank", vec!["b", "e", ""]),
+                    ("duplicate", vec!["b", "e", "b"]),
+                    ("full", vec!["a", "b", "c", "e"]),
+                ] {
+                    let work = fixture.parent.join(name);
+                    let result = retained
+                        .begin_quality_completion(
+                            &cx,
+                            &work,
+                            ArtifactGenerationIdentityV1::new(8, [0xa4; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            fixture.quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .build_partial(&cx, selected.into_iter().map(str::to_owned), BUDGET)
+                        .await;
+                    assert!(
+                        matches!(result, Err(SearchError::InvalidConfig { .. })),
+                        "{name}"
+                    );
+                    assert!(!work.exists(), "{name}");
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                }
+                for case in ["precision", "budget", "drift"] {
+                    let work = fixture.parent.join(case);
+                    let provider = Arc::new(updates::FaultingQuality::new(
+                        fixture.quality.clone(),
+                        false,
+                    ));
+                    let mut plan = retained
+                        .begin_quality_completion(
+                            &cx,
+                            &work,
+                            ArtifactGenerationIdentityV1::new(8, [0xa5; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            provider.clone(),
+                            BUDGET,
+                        )
+                        .unwrap();
+                    if case == "precision" {
+                        plan = plan
+                            .with_quality_storage(
+                                NativeBuildPrecision::F32,
+                                NativeBuildRetrieval::Exact,
+                            )
+                            .unwrap();
+                    } else if case == "drift" {
+                        provider.drift();
+                    }
+                    assert!(
+                        plan.build_partial(
+                            &cx,
+                            ["a", "b", "e"].map(str::to_owned),
+                            if case == "budget" { 1 } else { BUDGET },
+                        )
+                        .await
+                        .is_err()
+                    );
+                    assert!(!work.exists(), "{case}");
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                }
+                for cancel_at in [0, 1, 3] {
+                    let work = fixture.parent.join(format!("cancel-{cancel_at}"));
+                    let plan = retained
+                        .begin_quality_completion(
+                            &cx,
+                            &work,
+                            ArtifactGenerationIdentityV1::new(8, [0xa6; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            fixture.quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap();
+                    let mut position = 0;
+                    let ids = ["a", "b", "e"];
+                    let selected = std::iter::from_fn(|| {
+                        if position == cancel_at {
+                            cx.set_cancel_requested(true);
+                        }
+                        let id = ids.get(position).map(|id| (*id).to_owned());
+                        position += 1;
+                        id
+                    });
+                    let result = plan.build_partial(&cx, selected, BUDGET).await;
+                    cx.set_cancel_requested(false);
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                    assert!(!work.exists());
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                }
+                assert_eq!(fs::read(root.join("AUTHORITY")).unwrap(), authority);
+                assert_eq!(fs::read(root.join("LOCK")).unwrap(), lock);
+                assert_eq!(
+                    retained.partial_quality_document_ids(&cx).unwrap(),
+                    ["b", "e"]
+                );
+            });
+        }
+
+        #[test]
+        fn partial_backfill_inference_drift_and_cancellation_keep_the_predecessor() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for cancel in [false, true] {
+                    let fixture = fixture(&cx).await;
+                    let retained = &fixture.snapshot;
+                    let root = fixture.parent.join("root");
+                    let authority = fs::read(root.join("AUTHORITY")).unwrap();
+                    let lock = fs::read(root.join("LOCK")).unwrap();
+                    let old_fast = vector_bits(&retained.readers.vector);
+                    let old_quality = vector_bits(retained.readers.quality.as_ref().unwrap());
+                    let result = retained
+                        .begin_quality_completion(
+                            &cx,
+                            fixture.parent.join("failed-backfill"),
+                            ArtifactGenerationIdentityV1::new(8, [0xa7; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            Arc::new(updates::FaultingQuality::new(
+                                fixture.quality.clone(),
+                                cancel,
+                            )),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .with_batch_size(1)
+                        .unwrap()
+                        .build_partial(&cx, ["a", "b", "e"].map(str::to_owned), BUDGET)
+                        .await;
+                    cx.set_cancel_requested(false);
+                    assert!(result.is_err());
+                    if cancel {
+                        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                    }
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(fs::read(root.join("AUTHORITY")).unwrap(), authority);
+                    assert_eq!(fs::read(root.join("LOCK")).unwrap(), lock);
+                    assert_eq!(vector_bits(&retained.readers.vector), old_fast);
+                    assert_eq!(
+                        vector_bits(retained.readers.quality.as_ref().unwrap()),
+                        old_quality
+                    );
+                    let page = retained
+                        .search_progressive_with_partial_quality(
+                            &cx,
+                            fixture.fast.as_ref(),
+                            fixture.quality.as_ref(),
+                            "unmatched",
+                            4,
+                        )
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(page.len(), 4);
+                    assert!(
+                        page.iter()
+                            .find(|hit| hit.doc_id == "a")
+                            .unwrap()
+                            .quality_score
+                            .is_none()
+                    );
+                }
+            });
+        }
+
         mod model_migration {
             use super::updates::{admit_root, publish_partial};
             use super::*;
@@ -5066,7 +5509,7 @@ mod qualified_rollback {
                 });
             }
 
-            struct FaultingQuality {
+            pub(super) struct FaultingQuality {
                 inner: Arc<ProgressiveProvider>,
                 changed: EmbeddingIdentityBundleV1,
                 drifted: AtomicBool,
@@ -5074,7 +5517,10 @@ mod qualified_rollback {
             }
 
             impl FaultingQuality {
-                fn new(inner: Arc<ProgressiveProvider>, cancel_after_embed: bool) -> Self {
+                pub(super) fn new(
+                    inner: Arc<ProgressiveProvider>,
+                    cancel_after_embed: bool,
+                ) -> Self {
                     let mut changed = inner.identity.clone();
                     changed
                         .producer
@@ -5087,6 +5533,10 @@ mod qualified_rollback {
                         drifted: AtomicBool::new(false),
                         cancel_after_embed,
                     }
+                }
+
+                pub(super) fn drift(&self) {
+                    self.drifted.store(true, Ordering::SeqCst);
                 }
             }
 
