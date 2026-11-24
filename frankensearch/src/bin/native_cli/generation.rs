@@ -115,6 +115,8 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       [--mode fast|quality|full|partial|lexical] [--stream] [--filter JSON] [--timeout-ms N]\n\
       [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]\n\
       [--max-source-bytes N] [--max-image-bytes N]\n\n\
+  authority-export --receipt JSON [--current-receipt CURRENT_JSON]\n\
+      [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-fetch --receipt JSON --doc-id ID [--offset-bytes N] [--max-bytes N]\n\
       [--current-receipt CURRENT_JSON]\n\
       [--include-metadata] [--filter JSON] [--max-source-bytes N]\n\
@@ -334,6 +336,11 @@ Filtered source export is bounded by --max-source-bytes (default 256 MiB).\n\
 The fixed server scope stays on its retained generation. Activation and updates\n\
 prepare its successor membership before changing selection or publication.\n\
 Unfiltered queries do not export source.\n\
+authority-export writes the complete selected source as ordinary index JSONL.\n\
+It validates the full inventory before writing stdout and loads no models.\n\
+--max-source-bytes bounds both raw source and encoded output, with the index\n\
+input limits also enforced. Empty selections emit zero records. Historical export\n\
+requires the current receipt and normal ancestry admission.\n\
 authority-fetch reads one selected document window without loading a model.\n\
 Its receipt selects the exact current authority unless --current-receipt selects\n\
 its authenticated predecessor explicitly. Offsets default to\n\
@@ -359,6 +366,7 @@ enum Command {
     Repair,
     Search,
     Fetch,
+    Export,
     Serve,
     Recover,
     Rollback,
@@ -448,6 +456,7 @@ pub fn is_command(command: &str) -> bool {
             | "authority-repair"
             | "authority-search"
             | "authority-fetch"
+            | "authority-export"
             | "authority-serve"
             | "authority-recover"
             | "authority-rollback"
@@ -465,6 +474,7 @@ impl Options {
             Some("authority-repair") => Command::Repair,
             Some("authority-search") => Command::Search,
             Some("authority-fetch") => Command::Fetch,
+            Some("authority-export") => Command::Export,
             Some("authority-serve") => Command::Serve,
             Some("authority-recover") => Command::Recover,
             Some("authority-rollback") => Command::Rollback,
@@ -528,7 +538,10 @@ impl Options {
             match flag.as_str() {
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
                 "--current-receipt"
-                    if matches!(command, Command::Search | Command::Fetch | Command::Serve) =>
+                    if matches!(
+                        command,
+                        Command::Search | Command::Fetch | Command::Export | Command::Serve
+                    ) =>
                 {
                     options.current_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
@@ -569,6 +582,7 @@ impl Options {
                             | Command::Repair
                             | Command::Search
                             | Command::Fetch
+                            | Command::Export
                             | Command::Serve
                     ) =>
                 {
@@ -595,7 +609,7 @@ impl Options {
                 "--model-dir"
                     if !matches!(
                         command,
-                        Command::Fetch | Command::Recover | Command::Rollback
+                        Command::Fetch | Command::Export | Command::Recover | Command::Rollback
                     ) =>
                 {
                     options.models = Some(PathBuf::from(value(&mut args)?));
@@ -603,7 +617,7 @@ impl Options {
                 "--quality-backend"
                     if !matches!(
                         command,
-                        Command::Fetch | Command::Recover | Command::Rollback
+                        Command::Fetch | Command::Export | Command::Recover | Command::Rollback
                     ) =>
                 {
                     options.quality.backend =
@@ -612,7 +626,7 @@ impl Options {
                 "--quality-model-dir"
                     if !matches!(
                         command,
-                        Command::Fetch | Command::Recover | Command::Rollback
+                        Command::Fetch | Command::Export | Command::Recover | Command::Rollback
                     ) =>
                 {
                     options.quality.directory = Some(PathBuf::from(value(&mut args)?));
@@ -955,7 +969,7 @@ impl Options {
                     return Err(bad("authority-serve --batch-size requires --allow-updates"));
                 }
             }
-            Command::Recover => {}
+            Command::Recover | Command::Export => {}
         }
         Ok(Some(options))
     }
@@ -1574,14 +1588,7 @@ fn separate_destinations(paths: &[&Path]) -> Result<()> {
 fn save_receipt(receipt: &Receipt, path: &Path) -> Result<()> {
     receipt.validate()?;
     let bytes = encode(receipt, MAX_RECEIPT_BYTES)?;
-    let mut file = create_file(path, 0o600)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    File::open(
-        path.parent()
-            .ok_or_else(|| bad("receipt parent is missing"))?,
-    )?
-    .sync_all()?;
+    super::write_new_receipt(path, |file| file.write_all(&bytes))?;
     Ok(())
 }
 
@@ -2302,6 +2309,14 @@ fn retained_rebuild_documents(
 }
 
 fn validate_retained_documents(cx: &Cx, documents: &[IndexableDocument]) -> Result<()> {
+    visit_retained_records(cx, documents, |_| Ok(()))
+}
+
+fn visit_retained_records(
+    cx: &Cx,
+    documents: &[IndexableDocument],
+    mut accept: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
     checkpoint(cx)?;
     if documents.len() > MAX_DOCUMENTS {
         return Err(bad("retained source exceeds the 100000-document limit"));
@@ -2320,10 +2335,50 @@ fn validate_retained_documents(cx: &Cx, documents: &[IndexableDocument]) -> Resu
         }
         // Apply the CLI's JSONL record bound to the complete decoded document,
         // including escaping and a newline, before model loading or inference.
-        encode(document, MAX_RECORD_BYTES)
+        let record = encode(document, MAX_RECORD_BYTES)
             .map_err(|_| bad("retained source exceeds the 16 MiB encoded-record limit"))?;
+        accept(&record)?;
     }
     checkpoint(cx)?;
+    Ok(())
+}
+
+fn export(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
+    checkpoint(cx)?;
+    let receipt = Receipt::read(&options.receipt)?;
+    if receipt.documents > u64::try_from(MAX_DOCUMENTS)? {
+        return Err(bad("retained source exceeds the 100000-document limit"));
+    }
+    let (_root, snapshot) = open_read_selection(
+        cx,
+        &receipt,
+        options.current_receipt.as_deref(),
+        options.max_image_bytes,
+    )?;
+    let documents = snapshot.source_documents(cx, options.max_source_bytes)?;
+    write_export(cx, &documents, options.max_source_bytes, output)
+}
+
+fn write_export(
+    cx: &Cx,
+    documents: &[IndexableDocument],
+    max_bytes: usize,
+    output: &mut impl Write,
+) -> Result<()> {
+    // The reader must never mistake a budget or ID failure late in the
+    // inventory for a valid shorter rescan. Stage at most one CLI input stream.
+    let mut jsonl = Vec::new();
+    let limit = max_bytes.min(MAX_INPUT_BYTES);
+    visit_retained_records(cx, documents, |record| {
+        if record.len() > limit - jsonl.len() {
+            return Err(bad("export exceeds the encoded source byte limit"));
+        }
+        jsonl.extend_from_slice(record);
+        Ok(())
+    })?;
+    checkpoint(cx)?;
+    output.write_all(&jsonl)?;
+    output.flush()?;
     Ok(())
 }
 
@@ -4927,11 +4982,66 @@ pub fn run(args: Vec<String>) -> Result<()> {
             Command::Repair => Box::pin(repair::run(&cx, &options, &mut output, pool)).await,
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,
             Command::Fetch => fetch(&cx, &options, &mut output),
+            Command::Export => export(&cx, &options, &mut output),
             Command::Serve => Box::pin(serve(&cx, &options, &mut output, pool)).await,
             Command::Recover => recover(&cx, &options, &mut output),
             Command::Rollback => rollback(&cx, &options, &mut output),
         }
     })
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn export_is_model_free_and_rejects_search_and_write_options() {
+        let args = ["authority-export", "--receipt", "selected.json"];
+        assert!(is_command(args[0]));
+        assert_eq!(
+            Options::parse(args.map(str::to_owned))
+                .unwrap()
+                .unwrap()
+                .command,
+            Command::Export
+        );
+        for extra in [
+            ["--filter", "{}"],
+            ["--model-dir", "models"],
+            ["--quality-backend", "native-f32"],
+            ["--work-dir", "candidate"],
+            ["--doc-id", "one"],
+        ] {
+            assert!(Options::parse(args.into_iter().chain(extra).map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn export_validates_even_the_final_record_before_delivering_reindexable_jsonl() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let documents = vec![
+                IndexableDocument::new("one", "first\nsecond").with_metadata("language", "日本語"),
+                IndexableDocument::new("two", "last"),
+            ];
+            let mut output = Vec::new();
+            write_export(&cx, &documents, MAX_INPUT_BYTES, &mut output).unwrap();
+            let expected = output.len();
+            let roundtrip = read_documents(&mut std::io::Cursor::new(&output)).unwrap();
+            assert_eq!(
+                serde_json::to_value(&roundtrip).unwrap(),
+                serde_json::to_value(&documents).unwrap()
+            );
+            output.clear();
+            assert!(write_export(&cx, &documents, expected - 1, &mut output).is_err());
+            assert!(output.is_empty());
+            let mut duplicate = documents.clone();
+            duplicate[1].id.clone_from(&documents[0].id);
+            assert!(write_export(&cx, &duplicate, MAX_INPUT_BYTES, &mut output).is_err());
+            assert!(output.is_empty());
+            write_export(&cx, &[], 0, &mut output).unwrap();
+            assert!(output.is_empty());
+        });
+    }
 }
 
 #[cfg(test)]
