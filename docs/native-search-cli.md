@@ -358,10 +358,10 @@ selected-tier reranking, with the retained source policy described below.
 `authority-complete-quality` extends the independently bound quality tier of the
 selected fast-only or partial-quality generation. It reads the authenticated
 retained source, reuses the fast vectors and exact lexical image, and publishes
-one successor at the same source checkpoint. Omitting `--quality-ids` completes
-all missing quality rows and produces a full generation. For partial quality,
-existing quality vectors are reused. Original JSONL files are unnecessary, and
-the fast model performs no document inference.
+one successor at the same source checkpoint. Without a backfill option it
+completes all missing quality rows and produces a full generation. For partial
+quality, existing quality vectors are reused. Original JSONL files are
+unnecessary, and the fast model performs no document inference.
 
 ```sh
 ./target/release/frankensearch-native authority-complete-quality \
@@ -397,6 +397,38 @@ can resume from each newly published receipt until the remaining rows are ready
 for full completion. This also supports starting with a fast-only predecessor,
 whose existing quality membership is empty.
 
+To advance by a bounded number of documents without maintaining an ID list, use
+`--max-new-quality-documents N` instead of `--quality-ids`:
+
+```sh
+./target/release/frankensearch-native authority-complete-quality \
+  --from-receipt "$HOME/frankensearch-authority/partial.json" \
+  --work-dir "$HOME/frankensearch-authority/next-batch-work" \
+  --receipt "$HOME/frankensearch-authority/next-batch.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --max-new-quality-documents 100 --batch-size 16
+```
+
+The command selects the first missing source IDs in lexicographic order, using
+the admitted quality owner to distinguish covered rows. It retains every
+existing quality member and infers at most `N` newly covered documents across
+the entire build. `--batch-size` separately limits each inference request; it
+does not change the total backfill limit. `N` must be between 1 and 100,000, and
+the two backfill options cannot be combined.
+
+Resume with the newly published receipt and fresh work/receipt paths. No cursor
+or external coverage list is needed. If missing rows remain, the receipt records
+the actual larger partial subset. When the remaining rows fit within `N`, the
+same command publishes a full generation, enabling full and direct quality
+search. Zero limits, empty source and already complete selections refuse before
+model loading. Failed or cancelled work advances no coverage; retrying from the
+same still-current receipt selects the same missing IDs. A stale receipt refuses
+instead of following another publisher's selection.
+
+This bounds new quality inference, while complete successor images and graphs
+still require source-wide memory and I/O. It is not a process-memory or elapsed
+time limit.
+
 The configured fast provider must still match its retained identity. Choose the
 quality provider with the usual local model-directory and quality-backend flags.
 For a partial predecessor, that quality provider must match its independently
@@ -419,9 +451,13 @@ require complete coverage. A failed inference cannot publish a shorter list.
 
 Library callers use `NativeGenerationSnapshot::begin_quality_completion`, then
 `NativeQualityCompletion::build_partial(&cx, complete_quality_ids, max_image_bytes)`
-for bounded backfill or `build(&cx, max_image_bytes)` for full completion. Bounded
-backfill rejects a change to existing quality precision so it can reuse every
-retained quality vector; it still permits a different quality graph policy.
+for explicit membership, `build_next_batch(&cx, max_new_quality_documents,
+max_image_bytes)` for automatic bounded backfill, or `build(&cx, max_image_bytes)`
+for full completion. The automatic method returns a partial or full candidate
+according to the remaining rows; publication remains the caller's responsibility.
+Bounded backfill rejects a change to existing quality precision, including the
+automatic final batch, so it can reuse every retained quality vector. It still
+permits a different quality graph policy.
 
 A running fast-only or partial-quality server can adopt either successor receipt
 without restarting. Start it with `--allow-model-activation`; its ready event

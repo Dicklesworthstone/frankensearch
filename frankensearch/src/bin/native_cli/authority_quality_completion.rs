@@ -1,10 +1,12 @@
 //! Complete or incrementally expand quality coverage using one retained authority.
 
+use frankensearch_index::vector_cohort::VectorCohortCoverage;
+
 use super::{
-    BlockingPoolHandle, Cx, IndexableDocument, MAX_RECORD_BYTES, Models, NativeBuildPrecision,
-    NativeGenerationSnapshot, NativeGenerationTopology, Options, PublicationIntent,
-    PublicationOptions, QueryMode, Receipt, Result, Write, admit_root, bad, checkpoint,
-    emit_indexed, execution_context, load_authority_models, new_generation, new_path,
+    BlockingPoolHandle, Cx, IndexableDocument, MAX_DOCUMENTS, MAX_RECORD_BYTES, Models,
+    NativeBuildPrecision, NativeGenerationSnapshot, NativeGenerationTopology, Options,
+    PublicationIntent, PublicationOptions, QueryMode, Receipt, Result, Write, admit_root, bad,
+    checkpoint, emit_indexed, execution_context, load_authority_models, new_generation, new_path,
     prepare_partial_quality_completion, prepare_publication_with_intent, rebuild_precision,
     retained_rebuild_documents, separate_destinations, stage_prepared_and_publish,
 };
@@ -37,6 +39,17 @@ where
     F: FnOnce() -> Result<Models>,
 {
     checkpoint(cx)?;
+    if options.quality_ids.is_some() && options.max_new_quality_documents.is_some() {
+        return Err(bad(
+            "--quality-ids and --max-new-quality-documents cannot be combined",
+        ));
+    }
+    if options
+        .max_new_quality_documents
+        .is_some_and(|limit| limit == 0 || limit > MAX_DOCUMENTS)
+    {
+        return Err(bad("the new quality document limit is out of range"));
+    }
     let selected = Receipt::read(
         options
             .from_receipt
@@ -73,6 +86,9 @@ where
     if let Some(ids) = &options.quality_ids {
         validate_backfill_selection(cx, &snapshot, &documents, ids)?;
     }
+    if options.max_new_quality_documents.is_some() {
+        validate_next_batch_source(cx, &snapshot, &documents)?;
+    }
     drop(documents);
     // A partial predecessor already owns independently admitted quality rows.
     // Preserve their encoding so completion can reuse them exactly; only a new
@@ -84,7 +100,9 @@ where
         .transpose()?
         .unwrap_or(NativeBuildPrecision::F32);
     let quality_retrieval = options.build_retrieval(snapshot.quality_retrieval_configuration());
-    let loaded = load_models()?;
+    let loaded = load_models();
+    checkpoint(cx)?;
+    let loaded = loaded?;
     let quality = loaded.quality.ok_or_else(|| {
         bad("quality completion requires an independently supplied quality model")
     })?;
@@ -104,10 +122,14 @@ where
         completion
             .build_partial(cx, ids.iter().cloned(), options.max_image_bytes)
             .await?
+    } else if let Some(limit) = options.max_new_quality_documents {
+        completion
+            .build_next_batch(cx, limit, options.max_image_bytes)
+            .await?
     } else {
         completion.build(cx, options.max_image_bytes).await?
     };
-    let prepared = if options.quality_ids.is_some() {
+    let prepared = if built.coverage() == VectorCohortCoverage::PartialQuality {
         prepare_partial_quality_completion(cx, &built, &snapshot, options.max_image_bytes)?
     } else {
         prepare_publication_with_intent(
@@ -133,6 +155,34 @@ where
         built.retrieval_configuration(),
         built.quality_retrieval_configuration(),
     )
+}
+
+fn validate_next_batch_source(
+    cx: &Cx,
+    snapshot: &NativeGenerationSnapshot,
+    documents: &[IndexableDocument],
+) -> Result<()> {
+    checkpoint(cx)?;
+    let covered: std::collections::BTreeSet<_> = match snapshot.topology() {
+        NativeGenerationTopology::FastOnly => std::collections::BTreeSet::new(),
+        NativeGenerationTopology::PartialQuality { .. } => snapshot
+            .partial_quality_document_ids(cx)?
+            .into_iter()
+            .collect(),
+        NativeGenerationTopology::QualityOnly | NativeGenerationTopology::FullProgressive => {
+            return Err(bad("a quality batch requires incomplete quality coverage"));
+        }
+    };
+    if !documents
+        .iter()
+        .any(|document| !covered.contains(&document.id))
+    {
+        return Err(bad(
+            "a quality batch requires at least one uncovered source document",
+        ));
+    }
+    checkpoint(cx)?;
+    Ok(())
 }
 
 fn validate_backfill_selection(
@@ -178,7 +228,7 @@ fn validate_backfill_selection(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Command, NativeBuildRetrieval, is_command};
+    use super::super::{Command, MAX_DOCUMENTS, NativeBuildRetrieval, is_command};
     use super::*;
 
     fn arguments() -> Vec<String> {
@@ -258,6 +308,33 @@ mod tests {
     }
 
     #[test]
+    fn automatic_completion_accepts_a_positive_bounded_count_without_explicit_ids() {
+        for limit in [1, MAX_DOCUMENTS] {
+            let mut args = arguments();
+            args.extend(["--max-new-quality-documents".to_owned(), limit.to_string()]);
+            let options = Options::parse(args.clone()).unwrap().unwrap();
+            assert_eq!(options.max_new_quality_documents, Some(limit));
+            assert!(options.quality_ids.is_none());
+            args.extend(["--quality-ids", r#"["garden"]"#].map(str::to_owned));
+            assert!(Options::parse(args).is_err());
+        }
+        for value in [
+            "0".to_owned(),
+            (MAX_DOCUMENTS + 1).to_string(),
+            usize::MAX.to_string(),
+            "-1".to_owned(),
+            "not-a-count".to_owned(),
+        ] {
+            let mut args = arguments();
+            args.extend(["--max-new-quality-documents".to_owned(), value]);
+            assert!(Options::parse(args).is_err());
+        }
+        let mut args = arguments();
+        args.push("--max-new-quality-documents".to_owned());
+        assert!(Options::parse(args).is_err());
+    }
+
+    #[test]
     fn registered_fast_and_quality_models_share_the_retained_prepared_input_contract() {
         use frankensearch::embed::model_manifest::ModelArtifactManifestV1;
 
@@ -290,7 +367,7 @@ mod tests {
         use super::super::super::{
             CommitRange, DEFAULT_IMAGE_BYTES, Embedder, EmbedderTierTag, HnswParams,
             IndexableDocument, MAX_INPUT_BYTES, NativeGenerationSnapshot, NativeIndexBuilder,
-            SearchError, create_root, prepare_publication, stage_and_publish,
+            PublicationFailure, SearchError, create_root, prepare_publication, stage_and_publish,
         };
         use super::*;
         use frankensearch_core::generation::{
@@ -545,6 +622,401 @@ mod tests {
                 IndexableDocument::new("notes", "field notes"),
                 IndexableDocument::new("uncovered", "a final document"),
             ]
+        }
+
+        #[test]
+        fn automatic_completion_resumes_from_actual_membership_and_finishes_full() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for ann in [false, true] {
+                    for starts_partial in [false, true] {
+                        let quality = Provider::new(true);
+                        let mut documents = backfill_documents();
+                        // The existing covered ID is not the first source ID.
+                        // Resumption must inspect membership, not use its count as a cursor.
+                        documents.push(IndexableDocument::new("a-first", "alphabetically first"));
+                        let fixture = fixture_with_documents(
+                            &cx,
+                            ann,
+                            starts_partial.then(|| quality.clone()),
+                            documents,
+                        )
+                        .await;
+                        let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                        let batches = if starts_partial {
+                            vec![
+                                (1, vec!["a-first", "garden"]),
+                                (2, vec!["a-first", "garden", "notes", "retry"]),
+                                (8, vec!["a-first", "garden", "notes", "retry", "uncovered"]),
+                            ]
+                        } else {
+                            vec![
+                                (1, vec!["a-first"]),
+                                (2, vec!["a-first", "garden", "notes"]),
+                                (8, vec!["a-first", "garden", "notes", "retry", "uncovered"]),
+                            ]
+                        };
+                        let mut current_path = fixture.parent.join("fast.json");
+                        let mut current_receipt = fixture.selected.clone();
+                        let mut current = Arc::clone(&fixture.snapshot);
+                        let mut covered = usize::from(starts_partial);
+                        for (step, (limit, expected_ids)) in batches.into_iter().enumerate() {
+                            let mut batch = options(&fixture, &format!("automatic-{step}"));
+                            batch.from_receipt = Some(current_path.clone());
+                            batch.max_new_quality_documents = Some(limit);
+                            batch.batch_size = 1;
+                            let quality_calls = quality.calls.load(Ordering::SeqCst);
+                            let mut output = Vec::new();
+                            with_loader(&cx, &batch, &mut output, || {
+                                Ok(Models {
+                                    fast: fixture.fast.clone(),
+                                    quality: Some(quality.clone()),
+                                })
+                            })
+                            .await
+                            .unwrap();
+                            let added = expected_ids.len() - covered;
+                            assert!(added > 0 && added <= limit);
+                            assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls + added);
+                            assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                            let receipt = Receipt::read(&batch.receipt).unwrap();
+                            let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                            assert_eq!(receipt.identity, fixture.selected.identity);
+                            if current_receipt.quality_identity.is_some() {
+                                assert_eq!(
+                                    receipt.quality_identity,
+                                    current_receipt.quality_identity
+                                );
+                            }
+                            assert_eq!(
+                                receipt.generation.sequence,
+                                current_receipt.generation.sequence + 1
+                            );
+                            assert_eq!(
+                                reopened.retained_snapshot().manifest().predecessor(),
+                                Some(current.authority())
+                            );
+                            assert_eq!(
+                                reopened.retained_snapshot().manifest().components().lexical,
+                                fixture
+                                    .snapshot
+                                    .retained_snapshot()
+                                    .manifest()
+                                    .components()
+                                    .lexical,
+                            );
+                            assert_eq!(
+                                reopened.metadata().commit_range,
+                                fixture.snapshot.metadata().commit_range
+                            );
+                            assert_eq!(
+                                reopened.retrieval_configuration(),
+                                fixture.snapshot.retrieval_configuration()
+                            );
+                            assert_eq!(
+                                serde_json::to_value(
+                                    reopened.source_documents(&cx, MAX_INPUT_BYTES).unwrap()
+                                )
+                                .unwrap(),
+                                serde_json::to_value(
+                                    fixture
+                                        .snapshot
+                                        .source_documents(&cx, MAX_INPUT_BYTES)
+                                        .unwrap()
+                                )
+                                .unwrap(),
+                            );
+                            if expected_ids.len() == 5 {
+                                assert_eq!(receipt.quality_documents, None);
+                                assert_eq!(
+                                    reopened.topology(),
+                                    NativeGenerationTopology::FullProgressive
+                                );
+                                assert_eq!(
+                                    receipt.query_mode(Some(QueryMode::Full)).unwrap(),
+                                    QueryMode::Full
+                                );
+                                assert_eq!(
+                                    receipt.query_mode(Some(QueryMode::Quality)).unwrap(),
+                                    QueryMode::Quality
+                                );
+                            } else {
+                                assert_eq!(
+                                    receipt.quality_documents,
+                                    Some(u64::try_from(expected_ids.len()).unwrap())
+                                );
+                                assert_eq!(
+                                    reopened.partial_quality_document_ids(&cx).unwrap(),
+                                    expected_ids
+                                );
+                                assert!(receipt.query_mode(Some(QueryMode::Full)).is_err());
+                                assert_eq!(
+                                    receipt.query_mode(Some(QueryMode::Partial)).unwrap(),
+                                    QueryMode::Partial
+                                );
+                            }
+                            let report: serde_json::Value =
+                                serde_json::from_slice(&output).unwrap();
+                            assert_eq!(report["publication"], "committed");
+                            assert_eq!(
+                                report["selection"]["quality_documents"],
+                                serde_json::to_value(receipt.quality_documents).unwrap()
+                            );
+                            covered = expected_ids.len();
+                            current_path = batch.receipt;
+                            current_receipt = receipt;
+                            current = Arc::new(reopened);
+                        }
+                        // Full and stale receipts cannot load a model for another batch.
+                        for (label, path) in [
+                            ("already-full", current_path),
+                            ("stale", fixture.parent.join("fast.json")),
+                        ] {
+                            let mut batch = options(&fixture, label);
+                            batch.from_receipt = Some(path);
+                            batch.max_new_quality_documents = Some(1);
+                            let mut loads = 0;
+                            assert!(
+                                with_loader(&cx, &batch, &mut Vec::new(), || {
+                                    loads += 1;
+                                    Ok(Models {
+                                        fast: fixture.fast.clone(),
+                                        quality: Some(quality.clone()),
+                                    })
+                                })
+                                .await
+                                .is_err()
+                            );
+                            assert_eq!(loads, 0);
+                            assert!(!batch.work.as_ref().unwrap().exists());
+                            assert!(!batch.receipt.exists());
+                        }
+                        fixture.fast.fault.store(0, Ordering::SeqCst);
+                        let hits = current
+                            .search_progressive_with_quality(
+                                &cx,
+                                fixture.fast.as_ref(),
+                                quality.as_ref(),
+                                "final document",
+                                5,
+                            )
+                            .unwrap()
+                            .collect()
+                            .await
+                            .unwrap();
+                        assert!(
+                            hits.iter()
+                                .find(|hit| hit.doc_id == "uncovered")
+                                .unwrap()
+                                .quality_score
+                                .is_some()
+                        );
+                        assert_eq!(fixture.snapshot.topology(), fixture.selected.topology());
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn automatic_completion_refuses_empty_or_invalid_work_before_loading_models() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for empty in [false, true] {
+                    let fixture = fixture_with_documents(
+                        &cx,
+                        false,
+                        None,
+                        if empty {
+                            Vec::new()
+                        } else {
+                            backfill_documents()
+                        },
+                    )
+                    .await;
+                    let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                    let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                    for case in if empty {
+                        vec!["empty"]
+                    } else {
+                        vec![
+                            "zero",
+                            "too-many",
+                            "explicit-ids",
+                            "source-budget",
+                            "cancelled",
+                        ]
+                    } {
+                        let mut batch = options(&fixture, case);
+                        batch.max_new_quality_documents = Some(1);
+                        match case {
+                            "zero" => batch.max_new_quality_documents = Some(0),
+                            "too-many" => batch.max_new_quality_documents = Some(MAX_DOCUMENTS + 1),
+                            "explicit-ids" => batch.quality_ids = Some(vec!["garden".to_owned()]),
+                            "source-budget" => batch.max_source_bytes = 1,
+                            "cancelled" => cx.set_cancel_requested(true),
+                            _ => {}
+                        }
+                        let mut loads = 0;
+                        let mut output = Vec::new();
+                        let result = with_loader(&cx, &batch, &mut output, || {
+                            loads += 1;
+                            Err(bad("invalid automatic work must not load models"))
+                        })
+                        .await;
+                        cx.set_cancel_requested(false);
+                        assert!(result.is_err(), "{case}");
+                        assert_eq!(loads, 0, "{case}");
+                        assert!(output.is_empty());
+                        assert!(!batch.work.as_ref().unwrap().exists());
+                        assert!(!batch.receipt.exists());
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                        assert_eq!(
+                            fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                            authority
+                        );
+                    }
+                    fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn automatic_completion_retries_failed_batches_and_fences_a_concurrent_final_batch() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let quality = Provider::new(true);
+                let fixture =
+                    fixture_with_documents(&cx, true, Some(quality.clone()), backfill_documents())
+                        .await;
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+                for fault in [1, 2, 3] {
+                    let failed_quality = Provider::new(true);
+                    failed_quality.fault.store(fault, Ordering::SeqCst);
+                    let mut batch = options(&fixture, &format!("automatic-fault-{fault}"));
+                    batch.max_new_quality_documents = Some(1);
+                    batch.batch_size = 1;
+                    let mut output = Vec::new();
+                    let result = with_loader(&cx, &batch, &mut output, || {
+                        Ok(Models {
+                            fast: fixture.fast.clone(),
+                            quality: Some(failed_quality.clone()),
+                        })
+                    })
+                    .await;
+                    cx.set_cancel_requested(false);
+                    assert!(result.is_err());
+                    if fault == 2 {
+                        assert!(matches!(
+                            result.unwrap_err().downcast_ref::<SearchError>(),
+                            Some(SearchError::Cancelled { .. })
+                        ));
+                    }
+                    assert_eq!(failed_quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                    assert!(output.is_empty());
+                    assert!(!batch.receipt.exists());
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        authority
+                    );
+                    assert_eq!(
+                        fixture
+                            .selected
+                            .open(&cx, DEFAULT_IMAGE_BYTES)
+                            .unwrap()
+                            .partial_quality_document_ids(&cx)
+                            .unwrap(),
+                        ["garden"]
+                    );
+                }
+                // Retry with the same receipt: the failed work consumed no IDs.
+                let mut retry = options(&fixture, "automatic-retry");
+                retry.max_new_quality_documents = Some(1);
+                let quality_calls = quality.calls.load(Ordering::SeqCst);
+                with_loader(&cx, &retry, &mut Vec::new(), || {
+                    Ok(Models {
+                        fast: fixture.fast.clone(),
+                        quality: Some(quality.clone()),
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls + 1);
+                let current_receipt = Receipt::read(&retry.receipt).unwrap();
+                let current = current_receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    current.partial_quality_document_ids(&cx).unwrap(),
+                    ["garden", "notes"]
+                );
+
+                let winner = current
+                    .begin_quality_completion(
+                        &cx,
+                        fixture.parent.join("automatic-winner-work"),
+                        new_generation(current_receipt.generation.sequence + 1).unwrap(),
+                        fixture.fast.clone(),
+                        quality.clone(),
+                        MAX_INPUT_BYTES,
+                    )
+                    .unwrap()
+                    .build_partial(
+                        &cx,
+                        ["garden", "notes", "retry"].map(str::to_owned),
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .await
+                    .unwrap();
+                let prepared =
+                    prepare_partial_quality_completion(&cx, &winner, &current, DEFAULT_IMAGE_BYTES)
+                        .unwrap();
+                let root = admit_root(&current_receipt.root).unwrap();
+                let expected = current.retained_snapshot().authority_pair();
+                let mut losing = options(&fixture, "automatic-stale-final");
+                losing.from_receipt = Some(retry.receipt.clone());
+                losing.max_new_quality_documents = Some(8);
+                let mut winning_receipt = None;
+                let mut output = Vec::new();
+                let error = with_loader(&cx, &losing, &mut output, || {
+                    let published = stage_prepared_and_publish(
+                        &cx,
+                        &root,
+                        &current_receipt.root,
+                        &fixture.parent.join("automatic-winner.json"),
+                        &winner,
+                        prepared,
+                        PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                    )?;
+                    winning_receipt = Some(published.receipt);
+                    Ok(Models {
+                        fast: fixture.fast.clone(),
+                        quality: Some(quality.clone()),
+                    })
+                })
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<PublicationFailure>().unwrap().0["publication"],
+                    "not_committed"
+                );
+                assert!(output.is_empty());
+                assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+                let winner = winning_receipt.unwrap();
+                let reopened = winner.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    reopened.partial_quality_document_ids(&cx).unwrap(),
+                    ["garden", "notes", "retry"]
+                );
+                let attempted = Receipt::read(&losing.receipt).unwrap();
+                assert_eq!(
+                    attempted.quality_documents, None,
+                    "the losing final batch was complete"
+                );
+                assert_eq!(attempted.recovery_attempt().unwrap().expected, expected);
+                assert_ne!(attempted.authority().unwrap(), winner.authority().unwrap());
+                assert!(attempted.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                assert_eq!(
+                    current.partial_quality_document_ids(&cx).unwrap(),
+                    ["garden", "notes"]
+                );
+            });
         }
 
         #[test]

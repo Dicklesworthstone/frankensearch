@@ -90,6 +90,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       [--quality-model-dir DIR] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
   authority-complete-quality --from-receipt INCOMPLETE_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       [--quality-ids '[\"document-a\",\"document-b\"]' (complete successor subset)]\n\
+      [--max-new-quality-documents N (automatic next batch; excludes --quality-ids)]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--retrieval exact|hnsw] [--batch-size N] [--max-source-bytes N]\n\
       [--max-image-bytes N]\n\n\
@@ -180,7 +181,11 @@ tiers. Fresh-input rebuild still refuses partial sources.\n\
 Granted warm model activation\n\
 preserves the exact partial source and covered IDs. Explicit quality\n\
 completion accepts fast-only or partial sources. --quality-ids checkpoints a\n\
-larger proper subset, retaining every covered ID; omit it to complete all rows.\n\
+larger proper subset, retaining every covered ID. --max-new-quality-documents\n\
+instead selects at most N missing IDs in lexicographic order, preserving existing\n\
+vectors and completing full coverage on the final batch. Resume from its new\n\
+receipt; --batch-size separately bounds each provider request. Omit both selection\n\
+options to complete all rows.\n\
 Warm sessions accept mode=partial and explicit activation of quality backfills.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
@@ -434,6 +439,7 @@ struct Options {
     progressive: bool,
     partial_quality: bool,
     quality_ids: Option<Vec<String>>,
+    max_new_quality_documents: Option<usize>,
     mode: Option<QueryMode>,
     stream: bool,
     timeout_ms: Option<u64>,
@@ -517,6 +523,7 @@ impl Options {
             progressive: false,
             partial_quality: false,
             quality_ids: None,
+            max_new_quality_documents: None,
             mode: None,
             stream: false,
             timeout_ms: None,
@@ -721,6 +728,10 @@ impl Options {
                     }
                     options.quality_ids = Some(ids);
                 }
+                "--max-new-quality-documents" if command == Command::CompleteQuality => {
+                    options.max_new_quality_documents =
+                        Some(number(&value(&mut args)?, MAX_DOCUMENTS)?);
+                }
                 "--source-low"
                     if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
                 {
@@ -921,6 +932,11 @@ impl Options {
                 if options.from_receipt.is_none() || options.work.is_none() {
                     return Err(bad(
                         "authority-complete-quality requires --from-receipt and --work-dir",
+                    ));
+                }
+                if options.quality_ids.is_some() && options.max_new_quality_documents.is_some() {
+                    return Err(bad(
+                        "--quality-ids and --max-new-quality-documents cannot be combined",
                     ));
                 }
                 options.quality.validate_usage(true)?;
