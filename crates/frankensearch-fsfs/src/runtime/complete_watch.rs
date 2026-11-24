@@ -234,7 +234,7 @@ fn is_store_event(event: &Event, store: &Path) -> bool {
 struct SourceRoot {
     path: PathBuf,
     directory: File,
-    /// The generation store, when it sits inside the source: never a source.
+    /// The generation store is never a source, even through a followed alias.
     excluded: Option<PathBuf>,
 }
 
@@ -309,6 +309,9 @@ impl SourceRoot {
             retained_search_checkpoint(cx)?;
             let entry = match entry {
                 Ok(entry) => entry,
+                Err(super::IndexDiscoveryError::Policy(SearchError::Io(error))) => {
+                    return Err(observation_io(error));
+                }
                 Err(super::IndexDiscoveryError::Policy(error)) => return Err(error),
                 Err(super::IndexDiscoveryError::Walk(source)) => {
                     if source.io_error().is_some_and(is_observation_race) {
@@ -346,7 +349,6 @@ impl SourceRoot {
         }
         let mut files = Vec::new();
         let mut directories = BTreeMap::new();
-        let mut visited = ahash::AHashSet::new();
         let mut stack = vec![(self.path.clone(), self.directory.metadata()?, root_mount)];
         while let Some((directory, expected, directory_mount)) = stack.pop() {
             retained_search_checkpoint(cx)?;
@@ -358,10 +360,9 @@ impl SourceRoot {
             {
                 return Err(source_changed());
             }
-            let canonical = fs::canonicalize(&directory).map_err(observation_io)?;
-            if !visited.insert(canonical) {
-                continue;
-            }
+            // Discovery already rejected ancestor loops. Enumerate each admitted
+            // spelling: sibling symlinks to one directory can have different ignore
+            // rules, and the indexer keys their documents by source-relative path.
             directories.insert(directory.clone(), (opened.dev(), opened.ino()));
             let mut entries = fs::read_dir(&directory).map_err(observation_io)?;
             loop {
@@ -599,9 +600,7 @@ impl CompleteWatchSession {
         validate_retained_catalog_path(&runtime.config.storage.db_path)?;
         let mut source = SourceRoot::open(fs::canonicalize(runtime.resolve_target_root()?)?)?;
         let store_root = resolve_watch_store(&source.path, root)?;
-        source.excluded = store_root
-            .starts_with(&source.path)
-            .then(|| store_root.clone());
+        source.excluded = Some(store_root.clone());
         // Preserve the store's refusal of a symlink supplied by the caller;
         // canonicalization above is only for overlap checking and anchoring.
         if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
@@ -2263,6 +2262,125 @@ mod lifecycle_tests {
                     "the old retained generation keeps its original nested content"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn complete_watch_followed_directory_aliases_reconcile_each_searchable_path() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.discovery.follow_symlinks = true;
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            let shared = directory.path().join("shared");
+            fs::create_dir(&shared).unwrap();
+            for name in ["left", "right"] {
+                std::os::unix::fs::symlink(&shared, source.join(name)).unwrap();
+                fs::write(shared.join(format!("{name}.md")), "originaltoken").unwrap();
+            }
+            fs::write(source.join(".ignore"), "/left/right.md\n/right/left.md\n").unwrap();
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let first = publish_tick(&mut session, &cx).await;
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let original = pinned.search(&cx, "originaltoken", 10).await.unwrap();
+            let hits = &original.last().unwrap().hits;
+            assert_eq!(hits.len(), 2);
+            for name in ["left", "right"] {
+                let path = format!("{name}/{name}.md");
+                assert!(hits.iter().any(|hit| hit.path.ends_with(&path)));
+                let token = format!("{name}replacementtoken");
+                fs::write(shared.join(format!("{name}.md")), &token).unwrap();
+                // Only this spelling admits the edited file. Poll without a
+                // native hint as the target lies outside the watched root.
+                let deadline = session.last_reconcile + RECONCILE_INTERVAL;
+                let publication = session.advance(&cx, deadline).await.unwrap().unwrap();
+                require_durable_publication(publication).unwrap();
+                let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+                let result = fresh.search(&cx, &token, 10).await.unwrap();
+                let hits = &result.last().unwrap().hits;
+                assert_eq!(hits.len(), 1);
+                assert!(hits[0].path.ends_with(&path));
+            }
+            assert_eq!(pinned.generation(), &first);
+            assert_eq!(
+                pinned
+                    .search(&cx, "originaltoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn complete_watch_followed_store_aliases_are_excluded_from_discovery_and_search() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, _) = fixture(directory.path());
+            runtime.config.discovery.follow_symlinks = true;
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            let parent = directory.path().join("indices");
+            let store = parent.join("index");
+            fs::create_dir_all(&store).unwrap();
+            fs::write(store.join("artifact.md"), "generatedtoken").unwrap();
+            fs::write(parent.join("manual.md"), "realmanualtoken").unwrap();
+            for (link, target) in [
+                ("artifact.md", store.join("artifact.md")),
+                ("store", store.clone()),
+                ("via-parent", parent),
+            ] {
+                std::os::unix::fs::symlink(target, source.join(link)).unwrap();
+            }
+            runtime.cli_input.index_dir = Some(store.clone());
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &store).unwrap();
+            controlled_notifications(&mut session);
+            let observed = session
+                .source
+                .observe(&cx, &runtime.config.discovery)
+                .unwrap();
+            assert_eq!(
+                observed.stamps.keys().cloned().collect::<Vec<_>>(),
+                [source.join("alpha.md"), source.join("via-parent/manual.md")]
+            );
+            publish_tick(&mut session, &cx).await;
+            let mut reader = runtime.open_retained_search(&cx, &store).await.unwrap();
+            assert!(
+                reader
+                    .search(&cx, "generatedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
+            let result = reader.search(&cx, "realmanualtoken", 10).await.unwrap();
+            let hits = &result.last().unwrap().hits;
+            assert_eq!(hits.len(), 1);
+            assert!(hits[0].path.ends_with("via-parent/manual.md"));
+            // Writes inside the actual store must not retrigger the watcher,
+            // including when a source notification names an exposed alias.
+            fs::write(store.join("artifact.md"), "changedgeneratedtoken").unwrap();
+            let now = Instant::now();
+            {
+                let mut changes = lock_changes(&session.changes).unwrap();
+                changes.record(now, false);
+                changes.record_path(&source.join("artifact.md"));
+            }
+            assert!(
+                session
+                    .advance(&cx, now + DEBOUNCE)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 

@@ -35726,6 +35726,18 @@ fn index_discovery_walker_with_alias(
     walker.git_exclude(false);
     walker.hidden(false);
     let discovery = discovery.clone();
+    // The legacy CLI alias is excluded by its original spelling only; a user
+    // can retarget it during a watch. The actual store has a fixed destination.
+    let physical_store = if discovery.follow_symlinks && let Some(store) = excluded_root {
+        match fs::canonicalize(store) {
+            Ok(path) => Some(path),
+            // The first watch observation can precede creation of the store.
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
     let excluded_roots = [excluded_root.map(Path::to_path_buf), index_alias.map(Path::to_path_buf)];
     let mounts = MountTable::new(read_system_mounts(), &discovery.mount_override_map());
     walker.filter_entry(move |entry| {
@@ -35734,6 +35746,23 @@ fn index_discovery_walker_with_alias(
             return false;
         }
         let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+        if let Some(store) = &physical_store
+            && (is_dir || entry.path_is_symlink())
+        {
+            // A link may name an artifact directly or lead through a parent
+            // of the store. Check each directory before descent, even when
+            // the directory itself is reached through an earlier link.
+            match fs::canonicalize(entry.path()) {
+                Ok(path) if path.starts_with(store) => return false,
+                Ok(_) => {}
+                Err(error) => {
+                    *filter_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.into());
+                    return true;
+                }
+            }
+        }
         if is_dir {
             // File-only rules such as binary extensions must not prune a
             // directory named archive.zip. Do not load policy inside an
