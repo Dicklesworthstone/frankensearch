@@ -1,6 +1,299 @@
 # Bridge Plan: frankensearch
 
-## Current assessment — November 22, 2026
+## Current execution — November 24, 2026
+
+The core local search product works, and the current combined source now passes
+the complete stock quality gate. The project is not finished: full authority
+migration, broad recovery/conformance, platform qualification, original upgrade
+reuse acceptance and competitive performance work remain on their existing
+Beads. No new binary or crate release has been published by this execution.
+
+The November 23 assessment below began from stale local `5ac9c5e7`. Refreshing
+origin found the updater and prepared search repairs already integrated at
+`ea23592f`. The initial source selection was a mistake; local duplicate pushes
+were refused, and no force/reset/stash was used. Validation moved to isolated
+current source. Peer completion and warm-activation work through `b06d3268` is
+preserved. The subsequent repairs are published as `2e2b8026` on main and its
+compatibility mirror; this section supersedes older pending execution claims.
+
+- Fixed normal-limit downstream Send compilation by bounding the composed
+  request future inside the library, with one extra boxed allocation per
+  request. Both unchanged interaction consumers fail on the matched baseline
+  and pass strict Clippy after the fix. No raised test recursion attributes
+  remain. Optional-profile runtime: 1,305 library + 31 integration + 25 unit
+  cases pass; four existing performance probes remain ignored. No speedup claim.
+- Fixed native partial-quality preflight: invalid subset membership previously
+  entered model startup before refusing. The strengthened existing test fails
+  with one loader call on old code and requires zero after the production fix.
+  All six focused CLI cases and the full product profile pass.
+- The complete stock gate ran on clean `2e2b8026`, 00:31:52–01:00:58 UTC:
+  all 18 stages pass, zero failures, no model or cross-target skip allowance.
+  Includes all-target check/Clippy, hybrid/proxy, Windows guard, workspace/fsfs,
+  bounded Quill, installer, facade plus README doctests, four-model CLI/recovery,
+  invocation-built installed quickstart and lite. These are native-host results,
+  not RCH. Log SHA256:
+  `5983be7856497e10ac180c811198c135f1cdd03863efeb0ec5112ac36834b9bd`.
+- Actual native executable: partial HNSW indexing and two real-model phases,
+  forged-coverage refusal, retained-source quality completion after the input
+  path becomes unavailable, and adoption by an already-running scoped server
+  all pass. The previously uncovered document gains actual quality scoring.
+  This does not complete ordinary fsfs migration or partial mutation/watch.
+- Actual installed fsfs: SIGTERM/SIGINT after discovery and strict/performance
+  memory stops preserve the exact incumbent selection and searchability.
+  Both profiles also cancel while paused by actual sampled host load. Broader
+  phase/repeated-interrupt/RCH acceptance stays on peer-owned `bd-pz8va`.
+- `bd-fsfs-update-offline-g81fb` is closed after its original probe on actual
+  optimized/default and semantic-native executables. Each passes six paired
+  offline source/action cases, online override and local rollback inspection;
+  the old executable attempts an IP connection in every offline control.
+  Native-only application retains its update.profile refusal. Optimized
+  default quickstart also passes 12 commands and 22 controls, no owned processes.
+- `bd-current-oracle-routing-docs-2fzfn` is closed after 23 fresh contract checks.
+  Active oracle/routing documentation now agrees with source. The oracle-label
+  hash amendment changes only ten current unmeasured identities; historical
+  measurements remain exact, all ten QGs inactive, zero new decidable rows.
+- Release `bd-dsbym` remains in progress. Live registry audit refuses reuse of
+  all thirteen existing versions published from `d1b9da15`; forward bumps and
+  the established six-variant/platform/installer/crate consumer qualification
+  remain required. Both configured Linux and Apple ARM build hosts answer SSH;
+  connectivity alone is not build admission or a platform pass.
+
+Retained raw logs, scripts, source/lock/compiler/profile/binary identities and
+failed attempts are under `/data/tmp/fs-exec.SoVtXGnZ`; initial assessment
+artifacts remain under `/data/tmp/fs-assessment-20261123.XpwMXlFk`. The requested
+granular TODO and written work/honesty inventory are in
+[BUG_FIX_TODO.md](BUG_FIX_TODO.md). Both closures use fresh solo original-criteria
+reverification; no independent verifier certified this block. Earlier observer
+diagnostic/setup errors and retired runs remain recorded and add no pass credit.
+Tracker/plan publication may advance HEAD separately. Every executed result
+above remains bound to `2e2b8026` and its actual executable identity.
+
+## Historical November 23 assessment — before origin refresh
+
+FrankenSearch delivers its central local-search use case: real two-tier
+semantic indexing, Quill keyword retrieval, progressive ranking, a warm query
+daemon, live watch, explanations, and an interactive dashboard. It is useful
+software today. The complete vision is unfinished: the generation-authority
+migration and unified recovery span several implementations, Quill's full
+conformance obligations remain open, and none of the ten competitive performance
+gates is activated. Those performance goals remain the optimization program;
+the owner's September 1 ruling removed them as prerequisites for the default
+lexical backend. Do not turn them back into a binary-release requirement.
+
+### Scope and fresh evidence
+
+- Read all 958 lines of the repository AGENTS.md, all 1,940 lines of README.md,
+  the suite guidance, and the reality-check skill and its gap/bridge/refinement
+  references. Reviewed the Quill design, active bridge, architecture maps,
+  configuration/streaming/native/release and performance contracts, source
+  implementations and existing tests. Historical bridge entries retain their
+  own dates and are not current findings.
+- Audit source is clean committed main
+  `5ac9c5e7254c3ecef8eca1fea4e53a79590a4a42`, pinned in
+  `/data/projects/.fs-assessment-20261123-XpwMXlFk`. The shared checkout had
+  pre-existing Beads and bridge edits; these remain preserved. Evidence for
+  this assessment is `/data/tmp/fs-assessment-20261123.XpwMXlFk`.
+- Live GitHub and crates.io responses still identify fsfs 1.13.0 and facade
+  0.8.0. The release tag is 118 commits behind the audited main. Reverified
+  Minisign on the retained Linux release metadata; its digest agrees with the
+  live release asset. The tested signed executable SHA-256 is
+  `9f8ca93592270fd24f4526c934635ad3307a625c14e18da0d2f8ef7823a5b225`.
+  The default PATH executable has a different hash, so its version string was
+  not used as proof that it is the signed artifact.
+- Also tested the retained stock-release-profile `d53c2ff6` executable,
+  SHA-256
+  `708b415df84f7260e4ea611b6aa252ae3a6d7da1aa0d7b497160abdba83c3194`.
+  Its repository build inputs and Cargo.lock match the audit revision: the
+  intervening tracked differences are Beads and this plan. This is a retained
+  executable with checked source equivalence, not an invocation-built source
+  attestation. The optimizer sibling is clean `18b3910246862468893ca1d0cd345a379e4f7082`.
+- Both executables passed a fresh executable quickstart: 12 command outcomes,
+  22 negative controls, and zero remaining owned processes each. The receipts
+  are `tmp/fsfs-quickstart.{SOpnt6bE,0PJJyI5v}/receipt.json`. The checker
+  correctly reports an override binary's source as unknown; the independently
+  verified release/source facts above do not change that receipt field.
+- Independent `product_probe.py` controls passed for both arms: three-file
+  indexing and three unchanged files on repeat; planted hybrid and quality-only
+  winners; standalone explanation; missing-path and exclusion controls; one
+  final stream terminal; source-root mismatch refusal with unchanged selection;
+  append, fresh-process lookup, delete, compact, absence after reopen, and flush.
+  Retention was disabled on these owned fixtures to preserve all generations.
+- Signed 1.13.0 again failed fresh named-daemon offline startup with
+  `complete_generation.daemon_config`; the source-equivalent executable passed.
+  The repaired launcher explicitly forwards offline/online intent and removes
+  expansion provider keys. The release still needs those fixes.
+- A quality-only explanation also distinguishes shipped and source behavior.
+  Both arms rank the same planted document. The signed arm explains its raw
+  quality similarity `0.9200764894485474` as semantic score `1.0` and gives
+  the component zero RRF contribution. The source arm preserves that score's
+  f32 bits and the actual one-arm RRF contribution. See
+  `quality-explanation-controls.json`. This corroborates the landed `bd-a4r1d`
+  repair and its need for release; it is not a retrieval-quality improvement.
+- Both arms' `update --check --offline` attempted an AF_INET connection to a
+  refusing loopback proxy, then returned `update.github_api`. This is an
+  executable policy defect in the audited source, not an internet outage.
+  Current runtime dispatch calls the release fetch without consulting offline
+  policy. A later isolated repair is described in the older section below;
+  that code is not part of the audited main.
+- `watch_probe.py`'s completed third run observed a newly created canary through
+  both direct and live-daemon queries while each watcher remained alive. Both
+  watchers and both daemons stopped successfully. Functional edit-to-observed
+  durations were about 2.1 seconds on this small fixture; these are not latency
+  percentiles or competitive performance evidence. See `watch-probe-v3.log`
+  and `product-v2/{signed,source}/watch-v3-results.json`.
+- A controlling-PTY TUI session on the source-equivalent executable displayed
+  `retry.md`, progressed through lexical, semantic-fast and quality-refined
+  rendering, and exited zero. Raw terminal bytes are in `tui.pty`.
+- Receipt-directed recovery inspection and preparation passed without changing
+  selection. An incorrect manifest digest was refused as `index_corrupted`
+  with exit 1. This run does not certify restoration, crash durability or the
+  complete recovery matrix.
+- The AST scan found zero `todo!` and zero `unimplemented!` macros. Keyword
+  matches mostly name controls, synthetic fixtures and typed unsupported
+  platform paths. Read the real runtime dispatch, model admission, facade
+  builder/openers, native HNSW activation, retained store/pins and gauntlet
+  identity paths; the principal product is not a command scaffold.
+- Cargo.lock contains Asupersync 0.6.2 and none of the seven prohibited runtime
+  package names. All ten entries in `quill-perf-gates.toml` remain inactive.
+  Its oracle label says 0.27.0 while the actual lock and typed current oracle
+  contract say 0.26.2. The architecture maps also incorrectly say native HNSW
+  is not on a search path; admitted-v2 fast/quality query routes exist.
+- Fresh formatting passed on the pinned checkout. Independently inspected
+  `transport-gate.log`: its clean `d53c2ff6` run ends with all 18 stock stages
+  passing and `failures=0`, including the real-model executable lane, source
+  quickstart and lite. This is retained evidence for matching repository
+  build inputs, not a new whole-gate invocation. Fresh strict RCH attempts
+  retained symlink/topology and disk-budget refusals before Cargo. The focused
+  async-filter attempt also ended in queue refusal without running tests.
+  No such refusal is a compiler failure or a pass. The separately admitted
+  pinned workspace check is recorded in `admitted-remote-check.log`; its
+  terminal outcome must be read independently. It does not substitute for
+  the whole gate or qualify every optional feature. The offline updater
+  defect reproduces despite the retained stock gate passing: its missing
+  behavioral assertion is precisely why the new populated regression matters.
+
+### Vision checklist and gap coverage
+
+`WORKING` below describes the observed use case, not certification of all
+platforms, corpora, feature combinations or failure schedules. `PARTIAL`
+retains both implemented behavior and the named remaining acceptance.
+
+| # | Testable goal | Reality | Remaining obligation / Beads |
+|---|---|---|---|
+| 1 | Standard semantic installation and explicit lite | WORKING on the tested Linux release; published full Linux/Apple Silicon and four lite assets | Complete installer/updater/platform matrix: `bd-fsfs-cross-platform-semantic-installer-46z3u`, `bd-dsbym`; Windows and Intel Mac authority qualification remain separate. |
+| 2 | Verified real models and local operation | WORKING for the registered Potion/ONNX pair; actual missing/corrupt-model refusals pass | Ordinary acquire/retry and model-change recovery: `bd-p6z6`, `.3`, `.4`, `bd-3fy9`. |
+| 3 | Durable two-tier indexing with unchanged-work reuse | WORKING in both tested executables | Sustained-pressure/cancellation breadth and literal inference-free upgrades: `bd-pz8va`, `bd-fsfs-cli-upgrade-reuse-rsqq7`. |
+| 4 | Progressive hybrid and independent quality-only retrieval | WORKING on planted real-model cases | Current async filters/exact scan policies and complete persisted facade matrix: `bd-async-filter-2c68s`, `bd-quality-policy-1x3k7`, `bd-q4rg`. |
+| 5 | Predictable filtering, exclusions and degradation | WORKING for executed controls; wider identity/recovery program PARTIAL | `bd-jbfg`, `bd-a6zt`, `bd-3fy9`; never equate an explicit hash control with semantic search. |
+| 6 | Direct, daemon, streamed and cached policy parity | PARTIAL; release named-offline startup fails, source-equivalent arm passes | Carry landed fixes into `bd-dsbym`; newly named updater network refusal: `bd-fsfs-update-offline-g81fb`. |
+| 7 | Search while watch publishes successors | WORKING on both small Linux fixtures, including an already live daemon | Pressure, interruption, policy reconciliation and cross-platform acceptance: `bd-pz8va`, `bd-fsfs-identity-bound-watch-staging-t9m9m`. |
+| 8 | Atomic maintenance, selected-generation flush and recovery | WORKING maintenance; recovery inspection/preparation and bad-digest refusal pass | Full recovery/authority fault matrix: `bd-xomn.2`, `bd-immutable-generation-lifecycle-migration-rgcvv`, `bd-3fy9`. |
+| 9 | Explanations and progressive interactive search | WORKING for actual CLI and controlling-PTY use cases | Same retained identity under corruption/cancellation and migration: `bd-retained-composite-generation-snapshot-cdny8`; do not replace this with simulator evidence. |
+| 10 | Safe reuse across executable upgrades | PARTIAL; Linux opt-in contract exists, macOS process-scope limit is explicit | `bd-fsfs-cli-upgrade-reuse-rsqq7`; real predecessor/successor, no-inference and drift controls remain binding. |
+| 11 | Reusable library and caller-owned runtime | IMPLEMENTED, with retained external-consumer and facade gate evidence below | Public persisted restart/candidate-union and optional-feature qualification: `bd-q4rg`, `bd-2g2l`, `bd-8nqz`. |
+| 12 | Quill matches the complete used lexical contract | PARTIAL; real parser/scorer/postings/delta/merge implementations and bounded oracle witness | R1, UNION_HORIZON, total results, scale and terminal census: `bd-r1-exact-repair-or-residual-1i4j4`, `bd-quill-union-horizon-exactness-salej`, `bd-qwkq`, `bd-y7vz`, `bd-quill-flip-conformance-release-gate-0r2p`. |
+| 13 | Durable storage and CASS integration | IMPLEMENTED storage/queue and explicit Tantivy interop | Consumer semantic-generation/recovery and total lexical result receipts: `bd-cass-semantic-cross-repo-receipt-91k2`, `bd-cass-total-lexical-contract-jxyq`. |
+| 14 | One immutable authority and embedding-space identity everywhere | PARTIAL; cooperative FSFS store and distinct admitted-v2/native authority paths exist | `bd-xomn.1`–`.4`, fixed publisher, anti-rollback, retained composite snapshot, retention-root and raw-vector-retirement Beads; ordinary paths are not all migrated. |
+| 15 | Quantized exact vector retrieval and opt-in native ANN | IMPLEMENTED SIMD/f16, admitted HNSW and graph receipts | Representative recall/tail qualification and old ANN dependency retirement: `bd-kcek`, `bd-exact-residual-vector-scan-iusa0`, `bd-raw-vector-api-retirement-8sc8a`. |
+| 16 | Alternate native models and optional cross-encoder | IMPLEMENTED and covered by retained functional receipts; default quality still ONNX | ARM numerical/performance acceptance and any default switch: `bd-6kafg`, `bd-2ba5`; no automatic model/backend substitution. |
+| 17 | Measurable relevance benefit and current product cost | PARTIAL; README reports corpus-specific gains and losses; September receipts remain historical | Current complete-store cold/warm/cache/watch/RSS receipts and held-out ablations: `bd-fsfs-current-product-envelope-lz056`, E6.6/E6.7. |
+| 18 | Competitive lexical performance across frozen QGs | UNPROVEN as a completed program; 0/10 activated | `bd-h6eh`, E8/E8-H. Same-invocation live Tantivy, valid A/A and complete profile-specific evidence are mandatory; a measured loss is a valid result. |
+| 19 | Reproducible releases and accurate active contracts | PARTIAL; current release exists, later repairs remain source-only; active oracle/routing descriptions conflict | `bd-dsbym`, `bd-fsfs-update-offline-g81fb`, `bd-current-oracle-routing-docs-2fzfn`. |
+| 20 | Fleet telemetry and distributed deployment | EXPERIMENTAL / DESIGN ONLY, explicitly outside the shipped local product | Existing Ops owner decision and future distributed architecture; do not manufacture missing implementation commitments from design-only scope. |
+
+### Bridge work, ordered by user impact
+
+1. **Close the observed offline updater defect and deliver already landed
+   product fixes.** `bd-fsfs-update-offline-g81fb` contains the reproduction,
+   source seam, existing isolated repair, and a named closure probe. Test CLI,
+   environment and file policy for check/apply, positive online override,
+   local rollback, and the native-only profile. Zero IP connects is the
+   offline assertion. Implementation and its unit/executable tests remain one
+   Bead. The next release now depends on this Bead; a prepared patch alone
+   cannot satisfy it. Then qualify exact signed artifacts, installer/updater
+   routes and registry consumers through `bd-dsbym` and `46z3u`.
+2. **Converge authority and recovery through the existing graph.** Finish
+   publisher/anti-rollback/retained-snapshot prerequisites, then migrate actual
+   readers, writers, watchers, caches and recovery before retiring v1/raw
+   admission. A fresh process must see a complete predecessor or successor,
+   never a mixed fast/quality/lexical cohort. Preserve retained readers and
+   use dry-run retention proof. Reuse tests need actual distinct executables
+   and source/producer/artifact drift negatives. CASS and public facade
+   restart are consumers of this work, not reasons to build another engine.
+3. **Finish Quill correctness before claiming total interchangeability.**
+   Resolve minimized R1 and union-horizon cases with exact result envelopes
+   and classified ties; run fresh, delta, compacted and reopened states.
+   Execute bounded, complete default/all-feature and scaled/statistical
+   requirements separately, retaining standard ignores and every failure.
+   Same semantic output, snippets, counts, metadata and errors matter beyond
+   a top-k happy path. Do not relax the comparator to clear a gate.
+4. **Measure the current user path and attack observed costs.** Complete the
+   existing 1K and frozen-code-corpus receipt lane on booked hardware with
+   cold initialization, warm misses, cache hits, both delivered phases,
+   actual edit-to-search visibility, RSS and retained bytes. Use paired
+   lexical/fast/Initial/Refined/rerank/priors ablations with held-out judgments.
+   For competitive QGs run the live incumbent and both A/A controls in the
+   same invocation; report absolute costs and losses. No benchmark or
+   performance certification was attempted by this assessment's tiny smoke.
+5. **Repair active contract drift as a bounded documentation chore.**
+   `bd-current-oracle-routing-docs-2fzfn` names the oracle-label and native
+   routing discrepancies. Distinguish current executable pins from frozen
+   historical audit identities. A manifest-byte correction changes evidence
+   identity: retain old artifacts and require fresh current-manifest receipts
+   where necessary. No engine/default/target/tolerance change is authorized
+   by this chore, and it activates no QG.
+
+### Work graph and refinement
+
+The incoming JSONL held 1,486 issues: 1,342 closed, 87 open, 47 in progress,
+six blocked and four deferred. BV reported 37 actionable issues and no active
+cycle; two archived closed-only cycles are historical. Closure percentage
+does not measure delivered vision. Most gaps have strong existing coverage.
+The new updater Bead gives a concrete product refusal its own populated
+closure probe rather than leaving it implicit in an installer umbrella.
+The new documentation Bead covers the active oracle/routing mismatch.
+After export there are 1,488 issues: 1,342 closed, 89 open, 47 in progress,
+six blocked and four deferred. BV reports 38 actionable issues, and both its
+triage and plan outputs parse. `br dep cycles` reports zero active cycles.
+A record-wise comparison preserved all 1,486 incoming issues and changed only
+`bd-dsbym` for this assessment's comment and new blocker edge; exactly two
+issues were added. All earlier bridge body bytes remain intact.
+
+The complete skill flow was applied to this existing plan rather than
+starting a competing document. Three ambition reviews sharpened (1) parity
+across actual process and network-policy boundaries, (2) the shared retained
+identity from source through result/recovery, and (3) relevance and full-path
+cost on representative corpora. They yielded a concrete updater falsifier,
+an explicit migration ordering and corpus-specific measurement requirements;
+they did not create speculative feature epics.
+
+The Phase 3a and Phase 5 frozen templates were applied without paraphrasing
+their requirements. Five refinement passes checked every vision row against
+existing issues; exact positive/negative assertions; current source versus
+published and draft source; dependencies and platform/hardware boundaries;
+and preservation/nonduplication. Code and tests stay in one Bead under the
+suite's no-scope-splitting rule. The final pass found no additional task to
+add. Full Bead descriptions contain the background, implementation seams,
+test controls, evidence limits and closure criteria without relying on this
+document.
+
+Completing the existing issues plus these two additions would cover the
+bounded local-product gaps identified here **if their actual acceptance
+passes**. It cannot guarantee that empirical speed/relevance targets will
+be met, make unavailable hardware available, or turn the experimental Ops
+and design-only distributed architecture into shipped products. Those require
+measurements or an explicit scope decision, not a larger closed count.
+
+Observer-development failures are retained: the first product observer
+misread the stream's string-valued `event`; the first watcher requested the
+unsupported standalone JSON watch format; a later observer incorrectly
+expected a normal `data` envelope for successful daemon shutdown. Recovery
+also rejected an unsupported argument and returned a different nonzero exit
+class than the observer expected for a bad digest. Corrected observations
+inspect actual result members and refusal classes. None is counted as a
+product regression or erased to make a clean narrative.
+
+## Historical November 22 assessment and subsequent implementation receipts
 
 The core local search product ships and works. The signed Linux release
 executable indexed and ranked documents with both registered model tiers,

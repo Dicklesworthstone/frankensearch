@@ -1,5 +1,273 @@
 # Open bug repair TODO
 
+## November 23 execution — OrangeSparrow
+
+Consumer: the owner explicitly requested a complete, granular execution TODO
+after the reality check. This checklist gates my completion claims; Beads
+remain the task authority. Retire this section from active use when the listed
+work is completed or handed off with exact blockers. Retain it as history;
+no file deletion is authorized. The observed failure it prevents is losing
+pending implementation/validation behind an assessment report.
+
+- [x] Read the anti-ceremony skill; keep the next block on product code.
+- [x] Refresh source, dirty-worktree and active Beads state; preserve peer edits.
+- [x] Claim `bd-fsfs-update-offline-g81fb` and reserve its runtime/test surfaces.
+- [x] Locate the existing updater repair and verify its ancestry and scope.
+- [x] Deliver the offline updater repair (`bd-fsfs-update-offline-g81fb`).
+  - [x] Read the production guard, executable regression and native-only assertion.
+  - [x] Verify retained exact-source gate and binary identities.
+  - [x] Replay CLI, environment and config offline checks/application against
+    baseline and repaired executables; keep all connection traces.
+  - [x] Exercise positive online override and local offline rollback listing.
+  - [x] Reconcile required default/native-only and unit/executable gate evidence.
+    Clean `2e2b8026` stock gate: all 18 stages pass, zero failures, no model or
+    cross skip allowance; terminal 01:00:58 UTC November 24. Native-only
+    `semantic-native` all-target Clippy and the actual updater CLI regression
+    pass. Fresh optimized default and native-only executables each pass 14
+    trace-controlled invocations: all six offline source/action combinations
+    against the failing old executable, explicit online override and local
+    rollback. `final-updater-build-identity.json` binds source, lock, compiler,
+    profiles and both executables; raw logs are `updater-{default,native}-final-probe.log`.
+  - [x] Confirm the repair already landed on remote main (`474ed8bf`, `a723d161`).
+  - [x] Verify remote main and the compatibility mirror both select `ea23592f`.
+  - [x] Reverify original acceptance in a separate pass; close only on cited
+    evidence, or retain the exact unmet conditions on the original Bead.
+    Comment 5411 records the exact original matrix and all identities;
+    closed at 01:10:19 UTC. The optimized default additionally passes twelve
+    quickstart commands and 22 controls, zero owned processes, at
+    `tmp/fsfs-quickstart.jUZjGdo1/receipt.json` under the execution root.
+- [x] Qualify the search correctness improvements already integrated on remote main.
+  - [x] Refresh origin and confirm the prepared chain is already present; do not
+    cherry-pick duplicate implementations or claim their authorship.
+  - [x] Review the prepared search chain, especially two-tier identity,
+    filtered refill, failure fallback, scan policy and HNSW reuse.
+  - [x] Separate actual product changes from test/census corrections; preserve
+    all original guards, deadlines, ignores and negative cases.
+  - [x] Run populated filter, quality-policy, staging and interaction regressions
+    with the required feature profiles and exact source identity.
+    - [x] Clean `ea23592f` stock workspace lane: 1,274 fusion library tests
+      passed, zero failed, four ignored. Populated async-filter, late metadata,
+      failure-fallback, cancellation, explicit quality policy and semantic-tail
+      exclusion regressions all executed. Existing Beads have the scoped evidence.
+    - [x] The complete workspace unit/integration stage passed in 676 seconds;
+      this includes compilation and remains separate from the unfinished gate.
+    - [x] Qualify the new partial-quality authority library/CLI regressions
+      through the product `hybrid` feature profile and real-model commands.
+      - [x] Actual current-source native executable: partial HNSW index, two
+        real-model phases and expected winner; full-on-partial and forged
+        coverage refuse; original source path unavailable during retained
+        quality completion; warm server adopts the complete successor and
+        adds quality scoring for its previously uncovered scoped document.
+        Probe: `/data/tmp/fs-exec.SoVtXGnZ/native-product-probe-v2.log`;
+        fixture `/home/ubuntu/.frankensearch-native-product-l1i55zu5`.
+        Initial observer expected the wrong diagnostic wording; that failed
+        receipt is retained separately. No product change was needed.
+      - [x] Fix actual preflight ordering at `f5c5ba6c`: invalid quality IDs
+        loaded models before refusing. Strengthened existing regression fails
+        on old code (one loader call instead of zero); all six partial CLI
+        cases pass after validating membership before constructors. The broad
+        FSVI migration Bead remains open.
+  - [x] Run appropriate workspace/lint/real-model gates on the combined source.
+    - [x] Preserve the clean baseline: fmt, check, proxy Clippy and Windows
+      compile guard pass; workspace/hybrid Clippy fail on `RequestFilter`
+      visibility. Raw log: `/data/tmp/fs-exec.SoVtXGnZ/current-stock-gate.log`.
+    - [x] Correct the private-module visibility without changing the crate-only
+      re-export; commit `6684adc8` is isolated and not yet published.
+    - [x] Preserve all lite assertions and retain its artifacts instead of
+      deleting them; the initial baseline explicitly omits lite for this reason.
+    - [x] Reverify solver-depth corrections in both interaction test crates;
+      preserve the explicit Send requirements, all assertions and workloads.
+      Matched baseline `6684adc8` fails strict Clippy in both unchanged crates
+      with `quill,graph,rerank`; `150306ab` bounds the request future once and
+      passes. No raised test recursion limits remain. Final focused runtime:
+      1,305 library + 31 integration + 25 interaction-unit tests pass, four
+      existing performance ignores. This adds one bounded allocation per
+      request; no latency or performance improvement is claimed.
+    - [x] Run the complete stock gate on the committed final candidate,
+      including the previously omitted lite stage; retain all failed attempts.
+  - [x] Land and publish qualified source increments; update existing Beads.
+    Both remote refs select `2e2b8026`; tracker/TODO publication is a separate
+    documentation/data commit. Rust sources, manifests, lock and toolchain
+    remain unchanged; executed binaries and their build provenance bind `2e2b8026`.
+- [ ] Resolve the next ready product gap using observed behavior and the graph.
+  - [ ] Reconcile one-shot cancellation/pressure (`bd-pz8va`) with prepared repairs.
+    - [x] Fresh installed default executable: successful incumbent, SIGTERM
+      and SIGINT after discovery, both 128 MiB memory profiles, both actual
+      host-load pause profiles cancelled while paused; exact previous selection
+      and independently searchable incumbent after each. Thirteen commands,
+      no owned processes remain. `foreground-product-probe-v4.log` and
+      `/data/tmp/fsfs-foreground-n30xeikz/summary.json`; Bead comment 5410.
+    - [ ] Existing peer-owned broader phase/repeated-interrupt/RCH acceptance;
+      this scoped native pass does not close the original issue.
+  - [ ] Finish useful upgrade-reuse acceptance (`bd-fsfs-cli-upgrade-reuse-rsqq7`).
+  - [ ] Advance native ARM qualification (`bd-6kafg`) when an admitted host exists.
+  - [ ] Advance the existing complete-store product-cost task on booked hardware.
+  - [ ] Execute authority/recovery/CASS and Quill conformance work through their
+    existing prerequisites, without inventing replacement frameworks.
+- [ ] Qualify and deliver the next release through `bd-dsbym` and its actual
+  installer/platform/crate prerequisites; do not infer release clearance from
+  a focused pass or an unavailable worker.
+  - [x] Close the named updater blocker on original optimized/default and
+    native-only acceptance; preserve profile refusal and signing/install gates.
+  - [x] Live registry audit identifies thirteen existing versions from the
+    older published source. No version reuse or republishing is attempted.
+  - [x] Both configured release hosts answer read-only SSH (Linux x86_64 and
+    Darwin arm64). Connectivity gives no capacity/build/platform pass.
+  - [ ] Refresh dependencies from primary sources, one at a time as required
+    by the existing release Bead; rerun affected consumers.
+  - [ ] Bump versions and all internal requirements forward after qualification.
+  - [ ] Build and qualify all six established variants, signed installer and
+    updater paths, platform and registry consumers; publish and verify release.
+- [x] Correct the bounded active-contract drift (`bd-current-oracle-routing-docs-2fzfn`).
+  - [x] Correct both architecture maps against actual native v2 routing and
+    Ops' direct FrankenSQLite dependencies; keep the fsfs default explicit.
+  - [x] Correct the active oracle label to 0.26.2; preserve historical version
+    contracts, measured receipts and v6/v7 placeholders byte for byte.
+  - [x] Update only current unmeasured sentinel identities; independently
+    compare parsed manifests and confirm targets, rules and activation unchanged.
+  - [x] Regenerate the existing operator plan through its compiled renderer,
+    inspect the exact diff, and run version/manifest/bootstrap refusal tests.
+    `b0f3023e`: 23 existing checks pass. Frozen-hash amendment retains an exact
+    old-label control. Parsed manifest comparison changes only the oracle
+    label; ten current unmeasured identities change only their manifest hash;
+    measured and historical files stay byte-identical. Eight local links resolve.
+    No activated gate, changed target or new decidable measurement results.
+  - [x] Reverify original acceptance, publish, and then close on exact evidence.
+    Separate fresh solo pass executes all 23 checks on `2e2b8026` without
+    regeneration permission; comment 5409, closed at 01:03:33 UTC. This is
+    self-verification, not independent review.
+- [x] Before reporting completion: perform the skill's written work/honesty
+  review, verify changed-record scope, sync Beads and inspect dependency cycles.
+  Seven intended tracker records, two bounded own closures, original peer
+  status/acceptance/comments preserved, zero active dependency cycles. Tracker
+  additive-only mode correctly refused relation additions; monotonic reconcile
+  applied the reviewed newer rows in an isolated publication DB. Stale-path
+  export and missing-ancestor merge were refused and retained; a fresh export
+  path succeeded without force. Only this seven-record scope is published.
+
+Source correction: refreshing origin found `ea23592f`, already containing the
+updater and prepared search chain. The local fast-forward to `163e6b55` added
+no capability beyond remote main; both attempted pushes correctly refused
+non-fast-forward. No force push, reset or stash occurred. Current execution is
+on committed `2e2b8026` in `/data/projects/.fs-exec-fix-20261123-SoVtXGnZ`,
+including both newer peer completion/activation commits through `b06d3268`.
+The clean baseline checkout is retained separately at `6684adc8`.
+The old 5ac check was explicitly retired and provides no compiler verdict.
+The updater replay passed all four paired offline cases, online override and
+local rollback, using the independently hashed retained executable. Closure
+and release remain separate from that scoped result.
+
+Current validation: the full stock gate (no stage selection or skip allowance)
+ran from 00:31:52 to 01:00:58 UTC on November 24: all 18 stages pass, terminal
+zero. Exact log SHA256 is `5983be7856497e10ac180c811198c135f1cdd03863efeb0ec5112ac36834b9bd`.
+Source-attested installed quickstart passes 12 commands and 22 controls,
+zero owned processes remaining. Earlier failed/retired attempts stay in
+`/data/tmp/fs-exec.SoVtXGnZ`; retirement exit 143 is never a pass. The optimized
+default build completes in 13m29s, and both updater profile matrices pass.
+Source `2e2b8026` is published to main and its compatibility mirror.
+The existing source gate itself authorizes native-host compilation; these are
+native results, not RCH worker evidence.
+
+Bounded real-work/honesty review (OrangeSparrow, this execution block; update
+terminal outcomes before closure): purpose is reusable progressive two-tier
+hybrid search plus the fsfs product. Mechanical inputs: `git log --stat
+b06d3268..HEAD`, complete test/gate diffs, 12-entry reflog, five recent closed
+Beads and the oldest eight open Beads. Five own commits: two build/lint
+ENABLERs (`6684adc8`, `150306ab`), one USER fix (`f5c5ba6c`), one contributor
+USER documentation chore (`b0f3023e`), one test-lint ENABLER (`2e2b8026`).
+The integration merge preserves peer capability and earns no authorship
+credit. TODO/assessment/Beads edits are PROCESS, zero capability credit.
+The bounded oracle/routing and offline-updater items are closed after fresh
+original acceptance. No umbrella, peer-owned or broader feature item is closed.
+
+Work-audit answers: (1) demo invalid quality IDs with an empty model cache:
+the actual executable refuses before constructor startup; the populated
+partial/completion/warm probe demonstrates the positive path. Publication is
+still pending. (2) Without the process edits runtime behavior is identical;
+they serve the explicit owner request and completion discipline only.
+(3) Both unchanged interaction consumer crates now compile with normal trait
+depth, and the stock gate exercises the library; these are observed enablers.
+(4) The oldest open user-facing work includes Quill conformance and complete
+semantic lifecycle/restart qualification from July; this block first removed
+current build failures and qualified already-wired runtime paths, without
+claiming those older umbrella items complete. (5) Solo: no dispatched agents
+or closure-count comparison. (6) No follow-up was minted to retire unmet
+acceptance; broad migration, pressure, reuse and release items remain open.
+Verdict: ENABLER-dominant, with bounded requested process work. Do not call
+this a finished project; next work remains executable acceptance/publication,
+not another planning framework.
+
+Honesty inventory, original acceptance retained:
+1. Yes, the initial baseline explicitly omitted lite because it deleted its
+   fixture; it was never called a full pass. `6684adc8` retains artifacts and
+   every assertion; current stock run includes lite. Temporary recursion-limit
+   test edits were removed; both final interaction test diffs are empty.
+2. No (checked: production and test diffs); the existing invalid-membership
+   probe gained a constructor counter, and actual model-backed commands ran.
+3. Yes, current unmeasured sentinels, rendered plan and frozen digest changed
+   for the oracle-label correction. Explicit GOLDEN-CHANGE, old-hash control,
+   historical byte equality and zero new decidable rows price this amendment;
+   old measurements are not relabeled. No competitive win follows.
+4. Yes, lite cleanup and the identity-bound test changed as disclosed above.
+   No assertion, threshold, ignore, deadline or feature-default relaxation;
+   native RCH bypass is labeled native. The commit guard initially refused
+   missing AGENT_NAME; rerun used the reserved identity, no bypass.
+5. No (checked: all own production diffs); no corpus/model/benchmark special
+   case or demo success branch was added.
+6. No (checked: named test counts and raw terminal logs); zero-test harnesses,
+   RCH admission failures and retired runs add no pass credit.
+7. No (checked: retained terminal command logs); historical receipts remain
+   labeled historical. Final stock, both updater matrices and optimized
+   quickstart now have observed terminal passes.
+8. Yes, stale local source initially misdirected updater selection. The origin
+   refresh exposed the already-landed repair, the mistake was disclosed, and
+   current-source validation replaced the stale assumption. The first native
+   observer's diagnostic mismatch is retained, not reported as a product bug.
+   Foreground observers also initially expected unsanitized JSON detail and
+   used an invalid load ceiling of 1. Both failed attempts are retained; the
+   corrected observer requires typed JSON plus exact stderr and valid minimum
+   ceiling100. Original signal/pressure conditions are unchanged.
+9. No (checked: retained Clippy, frozen-hash and preflight failures plus all
+   retired logs); none supports a full-clearance claim.
+10. No (checked: cited build/probe invocations); stdout and stderr retained.
+11. No (checked: the two own bounded closures cite fresh original acceptance);
+    original umbrella scope and peer ownership remain unchanged.
+12. No (checked: descriptions and source diff); oracle documentation corrects
+    actual pins, while frozen performance targets and release conditions stay.
+13. Solo: no agent or peer closures accepted in this block.
+14. Solo: no subagent dispatch.
+15. Solo: no subagent report substituted for execution.
+16. Solo: no refusal-farming pane; refusal-only checks do not close umbrellas.
+17. No (checked: evidence references); agreement or inherited claims receive
+    no independent-evidence credit.
+18. No (checked: no comparative performance metric reported); test counts are
+    observed results, not a post-selected benchmark denominator.
+19. Origin should have been refreshed first. Both refused pushes, stale
+    assumption, temporary solver experiments, observer mismatch and the first
+    two commit messages' missing Bead IDs are retained. Existing Bead comments
+    map those commits without rewriting cited history. First source push also
+    omitted AGENT_NAME and was correctly refused by my own reservation guard;
+    supplying the real identity passed without bypass.
+20. Strongest current proof: matched old/new unchanged consumer builds, the
+    constructor-count red/green, and the actual real-model native warm probe.
+    The final stock 18-stage gate, both populated updater trace matrices and
+    optimized positive quickstart now pass. These are self-executed checks,
+    not an independent certificate or complete-release claim.
+
+Disposition: corrections are recorded and disclosed; countermeasures are
+RH-1/RH-13/RH-14/RH-15 (no weaker gates), RH-2 (proof class), RH-3 (explicit
+identity amendment), RH-4/RH-17 (no commit-count credit or hidden history),
+RH-9/RH-10 (original scope stays open), SM-11 (retain first attempts).
+Bounded CASS history audit used six searches and five exact context views;
+hits mostly contained owner instructions and explicit schema amendments,
+not independent proof of misconduct. Raw `honesty-search-*`/`honesty-view-*`
+artifacts are retained under the execution root. All verification here is
+self-executed; no independent verifier has certified this block.
+
+Creation-gate verdict: LEGITIMATE GATE by the owner's explicit TODO request.
+This checklist earns no capability credit. The next deliverable is the updater
+behavior; an hour on another planning artifact would be worse use of the time.
+
 Requested by the owner on 2026-09-12. Maintainer: PurpleBay.
 This is a working checklist, not a substitute for Beads or evidence of closure.
 Inventory baseline: `062f5b8f`; GitHub issues and JSONL read live on September 12.
