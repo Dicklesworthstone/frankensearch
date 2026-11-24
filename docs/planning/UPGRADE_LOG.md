@@ -69,6 +69,39 @@ its rejection and the actual artifact differences remain in
 was relaxed. Fresh final-source stock and executable qualification remains
 pending; this focused compilation preceded the test's source checkpoint.
 
+The clean `e591bf57` rerun passed formatting, compilation, all strict Clippy
+lanes, cross compilation, installer lanes and Quill. Both workspace and
+HTTP tests then exposed the same independent fixture race: the nominally
+stalled child sleeps only one second and can succeed before its observer
+finishes termination. The exact default ELF `68f690a0` passes all eight
+contract cases on cores 0 and 1; those affinity settings are diagnostic,
+not stock-gate overrides. A controlled SIGSTOP/SIGCONT replay pauses only
+its own parent, observes the child naturally exit with wait status 0, and
+reproduces the original assertion failure. Its first slower discovery
+attempt missed that window and is retained as an invalid control.
+
+After stopping only the already-failed stock tree (terminal 143), correct
+the subject to park until it is terminated. The 50 ms deadline, non-success
+exit assertion, caps, receipt checks and all other child cases stay intact.
+Default compilation and strict Clippy pass. A matched workspace build
+preserves all ten checked fingerprint fields, including dependency
+fingerprints, rustc, flags and profile. Corrected ELF `7fa91351` passes all
+eight cases on both cores. Under the same two-second parent pause, its
+child remains blocked and the unchanged timeout/reaping assertion passes.
+All eight HTTP-feature contract cases also pass, zero failures or ignores.
+Complete stock qualification is still pending. The integrity
+split is maintenance only: no competitive rows are evaluated or admitted,
+zero WINs and zero LOSEs; no performance threshold or oracle changes.
+
+Fresh candidate lexical-only watch probes pass for sibling and nested
+physical indexes. The actual foreground probe passes thirteen commands:
+SIGTERM/SIGINT, both 128 MiB memory profiles, and cancellation while paused
+under the valid explicit 100-per-mille load ceiling, with the incumbent
+preserved and searchable. Its first attempt incorrectly configured 1;
+the existing minimum-100 validation correctly refused it, and that attempt
+is not pressure evidence. These controls bind preserved ELF `bc531f43`;
+final stock-build identity reconciliation is still pending.
+
 The scoped UBS scan has zero critical findings. Comparing the same three
 files with the unchanged source leaves fifteen new findings, all assertions
 or unwraps inside tests; each was reviewed without adding suppressions.

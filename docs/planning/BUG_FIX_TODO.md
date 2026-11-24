@@ -38,8 +38,12 @@ no capability credit. Existing qualified work below remains unchanged.
       with 15 TB available: rsync terminal 0, 64,572,120,354 bytes transferred.
     - [ ] Rerun the entire unchanged stock gate on the copied cache.
     - [ ] Recheck actual foreground signals, both 128 MiB pressure profiles,
-      and cancellation while paused under an explicit 1-per-mille load ceiling.
+      and cancellation while paused under an explicit 100-per-mille load ceiling.
       This configured pressure probe cannot establish default-pressure behavior.
+      The first probe used 1, which the existing minimum-100 validator correctly
+      refused. That receipt is not pressure proof; the corrected 13-command
+      probe passes on preserved candidate ELF `bc531f43`, with no owned
+      processes left and the incumbent independently searchable after each stop.
     - [ ] Recheck strict Clippy and the affected pressure/doctor tests on
       the separate `semantic-native` profile; retain its exact feature set.
   - [ ] Preserve the legacy symlink watch repair as a permanent regression.
@@ -60,6 +64,30 @@ no capability credit. Existing qualified work below remains unchanged.
       its rejection and the reviewed actual artifact differences.
     - [ ] Qualify current-source lexical watch with sibling and nested storage;
       preserve the broader upgrade-reuse Bead and its original acceptance.
+- [ ] Repair the independently reproduced timeout-control fixture before
+  claiming a complete gate pass.
+  - [x] Preserve clean `e591bf57` stock failures in both workspace and HTTP
+    lanes: the one-second "stalled" child can already have exited successfully.
+  - [x] Replay the same ELF `68f690a0` on cores 0 and 1: all eight cases pass
+    there. No affinity setting becomes part of the stock gate.
+  - [x] Actual scheduling control pauses only its own parent for two seconds;
+    the finite child becomes a zombie with wait status 0 and the original
+    test fails. Initial slower child discovery missed the interception window;
+    retain that invalid control and use direct-child discovery plus wait status.
+  - [x] Stop only the already-failed stock run's owned process tree, terminal
+    143, before editing. Change only the timeout fixture to park until reaped;
+    preserve the 50 ms monitor deadline, all assertions and other child cases.
+  - [x] Recompile, lint, replay the same schedule against the blocked fixture,
+    and run every default and HTTP contract case.
+    - [x] Default compile and strict Clippy pass. Matched workspace build
+      preserves rustc, features, dependency fingerprints, flags and profile.
+      Corrected ELF `7fa91351` passes all eight cases on cores 0 and 1.
+    - [x] Under the same two-second parent pause, the corrected child is
+      still sleeping and the unchanged timeout/reaping assertion passes.
+    - [x] HTTP-feature cohort: all eight pass, zero failures or ignores.
+  - [ ] Complete the stock gate on the committed fixture checkpoint.
+  - [ ] Publish the integrity split: this corrects a maintenance fixture;
+    no competitive benchmark rows, WINs, LOSEs, or performance gates change.
   - [x] Record the exact dependency change, primary sources and terminal
     results in the existing UPGRADE_LOG; preserve failed attempts.
 - [ ] Complete remaining dependency review without relaxing audited identity,

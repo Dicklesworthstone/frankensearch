@@ -1223,7 +1223,12 @@ fn fresh_process_child() {
                     .expect("byte-overflow child must flush stdout");
             }
         }
-        "timeout-stall" => thread::sleep(Duration::from_secs(1)),
+        // Keep the subject stalled until the monitor terminates it. A finite
+        // sleep can expire while the parent is descheduled or invoking kill,
+        // turning the reaping control into an unrelated successful exit.
+        "timeout-stall" => loop {
+            thread::park();
+        },
         "tree-timeout-stall" => {
             let mut grandchild = Command::new("sleep")
                 .arg("10")
