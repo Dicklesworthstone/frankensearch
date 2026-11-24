@@ -430,23 +430,27 @@ impl std::fmt::Debug for HostSampler {
     }
 }
 
-impl Default for HostSampler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HostSampler {
     /// Create a new sampler. Performs initial sysinfo refresh.
-    #[must_use]
-    pub fn new() -> Self {
-        let mut system = System::new();
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed subsystem error when OS metrics cannot be initialized.
+    pub fn new() -> SearchResult<Self> {
+        Self::from_system(System::new())
+    }
+
+    fn from_system(system: Result<System, sysinfo::Error>) -> SearchResult<Self> {
+        let mut system = system.map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.pressure.system",
+            source: Box::new(source),
+        })?;
         system.refresh_cpu_all();
         system.refresh_memory();
-        Self {
+        Ok(Self {
             system,
             io_available: None,
-        }
+        })
     }
 
     /// Collect one pressure sample from the OS.
@@ -492,14 +496,10 @@ impl HostSampler {
         self.io_available = Some(io_available);
         let (io_read, io_write) = io.unwrap_or((0, 0));
 
-        let load_avg_1m = {
-            let load = System::load_average();
-            if load.one >= 0.0 {
-                Some(load.one)
-            } else {
-                None
-            }
-        };
+        let load_avg_1m = System::load_average()
+            .ok()
+            .filter(|load| load.one >= 0.0)
+            .map(|load| load.one);
 
         PressureSample {
             cpu_pct,
@@ -581,7 +581,7 @@ impl IndexPressureMonitor {
             }
         }
         Ok(Self {
-            sampler: HostSampler::new(),
+            sampler: HostSampler::new()?,
             controller: PressureController::new(PressureControllerConfig {
                 profile: config.profile,
                 ewma_alpha: f64::from(config.ewma_alpha_per_mille) / 1_000.0,
@@ -1094,7 +1094,7 @@ mod tests {
 
     #[test]
     fn host_sampler_returns_valid_sample() {
-        let mut sampler = HostSampler::new();
+        let mut sampler = HostSampler::new().expect("host metrics available");
         let sample = sampler.sample();
         // CPU should be non-negative (may be 0 on first call).
         assert!(sample.cpu_pct >= 0.0);
@@ -1105,12 +1105,25 @@ mod tests {
         // We just verify it doesn't panic.
     }
 
+    #[test]
+    fn host_sampler_unavailable_system_is_a_typed_startup_error() {
+        let error = HostSampler::from_system(Err(sysinfo::Error::Unsupported)).unwrap_err();
+        assert!(matches!(
+            error,
+            SearchError::SubsystemError {
+                subsystem: "fsfs.pressure.system",
+                source,
+            } if source.downcast_ref::<sysinfo::Error>()
+                .is_some_and(|error| matches!(error, sysinfo::Error::Unsupported))
+        ));
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn host_sampler_observes_cumulative_synced_writes() {
         use std::io::Write;
 
-        let mut sampler = HostSampler::new();
+        let mut sampler = HostSampler::new().expect("host metrics available");
         let mut before = sampler.sample();
         assert!(before.io_counters_available, "self process I/O is required");
         let mut file = tempfile::NamedTempFile::new().expect("private I/O fixture");

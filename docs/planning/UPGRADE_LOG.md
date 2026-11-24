@@ -1,5 +1,62 @@
 # Dependency Upgrade Log
 
+## 2026-11-24 — Fallible host metrics and cookie advisory patch
+
+Under `bd-dsbym`, upgrade the workspace's direct `sysinfo` requirement from
+0.39.6 to 0.40.4. Preserve the five previous default features explicitly;
+0.40's newly default GPU probing is unused. Asupersync still requires its
+separate 0.39.6 identity. The initial lock review adds only sysinfo 0.40.4;
+no existing package version or checksum changes.
+
+Primary sources: the [migration guide](https://github.com/GuillaumeGomez/sysinfo/blob/v0.40.4/migration_guide.md),
+[0.40.4 changelog](https://docs.rs/crate/sysinfo/0.40.4/source/CHANGELOG.md)
+and downloaded registry source at upstream commit
+`931b94e6fe53dbd22ce43a259163c43c096b8542`. Unchanged fsfs call sites produce
+ten actual compiler errors after the bump. The migration propagates typed
+system-initialization errors, retains unavailable load as unavailable, and
+makes `doctor` warn when disk inventory fails or has no matching mount.
+The successful disk-space threshold and pressure-controller policies remain
+unchanged. Injected OS failures are unit controls, not live OS-failure proof.
+
+Focused results: 224 pressure tests and 33 doctor tests pass, zero failures
+or ignores. Workspace check and strict workspace, hybrid and HTTP-feature
+Clippy pass. An initial implementation attempt failed on three test imports
+and an iterator lint; its receipt is retained. The optional broader fsfs
+Windows build stops in ring before fsfs: first missing `lib.exe`, then missing
+Windows SDK `assert.h` with clang-cl/llvm-lib. Neither is a Windows pass.
+
+Separately update only `cookie` 0.18.2 to 0.18.3 for
+[RUSTSEC-2026-0594](https://rustsec.org/advisories/RUSTSEC-2026-0594.html).
+The [upstream fix](https://github.com/rwf2/cookie-rs/commit/98de6032defb10ad5e49d83fa1a9bbed1873cbe4)
+uses OS randomness for private-cookie nonces after fork. This entry already
+existed before the sysinfo migration; no production exploit is demonstrated.
+The queried default workspace graph does not activate the optional cookie
+store. This second lock review replaces only cookie, without changing any
+other existing package. Against the same clean advisory database commit
+`52384ab5581a4487b62c549eef95cf7ba7e8bad5` (1,563 advisories), actual audit
+results change from one vulnerability to zero. Four unmaintained and one
+unsound informational warning remain. The shared advisory lock was left
+untouched; both audits use the private database. The HTTP/proxy gate passes
+with the patched lock. Raw evidence for this entry is retained under
+`/data/tmp/fs-next-20261124`; full stock and fresh executable qualification
+are still pending at this source checkpoint.
+
+The scoped UBS scan has zero critical findings. Comparing the same three
+files with the unchanged source leaves fifteen new findings, all assertions
+or unwraps inside tests; each was reviewed without adding suppressions.
+The scanner's existing warning inventory is not a clean-code claim. An
+initial baseline extraction used the wrong working directory and scanned
+empty files; that zero-run receipt is excluded and the populated 80,493-line
+baseline was rerun and retained as `sysinfo-ubs-baseline-v2.json`.
+
+The live registry census covers 67 direct external dependencies. This is
+not a completed latest-version migration: the runtime/SQLite family, TUI,
+model producer, wire-format and frozen oracle upgrades need their own
+contract-qualified changes. No release version or tag changes here. DSR
+currently rejects the configured Apple builder's writable APFS container
+(6.37 GiB available against the existing 40 GiB requirement); the original
+six-variant binary and thirteen-crate release acceptance stays open.
+
 ## 2026-11-21 - v1.13.0 release dependency preparation
 
 Refreshed semver-compatible lockfile dependencies (130+ entries including

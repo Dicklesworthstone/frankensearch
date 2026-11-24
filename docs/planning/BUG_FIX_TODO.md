@@ -1,5 +1,45 @@
 # Open bug repair TODO
 
+## November 24 release continuation — OrangeSparrow
+
+Owner-requested execution checklist; Beads remains authoritative. This section
+gates completion claims for `bd-dsbym` and retires from active use when this
+release block is published or handed off with exact unmet conditions. It earns
+no capability credit. Existing qualified work below remains unchanged.
+
+- [x] Refresh origin, source/worktree state and the current dependency graph.
+  Remote source remains `c5a7464a`; preserve the shared checkout's peer edits.
+- [x] Recover the established six-variant inventory and current release via
+  the GitHub connector and existing release checker; retain the actual profiles.
+- [x] Inspect release-host admission. The configured Apple host answers SSH
+  but DSR rejects its APFS writable roles: 6.41 GiB available versus the
+  existing 40 GiB minimum. No threshold change or cleanup is authorized.
+- [ ] Upgrade one stable dependency at a time under `bd-dsbym`.
+  - [x] Read the updater/research skills and primary sysinfo 0.40.4 source,
+    migration guide and changelog; compare every actual call site.
+  - [x] Retain the unchanged-callsite compile failure after the sysinfo bump.
+    Ten actual errors; `sysinfo-baseline-red.log` in the new evidence root.
+  - [x] Handle fallible sensor construction and disk inventory explicitly;
+    retain unavailable load as unavailable and existing pressure semantics.
+  - [x] Run affected pressure/storage/doctor tests and strict Clippy.
+    Pressure 224/0/0, doctor 33/0/0; workspace, hybrid and HTTP strict
+    Clippy pass. Optional fsfs Windows builds stop in ring's missing host
+    tools/SDK headers, before fsfs; they are not cross-platform passes.
+  - [x] Audit the lock against the current advisory database; patch the
+    pre-existing cookie 0.18.2 entry to 0.18.3 for RUSTSEC-2026-0594.
+    Same 1,563-advisory snapshot: one vulnerability before, zero after;
+    five informational warnings remain. Only cookie changes in this step.
+    The HTTP/proxy gate passes. No production exploit is demonstrated.
+  - [ ] Execute the complete stock gate and actual signal/pressure controls.
+  - [x] Record the exact dependency change, primary sources and terminal
+    results in the existing UPGRADE_LOG; preserve failed attempts.
+- [ ] Complete remaining dependency review without relaxing audited identity,
+  forbidden-runtime, profile, wire, installer or consumer contracts.
+- [ ] Recheck platform admission before any release. Keep the original
+  six-variant acceptance; preserve the current release until all gates pass.
+- [ ] Publish qualified increments and scoped Beads/TODO evidence, verify
+  both remote refs and dependency cycles, and fill the bounded honesty review.
+
 ## November 23 execution — OrangeSparrow
 
 Consumer: the owner explicitly requested a complete, granular execution TODO

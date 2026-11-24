@@ -24,7 +24,7 @@ use crate::config::PressureProfile;
 const DEFAULT_EWMA_ALPHA: f64 = 0.3;
 const DEFAULT_HYSTERESIS_PCT: f64 = 5.0;
 const DEFAULT_CONSECUTIVE_REQUIRED: u8 = 3;
-const DEFAULT_IO_CEILING_MIB_PER_SEC: f64 = 64.0;
+pub(crate) const DEFAULT_IO_CEILING_MIB_PER_SEC: f64 = 64.0;
 #[cfg(any(target_os = "linux", test))]
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 
@@ -1685,16 +1685,11 @@ pub struct HostPressureCollector {
     system: System,
 }
 
-impl Default for HostPressureCollector {
-    fn default() -> Self {
-        Self::new(DEFAULT_IO_CEILING_MIB_PER_SEC).expect("default config valid")
-    }
-}
-
 impl HostPressureCollector {
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] if `io_ceiling_mib_per_sec <= 0`.
+    /// Returns a subsystem error when non-Linux OS metrics cannot initialize.
     pub fn new(io_ceiling_mib_per_sec: f64) -> SearchResult<Self> {
         if !io_ceiling_mib_per_sec.is_finite() || io_ceiling_mib_per_sec <= 0.0 {
             return Err(SearchError::InvalidConfig {
@@ -1708,7 +1703,10 @@ impl HostPressureCollector {
             previous_io: None,
             #[cfg(not(target_os = "linux"))]
             system: {
-                let mut s = System::new();
+                let mut s = System::new().map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.pressure.system",
+                    source: Box::new(source),
+                })?;
                 s.refresh_cpu_all();
                 s.refresh_memory();
                 s
@@ -3064,8 +3062,8 @@ mod tests {
     // --- HostPressureCollector ---
 
     #[test]
-    fn host_pressure_collector_default() {
-        let c = HostPressureCollector::default();
+    fn host_pressure_collector_default_ceiling() {
+        let c = HostPressureCollector::new(DEFAULT_IO_CEILING_MIB_PER_SEC).unwrap();
         assert!((c.io_ceiling_mib_per_sec - 64.0).abs() < f64::EPSILON);
         assert!(c.previous_io.is_none());
     }
@@ -3098,7 +3096,7 @@ mod tests {
 
     #[test]
     fn io_pct_no_previous_returns_zero() {
-        let c = HostPressureCollector::default();
+        let c = HostPressureCollector::new(DEFAULT_IO_CEILING_MIB_PER_SEC).unwrap();
         let current = ProcIoCounters {
             read_bytes: 1_000_000,
             write_bytes: 1_000_000,

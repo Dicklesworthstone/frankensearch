@@ -195,7 +195,9 @@ proptest = "1.6"
 # Date/time formatting/parsing for telemetry RFC3339 timestamps
 
 # System information (CPU, memory, etc.)
-sysinfo = "0.39.6"
+# Preserve the previous default feature surface; 0.40 adds GPU probing by
+# default, which fsfs does not use.
+sysinfo = { version = "0.40.4", default-features = false, features = ["component", "disk", "network", "system", "user"] }
 
 # FrankenTUI terminal UI framework
 ftui-core = "0.9.0"

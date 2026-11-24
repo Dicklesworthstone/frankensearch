@@ -152,7 +152,7 @@ use crate::output_schema::{
     error_code_for,
 };
 use crate::pressure::{
-    DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
+    DEFAULT_IO_CEILING_MIB_PER_SEC, DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
     HostPressureCollector, PressureController, PressureControllerConfig, PressureSignal,
     PressureState, PressureTransition,
 };
@@ -3052,7 +3052,7 @@ struct IndexRunControl {
 impl IndexRunControl {
     fn new(config: &FsfsConfig) -> SearchResult<Self> {
         Ok(Self {
-            collector: HostPressureCollector::default(),
+            collector: HostPressureCollector::new(DEFAULT_IO_CEILING_MIB_PER_SEC)?,
             pressure: IndexPressureMonitor::new(&config.pressure)?,
             sample_interval: Duration::from_millis(config.pressure.sample_interval_ms.max(1)),
             last_sample: Instant::now(),
@@ -9445,7 +9445,8 @@ impl FsfsRuntime {
             );
         }
 
-        let mut pressure_collector = HostPressureCollector::default();
+        let mut pressure_collector =
+            HostPressureCollector::new(DEFAULT_IO_CEILING_MIB_PER_SEC)?;
         let mut pressure_controller = self.new_pressure_controller();
         let mut degradation_machine = self.new_degradation_state_machine()?;
         match self.collect_pressure_signal(&mut pressure_collector) {
@@ -19941,35 +19942,11 @@ impl FsfsRuntime {
         }
 
         // 6. Disk space check
-        let disks = Disks::new_with_refreshed_list();
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(disk) = disks
-            .iter()
-            .filter(|disk| cwd.starts_with(disk.mount_point()))
-            .max_by_key(|disk| disk.mount_point().as_os_str().len())
-        {
-            let available = disk.available_space();
-            let min_required: u64 = 500 * 1024 * 1024; // 500 MB minimum
-            if available >= min_required {
-                checks.push(DoctorCheck {
-                    name: "disk_space".to_owned(),
-                    verdict: DoctorVerdict::Pass,
-                    detail: format!("{} available", humanize_bytes(available)),
-                    suggestion: None,
-                });
-            } else {
-                checks.push(DoctorCheck {
-                    name: "disk_space".to_owned(),
-                    verdict: DoctorVerdict::Warn,
-                    detail: format!(
-                        "only {} available (minimum recommended: {})",
-                        humanize_bytes(available),
-                        humanize_bytes(min_required)
-                    ),
-                    suggestion: Some("free disk space for model downloads and indexing".to_owned()),
-                });
-            }
-        }
+        checks.push(disk_space_doctor_check(
+            &cwd,
+            Disks::new_with_refreshed_list(),
+        ));
 
         // 7. Config sources
         let config_summary = self.status_config_source_summary()?;
@@ -30298,7 +30275,11 @@ impl FsfsRuntime {
         watcher: Option<&FsWatcher>,
         disk_budget: Option<(&LifecycleTracker, &IndexStoragePaths)>,
     ) -> ShutdownReason {
-        let mut pressure_collector = HostPressureCollector::default();
+        let mut pressure_collector =
+            match HostPressureCollector::new(DEFAULT_IO_CEILING_MIB_PER_SEC) {
+                Ok(collector) => collector,
+                Err(error) => return ShutdownReason::Error(error.to_string()),
+            };
         let mut pressure_controller = self.new_pressure_controller();
         let sample_interval_ms = self.config.pressure.sample_interval_ms.max(1);
         let mut last_pressure_sample_ms = 0_u64;
@@ -30997,13 +30978,54 @@ fn looks_like_fsfs_index_root(path: &Path) -> bool {
         })
 }
 
+fn disk_space_doctor_check(cwd: &Path, disks: Result<Disks, sysinfo::Error>) -> DoctorCheck {
+    let unavailable = |detail| DoctorCheck {
+        name: "disk_space".to_owned(),
+        verdict: DoctorVerdict::Warn,
+        detail,
+        suggestion: Some("check disk free space before model downloads or indexing".to_owned()),
+    };
+    let disks = match disks {
+        Ok(disks) => disks,
+        Err(error) => return unavailable(format!("disk inventory unavailable: {error}")),
+    };
+    let Some(disk) = disks
+        .iter()
+        .filter(|disk| cwd.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+    else {
+        return unavailable("no disk inventory entry matches the working directory".to_owned());
+    };
+    let available = disk.available_space();
+    let min_required: u64 = 500 * 1024 * 1024;
+    if available >= min_required {
+        DoctorCheck {
+            name: "disk_space".to_owned(),
+            verdict: DoctorVerdict::Pass,
+            detail: format!("{} available", humanize_bytes(available)),
+            suggestion: None,
+        }
+    } else {
+        DoctorCheck {
+            name: "disk_space".to_owned(),
+            verdict: DoctorVerdict::Warn,
+            detail: format!(
+                "only {} available (minimum recommended: {})",
+                humanize_bytes(available),
+                humanize_bytes(min_required)
+            ),
+            suggestion: Some("free disk space for model downloads and indexing".to_owned()),
+        }
+    }
+}
+
 #[must_use]
 fn available_space_for_path(path: &Path) -> Option<u64> {
     let probe = nearest_existing_path(path);
-    let disks = Disks::new_with_refreshed_list();
+    let disks = Disks::new_with_refreshed_list().ok()?;
     let mut best_match: Option<(usize, u64)> = None;
 
-    for disk in disks.list() {
+    for disk in &disks {
         let mount_point = disk.mount_point();
         if probe.starts_with(mount_point) {
             let depth = mount_point.components().count();
@@ -31016,7 +31038,6 @@ fn available_space_for_path(path: &Path) -> Option<u64> {
 
     best_match.map(|(_, bytes)| bytes).or_else(|| {
         disks
-            .list()
             .iter()
             .map(sysinfo::Disk::available_space)
             .max()
@@ -53414,6 +53435,29 @@ mod tests {
     }
 
     #[test]
+    fn doctor_unavailable_disk_inventory_never_reports_enough_space() {
+        for error in [
+            sysinfo::Error::Unsupported,
+            sysinfo::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ] {
+            let check = super::disk_space_doctor_check(Path::new("/"), Err(error));
+            assert_eq!(check.name, "disk_space");
+            assert!(matches!(check.verdict, super::DoctorVerdict::Warn));
+            assert!(check.detail.starts_with("disk inventory unavailable:"));
+            assert!(check.suggestion.is_some());
+        }
+    }
+
+    #[test]
+    fn doctor_missing_disk_inventory_entry_never_reports_enough_space() {
+        let check = super::disk_space_doctor_check(Path::new("/"), sysinfo::Disks::new());
+        assert_eq!(check.name, "disk_space");
+        assert!(matches!(check.verdict, super::DoctorVerdict::Warn));
+        assert!(check.detail.contains("no disk inventory entry matches"));
+        assert!(check.suggestion.is_some());
+    }
+
+    #[test]
     fn more_severe_pressure_state_prefers_stricter_state() {
         assert_eq!(
             super::more_severe_pressure_state(PressureState::Normal, PressureState::Constrained),
@@ -53455,7 +53499,8 @@ mod tests {
     #[test]
     fn runtime_collect_pressure_signal_reads_host_metrics() {
         let runtime = FsfsRuntime::new(FsfsConfig::default());
-        let mut collector = HostPressureCollector::default();
+        let mut collector =
+            HostPressureCollector::new(super::DEFAULT_IO_CEILING_MIB_PER_SEC).unwrap();
         let sample = runtime
             .collect_pressure_signal(&mut collector)
             .expect("collect pressure sample");
