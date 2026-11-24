@@ -5635,13 +5635,13 @@ impl CassQueryParser {
         let parts = cass_operand_parts(raw)
             .into_iter()
             .map(|part| part.trim_matches('*').to_owned())
-            .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
         if parts.is_empty() {
             return Err(QueryDiagnosticKind::DroppedFragment);
         }
         for part in &parts {
-            if part.contains('*')
+            if part.is_empty()
+                || part.contains('*')
                 || (!cass_short_ascii_operand_is_admitted(part)
                     && cass_analyzed_fragments(part)?.terms.is_empty())
             {

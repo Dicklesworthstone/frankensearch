@@ -2602,7 +2602,6 @@ fn cass_normalize_phrase_terms(raw: &str) -> SearchResult<(CassIndexedFragments,
     let parts = cass_normalize_term_parts(raw)
         .into_iter()
         .map(|part| part.trim_matches('*').to_owned())
-        .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
     if parts.is_empty() {
         return Err(cass_normalization_error(
@@ -2612,7 +2611,8 @@ fn cass_normalize_phrase_terms(raw: &str) -> SearchResult<(CassIndexedFragments,
     for part in &parts {
         // Edge stars retain the existing quoted behavior. An interior star
         // cannot be turned into a separator or silently dropped under NOT.
-        if part.contains('*')
+        if part.is_empty()
+            || part.contains('*')
             || (!cass_ascii_operand_admitted(part)
                 && cass_analyzed_fragments(part)?.terms.is_empty())
         {
@@ -5558,6 +5558,9 @@ mod cass_query_tests {
             "*",
             "***",
             "\"*** \u{2003}\"",
+            r#""backup ***""#,
+            r#""* kérlek""#,
+            r#""backup ** kérlek""#,
             "()",
             "( )",
             "(\u{2003})",
