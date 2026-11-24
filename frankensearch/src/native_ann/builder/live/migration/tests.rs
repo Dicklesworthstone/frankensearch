@@ -885,6 +885,362 @@ fn selected_migration_checks_full_generation_storage_and_graph_policy() {
 }
 
 #[test]
+fn selected_quality_completion_retains_fast_cache_and_mixed_storage() {
+    run_test_with_cx(|cx| async move {
+        for fast_hnsw in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let fast = Provider::new("completion-fast", 2, true);
+            let cached = Arc::new(frankensearch_embed::CachedEmbedder::new(fast.clone(), 32));
+            let quality = Provider::new("completion-quality", 3, true);
+            let graph = NativeBuildRetrieval::Hnsw {
+                params: HnswParams::default(),
+                seed: 57,
+            };
+            let fast_retrieval = if fast_hnsw {
+                graph
+            } else {
+                NativeBuildRetrieval::Exact
+            };
+            let quality_retrieval = if fast_hnsw {
+                NativeBuildRetrieval::Exact
+            } else {
+                graph
+            };
+            let initial =
+                NativeIndexBuilder::new(root.path().join("initial"), generation(1), cached.clone())
+                    .unwrap()
+                    .with_fast_storage(NativeBuildPrecision::F16, fast_retrieval)
+                    .add_documents(documents())
+                    .build_hybrid(&cx)
+                    .await
+                    .unwrap();
+            let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+            let base = live.snapshot(&cx).await.unwrap();
+            let query = "warm-only horizontal query";
+            live.search(&cx, query, 3).await.unwrap();
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+            let path = root.path().join("completed");
+            let built = base
+                .begin_quality_completion(&cx, &path, generation(2), quality.clone())
+                .unwrap()
+                .with_quality_storage(NativeBuildPrecision::F32, quality_retrieval)
+                .unwrap()
+                .build(&cx)
+                .await
+                .unwrap();
+            let receipt = built.index().seal_for_reopen(&cx).unwrap();
+            drop(built);
+            fast.documents.store(0, Ordering::SeqCst);
+            quality.documents.store(0, Ordering::SeqCst);
+            let cache_before = cached.cache_stats();
+            let fast_bytes = std::fs::read(base.index().vectors().fast().vector_path()).unwrap();
+
+            // Ordinary selected replacement still refuses an implicit tier change.
+            assert!(
+                base.prepare_selected(&cx, &path, &receipt, NativeHybridReopenLimits::default())
+                    .await
+                    .is_err()
+            );
+            let candidate = base
+                .prepare_quality_completion_selected(
+                    &cx,
+                    &path,
+                    generation(2),
+                    &receipt,
+                    quality.clone(),
+                    (NativeBuildPrecision::F32, quality_retrieval),
+                    NativeHybridReopenLimits::default(),
+                )
+                .await
+                .unwrap();
+            assert_sources(base.index(), candidate.index());
+            assert!(Arc::ptr_eq(
+                &base.index().vectors().fast().embedder,
+                &candidate.index().vectors().fast().embedder,
+            ));
+            assert_eq!(
+                candidate.index().vectors().fast().precision,
+                NativeBuildPrecision::F16
+            );
+            assert_eq!(
+                candidate.index().vectors().fast().graph_receipt.is_some(),
+                fast_hnsw
+            );
+            assert_eq!(
+                candidate
+                    .index()
+                    .vectors()
+                    .quality()
+                    .unwrap()
+                    .graph_receipt
+                    .is_some(),
+                !fast_hnsw,
+            );
+            assert_eq!(cached.cache_stats(), cache_before);
+            assert_eq!(fast.documents.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.documents.load(Ordering::SeqCst), 0);
+            assert!(std::ptr::eq(
+                live.snapshot(&cx).await.unwrap().index(),
+                base.index()
+            ));
+
+            let selected = live.install(&cx, &candidate).await.unwrap();
+            let page = live.search_refined(&cx, query, 3).await.unwrap();
+            assert_eq!(page.snapshot.generation(), generation(2));
+            assert!(!page.results.is_empty());
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), 1);
+            assert!(cached.cache_stats().hits > cache_before.hits);
+            assert!(base.index().vectors().quality().is_none());
+            assert_eq!(
+                std::fs::read(base.index().vectors().fast().vector_path()).unwrap(),
+                fast_bytes,
+            );
+            let error = selected
+                .prepare_quality_completion_selected(
+                    &cx,
+                    root.path().join("not-read"),
+                    generation(3),
+                    &receipt,
+                    quality.clone(),
+                    (NativeBuildPrecision::F32, quality_retrieval),
+                    NativeHybridReopenLimits::default(),
+                )
+                .await
+                .unwrap_err();
+            assert_field(error, "native_ann.live.quality_completion.topology");
+        }
+    });
+}
+
+#[test]
+fn selected_quality_completion_refuses_changed_source_models_and_fast_policy() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let fast = Provider::new("completion-fast", 2, true);
+        let quality = Provider::new("completion-quality", 3, true);
+        let graph = NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 57,
+        };
+        let initial =
+            NativeIndexBuilder::new(root.path().join("initial"), generation(1), fast.clone())
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F16, graph)
+                .add_documents(documents())
+                .build_hybrid(&cx)
+                .await
+                .unwrap();
+        let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+        let base = live.snapshot(&cx).await.unwrap();
+        for variant in [
+            "fast-model",
+            "fast-precision",
+            "fast-exact",
+            "fast-seed",
+            "quality-model",
+            "missing-quality",
+            "id",
+            "content",
+            "title",
+            "metadata",
+            "count",
+        ] {
+            let mut source = documents();
+            match variant {
+                "id" => source[0].id = "another-id".to_owned(),
+                "content" => source[0].content = "another body".to_owned(),
+                "title" => source[0].title = Some("another title".to_owned()),
+                "metadata" => {
+                    source[0]
+                        .metadata
+                        .insert("project".to_owned(), "another project".to_owned());
+                }
+                "count" => {
+                    let _ = source.pop();
+                }
+                _ => {}
+            }
+            let target_fast = if variant == "fast-model" {
+                Provider::new("foreign-fast", 2, true)
+            } else {
+                fast.clone()
+            };
+            let target_quality = if variant == "quality-model" {
+                Provider::new("foreign-quality", 3, true)
+            } else {
+                quality.clone()
+            };
+            let precision = if variant == "fast-precision" {
+                NativeBuildPrecision::F32
+            } else {
+                NativeBuildPrecision::F16
+            };
+            let retrieval = match variant {
+                "fast-exact" => NativeBuildRetrieval::Exact,
+                "fast-seed" => NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 58,
+                },
+                _ => graph,
+            };
+            let path = root.path().join(variant);
+            let mut builder = NativeIndexBuilder::new(&path, generation(2), target_fast)
+                .unwrap()
+                .with_fast_storage(precision, retrieval)
+                .add_documents(source);
+            if variant != "missing-quality" {
+                builder = builder.with_quality_embedder(target_quality).unwrap();
+            }
+            let built = builder.build_hybrid(&cx).await.unwrap();
+            let receipt = built.seal_for_reopen(&cx).unwrap();
+            drop(built);
+            fast.documents.store(0, Ordering::SeqCst);
+            quality.documents.store(0, Ordering::SeqCst);
+            let outcome = base
+                .prepare_quality_completion_selected(
+                    &cx,
+                    &path,
+                    generation(2),
+                    &receipt,
+                    quality.clone(),
+                    (NativeBuildPrecision::F32, NativeBuildRetrieval::Exact),
+                    NativeHybridReopenLimits::default(),
+                )
+                .await;
+            assert!(outcome.is_err(), "accepted {variant}");
+            assert_eq!(fast.documents.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.documents.load(Ordering::SeqCst), 0);
+            assert!(std::ptr::eq(
+                live.snapshot(&cx).await.unwrap().index(),
+                base.index()
+            ));
+        }
+    });
+}
+
+#[test]
+fn selected_quality_completion_refuses_bad_selection_and_preserves_the_source_fence() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let fast = Provider::new("completion-fast", 2, true);
+        let quality = Provider::new("completion-quality", 3, true);
+        let initial = build(
+            &cx,
+            &root.path().join("initial"),
+            1,
+            &fast,
+            None,
+            documents(),
+        )
+        .await;
+        let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+        let base = live.snapshot(&cx).await.unwrap();
+        let path = root.path().join("completed");
+        let built = base
+            .begin_quality_completion(&cx, &path, generation(50), quality.clone())
+            .unwrap()
+            .build(&cx)
+            .await
+            .unwrap();
+        let quality_file = built
+            .index()
+            .vectors()
+            .quality()
+            .unwrap()
+            .vector_path()
+            .to_path_buf();
+        let receipt = built.index().seal_for_reopen(&cx).unwrap();
+        drop(built);
+        fast.documents.store(0, Ordering::SeqCst);
+        quality.documents.store(0, Ordering::SeqCst);
+        for requested in [
+            generation(1),
+            ArtifactGenerationIdentityV1::new(50, [0x60; 16]).unwrap(),
+        ] {
+            assert!(
+                base.prepare_quality_completion_selected(
+                    &cx,
+                    &path,
+                    requested,
+                    &receipt,
+                    quality.clone(),
+                    (NativeBuildPrecision::F32, NativeBuildRetrieval::Exact),
+                    NativeHybridReopenLimits::default(),
+                )
+                .await
+                .is_err()
+            );
+        }
+        cx.set_cancel_requested(true);
+        let cancelled = base
+            .prepare_quality_completion_selected(
+                &cx,
+                &path,
+                generation(50),
+                &receipt,
+                quality.clone(),
+                (NativeBuildPrecision::F32, NativeBuildRetrieval::Exact),
+                NativeHybridReopenLimits::default(),
+            )
+            .await;
+        cx.set_cancel_requested(false);
+        assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+        let original = std::fs::read(&quality_file).unwrap();
+        let mut damaged = original.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        std::fs::write(&quality_file, damaged).unwrap();
+        let rejected = base
+            .prepare_quality_completion_selected(
+                &cx,
+                &path,
+                generation(50),
+                &receipt,
+                quality.clone(),
+                (NativeBuildPrecision::F32, NativeBuildRetrieval::Exact),
+                NativeHybridReopenLimits::default(),
+            )
+            .await;
+        std::fs::write(&quality_file, original).unwrap();
+        assert!(rejected.is_err());
+        assert_eq!(fast.documents.load(Ordering::SeqCst), 0);
+        assert_eq!(quality.documents.load(Ordering::SeqCst), 0);
+
+        let pending = base.prepare_quality_completion_selected(
+            &cx,
+            &path,
+            generation(50),
+            &receipt,
+            quality.clone(),
+            (NativeBuildPrecision::F32, NativeBuildRetrieval::Exact),
+            NativeHybridReopenLimits::default(),
+        );
+        let source_update = base
+            .begin_update(&cx, root.path().join("source-edit"), generation(2))
+            .unwrap()
+            .delete_document("a")
+            .build(&cx)
+            .await
+            .unwrap();
+        let edited = live.install(&cx, &source_update).await.unwrap();
+        let candidate = pending.await.unwrap();
+        assert_field(
+            live.install(&cx, &candidate).await.unwrap_err(),
+            "native_ann.live.expected_current",
+        );
+        assert!(std::ptr::eq(
+            live.snapshot(&cx).await.unwrap().index(),
+            edited.index()
+        ));
+        assert!(edited.index().vectors().document("a").is_none());
+        assert!(base.index().vectors().document("a").is_some());
+        assert!(base.index().vectors().quality().is_none());
+        assert_eq!(fast.documents.load(Ordering::SeqCst), 0);
+        assert_eq!(quality.documents.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
 fn selected_migration_never_accepts_a_same_name_different_producer_or_bad_receipt() {
     run_test_with_cx(|cx| async move {
         let root = tempfile::tempdir().unwrap();

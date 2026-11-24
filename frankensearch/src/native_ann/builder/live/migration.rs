@@ -13,6 +13,7 @@ use frankensearch_core::generation::{
 };
 
 use super::{NativeHybridCandidate, NativeHybridSnapshot};
+use crate::native_ann::builder::update::retained_plan;
 use crate::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltHybridIndex, NativeBuiltTier,
     NativeHybridReopenLimits, NativeIndexBuilder, TierPlan,
@@ -84,6 +85,65 @@ struct TargetModels {
 }
 
 impl NativeHybridSnapshot {
+    /// Admit a selected quality completion while retaining the actual fast model.
+    ///
+    /// The predecessor must be fast-only. Its fast provider, including any warm
+    /// query cache, is shared with the reopened candidate; fast precision and all
+    /// native graph parameters are inherited exactly. Only the new quality
+    /// provider and its precision/retrieval policy are supplied by the caller.
+    ///
+    /// `expected` must be the original trusted hybrid seal receipt for this
+    /// directory. The selected reader checks every source/vector/graph/Quill
+    /// artifact under `limits`, then requires the exact requested generation,
+    /// unchanged complete source records and retained fast identity and policy.
+    /// Missing quality or corrupt required artifacts never become fallback.
+    /// No inference, model reload, file mutation or publication occurs here.
+    ///
+    /// The result is only a candidate. Installation still compares this exact
+    /// predecessor pin, so an intervening source update cannot be overwritten.
+    /// Existing queries retain their original fast-only snapshot.
+    ///
+    /// # Errors
+    /// Refuses existing quality, non-newer generations, provider/input drift,
+    /// source or storage mismatches, invalid receipts/artifacts and cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_quality_completion_selected(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path> + Send,
+        generation: ArtifactGenerationIdentityV1,
+        expected: &GenerationComponentReceiptV1,
+        quality: Arc<dyn Embedder>,
+        quality_storage: (NativeBuildPrecision, NativeBuildRetrieval),
+        limits: NativeHybridReopenLimits,
+    ) -> SearchResult<NativeHybridCandidate> {
+        checkpoint(cx, "native_ann.live.quality_completion_reopen")?;
+        let before = self.index().vectors();
+        if before.quality().is_some() {
+            return Err(invalid(
+                "live.quality_completion.topology",
+                "fast-only-required",
+                "selected quality completion requires a retained fast-only predecessor",
+            ));
+        }
+        let fast = retained_plan(before.fast())?;
+        let migration = self.begin_model_migration(
+            cx,
+            directory,
+            generation,
+            Arc::clone(&fast.embedder),
+            Some(quality),
+        )?;
+        // Recheck the identity captured by migration preparation: a changing
+        // retained provider cannot turn completion into a fast-model replacement.
+        fast.admit(&migration.builder.fast.identity)?;
+        migration
+            .with_fast_storage(fast.precision, fast.retrieval)
+            .with_quality_storage(quality_storage.0, quality_storage.1)?
+            .open_selected(cx, expected, limits)
+            .await
+    }
+
     /// Prepare an explicit complete model migration from this retained source.
     ///
     /// No inference, source cloning or filesystem writes occur here. Supply

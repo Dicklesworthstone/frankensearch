@@ -415,3 +415,370 @@ fn selected_model_upgrade_cannot_overwrite_an_intervening_source_commit() {
         );
     });
 }
+
+#[test]
+fn selected_quality_completion_repartitions_with_fast_cache_and_mixed_storage() {
+    run_test_with_cx(|cx| async move {
+        for fast_hnsw in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let fast = Arc::new(Provider::new("completion-fast", 2));
+            let cached = Arc::new(frankensearch_embed::CachedEmbedder::new(fast.clone(), 32));
+            let quality = Arc::new(Provider::new("completion-quality", 3));
+            let fast_retrieval = if fast_hnsw {
+                graph(57)
+            } else {
+                NativeBuildRetrieval::Exact
+            };
+            let quality_retrieval = if fast_hnsw {
+                NativeBuildRetrieval::Exact
+            } else {
+                graph(91)
+            };
+            let initial =
+                NativeIndexBuilder::new(root.path().join("initial"), generation(1), cached.clone())
+                    .unwrap()
+                    .with_fast_storage(NativeBuildPrecision::F16, fast_retrieval)
+                    .add_documents(sources())
+                    .build_sharded_hybrid(&cx, 2)
+                    .await
+                    .unwrap();
+            let live = NativeLiveShardedHybridIndex::new(&cx, initial).unwrap();
+            let base = live.snapshot(&cx).await.unwrap();
+            let query = "warm-only horizontal query";
+            live.search(&cx, query, 7).await.unwrap();
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+            let path = root.path().join("completed");
+            let built = base
+                .begin_quality_completion(&cx, &path, generation(2), quality.clone())
+                .unwrap()
+                .with_quality_storage(NativeBuildPrecision::F32, quality_retrieval)
+                .unwrap()
+                .build(&cx, 3)
+                .await
+                .unwrap();
+            let receipt = built.index().seal_for_reopen(&cx).unwrap();
+            drop(built);
+            fast.batches.lock().unwrap().clear();
+            quality.batches.lock().unwrap().clear();
+            let cache_before = cached.cache_stats();
+            let old_image = image(base.index().vectors().directory());
+            let target_image = image(&path);
+            assert!(
+                base.prepare_selected(
+                    &cx,
+                    &path,
+                    &receipt,
+                    NativeShardedHybridReopenLimits::default()
+                )
+                .await
+                .is_err()
+            );
+            let candidate = base
+                .prepare_quality_completion_selected(
+                    &cx,
+                    &path,
+                    generation(2),
+                    &receipt,
+                    quality.clone(),
+                    (NativeBuildPrecision::F32, quality_retrieval),
+                    NativeShardedHybridReopenLimits::default(),
+                )
+                .await
+                .unwrap();
+            let original_fast = &base.index().vectors().partitions()[0].fast;
+            assert_eq!(base.index().vectors().partitions().len(), 4);
+            assert_eq!(candidate.index().vectors().partitions().len(), 3);
+            assert_eq!(candidate.index().vectors().document_count(), 7);
+            for partition in candidate.index().vectors().partitions() {
+                assert!(Arc::ptr_eq(
+                    &original_fast.embedder,
+                    &partition.fast().embedder
+                ));
+                assert_eq!(partition.fast().precision, NativeBuildPrecision::F16);
+                assert_eq!(partition.fast().graph_receipt.is_some(), fast_hnsw);
+                assert_eq!(
+                    partition.quality().unwrap().precision,
+                    NativeBuildPrecision::F32
+                );
+                assert_eq!(
+                    partition.quality().unwrap().graph_receipt.is_some(),
+                    !fast_hnsw
+                );
+            }
+            assert_eq!(cached.cache_stats(), cache_before);
+            assert!(fast.submitted().is_empty());
+            assert!(quality.submitted().is_empty());
+            assert!(Arc::ptr_eq(
+                &base.index,
+                &live.snapshot(&cx).await.unwrap().index
+            ));
+            assert_eq!(image(&path), target_image);
+            let selected = live.install(&cx, &candidate).await.unwrap();
+            let page = live.search_refined(&cx, query, 7).await.unwrap();
+            assert_eq!(page.snapshot.generation(), generation(2));
+            assert_rows(&page.snapshot, &page.results);
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), 1);
+            assert!(cached.cache_stats().hits > cache_before.hits);
+            assert!(base.index().vectors().quality().is_none());
+            assert_eq!(image(base.index().vectors().directory()), old_image);
+            let error = selected
+                .prepare_quality_completion_selected(
+                    &cx,
+                    root.path().join("not-read"),
+                    generation(3),
+                    &receipt,
+                    quality.clone(),
+                    (NativeBuildPrecision::F32, quality_retrieval),
+                    NativeShardedHybridReopenLimits::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "native_ann.sharded_live.quality_completion.topology"));
+        }
+    });
+}
+
+#[test]
+fn selected_quality_completion_refuses_foreign_sharded_sources_and_fast_policy() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let fast = Arc::new(Provider::new("completion-fast", 2));
+        let quality = Arc::new(Provider::new("completion-quality", 3));
+        let initial =
+            NativeIndexBuilder::new(root.path().join("initial"), generation(1), fast.clone())
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F16, graph(57))
+                .add_documents(sources())
+                .build_sharded_hybrid(&cx, 2)
+                .await
+                .unwrap();
+        let live = NativeLiveShardedHybridIndex::new(&cx, initial).unwrap();
+        let base = live.snapshot(&cx).await.unwrap();
+        let old_image = image(base.index().vectors().directory());
+        for variant in [
+            "fast-model",
+            "fast-precision",
+            "fast-exact",
+            "fast-seed",
+            "quality-model",
+            "missing-quality",
+            "id",
+            "content",
+            "title",
+            "metadata",
+            "count",
+        ] {
+            let mut documents = sources();
+            let last = documents.last_mut().unwrap();
+            match variant {
+                "id" => last.id = "doc-7".to_owned(),
+                "content" => last.content = "another body".to_owned(),
+                "title" => last.title = Some("another title".to_owned()),
+                "metadata" => {
+                    last.metadata
+                        .insert("version".to_owned(), "another version".to_owned());
+                }
+                "count" => {
+                    let _ = documents.pop();
+                }
+                _ => {}
+            }
+            let target_fast = if variant == "fast-model" {
+                Arc::new(Provider::new("foreign-fast", 2))
+            } else {
+                fast.clone()
+            };
+            let target_quality = if variant == "quality-model" {
+                Arc::new(Provider::new("foreign-quality", 3))
+            } else {
+                quality.clone()
+            };
+            let precision = if variant == "fast-precision" {
+                NativeBuildPrecision::F32
+            } else {
+                NativeBuildPrecision::F16
+            };
+            let retrieval = match variant {
+                "fast-exact" => NativeBuildRetrieval::Exact,
+                "fast-seed" => graph(58),
+                _ => graph(57),
+            };
+            let path = root.path().join(variant);
+            let mut builder = NativeIndexBuilder::new(&path, generation(2), target_fast)
+                .unwrap()
+                .with_fast_storage(precision, retrieval)
+                .add_documents(documents);
+            if variant != "missing-quality" {
+                builder = builder.with_quality_embedder(target_quality).unwrap();
+            }
+            let built = builder.build_sharded_hybrid(&cx, 3).await.unwrap();
+            let receipt = built.seal_for_reopen(&cx).unwrap();
+            drop(built);
+            fast.batches.lock().unwrap().clear();
+            quality.batches.lock().unwrap().clear();
+            let outcome = base
+                .prepare_quality_completion_selected(
+                    &cx,
+                    &path,
+                    generation(2),
+                    &receipt,
+                    quality.clone(),
+                    (NativeBuildPrecision::F32, NativeBuildRetrieval::Exact),
+                    NativeShardedHybridReopenLimits::default(),
+                )
+                .await;
+            assert!(outcome.is_err(), "accepted {variant}");
+            assert!(fast.submitted().is_empty());
+            assert!(quality.submitted().is_empty());
+            assert!(Arc::ptr_eq(
+                &base.index,
+                &live.snapshot(&cx).await.unwrap().index
+            ));
+        }
+        assert_eq!(image(base.index().vectors().directory()), old_image);
+    });
+}
+
+#[test]
+fn selected_quality_completion_checks_the_last_partition_and_expected_predecessor() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let (live, fast, _) = initial(&cx, root.path(), sources(), false).await;
+        let quality = Arc::new(Provider::new("completion-quality", 3));
+        let base = live.snapshot(&cx).await.unwrap();
+        let path = root.path().join("completed");
+        let built = base
+            .begin_quality_completion(&cx, &path, generation(50), quality.clone())
+            .unwrap()
+            .with_quality_storage(NativeBuildPrecision::F32, graph(91))
+            .unwrap()
+            .build(&cx, 3)
+            .await
+            .unwrap();
+        let last = built.index().vectors().partitions().last().unwrap();
+        let quality_file = last.quality().unwrap().vector_path().to_path_buf();
+        let quality_graph = last.quality().unwrap().graph_path().unwrap().to_path_buf();
+        let receipt = built.index().seal_for_reopen(&cx).unwrap();
+        drop(built);
+        fast.batches.lock().unwrap().clear();
+        quality.batches.lock().unwrap().clear();
+        let policy = (NativeBuildPrecision::F32, graph(91));
+        let limits = NativeShardedHybridReopenLimits::default();
+        for requested in [
+            generation(1),
+            ArtifactGenerationIdentityV1::new(50, [0x60; 16]).unwrap(),
+        ] {
+            assert!(
+                base.prepare_quality_completion_selected(
+                    &cx,
+                    &path,
+                    requested,
+                    &receipt,
+                    quality.clone(),
+                    policy,
+                    limits,
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut limited = limits;
+        limited.vectors.max_shards = 1;
+        assert!(
+            base.prepare_quality_completion_selected(
+                &cx,
+                &path,
+                generation(50),
+                &receipt,
+                quality.clone(),
+                policy,
+                limited,
+            )
+            .await
+            .is_err()
+        );
+        fast.changed.store(true, Ordering::SeqCst);
+        let drift = base
+            .prepare_quality_completion_selected(
+                &cx,
+                &path,
+                generation(50),
+                &receipt,
+                quality.clone(),
+                policy,
+                limits,
+            )
+            .await;
+        fast.changed.store(false, Ordering::SeqCst);
+        assert!(drift.is_err());
+        cx.set_cancel_requested(true);
+        let cancelled = base
+            .prepare_quality_completion_selected(
+                &cx,
+                &path,
+                generation(50),
+                &receipt,
+                quality.clone(),
+                policy,
+                limits,
+            )
+            .await;
+        cx.set_cancel_requested(false);
+        assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+        for file in [&quality_file, &quality_graph] {
+            let original = fs::read(file).unwrap();
+            let mut damaged = original.clone();
+            *damaged.last_mut().unwrap() ^= 1;
+            fs::write(file, damaged).unwrap();
+            let outcome = base
+                .prepare_quality_completion_selected(
+                    &cx,
+                    &path,
+                    generation(50),
+                    &receipt,
+                    quality.clone(),
+                    policy,
+                    limits,
+                )
+                .await;
+            fs::write(file, original).unwrap();
+            assert!(outcome.is_err());
+        }
+        assert_no_inference(&fast, &quality);
+        assert!(Arc::ptr_eq(
+            &base.index,
+            &live.snapshot(&cx).await.unwrap().index
+        ));
+        let pending = base.prepare_quality_completion_selected(
+            &cx,
+            &path,
+            generation(50),
+            &receipt,
+            quality.clone(),
+            policy,
+            limits,
+        );
+        let source_update = base
+            .begin_update(&cx, root.path().join("source-edit"), generation(2))
+            .unwrap()
+            .delete_document("doc-6")
+            .build(&cx, 2)
+            .await
+            .unwrap();
+        let edited = live.install(&cx, &source_update).await.unwrap();
+        let candidate = pending.await.unwrap();
+        let error = live.install(&cx, &candidate).await.unwrap_err();
+        assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+            if field == "native_ann.sharded_live.expected_current"));
+        assert!(Arc::ptr_eq(
+            &edited.index,
+            &live.snapshot(&cx).await.unwrap().index
+        ));
+        assert!(edited.index().vectors().document("doc-6").is_none());
+        assert!(base.index().vectors().document("doc-6").is_some());
+        assert!(base.index().vectors().quality().is_none());
+        assert_no_inference(&fast, &quality);
+    });
+}

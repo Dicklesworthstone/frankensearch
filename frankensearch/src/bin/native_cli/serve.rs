@@ -108,7 +108,8 @@ impl Controls {
 
 impl SessionControls {
     /// Apply the startup query-cache policy to models loaded by later migrations.
-    /// Existing warm caches are never transferred across a model replacement.
+    /// Quality completion retains the fast cache and wraps only its new quality
+    /// provider; replaced models receive independent caches.
     pub(super) fn with_query_cache(mut self, cache: crate::query_cache::Config) -> Self {
         if let Some(authority) = self.migration.take() {
             self.migration = Some(authority.with_query_cache(cache));
@@ -420,6 +421,8 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
         "updates_enabled": controls.controls.updates,
         "model_migration_enabled": controls.migration.is_some(),
         "model_migration_supported": true,
+        "quality_completion_enabled": controls.migration.is_some(),
+        "quality_completion_supported": true,
         "update_max_mutations": warm_update::MAX_MUTATIONS,
         "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),

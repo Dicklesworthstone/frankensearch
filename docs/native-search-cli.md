@@ -2254,7 +2254,7 @@ inert partial files can remain. A failure or cancellation during or after receip
 persistence can leave a complete new receipt, so inspect that destination before
 retrying with fresh paths. Completion never rewrites an existing receipt or
 activates a running server. Open the new receipt with both matching models to use
-quality or full search.
+quality or full search, or adopt it through the explicit warm control below.
 
 Library consumers can call `begin_quality_completion` on `NativeBuiltIndex`,
 `NativeBuiltHybridIndex`, `NativeBuiltShardedIndex`, or
@@ -2264,6 +2264,59 @@ while keeping the fast producer and source content fixed. Live hybrid snapshots
 also expose a completion builder; their completed candidates install through
 the existing exact-predecessor check, so a stale completion cannot displace an
 intervening activation.
+
+### Adopt completed quality in an ordinary or sharded warm server
+
+A fast-only `serve` session can adopt the sealed successor from `complete-quality`
+without restarting or reloading its fast model. Grant this control at startup:
+
+```sh
+./target/release/frankensearch-native serve \
+  --receipt ./native-receipts/fast-g1.json \
+  --model-dir /absolute/path/to/installed/models \
+  --allow-model-migration
+```
+
+After building and saving the completion receipt separately, send:
+
+```json
+{"op":"activate_quality_completion","id":"add-quality","receipt":"/absolute/native-receipts/full-g2.json","expected_generation":{"schema_version":1,"sequence":1,"nonce":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]},"model_dir":"/absolute/path/to/installed/models","quality_exact":false}
+```
+
+Copy `expected_generation`, including its nonce, from the session's current
+ready, query or status frame; the example identity is illustrative. `receipt`
+and `model_dir` must be absolute. `model_dir` is required even with an explicit
+native quality backend; add `quality_backend` and `quality_model_dir` to select
+that local producer. No model is downloaded. The required `quality_exact` field
+must match the sealed quality tier: `true` for F32 exact retrieval built with
+`--quality-exact`, or `false` for the default F32 native HNSW configuration and
+seed 42. The fast tier keeps its existing precision, retrieval parameters and
+seed independently.
+
+The successor must be newer, use the same ordinary or sharded layout, and retain
+every source ID, body, title and metadata field. Sharded partition boundaries may
+change. An existing quality tier, changed fast producer, incompatible quality
+input contract, damaged artifacts or a stale expected generation refuses the
+request. Only the new quality model is loaded and wrapped with the session's
+query-cache policy; the actual fast model and its warm query cache are retained.
+Candidate installation checks the exact original serving snapshot, so a source
+update or another activation that wins during admission is preserved.
+
+The ready frame reports `quality_completion_enabled` and
+`quality_completion_supported`. Success emits one `terminal` frame with
+`operation: "activate_quality_completion"`, `status: "complete"`,
+`selection_changed: true`, both generation identities and the admitted per-tier
+retrieval facts. Subsequent full requests run both Initial and Refined phases,
+and direct quality search becomes available. Old retained readers keep their
+fast-only cohort. Failure before installation retains the serving selection;
+failed acknowledgement delivery does not undo an installation.
+
+This control admits and installs existing artifacts. It performs no document
+inference, file writes or durable publication; process restart still uses the
+explicit startup receipt. Library callers can prepare the same candidate through
+`NativeHybridSnapshot::prepare_quality_completion_selected` or
+`NativeShardedSnapshot::prepare_quality_completion_selected`, then use the
+existing exact-predecessor `install` operation.
 
 ## Recover a damaged native index by rebuilding its selected sources
 

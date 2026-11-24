@@ -91,7 +91,7 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--lexical-only (no model options, --mode, or reranking)]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
          [--allow-activation] [--allow-updates] [--filter JSON] [--timeout-ms N]\n\
-         [--allow-model-migration (explicit sealed replacement models)]\n\
+         [--allow-model-migration (sealed model replacement or quality completion)]\n\
          [--reranker-dir DIR] [--rerank-window N]\n\
          [--query-cache-entries N (0..1024 per model, default 0)]\n\
          [--lexical-only (fixed snapshot; no models or write controls)]\n\n\

@@ -16,6 +16,7 @@ use super::{NativeShardedCandidate, NativeShardedSnapshot};
 use crate::native_ann::builder::sharded::{
     MAX_NATIVE_BUILD_SHARDS, NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits,
 };
+use crate::native_ann::builder::update::{admit_retained_policy, retained_plan};
 use crate::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltTier, NativeIndexBuilder, TierPlan,
 };
@@ -73,6 +74,78 @@ pub struct NativeLiveShardedMigration {
 }
 
 impl NativeShardedSnapshot {
+    /// Admit a selected quality completion while sharing the retained fast model.
+    ///
+    /// Every predecessor partition must be fast-only and have the same admitted
+    /// fast producer, precision and graph policy. Those settings and the actual
+    /// fast provider, including its warm query cache, are inherited internally.
+    /// Only the new quality provider and its precision/retrieval policy are
+    /// supplied by the caller. Selected partition boundaries may differ.
+    ///
+    /// Supply the original trusted hybrid receipt for `directory`. The existing
+    /// bounded reader admits every partition, graph, source and global Quill
+    /// image, then requires the exact requested generation and every original
+    /// source field. Each successor fast tier must preserve the inherited
+    /// identity and policy, and every quality tier must match the explicit plan.
+    /// There is no inference, model reload, file mutation or publication.
+    ///
+    /// The complete result still uses the exact-predecessor installation fence.
+    /// A source update selected while admission runs makes this candidate stale;
+    /// old queries keep their original partition owners and physical row maps.
+    ///
+    /// # Errors
+    /// Refuses existing quality, non-newer generations, provider/input drift,
+    /// mixed policies, changed source, invalid/missing artifacts and cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_quality_completion_selected(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path> + Send,
+        generation: ArtifactGenerationIdentityV1,
+        expected: &GenerationComponentReceiptV1,
+        quality: Arc<dyn Embedder>,
+        quality_storage: (NativeBuildPrecision, NativeBuildRetrieval),
+        limits: NativeShardedHybridReopenLimits,
+    ) -> SearchResult<NativeShardedCandidate> {
+        checkpoint(cx, "native_ann.sharded_live.quality_completion_reopen")?;
+        let partitions = self.index().vectors().partitions();
+        let first = partitions.first().ok_or_else(|| {
+            invalid(
+                "sharded_live.quality_completion.topology",
+                "empty",
+                "selected completion requires an identity-bearing predecessor partition",
+            )
+        })?;
+        if partitions
+            .iter()
+            .any(|partition| partition.quality().is_some())
+        {
+            return Err(invalid(
+                "sharded_live.quality_completion.topology",
+                "fast-only-required",
+                "selected quality completion requires a complete fast-only inventory",
+            ));
+        }
+        let fast = retained_plan(first.fast())?;
+        for partition in partitions {
+            checkpoint(cx, "native_ann.sharded_live.quality_completion_policy")?;
+            admit_retained_policy(&fast, partition.fast())?;
+        }
+        let migration = self.begin_model_migration(
+            cx,
+            directory,
+            generation,
+            Arc::clone(&fast.embedder),
+            Some(quality),
+        )?;
+        fast.admit(&migration.builder.fast.identity)?;
+        migration
+            .with_fast_storage(fast.precision, fast.retrieval)
+            .with_quality_storage(quality_storage.0, quality_storage.1)?
+            .open_selected(cx, expected, limits)
+            .await
+    }
+
     /// Freeze replacement providers against this snapshot without starting work.
     ///
     /// `None` explicitly requests a fast-only target; it is not permission to

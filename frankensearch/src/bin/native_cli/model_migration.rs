@@ -1,16 +1,19 @@
-//! Explicit model replacement in a warm native stdio session.
+//! Explicit model replacement and quality completion in a warm native session.
 //!
 //! Read only the controller's original sealed selection, load explicitly named
 //! local models, and delegate all source/identity/policy joins to the native
 //! migration API. Ordinary activation still forbids model changes. This control
 //! does not rebuild, write receipts, switch durable authority, or grant GC.
 
+use std::sync::Arc;
+
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
-use frankensearch::SearchError;
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 use frankensearch::native_ann::builder::live::NativeHybridSnapshot;
 use frankensearch::native_ann::builder::sharded::NativeShardedHybridReopenLimits;
 use frankensearch::native_ann::builder::sharded::live::NativeShardedSnapshot;
+use frankensearch::{Embedder, SearchError};
+use frankensearch_core::generation::EmbedderTierTag;
 
 use super::validate_id;
 use crate::{
@@ -20,6 +23,8 @@ use crate::{
 };
 
 type Loader = dyn Fn(&Cx, &Path, bool, &models::QualityOptions) -> Result<Models> + Send + Sync;
+type QualityLoader =
+    dyn Fn(&Cx, &Path, &models::QualityOptions) -> Result<Arc<dyn Embedder>> + Send + Sync;
 
 /// Constructed only by a startup grant. The loader is the same local-only,
 /// verified loader used by the executable's index/search/rebuild commands.
@@ -27,13 +32,30 @@ type Loader = dyn Fn(&Cx, &Path, bool, &models::QualityOptions) -> Result<Models
 /// actual control loop with synthetic providers, not downloaded model assets.
 pub(super) struct Authority {
     load: Box<Loader>,
+    load_quality: Box<QualityLoader>,
 }
 
 impl Authority {
     pub(super) fn local(pool: Option<BlockingPoolHandle>) -> Self {
+        let migration_pool = pool.clone();
         Self {
             load: Box::new(move |cx, directory, quality, options| {
-                models::load(cx, Some(directory), quality, options, pool.clone())
+                models::load(
+                    cx,
+                    Some(directory),
+                    quality,
+                    options,
+                    migration_pool.clone(),
+                )
+            }),
+            load_quality: Box::new(move |cx, directory, options| {
+                models::load_single(
+                    cx,
+                    Some(directory),
+                    EmbedderTierTag::Quality,
+                    options,
+                    pool.clone(),
+                )
             }),
         }
     }
@@ -42,13 +64,19 @@ impl Authority {
         if !cache.enabled() {
             return self;
         }
-        let load = self.load;
+        let Self { load, load_quality } = self;
         Self {
             load: Box::new(move |cx, directory, quality, options| {
                 checkpoint(cx)?;
                 let outcome = load(cx, directory, quality, options);
                 checkpoint(cx)?;
                 cache.wrap(cx, outcome?)
+            }),
+            load_quality: Box::new(move |cx, directory, options| {
+                checkpoint(cx)?;
+                let outcome = load_quality(cx, directory, options);
+                checkpoint(cx)?;
+                cache.wrap_embedder(cx, outcome?)
             }),
         }
     }
@@ -68,12 +96,31 @@ pub(super) enum Request {
         // Match the original CLI rebuild's --exact policy (F32 in both tiers).
         exact: bool,
     },
+    ActivateQualityCompletion {
+        id: Option<String>,
+        expected_generation: ArtifactGenerationIdentityV1,
+        receipt: PathBuf,
+        model_dir: PathBuf,
+        quality_backend: Option<String>,
+        quality_model_dir: Option<PathBuf>,
+        // Fast storage remains exactly as retained by the serving snapshot.
+        // This independently selects the completed quality tier's F32 policy.
+        quality_exact: bool,
+    },
 }
 
 impl Request {
     fn id(&self) -> Option<&str> {
-        let Self::ActivateModelMigration { id, .. } = self;
+        let (Self::ActivateModelMigration { id, .. } | Self::ActivateQualityCompletion { id, .. }) =
+            self;
         id.as_deref()
+    }
+
+    const fn operation(&self) -> &'static str {
+        match self {
+            Self::ActivateModelMigration { .. } => "activate_model_migration",
+            Self::ActivateQualityCompletion { .. } => "activate_quality_completion",
+        }
     }
 }
 
@@ -125,7 +172,10 @@ fn select(
         quality_model_dir,
         exact,
         ..
-    } = request;
+    } = request
+    else {
+        return Err(bad("model migration requires its explicit request"));
+    };
     checkpoint(cx)?;
     expected_generation.validate()?;
     if *expected_generation != base.generation() {
@@ -180,6 +230,164 @@ fn select(
         selection,
         models,
         retrieval,
+    })
+}
+
+struct SelectedCompletion {
+    selection: Selection,
+    quality: Arc<dyn Embedder>,
+    retrieval: NativeBuildRetrieval,
+}
+
+fn select_completion(
+    base: cohort::Index<'_>,
+    cx: &Cx,
+    request: &Request,
+    authority: &Authority,
+) -> Result<SelectedCompletion> {
+    let Request::ActivateQualityCompletion {
+        expected_generation,
+        receipt,
+        model_dir,
+        quality_backend,
+        quality_model_dir,
+        quality_exact,
+        ..
+    } = request
+    else {
+        return Err(bad("quality completion requires its explicit request"));
+    };
+    checkpoint(cx)?;
+    expected_generation.validate()?;
+    if *expected_generation != base.generation() {
+        return Err(bad(
+            "expected_generation does not match the serving snapshot; no models or receipt read",
+        ));
+    }
+    if base.has_quality() {
+        return Err(bad(
+            "quality completion requires a fast-only serving snapshot",
+        ));
+    }
+    validate_path(receipt)?;
+    validate_path(model_dir)?;
+    if let Some(path) = quality_model_dir {
+        validate_path(path)?;
+    }
+    let options = models::QualityOptions {
+        backend: quality_backend
+            .as_deref()
+            .map(models::QualityBackend::parse)
+            .transpose()?,
+        directory: quality_model_dir.clone(),
+    };
+    options.validate_usage(true)?;
+    let outcome = Selection::read(receipt);
+    checkpoint(cx)?;
+    let selection = outcome?;
+    let schema = match base {
+        cohort::Index::Single(_) => SELECTION_SCHEMA,
+        cohort::Index::Sharded(_) => sharded::SELECTION_SCHEMA,
+    };
+    if selection.schema != schema
+        || selection.documents != base.document_count()
+        || selection.generation.sequence <= base.generation().sequence
+        || selection.quality_producer.is_none()
+    {
+        return Err(bad(
+            "quality completion requires a strictly newer same-layout two-tier selection of the entire retained source cohort",
+        ));
+    }
+    let producers = base.producers();
+    checkpoint(cx)?;
+    let (fast_producer, _) = producers?;
+    if selection.fast_producer != fast_producer {
+        return Err(bad(
+            "quality completion must retain the serving fast producer",
+        ));
+    }
+    // Load only quality. The native selected-completion operation retains the
+    // actual fast provider Arc, including its existing warm query cache.
+    let outcome = (authority.load_quality)(cx, model_dir, &options);
+    checkpoint(cx)?;
+    let quality = outcome?;
+    let fingerprint = quality.identity().map(|identity| identity.fingerprint());
+    checkpoint(cx)?;
+    let fingerprint = fingerprint?;
+    if selection.quality_producer.as_ref() != Some(&fingerprint) {
+        return Err(bad(
+            "quality completion requires the selected independent quality producer",
+        ));
+    }
+    let retrieval = if *quality_exact {
+        NativeBuildRetrieval::Exact
+    } else {
+        NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 42,
+        }
+    };
+    Ok(SelectedCompletion {
+        selection,
+        quality,
+        retrieval,
+    })
+}
+
+async fn prepare_completion(
+    base: &live::Snapshot,
+    cx: &Cx,
+    request: &Request,
+    authority: &Authority,
+) -> Result<Prepared> {
+    let SelectedCompletion {
+        selection,
+        quality,
+        retrieval,
+    } = select_completion(base.index(), cx, request, authority)?;
+    let expected = GenerationComponentReceiptV1 {
+        byte_len: selection.snapshot.byte_len,
+        sha256: selection.snapshot.sha256,
+    };
+    let storage = (NativeBuildPrecision::F32, retrieval);
+    let candidate = match base {
+        live::Snapshot::Single(base) => {
+            let mut limits = NativeHybridReopenLimits::default();
+            limits.vectors.max_documents = MAX_DOCUMENTS;
+            live::Candidate::Single(
+                Box::pin(base.prepare_quality_completion_selected(
+                    cx,
+                    &selection.directory,
+                    selection.generation,
+                    &expected,
+                    quality,
+                    storage,
+                    limits,
+                ))
+                .await?,
+            )
+        }
+        live::Snapshot::Sharded(base) => {
+            let mut limits = NativeShardedHybridReopenLimits::default();
+            limits.vectors.max_documents = MAX_DOCUMENTS;
+            live::Candidate::Sharded(
+                Box::pin(base.prepare_quality_completion_selected(
+                    cx,
+                    &selection.directory,
+                    selection.generation,
+                    &expected,
+                    quality,
+                    storage,
+                    limits,
+                ))
+                .await?,
+            )
+        }
+    };
+    checkpoint(cx)?;
+    Ok(Prepared {
+        candidate,
+        selection,
     })
 }
 
@@ -281,9 +489,14 @@ pub(super) async fn execute<W: Write>(
         })?;
         let base = live.snapshot(cx).await?;
         previous = Some(base.generation());
-        let prepared = match &base {
-            live::Snapshot::Single(base) => prepare(base, cx, request, authority).await?,
-            live::Snapshot::Sharded(base) => prepare_sharded(base, cx, request, authority).await?,
+        let prepared = match request {
+            Request::ActivateQualityCompletion { .. } => {
+                prepare_completion(&base, cx, request, authority).await?
+            }
+            Request::ActivateModelMigration { .. } => match &base {
+                live::Snapshot::Single(base) => prepare(base, cx, request, authority).await?,
+                live::Snapshot::Sharded(base) => prepare_sharded(base, cx, request, authority).await?,
+            },
         };
         // Exact original predecessor Arc, not a new snapshot after loading.
         // All fallible model/receipt checks precede this atomic operation.
@@ -296,6 +509,8 @@ pub(super) async fn execute<W: Write>(
             "quality": prepared.selection.quality_producer.is_some(),
             "fast_producer": prepared.selection.fast_producer,
             "quality_producer": prepared.selection.quality_producer,
+            "fast_native_hnsw": installed.index().all_native_hnsw(false),
+            "quality_native_hnsw": installed.index().all_native_hnsw(true),
         });
         installed.index().annotate(&mut payload);
         Ok(payload)
@@ -315,7 +530,7 @@ pub(super) async fn execute<W: Write>(
     };
     payload["schema"] = serde_json::json!(SCHEMA);
     payload["event"] = serde_json::json!("terminal");
-    payload["operation"] = serde_json::json!("activate_model_migration");
+    payload["operation"] = serde_json::json!(request.operation());
     payload["request"] = serde_json::json!(ordinal);
     payload["id"] = serde_json::json!(request.id().filter(|id| validate_id(Some(id)).is_ok()));
     payload["seq"] = serde_json::json!(0);

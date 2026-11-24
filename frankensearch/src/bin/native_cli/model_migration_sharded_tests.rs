@@ -174,11 +174,32 @@ fn frames(bytes: &[u8]) -> Vec<serde_json::Value> {
 
 fn authority(models: Models, loads: Arc<AtomicUsize>) -> Authority {
     Authority {
+        load_quality: Box::new(|_, _, _| panic!("migration must use its complete model loader")),
         load: Box::new(move |_, path, quality, _| {
             assert_eq!(path, Path::new("/explicit/replacement/models"));
             assert_eq!(quality, models.quality.is_some());
             loads.fetch_add(1, Ordering::SeqCst);
             Ok(models.clone())
+        }),
+    }
+}
+
+fn completion_request(receipt: &Path, quality_exact: bool) -> serde_json::Value {
+    serde_json::json!({
+        "op": "activate_quality_completion", "id": "completion",
+        "expected_generation": generation(1), "receipt": receipt,
+        "model_dir": "/explicit/quality/models", "quality_exact": quality_exact,
+    })
+}
+
+fn quality_authority(quality: Arc<Provider>, loads: Arc<AtomicUsize>) -> Authority {
+    Authority {
+        load: Box::new(|_, _, _, _| panic!("completion must not reload the fast model")),
+        load_quality: Box::new(move |_, path, options| {
+            assert_eq!(path, Path::new("/explicit/quality/models"));
+            assert!(options.backend.is_none());
+            loads.fetch_add(1, Ordering::SeqCst);
+            Ok(quality.clone())
         }),
     }
 }
@@ -197,6 +218,307 @@ async fn response(
     let mut frames = frames(&output);
     assert_eq!(frames.len(), 1);
     frames.pop().unwrap()
+}
+
+#[test]
+fn warm_sharded_quality_completion_repartitions_with_retained_fast_cache_and_mixed_policies() {
+    run_test_with_cx(|cx| async move {
+        for fast_exact in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let fast = Provider::new("retained-fast", 2);
+            let quality = Provider::new("completion-quality", 3);
+            let cache = crate::query_cache::Config::parse("8").unwrap();
+            let cached_fast = cache.wrap_embedder(&cx, fast.clone()).unwrap();
+            let (built, _) = sealed(
+                &cx,
+                &root.path().join("old"),
+                1,
+                Models {
+                    fast: cached_fast,
+                    quality: None,
+                },
+                documents(),
+                fast_exact,
+                1,
+            )
+            .await;
+            let quality_policy = if fast_exact {
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 42,
+                }
+            } else {
+                NativeBuildRetrieval::Exact
+            };
+            let completed = built
+                .begin_quality_completion(
+                    &cx,
+                    root.path().join("full"),
+                    generation(2),
+                    quality.clone(),
+                )
+                .unwrap()
+                .with_quality_storage(NativeBuildPrecision::F32, quality_policy)
+                .unwrap()
+                .build_sharded_hybrid(&cx, 2)
+                .await
+                .unwrap();
+            let selection = update::seal_selection(&cx, (&completed).into()).unwrap();
+            let receipt = root.path().join("full.json");
+            save_selection(&selection, &receipt).unwrap();
+            drop(completed);
+            let live = NativeLiveShardedHybridIndex::new(&cx, built).unwrap();
+            let old = live.snapshot(&cx).await.unwrap();
+            let loads = Arc::new(AtomicUsize::new(0));
+            let controls = SessionControls {
+                controls: Controls::default(),
+                migration: Some(quality_authority(quality.clone(), loads.clone())),
+            }
+            .with_query_cache(cache);
+            let mut reader = input(&[
+                serde_json::json!({"id":"before", "query":"vertical", "mode":"fast"}),
+                completion_request(&receipt, !fast_exact),
+                serde_json::json!({"id":"after", "query":"vertical", "mode":"full"}),
+                serde_json::json!({"id":"again", "query":"vertical", "mode":"full"}),
+                serde_json::json!({"op":"status", "id":"status"}),
+            ]);
+            let scope = filter::Filter::parse(r#"{"ids":["b"]}"#).unwrap();
+            let mut output = Vec::new();
+            run_with_controls(
+                &live,
+                &cx,
+                &mut reader,
+                &mut output,
+                (crate::Mode::Full, 3),
+                controls,
+                Some(&scope),
+                &query::Policy::new(&cx, None).unwrap(),
+            )
+            .await
+            .unwrap();
+            let output = frames(&output);
+            assert_eq!(output[0]["quality_completion_enabled"], true);
+            assert_eq!(output[0]["quality_completion_supported"], true);
+            assert_eq!(output[0]["partitions"], 3);
+            let ack = output
+                .iter()
+                .find(|frame| frame["id"] == "completion")
+                .unwrap();
+            assert_eq!(ack["operation"], "activate_quality_completion");
+            assert_eq!(ack["ok"], true);
+            assert_eq!(ack["selection_changed"], true);
+            assert_eq!(ack["layout"], "sharded");
+            assert_eq!(ack["partitions"], 2);
+            assert_eq!(ack["fast_native_hnsw"], !fast_exact);
+            assert_eq!(ack["quality_native_hnsw"], fast_exact);
+            assert_eq!(ack["generation"], serde_json::json!(generation(2)));
+            for id in ["after", "again"] {
+                let pages: Vec<_> = output
+                    .iter()
+                    .filter(|frame| frame["id"] == id && frame["event"] == "results")
+                    .collect();
+                assert_eq!(pages.len(), 2);
+                assert!(pages.iter().any(|page| page["phase"] == "initial"));
+                assert!(pages.iter().any(|page| page["phase"] == "refined"));
+                for page in pages {
+                    assert_eq!(page["generation"], serde_json::json!(generation(2)));
+                    assert_eq!(page["results"].as_array().unwrap().len(), 1);
+                    assert_eq!(page["results"][0]["doc_id"], "b");
+                    assert_eq!(page["results"][0]["metadata"]["scope"], "keep");
+                    assert_eq!(page["results"][0]["fast_row"]["shard"], 0);
+                    if page["phase"] == "refined" {
+                        assert_eq!(page["results"][0]["quality_row"]["shard"], 0);
+                    }
+                }
+            }
+            assert_eq!(loads.load(Ordering::SeqCst), 1);
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), 1);
+            assert_eq!(fast.documents.load(Ordering::SeqCst), 3);
+            assert_eq!(quality.documents.load(Ordering::SeqCst), 3);
+            let current = live.snapshot(&cx).await.unwrap();
+            for partition in current.index().vectors().partitions() {
+                assert!(std::ptr::eq(
+                    old.index().vectors().partitions()[0].fast().embedder(),
+                    partition.fast().embedder(),
+                ));
+            }
+            assert_eq!(old.index().vectors().partitions().len(), 3);
+            assert!(old.index().vectors().quality().is_none());
+            assert_eq!(old.generation(), generation(1));
+        }
+    });
+}
+
+#[test]
+fn sharded_quality_completion_rejects_wrong_policy_and_a_missing_last_quality_graph() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let fast = Provider::new("retained-fast", 2);
+        let quality = Provider::new("completion-quality", 3);
+        let (built, _) = sealed(
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast: fast.clone(),
+                quality: None,
+            },
+            documents(),
+            true,
+            2,
+        )
+        .await;
+        let completed = built
+            .begin_quality_completion(
+                &cx,
+                root.path().join("full"),
+                generation(2),
+                quality.clone(),
+            )
+            .unwrap()
+            .with_quality_storage(
+                NativeBuildPrecision::F32,
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 42,
+                },
+            )
+            .unwrap()
+            .build_sharded_hybrid(&cx, 1)
+            .await
+            .unwrap();
+        let selection = update::seal_selection(&cx, (&completed).into()).unwrap();
+        let receipt = root.path().join("full.json");
+        save_selection(&selection, &receipt).unwrap();
+        let missing = completed
+            .vectors()
+            .partitions()
+            .last()
+            .unwrap()
+            .quality()
+            .unwrap()
+            .graph_path()
+            .unwrap()
+            .to_path_buf();
+        let live = NativeLiveShardedHybridIndex::new(&cx, built).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let authority = quality_authority(quality.clone(), loads.clone());
+        let denied = response(
+            &live,
+            &cx,
+            completion_request(&receipt, true),
+            Some(&authority),
+        )
+        .await;
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["selection_changed"], false);
+        assert!(std::ptr::eq(
+            old.index(),
+            live.snapshot(&cx).await.unwrap().index()
+        ));
+        fs::rename(&missing, root.path().join("missing-quality-graph")).unwrap();
+        drop(completed);
+        let denied = response(
+            &live,
+            &cx,
+            completion_request(&receipt, false),
+            Some(&authority),
+        )
+        .await;
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["selection_changed"], false);
+        assert!(std::ptr::eq(
+            old.index(),
+            live.snapshot(&cx).await.unwrap().index()
+        ));
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(fast.documents.load(Ordering::SeqCst), 3);
+        assert_eq!(quality.documents.load(Ordering::SeqCst), 3);
+    });
+}
+
+#[test]
+fn sharded_quality_completion_keeps_its_original_base_when_a_source_update_wins() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let fast = Provider::new("retained-fast", 2);
+        let quality = Provider::new("completion-quality", 3);
+        let (built, _) = sealed(
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast,
+                quality: None,
+            },
+            documents(),
+            true,
+            1,
+        )
+        .await;
+        let completed = built
+            .begin_quality_completion(
+                &cx,
+                root.path().join("full"),
+                generation(9),
+                quality.clone(),
+            )
+            .unwrap()
+            .build_sharded_hybrid(&cx, 2)
+            .await
+            .unwrap();
+        let selection = update::seal_selection(&cx, (&completed).into()).unwrap();
+        let receipt = root.path().join("full.json");
+        save_selection(&selection, &receipt).unwrap();
+        drop(completed);
+        let live = Arc::new(NativeLiveShardedHybridIndex::new(&cx, built).unwrap());
+        let old = live.snapshot(&cx).await.unwrap();
+        let winner = Arc::new(
+            old.begin_update(&cx, root.path().join("winner"), generation(2))
+                .unwrap()
+                .upsert_document(IndexableDocument::new("winner", "fresh source"))
+                .build(&cx, 2)
+                .await
+                .unwrap(),
+        );
+        let competing = Arc::clone(&live);
+        let loaded = quality.clone();
+        let authority = Authority {
+            load: Box::new(|_, _, _, _| panic!("completion must not reload fast")),
+            load_quality: Box::new(move |cx, _, _| {
+                let mut install = Box::pin(competing.install(cx, &winner));
+                let Poll::Ready(Ok(installed)) = install
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("uncontended source update must finish");
+                };
+                assert_eq!(installed.generation(), generation(2));
+                Ok(loaded.clone())
+            }),
+        };
+        let denied = response(
+            &live,
+            &cx,
+            completion_request(&receipt, true),
+            Some(&authority),
+        )
+        .await;
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["selection_changed"], false);
+        let current = live.snapshot(&cx).await.unwrap();
+        assert_eq!(current.generation(), generation(2));
+        assert_eq!(current.index().vectors().document_count(), 4);
+        assert!(current.index().vectors().quality().is_none());
+        assert_eq!(old.generation(), generation(1));
+        assert_eq!(old.index().vectors().document_count(), 3);
+        assert_eq!(quality.documents.load(Ordering::SeqCst), 3);
+        assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+    });
 }
 
 #[test]
@@ -364,6 +686,7 @@ fn permissions_stale_generation_and_foreign_layout_refuse_before_model_loading()
         let live = NativeLiveShardedHybridIndex::new(&cx, built).unwrap();
         let pin = live.snapshot(&cx).await.unwrap();
         let denied = Authority {
+            load_quality: Box::new(|_, _, _| panic!("must not load quality")),
             load: Box::new(|_, _, _, _| panic!("must not load models")),
         };
         let missing = root.path().join("missing.json");
@@ -589,6 +912,9 @@ fn concurrent_source_update_beats_a_higher_sequence_model_migration() {
         drop(candidate);
         let competing = live.clone();
         let load = Authority {
+            load_quality: Box::new(|_, _, _| {
+                panic!("migration must use its complete model loader")
+            }),
             load: Box::new(move |cx, _, _, _| {
                 let mut install = Box::pin(competing.install(cx, &winner));
                 let Poll::Ready(Ok(installed)) = install
@@ -668,6 +994,9 @@ fn cancelled_loading_preserves_selection_and_offline_old_models_do_not_block_mig
         for success in [false, true] {
             let models = models.clone();
             let load = Authority {
+                load_quality: Box::new(|_, _, _| {
+                    panic!("migration must use its complete model loader")
+                }),
                 load: Box::new(move |cx, _, _, _| {
                     cx.set_cancel_requested(true);
                     if success {

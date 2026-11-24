@@ -2271,7 +2271,10 @@ fn authority_reuse_fingerprint(
     Ok(None)
 }
 
-fn admit_retained_policy(reference: &TierPlan, tier: &NativeBuiltTier) -> SearchResult<()> {
+pub(super) fn admit_retained_policy(
+    reference: &TierPlan,
+    tier: &NativeBuiltTier,
+) -> SearchResult<()> {
     let actual = retained_plan(tier)?;
     reference.admit(&actual.identity)?;
     let same_retrieval = match (reference.retrieval, actual.retrieval) {
@@ -2298,7 +2301,7 @@ fn admit_retained_policy(reference: &TierPlan, tier: &NativeBuiltTier) -> Search
     Ok(())
 }
 
-fn retained_plan(tier: &NativeBuiltTier) -> SearchResult<TierPlan> {
+pub(super) fn retained_plan(tier: &NativeBuiltTier) -> SearchResult<TierPlan> {
     let mut plan = TierPlan::new(Arc::clone(&tier.embedder))?;
     plan.admit(&tier.producer_identity)?;
     plan.precision = tier.precision;
