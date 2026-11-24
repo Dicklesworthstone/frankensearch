@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use asupersync::Cx;
@@ -225,6 +226,10 @@ impl CompleteGenerationStore {
     /// even when the selected generation is corrupt. Engine/producer admission
     /// remains the caller's responsibility, as with `active`.
     ///
+    /// Read-only inspection requires an existing reader pin for this generation.
+    /// A legacy store without one must be admitted by its owner before an
+    /// inspection-only reader can safely retain it against collection.
+    ///
     /// # Errors
     /// Returns invalid-identity, missing/changed-artifact, I/O or cancellation errors.
     pub fn open_retained(
@@ -251,7 +256,7 @@ impl CompleteGenerationStore {
         // Pin before admission: a retention pass that already removed this
         // generation leaves nothing to admit, and one that has not yet can no
         // longer remove it.
-        let pin = pin_generation(&self.root, id)?;
+        let pin = self.pin_retained_reader(id)?;
         let bytes =
             read_bounded_regular(&path.join(COMPLETE_GENERATION_MANIFEST), MAX_MANIFEST_BYTES)?;
         if digest(&bytes) != manifest_sha256 {
@@ -281,6 +286,21 @@ impl CompleteGenerationStore {
             manifest_sha256: manifest_sha256.to_owned(),
             _pin: pin,
         })
+    }
+
+    fn pin_retained_reader(&self, id: &str) -> SearchResult<Option<Arc<super::GenerationPin>>> {
+        #[cfg(unix)]
+        if self.security_profile()
+            == frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored
+        {
+            // The profile applies even to a store this user owns. Opening with
+            // create before falling back to read-only would mutate older stores.
+            let file = super::open_existing_pin_read_only(&self.root, id)?;
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
+                .map_err(io::Error::from)?;
+            return Ok(Some(Arc::new(super::GenerationPin { _file: file })));
+        }
+        pin_generation(&self.root, id)
     }
 
     /// Prepare an intentional rollback or repair of a damaged/missing selection.
@@ -1024,6 +1044,62 @@ mod receipt_durability_tests {
                     .count(),
                 2
             );
+        });
+    }
+
+    #[test]
+    fn read_only_retained_inspection_never_creates_missing_reader_pins() {
+        use crate::generation_store::{READER_PINS, pin_name};
+        use frankensearch_core::GenerationRootSecurityProfileV1;
+
+        run_test_with_cx(|cx| async move {
+            for missing_directory in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path();
+                let cooperative = CompleteGenerationStore::create(&cx, root).unwrap();
+                let read_only = CompleteGenerationStore::open_with_profile(
+                    &cx,
+                    root,
+                    GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+                )
+                .unwrap();
+                let pins = root.join(READER_PINS);
+                assert!(read_only.active(&cx).unwrap().is_none());
+                assert!(!pins.exists());
+
+                let target = publish(&cooperative, &cx, b"legacy bytes");
+                let id = target.id().to_owned();
+                let digest = target.manifest_sha256().to_owned();
+                drop(target);
+                let pointer = format!("{POINTER_MAGIC}\n{id}\n{digest}\n");
+                fs::write(root.join(COMPLETE_GENERATION_POINTER), &pointer).unwrap();
+                let pin = pins.join(pin_name(&id));
+                let missing = if missing_directory { &pins } else { &pin };
+                fs::rename(missing, root.join("saved-pin")).unwrap();
+
+                for error in [
+                    read_only.active(&cx).unwrap_err(),
+                    read_only.open_retained(&cx, &id, &digest).unwrap_err(),
+                ] {
+                    assert!(matches!(error, SearchError::Io(source)
+                        if source.kind() == ErrorKind::NotFound));
+                }
+                assert!(!missing.exists());
+                assert_eq!(
+                    fs::read_to_string(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    pointer
+                );
+
+                // A cooperative owner can establish the legacy pin. The same
+                // read-only handle now holds it against ordinary collection.
+                drop(cooperative.active(&cx).unwrap().unwrap());
+                let reader = read_only.active(&cx).unwrap().unwrap();
+                drop(publish(&cooperative, &cx, b"successor"));
+                let report = cooperative.collect_retained(&cx, 0).unwrap();
+                assert_eq!(report.pinned, std::slice::from_ref(&id));
+                drop(reader);
+                assert_eq!(cooperative.collect_retained(&cx, 0).unwrap().removed, [id]);
+            }
         });
     }
 
