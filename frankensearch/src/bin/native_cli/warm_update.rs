@@ -11,8 +11,8 @@ use super::NativeLiveHybridIndex;
 use super::validate_id;
 use crate::{
     ArtifactGenerationIdentityV1, Cx, Deserialize, DocumentInput, Path, PathBuf, Result, SCHEMA,
-    Selection, Write, bad, emit, fs, live, new_generation, new_path, query, save_selection, sharded,
-    update,
+    Selection, Write, bad, emit, fs, live, new_generation, new_path, query, save_selection,
+    sharded, update,
 };
 
 pub(super) const MAX_MUTATIONS: usize = 1_000;
@@ -60,7 +60,9 @@ impl UpdateInput {
             }
             (None, Some(documents)) => {
                 if documents.len() > MAX_MUTATIONS {
-                    return Err(bad("a replacement inventory may contain at most 1000 documents"));
+                    return Err(bad(
+                        "a replacement inventory may contain at most 1000 documents",
+                    ));
                 }
                 let mut ids = std::collections::BTreeSet::new();
                 let mut edits = update::Edits::new();
@@ -72,7 +74,9 @@ impl UpdateInput {
                 update::remove_omitted_documents(cx, base.index(), &mut edits)?;
                 Ok(edits)
             }
-            _ => Err(bad("an update requires exactly one changes or documents array")),
+            _ => Err(bad(
+                "an update requires exactly one changes or documents array",
+            )),
         }
     }
 }

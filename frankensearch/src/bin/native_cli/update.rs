@@ -120,7 +120,11 @@ pub fn read_update_input(reader: &mut impl BufRead, replace_source: bool) -> Res
 
 /// Convert a complete inventory into changes against exactly this retained
 /// predecessor. In particular, an empty inventory removes all previous IDs.
-pub fn remove_omitted_documents(cx: &Cx, index: cohort::Index<'_>, edits: &mut Edits) -> Result<()> {
+pub fn remove_omitted_documents(
+    cx: &Cx,
+    index: cohort::Index<'_>,
+    edits: &mut Edits,
+) -> Result<()> {
     for document in cohort_documents(index) {
         update_checkpoint(cx)?;
         edits.entry(document.id.clone()).or_insert(None);

@@ -342,7 +342,8 @@ fn warm_replacement_inventory_requires_write_permission_and_an_unambiguous_valid
         ]);
         let mut oversized = empty.clone();
         oversized["documents"] = serde_json::json!(vec![
-            serde_json::json!({"id":"document", "content":"body"}); MAX_MUTATIONS + 1
+            serde_json::json!({"id":"document", "content":"body"});
+            MAX_MUTATIONS + 1
         ]);
         let mut stale = empty.clone();
         stale["expected_generation"] =

@@ -3498,7 +3498,8 @@ impl TantivyIndex {
         for hit in search_result.hits {
             let doc = load_doc(&searcher, hit.doc_address)?;
 
-            let doc_id = Self::stored_document_id(&doc, self.fields.id, hit.doc_address)?.to_owned();
+            let doc_id =
+                Self::stored_document_id(&doc, self.fields.id, hit.doc_address)?.to_owned();
 
             let metadata = stored_metadata(&doc, self.fields)?;
 
@@ -3798,7 +3799,7 @@ impl TantivyIndex {
     /// # Errors
     ///
     /// Returns `SearchError` if a stored live document cannot be loaded, has no
-    /// stored string ID, or its metadata payload is malformed.
+    /// stored string ID or content, or its title or metadata payload is malformed.
     pub fn all_documents(&self) -> SearchResult<Vec<IndexableDocument>> {
         let searcher = self.reader.searcher();
         let mut documents = std::collections::BTreeMap::new();
@@ -3819,27 +3820,35 @@ impl TantivyIndex {
                 let content = doc
                     .get_first(self.fields.content)
                     .and_then(|value| value.as_str())
-                    .unwrap_or_default()
+                    .ok_or_else(|| SearchError::SubsystemError {
+                        subsystem: "tantivy.shadow_export",
+                        source: "live Tantivy document has no stored string content".into(),
+                    })?
                     .to_owned();
-                let title = doc
-                    .get_first(self.fields.title)
-                    .and_then(|value| value.as_str())
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned);
-                let metadata = doc
-                    .get_first(self.fields.metadata_json)
-                    .and_then(|value| value.as_str())
-                    .map_or_else(
-                        || Ok(std::collections::HashMap::new()),
-                        |json| {
-                            serde_json::from_str(json).map_err(|error| {
-                                SearchError::SubsystemError {
-                                    subsystem: "tantivy.shadow_export",
-                                    source: Box::new(error),
-                                }
-                            })
-                        },
-                    )?;
+                let title = match doc.get_first(self.fields.title) {
+                    None => None,
+                    Some(value) => {
+                        let title = value.as_str().ok_or_else(|| SearchError::SubsystemError {
+                            subsystem: "tantivy.shadow_export",
+                            source: "live Tantivy title is not a stored string".into(),
+                        })?;
+                        (!title.is_empty()).then(|| title.to_owned())
+                    }
+                };
+                let metadata = match doc.get_first(self.fields.metadata_json) {
+                    None => HashMap::new(),
+                    Some(value) => {
+                        let json = value.as_str().ok_or_else(|| SearchError::SubsystemError {
+                            subsystem: "tantivy.shadow_export",
+                            source: "live Tantivy metadata is not a stored string".into(),
+                        })?;
+                        serde_json::from_str(json).map_err(|_| SearchError::SubsystemError {
+                            subsystem: "tantivy.shadow_export",
+                            source: "live Tantivy metadata is not a JSON object of string values"
+                                .into(),
+                        })?
+                    }
+                };
                 documents.insert(
                     id.to_owned(),
                     IndexableDocument {
@@ -7274,6 +7283,97 @@ mod tests {
                 if include_known {
                     assert_eq!(exported[0].id, "retained");
                 }
+            });
+        }
+    }
+
+    #[test]
+    fn reopened_shadow_export_refuses_damaged_source_and_keeps_valid_empty_content() {
+        for fault in [
+            "missing-content",
+            "wrong-content-type",
+            "wrong-title-type",
+            "wrong-metadata-type",
+            "invalid-json",
+            "non-string-metadata",
+        ] {
+            run_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().expect("source fixture");
+                let index = TantivyIndex::create(dir.path()).expect("create");
+                let rich = IndexableDocument::new("rich", "original source café")
+                    .with_title("source title")
+                    .with_metadata("kind", "retained");
+                index
+                    .index_document(&cx, &rich)
+                    .await
+                    .expect("index valid source");
+                let mut empty = TantivyDocument::default();
+                empty.add_text(index.fields.id, "empty");
+                empty.add_text(index.fields.content, "");
+                // Older rows can omit the optional title and metadata fields.
+                let mut damaged = TantivyDocument::default();
+                damaged.add_text(index.fields.id, "private-source-id");
+                match fault {
+                    "missing-content" => {}
+                    "wrong-content-type" => damaged.add_u64(index.fields.content, 17),
+                    _ => damaged.add_text(index.fields.content, "private-source-content"),
+                }
+                if fault == "wrong-title-type" {
+                    damaged.add_u64(index.fields.title, 23);
+                }
+                match fault {
+                    "wrong-metadata-type" => damaged.add_u64(index.fields.metadata_json, 19),
+                    "invalid-json" => {
+                        damaged.add_text(index.fields.metadata_json, "private-malformed-json");
+                    }
+                    "non-string-metadata" => {
+                        damaged.add_text(index.fields.metadata_json, r#"{"private-key":7}"#);
+                    }
+                    _ => {}
+                }
+                {
+                    let writer = index.writer.lock(&cx).await.expect("writer lock");
+                    let writer = writer.as_ref().expect("writable fixture");
+                    writer.add_document(empty).expect("valid empty source");
+                    writer
+                        .add_document(damaged)
+                        .expect("persist malformed source");
+                }
+                index.commit(&cx).await.expect("publish source");
+                drop(index);
+
+                let index = TantivyIndex::open_read_only(dir.path()).expect("reopen source");
+                assert_eq!(index.doc_count().unwrap(), 3);
+                let error = index.all_documents().expect_err(fault);
+                assert!(matches!(
+                    error,
+                    SearchError::SubsystemError {
+                        subsystem: "tantivy.shadow_export",
+                        ..
+                    }
+                ));
+                let diagnostic = format!("{error:?}");
+                assert!(!diagnostic.contains("private-"), "{diagnostic}");
+                drop(index);
+
+                // A deleted malformed row is no longer part of the source inventory.
+                let index = TantivyIndex::open(dir.path()).expect("reopen writer");
+                index
+                    .delete_document(&cx, "private-source-id")
+                    .await
+                    .unwrap();
+                drop(index);
+                let index = TantivyIndex::open_read_only(dir.path()).expect("reopen live source");
+                let exported = index.all_documents().expect("remaining source");
+                assert_eq!(exported.len(), 2);
+                assert_eq!(exported[0].id, "empty");
+                assert_eq!(exported[0].content, "");
+                assert!(exported[0].title.is_none());
+                assert!(exported[0].metadata.is_empty());
+                assert_eq!(
+                    serde_json::to_value(&exported[1]).unwrap(),
+                    serde_json::to_value(&rich).unwrap()
+                );
             });
         }
     }

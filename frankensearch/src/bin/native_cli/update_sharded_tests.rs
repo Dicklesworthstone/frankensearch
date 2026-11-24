@@ -334,10 +334,15 @@ fn replacement_inventory_updates_single_and_sharded_selections_from_a_rescan() {
             let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(report["edited_ids"], 6); // three supplied plus three omitted
             let selected = Selection::read(options.new_receipt.as_ref().unwrap()).unwrap();
-            let next = sharded::Opened::open(&cx, &selected, f.models()).await.unwrap();
+            let next = sharded::Opened::open(&cx, &selected, f.models())
+                .await
+                .unwrap();
             let documents = cohort_documents(next.borrow()).collect::<Vec<_>>();
             assert_eq!(
-                documents.iter().map(|doc| doc.id.as_str()).collect::<Vec<_>>(),
+                documents
+                    .iter()
+                    .map(|doc| doc.id.as_str())
+                    .collect::<Vec<_>>(),
                 ["a", "fresh", "z"]
             );
             assert_eq!(documents[2].title.as_deref(), Some("revised"));
