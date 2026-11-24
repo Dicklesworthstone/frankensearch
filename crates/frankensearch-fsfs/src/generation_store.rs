@@ -1127,8 +1127,11 @@ impl CompleteGenerationStore {
         for generation in plan.reclaimable {
             checkpoint(cx)?;
             lease.fence("complete-generation retention removal")?;
-            // Readers pin only sealed generations; an abandoned build has none.
-            let exclusive = if generation.sealed {
+            // A reader can outlive damage to its generation's manifest. Honor
+            // its existing pin even if the inventory now looks unsealed. A
+            // never-published build without a pin needs no pin namespace.
+            let pin_path = self.root.join(READER_PINS).join(pin_name(&generation.id));
+            let exclusive = if generation.sealed || !entry_is_absent(&pin_path)? {
                 match exclusive_pin(&self.root, &generation.id)? {
                     Some(pin) => Some(pin),
                     None => {
@@ -1143,7 +1146,7 @@ impl CompleteGenerationStore {
             require_directory(&path)?;
             fs::remove_dir_all(&path)?;
             if exclusive.is_some() {
-                match fs::remove_file(self.root.join(READER_PINS).join(pin_name(&generation.id))) {
+                match fs::remove_file(pin_path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
@@ -2373,6 +2376,7 @@ mod tests {
             assert!(store.active(&cx).unwrap().is_none());
             assert_eq!(store.collect_retained(&cx, 0).unwrap().removed, [abandoned]);
             assert!(generation_names(root.path()).is_empty());
+            assert!(!root.path().join(READER_PINS).exists());
         });
     }
 
@@ -3236,6 +3240,40 @@ mod tests {
             let report = store.collect_retained(&cx, 0).unwrap();
             assert_eq!(report.removed, [pinned]);
             assert!(report.pinned.is_empty());
+        });
+    }
+
+    #[test]
+    fn retention_preserves_a_pinned_generation_after_its_manifest_is_lost() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "reader still needs these bytes"));
+            let reader = store.active(&cx).unwrap().unwrap();
+            let id = reader.id().to_owned();
+            let pin_path = root.path().join(READER_PINS).join(pin_name(&id));
+            drop(publish(&store, &cx, "predecessor"));
+            let current = publish(&store, &cx, "current");
+            fs::rename(
+                reader.path().join(COMPLETE_GENERATION_MANIFEST),
+                root.path().join("saved-manifest"),
+            )
+            .unwrap();
+
+            let report = store.collect_retained(&cx, RETAINED_PREDECESSORS).unwrap();
+            assert!(report.removed.is_empty());
+            assert_eq!(report.pinned, std::slice::from_ref(&id));
+            assert!(pin_path.is_file());
+            assert_eq!(
+                fs::read_to_string(reader.path().join("content.txt")).unwrap(),
+                "reader still needs these bytes"
+            );
+            drop(reader);
+            let report = store.collect_retained(&cx, RETAINED_PREDECESSORS).unwrap();
+            assert_eq!(report.removed, [id]);
+            assert!(report.pinned.is_empty());
+            assert!(!pin_path.exists());
+            assert_eq!(store.active(&cx).unwrap(), Some(current));
         });
     }
 
