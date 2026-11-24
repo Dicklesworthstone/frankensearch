@@ -284,9 +284,10 @@ its default remains fast. Source fetch, lexical search, publication-attempt
 recovery, and retained rollback use the complete admitted source. Partial sources
 support subset-preserving `authority-update` and granted warm updates, plus graph
 repair with `authority-repair --reuse-vectors` when both vector owners still
-authenticate. Rebuild, source-only repair, and ordinary model activation still
-refuse partial sources. These operations require a separate policy for changing
-the subset or reconstructing it after vector loss.
+authenticate. `authority-rebuild --retained-source` can change retrieval policy
+or, with `--migrate-model`, either producer while preserving the source and exact
+quality subset. Fresh-input rebuild, source-only repair, and ordinary warm model
+activation still refuse partial sources.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
 A warm partial server can adopt that completed generation through the explicit
@@ -302,6 +303,10 @@ For edits, `begin_partial_quality_update` returns a restricted
 `build(&cx, source, max_image_bytes)` preserves the surviving covered IDs.
 `partial_quality_document_ids(&cx)` exposes those authenticated IDs without
 exporting document content or loading models.
+`begin_partial_quality_model_migration` returns the same restricted plan with
+explicit permission to replace either independently identified producer. The
+unchanged tier reuses its vectors; changed quality inference covers only the
+retained subset. Each producer must preserve its own prepared-input contract.
 
 ### Rerank an individual authority tier
 
@@ -460,8 +465,10 @@ stable throughout the build; a changed tier never adopts its predecessor's vecto
 To rebuild the selected generation's existing documents, supply
 `--retained-source`. This reads the complete stored cohort from its already
 admitted vector and Quill images, preserves the exact source checkpoint, and
-builds a complete successor. Ordinary retained-source rebuilds re-embed every
-live document; explicitly authorized model migrations can reuse unchanged tiers.
+builds a complete successor. Ordinary single-tier and full retained-source
+rebuilds re-embed every live document; explicitly authorized model migrations can
+reuse unchanged tiers. Partial retained-source rebuilds always reuse eligible
+unchanged vectors and preserve the exact quality subset.
 Original JSONL files and build work directories are unnecessary. For example,
 this rebuild retains the documents while changing retrieval to HNSW:
 
@@ -494,10 +501,23 @@ continues to reject changed producers. The predecessor remains pinned and
 searchable throughout; failed inference, cancellation, or a competing publisher
 does not replace it with a partial migration.
 
+Partial generations use `begin_partial_quality_model_migration` and the restricted
+`NativePartialQualityUpdate::build` finalizer. The CLI supports this through the
+same `--retained-source --migrate-model` options. A changed fast producer embeds
+every source document; a changed quality producer embeds only the previously
+covered IDs. Neither a model change nor a graph-policy change expands coverage.
+The source checkpoint, complete stored documents, exact lexical image, and
+covered-ID set stay fixed. Publication authenticates the candidate vector owners
+and compares their actual membership before staging; equal coverage counts are
+insufficient. Partial fresh-input rebuilds and the `--query` recovery executor
+remain unsupported and refuse before model loading. Use explicit completion to
+move to full coverage, or the ordinary partial update operation to change source.
+
 Retained documents are already prepared input. This route may change producers
 and vector spaces, but must preserve each tier's complete input-preparation
-contract. To change canonicalization or document encoding, supply a complete
-freshly prepared corpus with `--input` instead. Both tiers are checked before
+contract. For a complete generation, changing canonicalization or document
+encoding requires a complete freshly prepared corpus with `--input` instead.
+Both tiers are checked before
 either begins inference or creates the new work directory.
 `--input`, `--source-low`, and `--source-high` are excluded in retained-source
 mode; it neither reads standard input nor assigns a new source checkpoint.

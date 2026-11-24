@@ -3796,11 +3796,656 @@ mod qualified_rollback {
             });
         }
 
+        mod model_migration {
+            use super::updates::{admit_root, publish_partial};
+            use super::*;
+            use std::sync::atomic::AtomicBool;
+
+            struct ReplacementProvider {
+                inner: ProgressiveProvider,
+                identity: EmbeddingIdentityBundleV1,
+                drifted_identity: EmbeddingIdentityBundleV1,
+                drifted: AtomicBool,
+                fault: u8,
+                calls: AtomicUsize,
+            }
+
+            impl ReplacementProvider {
+                fn new(previous: &ProgressiveProvider, wider: bool) -> Self {
+                    let mut identity = previous.identity.clone();
+                    identity
+                        .producer
+                        .implementation_revision
+                        .push_str("-replacement");
+                    if wider {
+                        identity.space.dimension += 2;
+                        identity.storage.dimension = identity.space.dimension;
+                        identity.producer.golden_vectors.dimension = identity.space.dimension;
+                    }
+                    let mut provider = Self {
+                        inner: ProgressiveProvider::new(previous.quality),
+                        drifted_identity: identity.clone(),
+                        identity,
+                        drifted: AtomicBool::new(false),
+                        fault: 0,
+                        calls: AtomicUsize::new(0),
+                    };
+                    provider.refresh_identity();
+                    provider
+                }
+
+                fn refresh_identity(&mut self) {
+                    self.identity.space.input_contract_fingerprint =
+                        self.identity.input.fingerprint();
+                    self.identity.producer.space_fingerprint = self.identity.space.fingerprint();
+                    self.identity.validate().unwrap();
+                    self.drifted_identity = self.identity.clone();
+                    self.drifted_identity
+                        .producer
+                        .implementation_revision
+                        .push_str("-drifted");
+                    self.drifted_identity.validate().unwrap();
+                }
+            }
+
+            impl Embedder for ReplacementProvider {
+                fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        // Equal-dimensional replacements deliberately return
+                        // identical values. Producer drift still forbids reuse.
+                        let mut vector = self.inner.embed(cx, text).await?;
+                        vector.resize(self.dimension(), 0.0);
+                        match self.fault {
+                            1 => self.drifted.store(true, Ordering::SeqCst),
+                            2 => {
+                                cx.set_cancel_requested(true);
+                            }
+                            _ => {}
+                        }
+                        Ok(vector)
+                    })
+                }
+
+                fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                    Ok(if self.drifted.load(Ordering::SeqCst) {
+                        &self.drifted_identity
+                    } else {
+                        &self.identity
+                    })
+                }
+
+                fn dimension(&self) -> usize {
+                    usize::try_from(self.identity.space.dimension).unwrap()
+                }
+
+                fn id(&self) -> &str {
+                    &self.identity.space.logical_model_id
+                }
+
+                fn model_name(&self) -> &str {
+                    self.id()
+                }
+
+                fn is_semantic(&self) -> bool {
+                    true
+                }
+
+                fn category(&self) -> ModelCategory {
+                    ModelCategory::TransformerEmbedder
+                }
+            }
+
+            #[test]
+            fn partial_model_migration_reuses_each_unchanged_tier_and_preserves_exact_coverage() {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    for (change_fast, change_quality, wider) in [
+                        (false, false, false),
+                        (true, false, false),
+                        (false, true, false),
+                        (true, true, false),
+                        (true, true, true),
+                    ] {
+                        let fixture = fixture_with_quality_input(&cx, true).await;
+                        let retained = &fixture.snapshot;
+                        let old_fast = vector_bits(&retained.readers.vector);
+                        let old_quality = vector_bits(retained.readers.quality.as_ref().unwrap());
+                        let lexical = retained
+                            .retained_snapshot()
+                            .closure()
+                            .bytes(GenerationComponentRole::Lexical)
+                            .unwrap();
+                        let replacement_fast =
+                            Arc::new(ReplacementProvider::new(&fixture.fast, wider));
+                        let replacement_quality =
+                            Arc::new(ReplacementProvider::new(&fixture.quality, wider));
+                        let fast: Arc<dyn Embedder> = if change_fast {
+                            replacement_fast.clone()
+                        } else {
+                            fixture.fast.clone()
+                        };
+                        let quality: Arc<dyn Embedder> = if change_quality {
+                            replacement_quality.clone()
+                        } else {
+                            fixture.quality.clone()
+                        };
+                        let root_path = fixture.parent.join("root");
+                        let authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                        let plan = retained
+                            .begin_partial_quality_model_migration(
+                                &cx,
+                                fixture.parent.join("migrated"),
+                                ArtifactGenerationIdentityV1::new(8, [0xc1; 16]).unwrap(),
+                                fast.clone(),
+                                quality.clone(),
+                                BUDGET,
+                            )
+                            .unwrap()
+                            .with_batch_size(1)
+                            .unwrap();
+                        fs::rename(
+                            fixture.parent.join("source"),
+                            fixture.parent.join("unavailable-source"),
+                        )
+                        .unwrap();
+                        let built = plan
+                            .build(&cx, retained.metadata().commit_range.clone(), BUDGET)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            replacement_fast.calls.load(Ordering::SeqCst),
+                            if change_fast { 4 } else { 0 }
+                        );
+                        assert_eq!(
+                            replacement_quality.calls.load(Ordering::SeqCst),
+                            if change_quality { 2 } else { 0 }
+                        );
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(built.coverage(), VectorCohortCoverage::PartialQuality);
+                        assert_eq!(built.binding().dimension(), fast.dimension());
+                        assert_eq!(
+                            built.quality_binding().unwrap().dimension(),
+                            quality.dimension()
+                        );
+                        assert_eq!(
+                            built.binding().frozen_identity()
+                                == &retained.metadata().embedders["fast"],
+                            !change_fast
+                        );
+                        assert_eq!(
+                            built.quality_binding().unwrap().frozen_identity()
+                                == &retained.metadata().embedders["quality"],
+                            !change_quality
+                        );
+                        assert_eq!(
+                            built.binding().frozen_identity().identity.input,
+                            retained.metadata().embedders["fast"].identity.input
+                        );
+                        assert_eq!(
+                            built
+                                .quality_binding()
+                                .unwrap()
+                                .frozen_identity()
+                                .identity
+                                .input,
+                            retained.metadata().embedders["quality"].identity.input
+                        );
+                        assert_eq!(
+                            built.component_bytes(GenerationComponentRole::Lexical),
+                            Some(lexical)
+                        );
+                        assert_eq!(
+                            built.metadata().commit_range,
+                            retained.metadata().commit_range
+                        );
+                        assert_progressive_policy(built.retrieval_configuration(), true, false);
+                        assert_progressive_policy(
+                            built.quality_retrieval_configuration().unwrap(),
+                            true,
+                            true,
+                        );
+                        let candidate = built
+                            .candidate(
+                                [0xc2; 16],
+                                Some(retained.authority()),
+                                GenerationAuthorityActionV1::Activate,
+                                [0xc3; 32],
+                            )
+                            .unwrap();
+                        let preview = built.preview_candidate(&cx, &candidate).unwrap();
+                        assert_eq!(
+                            preview.partial_quality_document_ids(&cx).unwrap(),
+                            ["b", "e"].map(str::to_owned)
+                        );
+                        if !wider {
+                            assert_eq!(vector_bits(&preview.readers.vector), old_fast);
+                            assert_eq!(
+                                vector_bits(preview.readers.quality.as_ref().unwrap()),
+                                old_quality
+                            );
+                        }
+                        assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
+                        let root = admit_root(&root_path);
+                        let published = publish_partial(&cx, &root, &built, retained, 0xc4);
+                        let fresh_root = admit_root(&root_path);
+                        let SnapshotOpenOutcomeV1::Opened(opened) = fresh_root
+                            .open_generation_snapshot_with_budget(
+                                ROOT_ID,
+                                PROFILE,
+                                None,
+                                BUDGET as u64,
+                            )
+                            .unwrap()
+                        else {
+                            panic!("the migrated partial generation must reopen")
+                        };
+                        let reopened = NativeGenerationSnapshot::admit_partial_quality(
+                            &cx,
+                            opened,
+                            built.binding(),
+                            built.quality_binding().unwrap(),
+                            DEFAULT_SCHEMA,
+                            config(),
+                            BUDGET,
+                        )
+                        .unwrap();
+                        assert_eq!(reopened.authority(), published.authority());
+                        assert_eq!(reopened.topology(), retained.topology());
+                        assert_eq!(
+                            reopened.partial_quality_document_ids(&cx).unwrap(),
+                            ["b", "e"].map(str::to_owned)
+                        );
+                        let hits = reopened
+                            .search_progressive_with_partial_quality(
+                                &cx,
+                                fast.as_ref(),
+                                quality.as_ref(),
+                                "unmatched",
+                                4,
+                            )
+                            .unwrap()
+                            .collect()
+                            .await
+                            .unwrap();
+                        assert_eq!(hits.len(), 4);
+                        for hit in &hits {
+                            assert_eq!(
+                                hit.quality_score.is_some(),
+                                matches!(hit.doc_id.as_str(), "b" | "e")
+                            );
+                        }
+                        if change_fast || change_quality {
+                            let stale_models = match reopened
+                                .search_progressive_with_partial_quality(
+                                    &cx,
+                                    fixture.fast.as_ref(),
+                                    fixture.quality.as_ref(),
+                                    "unmatched",
+                                    4,
+                                ) {
+                                Ok(search) => search.collect().await,
+                                Err(error) => Err(error),
+                            };
+                            assert!(stale_models.is_err());
+                        }
+                        let old_hits = retained
+                            .search_progressive_with_partial_quality(
+                                &cx,
+                                fixture.fast.as_ref(),
+                                fixture.quality.as_ref(),
+                                "unmatched",
+                                4,
+                            )
+                            .unwrap()
+                            .collect()
+                            .await
+                            .unwrap();
+                        assert_eq!(old_hits.len(), 4);
+                        assert_eq!(vector_bits(&retained.readers.vector), old_fast);
+                        assert_eq!(
+                            vector_bits(retained.readers.quality.as_ref().unwrap()),
+                            old_quality
+                        );
+                    }
+                });
+            }
+
+            #[test]
+            fn partial_model_migration_edits_keep_uncovered_ids_fast_only_and_fence_stale_publication()
+             {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let fixture = fixture_with_quality_input(&cx, true).await;
+                    let retained = &fixture.snapshot;
+                    let quality = Arc::new(ReplacementProvider::new(&fixture.quality, false));
+                    let built = retained
+                        .begin_partial_quality_model_migration(
+                            &cx,
+                            fixture.parent.join("migrated-edits"),
+                            ArtifactGenerationIdentityV1::new(8, [0xc5; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .delete_document("e")
+                        .delete_document("c")
+                        .upsert_document(IndexableDocument::new("b", "quality-special"))
+                        .upsert_document(IndexableDocument::new("a", "fast-tail-ordinary cohort"))
+                        .upsert_document(IndexableDocument::new("n", "quality-special"))
+                        .build(&cx, CommitRange { low: 1, high: 5 }, BUDGET)
+                        .await
+                        .unwrap();
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 3);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                    let root_path = fixture.parent.join("root");
+                    let root = admit_root(&root_path);
+                    let current = publish_partial(&cx, &root, &built, retained, 0xc6);
+                    assert_eq!(
+                        current.partial_quality_document_ids(&cx).unwrap(),
+                        ["b".to_owned()]
+                    );
+                    assert_eq!(
+                        current.topology(),
+                        NativeGenerationTopology::PartialQuality {
+                            quality_documents: 1,
+                            total_documents: 3,
+                            coverage_ppm: 333_333,
+                        }
+                    );
+                    let hits = current
+                        .search_progressive_with_partial_quality(
+                            &cx,
+                            fixture.fast.as_ref(),
+                            quality.as_ref(),
+                            "unmatched",
+                            3,
+                        )
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(hits.len(), 3);
+                    for hit in hits {
+                        assert_eq!(hit.quality_score.is_some(), hit.doc_id == "b");
+                    }
+
+                    let stale = retained
+                        .begin_partial_quality_model_migration(
+                            &cx,
+                            fixture.parent.join("stale-migration"),
+                            ArtifactGenerationIdentityV1::new(9, [0xc7; 16]).unwrap(),
+                            fixture.fast.clone(),
+                            quality.clone(),
+                            BUDGET,
+                        )
+                        .unwrap()
+                        .build(&cx, retained.metadata().commit_range.clone(), BUDGET)
+                        .await
+                        .unwrap();
+                    let candidate = stale
+                        .candidate(
+                            [0xc8; 16],
+                            Some(retained.authority()),
+                            GenerationAuthorityActionV1::Activate,
+                            [0xc9; 32],
+                        )
+                        .unwrap();
+                    stage(&root, &stale, &candidate);
+                    let mut publisher =
+                        GenerationPublisherV1::new(&root, ROOT_ID, [0xca; 16], PROFILE).unwrap();
+                    let attempt = publisher
+                        .prepare_attempt(
+                            &candidate,
+                            retained.retained_snapshot().authority_pair(),
+                            [0xcb; 16],
+                            [0xcc; 16],
+                        )
+                        .unwrap();
+                    let authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                    let lock = fs::read(root_path.join("LOCK")).unwrap();
+                    let result =
+                        publisher.publish_prepared(&cx, &candidate, &attempt, None, BUDGET as u64);
+                    assert!(matches!(
+                        result,
+                        Err(crate::GenerationPublicationErrorV1::StaleExpectedAuthority)
+                            | Ok(crate::GenerationPublicationResultV1 {
+                                publication: PublicationOutcomeV1::NotCommitted(_),
+                                ..
+                            })
+                    ));
+                    assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
+                    assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock);
+                    assert_eq!(
+                        current.partial_quality_document_ids(&cx).unwrap(),
+                        ["b".to_owned()]
+                    );
+                    assert_eq!(
+                        retained.partial_quality_document_ids(&cx).unwrap(),
+                        ["b", "e"].map(str::to_owned)
+                    );
+                });
+            }
+
+            #[test]
+            fn partial_model_migration_refuses_wrong_input_and_boundary_changes_before_work() {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let fixture = fixture_with_quality_input(&cx, true).await;
+                    let retained = &fixture.snapshot;
+                    let root_path = fixture.parent.join("root");
+                    let authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                    let lock = fs::read(root_path.join("LOCK")).unwrap();
+                    for quality_changed in [false, true] {
+                        let original = if quality_changed {
+                            &fixture.quality
+                        } else {
+                            &fixture.fast
+                        };
+                        let mut changed = ReplacementProvider::new(original, false);
+                        if quality_changed {
+                            // Matching fast is insufficient: quality retains
+                            // its own independently admitted input contract.
+                            changed.identity.input = fixture.fast.identity.input.clone();
+                        } else {
+                            changed
+                                .identity
+                                .input
+                                .canonicalization
+                                .push_str("-wrong-input");
+                        }
+                        changed.refresh_identity();
+                        let changed = Arc::new(changed);
+                        let fast: Arc<dyn Embedder> = if quality_changed {
+                            fixture.fast.clone()
+                        } else {
+                            changed.clone()
+                        };
+                        let quality: Arc<dyn Embedder> = if quality_changed {
+                            changed.clone()
+                        } else {
+                            fixture.quality.clone()
+                        };
+                        let work = fixture
+                            .parent
+                            .join(format!("wrong-input-{quality_changed}"));
+                        let result = retained.begin_partial_quality_model_migration(
+                            &cx,
+                            &work,
+                            ArtifactGenerationIdentityV1::new(8, [0xcd; 16]).unwrap(),
+                            fast,
+                            quality,
+                            // Identity refusal must precede even a source
+                            // export that would exhaust this tiny budget.
+                            1,
+                        );
+                        assert!(
+                            matches!(result, Err(SearchError::InvalidConfig { field, value, .. }) if field == "native_ann.update.input" && value == "changed")
+                        );
+                        assert_eq!(changed.calls.load(Ordering::SeqCst), 0);
+                        assert!(!work.exists());
+                    }
+                    let quality = Arc::new(ReplacementProvider::new(&fixture.quality, false));
+                    let ordinary = fixture.parent.join("ordinary-migration");
+                    assert!(
+                        retained
+                            .begin_partial_quality_update(
+                                &cx,
+                                &ordinary,
+                                ArtifactGenerationIdentityV1::new(8, [0xce; 16]).unwrap(),
+                                fixture.fast.clone(),
+                                quality.clone(),
+                                BUDGET,
+                            )
+                            .is_err()
+                    );
+                    assert!(
+                        retained
+                            .begin_model_migration(
+                                &cx,
+                                &ordinary,
+                                ArtifactGenerationIdentityV1::new(8, [0xcf; 16]).unwrap(),
+                                fixture.fast.clone(),
+                                Some(quality.clone()),
+                                BUDGET,
+                            )
+                            .is_err()
+                    );
+                    assert!(!ordinary.exists());
+                    for ids in [vec!["b", "e"], vec!["a", "c"]] {
+                        let work = fixture
+                            .parent
+                            .join(format!("migration-boundary-{}", ids.join("-")));
+                        let mut plan = retained
+                            .begin_partial_quality_model_migration(
+                                &cx,
+                                &work,
+                                ArtifactGenerationIdentityV1::new(8, [0xd0; 16]).unwrap(),
+                                fixture.fast.clone(),
+                                quality.clone(),
+                                BUDGET,
+                            )
+                            .unwrap();
+                        for id in ids {
+                            plan = plan.delete_document(id);
+                        }
+                        assert!(
+                            plan.build(&cx, CommitRange { low: 1, high: 5 }, BUDGET)
+                                .await
+                                .is_err()
+                        );
+                        assert!(!work.exists());
+                    }
+                    for cancel in [false, true] {
+                        let work = fixture.parent.join(format!("stopped-migration-{cancel}"));
+                        let plan = retained
+                            .begin_partial_quality_model_migration(
+                                &cx,
+                                &work,
+                                ArtifactGenerationIdentityV1::new(8, [0xd1; 16]).unwrap(),
+                                fixture.fast.clone(),
+                                quality.clone(),
+                                BUDGET,
+                            )
+                            .unwrap();
+                        if cancel {
+                            cx.set_cancel_requested(true);
+                            let result = plan
+                                .build(&cx, retained.metadata().commit_range.clone(), BUDGET)
+                                .await;
+                            cx.set_cancel_requested(false);
+                            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                        } else {
+                            drop(plan);
+                        }
+                        assert!(!work.exists());
+                    }
+                    assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
+                    assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock);
+                });
+            }
+
+            #[test]
+            fn partial_model_migration_drift_or_cancellation_preserves_the_selected_generation() {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    for (quality_changed, fault) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+                        let fixture = fixture(&cx).await;
+                        let retained = &fixture.snapshot;
+                        let original = if quality_changed {
+                            &fixture.quality
+                        } else {
+                            &fixture.fast
+                        };
+                        let mut replacement = ReplacementProvider::new(original, false);
+                        replacement.fault = fault;
+                        let replacement = Arc::new(replacement);
+                        let fast: Arc<dyn Embedder> = if quality_changed {
+                            fixture.fast.clone()
+                        } else {
+                            replacement.clone()
+                        };
+                        let quality: Arc<dyn Embedder> = if quality_changed {
+                            replacement.clone()
+                        } else {
+                            fixture.quality.clone()
+                        };
+                        let root_path = fixture.parent.join("root");
+                        let authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                        let lock = fs::read(root_path.join("LOCK")).unwrap();
+                        let result = retained
+                            .begin_partial_quality_model_migration(
+                                &cx,
+                                fixture.parent.join("failed-migration"),
+                                ArtifactGenerationIdentityV1::new(8, [0xd2; 16]).unwrap(),
+                                fast,
+                                quality,
+                                BUDGET,
+                            )
+                            .unwrap()
+                            .with_batch_size(1)
+                            .unwrap()
+                            .build(&cx, retained.metadata().commit_range.clone(), BUDGET)
+                            .await;
+                        cx.set_cancel_requested(false);
+                        assert!(result.is_err());
+                        if fault == 2 {
+                            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                        }
+                        assert_eq!(replacement.calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
+                        assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock);
+                        assert_eq!(
+                            retained.partial_quality_document_ids(&cx).unwrap(),
+                            ["b", "e"].map(str::to_owned)
+                        );
+                        let hits = retained
+                            .search_progressive_with_partial_quality(
+                                &cx,
+                                fixture.fast.as_ref(),
+                                fixture.quality.as_ref(),
+                                "unmatched",
+                                4,
+                            )
+                            .unwrap()
+                            .collect()
+                            .await
+                            .unwrap();
+                        assert_eq!(hits.len(), 4);
+                    }
+                });
+            }
+        }
+
         mod updates {
             use super::*;
             use std::sync::atomic::AtomicBool;
 
-            fn admit_root(path: &Path) -> QualifiedGenerationRoot {
+            pub(super) fn admit_root(path: &Path) -> QualifiedGenerationRoot {
                 QualifiedGenerationRoot::admit(
                     path,
                     GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1).unwrap(),
@@ -3808,7 +4453,7 @@ mod qualified_rollback {
                 .unwrap()
             }
 
-            fn publish_partial(
+            pub(super) fn publish_partial(
                 cx: &Cx,
                 root: &QualifiedGenerationRoot,
                 built: &NativeBuiltExactGeneration,

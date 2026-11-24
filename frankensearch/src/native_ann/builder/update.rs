@@ -418,6 +418,10 @@ impl NativeQualityCompletion {
 /// its own unchanged source vectors and keeps its independent storage/retrieval
 /// policy unless explicitly overridden. The complete source and original
 /// authority remain pinned until the successor passes component admission.
+/// An explicit partial model migration may replace either producer while
+/// preserving that tier's prepared-input contract. Only the changed producer's
+/// surviving members require full re-inference; ordinary updates still require
+/// both original identities.
 ///
 /// This plan exposes only partial-quality finalization. An edit that leaves an
 /// empty or fully covered source is refused before files or inference; topology
@@ -442,6 +446,59 @@ impl NativePartialQualityUpdate {
         index: Arc<NativeAnnIndex>,
         quality_index: Arc<NativeAnnIndex>,
     ) -> SearchResult<Self> {
+        Self::from_authority_with_intent(
+            cx,
+            directory,
+            generation,
+            fast_provider,
+            quality_provider,
+            snapshot,
+            max_source_bytes,
+            index,
+            quality_index,
+            AuthorityUpdateIntent::PreservePartialQuality,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn from_authority_model_migration(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        fast_provider: Arc<dyn crate::Embedder>,
+        quality_provider: Arc<dyn crate::Embedder>,
+        snapshot: &NativeGenerationSnapshot,
+        max_source_bytes: usize,
+        index: Arc<NativeAnnIndex>,
+        quality_index: Arc<NativeAnnIndex>,
+    ) -> SearchResult<Self> {
+        Self::from_authority_with_intent(
+            cx,
+            directory,
+            generation,
+            fast_provider,
+            quality_provider,
+            snapshot,
+            max_source_bytes,
+            index,
+            quality_index,
+            AuthorityUpdateIntent::MigratePartialModels,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_authority_with_intent(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        fast_provider: Arc<dyn crate::Embedder>,
+        quality_provider: Arc<dyn crate::Embedder>,
+        snapshot: &NativeGenerationSnapshot,
+        max_source_bytes: usize,
+        index: Arc<NativeAnnIndex>,
+        quality_index: Arc<NativeAnnIndex>,
+        intent: AuthorityUpdateIntent,
+    ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.partial_update.prepare")?;
         if !matches!(
             snapshot.topology(),
@@ -462,7 +519,7 @@ impl NativePartialQualityUpdate {
             max_source_bytes,
             index,
             Some((quality_provider, quality_index)),
-            AuthorityUpdateIntent::PreservePartialQuality,
+            intent,
         )?;
         Ok(Self { update })
     }
@@ -551,6 +608,8 @@ impl NativePartialQualityUpdate {
     /// Covered content changes are independently embedded in both tiers. New
     /// and uncovered content changes are embedded only in fast. No unavailable
     /// quality row is treated as a request to expand coverage.
+    /// A migrated producer re-infers all of its surviving members, even when
+    /// their content is unchanged; an unchanged producer retains normal reuse.
     ///
     /// # Errors
     /// Refuses an empty/full surviving quality subset, backward source boundaries,
@@ -610,6 +669,7 @@ enum AuthorityUpdateIntent {
     MigrateModels,
     CompleteQuality,
     PreservePartialQuality,
+    MigratePartialModels,
 }
 
 impl NativeBuiltIndex {
@@ -877,6 +937,7 @@ impl NativeIndexUpdate {
                 intent,
                 AuthorityUpdateIntent::CompleteQuality
                     | AuthorityUpdateIntent::PreservePartialQuality
+                    | AuthorityUpdateIntent::MigratePartialModels
             )
         {
             return Err(invalid(
@@ -1463,6 +1524,7 @@ impl ReuseSource {
                 matches!(
                     authority.intent,
                     AuthorityUpdateIntent::PreservePartialQuality
+                        | AuthorityUpdateIntent::MigratePartialModels
                 )
             })
             .ok_or_else(|| {
@@ -1850,7 +1912,10 @@ fn authority_reuse_fingerprint(
         index.admit_identity(&plan.identity)?;
         return Ok(Some(plan.identity.fingerprint()));
     }
-    if !matches!(intent, AuthorityUpdateIntent::MigrateModels) {
+    if !matches!(
+        intent,
+        AuthorityUpdateIntent::MigrateModels | AuthorityUpdateIntent::MigratePartialModels
+    ) {
         return Err(invalid(
             "update.producer",
             "changed",

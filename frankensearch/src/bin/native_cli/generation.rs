@@ -166,8 +166,10 @@ report quality document counts and coverage. Full-query tuning remains full-only
 Partial generations support search, fetch, serve, attempt recovery and retained\n\
 rollback. Updates preserve surviving covered IDs; new/uncovered IDs stay fast-only.\n\
 Removing all covered or all uncovered IDs refuses before model loading/staging.\n\
-Graph repair with --reuse-vectors preserves the exact subset. Rebuild, source-only\n\
-repair and ordinary model activation still refuse partial sources. Explicit quality\n\
+Graph repair with --reuse-vectors preserves the exact subset. Partial rebuilds\n\
+require --retained-source and keep the source and covered IDs; --migrate-model\n\
+permits independent producer replacement. Source-only repair, fresh-input rebuild,\n\
+rebuild --query and ordinary warm model activation still refuse partial sources. Explicit quality\n\
 completion accepts fast-only or partial sources. Warm sessions accept mode=partial.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
@@ -200,7 +202,7 @@ Updates require nonbackward source checkpoints and a new work directory/receipt.
 Use rebuild for producer or retrieval changes. Update never changes old images.\n\
 Repair explicitly admits the selected control state, metadata and complete stored\n\
 source even when vector or ANN images are damaged or missing. It needs no healthy\n\
-ancestor and never serves a partial generation. It rebuilds every stored tier\n\
+ancestor and never serves damaged images. Source-only repair rebuilds every stored tier\n\
 with the same full producer identities, precision, source checkpoint and document\n\
 fields, then publishes a complete higher-sequence Repair successor. Both repair\n\
 routes require explicit --retrieval exact or hnsw; old images remain untouched.\n\
@@ -1676,6 +1678,7 @@ fn prepare_publication(
 enum PublicationIntent {
     PreserveTopology,
     CompleteQuality,
+    RebuildPartialQuality,
 }
 
 fn prepare_publication_with_intent(
@@ -1684,9 +1687,9 @@ fn prepare_publication_with_intent(
     max_image_bytes: usize,
     intent: PublicationIntent,
 ) -> Result<PreparedPublication> {
-    if intent == PublicationIntent::CompleteQuality && predecessor.is_none() {
+    if intent != PublicationIntent::PreserveTopology && predecessor.is_none() {
         return Err(bad(
-            "quality completion requires a selected fast-only or partial-quality predecessor",
+            "explicit quality maintenance requires its selected predecessor",
         ));
     }
     let (root_id, expected, previous) = match predecessor {
@@ -1739,6 +1742,32 @@ fn prepare_publication_with_intent(
                         && built.metadata().commit_range == snapshot.metadata().commit_range
                         && built.metadata().total_documents == snapshot.metadata().total_documents
                 }
+                PublicationIntent::RebuildPartialQuality => {
+                    matches!(
+                        snapshot.topology(),
+                        NativeGenerationTopology::PartialQuality { .. }
+                    ) && built.coverage() == VectorCohortCoverage::PartialQuality
+                        && snapshot
+                            .metadata()
+                            .embedders
+                            .get("fast")
+                            .is_some_and(|previous| {
+                                previous.identity.input
+                                    == built.binding().frozen_identity().identity.input
+                            })
+                        && built.quality_binding().is_some_and(|binding| {
+                            snapshot
+                                .metadata()
+                                .embedders
+                                .get("quality")
+                                .is_some_and(|previous| {
+                                    previous.identity.input
+                                        == binding.frozen_identity().identity.input
+                                })
+                        })
+                        && built.metadata().commit_range == snapshot.metadata().commit_range
+                        && built.metadata().total_documents == snapshot.metadata().total_documents
+                }
             };
             if built.binding().generation().sequence
                 <= snapshot
@@ -1778,16 +1807,19 @@ fn prepare_publication_with_intent(
         GenerationAuthorityActionV1::Activate,
         hasher.finalize().into(),
     )?;
-    if intent == PublicationIntent::CompleteQuality {
+    if matches!(
+        intent,
+        PublicationIntent::CompleteQuality | PublicationIntent::RebuildPartialQuality
+    ) {
         let previous = predecessor
-            .ok_or_else(|| bad("quality completion requires its selected predecessor"))?
+            .ok_or_else(|| bad("quality maintenance requires its selected predecessor"))?
             .retained_snapshot()
             .manifest();
         if candidate.manifest().document_set_sha256() != previous.document_set_sha256()
             || candidate.manifest().components().lexical != previous.components().lexical
         {
             return Err(bad(
-                "quality completion must preserve the exact source cohort and lexical image",
+                "quality maintenance must preserve the exact source cohort and lexical image",
             ));
         }
     }
@@ -1800,6 +1832,29 @@ fn prepare_publication_with_intent(
         expected,
         writer,
     })
+}
+
+fn prepare_partial_quality_rebuild(
+    cx: &Cx,
+    built: &NativeBuiltExactGeneration,
+    predecessor: &NativeGenerationSnapshot,
+    max_image_bytes: usize,
+) -> Result<PreparedPublication> {
+    checkpoint(cx)?;
+    let prepared = prepare_publication_with_intent(
+        built,
+        Some(predecessor),
+        max_image_bytes,
+        PublicationIntent::RebuildPartialQuality,
+    )?;
+    // Metadata counts do not identify a covered subset. Authenticate the actual
+    // candidate vector owners before staging, then require the retained IDs.
+    let preview = built.preview_candidate(cx, &prepared.candidate)?;
+    if preview.partial_quality_document_ids(cx)? != predecessor.partial_quality_document_ids(cx)? {
+        return Err(serve_refused("partial_quality_rebuild_coverage_mismatch"));
+    }
+    checkpoint(cx)?;
+    Ok(prepared)
 }
 
 fn stage_prepared_and_publish(
@@ -2336,7 +2391,17 @@ where
             .as_deref()
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
-    selected.require_complete_for_mutation()?;
+    let partial_quality = selected.quality_documents.is_some();
+    if partial_quality {
+        if !options.retained_source {
+            return Err(serve_refused(
+                "partial_quality_rebuild_requires_retained_source",
+            ));
+        }
+        if options.query.is_some() {
+            return Err(serve_refused("partial_quality_rebuild_query_unsupported"));
+        }
+    }
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;
@@ -2389,7 +2454,11 @@ where
             None => read_documents(&mut io::stdin().lock())?,
         }
     };
-    let loaded = load_models(selected.query_mode(None)?)?;
+    let loaded = load_models(if partial_quality {
+        QueryMode::Full
+    } else {
+        selected.query_mode(None)?
+    })?;
     let expected_identity = rebuild_identity(
         &selected.identity,
         loaded.fast.as_ref(),
@@ -2422,7 +2491,46 @@ where
         }
     }
     let generation = new_generation(sequence)?;
-    let built = if options.retained_source && options.migrate_model {
+    let built = if partial_quality {
+        // No mutation or caller-supplied subset is accepted here. The restricted
+        // plan retains the source and membership from this exact predecessor.
+        drop(documents);
+        let quality = loaded.quality.as_ref().ok_or_else(|| {
+            bad("partial rebuild requires its independently supplied quality provider")
+        })?;
+        let migration = if options.migrate_model {
+            snapshot.begin_partial_quality_model_migration(
+                cx,
+                &work_path,
+                generation,
+                Arc::clone(&loaded.fast),
+                Arc::clone(quality),
+                options.max_source_bytes,
+            )?
+        } else {
+            snapshot.begin_partial_quality_update(
+                cx,
+                &work_path,
+                generation,
+                Arc::clone(&loaded.fast),
+                Arc::clone(quality),
+                options.max_source_bytes,
+            )?
+        };
+        let migration = migration
+            .with_batch_size(options.batch_size)?
+            .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
+            .with_fast_storage(rebuild_precision(&expected_identity)?, retrieval)
+            .with_quality_storage(
+                rebuild_precision(expected_quality.as_ref().ok_or_else(|| {
+                    bad("partial rebuild requires its independent quality identity")
+                })?)?,
+                quality_retrieval.ok_or_else(|| {
+                    bad("partial rebuild requires its independent quality retrieval policy")
+                })?,
+            )?;
+        Box::pin(migration.build(cx, source, options.max_image_bytes)).await?
+    } else if options.retained_source && options.migrate_model {
         // Source preflight above applies CLI record/ID bounds before loading
         // models. The update exports from the same retained reader and keeps
         // the original authority pair pinned through completion/publication.
@@ -2502,15 +2610,29 @@ where
         ))
         .await;
     }
-    let PublishedGeneration { receipt, .. } = stage_and_publish(
-        cx,
-        &root,
-        &selected.root,
-        &receipt_path,
-        &built,
-        Some(&snapshot),
-        PublicationOptions::unscoped(options.max_image_bytes),
-    )?;
+    let PublishedGeneration { receipt, .. } = if partial_quality {
+        let prepared =
+            prepare_partial_quality_rebuild(cx, &built, &snapshot, options.max_image_bytes)?;
+        stage_prepared_and_publish(
+            cx,
+            &root,
+            &selected.root,
+            &receipt_path,
+            &built,
+            prepared,
+            PublicationOptions::unscoped(options.max_image_bytes),
+        )?
+    } else {
+        stage_and_publish(
+            cx,
+            &root,
+            &selected.root,
+            &receipt_path,
+            &built,
+            Some(&snapshot),
+            PublicationOptions::unscoped(options.max_image_bytes),
+        )?
+    };
     let mut report = serde_json::json!({
         "schema": SCHEMA, "ok": true, "event": "rebuilt", "publication": "committed",
         "serving": "activated", "receipt": receipt_path,

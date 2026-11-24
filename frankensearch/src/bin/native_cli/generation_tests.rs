@@ -7603,6 +7603,10 @@ mod warm_authority {
 
 #[cfg(target_os = "linux")]
 mod progressive_authority {
+    mod partial_rebuild_tests {
+        include!("authority_partial_rebuild_tests.rs");
+    }
+
     mod timeout_tests {
         include!("authority_timeout_tests.rs");
     }
@@ -8528,9 +8532,11 @@ mod progressive_authority {
             rebuild.from_receipt = Some(options.receipt.clone());
             rebuild.work = Some(parent.join("forbidden-rebuild-work"));
             rebuild.receipt = parent.join("forbidden-rebuild.json");
+            rebuild.retained_source = false;
+            rebuild.input = Some(parent.join("unread-fresh-source.jsonl"));
             assert!(
                 rebuild_with_loader(&cx, &rebuild, &mut output, |_| {
-                    panic!("unsupported partial rebuild must refuse before model loading")
+                    panic!("fresh-input partial rebuild must refuse before model loading")
                 })
                 .await
                 .is_err()
