@@ -110,6 +110,39 @@ initial baseline extraction used the wrong working directory and scanned
 empty files; that zero-run receipt is excluded and the populated 80,493-line
 baseline was rerun and retained as `sysinfo-ubs-baseline-v2.json`.
 
+The current remote partial-quality chain (`bbd81cdb`) is merged without
+rewriting either history at `a35b1769`. Its complete stock run terminates
+with exit 1: fourteen labels pass, while hybrid Clippy, workspace tests,
+facade tests and real-model e2e fail. Preserve `dependency-stock-gate-v3.log`.
+The stronger watch handoff case passes in that run. The e2e failure is my
+omission of the required `FSFS_UPGRADE_REUSE_PREVIOUS_BINARY` input, not a
+reuse result. The retained genuine `2e2b8026` optimized executable supplies
+that input for the next run; both executable hashes remain distinct.
+
+Four strict-Clippy errors in the newly included activation test file are
+corrected by removing an inherited import and borrowing queries rather than
+cloning. One repair assertion is aligned with the flag-specific two-tier
+refusal; all model-load, no-publication and exact-byte assertions remain.
+The workspace failure is independently reproduced by first using the actual
+shadow diagnostic callsite on a thread without the capture subscriber.
+With pinned tracing 0.1.44/core 0.1.36, its single-dispatch fast path caches
+that thread's interest, losing an event from the parent capture. A separate
+minimal executable also demonstrates zero captured events with one dispatch
+and exactly one with two. The test now holds a second registration of its
+capture while exercising that same adverse first-use order. Every privacy
+exclusion, event-presence and query-length assertion remains unchanged.
+The isolated test fails before this fixture repair; the repaired full core
+cohort passes 1,239 tests with zero failures and one pre-existing ignore.
+Strict core and hybrid all-target Clippy pass; the repair case and all three
+partial-model activation cases pass. Explicit include-file rustfmt and
+workspace formatting pass. The three-file UBS scan has zero critical
+findings; six new notices concern fixture assertions, constructor/join
+expectations and shared-handle clones, reviewed without suppressions.
+The genuine two-executable reuse case passes all original controls: current
+`83d0c462` against prior `6f4070b6`, receipt `upgrade-reuse-current-focus.json`.
+This is not a production logging fix or a performance result. Full integrated
+qualification remains pending; no test deadline, ignore or gate is relaxed.
+
 The live registry census covers 67 direct external dependencies. This is
 not a completed latest-version migration: the runtime/SQLite family, TUI,
 model producer, wire-format and frozen oracle upgrades need their own

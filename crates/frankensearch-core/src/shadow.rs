@@ -1865,8 +1865,31 @@ mod tests {
         let serving = vec![result("private-shadow-document-canary", 1.0)];
         let capture = DiagnosticCapture::default();
         let cx = Cx::for_testing();
+        // tracing-core's single-dispatch fast path can cache a new callsite's
+        // interest from another thread's default subscriber. Keep a second
+        // registration alive so first use there consults this capture too.
+        let _registration_guard = tracing::Dispatch::new(capture.clone());
         tracing::subscriber::with_default(capture.clone(), || {
             tracing::callsite::rebuild_interest_cache();
+            // First-use registration can happen on a serving thread without
+            // this thread's subscriber. Exercise that order before capturing
+            // the same production callsite below.
+            let priming_shadow = shadow.clone();
+            let priming_root = temp.path().to_path_buf();
+            std::thread::spawn(move || {
+                let primer = ShadowLexicalObserver::new(
+                    priming_shadow,
+                    ShadowLexicalConfig {
+                        sample_rate_basis_points: 0,
+                        ..enabled_config(&priming_root)
+                    },
+                )
+                .expect("first-use observer");
+                primer.observe_serving_results(&Cx::for_testing(), QUERY, 1, &[], false, 1);
+                assert_eq!(primer.status().sampled_out, 1);
+            })
+            .join()
+            .expect("subscriber-less first use");
             let sampled_out = ShadowLexicalObserver::new(
                 shadow.clone(),
                 ShadowLexicalConfig {

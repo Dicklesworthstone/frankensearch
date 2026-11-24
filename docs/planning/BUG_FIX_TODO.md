@@ -8,7 +8,8 @@ release block is published or handed off with exact unmet conditions. It earns
 no capability credit. Existing qualified work below remains unchanged.
 
 - [x] Refresh origin, source/worktree state and the current dependency graph.
-  Remote source remains `c5a7464a`; preserve the shared checkout's peer edits.
+  Merge remote `bbd81cdb` without rewriting either history; the integrated
+  checkpoint is `a35b1769`. Preserve the shared checkout's peer edits.
 - [x] Recover the established six-variant inventory and current release via
   the GitHub connector and existing release checker; retain the actual profiles.
 - [x] Inspect release-host admission. The configured Apple host answers SSH
@@ -37,6 +38,12 @@ no capability credit. Existing qualified work below remains unchanged.
     - [x] Copy the cache without deletion to the separately probed volume
       with 15 TB available: rsync terminal 0, 64,572,120,354 bytes transferred.
     - [ ] Rerun the entire unchanged stock gate on the copied cache.
+      - [x] Retain the completed `a35b1769` attempt, terminal 1: fourteen
+        labels pass; hybrid Clippy, workspace tests, facade tests and real-model
+        e2e fail. The fsfs, HTTP, quickstart and lite stages pass. No skips.
+      - [x] Supply the genuine retained `2e2b8026` prior executable to the
+        two-executable test; the previous full run omitted this required input.
+      - [ ] Complete all eighteen labels on the repaired committed source.
     - [ ] Recheck actual foreground signals, both 128 MiB pressure profiles,
       and cancellation while paused under an explicit 100-per-mille load ceiling.
       This configured pressure probe cannot establish default-pressure behavior.
@@ -90,6 +97,26 @@ no capability credit. Existing qualified work below remains unchanged.
     no competitive benchmark rows, WINs, LOSEs, or performance gates change.
   - [x] Record the exact dependency change, primary sources and terminal
     results in the existing UPGRADE_LOG; preserve failed attempts.
+- [ ] Qualify the integrated partial-quality changes under the original gates.
+  - [x] Fix four strict-Clippy errors in the included activation tests: remove
+    an already inherited import and borrow the existing query without cloning.
+  - [x] Match the flag-specific two-tier refusal text in the repair test;
+    preserve its model-call, no-publication and exact-byte assertions.
+  - [x] Reproduce the privacy-capture failure with an actual subscriber-less
+    first use of the production callsite. One isolated test fails before repair.
+  - [x] Keep a second capture dispatch registered to avoid the pinned
+    tracing-core single-dispatch cache shortcut. The same first-use order and
+    every query/content exclusion, event-presence and query-length assertion
+    remain. This corrects a test fixture, not production tracing behavior.
+  - [x] Run the entire core unit cohort with the repaired capture:
+    1,239 pass, zero failures, one pre-existing ignore.
+  - [x] Run strict core/hybrid Clippy and affected native repair/activation tests.
+    Both Clippy lanes pass; the repair case and all three activation cases pass.
+  - [x] Review the scoped UBS findings and explicit formatting of included files.
+    Three-file scan: zero critical; six new notices are fixture assertions,
+    joins/constructor expectations and necessary shared-handle clones. No
+    suppressions. Explicit include-file rustfmt and workspace fmt pass.
+  - [ ] Complete the unchanged full stock gate with all required inputs.
 - [ ] Complete remaining dependency review without relaxing audited identity,
   forbidden-runtime, profile, wire, installer or consumer contracts.
 - [ ] Recheck platform admission before any release. Keep the original

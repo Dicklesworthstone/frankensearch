@@ -1,5 +1,5 @@
 use super::*;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 const QUERY: &str = "retry partial model activation";
 
@@ -212,7 +212,7 @@ fn partial_model_activation_replaces_spaces_caches_and_preserves_scopes_and_futu
                 selected.quality_identity.as_ref().unwrap().identity.input
             );
             let query = serde_json::json!({"query":QUERY,"mode":"partial","stream":true});
-            let before = exchange(&cx, &mut session, &[query.clone()]).await;
+            let before = exchange(&cx, &mut session, std::slice::from_ref(&query)).await;
             assert_eq!(before[2]["results"].as_array().unwrap().len(), 2);
             let old_caches = cache_pair(&session);
             let next_fast = if change_fast {
@@ -372,7 +372,7 @@ fn partial_model_activation_refuses_subset_source_and_input_changes_before_loadi
             let mut session = session(&cx, &selected, &fast, &quality);
             let retained = Arc::clone(&session.snapshot);
             let query = serde_json::json!({"query":QUERY,"mode":"partial","stream":true});
-            exchange(&cx, &mut session, &[query.clone()]).await;
+            exchange(&cx, &mut session, std::slice::from_ref(&query)).await;
             let caches = cache_pair(&session);
             let providers = models(&fast, &quality);
             let mut documents = retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap();
@@ -470,7 +470,7 @@ fn partial_model_activation_loader_failures_and_racing_head_preserve_the_warm_se
         let (_, selected) = publish_partial_cli(&cx, &parent, &fast, &quality, true).await;
         let mut session = session(&cx, &selected, &fast, &quality);
         let query = serde_json::json!({"query":QUERY,"mode":"partial","stream":true});
-        exchange(&cx, &mut session, &[query.clone()]).await;
+        exchange(&cx, &mut session, std::slice::from_ref(&query)).await;
         let retained = Arc::clone(&session.snapshot);
         let caches = cache_pair(&session);
         let providers = models(&fast, &quality);

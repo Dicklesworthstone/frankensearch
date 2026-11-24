@@ -884,7 +884,11 @@ mod lifecycle {
                     assert_eq!(loads, 1);
                     assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), calls + 2);
                 } else {
-                    assert!(error.to_string().contains("complete two-tier selection"));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("--quality-hnsw-seed requires a two-tier selection")
+                    );
                     assert_eq!(loads, 0);
                     assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), calls);
                     assert!(!options.work.as_ref().unwrap().exists());
