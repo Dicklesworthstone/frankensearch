@@ -7,11 +7,14 @@
 //! vector bits and Quill bytes. Either route can build independently seeded
 //! graphs; reusing the selected ANN object address is refused before publication.
 
-use frankensearch::native_ann::{NativeGenerationSource, NativeGenerationVectorSource};
+use frankensearch::native_ann::{
+    NativeGenerationSource, NativeGenerationTopology, NativeGenerationVectorSource,
+};
 use frankensearch_core::generation::GenerationComponentRole;
 use frankensearch_index::generation_root::generation_reader::{
     SourceOpenOutcomeV1, VectorSourceOpenOutcomeV1,
 };
+use frankensearch_index::vector_cohort::VectorCohortCoverage;
 use sha2::{Digest as _, Sha256};
 
 use super::{
@@ -61,9 +64,7 @@ fn vector_policies(
     selected: &Receipt,
 ) -> Result<(NativeBuildRetrieval, Option<NativeBuildRetrieval>)> {
     if options.repair_vectors.quality_seed.is_some() && selected.quality_identity.is_none() {
-        return Err(bad(
-            "--quality-hnsw-seed requires a complete two-tier selection",
-        ));
+        return Err(bad("--quality-hnsw-seed requires a two-tier selection"));
     }
     let primary = match options.retrieval {
         Some(NativeBuildRetrieval::Exact) => NativeBuildRetrieval::Exact,
@@ -116,7 +117,11 @@ where
             .as_deref()
             .ok_or_else(|| bad("missing repair source receipt"))?,
     )?;
-    selected.require_complete_for_mutation()?;
+    if !options.repair_vectors.reuse_vectors {
+        // Source metadata alone does not authenticate the selected quality IDs.
+        // Only healthy retained vectors can preserve a partial quality subset.
+        selected.require_complete_for_mutation()?;
+    }
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;
@@ -289,14 +294,29 @@ fn open_vector_source(
             "the retained vectors differ from the selected root or profile",
         ));
     }
-    let source = NativeGenerationVectorSource::admit(
-        cx,
-        opened,
-        &selected.binding()?,
-        selected.quality_binding()?.as_ref(),
-        selected.tier,
-        usize::try_from(budget)?,
-    );
+    let primary = selected.binding()?;
+    let quality = selected.quality_binding()?;
+    let source = match selected.topology() {
+        NativeGenerationTopology::PartialQuality { .. } => {
+            NativeGenerationVectorSource::admit_partial_quality(
+                cx,
+                opened,
+                &primary,
+                quality
+                    .as_ref()
+                    .ok_or_else(|| bad("missing partial quality identity"))?,
+                usize::try_from(budget)?,
+            )
+        }
+        _ => NativeGenerationVectorSource::admit(
+            cx,
+            opened,
+            &primary,
+            quality.as_ref(),
+            selected.tier,
+            usize::try_from(budget)?,
+        ),
+    };
     checkpoint(cx)?;
     let source = source?;
     if source.source().topology() != selected.topology()
@@ -396,6 +416,17 @@ fn prepare_repair(
     reuse_vectors: bool,
 ) -> Result<PreparedPublication> {
     let retained = source.retained_source();
+    let coverage = match source.topology() {
+        NativeGenerationTopology::PartialQuality { .. } if reuse_vectors => {
+            VectorCohortCoverage::PartialQuality
+        }
+        NativeGenerationTopology::PartialQuality { .. } => {
+            return Err(bad(
+                "partial quality repair requires authenticated retained vectors",
+            ));
+        }
+        _ => VectorCohortCoverage::Complete,
+    };
     if built.binding().generation().sequence <= source.binding().generation().sequence
         || built.binding().frozen_identity() != source.binding().frozen_identity()
         || built
@@ -407,6 +438,7 @@ fn prepare_repair(
         || built.metadata().vector_artifacts[0].embedder_tier != source.tier()
         || built.metadata().commit_range != source.metadata().commit_range
         || built.metadata().total_documents != source.metadata().total_documents
+        || built.coverage() != coverage
         || built.retrieval_configuration() != primary_policy
         || built.quality_retrieval_configuration() != quality_policy
     {

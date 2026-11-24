@@ -16,24 +16,26 @@ use frankensearch_index::exact_component_adapters::{
 };
 use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
 use frankensearch_index::native_hnsw::{NativeHnswGenerationReceiptV2, ValidatedNativeHnsw};
-use frankensearch_index::vector_cohort::ExactVectorCohortV1;
+use frankensearch_index::vector_cohort::{ExactVectorCohortV1, VectorCohortCoverage};
 
 use super::{
     NativeBuildRetrieval, NativeBuiltExactGeneration, capture_ann_image, checkpoint,
     image_budget_error, invalid, lower_hex, remaining_budget, timestamp_millis,
 };
-use crate::native_ann::NativeGenerationVectorSource;
 use crate::native_ann::generation::{NATIVE_ANN_RECEIPT_KEY, NATIVE_QUALITY_ANN_RECEIPT_KEY};
+use crate::native_ann::{NativeGenerationTopology, NativeGenerationVectorSource};
 use crate::{Cx, SearchResult};
 
 impl NativeGenerationVectorSource {
-    /// Rebuild a complete generation from admitted vectors without model inference.
+    /// Rebuild an admitted generation from retained vectors without model inference.
     ///
     /// Every vector's stored bits, flags and physical position are preserved;
     /// only its canonical generation header changes. The complete Quill image
     /// is reused byte-for-byte, including titles and document metadata. Each
-    /// tier requires an explicit exact/HNSW policy. A full generation requires
-    /// its independent quality policy, while a single tier forbids one.
+    /// tier requires an explicit exact/HNSW policy. Both complete and partial
+    /// two-tier generations require an independent quality policy, while a
+    /// single tier forbids one. An admitted partial quality subset remains
+    /// exactly the same subset; uncovered documents receive no quality vectors.
     ///
     /// Graphs are built against the rebound owners in a fresh work directory.
     /// Choose fresh HNSW seeds when repairing a graph: recreating the selected
@@ -64,6 +66,10 @@ impl NativeGenerationVectorSource {
         checkpoint(cx, "native_ann.vector_recovery.build")?;
         generation.validate()?;
         let source = self.source();
+        let coverage = match source.topology() {
+            NativeGenerationTopology::PartialQuality { .. } => VectorCohortCoverage::PartialQuality,
+            _ => VectorCohortCoverage::Complete,
+        };
         if generation.sequence <= source.binding().generation().sequence {
             return Err(invalid(
                 "vector_recovery.generation",
@@ -113,11 +119,12 @@ impl NativeGenerationVectorSource {
         let cohort = quality
             .as_ref()
             .map(|quality| {
-                ExactVectorCohortV1::build(
+                ExactVectorCohortV1::build_with_coverage(
                     cx,
                     (primary.identity_binding(), primary.owned_bytes()),
                     (quality.identity_binding(), quality.owned_bytes()),
                     checkpoint_value,
+                    coverage,
                     vector_budget,
                 )
             })
@@ -341,7 +348,7 @@ impl NativeGenerationVectorSource {
             metadata_bytes,
             retrieval: primary_policy,
             quality_retrieval: quality_policy,
-            coverage: frankensearch_index::vector_cohort::VectorCohortCoverage::Complete,
+            coverage,
             max_image_bytes,
         })
     }

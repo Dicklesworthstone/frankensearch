@@ -163,10 +163,15 @@ They default to fast search; --mode partial explicitly enables quality refinemen
 including streaming, filters, deadlines and optional reranking. Full and direct\n\
 quality modes require complete coverage and refuse partial generations. Results\n\
 report quality document counts and coverage. Full-query tuning remains full-only.\n\
-Partial generations support search, fetch, read-only serve, attempt recovery and\n\
-retained rollback. Update, rebuild, repair and model activation refuse partial\n\
-sources until subset-preserving mutation is available. Quality completion still\n\
-requires a fast-only source. A warm partial session accepts mode=partial explicitly.\n\
+Partial generations support search, fetch, serve, attempt recovery and retained\n\
+rollback. Updates preserve surviving covered IDs; new/uncovered IDs stay fast-only.\n\
+Removing all covered or all uncovered IDs refuses before model loading/staging.\n\
+Graph repair with --reuse-vectors preserves the exact subset. Partial rebuilds\n\
+require --retained-source and keep the source and covered IDs; --migrate-model\n\
+permits independent producer replacement. Source-only repair, fresh-input rebuild,\n\
+and rebuild --query still refuse partial sources. Granted warm model activation\n\
+preserves the exact partial source and covered IDs. Explicit quality\n\
+completion accepts fast-only or partial sources. Warm sessions accept mode=partial.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
 missing or invalid graphs fail admission without substituting exact retrieval.\n\
@@ -192,18 +197,21 @@ operation for each ID winning. It reuses unchanged content vectors and preserves
 the selected producers, topology, precision, and retrieval policy. Only changed or new\n\
 content is embedded; complete vector, graph, and Quill images are still produced.\n\
 The final cohort satisfies the combined encoded-source limits. Deleting every\n\
-document publishes a complete empty generation that later updates can populate.\n\
+document publishes a complete empty generation that later updates can populate,\n\
+except partial quality updates, which must retain a nonempty proper quality subset.\n\
 Updates require nonbackward source checkpoints and a new work directory/receipt.\n\
 Use rebuild for producer or retrieval changes. Update never changes old images.\n\
 Repair explicitly admits the selected control state, metadata and complete stored\n\
 source even when vector or ANN images are damaged or missing. It needs no healthy\n\
-ancestor and never serves a partial generation. It rebuilds every stored tier\n\
+ancestor and never serves damaged images. Source-only repair rebuilds every stored tier\n\
 with the same full producer identities, precision, source checkpoint and document\n\
 fields, then publishes a complete higher-sequence Repair successor. Both repair\n\
 routes require explicit --retrieval exact or hnsw; old images remain untouched.\n\
 With --reuse-vectors, repair instead requires intact authenticated vectors and\n\
 never loads models. It preserves exact vector values and Quill bytes without\n\
-exporting the corpus or running inference. HNSW requires\n\
+exporting the corpus or running inference. Partial generations require this route:\n\
+both vector owners must authenticate and the exact quality subset is retained.\n\
+HNSW requires\n\
 --hnsw-seed: choose a fresh seed so the rebuilt graph has a new immutable object\n\
 address. --quality-hnsw-seed selects an independent full-tier seed; otherwise it\n\
 uses --hnsw-seed. A repeated old whole-graph receipt is refused before staging.\n\
@@ -271,7 +279,7 @@ quality cache. Model activation installs fresh caches only after admission;\n\
 failed activation preserves the previous caches. Enabled caching excludes\n\
 --lexical-only. Query/filter text and embeddings are never written to disk.\n\
 Requests use {\"id\":\"q1\",\"query\":\"text\",\"limit\":10} and may select\n\
-\"mode\":\"fast\"|\"quality\"|\"full\" and \"stream\":true. Full is the default for\n\
+\"mode\":\"fast\"|\"quality\"|\"full\"|\"partial\" and \"stream\":true. Full is the default for\n\
 a full generation. Streaming emits each requested semantic stage and an optional\n\
 final Reranked frame; empty or exclusion-only pools skip the scorer. It never follows a new\n\
 authority implicitly. With --allow-activation, an explicit request may select a\n\
@@ -287,6 +295,8 @@ migration using an exact receipt, expected_authority and explicit local model\n\
 paths. All selected producers, images and fixed scope are validated before the\n\
 swap; failure retains the old complete selection. Topology and prepared-input\n\
 contracts stay fixed. No model is downloaded and no new authority is published.\n\
+Partial model activation also requires the exact source checkpoint, full source,\n\
+Quill image and authenticated quality-covered IDs; it cannot expand coverage.\n\
 The same grant accepts op=activate_quality_completion for an already published\n\
 authority-complete-quality successor of a fast-only session. It retains the fast\n\
 model and loads only the explicitly selected quality model, using quality_backend\n\
@@ -1671,6 +1681,7 @@ fn prepare_publication(
 enum PublicationIntent {
     PreserveTopology,
     CompleteQuality,
+    RebuildPartialQuality,
 }
 
 fn prepare_publication_with_intent(
@@ -1679,9 +1690,9 @@ fn prepare_publication_with_intent(
     max_image_bytes: usize,
     intent: PublicationIntent,
 ) -> Result<PreparedPublication> {
-    if intent == PublicationIntent::CompleteQuality && predecessor.is_none() {
+    if intent != PublicationIntent::PreserveTopology && predecessor.is_none() {
         return Err(bad(
-            "quality completion requires a selected fast-only or partial-quality predecessor",
+            "explicit quality maintenance requires its selected predecessor",
         ));
     }
     let (root_id, expected, previous) = match predecessor {
@@ -1702,7 +1713,15 @@ fn prepare_publication_with_intent(
                     NativeGenerationTopology::FastOnly | NativeGenerationTopology::QualityOnly => {
                         built.quality_binding().is_none()
                     }
-                    NativeGenerationTopology::PartialQuality { .. } => false,
+                    NativeGenerationTopology::PartialQuality { .. } => {
+                        built.coverage() == VectorCohortCoverage::PartialQuality
+                            && snapshot.metadata().embedders.get("fast")
+                                == Some(built.binding().frozen_identity())
+                            && built.quality_binding().is_some_and(|binding| {
+                                snapshot.metadata().embedders.get("quality")
+                                    == Some(binding.frozen_identity())
+                            })
+                    }
                 },
                 PublicationIntent::CompleteQuality => {
                     let quality_identity_matches = match snapshot.topology() {
@@ -1723,6 +1742,32 @@ fn prepare_publication_with_intent(
                             == snapshot.metadata().embedders.get("fast").ok_or_else(|| {
                                 bad("quality completion requires the retained fast identity")
                             })?
+                        && built.metadata().commit_range == snapshot.metadata().commit_range
+                        && built.metadata().total_documents == snapshot.metadata().total_documents
+                }
+                PublicationIntent::RebuildPartialQuality => {
+                    matches!(
+                        snapshot.topology(),
+                        NativeGenerationTopology::PartialQuality { .. }
+                    ) && built.coverage() == VectorCohortCoverage::PartialQuality
+                        && snapshot
+                            .metadata()
+                            .embedders
+                            .get("fast")
+                            .is_some_and(|previous| {
+                                previous.identity.input
+                                    == built.binding().frozen_identity().identity.input
+                            })
+                        && built.quality_binding().is_some_and(|binding| {
+                            snapshot
+                                .metadata()
+                                .embedders
+                                .get("quality")
+                                .is_some_and(|previous| {
+                                    previous.identity.input
+                                        == binding.frozen_identity().identity.input
+                                })
+                        })
                         && built.metadata().commit_range == snapshot.metadata().commit_range
                         && built.metadata().total_documents == snapshot.metadata().total_documents
                 }
@@ -1765,16 +1810,19 @@ fn prepare_publication_with_intent(
         GenerationAuthorityActionV1::Activate,
         hasher.finalize().into(),
     )?;
-    if intent == PublicationIntent::CompleteQuality {
+    if matches!(
+        intent,
+        PublicationIntent::CompleteQuality | PublicationIntent::RebuildPartialQuality
+    ) {
         let previous = predecessor
-            .ok_or_else(|| bad("quality completion requires its selected predecessor"))?
+            .ok_or_else(|| bad("quality maintenance requires its selected predecessor"))?
             .retained_snapshot()
             .manifest();
         if candidate.manifest().document_set_sha256() != previous.document_set_sha256()
             || candidate.manifest().components().lexical != previous.components().lexical
         {
             return Err(bad(
-                "quality completion must preserve the exact source cohort and lexical image",
+                "quality maintenance must preserve the exact source cohort and lexical image",
             ));
         }
     }
@@ -1787,6 +1835,29 @@ fn prepare_publication_with_intent(
         expected,
         writer,
     })
+}
+
+fn prepare_partial_quality_rebuild(
+    cx: &Cx,
+    built: &NativeBuiltExactGeneration,
+    predecessor: &NativeGenerationSnapshot,
+    max_image_bytes: usize,
+) -> Result<PreparedPublication> {
+    checkpoint(cx)?;
+    let prepared = prepare_publication_with_intent(
+        built,
+        Some(predecessor),
+        max_image_bytes,
+        PublicationIntent::RebuildPartialQuality,
+    )?;
+    // Metadata counts do not identify a covered subset. Authenticate the actual
+    // candidate vector owners before staging, then require the retained IDs.
+    let preview = built.preview_candidate(cx, &prepared.candidate)?;
+    if preview.partial_quality_document_ids(cx)? != predecessor.partial_quality_document_ids(cx)? {
+        return Err(serve_refused("partial_quality_rebuild_coverage_mismatch"));
+    }
+    checkpoint(cx)?;
+    Ok(prepared)
 }
 
 fn stage_prepared_and_publish(
@@ -2323,7 +2394,17 @@ where
             .as_deref()
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
-    selected.require_complete_for_mutation()?;
+    let partial_quality = selected.quality_documents.is_some();
+    if partial_quality {
+        if !options.retained_source {
+            return Err(serve_refused(
+                "partial_quality_rebuild_requires_retained_source",
+            ));
+        }
+        if options.query.is_some() {
+            return Err(serve_refused("partial_quality_rebuild_query_unsupported"));
+        }
+    }
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;
@@ -2376,7 +2457,11 @@ where
             None => read_documents(&mut io::stdin().lock())?,
         }
     };
-    let loaded = load_models(selected.query_mode(None)?)?;
+    let loaded = load_models(if partial_quality {
+        QueryMode::Full
+    } else {
+        selected.query_mode(None)?
+    })?;
     let expected_identity = rebuild_identity(
         &selected.identity,
         loaded.fast.as_ref(),
@@ -2409,7 +2494,46 @@ where
         }
     }
     let generation = new_generation(sequence)?;
-    let built = if options.retained_source && options.migrate_model {
+    let built = if partial_quality {
+        // No mutation or caller-supplied subset is accepted here. The restricted
+        // plan retains the source and membership from this exact predecessor.
+        drop(documents);
+        let quality = loaded.quality.as_ref().ok_or_else(|| {
+            bad("partial rebuild requires its independently supplied quality provider")
+        })?;
+        let migration = if options.migrate_model {
+            snapshot.begin_partial_quality_model_migration(
+                cx,
+                &work_path,
+                generation,
+                Arc::clone(&loaded.fast),
+                Arc::clone(quality),
+                options.max_source_bytes,
+            )?
+        } else {
+            snapshot.begin_partial_quality_update(
+                cx,
+                &work_path,
+                generation,
+                Arc::clone(&loaded.fast),
+                Arc::clone(quality),
+                options.max_source_bytes,
+            )?
+        };
+        let migration = migration
+            .with_batch_size(options.batch_size)?
+            .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
+            .with_fast_storage(rebuild_precision(&expected_identity)?, retrieval)
+            .with_quality_storage(
+                rebuild_precision(expected_quality.as_ref().ok_or_else(|| {
+                    bad("partial rebuild requires its independent quality identity")
+                })?)?,
+                quality_retrieval.ok_or_else(|| {
+                    bad("partial rebuild requires its independent quality retrieval policy")
+                })?,
+            )?;
+        Box::pin(migration.build(cx, source, options.max_image_bytes)).await?
+    } else if options.retained_source && options.migrate_model {
         // Source preflight above applies CLI record/ID bounds before loading
         // models. The update exports from the same retained reader and keeps
         // the original authority pair pinned through completion/publication.
@@ -2489,15 +2613,29 @@ where
         ))
         .await;
     }
-    let PublishedGeneration { receipt, .. } = stage_and_publish(
-        cx,
-        &root,
-        &selected.root,
-        &receipt_path,
-        &built,
-        Some(&snapshot),
-        PublicationOptions::unscoped(options.max_image_bytes),
-    )?;
+    let PublishedGeneration { receipt, .. } = if partial_quality {
+        let prepared =
+            prepare_partial_quality_rebuild(cx, &built, &snapshot, options.max_image_bytes)?;
+        stage_prepared_and_publish(
+            cx,
+            &root,
+            &selected.root,
+            &receipt_path,
+            &built,
+            prepared,
+            PublicationOptions::unscoped(options.max_image_bytes),
+        )?
+    } else {
+        stage_and_publish(
+            cx,
+            &root,
+            &selected.root,
+            &receipt_path,
+            &built,
+            Some(&snapshot),
+            PublicationOptions::unscoped(options.max_image_bytes),
+        )?
+    };
     let mut report = serde_json::json!({
         "schema": SCHEMA, "ok": true, "event": "rebuilt", "publication": "committed",
         "serving": "activated", "receipt": receipt_path,
@@ -2587,7 +2725,6 @@ where
     F: FnOnce() -> Result<mutations::Edits>,
 {
     checkpoint(cx)?;
-    selected.require_complete_for_mutation()?;
     if snapshot.retained_snapshot().selected_history_of().is_some()
         || snapshot.authority() != selected.authority()?
     {
@@ -2623,6 +2760,18 @@ where
     let documents = retained_rebuild_documents(cx, snapshot, spec.limits.max_source_bytes)?;
     let edits = read_edits()?;
     let document_count = mutations::validate_final_source(cx, &documents, &edits)?;
+    if selected.quality_documents.is_some() {
+        let covered = snapshot.partial_quality_document_ids(cx)?;
+        let remaining = covered
+            .iter()
+            .filter(|id| !matches!(edits.get(id.as_str()), Some(None)))
+            .count();
+        if remaining == 0 || remaining >= document_count {
+            return Err(serve_refused(
+                "partial_quality_update_requires_partial_coverage",
+            ));
+        }
+    }
     // The library prepares reuse from the same immutable image. Let these
     // preflight bodies go before loading a model or materializing that source.
     checkpoint(cx)?;
@@ -2650,45 +2799,75 @@ async fn build_and_publish_update(
         document_count,
     } = prepared;
     admit_serving_models(selected, loaded)?;
-    let transaction = if let Some(quality) = &loaded.quality {
-        snapshot.begin_progressive_update(
-            cx,
-            &spec.work,
-            new_generation(sequence)?,
-            Arc::clone(&loaded.fast),
-            Arc::clone(quality),
-            spec.limits.max_source_bytes,
-        )?
+    let built = if selected.quality_documents.is_some() {
+        let quality = loaded
+            .quality
+            .as_ref()
+            .ok_or_else(|| bad("partial update requires its retained quality provider"))?;
+        let mut transaction = snapshot
+            .begin_partial_quality_update(
+                cx,
+                &spec.work,
+                new_generation(sequence)?,
+                Arc::clone(&loaded.fast),
+                Arc::clone(quality),
+                spec.limits.max_source_bytes,
+            )?
+            .with_batch_size(spec.limits.batch_size)?
+            .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+        for (id, document) in edits {
+            checkpoint(cx)?;
+            transaction = match document {
+                Some(document) => transaction.upsert_document(document),
+                None => transaction.delete_document(id),
+            };
+        }
+        Box::pin(transaction.build(cx, spec.source, spec.max_image_bytes)).await?
     } else {
-        snapshot.begin_update(
-            cx,
-            &spec.work,
-            new_generation(sequence)?,
-            Arc::clone(&loaded.fast),
-            spec.limits.max_source_bytes,
-        )?
-    };
-    let mut transaction = transaction
-        .with_batch_size(spec.limits.batch_size)?
-        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
-    for (id, document) in edits {
-        checkpoint(cx)?;
-        transaction = match document {
-            Some(document) => transaction.upsert_document(document),
-            None => transaction.delete_document(id),
+        let transaction = if let Some(quality) = &loaded.quality {
+            snapshot.begin_progressive_update(
+                cx,
+                &spec.work,
+                new_generation(sequence)?,
+                Arc::clone(&loaded.fast),
+                Arc::clone(quality),
+                spec.limits.max_source_bytes,
+            )?
+        } else {
+            snapshot.begin_update(
+                cx,
+                &spec.work,
+                new_generation(sequence)?,
+                Arc::clone(&loaded.fast),
+                spec.limits.max_source_bytes,
+            )?
         };
-    }
-    let built = if selected.quality_identity.is_some() {
-        Box::pin(transaction.build_progressive_generation(cx, spec.source, spec.max_image_bytes))
+        let mut transaction = transaction
+            .with_batch_size(spec.limits.batch_size)?
+            .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+        for (id, document) in edits {
+            checkpoint(cx)?;
+            transaction = match document {
+                Some(document) => transaction.upsert_document(document),
+                None => transaction.delete_document(id),
+            };
+        }
+        if selected.quality_identity.is_some() {
+            Box::pin(transaction.build_progressive_generation(
+                cx,
+                spec.source,
+                spec.max_image_bytes,
+            ))
             .await?
-    } else {
-        Box::pin(transaction.build_exact_generation(
-            cx,
-            selected.tier,
-            spec.source,
-            spec.max_image_bytes,
-        ))
-        .await?
+        } else {
+            Box::pin(transaction.build_exact_generation(
+                cx,
+                selected.tier,
+                spec.source,
+                spec.max_image_bytes,
+            ))
+            .await?
+        }
     };
     if built.binding().frozen_identity() != &selected.identity
         || built
@@ -3756,7 +3935,6 @@ impl AuthoritySession {
     }
 
     fn with_updates(mut self, batch_size: usize, max_source_bytes: usize) -> Result<Self> {
-        self.receipt.require_complete_for_mutation()?;
         self.require_current_selection()?;
         self.models.models()?;
         if batch_size == 0 || batch_size > MAX_DOCUMENTS || max_source_bytes == 0 {
@@ -4562,8 +4740,8 @@ async fn serve(
     }
     if options.allow_model_activation {
         // A partial session may explicitly adopt a completed quality tier.
-        // Ordinary model activation and updates enforce their own topology
-        // guards; this grant alone does not authorize changing the subset.
+        // Ordinary model activation keeps its own topology guard, and partial
+        // updates preserve membership independently of this activation grant.
         session.require_current_selection()?;
         session.models.models()?;
         session.allow_model_activation = true;

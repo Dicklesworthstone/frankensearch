@@ -37,7 +37,9 @@ use frankensearch_quill::{
 };
 use sha2::Digest as _;
 
-use super::builder::{NativeBuildRetrieval, NativeIndexUpdate, NativeQualityCompletion};
+use super::builder::{
+    NativeBuildRetrieval, NativeIndexUpdate, NativePartialQualityUpdate, NativeQualityCompletion,
+};
 use super::{
     NativeAnnIndex, NativeBackend, NativeProgressiveSearch, NativeRetrievalMode, checkpoint,
     invalid, lower_hex,
@@ -181,6 +183,18 @@ impl NativeGenerationPreview {
     #[must_use]
     pub const fn metadata(&self) -> &GenerationManifest {
         &self.readers.metadata
+    }
+
+    /// Return the actual covered IDs of an admitted partial candidate.
+    ///
+    /// Membership comes from the candidate's retained quality vector owner in
+    /// lexicographic order. Callers can compare it with the selected predecessor
+    /// before publication without model inference or source-content export.
+    ///
+    /// # Errors
+    /// Refuses nonpartial topology, cancellation or an invalid retained row.
+    pub fn partial_quality_document_ids(&self, cx: &Cx) -> SearchResult<Vec<String>> {
+        self.readers.partial_quality_document_ids(cx)
     }
 
     /// Lazily preview exactly one admitted vector tier and its lexical source.
@@ -732,6 +746,19 @@ impl NativeGenerationSnapshot {
         &self.readers.metadata
     }
 
+    /// Return the authenticated covered IDs of an explicitly partial generation.
+    ///
+    /// IDs are returned in lexicographic order from the retained quality vector
+    /// owner. This does not export source content, load models, infer vectors or
+    /// reopen paths. It supports mutation preflight before loading either model;
+    /// counts or caller-provided IDs never substitute for this actual membership.
+    ///
+    /// # Errors
+    /// Refuses nonpartial topology, cancellation or an invalid retained row.
+    pub fn partial_quality_document_ids(&self, cx: &Cx) -> SearchResult<Vec<String>> {
+        self.readers.partial_quality_document_ids(cx)
+    }
+
     /// Recover the complete stored source cohort from this retained generation.
     ///
     /// Documents follow physical live FSVI row order; tombstones are omitted.
@@ -943,6 +970,97 @@ impl NativeGenerationSnapshot {
             max_source_bytes,
             Arc::clone(&self.readers.vector),
             Some((quality_provider, Arc::clone(quality))),
+        )
+    }
+
+    /// Prepare subset-preserving edits against this partial quality generation.
+    ///
+    /// Both providers must match their independent complete retained identities.
+    /// Surviving covered IDs retain quality membership; changed covered content
+    /// is re-embedded in both tiers, while new and uncovered IDs stay fast-only.
+    /// Unchanged vectors retain their stored bits. Storage and graph policies
+    /// are inherited independently and may be explicitly overridden on the plan.
+    ///
+    /// The returned [`NativePartialQualityUpdate`] exposes only partial
+    /// finalization. Deleting all covered IDs or leaving only covered IDs refuses
+    /// before inference or work files. Use the explicit quality-completion
+    /// contract for coverage expansion. Source export uses
+    /// [`Self::source_documents`]'s payload budget; the original authority and
+    /// both owners remain pinned throughout construction. Publication still
+    /// requires this snapshot's original expected authority pair.
+    ///
+    /// # Errors
+    /// Refuses nonpartial topology, changed providers, historical selection,
+    /// non-newer generations, source-budget exhaustion or cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_partial_quality_update(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        fast_provider: Arc<dyn Embedder>,
+        quality_provider: Arc<dyn Embedder>,
+        max_source_bytes: usize,
+    ) -> SearchResult<NativePartialQualityUpdate> {
+        checkpoint(cx, "native_ann.generation.partial_quality_update")?;
+        let quality = self.readers.partial_quality()?;
+        NativePartialQualityUpdate::from_authority(
+            cx,
+            directory,
+            generation,
+            fast_provider,
+            quality_provider,
+            self,
+            max_source_bytes,
+            Arc::clone(&self.readers.vector),
+            Arc::clone(quality),
+        )
+    }
+
+    /// Explicitly migrate models while preserving a partial quality subset.
+    ///
+    /// Each provider retains its own prepared-input contract. Its complete
+    /// producer identity determines reuse independently: an unchanged tier
+    /// copies its exact stored vectors, while a changed fast provider infers
+    /// every surviving source and a changed quality provider infers only the
+    /// surviving covered IDs. Equal dimensions or output values never permit
+    /// reuse across producers. New and previously uncovered IDs stay fast-only.
+    ///
+    /// Storage and graph policies are inherited independently. The restricted
+    /// plan supports ordinary source edits, monotone source boundaries, and
+    /// explicit storage overrides while retaining the proper-subset contract.
+    /// With no edits and the same source cut, it preserves the exact Quill image.
+    /// Models are never discovered or substituted, and preparation creates no
+    /// files or inference. Publish with this snapshot's original expected pair.
+    /// Ordinary partial updates still require the original providers; the
+    /// complete-generation migration API remains separate.
+    ///
+    /// # Errors
+    /// Refuses nonpartial topology, changed prepared-input contracts, historical
+    /// selection, non-newer generations, invalid or drifting producers,
+    /// source-budget exhaustion or cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_partial_quality_model_migration(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        fast_provider: Arc<dyn Embedder>,
+        quality_provider: Arc<dyn Embedder>,
+        max_source_bytes: usize,
+    ) -> SearchResult<NativePartialQualityUpdate> {
+        checkpoint(cx, "native_ann.generation.partial_quality_model_migration")?;
+        let quality = self.readers.partial_quality()?;
+        NativePartialQualityUpdate::from_authority_model_migration(
+            cx,
+            directory,
+            generation,
+            fast_provider,
+            quality_provider,
+            self,
+            max_source_bytes,
+            Arc::clone(&self.readers.vector),
+            Arc::clone(quality),
         )
     }
 
@@ -1639,6 +1757,22 @@ impl CompositeReaders {
         self.quality
             .as_ref()
             .ok_or_else(|| refused("topology", "explicit-partial-quality-required"))
+    }
+
+    fn partial_quality_document_ids(&self, cx: &Cx) -> SearchResult<Vec<String>> {
+        checkpoint(cx, "native_ann.generation.partial_quality_ids")?;
+        let quality = self.partial_quality()?;
+        let mut ids = Vec::with_capacity(quality.owner.live_count());
+        for physical in 0..quality.owner.record_count() {
+            checkpoint(cx, "native_ann.generation.partial_quality_id")?;
+            let row = quality.owner.row(physical)?;
+            if row.flags().is_live() {
+                ids.push(row.doc_id().to_owned());
+            }
+        }
+        ids.sort_unstable();
+        checkpoint(cx, "native_ann.generation.partial_quality_ids_ready")?;
+        Ok(ids)
     }
 
     fn bounded_limit(&self, requested: usize) -> usize {

@@ -282,8 +282,13 @@ Full-query tuning remains restricted to complete full generations.
 `authority-serve` retains both producers and accepts `"mode":"partial"` explicitly;
 its default remains fast. Source fetch, lexical search, publication-attempt
 recovery, and retained rollback use the complete admitted source. Partial sources
-currently refuse update, rebuild, repair, and ordinary model activation; these
-operations need an explicit policy for preserving or changing the subset.
+support subset-preserving `authority-update` and granted warm updates, plus graph
+repair with `authority-repair --reuse-vectors` when both vector owners still
+authenticate. `authority-rebuild --retained-source` can change retrieval policy
+or, with `--migrate-model`, either producer while preserving the source and exact
+quality subset. A granted warm `activate_model` request can adopt that partial
+successor without restarting. Fresh-input rebuild and source-only repair still
+refuse partial sources.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
 A warm partial server can adopt that completed generation through the explicit
@@ -294,6 +299,15 @@ Library callers use `build_partial_quality_generation(&cx, source, quality_ids,
 max_image_bytes)`, `NativeGenerationSnapshot::admit_partial_quality`, and
 `search_progressive_with_partial_quality` (including pool and scoped variants).
 The existing full-coverage methods continue to require complete quality coverage.
+For edits, `begin_partial_quality_update` returns a restricted
+`NativePartialQualityUpdate` plan with upsert/delete and batch/storage settings;
+`build(&cx, source, max_image_bytes)` preserves the surviving covered IDs.
+`partial_quality_document_ids(&cx)` exposes those authenticated IDs without
+exporting document content or loading models.
+`begin_partial_quality_model_migration` returns the same restricted plan with
+explicit permission to replace either independently identified producer. The
+unchanged tier reuses its vectors; changed quality inference covers only the
+retained subset. Each producer must preserve its own prepared-input contract.
 
 ### Rerank an individual authority tier
 
@@ -399,7 +413,8 @@ This request only adopts an already published successor. It does not build
 vectors, publish another generation or download models. Missing permission,
 changed producers, changed source or lexical images, stale authority, loading
 failure and cancellation leave the previous serving selection intact. Ordinary
-`activate_model` remains unavailable while the session is partial.
+`activate_model` preserves partial coverage and cannot perform this transition
+to full coverage.
 
 ### Rebuild an existing authority generation
 
@@ -452,8 +467,10 @@ stable throughout the build; a changed tier never adopts its predecessor's vecto
 To rebuild the selected generation's existing documents, supply
 `--retained-source`. This reads the complete stored cohort from its already
 admitted vector and Quill images, preserves the exact source checkpoint, and
-builds a complete successor. Ordinary retained-source rebuilds re-embed every
-live document; explicitly authorized model migrations can reuse unchanged tiers.
+builds a complete successor. Ordinary single-tier and full retained-source
+rebuilds re-embed every live document; explicitly authorized model migrations can
+reuse unchanged tiers. Partial retained-source rebuilds always reuse eligible
+unchanged vectors and preserve the exact quality subset.
 Original JSONL files and build work directories are unnecessary. For example,
 this rebuild retains the documents while changing retrieval to HNSW:
 
@@ -486,10 +503,23 @@ continues to reject changed producers. The predecessor remains pinned and
 searchable throughout; failed inference, cancellation, or a competing publisher
 does not replace it with a partial migration.
 
+Partial generations use `begin_partial_quality_model_migration` and the restricted
+`NativePartialQualityUpdate::build` finalizer. The CLI supports this through the
+same `--retained-source --migrate-model` options. A changed fast producer embeds
+every source document; a changed quality producer embeds only the previously
+covered IDs. Neither a model change nor a graph-policy change expands coverage.
+The source checkpoint, complete stored documents, exact lexical image, and
+covered-ID set stay fixed. Publication authenticates the candidate vector owners
+and compares their actual membership before staging; equal coverage counts are
+insufficient. Partial fresh-input rebuilds and the `--query` recovery executor
+remain unsupported and refuse before model loading. Use explicit completion to
+move to full coverage, or the ordinary partial update operation to change source.
+
 Retained documents are already prepared input. This route may change producers
 and vector spaces, but must preserve each tier's complete input-preparation
-contract. To change canonicalization or document encoding, supply a complete
-freshly prepared corpus with `--input` instead. Both tiers are checked before
+contract. For a complete generation, changing canonicalization or document
+encoding requires a complete freshly prepared corpus with `--input` instead.
+Both tiers are checked before
 either begins inference or creates the new work directory.
 `--input`, `--source-low`, and `--source-high` are excluded in retained-source
 mode; it neither reads standard input nor assigns a new source checkpoint.
@@ -637,6 +667,16 @@ If the vectors still authenticate and only the graphs need rebuilding, add
 `--reuse-vectors` and omit model options. This route preserves the exact vector
 values and Quill bytes without loading models, exporting the corpus or running
 inference. It accepts the same explicit exact/HNSW choices and graph seeds.
+This includes partial quality generations: the complete fast owner and the
+sparse quality owner must both authenticate, and the repaired generation keeps
+the same covered IDs, quality count, source cohort and per-tier vector values.
+It remains a partial generation with explicit partial query mode; graph repair
+does not fill missing quality coverage.
+
+Source-only re-embedding still refuses partial quality generations. Their source
+metadata authenticates a coverage commitment but cannot reconstruct the exact
+quality subset when its vector owner is unavailable. Healthy retained vectors
+are therefore required for partial repair.
 
 Both routes retain the original physical authority pair through preparation and
 publication. A competing publisher causes refusal rather than replacing its
@@ -656,6 +696,21 @@ publication or lost output.
 and reuses the stored vectors for unchanged document content. Title and metadata
 changes update the retained source and lexical image without document inference.
 Only the final new or changed content for each ID is embedded.
+
+For a partial quality predecessor, membership follows the selected generation:
+surviving covered IDs remain covered, and changed covered content is re-embedded
+by both producers. New and previously uncovered IDs receive fast vectors only.
+Deleting a covered ID removes its quality row; reinserting that ID in a later
+generation leaves it fast-only. Within one delta, the final operation for an ID
+wins, so a covered ID ending in an upsert retains its original coverage.
+Title/metadata-only edits reuse vectors independently in both tiers.
+
+The resulting quality subset must remain nonempty and smaller than the complete
+source cohort. Deleting every covered ID, deleting every uncovered ID, or
+deleting the entire partial corpus refuses before model loading or staging.
+These updates cannot claim full coverage or silently discard the quality tier.
+Use explicit quality completion before edits that need a complete topology.
+The same rules apply to granted warm-server updates.
 
 An input file can contain:
 
@@ -686,15 +741,17 @@ overwritten by another edit. Deleting an absent ID has no effect.
 
 Omit `--input` to read bounded JSONL from standard input. Both source checkpoint
 boundaries are required and must be at least their selected predecessor values.
-An empty delta can advance the checkpoint with zero document inference. A delta
-that deletes the entire cohort publishes a complete empty generation. Its
+An empty delta can advance the checkpoint with zero document inference. For
+single-tier and full generations, a delta that deletes the entire cohort
+publishes a complete empty generation. Its
 zero-row vector images, empty Quill source, metadata and optional graph are
 admitted and committed together. Searches return no hits, source fetches report
 the requested documents as unavailable, and later upserts repopulate the same
 root. Full generations retain both independently bound tiers when empty.
 
-Empty input is also supported by `authority-index` and `authority-rebuild`,
-including `--retained-source` rebuilds of an empty predecessor. Empty generations
+Single-tier and full builds also support empty input through `authority-index`
+and `authority-rebuild`, including `--retained-source` rebuilds of an empty
+predecessor. Empty generations
 keep their producer identities, storage and retrieval contracts, source
 checkpoint and canonical empty document-set digest. Semantic builds and queries
 still load and check the matching models, but zero documents require no embedding
@@ -984,7 +1041,7 @@ owning lane, and cancellation is observed between reads and requests.
 
 Start a semantic authority server with `--allow-model-activation` to permit
 replacement of its local producer or both producers in a complete two-tier
-generation:
+or partial-quality generation:
 
 ```sh
 ./target/release/frankensearch-native authority-serve \
@@ -1004,14 +1061,14 @@ Lexical-only startup rejects the model-activation grant.
 | `id` | Optional request identifier |
 | `expected_authority` | Exact authority byte array from the session's last successful selection event |
 | `receipt` | Absolute path to the already published candidate's receipt |
-| `model_dir` | Explicit local model root for fast or ONNX quality; required for a full generation's fast tier |
+| `model_dir` | Explicit local model root for fast or ONNX quality; required for the fast tier of full and partial generations |
 | `quality_backend` | Optional explicit quality backend: `onnx`, `native-int8`, `native-f32`, or `native-multilingual` |
 | `quality_model_dir` | Exact verified native-quality model directory when choosing a native backend |
 
 Receipt and model paths must be absolute, UTF-8, NUL-free, and at most 4096 bytes.
 Model selection never inherits an unspecified process default and never downloads
 or acquires artifacts. Quality-only activation loads only its quality provider;
-a full generation loads and validates fast and quality independently.
+Full and partial generations load and validate fast and quality independently.
 
 The candidate must belong to the original qualified root, security profile and
 topology, and must advance the authority sequence. Each tier's prepared-input
@@ -1020,6 +1077,21 @@ membership are admitted before loading replacement models. Each new producer
 must then match its selected embedding space, producer and input identities.
 After loading, the server reopens that exact authority on its retained root to
 detect an intervening publication. It never follows a different head.
+
+For a partial session, build the successor using `authority-rebuild
+--retained-source --migrate-model`. Warm adoption requires the exact same source
+checkpoint, complete stored source, lexical image, and actual quality-covered
+IDs. The server compares authenticated vector membership before loading either
+model; equal counts cannot authorize a different subset. Source edits use the
+separate partial update operation, and expansion to full coverage uses
+`activate_quality_completion`. Each tier retains its own prepared-input contract,
+including when those contracts differ between fast and quality.
+
+Successful model activation replaces both query-embedding caches. A repeated
+query is embedded under the admitted replacement identities before becoming
+cacheable again. An activation refusal retains the previous models, caches,
+reader, and fixed scope. The next permitted update embeds documents with the
+installed producers and preserves that generation's partial coverage.
 
 Only after all checks pass does the request loop install the receipt, reader,
 fixed scope and complete model set together. The response reports
@@ -1063,7 +1135,8 @@ fields:
 An update contains at most 1,000 mutation records, counting overwritten edits,
 and must fit within the existing 1 MiB request limit. Every record is validated;
 the final operation for each ID wins. Empty `changes` may advance the checkpoint.
-The complete resulting cohort may be empty and must satisfy the same
+Single-tier and full sessions may produce an empty cohort. Partial sessions
+must preserve a nonempty proper quality subset. Every result satisfies the same
 100,000-document, 16 MiB record and 256 MiB encoded-source limits as the one-shot
 command. Destinations must be UTF-8 paths of at most 4,096 bytes, outside the
 selected root and separate from each other. `--batch-size` on the server
@@ -1077,7 +1150,11 @@ and graph parameters remain fixed. Full sessions retain both producers and reuse
 each tier's stored vector for unchanged content. Metadata-only edits therefore
 perform no document inference in either tier; each final changed document is
 embedded once by each producer. Complete successor images are built and admitted
-through the same path as `authority-update`.
+through the same path as `authority-update`. Partial sessions use the restricted
+subset-preserving builder: only changed covered documents reach quality
+inference, and new or uncovered documents remain fast-only. The server keeps
+both query embedding caches and recomputes the fixed source scope against the
+successor. Existing retained readers keep their original source and coverage.
 
 The new recovery receipt is synced before publication. A successful update
 installs the exact admitted reader returned by the publisher, then acknowledges

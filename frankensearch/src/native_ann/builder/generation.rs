@@ -161,11 +161,13 @@ impl NativeIndexBuilder {
     /// cohort records partial coverage explicitly and is admitted only through
     /// the partial-quality reader. Full-coverage admission remains strict. Graphs
     /// retain their own actual vector owners; no placeholder vectors are added.
-    /// This constructs a fresh generation, not an incremental update.
+    /// Fresh builders select the requested subset. A restricted
+    /// [`super::NativePartialQualityUpdate`] retains only surviving covered IDs
+    /// and reuses their own unchanged vectors; other reuse plans are refused.
     ///
     /// # Errors
-    /// Rejects missing quality, empty/full/duplicate/unknown selections, reuse
-    /// plans, and the source, image-budget and cancellation errors documented by
+    /// Rejects missing quality, empty/full/duplicate/unknown selections,
+    /// unauthorized coverage changes, and the source, image-budget and cancellation errors documented by
     /// [`Self::build_exact_generation`]. A failure may leave unselected work files.
     pub async fn build_partial_quality_generation(
         self,
@@ -175,11 +177,11 @@ impl NativeIndexBuilder {
         max_image_bytes: usize,
     ) -> SearchResult<NativeBuiltExactGeneration> {
         checkpoint(cx, "native_ann.builder.partial_quality_start")?;
-        if self.quality.is_none() || self.reuse.is_some() {
+        if self.quality.is_none() {
             return Err(invalid(
                 "builder.generation.partial_quality",
                 "unsupported-plan",
-                "partial quality requires two explicit providers and a fresh source build",
+                "partial quality requires two explicit providers",
             ));
         }
         let mut selected = BTreeSet::new();
@@ -199,6 +201,15 @@ impl NativeIndexBuilder {
                     "quality IDs must select fewer documents than the complete source",
                 ));
             }
+        }
+        if let Some(reuse) = &self.reuse
+            && reuse.preserved_partial_quality_ids(cx, &self.documents)? != selected
+        {
+            return Err(invalid(
+                "builder.generation.partial_quality",
+                "changed-membership",
+                "partial updates must preserve exactly the surviving covered IDs",
+            ));
         }
         Box::pin(self.build_composite_generation(
             cx,
@@ -281,6 +292,11 @@ impl NativeIndexBuilder {
                     documents.push(document.clone());
                 }
             }
+            let reuse = self
+                .reuse
+                .as_ref()
+                .map(|source| source.partial_quality_projection(cx).map(Arc::new))
+                .transpose()?;
             Some(Self {
                 directory: self.directory.join("partial-quality"),
                 generation: self.generation,
@@ -290,7 +306,7 @@ impl NativeIndexBuilder {
                 max_batch_input_bytes: self.max_batch_input_bytes,
                 split_failed_batches: self.split_failed_batches,
                 documents,
-                reuse: None,
+                reuse,
                 blocking_pool: self.blocking_pool.clone(),
             })
         } else {
