@@ -33,6 +33,10 @@ unmet criteria; retain dated history. It earns no capability credit.
     then owned group termination yields -15. A parser negative lacked a valid
     base-command control; add valid bases and exact refusal classification.
     Retain the original run and all actual-model evidence without full-gate credit.
+  - [x] Retire `b1fe37b7` before further test edits: two labels pass, terminal -15.
+    Finish the negative-control review: valid oversized JSON, unique over-limit
+    warm IDs, exact refusal codes, and a valid cancelled request that succeeds
+    unchanged when cancellation is cleared. Production implementation is unchanged.
 - [ ] Reverify the feature's original criteria in a fresh solo pass, update Beads
   honestly, publish source/evidence and verify both refs. The broader migration,
   platform and release tasks retain their original acceptance.

@@ -8610,25 +8610,26 @@ mod progressive_authority {
             let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
             let lock = fs::read(selected.root.join("LOCK")).unwrap();
             let before = calls(&fast, &quality);
-            for (label, input) in [
-                ("duplicate", "{\"id\":\"quality\",\"content\":\"retry\"}\n{\"id\":\"quality\",\"content\":\"changed\"}\n".to_owned()),
-                ("blank", "{\"id\":\" \",\"content\":\"retry\"}\n".to_owned()),
-                ("nul", "{\"id\":\"bad\\u0000\",\"content\":\"retry\"}\n".to_owned()),
-                ("unknown-field", "{\"id\":\"quality\",\"content\":\"retry\",\"op\":\"upsert\"}\n".to_owned()),
-                ("oversize", "x".repeat(MAX_RECORD_BYTES + 1)),
-                ("empty-partial", String::new()),
-                ("full-subset", "{\"id\":\"quality\",\"content\":\"retry\"}\n".to_owned()),
-                ("no-subset", "{\"id\":\"new\",\"content\":\"retry\"}\n".to_owned()),
+            for (label, input, expected) in [
+                ("duplicate", "{\"id\":\"quality\",\"content\":\"retry\"}\n{\"id\":\"quality\",\"content\":\"changed\"}\n".to_owned(), "IDs must be unique"),
+                ("blank", "{\"id\":\" \",\"content\":\"retry\"}\n".to_owned(), "IDs must be unique"),
+                ("nul", "{\"id\":\"bad\\u0000\",\"content\":\"retry\"}\n".to_owned(), "IDs must be unique"),
+                ("unknown-field", "{\"id\":\"quality\",\"content\":\"retry\",\"op\":\"upsert\"}\n".to_owned(), "invalid document on line 1"),
+                ("oversize", format!("{{\"id\":\"quality\",\"content\":\"{}\"}}\n", "x".repeat(MAX_RECORD_BYTES)), "input exceeds its 16 MiB record or 256 MiB stream limit"),
+                ("empty-partial", String::new(), "partial_quality_update_requires_partial_coverage"),
+                ("full-subset", "{\"id\":\"quality\",\"content\":\"retry\"}\n".to_owned(), "partial_quality_update_requires_partial_coverage"),
+                ("no-subset", "{\"id\":\"new\",\"content\":\"retry\"}\n".to_owned(), "partial_quality_update_requires_partial_coverage"),
             ] {
                 let path = parent.join(format!("{label}.jsonl"));
                 fs::write(&path, input).unwrap();
                 let mut options = update_options(&parent, &initial.receipt, label, &path, 8);
                 options.replace_source = true;
                 let mut loads = 0;
-                assert!(update_generation_with_loader(&cx, &options, &mut Vec::new(), |_| {
+                let error = update_generation_with_loader(&cx, &options, &mut Vec::new(), |_| {
                     loads += 1;
                     Err(bad("invalid replacement must precede model loading"))
-                }).await.is_err(), "{label}");
+                }).await.err().unwrap();
+                assert!(error.to_string().contains(expected), "{label}: {error}");
                 assert_eq!(loads, 0, "{label}");
                 assert!(!options.work.unwrap().exists(), "{label}");
                 assert!(!options.receipt.exists(), "{label}");
@@ -8659,33 +8660,49 @@ mod progressive_authority {
             let response = exchange(&cx, &mut session, std::slice::from_ref(&base)).await;
             assert_eq!(response[1]["code"], "updates_disabled");
             session = session.with_updates(2, MAX_INPUT_BYTES).unwrap();
-            for (label, documents) in [
+            for (label, documents, code) in [
                 (
                     "duplicate",
                     serde_json::json!([{"id":"quality","content":"retry"},{"id":"quality","content":"retry"}]),
+                    "invalid_update_documents",
                 ),
-                ("blank", serde_json::json!([{"id":" ","content":"retry"}])),
-                ("empty", serde_json::json!([])),
+                (
+                    "blank",
+                    serde_json::json!([{"id":" ","content":"retry"}]),
+                    "invalid_update_documents",
+                ),
+                (
+                    "empty",
+                    serde_json::json!([]),
+                    "partial_quality_update_requires_partial_coverage",
+                ),
                 (
                     "full-subset",
                     serde_json::json!([{"id":"quality","content":"retry"}]),
+                    "partial_quality_update_requires_partial_coverage",
                 ),
                 (
                     "no-subset",
                     serde_json::json!([{"id":"new","content":"retry"}]),
+                    "partial_quality_update_requires_partial_coverage",
                 ),
                 (
                     "oversize",
-                    serde_json::json!(vec![
-                        serde_json::json!({"id":"new","content":"retry"});
-                        MAX_AUTHORITY_MUTATIONS + 1
-                    ]),
+                    serde_json::json!(
+                        (0..=MAX_AUTHORITY_MUTATIONS)
+                            .map(|id| {
+                                serde_json::json!({"id":format!("limit-{id}"),"content":"retry"})
+                            })
+                            .collect::<Vec<_>>()
+                    ),
+                    "update_mutation_limit",
                 ),
             ] {
                 let mut request = base.clone();
                 request["documents"] = documents;
                 let response = exchange(&cx, &mut session, &[request]).await;
                 assert_eq!(response[1]["event"], "failed", "{label}: {response:?}");
+                assert_eq!(response[1]["code"], code, "{label}: {response:?}");
                 assert!(Arc::ptr_eq(&session.snapshot, &opened));
                 assert!(!parent.join("warm-work").exists());
                 assert!(!parent.join("warm.json").exists());
@@ -8708,9 +8725,19 @@ mod progressive_authority {
                 exchange(&cx, &mut session, &[backward]).await[1]["code"],
                 "backward_source_checkpoint"
             );
+            let mut cancelled = base;
+            cancelled["documents"] = serde_json::json!([
+                {"id":"quality","content":"retry network with quality coverage"},
+                {"id":"new","content":"retry newly added source"}
+            ]);
             cx.set_cancel_requested(true);
-            let request: AuthorityUpdateRequest = serde_json::from_value(base).unwrap();
-            assert!(session.update(&cx, request).await.is_err());
+            let request: AuthorityUpdateRequest =
+                serde_json::from_value(cancelled.clone()).unwrap();
+            let error = session.update(&cx, request).await.err().unwrap();
+            assert!(matches!(
+                error.downcast_ref::<SearchError>(),
+                Some(SearchError::Cancelled { phase, .. }) if phase == "native_cli.authority"
+            ));
             cx.set_cancel_requested(false);
             assert_eq!(calls(&fast, &quality), before);
             assert_eq!(
@@ -8718,6 +8745,12 @@ mod progressive_authority {
                 authority
             );
             assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock);
+            assert!(!parent.join("warm-work").exists());
+            assert!(!parent.join("warm.json").exists());
+            let request = serde_json::from_value(cancelled).unwrap();
+            let response = session.update(&cx, request).await.unwrap();
+            assert_eq!(response["event"], "updated");
+            assert_eq!(calls(&fast, &quality), (before.0 + 1, before.1));
         });
     }
 
