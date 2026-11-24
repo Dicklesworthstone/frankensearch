@@ -1241,22 +1241,25 @@ impl Receipt {
     }
 
     fn topology(&self) -> NativeGenerationTopology {
-        if let Some(quality_documents) = self.quality_documents {
-            NativeGenerationTopology::PartialQuality {
+        self.quality_documents.map_or_else(
+            || {
+                if self.quality_identity.is_some() {
+                    NativeGenerationTopology::FullProgressive
+                } else if self.tier == EmbedderTierTag::Quality {
+                    NativeGenerationTopology::QualityOnly
+                } else {
+                    NativeGenerationTopology::FastOnly
+                }
+            },
+            |quality_documents| NativeGenerationTopology::PartialQuality {
                 quality_documents,
                 total_documents: self.documents,
                 coverage_ppm: u32::try_from(
                     quality_documents.saturating_mul(1_000_000) / self.documents.max(1),
                 )
                 .unwrap_or(u32::MAX),
-            }
-        } else if self.quality_identity.is_some() {
-            NativeGenerationTopology::FullProgressive
-        } else if self.tier == EmbedderTierTag::Quality {
-            NativeGenerationTopology::QualityOnly
-        } else {
-            NativeGenerationTopology::FastOnly
-        }
+            },
+        )
     }
 
     fn topology_name(&self) -> &'static str {

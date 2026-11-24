@@ -1556,16 +1556,19 @@ impl TwoTierSearcher {
         mode: SearchExecutionMode,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<TwoTierMetrics> {
-        self.search_with_filter_state(
+        let mut request_filter = RequestFilter::new(filter);
+        // Prove the composed retrieval future's Send bound inside the library,
+        // keeping downstream callers independent of its internal type depth.
+        let search: SearchFuture<'_, _> = Box::pin(self.search_with_filter_state(
             cx,
             query,
             k,
             text_fn,
             on_phase,
             mode,
-            &mut RequestFilter::new(filter),
-        )
-        .await
+            &mut request_filter,
+        ));
+        search.await
     }
 
     /// Borrow request observations so an outer deadline can validate the last
