@@ -47,9 +47,9 @@ pub use snapshot::NativeReopenLimits;
 pub mod sharded;
 
 mod update;
-#[cfg(feature = "quill")]
-pub use update::NativeQualityCompletion;
 pub use update::{NativeIndexQualityCompletion, NativeIndexUpdate};
+#[cfg(feature = "quill")]
+pub use update::{NativePartialQualityUpdate, NativeQualityCompletion};
 use update::{ReuseRole, ReuseSource};
 
 #[cfg(feature = "quill")]

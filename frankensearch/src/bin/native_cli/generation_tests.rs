@@ -8130,7 +8130,373 @@ mod progressive_authority {
     }
 
     #[test]
-    fn partial_quality_cli_rejects_forged_coverage_and_unsupported_mutation() {
+    fn partial_authority_updates_preserve_membership_and_reuse_each_covered_vector() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ann in [false, true] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let (initial, selected) =
+                    publish_partial_cli(&cx, &parent, &fast, &quality, ann).await;
+                let retained = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let original_receipt = fs::read(&initial.receipt).unwrap();
+                fs::rename(
+                    initial.input.as_ref().unwrap(),
+                    parent.join("archived-partial-input"),
+                )
+                .unwrap();
+                let metadata = parent.join("metadata-edits.jsonl");
+                fs::write(
+                    &metadata,
+                    concat!(
+                        "{\"op\":\"upsert\",\"id\":\"quality\",\"content\":\"retry network with quality coverage\",\"title\":\"Retained quality\"}\n",
+                        "{\"op\":\"upsert\",\"id\":\"fast-only\",\"content\":\"retry fallback remains searchable\",\"metadata\":{\"tenant\":\"A\"}}\n",
+                    ),
+                )
+                .unwrap();
+                let first = update_options(&parent, &initial.receipt, "metadata", &metadata, 8);
+                let before = calls(&fast, &quality);
+                let mut loads = Vec::new();
+                let mut output = Vec::new();
+                update_generation_with_loader(&cx, &first, &mut output, |tier| {
+                    loads.push(tier);
+                    Ok(match tier {
+                        EmbedderTierTag::Fast => fast.clone(),
+                        EmbedderTierTag::Quality => quality.clone(),
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(loads, [EmbedderTierTag::Fast, EmbedderTierTag::Quality]);
+                assert_eq!(calls(&fast, &quality), before);
+                let metadata_receipt = Receipt::read(&first.receipt).unwrap();
+                let metadata_reader = metadata_receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    metadata_reader.partial_quality_document_ids(&cx).unwrap(),
+                    ["quality"]
+                );
+                assert_eq!(
+                    metadata_reader
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap()
+                        .iter()
+                        .find(|document| document.id == "quality")
+                        .unwrap()
+                        .title
+                        .as_deref(),
+                    Some("Retained quality")
+                );
+
+                let changes = parent.join("content-edits.jsonl");
+                fs::write(
+                    &changes,
+                    concat!(
+                        "{\"op\":\"upsert\",\"id\":\"quality\",\"content\":\"retry changed quality content\"}\n",
+                        "{\"op\":\"upsert\",\"id\":\"fast-only\",\"content\":\"retry changed fast content\"}\n",
+                        "{\"op\":\"delete\",\"id\":\"garden\"}\n",
+                        "{\"op\":\"upsert\",\"id\":\"new\",\"content\":\"retry newly discovered document\"}\n",
+                    ),
+                )
+                .unwrap();
+                let second = update_options(&parent, &first.receipt, "content", &changes, 9);
+                let before = calls(&fast, &quality);
+                output.clear();
+                update_generation_with_loader(&cx, &second, &mut output, |tier| {
+                    Ok(match tier {
+                        EmbedderTierTag::Fast => fast.clone(),
+                        EmbedderTierTag::Quality => quality.clone(),
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(calls(&fast, &quality), (before.0 + 3, before.1 + 1));
+                let current = Receipt::read(&second.receipt).unwrap();
+                let reopened = current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(current.schema, PARTIAL_QUALITY_RECEIPT_SCHEMA);
+                assert_eq!(current.documents, 3);
+                assert_eq!(current.quality_documents, Some(1));
+                assert_eq!(current.identity, selected.identity);
+                assert_eq!(current.quality_identity, selected.quality_identity);
+                assert_eq!(
+                    reopened.partial_quality_document_ids(&cx).unwrap(),
+                    ["quality"]
+                );
+                assert_eq!(
+                    reopened.retrieval_configuration(),
+                    retained.retrieval_configuration()
+                );
+                assert_eq!(
+                    reopened.quality_retrieval_configuration(),
+                    retained.quality_retrieval_configuration()
+                );
+                assert_eq!(
+                    reopened.metadata().commit_range,
+                    CommitRange { low: 2, high: 9 }
+                );
+                let documents = reopened.source_documents(&cx, MAX_INPUT_BYTES).unwrap();
+                assert_eq!(
+                    documents
+                        .iter()
+                        .map(|document| document.id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["fast-only", "new", "quality"])
+                );
+                assert!(
+                    retained
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap()
+                        .iter()
+                        .any(|document| document.id == "garden")
+                );
+                assert_eq!(fs::read(&initial.receipt).unwrap(), original_receipt);
+                assert_eq!(retained.topology(), selected.topology());
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["event"], "updated");
+                assert_eq!(report["selection"]["quality_documents"], 1);
+                assert_eq!(report["documents"], 3);
+                let query = partial_search_options(&second.receipt, Some(QueryMode::Partial));
+                output.clear();
+                search_with_loader(&cx, &query, &mut output, |tier| {
+                    Ok(match tier {
+                        EmbedderTierTag::Fast => fast.clone(),
+                        EmbedderTierTag::Quality => quality.clone(),
+                    })
+                })
+                .await
+                .unwrap();
+                let response = frames(&output);
+                assert_eq!(response.len(), 2);
+                assert_eq!(response[1]["phase"], "refined");
+                assert_eq!(response[1]["quality_coverage"]["quality_documents"], 1);
+                assert_eq!(response[1]["results"].as_array().unwrap().len(), 3);
+            }
+        });
+    }
+
+    #[test]
+    fn partial_warm_updates_keep_scopes_query_caches_and_old_readers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (_, selected) = publish_partial_cli(&cx, &parent, &fast, &quality, true).await;
+            let root = admit_root(&selected.root).unwrap();
+            let retained = Arc::new(
+                selected
+                    .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                    .unwrap(),
+            );
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                selected.clone(),
+                Arc::clone(&retained),
+                models(&fast, &quality),
+                (4, DEFAULT_IMAGE_BYTES),
+                false,
+            )
+            .unwrap()
+            .with_query_cache(&cx, query_cache::Config::parse("4").unwrap())
+            .unwrap()
+            .with_filter(
+                &cx,
+                Some(Filter::parse(r#"{"ids":["quality","fast-only","new"]}"#).unwrap()),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap()
+            .with_updates(2, MAX_INPUT_BYTES)
+            .unwrap();
+            let fast_cache = Arc::clone(&session.query_models().models().unwrap().fast);
+            let quality_cache = Arc::clone(
+                session
+                    .query_models()
+                    .models()
+                    .unwrap()
+                    .quality
+                    .as_ref()
+                    .unwrap(),
+            );
+            let response = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({"query":"retry", "mode":"partial", "stream":true})],
+            )
+            .await;
+            assert_eq!(response[0]["updates_enabled"], true);
+            assert_eq!(response[2]["results"].as_array().unwrap().len(), 2);
+            let before = calls(&fast, &quality);
+            let next_path = parent.join("warm-partial-updated.json");
+            let response = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({
+                    "op":"update", "id":"partial-edit", "expected_authority":selected.authority,
+                    "work_dir":parent.join("warm-partial-work"), "new_receipt":next_path,
+                    "source_low":2, "source_high":8, "changes":[
+                        {"op":"upsert", "id":"quality", "content":"retry revised quality document"},
+                        {"op":"upsert", "id":"new", "content":"retry new fast-only document"}
+                    ]
+                })],
+            )
+            .await;
+            assert_eq!(response[1]["event"], "updated");
+            assert_eq!(response[1]["publication"], "committed");
+            assert_eq!(response[1]["scope"]["eligible_documents"], 3);
+            assert_eq!(response[1]["quality_coverage"]["quality_documents"], 1);
+            assert_eq!(response[1]["quality_coverage"]["total_documents"], 4);
+            assert_eq!(calls(&fast, &quality), (before.0 + 2, before.1 + 1));
+            assert!(Arc::ptr_eq(
+                &fast_cache,
+                &session.query_models().models().unwrap().fast
+            ));
+            assert!(Arc::ptr_eq(
+                &quality_cache,
+                session
+                    .query_models()
+                    .models()
+                    .unwrap()
+                    .quality
+                    .as_ref()
+                    .unwrap()
+            ));
+            assert_eq!(
+                session.snapshot.partial_quality_document_ids(&cx).unwrap(),
+                ["quality"]
+            );
+            assert_eq!(retained.metadata().total_documents, 3);
+            assert_eq!(retained.topology(), selected.topology());
+            assert_eq!(session.scope.as_ref().unwrap().len(), 3);
+            let next = Receipt::read(&next_path).unwrap();
+            assert_eq!(next.authority, session.receipt.authority);
+            next.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+
+            let before = calls(&fast, &quality);
+            let response = exchange(
+                &cx,
+                &mut session,
+                &[
+                    serde_json::json!({"id":"current", "query":"retry", "mode":"partial", "stream":true}),
+                    serde_json::json!({"id":"intersection", "query":"retry", "mode":"partial", "stream":true,
+                        "filter":{"ids":["new","garden"]}}),
+                ],
+            )
+            .await;
+            assert_eq!(response[2]["results"].as_array().unwrap().len(), 3);
+            assert_eq!(response[4]["results"].as_array().unwrap().len(), 1);
+            assert_eq!(response[4]["results"][0]["doc_id"], "new");
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "query embeddings remain warm"
+            );
+
+            let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            for (label, expected, changes, code) in [
+                (
+                    "stale",
+                    selected.authority.clone(),
+                    serde_json::json!([]),
+                    "stale_expected_authority",
+                ),
+                (
+                    "empty-quality",
+                    next.authority.clone(),
+                    serde_json::json!([{"op":"delete", "id":"quality"}]),
+                    "partial_quality_update_requires_partial_coverage",
+                ),
+            ] {
+                let work = parent.join(format!("{label}-work"));
+                let receipt = parent.join(format!("{label}.json"));
+                let response = exchange(
+                    &cx,
+                    &mut session,
+                    &[serde_json::json!({
+                        "op":"update", "id":label, "expected_authority":expected,
+                        "work_dir":work, "new_receipt":receipt,
+                        "source_low":2, "source_high":9, "changes":changes
+                    })],
+                )
+                .await;
+                assert_eq!(response[1]["event"], "failed");
+                assert_eq!(response[1]["code"], code);
+                assert_eq!(calls(&fast, &quality), before);
+                assert!(!work.exists());
+                assert!(!receipt.exists());
+                assert_eq!(session.receipt.authority, next.authority);
+                assert_eq!(
+                    fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                    authority
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn partial_update_inference_failure_and_full_subset_collapse_preserve_authority() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (initial, selected) =
+                publish_partial_cli(&cx, &parent, &fast, &quality, false).await;
+            let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            let changes = parent.join("collapse-edits.jsonl");
+            fs::write(
+                &changes,
+                "{\"op\":\"delete\",\"id\":\"fast-only\"}\n{\"op\":\"delete\",\"id\":\"garden\"}\n",
+            )
+            .unwrap();
+            let collapse = update_options(&parent, &initial.receipt, "full-collapse", &changes, 8);
+            let before = calls(&fast, &quality);
+            let error = update_generation_with_loader(&cx, &collapse, &mut Vec::new(), |_| {
+                panic!("subset collapse must refuse before loading either model")
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<AuthorityServeRefusal>().unwrap().0,
+                "partial_quality_update_requires_partial_coverage"
+            );
+            assert_eq!(calls(&fast, &quality), before);
+            assert!(!collapse.work.as_ref().unwrap().exists());
+            assert!(!collapse.receipt.exists());
+
+            let changes = parent.join("failing-edits.jsonl");
+            fs::write(
+                &changes,
+                "{\"op\":\"upsert\",\"id\":\"quality\",\"content\":\"retry changed covered content\"}\n",
+            )
+            .unwrap();
+            let failing = update_options(&parent, &initial.receipt, "failing", &changes, 8);
+            let mut output = Vec::new();
+            let result = update_generation_with_loader(&cx, &failing, &mut output, |tier| {
+                Ok(match tier {
+                    EmbedderTierTag::Fast => fast.clone() as Arc<dyn Embedder>,
+                    EmbedderTierTag::Quality => Arc::new(FailingQuality {
+                        inner: Arc::clone(&quality),
+                    }) as Arc<dyn Embedder>,
+                })
+            })
+            .await;
+            assert!(result.is_err());
+            assert!(output.is_empty());
+            assert!(!failing.receipt.exists());
+            assert_eq!(calls(&fast, &quality), (before.0 + 1, before.1 + 1));
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority
+            );
+            let reopened = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(
+                reopened.partial_quality_document_ids(&cx).unwrap(),
+                ["quality"]
+            );
+            assert_eq!(reopened.topology(), selected.topology());
+        });
+    }
+
+    #[test]
+    fn partial_quality_cli_rejects_forged_coverage_and_subset_collapse() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let parent = private_parent();
             let fast = provider(false);
@@ -8150,7 +8516,7 @@ mod progressive_authority {
             let mut output = Vec::new();
             assert!(
                 update_generation_with_loader(&cx, &update, &mut output, |_| {
-                    panic!("unsupported partial mutation must refuse before model loading")
+                    panic!("partial subset collapse must refuse before model loading")
                 })
                 .await
                 .is_err()

@@ -163,11 +163,12 @@ They default to fast search; --mode partial explicitly enables quality refinemen
 including streaming, filters, deadlines and optional reranking. Full and direct\n\
 quality modes require complete coverage and refuse partial generations. Results\n\
 report quality document counts and coverage. Full-query tuning remains full-only.\n\
-Partial generations support search, fetch, read-only serve, attempt recovery and\n\
-retained rollback. Graph repair with --reuse-vectors also preserves partial coverage.\n\
-Update, rebuild, source-only repair and ordinary model activation refuse partial\n\
-sources. Explicit quality completion accepts fast-only or partial sources. A warm\n\
-partial session accepts mode=partial explicitly.\n\
+Partial generations support search, fetch, serve, attempt recovery and retained\n\
+rollback. Updates preserve surviving covered IDs; new/uncovered IDs stay fast-only.\n\
+Removing all covered or all uncovered IDs refuses before model loading/staging.\n\
+Graph repair with --reuse-vectors preserves the exact subset. Rebuild, source-only\n\
+repair and ordinary model activation still refuse partial sources. Explicit quality\n\
+completion accepts fast-only or partial sources. Warm sessions accept mode=partial.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
 missing or invalid graphs fail admission without substituting exact retrieval.\n\
@@ -193,7 +194,8 @@ operation for each ID winning. It reuses unchanged content vectors and preserves
 the selected producers, topology, precision, and retrieval policy. Only changed or new\n\
 content is embedded; complete vector, graph, and Quill images are still produced.\n\
 The final cohort satisfies the combined encoded-source limits. Deleting every\n\
-document publishes a complete empty generation that later updates can populate.\n\
+document publishes a complete empty generation that later updates can populate,\n\
+except partial quality updates, which must retain a nonempty proper quality subset.\n\
 Updates require nonbackward source checkpoints and a new work directory/receipt.\n\
 Use rebuild for producer or retrieval changes. Update never changes old images.\n\
 Repair explicitly admits the selected control state, metadata and complete stored\n\
@@ -1705,7 +1707,15 @@ fn prepare_publication_with_intent(
                     NativeGenerationTopology::FastOnly | NativeGenerationTopology::QualityOnly => {
                         built.quality_binding().is_none()
                     }
-                    NativeGenerationTopology::PartialQuality { .. } => false,
+                    NativeGenerationTopology::PartialQuality { .. } => {
+                        built.coverage() == VectorCohortCoverage::PartialQuality
+                            && snapshot.metadata().embedders.get("fast")
+                                == Some(built.binding().frozen_identity())
+                            && built.quality_binding().is_some_and(|binding| {
+                                snapshot.metadata().embedders.get("quality")
+                                    == Some(binding.frozen_identity())
+                            })
+                    }
                 },
                 PublicationIntent::CompleteQuality => {
                     let quality_identity_matches = match snapshot.topology() {
@@ -2590,7 +2600,6 @@ where
     F: FnOnce() -> Result<mutations::Edits>,
 {
     checkpoint(cx)?;
-    selected.require_complete_for_mutation()?;
     if snapshot.retained_snapshot().selected_history_of().is_some()
         || snapshot.authority() != selected.authority()?
     {
@@ -2626,6 +2635,18 @@ where
     let documents = retained_rebuild_documents(cx, snapshot, spec.limits.max_source_bytes)?;
     let edits = read_edits()?;
     let document_count = mutations::validate_final_source(cx, &documents, &edits)?;
+    if selected.quality_documents.is_some() {
+        let covered = snapshot.partial_quality_document_ids(cx)?;
+        let remaining = covered
+            .iter()
+            .filter(|id| !matches!(edits.get(id.as_str()), Some(None)))
+            .count();
+        if remaining == 0 || remaining >= document_count {
+            return Err(serve_refused(
+                "partial_quality_update_requires_partial_coverage",
+            ));
+        }
+    }
     // The library prepares reuse from the same immutable image. Let these
     // preflight bodies go before loading a model or materializing that source.
     checkpoint(cx)?;
@@ -2653,45 +2674,75 @@ async fn build_and_publish_update(
         document_count,
     } = prepared;
     admit_serving_models(selected, loaded)?;
-    let transaction = if let Some(quality) = &loaded.quality {
-        snapshot.begin_progressive_update(
-            cx,
-            &spec.work,
-            new_generation(sequence)?,
-            Arc::clone(&loaded.fast),
-            Arc::clone(quality),
-            spec.limits.max_source_bytes,
-        )?
+    let built = if selected.quality_documents.is_some() {
+        let quality = loaded
+            .quality
+            .as_ref()
+            .ok_or_else(|| bad("partial update requires its retained quality provider"))?;
+        let mut transaction = snapshot
+            .begin_partial_quality_update(
+                cx,
+                &spec.work,
+                new_generation(sequence)?,
+                Arc::clone(&loaded.fast),
+                Arc::clone(quality),
+                spec.limits.max_source_bytes,
+            )?
+            .with_batch_size(spec.limits.batch_size)?
+            .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+        for (id, document) in edits {
+            checkpoint(cx)?;
+            transaction = match document {
+                Some(document) => transaction.upsert_document(document),
+                None => transaction.delete_document(id),
+            };
+        }
+        Box::pin(transaction.build(cx, spec.source, spec.max_image_bytes)).await?
     } else {
-        snapshot.begin_update(
-            cx,
-            &spec.work,
-            new_generation(sequence)?,
-            Arc::clone(&loaded.fast),
-            spec.limits.max_source_bytes,
-        )?
-    };
-    let mut transaction = transaction
-        .with_batch_size(spec.limits.batch_size)?
-        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
-    for (id, document) in edits {
-        checkpoint(cx)?;
-        transaction = match document {
-            Some(document) => transaction.upsert_document(document),
-            None => transaction.delete_document(id),
+        let transaction = if let Some(quality) = &loaded.quality {
+            snapshot.begin_progressive_update(
+                cx,
+                &spec.work,
+                new_generation(sequence)?,
+                Arc::clone(&loaded.fast),
+                Arc::clone(quality),
+                spec.limits.max_source_bytes,
+            )?
+        } else {
+            snapshot.begin_update(
+                cx,
+                &spec.work,
+                new_generation(sequence)?,
+                Arc::clone(&loaded.fast),
+                spec.limits.max_source_bytes,
+            )?
         };
-    }
-    let built = if selected.quality_identity.is_some() {
-        Box::pin(transaction.build_progressive_generation(cx, spec.source, spec.max_image_bytes))
+        let mut transaction = transaction
+            .with_batch_size(spec.limits.batch_size)?
+            .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+        for (id, document) in edits {
+            checkpoint(cx)?;
+            transaction = match document {
+                Some(document) => transaction.upsert_document(document),
+                None => transaction.delete_document(id),
+            };
+        }
+        if selected.quality_identity.is_some() {
+            Box::pin(transaction.build_progressive_generation(
+                cx,
+                spec.source,
+                spec.max_image_bytes,
+            ))
             .await?
-    } else {
-        Box::pin(transaction.build_exact_generation(
-            cx,
-            selected.tier,
-            spec.source,
-            spec.max_image_bytes,
-        ))
-        .await?
+        } else {
+            Box::pin(transaction.build_exact_generation(
+                cx,
+                selected.tier,
+                spec.source,
+                spec.max_image_bytes,
+            ))
+            .await?
+        }
     };
     if built.binding().frozen_identity() != &selected.identity
         || built
@@ -3759,7 +3810,6 @@ impl AuthoritySession {
     }
 
     fn with_updates(mut self, batch_size: usize, max_source_bytes: usize) -> Result<Self> {
-        self.receipt.require_complete_for_mutation()?;
         self.require_current_selection()?;
         self.models.models()?;
         if batch_size == 0 || batch_size > MAX_DOCUMENTS || max_source_bytes == 0 {
@@ -4565,8 +4615,8 @@ async fn serve(
     }
     if options.allow_model_activation {
         // A partial session may explicitly adopt a completed quality tier.
-        // Ordinary model activation and updates enforce their own topology
-        // guards; this grant alone does not authorize changing the subset.
+        // Ordinary model activation keeps its own topology guard, and partial
+        // updates preserve membership independently of this activation grant.
         session.require_current_selection()?;
         session.models.models()?;
         session.allow_model_activation = true;

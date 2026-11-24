@@ -6,6 +6,8 @@
 //! Compatible native graphs retain their topology and insert only new documents.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "quill")]
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -409,12 +411,205 @@ impl NativeQualityCompletion {
     }
 }
 
+/// Edit a partial authority cohort while preserving its covered document IDs.
+///
+/// Surviving quality members stay covered, including after content changes.
+/// New IDs and previously uncovered IDs remain fast-only. Each tier reuses only
+/// its own unchanged source vectors and keeps its independent storage/retrieval
+/// policy unless explicitly overridden. The complete source and original
+/// authority remain pinned until the successor passes component admission.
+///
+/// This plan exposes only partial-quality finalization. An edit that leaves an
+/// empty or fully covered source is refused before files or inference; topology
+/// transitions retain their separate explicit contracts. No build publishes,
+/// changes the selected authority, or invalidates an existing reader.
+#[cfg(feature = "quill")]
+pub struct NativePartialQualityUpdate {
+    update: NativeIndexUpdate,
+}
+
+#[cfg(feature = "quill")]
+impl NativePartialQualityUpdate {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn from_authority(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        fast_provider: Arc<dyn crate::Embedder>,
+        quality_provider: Arc<dyn crate::Embedder>,
+        snapshot: &NativeGenerationSnapshot,
+        max_source_bytes: usize,
+        index: Arc<NativeAnnIndex>,
+        quality_index: Arc<NativeAnnIndex>,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.partial_update.prepare")?;
+        if !matches!(
+            snapshot.topology(),
+            crate::native_ann::NativeGenerationTopology::PartialQuality { .. }
+        ) {
+            return Err(invalid(
+                "partial_update.topology",
+                "partial-quality-required",
+                "subset-preserving updates require an admitted partial quality generation",
+            ));
+        }
+        let update = NativeIndexUpdate::from_authority_with_intent(
+            cx,
+            directory,
+            generation,
+            fast_provider,
+            snapshot,
+            max_source_bytes,
+            index,
+            Some((quality_provider, quality_index)),
+            AuthorityUpdateIntent::PreservePartialQuality,
+        )?;
+        Ok(Self { update })
+    }
+
+    /// Insert or replace one complete source record, preserving its prior coverage.
+    ///
+    /// New IDs remain fast-only. The last edit for an ID wins; source-only title
+    /// or metadata changes do not require document inference.
+    #[must_use]
+    pub fn upsert_document(mut self, document: IndexableDocument) -> Self {
+        self.update = self.update.upsert_document(document);
+        self
+    }
+
+    /// Apply upserts in iteration order with last-edit-wins semantics.
+    #[must_use]
+    pub fn upsert_documents(self, documents: impl IntoIterator<Item = IndexableDocument>) -> Self {
+        documents.into_iter().fold(self, Self::upsert_document)
+    }
+
+    /// Remove an ID from the source and every tier that previously covered it.
+    #[must_use]
+    pub fn delete_document(mut self, id: impl Into<String>) -> Self {
+        self.update = self.update.delete_document(id);
+        self
+    }
+
+    /// Bound document inference batch size in both tiers.
+    ///
+    /// # Errors
+    /// Refuses zero.
+    pub fn with_batch_size(mut self, batch_size: usize) -> SearchResult<Self> {
+        self.update = self.update.with_batch_size(batch_size)?;
+        Ok(self)
+    }
+
+    /// Bound prepared content bytes in each inference batch.
+    ///
+    /// # Errors
+    /// Refuses zero. Every surviving source is preflighted before build files.
+    pub fn with_max_batch_input_bytes(mut self, max_bytes: usize) -> SearchResult<Self> {
+        self.update = self.update.with_max_batch_input_bytes(max_bytes)?;
+        Ok(self)
+    }
+
+    /// Override fast storage or graph policy without changing its producer.
+    ///
+    /// Changing precision re-embeds every surviving fast document.
+    #[must_use]
+    pub fn with_fast_storage(
+        mut self,
+        precision: NativeBuildPrecision,
+        retrieval: NativeBuildRetrieval,
+    ) -> Self {
+        self.update = self.update.with_fast_storage(precision, retrieval);
+        self
+    }
+
+    /// Override quality storage or graph policy without changing its membership.
+    ///
+    /// Changing precision re-embeds only the surviving covered documents.
+    ///
+    /// # Errors
+    /// Propagates invalid quality storage configuration.
+    pub fn with_quality_storage(
+        mut self,
+        precision: NativeBuildPrecision,
+        retrieval: NativeBuildRetrieval,
+    ) -> SearchResult<Self> {
+        self.update = self.update.with_quality_storage(precision, retrieval)?;
+        Ok(self)
+    }
+
+    /// Finalize vectors and graphs on the caller's existing blocking pool.
+    #[must_use]
+    pub fn with_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        self.update = self.update.with_blocking_pool(pool);
+        self
+    }
+
+    /// Build a new partial cohort from these edits and the retained membership.
+    ///
+    /// Covered content changes are independently embedded in both tiers. New
+    /// and uncovered content changes are embedded only in fast. No unavailable
+    /// quality row is treated as a request to expand coverage.
+    ///
+    /// # Errors
+    /// Refuses an empty/full surviving quality subset, backward source boundaries,
+    /// invalid source records, producer drift, budget exhaustion or cancellation.
+    /// All source/subset checks precede inference and work-file creation.
+    pub async fn build(
+        self,
+        cx: &Cx,
+        source: CommitRange,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.partial_update.build")?;
+        let retained = self.update.builder.reuse.as_ref().ok_or_else(|| {
+            invalid(
+                "partial_update.source",
+                "missing",
+                "subset-preserving updates require their retained authority",
+            )
+        })?;
+        let authority = retained.partial_quality_authority()?;
+        if source.low < authority.source.low || source.high < authority.source.high {
+            return Err(invalid(
+                "partial_update.source",
+                "backward",
+                "partial updates must advance source boundaries monotonically",
+            ));
+        }
+        let authority_pin = Arc::clone(&authority.snapshot);
+        let builder = self.update.prepare(cx)?;
+        let selected = builder
+            .reuse
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    "partial_update.source",
+                    "missing",
+                    "subset-preserving updates require their retained source inventory",
+                )
+            })?
+            .preserved_partial_quality_ids(cx, &builder.documents)?;
+        let result = Box::pin(builder.build_partial_quality_generation(
+            cx,
+            source,
+            selected,
+            max_image_bytes,
+        ))
+        .await;
+        drop(authority_pin);
+        result
+    }
+}
+
 #[cfg(feature = "quill")]
 #[derive(Clone, Copy)]
 enum AuthorityUpdateIntent {
     RetainProducers,
     MigrateModels,
     CompleteQuality,
+    PreservePartialQuality,
 }
 
 impl NativeBuiltIndex {
@@ -677,7 +872,13 @@ impl NativeIndexUpdate {
             snapshot.topology(),
             crate::native_ann::NativeGenerationTopology::PartialQuality { .. }
         );
-        if partial_quality && !matches!(intent, AuthorityUpdateIntent::CompleteQuality) {
+        if partial_quality
+            && !matches!(
+                intent,
+                AuthorityUpdateIntent::CompleteQuality
+                    | AuthorityUpdateIntent::PreservePartialQuality
+            )
+        {
             return Err(invalid(
                 "update.inventory",
                 "partial-quality-unsupported",
@@ -798,7 +999,9 @@ impl NativeIndexUpdate {
                     fingerprint,
                     precision,
                     if partial_quality {
-                        ReuseCoverage::PartialQualityCompletion
+                        ReuseCoverage::PartialQuality {
+                            infer_missing: matches!(intent, AuthorityUpdateIntent::CompleteQuality),
+                        }
                     } else {
                         ReuseCoverage::Complete
                     },
@@ -818,6 +1021,7 @@ impl NativeIndexUpdate {
                 tier,
                 progressive,
                 source: snapshot.metadata().commit_range.clone(),
+                intent,
             }),
         }));
         checkpoint(cx, "native_ann.update.authority_prepared")?;
@@ -1212,14 +1416,15 @@ pub(super) struct ReuseSource {
     partitions: Vec<ReusePartition>,
     // Only explicit completion constructors may set this after proving every
     // predecessor partition is fast-only. Partial completion retains its quality
-    // owner and sparse row map instead; ordinary updates require a complete
-    // quality owner and must never treat a failed lookup as a fallback.
+    // owner and sparse row map instead. Subset-preserving updates retain the
+    // same sparse join but may never infer a missing quality row.
     completing_quality: bool,
     #[cfg(feature = "quill")]
     authority: Option<AuthorityReuse>,
 }
 
 #[cfg(feature = "quill")]
+#[derive(Clone)]
 struct AuthorityReuse {
     // Keep the original root/closure/reader pin even when only this prepared
     // update remains alive, including while a blocking finalizer owns it.
@@ -1227,6 +1432,7 @@ struct AuthorityReuse {
     tier: EmbedderTierTag,
     progressive: bool,
     source: CommitRange,
+    intent: AuthorityUpdateIntent,
 }
 
 struct ReusePartition {
@@ -1247,6 +1453,104 @@ impl ReuseSource {
             return None;
         }
         Some((self, ReuseRole::Quality))
+    }
+
+    #[cfg(feature = "quill")]
+    fn partial_quality_authority(&self) -> SearchResult<&AuthorityReuse> {
+        self.authority
+            .as_ref()
+            .filter(|authority| {
+                matches!(
+                    authority.intent,
+                    AuthorityUpdateIntent::PreservePartialQuality
+                )
+            })
+            .ok_or_else(|| {
+                invalid(
+                    "partial_update.source",
+                    "unauthorized-reuse",
+                    "partial reuse requires an explicit subset-preserving authority plan",
+                )
+            })
+    }
+
+    /// Select only surviving IDs that had actual rows in the admitted quality owner.
+    #[cfg(feature = "quill")]
+    pub(super) fn preserved_partial_quality_ids(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> SearchResult<BTreeSet<String>> {
+        self.partial_quality_authority()?;
+        let mut selected = BTreeSet::new();
+        for document in documents {
+            checkpoint(cx, "native_ann.partial_update.membership")?;
+            let Some((partition, position)) = self.find(&document.id) else {
+                continue;
+            };
+            let quality = partition.quality.as_ref().ok_or_else(|| {
+                invalid(
+                    "partial_update.source",
+                    "missing-quality",
+                    "partial reuse requires its admitted quality owner",
+                )
+            })?;
+            if !matches!(
+                quality.coverage,
+                ReuseCoverage::PartialQuality {
+                    infer_missing: false
+                }
+            ) {
+                return Err(invalid(
+                    "partial_update.source",
+                    "invalid-coverage",
+                    "subset preservation cannot infer absent quality rows",
+                ));
+            }
+            if quality.physical_rows[position] != usize::MAX {
+                selected.insert(document.id.clone());
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Project quality into a single-tier builder without borrowing the fast owner.
+    #[cfg(feature = "quill")]
+    pub(super) fn partial_quality_projection(&self, cx: &Cx) -> SearchResult<Self> {
+        let authority = self.partial_quality_authority()?;
+        let mut partitions = Vec::with_capacity(self.partitions.len());
+        for partition in &self.partitions {
+            checkpoint(cx, "native_ann.partial_update.quality_reuse")?;
+            let quality = partition.quality.as_ref().ok_or_else(|| {
+                invalid(
+                    "partial_update.source",
+                    "missing-quality",
+                    "partial reuse requires its admitted quality owner",
+                )
+            })?;
+            if !matches!(
+                quality.coverage,
+                ReuseCoverage::PartialQuality {
+                    infer_missing: false
+                }
+            ) {
+                return Err(invalid(
+                    "partial_update.source",
+                    "invalid-coverage",
+                    "subset preservation cannot infer absent quality rows",
+                ));
+            }
+            partitions.push(ReusePartition {
+                documents: Arc::clone(&partition.documents),
+                fast: quality.clone(),
+                quality: None,
+            });
+        }
+        Ok(Self {
+            partitions,
+            completing_quality: false,
+            authority: Some(authority.clone()),
+        })
     }
 
     /// Retain exact lexical bytes only for an identical complete source and cut.
@@ -1338,10 +1642,12 @@ impl ReuseSource {
     }
 }
 
+#[derive(Clone)]
 struct ReuseTier {
     index: Arc<NativeAnnIndex>,
     owner: Arc<ValidatedFsviBytes>,
-    // usize::MAX denotes a missing row only for explicit partial completion.
+    // usize::MAX marks an uncovered source ID only in explicit partial plans.
+    // Completion may infer it; subset-preserving updates must never submit it.
     // Keeping one word per source preserves the complete-update join's cost.
     physical_rows: Vec<usize>,
     coverage: ReuseCoverage,
@@ -1355,7 +1661,9 @@ struct ReuseTier {
 enum ReuseCoverage {
     Complete,
     #[cfg(feature = "quill")]
-    PartialQualityCompletion,
+    PartialQuality {
+        infer_missing: bool,
+    },
 }
 
 impl ReuseTier {
@@ -1486,11 +1794,16 @@ impl TierPlan {
                 }
                 let physical = tier.physical_rows[position];
                 if physical == usize::MAX {
-                    if tier.coverage == ReuseCoverage::Complete {
+                    let infer_missing = match tier.coverage {
+                        ReuseCoverage::Complete => false,
+                        #[cfg(feature = "quill")]
+                        ReuseCoverage::PartialQuality { infer_missing } => infer_missing,
+                    };
+                    if !infer_missing {
                         return Err(invalid(
                             "update.source_join",
                             "missing",
-                            "ordinary retained reuse requires a live physical row",
+                            "retained reuse requires a live physical row unless completing quality",
                         ));
                     }
                     changed.push(document.clone());

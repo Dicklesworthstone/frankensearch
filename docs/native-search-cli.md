@@ -282,10 +282,11 @@ Full-query tuning remains restricted to complete full generations.
 `authority-serve` retains both producers and accepts `"mode":"partial"` explicitly;
 its default remains fast. Source fetch, lexical search, publication-attempt
 recovery, and retained rollback use the complete admitted source. Partial sources
-support graph repair with `authority-repair --reuse-vectors` when both vector
-owners still authenticate. They currently refuse update, rebuild, source-only
-repair, and ordinary model activation; these operations need an explicit policy
-for preserving or changing the subset.
+support subset-preserving `authority-update` and granted warm updates, plus graph
+repair with `authority-repair --reuse-vectors` when both vector owners still
+authenticate. Rebuild, source-only repair, and ordinary model activation still
+refuse partial sources. These operations require a separate policy for changing
+the subset or reconstructing it after vector loss.
 `authority-complete-quality` explicitly fills the missing quality coverage and
 publishes a full generation before those ordinary maintenance operations resume.
 A warm partial server can adopt that completed generation through the explicit
@@ -296,6 +297,11 @@ Library callers use `build_partial_quality_generation(&cx, source, quality_ids,
 max_image_bytes)`, `NativeGenerationSnapshot::admit_partial_quality`, and
 `search_progressive_with_partial_quality` (including pool and scoped variants).
 The existing full-coverage methods continue to require complete quality coverage.
+For edits, `begin_partial_quality_update` returns a restricted
+`NativePartialQualityUpdate` plan with upsert/delete and batch/storage settings;
+`build(&cx, source, max_image_bytes)` preserves the surviving covered IDs.
+`partial_quality_document_ids(&cx)` exposes those authenticated IDs without
+exporting document content or loading models.
 
 ### Rerank an individual authority tier
 
@@ -669,6 +675,21 @@ and reuses the stored vectors for unchanged document content. Title and metadata
 changes update the retained source and lexical image without document inference.
 Only the final new or changed content for each ID is embedded.
 
+For a partial quality predecessor, membership follows the selected generation:
+surviving covered IDs remain covered, and changed covered content is re-embedded
+by both producers. New and previously uncovered IDs receive fast vectors only.
+Deleting a covered ID removes its quality row; reinserting that ID in a later
+generation leaves it fast-only. Within one delta, the final operation for an ID
+wins, so a covered ID ending in an upsert retains its original coverage.
+Title/metadata-only edits reuse vectors independently in both tiers.
+
+The resulting quality subset must remain nonempty and smaller than the complete
+source cohort. Deleting every covered ID, deleting every uncovered ID, or
+deleting the entire partial corpus refuses before model loading or staging.
+These updates cannot claim full coverage or silently discard the quality tier.
+Use explicit quality completion before edits that need a complete topology.
+The same rules apply to granted warm-server updates.
+
 An input file can contain:
 
 ```jsonl
@@ -698,15 +719,17 @@ overwritten by another edit. Deleting an absent ID has no effect.
 
 Omit `--input` to read bounded JSONL from standard input. Both source checkpoint
 boundaries are required and must be at least their selected predecessor values.
-An empty delta can advance the checkpoint with zero document inference. A delta
-that deletes the entire cohort publishes a complete empty generation. Its
+An empty delta can advance the checkpoint with zero document inference. For
+single-tier and full generations, a delta that deletes the entire cohort
+publishes a complete empty generation. Its
 zero-row vector images, empty Quill source, metadata and optional graph are
 admitted and committed together. Searches return no hits, source fetches report
 the requested documents as unavailable, and later upserts repopulate the same
 root. Full generations retain both independently bound tiers when empty.
 
-Empty input is also supported by `authority-index` and `authority-rebuild`,
-including `--retained-source` rebuilds of an empty predecessor. Empty generations
+Single-tier and full builds also support empty input through `authority-index`
+and `authority-rebuild`, including `--retained-source` rebuilds of an empty
+predecessor. Empty generations
 keep their producer identities, storage and retrieval contracts, source
 checkpoint and canonical empty document-set digest. Semantic builds and queries
 still load and check the matching models, but zero documents require no embedding
@@ -1075,7 +1098,8 @@ fields:
 An update contains at most 1,000 mutation records, counting overwritten edits,
 and must fit within the existing 1 MiB request limit. Every record is validated;
 the final operation for each ID wins. Empty `changes` may advance the checkpoint.
-The complete resulting cohort may be empty and must satisfy the same
+Single-tier and full sessions may produce an empty cohort. Partial sessions
+must preserve a nonempty proper quality subset. Every result satisfies the same
 100,000-document, 16 MiB record and 256 MiB encoded-source limits as the one-shot
 command. Destinations must be UTF-8 paths of at most 4,096 bytes, outside the
 selected root and separate from each other. `--batch-size` on the server
@@ -1089,7 +1113,11 @@ and graph parameters remain fixed. Full sessions retain both producers and reuse
 each tier's stored vector for unchanged content. Metadata-only edits therefore
 perform no document inference in either tier; each final changed document is
 embedded once by each producer. Complete successor images are built and admitted
-through the same path as `authority-update`.
+through the same path as `authority-update`. Partial sessions use the restricted
+subset-preserving builder: only changed covered documents reach quality
+inference, and new or uncovered documents remain fast-only. The server keeps
+both query embedding caches and recomputes the fixed source scope against the
+successor. Existing retained readers keep their original source and coverage.
 
 The new recovery receipt is synced before publication. A successful update
 installs the exact admitted reader returned by the publisher, then acknowledges
