@@ -329,6 +329,24 @@ fn open_vector_source(
     Ok(source)
 }
 
+/// Admit exactly the components that prove this receipt's selected source.
+/// Partial receipts also require their actual quality rows to attest coverage.
+pub(super) fn export_documents(
+    cx: &Cx,
+    root: &QualifiedGenerationRoot,
+    selected: &Receipt,
+    max_image_bytes: usize,
+    max_source_bytes: usize,
+) -> Result<Vec<frankensearch::IndexableDocument>> {
+    if selected.quality_documents.is_some() {
+        let vectors = open_vector_source(cx, root, selected, max_image_bytes)?;
+        Ok(vectors.source().source_documents(cx, max_source_bytes)?)
+    } else {
+        let source = open_source(cx, root, selected, max_image_bytes)?;
+        Ok(source.source_documents(cx, max_source_bytes)?)
+    }
+}
+
 fn open_source(
     cx: &Cx,
     root: &QualifiedGenerationRoot,
