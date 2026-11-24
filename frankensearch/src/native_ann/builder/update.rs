@@ -231,6 +231,8 @@ impl NativeIndexQualityCompletion {
 /// admitted result with the predecessor's expected pair. [`Self::build`] completes
 /// every missing row; [`Self::build_partial`] checkpoints an explicitly selected
 /// larger proper subset without changing existing vector precision.
+/// [`Self::build_next_batch`] selects a bounded number of missing rows from the
+/// retained source and completes coverage when that batch reaches its end.
 #[cfg(feature = "quill")]
 pub struct NativeQualityCompletion {
     update: NativeIndexUpdate,
@@ -452,6 +454,101 @@ impl NativeQualityCompletion {
             max_image_bytes,
         ))
         .await;
+        drop(authority_pin);
+        result
+    }
+
+    /// Infer at most the next `max_new_quality_documents` missing quality rows.
+    ///
+    /// Selection follows lexicographic document-ID order in the authenticated
+    /// retained source and always includes every already covered ID. A batch
+    /// returns partial quality while missing rows remain, or a complete two-tier
+    /// generation when the remaining rows fit. Resume from the admitted published
+    /// successor; no caller-maintained membership list or cursor is required.
+    ///
+    /// This limit counts newly covered documents across the whole build, not
+    /// provider calls. [`Self::with_batch_size`] independently bounds each
+    /// inference request. Existing fast and quality vectors, quality precision,
+    /// producer contracts, exact source bytes and source checkpoint are retained,
+    /// including the final complete batch. No authority is published here.
+    ///
+    /// # Errors
+    /// Refuses a zero limit, an empty source or no missing rows, changed retained
+    /// source, producer or quality precision, budget exhaustion and cancellation.
+    /// Selection and policy refusals precede inference and work-file creation.
+    /// A failed or cancelled batch returns no publishable prefix.
+    pub async fn build_next_batch(
+        self,
+        cx: &Cx,
+        max_new_quality_documents: usize,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.quality_completion.next_batch")?;
+        if max_new_quality_documents == 0 {
+            return Err(invalid(
+                "quality_completion.max_new_quality_documents",
+                "zero",
+                "a quality backfill batch must permit at least one new document",
+            ));
+        }
+        let authority_pin = self
+            .update
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            .map(|authority| Arc::clone(&authority.snapshot));
+        let builder = self.update.prepare(cx)?;
+        let reuse = builder.reuse.as_ref().ok_or_else(|| {
+            invalid(
+                "quality_completion.source",
+                "unavailable",
+                "quality backfill requires its retained authority source",
+            )
+        })?;
+        let quality = builder.quality.as_ref().ok_or_else(|| {
+            invalid(
+                "quality_completion.identity",
+                "missing-quality",
+                "quality backfill requires its independently admitted quality provider",
+            )
+        })?;
+        let mut selected =
+            reuse.completion_quality_ids(cx, &builder.documents, &self.source, quality)?;
+        let mut ordered = BTreeSet::new();
+        for document in &builder.documents {
+            checkpoint(cx, "native_ann.quality_completion.batch_source")?;
+            ordered.insert(document.id.as_str());
+        }
+        let mut added = 0;
+        for id in ordered {
+            checkpoint(cx, "native_ann.quality_completion.batch_selection")?;
+            if !selected.contains(id) {
+                selected.insert(id.to_owned());
+                added += 1;
+                if added == max_new_quality_documents {
+                    break;
+                }
+            }
+        }
+        if added == 0 {
+            return Err(invalid(
+                "quality_completion.membership",
+                "no-missing-documents",
+                "a quality backfill batch requires at least one uncovered source document",
+            ));
+        }
+        let result = if selected.len() == builder.documents.len() {
+            Box::pin(builder.build_progressive_generation(cx, self.source, max_image_bytes)).await
+        } else {
+            Box::pin(builder.build_partial_quality_generation(
+                cx,
+                self.source,
+                selected,
+                max_image_bytes,
+            ))
+            .await
+        };
         drop(authority_pin);
         result
     }
@@ -1726,6 +1823,35 @@ impl ReuseSource {
             }
             return Ok(());
         }
+        let previous = self.completion_quality_ids(cx, documents, source, quality_plan)?;
+        if selected.len() <= previous.len() || !selected.is_superset(&previous) {
+            return Err(invalid(
+                "quality_completion.membership",
+                "not-expanded",
+                "bounded quality completion must retain every covered ID and add new members",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admit unchanged quality reuse before either a partial or final batch.
+    #[cfg(feature = "quill")]
+    fn completion_quality_ids(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        source: &CommitRange,
+        quality_plan: &TierPlan,
+    ) -> SearchResult<BTreeSet<String>> {
+        if !self.authority.as_ref().is_some_and(|authority| {
+            matches!(authority.intent, AuthorityUpdateIntent::CompleteQuality)
+        }) {
+            return Err(invalid(
+                "quality_completion.source",
+                "unauthorized-reuse",
+                "quality backfill requires an explicit authority completion plan",
+            ));
+        }
         if self
             .unchanged_authority_lexical(cx, documents, source)?
             .is_none()
@@ -1773,14 +1899,7 @@ impl ReuseSource {
                 }
             }
         }
-        if selected.len() <= previous.len() || !selected.is_superset(&previous) {
-            return Err(invalid(
-                "quality_completion.membership",
-                "not-expanded",
-                "bounded quality completion must retain every covered ID and add new members",
-            ));
-        }
-        Ok(())
+        Ok(previous)
     }
 
     /// Project quality into a single-tier builder without borrowing the fast owner.
