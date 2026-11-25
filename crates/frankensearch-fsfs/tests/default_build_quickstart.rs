@@ -7794,6 +7794,287 @@ meta:
         Ok(())
     }
 
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[test]
+    #[ignore = "requires pinned Potion and MiniLM caches; executes the production CLI"]
+    fn legacy_daemon_compacts_existing_wal() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::Arc;
+
+        use frankensearch_durability::{
+            DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
+        };
+        use frankensearch_index::wal_path_for;
+
+        log_binary_profile("legacy-daemon-startup-wal");
+        let models = configured_model_root();
+        verify_pinned_model_cache(&models).expect("verified pinned real producers");
+        let protector =
+            FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default()).unwrap();
+
+        // Finish the previously unqualified IcySnow prototype with distinct
+        // sidecar refusals, retained artifacts and an unprotected control.
+        for scenario in [
+            "intact",
+            "repair-fast",
+            "repair-quality",
+            "unprotected",
+            "corrupt-fast-sidecar",
+            "corrupt-quality-sidecar",
+            "corrupt-quality-wal",
+        ] {
+            let root = tempfile::tempdir().unwrap().keep();
+            eprintln!(
+                "[default-build-e2e] stage=legacy-startup-wal scenario={scenario} artifacts={}",
+                root.display()
+            );
+            let fsfs = IsolatedFsfs::new(&root, models.clone());
+            let corpus = root.join("corpus");
+            let index = root.join("index");
+            fs::create_dir(&corpus).unwrap();
+            fs::write(
+                corpus.join("billing.md"),
+                "Reconcile invoices and audit accounts.",
+            )
+            .unwrap();
+            let append = root.join("append.jsonl");
+            let appended_id = "repair-runbook.md";
+            fs::write(
+                &append,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "id":appended_id,
+                        "text":"The veldquartz recovery guide explains how to restore an index from a checkpoint."
+                    })
+                ),
+            )
+            .unwrap();
+            let run = |label: &str, command: &[&str], format: &str| {
+                fsfs.run_with_env(
+                    &root,
+                    label,
+                    command.iter().copied().chain([
+                        "--index-dir",
+                        index.to_str().unwrap(),
+                        "--offline",
+                        "--format",
+                        format,
+                    ]),
+                    QUICKSTART_TIMEOUT,
+                    &[
+                        ("FSFS_COMPLETE_GENERATIONS", "0"),
+                        ("FRANKENSEARCH_PRESSURE_PROFILE", "performance"),
+                        ("FRANKENSEARCH_SEARCH_QUALITY_TIMEOUT_MS", "5000"),
+                        ("FRANKENSEARCH_CHECK_UPDATES", "0"),
+                        ("FSFS_DISABLE_QUERY_CACHE", "1"),
+                    ],
+                )
+            };
+            let indexed = run(
+                "index",
+                &["index", corpus.to_str().unwrap(), "--no-watch-mode"],
+                "json",
+            );
+            assert_eq!(
+                parse_success_envelope("legacy vector index", &indexed)["data"]["indexed_files"],
+                1
+            );
+            assert!(!index.join("FSFS-CURRENT").exists());
+            let appended = run(
+                "append",
+                &["append-batch", "--file", append.to_str().unwrap()],
+                "json",
+            );
+            assert_eq!(
+                parse_success_envelope("append to both legacy WALs", &appended)["data"]["appended"],
+                1
+            );
+            let paths = [
+                index.join("vector/index.fsvi"),
+                index.join("vector/quality.fsvi"),
+            ];
+            let producers = paths.each_ref().map(|path| {
+                let tier = VectorIndex::open_read_only(path).unwrap();
+                assert_eq!(tier.record_count(), 1, "{}", path.display());
+                assert_eq!(tier.wal_record_count(), 1, "{}", path.display());
+                assert_eq!(protector.verify(path).unwrap(), FsviVerifyResult::Intact);
+                (
+                    tier.embedder_id().to_owned(),
+                    tier.embedder_revision().to_owned(),
+                    tier.dimension(),
+                    tier.quantization(),
+                )
+            });
+            let search = |label| {
+                let result = run(label, &["search", "veldquartz", "--no-daemon"], "json");
+                let result = parse_success_envelope(label, &result);
+                assert_eq!(result["data"]["phase"], "refined", "{result}");
+                assert_eq!(result["data"]["hits"][0]["path"], appended_id, "{result}");
+                result["data"]["hits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit["path"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            };
+            let before_hits = search("query-before");
+
+            let repair = match scenario {
+                "repair-fast" => Some(0),
+                "repair-quality" => Some(1),
+                _ => None,
+            };
+            if let Some(tier) = repair {
+                let mut bytes = fs::read(&paths[tier]).unwrap();
+                bytes[0] ^= 1;
+                fs::rename(&paths[tier], root.join("preserved-vector.fsvi")).unwrap();
+                fs::write(&paths[tier], bytes).unwrap();
+                assert!(VectorIndex::open_read_only(&paths[tier]).is_err());
+                assert_eq!(
+                    protector.verify(&paths[tier]).unwrap(),
+                    FsviVerifyResult::Corrupted { repairable: true }
+                );
+            }
+            if scenario == "unprotected" {
+                for (tier, path) in paths.iter().enumerate() {
+                    fs::rename(
+                        FsviProtector::sidecar_path(path),
+                        root.join(format!("preserved-{tier}.fec")),
+                    )
+                    .unwrap();
+                    assert_eq!(protector.verify(path).unwrap(), FsviVerifyResult::NoSidecar);
+                }
+            }
+            let bad_sidecar = match scenario {
+                "corrupt-fast-sidecar" => Some(0),
+                "corrupt-quality-sidecar" => Some(1),
+                _ => None,
+            };
+            if let Some(tier) = bad_sidecar {
+                let sidecar = FsviProtector::sidecar_path(&paths[tier]);
+                let mut bytes = fs::read(&sidecar).unwrap();
+                bytes[0] ^= 1;
+                fs::rename(&sidecar, root.join("preserved-sidecar.fec")).unwrap();
+                fs::write(&sidecar, bytes).unwrap();
+                assert!(protector.verify(&paths[tier]).is_err());
+            }
+            let bad_wal = scenario == "corrupt-quality-wal";
+            if bad_wal {
+                let wal = wal_path_for(&paths[1]);
+                let mut bytes = fs::read(&wal).unwrap();
+                bytes[0] ^= 1;
+                fs::rename(&wal, root.join("preserved-quality.wal")).unwrap();
+                fs::write(&wal, bytes).unwrap();
+                assert!(VectorIndex::open_read_only(&paths[1]).is_err());
+            }
+            let watched = paths
+                .iter()
+                .flat_map(|path| {
+                    [
+                        path.clone(),
+                        wal_path_for(path),
+                        FsviProtector::sidecar_path(path),
+                    ]
+                })
+                .filter(|path| path.exists())
+                .collect::<Vec<_>>();
+            let bytes_before = watched
+                .iter()
+                .map(|path| fs::read(path).unwrap())
+                .collect::<Vec<_>>();
+            let daemon = ["daemon", "--poll-ms", "25", "--idle-timeout-ms", "350"];
+            let format = if bad_sidecar.is_some() || bad_wal {
+                "json"
+            } else {
+                "table"
+            };
+            let outcome = run("daemon", &daemon, format);
+            if bad_sidecar.is_some() || bad_wal {
+                assert!(!outcome.timed_out, "{scenario}: {outcome:?}");
+                assert!(!outcome.status.success(), "{scenario}: {outcome:?}");
+                let refusal: Value = serde_json::from_str(&outcome.stdout).unwrap();
+                assert_eq!(refusal["ok"], false, "{scenario}: {outcome:?}");
+                assert_eq!(refusal["error"]["code"], "index_corrupted", "{refusal}");
+                if !bad_wal {
+                    assert!(
+                        refusal["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("repair trailer crc mismatch"),
+                        "{refusal}"
+                    );
+                }
+                assert_eq!(
+                    watched
+                        .iter()
+                        .map(|path| fs::read(path).unwrap())
+                        .collect::<Vec<_>>(),
+                    bytes_before,
+                    "a refused preflight cannot merge either tier: {scenario}"
+                );
+                if !bad_wal {
+                    assert_eq!(search("query-after-refusal"), before_hits);
+                }
+                continue;
+            }
+            assert_finished_successfully("legacy WAL daemon", &outcome);
+            for (tier, path) in paths.iter().enumerate() {
+                let reader = VectorIndex::open_read_only(path).unwrap();
+                assert_eq!(
+                    reader.record_count(),
+                    2,
+                    "{scenario}: {}: {outcome:?}",
+                    path.display()
+                );
+                assert_eq!(
+                    reader.wal_record_count(),
+                    0,
+                    "{scenario}: {}",
+                    path.display()
+                );
+                assert!(reader.live_doc_ids().unwrap().contains(appended_id));
+                assert_eq!(
+                    (
+                        reader.embedder_id().to_owned(),
+                        reader.embedder_revision().to_owned(),
+                        reader.dimension(),
+                        reader.quantization()
+                    ),
+                    producers[tier]
+                );
+                assert_eq!(protector.verify(path).unwrap(), FsviVerifyResult::Intact);
+            }
+            assert_eq!(search("query-after"), before_hits);
+            let sealed = paths
+                .iter()
+                .flat_map(|path| [path.clone(), FsviProtector::sidecar_path(path)])
+                .collect::<Vec<_>>();
+            let snapshot = || {
+                sealed
+                    .iter()
+                    .map(|path| {
+                        let metadata = fs::metadata(path).unwrap();
+                        (
+                            fs::read(path).unwrap(),
+                            metadata.ino(),
+                            metadata.modified().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let compacted = snapshot();
+            let idle = run("daemon-idle", &daemon, "table");
+            assert_finished_successfully("idle legacy WAL daemon", &idle);
+            assert!(!idle.stdout.contains("compacted"), "{scenario}: {idle:?}");
+            assert_eq!(
+                snapshot(),
+                compacted,
+                "idle startup must not rewrite {scenario}"
+            );
+        }
+    }
+
     #[cfg(feature = "semantic-loaders")]
     #[test]
     #[ignore = "mock-free model-backed quickstart; provision the pinned cache, then run with --ignored --nocapture"]

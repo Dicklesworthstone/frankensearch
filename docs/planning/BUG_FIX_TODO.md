@@ -1,5 +1,86 @@
 # Open bug repair TODO
 
+## November 25 legacy startup WAL repair — OrangeSparrow
+
+Owner-requested execution checklist for `bd-legacy-daemon-startup-wal-420fg`.
+Retire this active block at qualified publication or handoff with explicit
+unmet criteria; preserve its history. Beads remains the task authority.
+
+- [x] Refresh current source and governing instructions; preserve the dirty
+  shared checkout and fast-forward the clean isolated checkout to `b27feb94`.
+- [x] Triage the existing graph: no ready work; preserve blocked migration and
+  peer performance acceptance. Claim one concrete ordinary-product bug under
+  the exclusive graph lease, with its code and named real-model test together.
+- [x] Inspect IcySnow's preserved unqualified candidate; credit its design and
+  leave that worktree untouched. The startup-counter defect remains upstream.
+- [x] Retain a matched baseline executable and reproduce the named populated
+  daemon-startup test failing because both pending WALs remain unmerged.
+- [x] Finish the production fix: process existing work on the first poll,
+  preflight both vector sidecars, retain later growth/stop/cancellation behavior,
+  and report failed maintenance honestly.
+- [x] Verify both actual model tiers merge their WALs, preserve identities and
+  Refined search, and avoid rewriting on the second idle startup.
+- [x] Verify repairable corruption and separate corrupt-fast/corrupt-quality
+  sidecar refusals before any merge; preserve vector/WAL bytes. Exercise the
+  existing healthy unprotected policy with preserved sidecars outside the root.
+- [x] Compile/lint the integrated source and execute the named test red/green;
+  triage the exact changed files with UBS and check formatting.
+- [ ] Freeze a clean source checkpoint and finish all eighteen unchanged stock
+  labels with real models and the genuine prior executable. Keep execution
+  classes, all failed attempts and source/lock/ELF/model identities explicit.
+- [ ] Reverify original acceptance in a fresh solo pass, write the bounded
+  work/honesty review, close only the owned bug on evidence, export only owned
+  tracker changes, publish and verify both refs, then release reservations.
+
+Current evidence: `/data/tmp/fs-daemon-startup.sKDROXdS`. The clean-overlay
+`b27feb94` build with explicit `fast_cmaes` revision completed on hz4 and its
+artifact was retrieved (terminal acknowledgement and exit 0). Retained baseline
+ELF SHA256: `33ef59c2395b67a05c8cb176c984fe03f8c5b15c583cb1951b319efc9367977c`.
+The native-built permanent probe executes that baseline and fails at the actual
+startup result: daemon exit 0, fast main count 1 instead of 2. Both pending WALs
+also remain byte-identical in the separately retained product reproduction.
+Admission refusals (external containment, slots, queue timeout, disk) are saved
+and earn no compilation/test credit. Stock and fresh acceptance remain pending.
+The first candidate launch raced an unfinished executable copy and failed to
+spawn; the next retained run passed all four positive scenarios, then caught
+an incorrect expected diagnostic in the new test. A first-byte sidecar edit
+trips the existing CRC check before magic validation (`repair_trailer.rs:98`).
+The assertion now requires that CRC diagnostic, with the original nonzero,
+typed-corruption and byte-preservation checks retained. No stock test changed.
+The next run passed both malformed-sidecar controls but caught an actual
+production defect in the added quality-WAL control: writer-open recovery
+quarantines an unusable WAL and continues, so writer opens alone are not strict
+preflight. The repair adds read-only validation of all pending tiers before
+opening either writer; the failed run is retained alongside the complete rerun.
+
+Focused result: `candidate-named-probe-v4.log`, terminal 0, one actual test,
+seven predeclared scenarios, 73.50 seconds. Four positive scenarios merge both
+tiers and preserve Refined hits, producer/dimension/quantization and idle
+bytes/inodes/mtimes; three malformed-input scenarios refuse before merging and
+preserve the watched bytes. The quality-WAL control now reports bad magic
+without quarantine. Default executable SHA256:
+`43661b1adc2505418ac65a7ff9e1d7ffa65953394c26023f6e25030726869df4`.
+Focused Clippy passes with warnings denied; formatting and diff checks pass.
+UBS exits 0 on the two changed Rust files, with 0 critical, 10,016 warnings and
+2,703 informational findings across their entire contents. The 114 findings
+in touched spans were reviewed: test assertions/unwraps and deliberate fixture
+writes fail the test on bad setup; indexed arrays share the fixed tier count,
+test tier selectors are 0/1, and corrupted bytes come from successfully opened
+nonempty files. Paths use fixed tier constants; apparent division/modulo are
+path strings/tracing syntax. Bounded fixture copies and command/error logging
+are intentional. No suppression or scanner/gate change was made. Unchanged
+file regions were not qualified by this scoped triage.
+
+Creation worksheet (November 25, this checklist and retained run evidence):
+running code does not branch on these artifacts. Consumer: the owner explicitly
+requested a granular TODO and honest Beads execution. Gate: publication/closure
+of the startup-compaction bug requires the original populated red/green and
+unchanged stock checks. Observed defect: an exit-0 daemon silently leaves both
+startup WALs pending, demonstrated above. Retirement: stop active tracking at
+qualified publication or an explicit incomplete handoff; preserve dated history.
+Verdict: legitimate minimal gate. The highest-value ready capability is this
+repair; another process framework would displace it and is not being created.
+
 ## November 24 source-replacement wiring — published, OrangeSparrow
 
 Owner-requested implementation checklist for `bd-native-authority-replace-source-6o6m1`.

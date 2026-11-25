@@ -19146,8 +19146,7 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    /// Start a long-lived daemon that polls the WAL for new entries and
-    /// hot-reloads the index when changes are detected.
+    /// Compact pending WAL entries on startup, then poll for new entries.
     ///
     /// The daemon runs in a loop, checking the WAL sidecar file at a
     /// configurable interval. When new WAL entries appear, it triggers
@@ -19200,8 +19199,11 @@ impl FsfsRuntime {
             .map(Duration::from_millis);
         let mut last_activity = std::time::Instant::now();
         let wal_sidecar = frankensearch_index::wal_path_for(&vector_path);
-        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
-        let quality_wal_sidecar = frankensearch_index::wal_path_for(&quality_vector_path);
+        let tiers = FSFS_VECTOR_GENERATION_FILES.map(|(tier, relative_path)| {
+            let path = index_root.join(relative_path);
+            let wal = frankensearch_index::wal_path_for(&path);
+            (tier, path, wal)
+        });
 
         info!(
             poll_ms,
@@ -19218,9 +19220,8 @@ impl FsfsRuntime {
             );
         }
 
-        let mut last_wal_len: u64 = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut last_quality_wal_len: u64 =
-            quality_wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
+        // Existing WAL bytes are pending work, not an already-observed baseline.
+        let mut previous_wal_bytes = [0; FSFS_VECTOR_GENERATION_FILES.len()];
 
         let shutdown = Arc::new(ShutdownCoordinator::new());
         shutdown.register_signals()?;
@@ -19243,23 +19244,15 @@ impl FsfsRuntime {
                 });
             }
 
-            // Poll WAL file size.
-            let current_wal_len = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
-
-            if current_wal_len > last_wal_len {
+            let observed_wal_bytes = tiers.each_ref().map(|(_, _, wal)| {
+                wal.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+            });
+            let pending: [bool; FSFS_VECTOR_GENERATION_FILES.len()] = std::array::from_fn(|position| {
+                observed_wal_bytes[position] > previous_wal_bytes[position]
+                    && tiers[position].1.exists()
+            });
+            if pending.iter().any(|pending| *pending) {
                 last_activity = std::time::Instant::now();
-                info!(
-                    previous_bytes = last_wal_len,
-                    current_bytes = current_wal_len,
-                    "daemon: WAL changed, triggering compaction"
-                );
-
-                if self.cli_input.format == OutputFormat::Table {
-                    println!(
-                        "daemon: WAL changed ({last_wal_len} -> {current_wal_len} bytes), compacting..."
-                    );
-                }
-
                 // A fence failure means the long-held lease no longer proves
                 // exclusivity (lock file substituted); abort rather than
                 // compact alongside a possible second publisher.
@@ -19268,10 +19261,33 @@ impl FsfsRuntime {
                 if let Err(error) = self.quiesce_query_daemon("daemon vector compaction") {
                     warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
                 }
-                match Self::open_vector_index_for_mutation(&vector_path) {
-                    Ok(mut index) => match index.compact() {
+                publication_lease.fence("daemon vector repair preflight")?;
+                repair_vector_generations_if_corrupted(&index_root)?;
+
+                // Validate both pending indexes and their WALs before rewriting
+                // either tier. A malformed quality WAL must not drain fast first.
+                // Writer opens may quarantine unusable WALs and continue, so
+                // first use strict readers to preserve malformed pending input.
+                for (position, (_, path, _)) in tiers.iter().enumerate() {
+                    if pending[position] {
+                        drop(VectorIndex::open_read_only(path)?);
+                    }
+                }
+                let mut indexes = Vec::with_capacity(tiers.len());
+                for (position, (tier, path, _)) in tiers.iter().enumerate() {
+                    if pending[position] {
+                        indexes.push((*tier, Self::open_vector_index_for_mutation(path)?));
+                    }
+                }
+                let mut rewritten = false;
+                let mut compaction_error = None;
+                for (tier, mut index) in indexes {
+                    publication_lease.fence("daemon tier compaction")?;
+                    match index.compact() {
                         Ok(stats) => {
+                            rewritten |= stats.wal_records > 0;
                             info!(
+                                tier,
                                 wal_merged = stats.wal_records,
                                 total_after = stats.total_records_after,
                                 elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
@@ -19279,81 +19295,31 @@ impl FsfsRuntime {
                             );
                             if self.cli_input.format == OutputFormat::Table {
                                 println!(
-                                    "daemon: compacted {} WAL entries -> {} total records ({:.1}ms)",
+                                    "daemon: {tier}: compacted {} WAL entries -> {} total records ({:.1}ms)",
                                     stats.wal_records, stats.total_records_after, stats.elapsed_ms
                                 );
                             }
                         }
                         Err(error) => {
-                            warn!(error = %error, "daemon: compaction failed");
-                            if self.cli_input.format == OutputFormat::Table {
-                                eprintln!("daemon: compaction error: {error}");
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        warn!(error = %error, "daemon: failed to open index for compaction");
-                        if self.cli_input.format == OutputFormat::Table {
-                            eprintln!("daemon: index open error: {error}");
+                            compaction_error = Some(error);
+                            break;
                         }
                     }
                 }
-
-                // The rewrite invalidated the fast tier's RaptorQ sidecar.
-                if let Err(error) = publication_lease.fence("daemon vector durability sidecars") {
-                    warn!(error = %error, "daemon: lease fence failed before re-protecting the fast tier");
-                } else {
+                // All writer handles are dropped before sidecar protection opens
+                // shared readers. An I/O failure may also have rewritten bytes.
+                if rewritten || compaction_error.is_some() {
+                    publication_lease.fence("daemon vector durability sidecars")?;
                     protect_vector_generations(&index_root, "daemon compaction");
                 }
-                // Re-read the current WAL length after compaction (it should be gone or reset).
-                last_wal_len = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
-            } else {
-                last_wal_len = current_wal_len;
+                if let Some(error) = compaction_error {
+                    return Err(error);
+                }
             }
-
-            // The quality tier's WAL is compacted on the same trigger so the
-            // two tiers never drift in what they serve.
-            let current_quality_wal_len =
-                quality_wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
-            if current_quality_wal_len > last_quality_wal_len && quality_vector_path.exists() {
-                last_activity = std::time::Instant::now();
-                info!(
-                    previous_bytes = last_quality_wal_len,
-                    current_bytes = current_quality_wal_len,
-                    "daemon: quality-tier WAL changed, triggering compaction"
-                );
-                publication_lease.fence("daemon quality vector compaction")?;
-                #[cfg(unix)]
-                if let Err(error) = self.quiesce_query_daemon("daemon quality vector compaction") {
-                    warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
-                }
-                match Self::open_vector_index_for_mutation(&quality_vector_path) {
-                    Ok(mut quality_index) => match quality_index.compact() {
-                        Ok(stats) => info!(
-                            wal_merged = stats.wal_records,
-                            total_after = stats.total_records_after,
-                            elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
-                            "daemon: quality-tier compaction completed"
-                        ),
-                        Err(error) => {
-                            warn!(error = %error, "daemon: quality-tier compaction failed");
-                        }
-                    },
-                    Err(error) => {
-                        warn!(error = %error, "daemon: failed to open quality tier for compaction");
-                    }
-                }
-                if let Err(error) =
-                    publication_lease.fence("daemon quality vector durability sidecars")
-                {
-                    warn!(error = %error, "daemon: lease fence failed before re-protecting the quality tier");
-                } else {
-                    protect_vector_generations(&index_root, "daemon quality compaction");
-                }
-                last_quality_wal_len = quality_wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
-            } else {
-                last_quality_wal_len = current_quality_wal_len;
-            }
+            // A successful merge removes/resets the WAL; future growth is work.
+            previous_wal_bytes = tiers.each_ref().map(|(_, _, wal)| {
+                wal.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+            });
 
             if let Some(limit) = idle_timeout {
                 let idle_for = last_activity.elapsed();
@@ -30705,7 +30671,7 @@ Index Management:
   append-batch [--file <path>]             Append documents to index via WAL (aliases: append, ab)
   delete <id>... [--prefix]                Soft-delete documents by ID or prefix (alias: del)
   compact                                  Merge WAL into main index and vacuum tombstones
-  daemon [--poll-ms <ms>] [--idle-timeout-ms <ms>]  Long-running process that auto-compacts when WAL grows
+  daemon [--poll-ms <ms>] [--idle-timeout-ms <ms>]  Compact queued WAL records and poll for growth
   daemon --stop                            Stop the index's compaction daemon and query daemons
 
 Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online

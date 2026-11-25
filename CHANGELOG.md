@@ -12,6 +12,11 @@
 
 ### Fixed
 
+- The legacy WAL compaction daemon now merges records already pending at
+  startup in both vector tiers. It checks repair sidecars and opens both
+  pending WALs before merging either tier, repairs recoverable vector damage,
+  and reports failed maintenance instead of silently reaching an idle exit.
+  Starting it again with no queued work leaves the index and sidecars intact.
 - Incremental vector appends now validate the existing WAL header and roll
   back failed writes or durability barriers before releasing the writer lock.
   A failed rollback blocks further mutations on that handle until reopening
