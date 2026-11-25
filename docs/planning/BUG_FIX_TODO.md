@@ -1,5 +1,48 @@
 # Open bug repair TODO
 
+## November 25 manual legacy compaction admission — in progress
+
+`bd-explicit-compact-admission-kv0lf`, OrangeSparrow. The published installed
+default `b1bfe7b8…` drains fast and removes its FEC before returning a quality
+map-lock error. It also reports success while quarantining the malformed
+quality WAL of an acknowledged append. Reproduced on actual Potion and MiniLM
+inputs. The independent lock-release and original-WAL restore controls both
+complete manual compaction, followed by real Refined results.
+
+- [x] Review the prior diff, trace both compaction callers and WAL recovery,
+  reproduce both manual failures, and verify the empty ready queue.
+- [x] Claim one Bead with original criteria and reserve the scoped files.
+- [x] Acquire every group lock, strictly parse all main files and WALs, then
+  apply ordinary stale/torn suffix recovery. Keep single-writer behavior.
+- [x] Share group admission between manual compact and the daemon. Preserve
+  the explicit bounded lock wait, affected path, fast-only and JSON behavior.
+- [x] Extend the two named real-model regressions with manual refusals.
+  Check both tiers byte-for-byte and prove no quarantine. Retain all prior tests.
+- [x] Run matching red/green installed and candidate probes, including the
+  positive explicit retry, retained IDs and protection sidecars.
+- [ ] Re-review, pass strict compiler/UBS checks and all eighteen unchanged
+  stock stages on clean exact source. Retain exact artifacts and receipts.
+- [ ] Run fresh installed acceptance, publish scoped source/evidence, verify
+  both remote refs, close on cited criteria, export closure, and release leases.
+
+Baseline and candidate receipts `manual-{busy,malformed}-{red,green}-v1-result.json`
+retain the same harness `0c819b33…` and exact tested binary identities.
+Candidate Cargo-test CLI `d3f24dfb…` passes the 33.17 s contention run and
+the 74.44 s startup/malformed-WAL run. The published installed baseline
+fails at the intended new assertions in both runs. Independent actual
+candidate CLI controls preserve every artifact through both refusals.
+After releasing the quality reader or restoring the original fixture WAL,
+explicit compact merges one record per tier, Doctor verifies both sidecars
+intact, and Refined search returns the acknowledged ID. A real Potion-only
+index also compacts and retains the hit. Transcripts:
+`/data/tmp/fs-review-2-explicit-*-candidate.log`.
+
+Strict Clippy initially refused a needless move of the small recovery
+instruction. The final version makes that value copyable and simplifies the
+missing-fast error path. This leaves admission and recovery unchanged. The
+failure remains in `fs-review-2-{native,rch}-clippy-v1.log`. UBS on the final
+changed files reports zero critical findings.
+
 ## November 25 fresh review of legacy compactor repair — qualified source published
 
 `bd-compactor-repair-admission-40m0c`, OrangeSparrow. The previously

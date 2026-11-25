@@ -7800,6 +7800,7 @@ meta:
     #[test]
     #[ignore = "requires pinned Potion and MiniLM caches; executes the production CLI"]
     fn legacy_daemon_compacts_existing_wal() {
+        use std::io::Write as _;
         use std::os::unix::fs::MetadataExt as _;
         use std::sync::Arc;
 
@@ -7969,6 +7970,14 @@ meta:
                 fs::rename(&wal, root.join("preserved-quality.wal")).unwrap();
                 fs::write(&wal, bytes).unwrap();
                 assert!(VectorIndex::open_read_only(&paths[1]).is_err());
+                // Fast has a recoverable tail. It must be left intact if
+                // quality fails admission, even with both writer locks held.
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(wal_path_for(&paths[0]))
+                    .unwrap()
+                    .write_all(b"BATCH-incomplete-fast-tail")
+                    .unwrap();
             }
             let watched = paths
                 .iter()
@@ -7985,6 +7994,34 @@ meta:
                 .iter()
                 .map(|path| fs::read(path).unwrap())
                 .collect::<Vec<_>>();
+            if bad_wal {
+                let manual = run("compact-refuses-quality-wal", &["compact"], "json");
+                assert!(
+                    !manual.timed_out && !manual.status.success(),
+                    "explicit compact must refuse malformed quality WAL: {manual:?}"
+                );
+                let refusal: Value = serde_json::from_str(&manual.stdout).unwrap();
+                assert_eq!(refusal["error"]["code"], "index_corrupted", "{refusal}");
+                assert_eq!(
+                    watched
+                        .iter()
+                        .map(|path| fs::read(path).unwrap())
+                        .collect::<Vec<_>>(),
+                    bytes_before
+                );
+                assert!(
+                    !fs::read_dir(paths[1].parent().unwrap())
+                        .unwrap()
+                        .any(|entry| {
+                            entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with("quality.fsvi.wal.corrupt.")
+                        }),
+                    "explicit compact must not quarantine the pending quality WAL"
+                );
+            }
             let daemon = ["daemon", "--poll-ms", "25", "--idle-timeout-ms", "350"];
             let format = if bad_sidecar.is_some() || bad_wal {
                 "json"
@@ -8617,6 +8654,28 @@ meta:
                 None
             };
             let quality_reader = (!direct).then(|| VectorIndex::open_read_only(&paths[1]).unwrap());
+            if torn_wal {
+                let manual = run("compact-refuses-quality-reader", &["compact"]);
+                assert!(!manual.timed_out && !manual.status.success(), "{manual:?}");
+                let refusal: Value = serde_json::from_str(&manual.stdout).unwrap();
+                assert_eq!(refusal["error"]["field"], "fsvi.map_lock", "{refusal}");
+                assert!(
+                    refusal["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(paths[1].to_str().unwrap()),
+                    "{refusal}"
+                );
+                assert!(
+                    frankensearch_index::wal_path_for(&paths[0]).exists(),
+                    "refused manual compact must retain the fast WAL"
+                );
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "refused manual compact cannot change pending artifacts"
+                );
+            }
             let (mut daemon, _, stderr) =
                 start(id, &["daemon", "--poll-ms", "25", "--idle-timeout-ms", "0"]);
             let refusal = if repair {

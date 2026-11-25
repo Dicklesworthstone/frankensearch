@@ -19067,7 +19067,16 @@ impl FsfsRuntime {
         // A generation whose bytes drifted from its RaptorQ sidecar is
         // restored before it is merged; unrepairable damage is a typed error.
         let repaired_generations = repair_vector_generations_if_corrupted(&index_root)?;
-        let mut index = Self::open_vector_index_for_mutation(&vector_path)?;
+        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+        let paths = [
+            Some(vector_path.as_path()),
+            quality_vector_path.try_exists()?.then_some(quality_vector_path.as_path()),
+        ];
+        publication_lease.fence("explicit vector writer admission")?;
+        let mut indexes = Self::retry_vector_writer_open(&vector_path, Duration::from_secs(2), || {
+            VectorIndex::open_writers(paths.into_iter().flatten())
+        })?.into_iter();
+        let mut index = indexes.next().ok_or(SearchError::IndexNotFound { path: vector_path })?;
 
         // First compact WAL into main index.
         let compaction_stats = index.compact()?;
@@ -19077,10 +19086,8 @@ impl FsfsRuntime {
 
         // The quality tier, when present, is compacted and vacuumed in the
         // same run so its tombstones and WAL never lag the fast tier.
-        let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
-        let quality_stats = if quality_vector_path.exists() {
+        let quality_stats = if let Some(mut quality_index) = indexes.next() {
             publication_lease.fence("explicit quality vector compaction")?;
-            let mut quality_index = Self::open_vector_index_for_mutation(&quality_vector_path)?;
             let quality_compaction = quality_index.compact()?;
             let quality_vacuum = quality_index.vacuum()?;
             info!(
@@ -19306,15 +19313,8 @@ impl FsfsRuntime {
 
                     let pending_tiers = tiers.iter().zip(pending)
                         .filter_map(|(tier, pending)| pending.then_some(tier));
-                    // Validate both pending indexes and their WALs before rewriting
-                    // either tier. A malformed quality WAL must not drain fast first.
-                    // Writer opens may quarantine unusable WALs and continue, so
-                    // first use strict readers to preserve malformed pending input.
-                    for (_, path, _) in pending_tiers.clone() {
-                        drop(VectorIndex::open_read_only(path)?);
-                    }
-                    // Lock every pending tier before any writer open can trim
-                    // a torn WAL suffix or discard a stale WAL generation.
+                    // Admit all locks and strictly validate every pending WAL
+                    // before recovery or compaction can modify an earlier tier.
                     let Some(indexes) = VectorIndex::try_open_writers(
                         pending_tiers.clone().map(|(_, path, _)| path.as_path()),
                     )? else {
@@ -19706,18 +19706,26 @@ impl FsfsRuntime {
         path: &Path,
         budget: Duration,
     ) -> SearchResult<VectorIndex> {
+        Self::retry_vector_writer_open(path, budget, || VectorIndex::open(path))
+    }
+
+    fn retry_vector_writer_open<T>(
+        path: &Path,
+        budget: Duration,
+        mut open: impl FnMut() -> SearchResult<T>,
+    ) -> SearchResult<T> {
         const OPEN_POLL: Duration = Duration::from_millis(50);
 
         let started = Instant::now();
         let mut refusals = 0u32;
         loop {
-            match VectorIndex::open(path) {
-                Err(SearchError::InvalidConfig { field, reason, .. })
+            match open() {
+                Err(SearchError::InvalidConfig { field, reason, value })
                     if field == "fsvi.map_lock" && started.elapsed() < budget =>
                 {
                     if refusals == 0 {
                         info!(
-                            path = %path.display(),
+                            path = %value,
                             budget_ms = budget.as_millis(),
                             reason,
                             "vector index writer open refused by the map lock; waiting for the holder"

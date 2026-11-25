@@ -840,6 +840,12 @@ struct FsviOpenError {
     lock_contended: bool,
 }
 
+#[derive(Clone, Copy)]
+enum WalOpenRecovery {
+    RemoveStale,
+    KeepPrefix(u64),
+}
+
 impl From<SearchError> for FsviOpenError {
     fn from(error: SearchError) -> Self {
         Self {
@@ -2112,10 +2118,13 @@ impl VectorIndex {
             .transpose()
     }
 
-    /// Open legacy FSVI writers in input order, acquiring every lock before
-    /// any open can recover a WAL. Paths must refer to distinct indexes.
+    /// Open legacy FSVI writers in input order under a shared admission step.
+    /// Acquire every lock and validate every main and WAL header before doing
+    /// any WAL recovery. Paths must refer to distinct indexes.
+    ///
     /// Returns `Ok(None)` on lock contention, releasing acquired locks without
-    /// opening any WAL.
+    /// opening any WAL. A malformed WAL header is returned as an error without
+    /// quarantining it. Valid prefixes of torn WALs are recovered after admission.
     ///
     /// # Errors
     ///
@@ -2123,18 +2132,45 @@ impl VectorIndex {
     pub fn try_open_writers<'a>(
         paths: impl IntoIterator<Item = &'a Path>,
     ) -> SearchResult<Option<Vec<Self>>> {
+        match Self::open_writers_classified(paths) {
+            Ok(indexes) => Ok(Some(indexes)),
+            Err(FsviOpenError {
+                lock_contended: true,
+                ..
+            }) => Ok(None),
+            Err(error) => Err(error.error),
+        }
+    }
+
+    /// Admit legacy FSVI writers together, returning the affected path on any
+    /// lock refusal. Uses the same strict validation as [`Self::try_open_writers`].
+    ///
+    /// # Errors
+    ///
+    /// Returns lock refusals, I/O errors, and index validation failures.
+    pub fn open_writers<'a>(paths: impl IntoIterator<Item = &'a Path>) -> SearchResult<Vec<Self>> {
+        Self::open_writers_classified(paths).map_err(|error| error.error)
+    }
+
+    fn open_writers_classified<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<Vec<Self>, FsviOpenError> {
         let mut locked = Vec::new();
         for path in paths {
-            let Some(lock) = Self::try_lock_writer(path)? else {
-                return Ok(None);
-            };
-            locked.push((path, lock));
+            locked.push((path, Self::acquire_map_lock(path, true)?));
         }
-        locked
+        let admitted = locked
             .into_iter()
-            .map(|(path, lock)| Self::open_locked(path, lock))
+            .map(|(path, lock)| Self::prepare_locked(path, lock, false))
+            .collect::<SearchResult<Vec<_>>>()?;
+        admitted
+            .into_iter()
+            .map(|(index, recovery)| {
+                index.recover_wal_after_open(recovery)?;
+                Ok(index)
+            })
             .collect::<SearchResult<Vec<_>>>()
-            .map(Some)
+            .map_err(Into::into)
     }
 
     fn try_lock_writer(path: &Path) -> SearchResult<Option<FsviMapLock>> {
@@ -2201,9 +2237,21 @@ impl VectorIndex {
         Ok(map_lock)
     }
 
-    #[allow(unsafe_code, clippy::too_many_lines)] // memmap constructors require unsafe for memory-mapped I/O.
     fn open_locked(path: &Path, map_lock: FsviMapLock) -> SearchResult<Self> {
         let writer = map_lock.is_writer();
+        let (index, recovery) = Self::prepare_locked(path, map_lock, writer)?;
+        if writer {
+            index.recover_wal_after_open(recovery)?;
+        }
+        Ok(index)
+    }
+
+    #[allow(unsafe_code)] // memmap constructors require unsafe for memory-mapped I/O.
+    fn prepare_locked(
+        path: &Path,
+        map_lock: FsviMapLock,
+        recover_torn_header: bool,
+    ) -> SearchResult<(Self, WalOpenRecovery)> {
         let data = match &map_lock {
             FsviMapLock::Exclusive { file, .. } => VectorIndexData::Mutable(unsafe {
                 MmapMut::map_mut(file).map_err(SearchError::Io)?
@@ -2232,9 +2280,9 @@ impl VectorIndex {
 
         // Load WAL entries if a sidecar file exists.
         let wal_path = wal::wal_path_for(path);
-        // Only a write-capable open may quarantine a torn header; a read-only
-        // open stays side-effect-free like every other `writer &&` guard here.
-        let (wal_entries_raw, wal_compaction_gen, valid_len) = if writer {
+        // Only a single writer open can recover a malformed header here.
+        // Group admission and read-only opens leave the input intact.
+        let (wal_entries_raw, wal_compaction_gen, valid_len) = if recover_torn_header {
             wal::read_wal_recovering_torn_header(
                 &wal_path,
                 metadata.dimension,
@@ -2265,7 +2313,7 @@ impl VectorIndex {
             false
         };
 
-        if is_stale {
+        let recovery = if is_stale {
             tracing::warn!(
                 path = %path.display(),
                 main_gen = metadata.compaction_gen,
@@ -2273,40 +2321,54 @@ impl VectorIndex {
                 "discarding stale/mismatched WAL entries"
             );
             wal_entries.clear();
-            if writer {
+            WalOpenRecovery::RemoveStale
+        } else {
+            WalOpenRecovery::KeepPrefix(valid_len)
+        };
+
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                data,
+                map_lock: Some(map_lock),
+                metadata,
+                records_offset,
+                strings_offset,
+                vectors_offset,
+                wal_entries,
+                wal_config: WalConfig::default(),
+                wal_append_requires_reopen: false,
+                vectors_i8: OnceLock::new(),
+                vectors_nibbles: OnceLock::new(),
+            },
+            recovery,
+        ))
+    }
+
+    fn recover_wal_after_open(&self, recovery: WalOpenRecovery) -> SearchResult<()> {
+        let wal_path = wal::wal_path_for(&self.path);
+        match recovery {
+            WalOpenRecovery::RemoveStale => {
                 // Future appends must not land behind a stale generation header.
                 wal::remove_wal(&wal_path)?;
             }
-        } else if writer && wal_path.try_exists().map_err(SearchError::Io)? {
-            let actual_len = std::fs::metadata(&wal_path).map_err(SearchError::Io)?.len();
-            if actual_len > valid_len {
-                tracing::warn!(
-                    path = %wal_path.display(),
-                    actual_len,
-                    valid_len,
-                    "truncating corrupted WAL trailer"
-                );
-                let file = open_fsvi_regular_file(&wal_path, File::options().write(true))
-                    .map_err(SearchError::Io)?;
-                file.set_len(valid_len).map_err(SearchError::Io)?;
-                file.sync_all().map_err(SearchError::Io)?;
+            WalOpenRecovery::KeepPrefix(valid_len) if wal_path.try_exists()? => {
+                let actual_len = std::fs::metadata(&wal_path)?.len();
+                if actual_len > valid_len {
+                    tracing::warn!(
+                        path = %wal_path.display(),
+                        actual_len,
+                        valid_len,
+                        "truncating corrupted WAL trailer"
+                    );
+                    let file = open_fsvi_regular_file(&wal_path, File::options().write(true))?;
+                    file.set_len(valid_len)?;
+                    file.sync_all()?;
+                }
             }
+            WalOpenRecovery::KeepPrefix(_) => {}
         }
-
-        Ok(Self {
-            path: path.to_path_buf(),
-            data,
-            map_lock: Some(map_lock),
-            metadata,
-            records_offset,
-            strings_offset,
-            vectors_offset,
-            wal_entries,
-            wal_config: WalConfig::default(),
-            wal_append_requires_reopen: false,
-            vectors_i8: OnceLock::new(),
-            vectors_nibbles: OnceLock::new(),
-        })
+        Ok(())
     }
 
     /// Create a writer that stores vectors as f16 with an empty revision string.
