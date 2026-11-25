@@ -126,6 +126,16 @@ startup production/test implementation are byte-identical to `b692f5d4`.
   cancellation/epoch fencing, legacy raw adapters and neutral recovery advice.
 - [ ] Requalify the optional graph feature on this combined source: its cache
   dependency changed, so the earlier graph result cannot qualify this tree.
+- [x] Retain v7's strict-Clippy failure in the incoming legacy sync test
+  provider. Return its literal as `&'static str`, preserving the trait contract,
+  all assertions and strict lints. The refreshed graph run at `fcc2b15b` passes
+  26/0/0; keep that scoped receipt separate from final stock qualification.
+- [x] Review all 155 touched scanner findings in the four incoming Rust files.
+  Full scan exits 1: nine critical, 1,625 warnings, 325 informational. All nine
+  critical are unchanged schema-test failure sentinels (lines 132–253), with
+  byte-identical prefix proof and zero critical in changed spans. Preserve the
+  failed scan; add no suppression. Correct the first triage receipt's mistaken
+  canonical HEAD in a separate retained v2 receipt bound to `fcc2b15b`.
 - [ ] Repeat the original baseline/default-installed-binary acceptance pair on
   the combined source, retaining both executable and harness identities.
 - [ ] Repeat the twelve actual-model native preview command outcomes and add

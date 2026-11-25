@@ -2269,7 +2269,7 @@ mod tests {
                 2
             }
 
-            fn id(&self) -> &str {
+            fn id(&self) -> &'static str {
                 "legacy-sync-control"
             }
 
