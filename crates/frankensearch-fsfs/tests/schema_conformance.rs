@@ -1141,12 +1141,14 @@ fn test_degradation_advice_fixture_conformance() -> serde_json::Result<()> {
         .map(|advice| advice.reason_code.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(fixture.len(), 9);
+    assert_eq!(fixture.len(), 11);
     assert_eq!(
         reasons,
         vec![
             "degrade.advice.refinement_failed",
             "degrade.advice.lexical_fallback",
+            "degrade.advice.model_unavailable",
+            "degrade.advice.artifact_integrity_failure",
             "degrade.advice.quality_model_missing",
             "degrade.advice.embedding_space_unverifiable",
             "degrade.advice.timeout",
